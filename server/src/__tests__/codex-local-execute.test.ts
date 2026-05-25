@@ -82,6 +82,34 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, c
   await fs.chmod(commandPath, 0o755);
 }
 
+async function writeAgentsMtimeMutatingCodexCommand(commandPath: string): Promise<void> {
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
+if (capturePath) {
+  const payload = {
+    argv: process.argv.slice(2),
+    prompt: fs.readFileSync(0, "utf8"),
+  };
+  fs.writeFileSync(capturePath, JSON.stringify(payload), "utf8");
+}
+const agentsPath = process.env.PAPERCLIP_TEST_AGENTS_TOUCH_PATH;
+setTimeout(() => {
+  if (agentsPath) {
+    const touchedAt = new Date();
+    fs.utimesSync(agentsPath, touchedAt, touchedAt);
+  }
+  setTimeout(() => {
+    console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-session-1" }));
+    console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "hello" } }));
+    console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } }));
+  }, 300);
+}, 50);
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
 type CapturePayload = {
   argv: string[];
   prompt: string;
@@ -1284,6 +1312,111 @@ describe("codex execute", () => {
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
       expect(capture.argv).toEqual(expect.arrayContaining(["resume", "codex-session-1", "-"]));
       expect(result.sessionParams?.sessionStartedAt).toBe(savedSessionStartedAt);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("forces a fresh session on the next wake when AGENTS.md changes during a fresh execution", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-agents-midrun-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "codex");
+    const capturePath1 = path.join(root, "capture-1.json");
+    const capturePath2 = path.join(root, "capture-2.json");
+    const instructionsPath = path.join(root, "AGENTS.md");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(instructionsPath, "Stable instructions.\n", "utf8");
+    await writeAgentsMtimeMutatingCodexCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    let secondRunCommandNotes: string[] = [];
+    try {
+      const now = Date.now();
+      await fs.utimes(instructionsPath, new Date(now - 120_000), new Date(now - 120_000));
+
+      const firstRun = await execute({
+        runId: "run-agents-mtime-midrun-1",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Codex Coder",
+          adapterType: "codex_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          instructionsFilePath: instructionsPath,
+          env: {
+            PAPERCLIP_TEST_CAPTURE_PATH: capturePath1,
+            PAPERCLIP_TEST_AGENTS_TOUCH_PATH: instructionsPath,
+          },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(firstRun.exitCode).toBe(0);
+      expect(firstRun.errorMessage).toBeNull();
+      expect(firstRun.sessionId).toBe("codex-session-1");
+
+      const firstCapture = JSON.parse(await fs.readFile(capturePath1, "utf8")) as CapturePayload;
+      expect(firstCapture.argv).toEqual(expect.arrayContaining(["exec", "--json", "-"]));
+      expect(firstCapture.argv).not.toContain("resume");
+
+      const secondRun = await execute({
+        runId: "run-agents-mtime-midrun-2",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Codex Coder",
+          adapterType: "codex_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: firstRun.sessionParams as Record<string, unknown> | null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          instructionsFilePath: instructionsPath,
+          env: {
+            PAPERCLIP_TEST_CAPTURE_PATH: capturePath2,
+            PAPERCLIP_TEST_AGENTS_TOUCH_PATH: "",
+          },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+        onMeta: async (meta) => {
+          secondRunCommandNotes = meta.commandNotes ?? [];
+        },
+      });
+
+      expect(secondRun.exitCode).toBe(0);
+      expect(secondRun.errorMessage).toBeNull();
+      const secondCapture = JSON.parse(await fs.readFile(capturePath2, "utf8")) as CapturePayload;
+      expect(secondCapture.argv).toEqual(expect.arrayContaining(["exec", "--json", "-"]));
+      expect(secondCapture.argv).not.toContain("resume");
+      expect(secondRunCommandNotes).toContain(
+        "Forced a fresh Codex session because AGENTS.md changed after the saved session start.",
+      );
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

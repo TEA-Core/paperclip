@@ -700,6 +700,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   const runAttempt = async (resumeSessionId: string | null) => {
+    let attemptStartedAt = new Date().toISOString();
     const execArgs = buildCodexExecArgs(
       forceSaferInvocation ? { ...config, fastMode: false } : config,
       { resumeSessionId },
@@ -732,7 +733,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stdin: prompt,
       timeoutSec,
       graceSec,
-      onSpawn,
+      onSpawn: async (meta) => {
+        attemptStartedAt = meta.startedAt;
+        if (onSpawn) {
+          await onSpawn(meta);
+        }
+      },
       onLog: async (stream, chunk) => {
         if (stream !== "stderr") {
           await onLog(stream, chunk);
@@ -752,6 +758,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       rawStderr: proc.stderr,
       parsed: parseCodexJsonl(proc.stdout),
       attemptedResumeSessionId: resumeSessionId,
+      attemptStartedAt,
     };
   };
 
@@ -761,6 +768,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       rawStderr: string;
       parsed: ReturnType<typeof parseCodexJsonl>;
       attemptedResumeSessionId: string | null;
+      attemptStartedAt: string;
     },
     clearSessionOnMissingSession = false,
     isRetry = false,
@@ -790,7 +798,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     );
     const resolvedSessionStartedAt = resumedExistingSession && runtimeSessionStartedAt
       ? runtimeSessionStartedAt.iso
-      : new Date().toISOString();
+      : attempt.attemptStartedAt;
     const resolvedSessionParams = resolvedSessionId
       ? ({
         sessionId: resolvedSessionId,
