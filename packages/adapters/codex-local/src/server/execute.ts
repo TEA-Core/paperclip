@@ -529,20 +529,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   let forceFreshSessionForAgentsMtime = false;
   let agentsMtimeBypassNote: string | null = null;
-  if (
-    canResumeSession &&
-    runtimeSessionStartedAt &&
-    instructionsFilePath.length > 0 &&
-    isAgentsInstructionsFile(instructionsFilePath)
-  ) {
-    try {
-      const instructionsStat = await fs.stat(instructionsFilePath);
-      if (instructionsStat.mtimeMs > runtimeSessionStartedAt.ms) {
-        forceFreshSessionForAgentsMtime = true;
-        agentsMtimeBypassNote = "Forced a fresh Codex session because AGENTS.md changed after the saved session start.";
+  if (canResumeSession && instructionsFilePath.length > 0 && isAgentsInstructionsFile(instructionsFilePath)) {
+    if (!runtimeSessionStartedAt) {
+      forceFreshSessionForAgentsMtime = true;
+      agentsMtimeBypassNote =
+        "Forced a fresh Codex session because AGENTS.md guard could not read the saved session start metadata.";
+    } else {
+      try {
+        const instructionsStat = await fs.stat(instructionsFilePath);
+        if (instructionsStat.mtimeMs > runtimeSessionStartedAt.ms) {
+          forceFreshSessionForAgentsMtime = true;
+          agentsMtimeBypassNote = "Forced a fresh Codex session because AGENTS.md changed after the saved session start.";
+        }
+      } catch {
+        // keep resume behavior; a warning for unreadable files is emitted below.
       }
-    } catch {
-      // keep resume behavior; a warning for unreadable files is emitted below.
     }
   }
   const codexTransientFallbackMode = readCodexTransientFallbackMode(context);

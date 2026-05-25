@@ -988,6 +988,9 @@ describe("codex execute", () => {
     let invocationNotes: string[] = [];
     let promptMetrics: Record<string, number> = {};
     try {
+      const now = Date.now();
+      await fs.utimes(instructionsPath, new Date(now - 60_000), new Date(now - 60_000));
+      const savedSessionStartedAt = new Date(now).toISOString();
       const result = await execute({
         runId: "run-resume-wake",
         agent: {
@@ -1002,6 +1005,7 @@ describe("codex execute", () => {
           sessionParams: {
             sessionId: "codex-session-1",
             cwd: workspace,
+            sessionStartedAt: savedSessionStartedAt,
           },
           sessionDisplayId: null,
           taskKey: null,
@@ -1280,6 +1284,72 @@ describe("codex execute", () => {
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
       expect(capture.argv).toEqual(expect.arrayContaining(["resume", "codex-session-1", "-"]));
       expect(result.sessionParams?.sessionStartedAt).toBe(savedSessionStartedAt);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("forces a fresh session when AGENTS.md guard cannot read saved session start metadata", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-agents-mtime-legacy-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "codex");
+    const capturePath = path.join(root, "capture.json");
+    const instructionsPath = path.join(root, "AGENTS.md");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(instructionsPath, "Updated instructions.\n", "utf8");
+    await writeFakeCodexCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    let commandNotes: string[] = [];
+    try {
+      const result = await execute({
+        runId: "run-agents-mtime-legacy-metadata",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Codex Coder",
+          adapterType: "codex_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: {
+            sessionId: "codex-session-1",
+            cwd: workspace,
+          },
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          instructionsFilePath: instructionsPath,
+          env: {
+            PAPERCLIP_TEST_CAPTURE_PATH: capturePath,
+          },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+        onMeta: async (meta) => {
+          commandNotes = meta.commandNotes ?? [];
+        },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.errorMessage).toBeNull();
+
+      const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+      expect(capture.argv).toEqual(expect.arrayContaining(["exec", "--json", "-"]));
+      expect(capture.argv).not.toContain("resume");
+      expect(commandNotes).toContain(
+        "Forced a fresh Codex session because AGENTS.md guard could not read the saved session start metadata.",
+      );
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
