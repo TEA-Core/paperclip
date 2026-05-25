@@ -774,7 +774,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
 
-    const canFallbackToRuntimeSession = !isRetry && !forceFreshSession;
+    const canFallbackToRuntimeSession = !isRetry && !forceFreshSession && !forceFreshSessionForAgentsMtime;
     const resolvedSessionId =
       attempt.parsed.sessionId ??
       (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null);
@@ -782,6 +782,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       attempt.attemptedResumeSessionId &&
       !isRetry &&
       !forceFreshSession &&
+      !forceFreshSessionForAgentsMtime &&
       resolvedSessionId &&
       runtimeSessionId &&
       resolvedSessionId === runtimeSessionId,
