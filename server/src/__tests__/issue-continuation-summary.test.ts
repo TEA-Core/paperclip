@@ -85,4 +85,36 @@ describe("issue continuation summaries", () => {
     expect(body).toContain("Latest run error (adapter_failed): adapter failed");
     expect(body).toContain("Inspect the failed run, fix the cause");
   });
+
+  it("neutralizes first-person phrasing in the prior run's result summary", () => {
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1579",
+        title: "Add continuation summaries",
+        description: null,
+        status: "in_progress",
+        priority: "medium",
+      },
+      run: {
+        id: "run-3",
+        status: "succeeded",
+        error: null,
+        resultJson: {
+          summary: "I implemented the feature and my tests pass. Mine is ready for review.",
+        },
+      },
+      agent: {
+        id: "agent-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+      },
+    });
+
+    expect(body).toContain("the previous run implemented the feature and the previous run's tests pass");
+    expect(body).toContain("The previous run's is ready for review");
+    expect(body).not.toContain(" I ");
+    expect(body).not.toContain(" my ");
+    expect(body).not.toContain(" mine ");
+  });
 });

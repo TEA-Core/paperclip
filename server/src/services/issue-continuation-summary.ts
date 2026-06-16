@@ -66,6 +66,22 @@ function readResultSummary(resultJson: Record<string, unknown> | null | undefine
   );
 }
 
+const FIRST_PERSON_RE = /\b(I|my|me|myself|mine)\b/i;
+
+function neutralizeFirstPersonPhrasing(text: string): string {
+  if (!FIRST_PERSON_RE.test(text)) return text;
+  return text
+    .replace(/\bI\b/g, "the previous run")
+    .replace(/\bMy\b/g, "The previous run's")
+    .replace(/\bmy\b/g, "the previous run's")
+    .replace(/\bMe\b/g, "The previous run")
+    .replace(/\bme\b/g, "the previous run")
+    .replace(/\bMyself\b/g, "The previous run itself")
+    .replace(/\bmyself\b/g, "the previous run itself")
+    .replace(/\bMine\b/g, "The previous run's")
+    .replace(/\bmine\b/g, "the previous run's");
+}
+
 function extractMarkdownSection(markdown: string | null | undefined, heading: string) {
   if (!markdown) return null;
   const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -127,7 +143,8 @@ export function buildContinuationSummaryMarkdown(input: {
   previousSummaryBody?: string | null;
 }) {
   const { issue, run, agent } = input;
-  const resultSummary = readResultSummary(run.resultJson);
+  const rawResultSummary = readResultSummary(run.resultJson);
+  const resultSummary = rawResultSummary ? neutralizeFirstPersonPhrasing(rawResultSummary) : null;
   const recentActions = [
     `Run \`${run.id}\` finished with status \`${run.status}\`${run.finishedAt ? ` at ${run.finishedAt.toISOString()}` : ""}.`,
     resultSummary ? truncateText(resultSummary, SUMMARY_SECTION_MAX_CHARS) : "No adapter-provided result summary was captured for this run.",
