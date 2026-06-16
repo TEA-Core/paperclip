@@ -95,11 +95,24 @@ function stripIdentityStamps(text: string): string {
     .trim();
 }
 
+// Matches legacy prior-run identity headers such as
+// "Previous run: e4af36c8 via Lead Engineer (opencode_local)" that can survive
+// in already-contaminated summaries.
+const LEGACY_IDENTITY_HEADER_RE = /^\s*[-*]?\s*Previous run\s*:\s*.+?\s+via\s+.+?(\s*\([^)]+\))?\s*$/gim;
+
+function stripLegacyIdentityHeaders(text: string): string {
+  return text
+    .replace(LEGACY_IDENTITY_HEADER_RE, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 // Single sanitizer for ANY prior-run prose that gets injected into the next
-// agent's wake context: drop foreign identity stamps, then neutralize
-// first-person narration so it reads as the previous run in third person.
-function sanitizePriorRunProse(text: string): string {
-  return neutralizeFirstPersonPhrasing(stripIdentityStamps(text));
+// agent's wake context: drop foreign identity stamps, drop legacy identity
+// headers, then neutralize first-person narration so it reads as the previous
+// run in third person.
+export function sanitizePriorRunProse(text: string): string {
+  return neutralizeFirstPersonPhrasing(stripLegacyIdentityHeaders(stripIdentityStamps(text)));
 }
 
 function extractMarkdownSection(markdown: string | null | undefined, heading: string) {

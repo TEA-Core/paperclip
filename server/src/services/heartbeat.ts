@@ -86,6 +86,7 @@ import {
 import {
   getIssueContinuationSummaryDocument,
   refreshIssueContinuationSummary,
+  sanitizePriorRunProse,
 } from "./issue-continuation-summary.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
@@ -1185,6 +1186,34 @@ function formatCount(value: number | null | undefined) {
 
 export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): SessionCompactionPolicy {
   return resolveSessionCompactionPolicy(agent.adapterType, agent.runtimeConfig).policy;
+}
+
+export function buildPaperclipSessionHandoffMarkdown(input: {
+  sessionId: string;
+  issueId: string | null;
+  reason: string;
+  latestTextSummary: string | null;
+  continuationSummaryBody: string | null | undefined;
+}): string {
+  const { sessionId, issueId, reason, latestTextSummary, continuationSummaryBody } = input;
+  const sanitizedLatestTextSummary = latestTextSummary ? sanitizePriorRunProse(latestTextSummary) : null;
+  const sanitizedContinuationSummaryBody = continuationSummaryBody
+    ? sanitizePriorRunProse(continuationSummaryBody).slice(0, 1_500)
+    : null;
+
+  return [
+    "Paperclip session handoff:",
+    `- Previous session: ${sessionId}`,
+    issueId ? `- Issue: ${issueId}` : "",
+    `- Rotation reason: ${reason}`,
+    sanitizedLatestTextSummary ? `- Last run summary: ${sanitizedLatestTextSummary}` : "",
+    sanitizedContinuationSummaryBody
+      ? `- Issue continuation summary: ${sanitizedContinuationSummaryBody}`
+      : "",
+    "Continue from the current task state. Rebuild only the minimum context you need.",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function resolveRuntimeSessionParamsForWorkspace(input: {
@@ -2296,19 +2325,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       readNonEmptyString(latestSummary?.message) ??
       readNonEmptyString(latestRun.error);
 
-    const handoffMarkdown = [
-      "Paperclip session handoff:",
-      `- Previous session: ${sessionId}`,
-      issueId ? `- Issue: ${issueId}` : "",
-      `- Rotation reason: ${reason}`,
-      latestTextSummary ? `- Last run summary: ${latestTextSummary}` : "",
-      input.continuationSummaryBody
-        ? `- Issue continuation summary: ${input.continuationSummaryBody.slice(0, 1_500)}`
-        : "",
-      "Continue from the current task state. Rebuild only the minimum context you need.",
-    ]
-      .filter(Boolean)
-      .join("\n");
+    const handoffMarkdown = buildPaperclipSessionHandoffMarkdown({
+      sessionId,
+      issueId,
+      reason,
+      latestTextSummary,
+      continuationSummaryBody: input.continuationSummaryBody,
+    });
 
     return {
       rotate: true,

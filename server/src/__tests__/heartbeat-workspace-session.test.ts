@@ -6,6 +6,7 @@ import {
   applyPersistedExecutionWorkspaceConfig,
   buildRealizedExecutionWorkspaceFromPersisted,
   buildExplicitResumeSessionOverride,
+  buildPaperclipSessionHandoffMarkdown,
   deriveTaskKeyWithHeartbeatFallback,
   extractWakeCommentIds,
   formatRuntimeWorkspaceWarningLog,
@@ -557,5 +558,74 @@ describe("parseSessionCompactionPolicy", () => {
       maxRawInputTokens: 500_000,
       maxSessionAgeHours: 0,
     });
+  });
+});
+
+describe("buildPaperclipSessionHandoffMarkdown", () => {
+  it("composes a session handoff with the required sections", () => {
+    const markdown = buildPaperclipSessionHandoffMarkdown({
+      sessionId: "session-1",
+      issueId: "issue-1",
+      reason: "session exceeded 200 runs",
+      latestTextSummary: "Last run finished cleanly.",
+      continuationSummaryBody: "Continue implementing SUP-6649.",
+    });
+
+    expect(markdown).toContain("Paperclip session handoff:");
+    expect(markdown).toContain("- Previous session: session-1");
+    expect(markdown).toContain("- Issue: issue-1");
+    expect(markdown).toContain("- Rotation reason: session exceeded 200 runs");
+    expect(markdown).toContain("- Last run summary: Last run finished cleanly.");
+    expect(markdown).toContain("- Issue continuation summary: Continue implementing SUP-6649.");
+    expect(markdown).toContain("Continue from the current task state. Rebuild only the minimum context you need.");
+  });
+
+  it("sanitizes identity stamps and first-person prose from the latest run summary (SUP-6649)", () => {
+    const markdown = buildPaperclipSessionHandoffMarkdown({
+      sessionId: "session-1",
+      issueId: "issue-1",
+      reason: "session exceeded 200 runs",
+      latestTextSummary: "Agent: Lead Engineer (opencode_local)\nI finished my changes.",
+      continuationSummaryBody: null,
+    });
+
+    expect(markdown).not.toContain("Agent:");
+    expect(markdown).not.toContain("Lead Engineer");
+    expect(markdown).not.toContain("opencode_local");
+    expect(markdown).not.toContain(" I ");
+    expect(markdown).not.toContain(" my ");
+    expect(markdown).toContain("- Last run summary: the previous run finished the previous run's changes");
+  });
+
+  it("sanitizes legacy identity headers and first-person prose from the continuation summary (SUP-6649)", () => {
+    const markdown = buildPaperclipSessionHandoffMarkdown({
+      sessionId: "session-1",
+      issueId: "issue-1",
+      reason: "session exceeded 200 runs",
+      latestTextSummary: null,
+      continuationSummaryBody:
+        "Previous run: e4af36c8-3408-4910-9252-b9d6a90a1c1c via Lead Engineer (opencode_local)\nI am ready for review.",
+    });
+
+    expect(markdown).not.toContain("Previous run:");
+    expect(markdown).not.toContain("Lead Engineer");
+    expect(markdown).not.toContain("opencode_local");
+    expect(markdown).not.toContain(" I ");
+    expect(markdown).not.toContain(" my ");
+    expect(markdown).toContain("- Issue continuation summary: the previous run am ready for review.");
+  });
+
+  it("truncates the continuation summary body after sanitization", () => {
+    const longBody = "a".repeat(2_000);
+    const markdown = buildPaperclipSessionHandoffMarkdown({
+      sessionId: "session-1",
+      issueId: null,
+      reason: "session age reached 72 hours",
+      latestTextSummary: null,
+      continuationSummaryBody: longBody,
+    });
+
+    const match = markdown.match(/- Issue continuation summary: (\S+)/);
+    expect(match?.[1]).toHaveLength(1_500);
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ISSUE_CONTINUATION_SUMMARY_MAX_BODY_CHARS,
   buildContinuationSummaryMarkdown,
+  sanitizePriorRunProse,
 } from "../services/issue-continuation-summary.js";
 
 describe("issue continuation summaries", () => {
@@ -198,5 +199,33 @@ describe("issue continuation summaries", () => {
     expect(body).not.toContain(" I ");
     expect(body).not.toContain(" my ");
     expect(body).toContain("the previous run will run the previous run's tests next");
+  });
+
+  it("strips legacy prior-run identity header shapes (SUP-6649)", () => {
+    const contaminated = [
+      "Previous run: e4af36c8-3408-4910-9252-b9d6a90a1c1c via Lead Engineer (opencode_local)",
+      "",
+      "I made progress and my changes are ready.",
+    ].join("\n");
+
+    const sanitized = sanitizePriorRunProse(contaminated);
+
+    expect(sanitized).not.toContain("Lead Engineer");
+    expect(sanitized).not.toContain("opencode_local");
+    expect(sanitized).not.toContain("Previous run:");
+    expect(sanitized).not.toContain(" I ");
+    expect(sanitized).not.toContain(" my ");
+    expect(sanitized).toContain("the previous run made progress");
+    expect(sanitized).toContain("the previous run's changes are ready");
+  });
+
+  it("strips bullet-prefixed legacy prior-run identity headers (SUP-6649)", () => {
+    const contaminated = "- Previous run: run-abc123 via Frontend Engineer (kimi-for-coding/k2p7)\nI fixed it.";
+    const sanitized = sanitizePriorRunProse(contaminated);
+
+    expect(sanitized).not.toContain("Frontend Engineer");
+    expect(sanitized).not.toContain("kimi-for-coding/k2p7");
+    expect(sanitized).not.toContain("Previous run:");
+    expect(sanitized).toContain("the previous run fixed it");
   });
 });
