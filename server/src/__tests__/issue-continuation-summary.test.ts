@@ -53,6 +53,8 @@ describe("issue continuation summaries", () => {
     expect(body).toContain("## Commands Run");
     expect(body).toContain("## Blockers / Decisions");
     expect(body).toContain("## Next Action");
+    expect(body).toContain("Previous run: run-1 via CodexCoder (codex_local)");
+    expect(body).not.toContain("- Agent:");
     expect(body.length).toBeLessThanOrEqual(ISSUE_CONTINUATION_SUMMARY_MAX_BODY_CHARS);
   });
 

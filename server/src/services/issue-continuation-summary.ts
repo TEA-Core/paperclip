@@ -150,7 +150,7 @@ export function buildContinuationSummaryMarkdown(input: {
     `- Priority: ${issue.priority}`,
     `- Current mode: ${mode}`,
     `- Last updated by run: ${run.id}`,
-    `- Agent: ${agent.name} (${agent.adapterType ?? "unknown"})`,
+    `- Previous run: ${run.id} via ${agent.name} (${agent.adapterType ?? "unknown"})`,
     "",
     "## Objective",
     "",
