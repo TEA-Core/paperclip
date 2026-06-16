@@ -71,15 +71,15 @@ const FIRST_PERSON_RE = /\b(I|my|me|myself|mine)\b/i;
 function neutralizeFirstPersonPhrasing(text: string): string {
   if (!FIRST_PERSON_RE.test(text)) return text;
   return text
-    .replace(/\bI\b/g, "the previous run")
-    .replace(/\bMy\b/g, "The previous run's")
-    .replace(/\bmy\b/g, "the previous run's")
-    .replace(/\bMe\b/g, "The previous run")
-    .replace(/\bme\b/g, "the previous run")
-    .replace(/\bMyself\b/g, "The previous run itself")
-    .replace(/\bmyself\b/g, "the previous run itself")
-    .replace(/\bMine\b/g, "The previous run's")
-    .replace(/\bmine\b/g, "the previous run's");
+    .replace(/\bi'm\b/gi, "the previous run is")
+    .replace(/\bi've\b/gi, "the previous run has")
+    .replace(/\bi'll\b/gi, "the previous run will")
+    .replace(/\bi'd\b/gi, "the previous run would")
+    .replace(/\bi\b/gi, "the previous run")
+    .replace(/\bmy\b/gi, "the previous run's")
+    .replace(/\bme\b/gi, "the previous run")
+    .replace(/\bmyself\b/gi, "the previous run itself")
+    .replace(/\bmine\b/gi, "the previous run's");
 }
 
 // Matches a prior-author identity stamp line such as

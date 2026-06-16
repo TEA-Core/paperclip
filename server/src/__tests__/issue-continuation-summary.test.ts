@@ -117,10 +117,47 @@ describe("issue continuation summaries", () => {
     });
 
     expect(body).toContain("the previous run implemented the feature and the previous run's tests pass");
-    expect(body).toContain("The previous run's is ready for review");
+    expect(body).toContain("the previous run's is ready for review");
     expect(body).not.toContain(" I ");
     expect(body).not.toContain(" my ");
     expect(body).not.toContain(" mine ");
+  });
+
+  it("neutralizes lowercase first-person tokens including contractions (SUP-6649 regression)", () => {
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1579",
+        title: "Regression: lowercase first-person",
+        description: null,
+        status: "in_progress",
+        priority: "medium",
+      },
+      run: {
+        id: "run-lowercase",
+        status: "succeeded",
+        error: null,
+        resultJson: {
+          summary: "i fixed it. i'm done. i've verified. i'll hand off. i'd recommend this approach.",
+        },
+      },
+      agent: {
+        id: "agent-1",
+        name: "LeadEngineer",
+        adapterType: "opencode_local",
+      },
+    });
+
+    expect(body).not.toMatch(/\bi\b/);
+    expect(body).not.toMatch(/\bi'm\b/i);
+    expect(body).not.toMatch(/\bi've\b/i);
+    expect(body).not.toMatch(/\bi'll\b/i);
+    expect(body).not.toMatch(/\bi'd\b/i);
+    expect(body).toContain("the previous run fixed it");
+    expect(body).toContain("the previous run is done");
+    expect(body).toContain("the previous run has verified");
+    expect(body).toContain("the previous run will hand off");
+    expect(body).toContain("the previous run would recommend this approach");
   });
 
   it("strips a foreign prior-agent identity stamp (SUP-6562 lineage) from the injected summary", () => {
