@@ -53,8 +53,12 @@ describe("issue continuation summaries", () => {
     expect(body).toContain("## Commands Run");
     expect(body).toContain("## Blockers / Decisions");
     expect(body).toContain("## Next Action");
-    expect(body).toContain("Previous run: run-1 via CodexCoder (codex_local)");
+    expect(body).toContain("- Last updated by run: run-1");
+    // Identity-neutral: no prior-agent name/adapter stamp and no "Agent:" self-stamp line
+    expect(body).not.toContain("CodexCoder");
+    expect(body).not.toContain("codex_local");
     expect(body).not.toContain("- Agent:");
+    expect(body).not.toContain("Agent:");
     expect(body.length).toBeLessThanOrEqual(ISSUE_CONTINUATION_SUMMARY_MAX_BODY_CHARS);
   });
 
@@ -116,5 +120,83 @@ describe("issue continuation summaries", () => {
     expect(body).not.toContain(" I ");
     expect(body).not.toContain(" my ");
     expect(body).not.toContain(" mine ");
+  });
+
+  it("strips a foreign prior-agent identity stamp (SUP-6562 lineage) from the injected summary", () => {
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-6562",
+        identifier: "SUP-6562",
+        title: "NEWS-SENT T6 — Operator Sentiment & Scoring panel",
+        description: null,
+        status: "in_progress",
+        priority: "medium",
+      },
+      run: {
+        id: "run-6562",
+        status: "succeeded",
+        error: null,
+        resultJson: {
+          // Exact SUP-6562 lineage shape that captured the Lead Engineer self-stamp.
+          summary: "Agent: Lead Engineer (opencode_local)\nI reviewed the CR feedback and my changes are ready.",
+        },
+      },
+      agent: {
+        // The reader on this wake is the Frontend Engineer.
+        id: "fe-agent",
+        name: "Frontend Engineer",
+        adapterType: "kimi-for-coding/k2p7",
+      },
+    });
+
+    // No line the reader (FE) could mistake for its own identity.
+    expect(body).not.toContain("Agent: Lead Engineer");
+    expect(body).not.toContain("Agent:");
+    // The reader's own identity must not be re-stamped into the body either.
+    expect(body).not.toContain("Frontend Engineer");
+    expect(body).not.toContain("kimi-for-coding/k2p7");
+    // First-person prior narration is neutralized.
+    expect(body).not.toContain(" I ");
+    expect(body).not.toContain(" my ");
+    expect(body).toContain("the previous run reviewed the CR feedback");
+  });
+
+  it("neutralizes a contaminated previous-summary Next Action carried forward", () => {
+    const previousSummaryBody = [
+      "# Continuation Summary",
+      "",
+      "## Next Action",
+      "",
+      "- I will run my tests next.",
+    ].join("\n");
+
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-7",
+        identifier: "PAP-7",
+        title: "Carry-forward neutralization",
+        description: null,
+        status: "in_progress",
+        priority: "medium",
+      },
+      run: {
+        id: "run-7",
+        status: "succeeded",
+        error: null,
+        resultJson: null,
+      },
+      agent: {
+        id: "agent-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+      },
+      previousSummaryBody,
+    });
+
+    // The carried-forward Next Action must not reach the next agent in first person.
+    expect(body).not.toContain("I will run my tests next");
+    expect(body).not.toContain(" I ");
+    expect(body).not.toContain(" my ");
+    expect(body).toContain("the previous run will run the previous run's tests next");
   });
 });

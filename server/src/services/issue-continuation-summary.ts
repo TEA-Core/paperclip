@@ -82,6 +82,26 @@ function neutralizeFirstPersonPhrasing(text: string): string {
     .replace(/\bmine\b/g, "the previous run's");
 }
 
+// Matches a prior-author identity stamp line such as
+// "Agent: Lead Engineer (opencode_local)" or "- Agent: Frontend Engineer".
+// These must never reach the next reader's context: a weak model can read the
+// injected stamp as its OWN identity and override its system prompt (SUP-6562).
+const IDENTITY_STAMP_LINE_RE = /^\s*[-*]?\s*Agent\s*:\s.*$/gim;
+
+function stripIdentityStamps(text: string): string {
+  return text
+    .replace(IDENTITY_STAMP_LINE_RE, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// Single sanitizer for ANY prior-run prose that gets injected into the next
+// agent's wake context: drop foreign identity stamps, then neutralize
+// first-person narration so it reads as the previous run in third person.
+function sanitizePriorRunProse(text: string): string {
+  return neutralizeFirstPersonPhrasing(stripIdentityStamps(text));
+}
+
 function extractMarkdownSection(markdown: string | null | undefined, heading: string) {
   if (!markdown) return null;
   const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -144,7 +164,7 @@ export function buildContinuationSummaryMarkdown(input: {
 }) {
   const { issue, run, agent } = input;
   const rawResultSummary = readResultSummary(run.resultJson);
-  const resultSummary = rawResultSummary ? neutralizeFirstPersonPhrasing(rawResultSummary) : null;
+  const resultSummary = rawResultSummary ? sanitizePriorRunProse(rawResultSummary) : null;
   const recentActions = [
     `Run \`${run.id}\` finished with status \`${run.status}\`${run.finishedAt ? ` at ${run.finishedAt.toISOString()}` : ""}.`,
     resultSummary ? truncateText(resultSummary, SUMMARY_SECTION_MAX_CHARS) : "No adapter-provided result summary was captured for this run.",
@@ -157,7 +177,9 @@ export function buildContinuationSummaryMarkdown(input: {
   const objective = extractMarkdownSection(issue.description, "Objective") ?? issue.description?.trim() ?? "No objective captured.";
   const acceptanceCriteria = extractMarkdownSection(issue.description, "Acceptance Criteria") ?? "No explicit acceptance criteria captured.";
   const mode = inferMode(issue, run);
-  const nextAction = inferNextAction(issue, run, extractPreviousNextAction(input.previousSummaryBody));
+  const rawPreviousNextAction = extractPreviousNextAction(input.previousSummaryBody);
+  const previousNextAction = rawPreviousNextAction ? sanitizePriorRunProse(rawPreviousNextAction) : null;
+  const nextAction = inferNextAction(issue, run, previousNextAction);
 
   const body = [
     "# Continuation Summary",
@@ -167,7 +189,6 @@ export function buildContinuationSummaryMarkdown(input: {
     `- Priority: ${issue.priority}`,
     `- Current mode: ${mode}`,
     `- Last updated by run: ${run.id}`,
-    `- Previous run: ${run.id} via ${agent.name} (${agent.adapterType ?? "unknown"})`,
     "",
     "## Objective",
     "",
@@ -189,7 +210,7 @@ export function buildContinuationSummaryMarkdown(input: {
     "",
     bulletList(
       [
-        `Heartbeat run \`${run.id}\` invoked adapter \`${agent.adapterType ?? "unknown"}\`.`,
+        `Heartbeat run \`${run.id}\` recorded its shell/tool activity in the run log.`,
         "Detailed shell/tool commands remain in the run log and transcript.",
       ],
       "No command metadata captured.",
