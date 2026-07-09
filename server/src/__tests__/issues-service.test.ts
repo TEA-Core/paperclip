@@ -2468,3 +2468,224 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(row).toEqual({ executionRunId: null, executionLockedAt: null });
   });
 });
+
+describeEmbeddedPostgres("issueService.create/update returnAssigneeAgentId validation", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-return-assignee-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+async function seedCompany() {
+    const companyId = randomUUID();
+    const prefix = companyId.replace(/-/g, "").slice(0, 6).toUpperCase();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "TestCo",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    return companyId;
+  }
+
+  async function seedAgent(companyId: string, overrides: Partial<typeof agents.$inferInsert> = {}) {
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: `Agent-${agentId.slice(0, 8)}`,
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      ...overrides,
+    });
+    return agentId;
+  }
+
+  async function seedIssue(companyId: string, overrides: Partial<typeof issues.$inferInsert> = {}) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "todo",
+      priority: "medium",
+      ...overrides,
+    });
+    return issueId;
+  }
+
+  describe("create", () => {
+    it("rejects create with nonexistent returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      await expect(
+        svc.create(companyId, {
+          title: "Test",
+          executionPolicy: { returnAssigneeAgentId: randomUUID() },
+        }),
+      ).rejects.toThrow("Assignee agent not found");
+    });
+
+    it("rejects create with out-of-company returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      const otherCompanyId = await seedCompany();
+      const agentId = await seedAgent(otherCompanyId);
+      await expect(
+        svc.create(companyId, {
+          title: "Test",
+          executionPolicy: { returnAssigneeAgentId: agentId },
+        }),
+      ).rejects.toThrow("Assignee must belong to same company");
+    });
+
+    it("rejects create with pending_approval returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, { status: "pending_approval" });
+      await expect(
+        svc.create(companyId, {
+          title: "Test",
+          executionPolicy: { returnAssigneeAgentId: agentId },
+        }),
+      ).rejects.toThrow("Cannot assign work to pending approval agents");
+    });
+
+    it("rejects create with terminated returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, { status: "terminated" });
+      await expect(
+        svc.create(companyId, {
+          title: "Test",
+          executionPolicy: { returnAssigneeAgentId: agentId },
+        }),
+      ).rejects.toThrow("Cannot assign work to terminated agents");
+    });
+
+    it("allows create with returnAssigneeAgentId absent", async () => {
+      const companyId = await seedCompany();
+      const issue = await svc.create(companyId, { title: "Test" });
+      expect(issue).toBeDefined();
+      expect(issue.id).toBeDefined();
+    });
+
+    it("allows create with returnAssigneeAgentId null", async () => {
+      const companyId = await seedCompany();
+      const issue = await svc.create(companyId, {
+        title: "Test",
+        executionPolicy: { returnAssigneeAgentId: null },
+      });
+      expect(issue).toBeDefined();
+      expect(issue.id).toBeDefined();
+    });
+
+    it("allows create with valid returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId);
+      const issue = await svc.create(companyId, {
+        title: "Test",
+        executionPolicy: { returnAssigneeAgentId: agentId },
+      });
+      expect(issue).toBeDefined();
+      expect(issue.id).toBeDefined();
+    });
+  });
+
+  describe("update", () => {
+    it("rejects update with nonexistent returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      const issueId = await seedIssue(companyId);
+      await expect(
+        svc.update(issueId, {
+          executionPolicy: { returnAssigneeAgentId: randomUUID() },
+        }),
+      ).rejects.toThrow("Assignee agent not found");
+    });
+
+    it("rejects update with out-of-company returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      const issueId = await seedIssue(companyId);
+      const otherCompanyId = await seedCompany();
+      const agentId = await seedAgent(otherCompanyId);
+      await expect(
+        svc.update(issueId, {
+          executionPolicy: { returnAssigneeAgentId: agentId },
+        }),
+      ).rejects.toThrow("Assignee must belong to same company");
+    });
+
+    it("rejects update with pending_approval returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      const issueId = await seedIssue(companyId);
+      const agentId = await seedAgent(companyId, { status: "pending_approval" });
+      await expect(
+        svc.update(issueId, {
+          executionPolicy: { returnAssigneeAgentId: agentId },
+        }),
+      ).rejects.toThrow("Cannot assign work to pending approval agents");
+    });
+
+    it("rejects update with terminated returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      const issueId = await seedIssue(companyId);
+      const agentId = await seedAgent(companyId, { status: "terminated" });
+      await expect(
+        svc.update(issueId, {
+          executionPolicy: { returnAssigneeAgentId: agentId },
+        }),
+      ).rejects.toThrow("Cannot assign work to terminated agents");
+    });
+
+    it("allows update with returnAssigneeAgentId absent", async () => {
+      const companyId = await seedCompany();
+      const issueId = await seedIssue(companyId);
+      const updated = await svc.update(issueId, { title: "Updated" });
+      expect(updated).toBeDefined();
+      expect(updated?.title).toBe("Updated");
+    });
+
+    it("allows update with returnAssigneeAgentId null", async () => {
+      const companyId = await seedCompany();
+      const issueId = await seedIssue(companyId);
+      const updated = await svc.update(issueId, {
+        executionPolicy: { returnAssigneeAgentId: null },
+      });
+      expect(updated).toBeDefined();
+    });
+
+    it("allows update with valid returnAssigneeAgentId", async () => {
+      const companyId = await seedCompany();
+      const issueId = await seedIssue(companyId);
+      const agentId = await seedAgent(companyId);
+      const updated = await svc.update(issueId, {
+        executionPolicy: { returnAssigneeAgentId: agentId },
+      });
+      expect(updated).toBeDefined();
+    });
+  });
+});
