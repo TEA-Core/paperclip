@@ -409,6 +409,56 @@ describe("issue execution policy transitions", () => {
       });
     });
 
+    it("reviewer requests changes -> returns to configured assignee when policy overrides bounce routing", () => {
+      const policyWithConfiguredReturn = normalizeIssueExecutionPolicy({
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+          { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+        ],
+        returnAssigneeAgentId: ctoAgentId,
+      })!;
+      const configuredReviewStageId = policyWithConfiguredReturn.stages[0].id;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policyWithConfiguredReturn,
+          executionState: {
+            status: "pending",
+            currentStageId: configuredReviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy: policyWithConfiguredReturn,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Needs another pass on edge cases",
+      });
+
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBe(ctoAgentId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        currentStageType: "review",
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        lastDecisionOutcome: "changes_requested",
+      });
+      expect(result.decision).toMatchObject({
+        stageId: configuredReviewStageId,
+        stageType: "review",
+        outcome: "changes_requested",
+      });
+    });
+
     it("executor re-submits after changes → returns to same review stage", () => {
       const result = applyIssueExecutionPolicyTransition({
         issue: {
