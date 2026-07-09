@@ -105,6 +105,7 @@ export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
   stages: z.array(issueExecutionStageSchema).default([]),
+  returnAssigneeAgentId: z.string().uuid().optional().nullable(),
 });
 
 export const issueReviewRequestSchema = z.object({

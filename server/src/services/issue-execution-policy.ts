@@ -87,6 +87,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     mode: parsed.data.mode ?? "normal",
     commentRequired: true,
     stages,
+    returnAssigneeAgentId: parsed.data.returnAssigneeAgentId ?? null,
   };
 }
 
@@ -436,12 +437,16 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
         if (!input.commentBody?.trim()) {
           throw unprocessable("Requesting changes requires a comment");
         }
-        if (!existingState?.returnAssignee) {
+        const configuredReturnAssignee = input.policy?.returnAssigneeAgentId
+          ? { type: "agent" as const, agentId: input.policy.returnAssigneeAgentId, userId: null }
+          : null;
+        const effectiveReturnAssignee = configuredReturnAssignee ?? existingState?.returnAssignee;
+        if (!effectiveReturnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
         }
         patch.status = "in_progress";
-        Object.assign(patch, patchForPrincipal(existingState.returnAssignee));
-        patch.executionState = buildChangesRequestedState(existingState, activeStage);
+        Object.assign(patch, patchForPrincipal(effectiveReturnAssignee));
+        patch.executionState = buildChangesRequestedState(existingState!, activeStage);
         return {
           patch,
           decision: {
