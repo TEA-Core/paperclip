@@ -2660,6 +2660,10 @@ export function issueService(db: Db) {
       if (data.assigneeAgentId) {
         await assertAssignableAgent(companyId, data.assigneeAgentId);
       }
+      const returnAssigneeAgentId = readStringFromRecord(data.executionPolicy, "returnAssigneeAgentId");
+      if (returnAssigneeAgentId) {
+        await assertAssignableAgent(companyId, returnAssigneeAgentId);
+      }
       if (data.assigneeUserId) {
         await assertAssignableUser(companyId, data.assigneeUserId);
       }
@@ -2884,6 +2888,10 @@ export function issueService(db: Db) {
       }
       if (issueData.assigneeAgentId) {
         await assertAssignableAgent(existing.companyId, issueData.assigneeAgentId);
+      }
+      const returnAssigneeAgentId = readStringFromRecord(issueData.executionPolicy, "returnAssigneeAgentId");
+      if (returnAssigneeAgentId) {
+        await assertAssignableAgent(existing.companyId, returnAssigneeAgentId);
       }
       if (issueData.assigneeUserId) {
         await assertAssignableUser(existing.companyId, issueData.assigneeUserId);
