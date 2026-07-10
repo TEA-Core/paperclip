@@ -385,8 +385,9 @@ describe("issue execution policy routes", () => {
     );
   });
 
-  it("rejects returnAssigneeAgentId changes from agents without tasks:assign", async () => {
-    const issue = {
+  it("rejects returnAssigneeAgentId changes and clearing from agents without tasks:assign", async () => {
+    const oldReturnAssigneeAgentId = "55555555-5555-4555-8555-555555555555";
+    const inactiveIssue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
       status: "todo",
@@ -395,10 +396,10 @@ describe("issue execution policy routes", () => {
       createdByUserId: "local-board",
       identifier: "PAP-989",
       title: "Policy update auth test",
-      executionPolicy: normalizeIssueExecutionPolicy(executionPolicyPayload("55555555-5555-4555-8555-555555555555")),
+      executionPolicy: normalizeIssueExecutionPolicy(executionPolicyPayload(oldReturnAssigneeAgentId)),
       executionState: null,
     };
-    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getById.mockResolvedValue(inactiveIssue);
 
     const res = await request(await createApp(agentActor))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -407,34 +408,97 @@ describe("issue execution policy routes", () => {
     expect(res.status).toBe(403);
     expect(res.body.error).toBe("Missing permission: tasks:assign");
     expect(mockIssueService.update).not.toHaveBeenCalled();
-  });
 
-  it("rejects returnAssigneeAgentId clearing from agents without tasks:assign", async () => {
-    const issue = {
-      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      companyId: "company-1",
-      status: "todo",
-      assigneeAgentId: null,
-      assigneeUserId: "local-board",
-      createdByUserId: "local-board",
+    const inactiveClearIssue = {
+      ...inactiveIssue,
       identifier: "PAP-988",
       title: "Policy clear auth test",
       executionPolicy: normalizeIssueExecutionPolicy(executionPolicyPayload(returnAssigneeAgentId)),
-      executionState: null,
     };
-    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getById.mockResolvedValue(inactiveClearIssue);
 
-    const res = await request(await createApp(agentActor))
+    const inactiveClearRes = await request(await createApp(agentActor))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ executionPolicy: { returnAssigneeAgentId: null } });
 
-    expect(res.status).toBe(403);
-    expect(res.body.error).toBe("Missing permission: tasks:assign");
+    expect(inactiveClearRes.status).toBe(403);
+    expect(inactiveClearRes.body.error).toBe("Missing permission: tasks:assign");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    const activeReviewerActor = { ...agentActor, agentId: reviewerAgentId };
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-986",
+      title: "Active policy update auth test",
+      executionPolicy: normalizeIssueExecutionPolicy(executionPolicyPayload(oldReturnAssigneeAgentId)),
+      executionState: {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: oldReturnAssigneeAgentId, userId: null },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const activeRes = await request(await createApp(activeReviewerActor))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: executionPolicyPayload(returnAssigneeAgentId) });
+
+    expect(activeRes.status).toBe(403);
+    expect(activeRes.body.error).toBe("Missing permission: tasks:assign");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    const clearIssue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-985",
+      title: "Active policy clear auth test",
+      executionPolicy: normalizeIssueExecutionPolicy(executionPolicyPayload(returnAssigneeAgentId)),
+      executionState: {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: returnAssigneeAgentId, userId: null },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(clearIssue);
+
+    const clearRes = await request(await createApp(activeReviewerActor))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: { returnAssigneeAgentId: null } });
+
+    expect(clearRes.status).toBe(403);
+    expect(clearRes.body.error).toBe("Missing permission: tasks:assign");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("allows returnAssigneeAgentId changes from agents with tasks:assign", async () => {
     mockAccessService.hasPermission.mockResolvedValue(true);
+    const oldReturnAssigneeAgentId = "55555555-5555-4555-8555-555555555555";
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -444,7 +508,7 @@ describe("issue execution policy routes", () => {
       createdByUserId: "local-board",
       identifier: "PAP-987",
       title: "Policy update auth success test",
-      executionPolicy: normalizeIssueExecutionPolicy(executionPolicyPayload("55555555-5555-4555-8555-555555555555")),
+      executionPolicy: normalizeIssueExecutionPolicy(executionPolicyPayload(oldReturnAssigneeAgentId)),
       executionState: null,
     };
     mockIssueService.getById.mockResolvedValue(issue);
@@ -469,6 +533,57 @@ describe("issue execution policy routes", () => {
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       expect.objectContaining({
         executionPolicy: expect.objectContaining({ returnAssigneeAgentId }) as unknown,
+      }),
+    );
+
+    const activeReviewerActor = { ...agentActor, agentId: reviewerAgentId };
+    const activeIssue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-984",
+      title: "Active policy update auth success test",
+      executionPolicy: normalizeIssueExecutionPolicy(executionPolicyPayload(oldReturnAssigneeAgentId)),
+      executionState: {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: oldReturnAssigneeAgentId, userId: null },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(activeIssue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...activeIssue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const activeRes = await request(await createApp(activeReviewerActor))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: executionPolicyPayload(returnAssigneeAgentId) });
+
+    expect(activeRes.status).toBe(200);
+    expect(mockAccessService.hasPermission).toHaveBeenCalledWith(
+      "company-1",
+      "agent",
+      activeReviewerActor.agentId,
+      "tasks:assign",
+    );
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({ returnAssigneeAgentId }) as unknown,
+        executionState: expect.objectContaining({
+          returnAssignee: { type: "agent", agentId: returnAssigneeAgentId, userId: null },
+        }) as unknown,
       }),
     );
   });

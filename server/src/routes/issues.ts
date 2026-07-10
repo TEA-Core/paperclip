@@ -2177,8 +2177,8 @@ export function issueRoutes(
       nextAssigneeUserId === existing.createdByUserId;
 
     const assignmentAuthorityRequired =
-      !transition.workflowControlledAssignment &&
-      (returnAssigneePolicyWillChange || (assigneeWillChange && !isAgentReturningIssueToCreator));
+      returnAssigneePolicyWillChange ||
+      (!transition.workflowControlledAssignment && assigneeWillChange && !isAgentReturningIssueToCreator);
 
     if (assignmentAuthorityRequired) {
       await assertCanAssignTasks(req, existing.companyId);
