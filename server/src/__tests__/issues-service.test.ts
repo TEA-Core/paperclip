@@ -1288,6 +1288,82 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     })).rejects.toThrow("Assignee agent not found");
   });
 
+  it("rejects update with wrong-company returnAssigneeAgentId", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const returnAssigneeAgentId = randomUUID();
+    const crossCompanyAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+
+    await db.insert(companies).values([
+      {
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: otherCompanyId,
+        name: "OtherCo",
+        issuePrefix: `T${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+
+    await db.insert(agents).values([
+      {
+        id: returnAssigneeAgentId,
+        companyId,
+        name: "Return Assignee",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: crossCompanyAgentId,
+        companyId: otherCompanyId,
+        name: "Cross-Company Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: reviewerAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    const issue = await svc.create(companyId, {
+      title: "Update cross-company test issue",
+      status: "todo",
+      priority: "medium",
+      executionPolicy: {
+        returnAssigneeAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    });
+
+    await expect(svc.update(issue.id, {
+      executionPolicy: {
+        returnAssigneeAgentId: crossCompanyAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    })).rejects.toThrow("Assignee must belong to same company");
+  });
+
   it("does not let description preview truncation split multibyte characters", async () => {
     const companyId = randomUUID();
     const issueId = randomUUID();
