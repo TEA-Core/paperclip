@@ -491,6 +491,73 @@ describe("issue execution policy transitions", () => {
       expect(changesRequested.patch.assigneeAgentId).toBe(coderAgentId);
       expect(changesRequested.patch.assigneeUserId).toBeNull();
     });
+
+    it("refreshes active pending return assignee from policy before changes are requested", () => {
+      const policyWithReturnAssignee = makePolicy(
+        [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+        { returnAssigneeAgentId: coderAgentId },
+      );
+      const reviewStageId = policyWithReturnAssignee.stages[0].id;
+      const staleExecutionState: IssueExecutionState = {
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      };
+
+      const refresh = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policyWithReturnAssignee,
+          executionState: staleExecutionState,
+        },
+        policy: policyWithReturnAssignee,
+        requestedStatus: undefined,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(refresh.patch.status).toBe("in_review");
+      expect(refresh.patch.assigneeAgentId).toBe(qaAgentId);
+      expect(refresh.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+      });
+
+      const changesRequested = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policyWithReturnAssignee,
+          executionState: staleExecutionState,
+        },
+        policy: policyWithReturnAssignee,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Needs another pass",
+      });
+
+      expect(changesRequested.patch.status).toBe("in_progress");
+      expect(changesRequested.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(changesRequested.patch.assigneeUserId).toBeNull();
+      expect(changesRequested.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+        lastDecisionOutcome: "changes_requested",
+      });
+    });
   });
 
   describe("review-only policy (no approval stage)", () => {

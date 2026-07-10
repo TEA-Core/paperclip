@@ -834,6 +834,13 @@ export function issueRoutes(
     return rawExecutionPolicy;
   }
 
+  function returnAssigneeAgentWillChange(
+    previous: NormalizedExecutionPolicy | null,
+    next: NormalizedExecutionPolicy | null,
+  ) {
+    return (previous?.returnAssigneeAgentId ?? null) !== (next?.returnAssigneeAgentId ?? null);
+  }
+
   function toValidTimestamp(value: Date | string | null | undefined) {
     if (!value) return null;
     const timestamp = value instanceof Date ? value.getTime() : new Date(value).getTime();
@@ -1851,9 +1858,6 @@ export function issueRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (req.body.assigneeAgentId || req.body.assigneeUserId) {
-      await assertCanAssignTasks(req, companyId);
-    }
     await assertIssueEnvironmentSelection(companyId, req.body.executionWorkspaceSettings?.environmentId);
 
     const actor = getActorInfo(req);
@@ -1861,6 +1865,9 @@ export function issueRoutes(
       companyId,
       normalizeIssueExecutionPolicy(req.body.executionPolicy),
     );
+    if (req.body.assigneeAgentId || req.body.assigneeUserId || executionPolicy?.returnAssigneeAgentId) {
+      await assertCanAssignTasks(req, companyId);
+    }
     const issue = await svc.create(companyId, {
       ...req.body,
       executionPolicy,
@@ -1921,9 +1928,6 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, parent.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (req.body.assigneeAgentId || req.body.assigneeUserId) {
-      await assertCanAssignTasks(req, parent.companyId);
-    }
     await assertIssueEnvironmentSelection(parent.companyId, req.body.executionWorkspaceSettings?.environmentId);
 
     const actor = getActorInfo(req);
@@ -1931,6 +1935,9 @@ export function issueRoutes(
       parent.companyId,
       normalizeIssueExecutionPolicy(req.body.executionPolicy),
     );
+    if (req.body.assigneeAgentId || req.body.assigneeUserId || executionPolicy?.returnAssigneeAgentId) {
+      await assertCanAssignTasks(req, parent.companyId);
+    }
     const { issue, parentBlockerAdded } = await svc.createChild(parent.id, {
       ...req.body,
       executionPolicy,
@@ -2106,6 +2113,7 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
+    const returnAssigneePolicyWillChange = returnAssigneeAgentWillChange(previousExecutionPolicy, nextExecutionPolicy);
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
@@ -2168,10 +2176,12 @@ export function issueRoutes(
       !!existing.createdByUserId &&
       nextAssigneeUserId === existing.createdByUserId;
 
-    if (assigneeWillChange && !transition.workflowControlledAssignment) {
-      if (!isAgentReturningIssueToCreator) {
-        await assertCanAssignTasks(req, existing.companyId);
-      }
+    const assignmentAuthorityRequired =
+      !transition.workflowControlledAssignment &&
+      (returnAssigneePolicyWillChange || (assigneeWillChange && !isAgentReturningIssueToCreator));
+
+    if (assignmentAuthorityRequired) {
+      await assertCanAssignTasks(req, existing.companyId);
     }
 
     let issue;

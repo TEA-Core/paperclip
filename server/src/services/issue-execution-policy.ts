@@ -311,6 +311,9 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
   const currentStage = input.policy ? findStageById(input.policy, existingState?.currentStageId) : null;
   const requestedStatus = input.requestedStatus;
   const activeStage = currentStage && existingState?.status === PENDING_STATUS ? currentStage : null;
+  const effectiveReturnAssignee = activeStage
+    ? configuredReturnAssignee ?? existingState?.returnAssignee ?? null
+    : configuredReturnAssignee ?? existingState?.returnAssignee ?? currentAssignee;
   const effectiveReviewRequest = input.reviewRequest === undefined
     ? existingState?.reviewRequest ?? null
     : input.reviewRequest;
@@ -347,6 +350,7 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
   }
 
   if (activeStage) {
+    if (!existingState) return { patch };
     const currentParticipant =
       existingState?.currentParticipant ??
       selectStageParticipant(activeStage, {
@@ -377,7 +381,7 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
         policy: input.policy,
         stage: activeStage,
         participant,
-        returnAssignee: existingState?.returnAssignee ?? configuredReturnAssignee ?? currentAssignee ?? actor,
+        returnAssignee: effectiveReturnAssignee ?? actor,
         reviewRequest: effectiveReviewRequest,
       });
       return {
@@ -424,7 +428,7 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
           policy: input.policy,
           stage: nextStage,
           participant,
-          returnAssignee: existingState?.returnAssignee ?? configuredReturnAssignee ?? currentAssignee ?? actor,
+          returnAssignee: effectiveReturnAssignee ?? actor,
           reviewRequest: input.reviewRequest ?? null,
         });
         return {
@@ -443,12 +447,15 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
         if (!input.commentBody?.trim()) {
           throw unprocessable("Requesting changes requires a comment");
         }
-        if (!existingState?.returnAssignee) {
+        if (!effectiveReturnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
         }
         patch.status = "in_progress";
-        Object.assign(patch, patchForPrincipal(existingState.returnAssignee));
-        patch.executionState = buildChangesRequestedState(existingState, activeStage);
+        Object.assign(patch, patchForPrincipal(effectiveReturnAssignee));
+        patch.executionState = buildChangesRequestedState(
+          { ...existingState, returnAssignee: effectiveReturnAssignee },
+          activeStage,
+        );
         return {
           patch,
           decision: {
@@ -481,7 +488,26 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
         policy: input.policy,
         stage: activeStage,
         participant: currentParticipant,
-        returnAssignee: existingState?.returnAssignee ?? configuredReturnAssignee ?? currentAssignee ?? actor,
+        returnAssignee: effectiveReturnAssignee ?? actor,
+        reviewRequest: effectiveReviewRequest,
+      });
+      return {
+        patch,
+        workflowControlledAssignment: true,
+      };
+    }
+
+    const returnAssigneeDrifted =
+      Boolean(existingState?.returnAssignee || effectiveReturnAssignee) &&
+      !principalsEqual(existingState?.returnAssignee ?? null, effectiveReturnAssignee ?? null);
+    if (returnAssigneeDrifted) {
+      buildPendingStagePatch({
+        patch,
+        previous: existingState,
+        policy: input.policy,
+        stage: activeStage,
+        participant: currentParticipant,
+        returnAssignee: effectiveReturnAssignee,
         reviewRequest: effectiveReviewRequest,
       });
       return {
