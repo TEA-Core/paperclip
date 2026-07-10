@@ -86,6 +86,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   return {
     mode: parsed.data.mode ?? "normal",
     commentRequired: true,
+    ...(parsed.data.returnAssigneeAgentId ? { returnAssigneeAgentId: parsed.data.returnAssigneeAgentId } : {}),
     stages,
   };
 }

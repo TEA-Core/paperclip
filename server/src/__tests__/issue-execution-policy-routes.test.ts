@@ -1,10 +1,13 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  create: vi.fn(),
+  createChild: vi.fn(),
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
@@ -76,7 +79,18 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+type TestActor = {
+  type?: "board" | "agent" | "user" | "none";
+  userId?: string;
+  companyIds?: string[];
+  source?: string;
+  isInstanceAdmin?: boolean;
+  companyId?: string;
+  role?: string;
+  agentId?: string;
+};
+
+async function createApp(actorOverrides: TestActor = {}) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     import("../middleware/index.js"),
     import("../routes/issues.js"),
@@ -90,6 +104,7 @@ async function createApp() {
       companyIds: ["company-1"],
       source: "local_implicit",
       isInstanceAdmin: false,
+      ...actorOverrides,
     };
     next();
   });
@@ -161,5 +176,99 @@ describe("issue execution policy routes", () => {
     expect(updatePatch.assigneeUserId).toBeUndefined();
     expect(updatePatch.executionState).toBeUndefined();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("requires tasks:assign to create an issue with returnAssigneeAgentId in policy", async () => {
+    const assigneeAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const policy = normalizeIssueExecutionPolicy({
+      returnAssigneeAgentId: assigneeAgentId,
+      stages: [{
+        type: "review",
+        participants: [{ type: "agent", agentId: reviewerAgentId }],
+      }],
+    })!;
+
+    mockIssueService.create.mockResolvedValue({
+      id: randomUUID(),
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      title: "Policy issue",
+    } as any);
+
+    const res = await request(await createApp({ source: "oauth", userId: "external-user" }))
+      .post("/api/companies/company-1/issues")
+      .send({ title: "Policy issue", executionPolicy: policy });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Missing permission: tasks:assign" });
+  });
+
+  it("requires tasks:assign to create a child issue with returnAssigneeAgentId in policy", async () => {
+    const assigneeAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    const policy = normalizeIssueExecutionPolicy({
+      returnAssigneeAgentId: assigneeAgentId,
+      stages: [{
+        type: "approval",
+        participants: [{ type: "agent", agentId: reviewerAgentId }],
+      }],
+    })!;
+
+    mockIssueService.getById.mockResolvedValue({ id: parentId, companyId: "company-1" });
+    mockIssueService.createChild.mockResolvedValue({
+      issue: {
+        id: childId,
+        companyId: "company-1",
+        status: "todo",
+      } as any,
+      parentBlockerAdded: false,
+    });
+
+    const res = await request(await createApp({ source: "oauth", userId: "external-user" }))
+      .post(`/api/issues/${parentId}/children`)
+      .send({ title: "Child policy issue", executionPolicy: policy });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Missing permission: tasks:assign" });
+  });
+
+  it("requires tasks:assign to set returnAssigneeAgentId via issue update", async () => {
+    const issueId = randomUUID();
+    const returnAssigneeAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const issue = {
+      id: issueId,
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-42",
+      title: "Execution policy edit",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: { returnAssigneeAgentId, stages: [] } } as any);
+
+    const policy = normalizeIssueExecutionPolicy({
+      returnAssigneeAgentId,
+      stages: [{
+        type: "review",
+        participants: [{ type: "agent", agentId: reviewerAgentId }],
+      }],
+    })!;
+
+    const res = await request(await createApp({ source: "oauth", userId: "external-user" }))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: policy });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Missing permission: tasks:assign" });
   });
 });

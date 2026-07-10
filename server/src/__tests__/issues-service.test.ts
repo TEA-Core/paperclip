@@ -1049,6 +1049,61 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(result?.executionWorkspaceSettings).toBeNull();
   });
 
+  it("normalizes executionPolicy returnAssigneeAgentId on create and update", async () => {
+    const companyId = randomUUID();
+    const returnAssigneeAgentId = randomUUID();
+    const nextReturnAssigneeAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Policy normalization issue",
+      status: "todo",
+      priority: "medium",
+      executionPolicy: {
+        returnAssigneeAgentId: ` ${returnAssigneeAgentId} `,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    });
+
+    let row = await db
+      .select({ executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, issue.id))
+      .then((rows) => rows[0]);
+
+    expect(row?.executionPolicy).toEqual(expect.objectContaining({
+      returnAssigneeAgentId,
+      mode: "normal",
+      commentRequired: true,
+    }));
+
+    await svc.update(issue.id, {
+      executionPolicy: {
+        returnAssigneeAgentId: ` ${nextReturnAssigneeAgentId} `,
+        stages: [{ type: "approval", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    });
+
+    row = await db
+      .select({ executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, issue.id))
+      .then((rows) => rows[0]);
+
+    expect(row?.executionPolicy).toEqual(expect.objectContaining({
+      returnAssigneeAgentId: nextReturnAssigneeAgentId,
+      mode: "normal",
+      commentRequired: true,
+    }));
+  });
+
   it("does not let description preview truncation split multibyte characters", async () => {
     const companyId = randomUUID();
     const issueId = randomUUID();
