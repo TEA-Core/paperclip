@@ -2059,8 +2059,12 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
-    if (updateFields.executionPolicy !== undefined && nextExecutionPolicy?.returnAssigneeAgentId) {
-      await assertCanAssignTasks(req, existing.companyId);
+    if (updateFields.executionPolicy !== undefined) {
+      const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
+      const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;
+      if (prevReturnAssignee !== nextReturnAssignee) {
+        await assertCanAssignTasks(req, existing.companyId);
+      }
     }
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;

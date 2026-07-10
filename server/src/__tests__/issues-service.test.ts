@@ -1062,6 +1062,42 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       requireBoardApprovalForNewAgents: false,
     });
 
+    await db.insert(agents).values([
+      {
+        id: returnAssigneeAgentId,
+        companyId,
+        name: "Return Assignee",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: nextReturnAssigneeAgentId,
+        companyId,
+        name: "Next Return Assignee",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: reviewerAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
     const issue = await svc.create(companyId, {
       title: "Policy normalization issue",
       status: "todo",
@@ -1102,6 +1138,154 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       mode: "normal",
       commentRequired: true,
     }));
+  });
+
+  it("rejects create with nonexistent returnAssigneeAgentId", async () => {
+    const companyId = randomUUID();
+    const nonexistentAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await expect(svc.create(companyId, {
+      title: "Bad return assignee",
+      status: "todo",
+      priority: "medium",
+      executionPolicy: {
+        returnAssigneeAgentId: nonexistentAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    })).rejects.toThrow("Assignee agent not found");
+  });
+
+  it("rejects create with wrong-company returnAssigneeAgentId", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const crossCompanyAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+
+    await db.insert(companies).values([
+      {
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: otherCompanyId,
+        name: "OtherCo",
+        issuePrefix: `T${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+
+    await db.insert(agents).values([
+      {
+        id: crossCompanyAgentId,
+        companyId: otherCompanyId,
+        name: "Cross-Company Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: reviewerAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    await expect(svc.create(companyId, {
+      title: "Cross-company return assignee",
+      status: "todo",
+      priority: "medium",
+      executionPolicy: {
+        returnAssigneeAgentId: crossCompanyAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    })).rejects.toThrow("Assignee must belong to same company");
+  });
+
+  it("rejects update with nonexistent returnAssigneeAgentId", async () => {
+    const companyId = randomUUID();
+    const returnAssigneeAgentId = randomUUID();
+    const nonexistentAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: returnAssigneeAgentId,
+        companyId,
+        name: "Return Assignee",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: reviewerAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    const issue = await svc.create(companyId, {
+      title: "Update test issue",
+      status: "todo",
+      priority: "medium",
+      executionPolicy: {
+        returnAssigneeAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    });
+
+    await expect(svc.update(issue.id, {
+      executionPolicy: {
+        returnAssigneeAgentId: nonexistentAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      },
+    })).rejects.toThrow("Assignee agent not found");
   });
 
   it("does not let description preview truncation split multibyte characters", async () => {

@@ -271,4 +271,80 @@ describe("issue execution policy routes", () => {
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: "Missing permission: tasks:assign" });
   });
+
+  it("requires tasks:assign to change returnAssigneeAgentId via issue update", async () => {
+    const issueId = randomUUID();
+    const oldReturnAssigneeAgentId = randomUUID();
+    const newReturnAssigneeAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const issue = {
+      id: issueId,
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-43",
+      title: "Execution policy change",
+      executionPolicy: normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: oldReturnAssigneeAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      }),
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: { returnAssigneeAgentId: newReturnAssigneeAgentId, stages: [] } } as any);
+
+    const policy = normalizeIssueExecutionPolicy({
+      returnAssigneeAgentId: newReturnAssigneeAgentId,
+      stages: [{
+        type: "review",
+        participants: [{ type: "agent", agentId: reviewerAgentId }],
+      }],
+    })!;
+
+    const res = await request(await createApp({ source: "oauth", userId: "external-user" }))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: policy });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Missing permission: tasks:assign" });
+  });
+
+  it("requires tasks:assign to clear returnAssigneeAgentId via issue update", async () => {
+    const issueId = randomUUID();
+    const returnAssigneeAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const issue = {
+      id: issueId,
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-44",
+      title: "Execution policy clear",
+      executionPolicy: normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+      }),
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: { stages: [] } } as any);
+
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{
+        type: "review",
+        participants: [{ type: "agent", agentId: reviewerAgentId }],
+      }],
+    })!;
+
+    const res = await request(await createApp({ source: "oauth", userId: "external-user" }))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: policy });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Missing permission: tasks:assign" });
+  });
 });

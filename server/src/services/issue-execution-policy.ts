@@ -237,12 +237,13 @@ function buildPendingState(input: {
   };
 }
 
-function buildChangesRequestedState(previous: IssueExecutionState, currentStage: IssueExecutionStage): IssueExecutionState {
+function buildChangesRequestedState(previous: IssueExecutionState, currentStage: IssueExecutionStage, returnAssignee: IssueExecutionStagePrincipal): IssueExecutionState {
   return {
     ...previous,
     status: CHANGES_REQUESTED_STATUS,
     currentStageId: currentStage.id,
     currentStageType: currentStage.type,
+    returnAssignee,
     reviewRequest: null,
     lastDecisionOutcome: "changes_requested",
   };
@@ -290,7 +291,7 @@ function resolveReturnAssignee(input: {
   if (input.policy?.returnAssigneeAgentId) {
     return { type: "agent", agentId: input.policy.returnAssigneeAgentId, userId: null };
   }
-  return input.existingState?.returnAssignee ?? input.currentAssignee;
+  return input.existingState ? input.existingState.returnAssignee : input.currentAssignee;
 }
 
 function canAutoSkipPendingStage(input: {
@@ -468,12 +469,17 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
         if (!input.commentBody?.trim()) {
           throw unprocessable("Requesting changes requires a comment");
         }
-        if (!existingState?.returnAssignee) {
+        const returnAssignee = resolveReturnAssignee({
+          policy: input.policy,
+          existingState,
+          currentAssignee,
+        });
+        if (!returnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
         }
         patch.status = "in_progress";
-        Object.assign(patch, patchForPrincipal(existingState.returnAssignee));
-        patch.executionState = buildChangesRequestedState(existingState, activeStage);
+        Object.assign(patch, patchForPrincipal(returnAssignee));
+        patch.executionState = buildChangesRequestedState(existingState!, activeStage, returnAssignee);
         return {
           patch,
           decision: {

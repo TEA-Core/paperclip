@@ -29,6 +29,7 @@ import {
 } from "@paperclipai/db";
 import type {
   IssueBlockerAttention,
+  IssueExecutionPolicy,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
@@ -215,9 +216,11 @@ export function clampIssueListLimit(limit: number): number {
   return Math.min(ISSUE_LIST_MAX_LIMIT, Math.max(1, Math.floor(limit)));
 }
 
-function normalizeExecutionPolicyIfProvided(issueData: { executionPolicy?: unknown }): void {
-  if (!Object.prototype.hasOwnProperty.call(issueData, "executionPolicy")) return;
-  issueData.executionPolicy = normalizeIssueExecutionPolicy(issueData.executionPolicy) ?? null;
+function normalizeExecutionPolicyIfProvided(issueData: { executionPolicy?: unknown }): IssueExecutionPolicy | null {
+  if (!Object.prototype.hasOwnProperty.call(issueData, "executionPolicy")) return null;
+  const normalized = normalizeIssueExecutionPolicy(issueData.executionPolicy) ?? null;
+  issueData.executionPolicy = normalized;
+  return normalized;
 }
 
 function chunkList<T>(values: T[], size: number): T[][] {
@@ -2655,6 +2658,10 @@ export function issueService(db: Db) {
         ...issueData
       } = data;
       normalizeExecutionPolicyIfProvided(issueData);
+      const normalizedPolicy = issueData.executionPolicy as IssueExecutionPolicy | null;
+      if (normalizedPolicy?.returnAssigneeAgentId) {
+        await assertAssignableAgent(companyId, normalizedPolicy.returnAssigneeAgentId);
+      }
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -2850,6 +2857,10 @@ export function issueService(db: Db) {
         ...issueData
       } = data;
       normalizeExecutionPolicyIfProvided(issueData);
+      const normalizedPolicy = issueData.executionPolicy as IssueExecutionPolicy | null;
+      if (normalizedPolicy?.returnAssigneeAgentId) {
+        await assertAssignableAgent(existing.companyId, normalizedPolicy.returnAssigneeAgentId);
+      }
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
