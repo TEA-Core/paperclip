@@ -281,6 +281,17 @@ function clearExecutionStatePatch(input: {
   }
 }
 
+function resolveReturnAssignee(input: {
+  policy: IssueExecutionPolicy | null;
+  existingState: IssueExecutionState | null;
+  currentAssignee: IssueExecutionStagePrincipal | null;
+}): IssueExecutionStagePrincipal | null {
+  if (input.policy?.returnAssigneeAgentId) {
+    return { type: "agent", agentId: input.policy.returnAssigneeAgentId, userId: null };
+  }
+  return input.existingState?.returnAssignee ?? input.currentAssignee;
+}
+
 function canAutoSkipPendingStage(input: {
   stage: IssueExecutionStage;
   returnAssignee: IssueExecutionStagePrincipal | null;
@@ -343,7 +354,11 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
     const currentParticipant =
       existingState?.currentParticipant ??
       selectStageParticipant(activeStage, {
-        exclude: existingState?.returnAssignee ?? null,
+        exclude: resolveReturnAssignee({
+          policy: input.policy,
+          existingState,
+          currentAssignee,
+        }),
       });
     if (!currentParticipant) {
       throw unprocessable(`No eligible ${activeStage.type} participant is configured for this issue`);
@@ -352,7 +367,11 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
     if (!stageHasParticipant(activeStage, currentParticipant)) {
       const participant = selectStageParticipant(activeStage, {
         preferred: explicitAssignee ?? existingState?.currentParticipant ?? null,
-        exclude: existingState?.returnAssignee ?? null,
+        exclude: resolveReturnAssignee({
+          policy: input.policy,
+          existingState,
+          currentAssignee,
+        }),
       });
       if (!participant) {
         clearExecutionStatePatch({
@@ -370,7 +389,11 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
         policy: input.policy,
         stage: activeStage,
         participant,
-        returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+        returnAssignee: resolveReturnAssignee({
+          policy: input.policy,
+          existingState,
+          currentAssignee,
+        }) ?? actor,
         reviewRequest: effectiveReviewRequest,
       });
       return {
@@ -405,7 +428,11 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
 
         const participant = selectStageParticipant(nextStage, {
           preferred: explicitAssignee,
-          exclude: existingState?.returnAssignee ?? null,
+          exclude: resolveReturnAssignee({
+            policy: input.policy,
+            existingState,
+            currentAssignee,
+          }),
         });
         if (!participant) {
           throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
@@ -417,7 +444,11 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
           policy: input.policy,
           stage: nextStage,
           participant,
-          returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+          returnAssignee: resolveReturnAssignee({
+            policy: input.policy,
+            existingState,
+            currentAssignee,
+          }) ?? actor,
           reviewRequest: input.reviewRequest ?? null,
         });
         return {
@@ -474,7 +505,11 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
         policy: input.policy,
         stage: activeStage,
         participant: currentParticipant,
-        returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+        returnAssignee: resolveReturnAssignee({
+          policy: input.policy,
+          existingState,
+          currentAssignee,
+        }) ?? actor,
         reviewRequest: effectiveReviewRequest,
       });
       return {
@@ -500,7 +535,11 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
       : nextPendingStage(input.policy, existingState);
   if (!pendingStage) return { patch };
 
-  const returnAssignee = existingState?.returnAssignee ?? currentAssignee;
+  const returnAssignee = resolveReturnAssignee({
+    policy: input.policy,
+    existingState,
+    currentAssignee,
+  });
   const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
   let participant = selectStageParticipant(pendingStage, {
     preferred:
