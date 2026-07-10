@@ -108,6 +108,11 @@ export function assigneePrincipal(input: AssigneeLike): IssueExecutionStagePrinc
   return null;
 }
 
+function policyReturnAssigneePrincipal(policy: IssueExecutionPolicy | null): IssueExecutionStagePrincipal | null {
+  if (!policy?.returnAssigneeAgentId) return null;
+  return { type: "agent", agentId: policy.returnAssigneeAgentId, userId: null };
+}
+
 function actorPrincipal(actor: ActorLike): IssueExecutionStagePrincipal | null {
   if (actor.agentId) return { type: "agent", agentId: actor.agentId, userId: null };
   if (actor.userId) return { type: "user", userId: actor.userId, agentId: null };
@@ -298,6 +303,7 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
   const patch: Record<string, unknown> = {};
   const existingState = parseIssueExecutionState(input.issue.executionState);
   const currentAssignee = assigneePrincipal(input.issue);
+  const configuredReturnAssignee = policyReturnAssigneePrincipal(input.policy);
   const actor = actorPrincipal(input.actor);
   const requestedAssigneePatchProvided =
     input.requestedAssigneePatch.assigneeAgentId !== undefined || input.requestedAssigneePatch.assigneeUserId !== undefined;
@@ -371,7 +377,7 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
         policy: input.policy,
         stage: activeStage,
         participant,
-        returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+        returnAssignee: existingState?.returnAssignee ?? configuredReturnAssignee ?? currentAssignee ?? actor,
         reviewRequest: effectiveReviewRequest,
       });
       return {
@@ -418,7 +424,7 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
           policy: input.policy,
           stage: nextStage,
           participant,
-          returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+          returnAssignee: existingState?.returnAssignee ?? configuredReturnAssignee ?? currentAssignee ?? actor,
           reviewRequest: input.reviewRequest ?? null,
         });
         return {
@@ -475,7 +481,7 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
         policy: input.policy,
         stage: activeStage,
         participant: currentParticipant,
-        returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+        returnAssignee: existingState?.returnAssignee ?? configuredReturnAssignee ?? currentAssignee ?? actor,
         reviewRequest: effectiveReviewRequest,
       });
       return {
@@ -501,7 +507,7 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
       : nextPendingStage(input.policy, existingState);
   if (!pendingStage) return { patch };
 
-  const returnAssignee = existingState?.returnAssignee ?? currentAssignee;
+  const returnAssignee = existingState?.returnAssignee ?? configuredReturnAssignee ?? currentAssignee;
   const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
   let participant = selectStageParticipant(pendingStage, {
     preferred:

@@ -10,8 +10,9 @@ const boardUserId = "board-user";
 
 function makePolicy(
   stages: Array<{ type: "review" | "approval"; participants: Array<{ type: "agent" | "user"; agentId?: string; userId?: string }> }>,
+  overrides: Partial<IssueExecutionPolicy> = {},
 ) {
-  return normalizeIssueExecutionPolicy({ stages })!;
+  return normalizeIssueExecutionPolicy({ stages, ...overrides })!;
 }
 
 function twoStagePolicy() {
@@ -443,6 +444,52 @@ describe("issue execution policy transitions", () => {
         currentStageType: "review",
         currentParticipant: { type: "agent", agentId: qaAgentId },
       });
+    });
+
+    it("seeds and uses the policy return assignee when review is activated", () => {
+      const originalAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+      const policyWithReturnAssignee = makePolicy(
+        [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+        { returnAssigneeAgentId: coderAgentId },
+      );
+      const activation = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: originalAssigneeAgentId,
+          assigneeUserId: null,
+          executionPolicy: policyWithReturnAssignee,
+          executionState: null,
+        },
+        policy: policyWithReturnAssignee,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: originalAssigneeAgentId },
+        commentBody: "Ready for review",
+      });
+
+      expect(activation.patch.executionState).toMatchObject({
+        status: "pending",
+        returnAssignee: { type: "agent", agentId: coderAgentId, userId: null },
+      });
+
+      const changesRequested = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policyWithReturnAssignee,
+          executionState: activation.patch.executionState as IssueExecutionState,
+        },
+        policy: policyWithReturnAssignee,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Needs another pass",
+      });
+
+      expect(changesRequested.patch.status).toBe("in_progress");
+      expect(changesRequested.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(changesRequested.patch.assigneeUserId).toBeNull();
     });
   });
 

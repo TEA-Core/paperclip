@@ -57,7 +57,7 @@ import {
   workProductService,
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
-import { conflict, forbidden, HttpError, notFound, unauthorized } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -785,6 +785,15 @@ export function issueRoutes(
     }
     if (!resolved.agent) {
       throw notFound("Agent not found");
+    }
+    if (resolved.agent.companyId !== companyId) {
+      throw unprocessable("Assignee must belong to same company");
+    }
+    if (resolved.agent.status === "pending_approval") {
+      throw conflict("Cannot assign work to pending approval agents");
+    }
+    if (resolved.agent.status === "terminated") {
+      throw conflict("Cannot assign work to terminated agents");
     }
     return resolved.agent.id;
   }
@@ -1848,7 +1857,10 @@ export function issueRoutes(
     await assertIssueEnvironmentSelection(companyId, req.body.executionWorkspaceSettings?.environmentId);
 
     const actor = getActorInfo(req);
-    const executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+    const executionPolicy = await normalizeExecutionPolicyReturnAssigneeAgent(
+      companyId,
+      normalizeIssueExecutionPolicy(req.body.executionPolicy),
+    );
     const issue = await svc.create(companyId, {
       ...req.body,
       executionPolicy,
@@ -1915,7 +1927,10 @@ export function issueRoutes(
     await assertIssueEnvironmentSelection(parent.companyId, req.body.executionWorkspaceSettings?.environmentId);
 
     const actor = getActorInfo(req);
-    const executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+    const executionPolicy = await normalizeExecutionPolicyReturnAssigneeAgent(
+      parent.companyId,
+      normalizeIssueExecutionPolicy(req.body.executionPolicy),
+    );
     const { issue, parentBlockerAdded } = await svc.createChild(parent.id, {
       ...req.body,
       executionPolicy,
