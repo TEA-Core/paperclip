@@ -29,6 +29,7 @@ import {
 } from "@paperclipai/db";
 import type {
   IssueBlockerAttention,
+  IssueExecutionPolicy,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
@@ -42,6 +43,7 @@ import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
 } from "./execution-workspace-policy.js";
+import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -212,6 +214,13 @@ function escapeLikePattern(value: string): string {
 
 export function clampIssueListLimit(limit: number): number {
   return Math.min(ISSUE_LIST_MAX_LIMIT, Math.max(1, Math.floor(limit)));
+}
+
+function normalizeExecutionPolicyIfProvided(issueData: { executionPolicy?: unknown }): IssueExecutionPolicy | null {
+  if (!Object.prototype.hasOwnProperty.call(issueData, "executionPolicy")) return null;
+  const normalized = normalizeIssueExecutionPolicy(issueData.executionPolicy) ?? null;
+  issueData.executionPolicy = normalized;
+  return normalized;
 }
 
 function chunkList<T>(values: T[], size: number): T[][] {
@@ -2648,6 +2657,11 @@ export function issueService(db: Db) {
         inheritExecutionWorkspaceFromIssueId,
         ...issueData
       } = data;
+      normalizeExecutionPolicyIfProvided(issueData);
+      const normalizedPolicy = issueData.executionPolicy as IssueExecutionPolicy | null;
+      if (normalizedPolicy?.returnAssigneeAgentId) {
+        await assertAssignableAgent(companyId, normalizedPolicy.returnAssigneeAgentId);
+      }
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -2842,6 +2856,11 @@ export function issueService(db: Db) {
         actorUserId,
         ...issueData
       } = data;
+      normalizeExecutionPolicyIfProvided(issueData);
+      const normalizedPolicy = issueData.executionPolicy as IssueExecutionPolicy | null;
+      if (normalizedPolicy?.returnAssigneeAgentId) {
+        await assertAssignableAgent(existing.companyId, normalizedPolicy.returnAssigneeAgentId);
+      }
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;

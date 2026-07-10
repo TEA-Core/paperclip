@@ -1805,13 +1805,18 @@ export function issueRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (req.body.assigneeAgentId || req.body.assigneeUserId) {
-      await assertCanAssignTasks(req, companyId);
-    }
     await assertIssueEnvironmentSelection(companyId, req.body.executionWorkspaceSettings?.environmentId);
 
     const actor = getActorInfo(req);
     const executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+    if (
+      req.body.assigneeAgentId ||
+      req.body.assigneeUserId ||
+      executionPolicy?.returnAssigneeAgentId
+    ) {
+      await assertCanAssignTasks(req, companyId);
+    }
+
     const issue = await svc.create(companyId, {
       ...req.body,
       executionPolicy,
@@ -1872,13 +1877,18 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, parent.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (req.body.assigneeAgentId || req.body.assigneeUserId) {
-      await assertCanAssignTasks(req, parent.companyId);
-    }
     await assertIssueEnvironmentSelection(parent.companyId, req.body.executionWorkspaceSettings?.environmentId);
 
     const actor = getActorInfo(req);
     const executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+    if (
+      req.body.assigneeAgentId ||
+      req.body.assigneeUserId ||
+      executionPolicy?.returnAssigneeAgentId
+    ) {
+      await assertCanAssignTasks(req, parent.companyId);
+    }
+
     const { issue, parentBlockerAdded } = await svc.createChild(parent.id, {
       ...req.body,
       executionPolicy,
@@ -2049,6 +2059,13 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
+    if (updateFields.executionPolicy !== undefined) {
+      const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
+      const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;
+      if (prevReturnAssignee !== nextReturnAssignee) {
+        await assertCanAssignTasks(req, existing.companyId);
+      }
+    }
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
