@@ -788,6 +788,43 @@ export function issueRoutes(
     }
     return resolved.agent.id;
   }
+
+  async function normalizeExecutionPolicyReturnAssigneeAgent(
+    companyId: string,
+    executionPolicy: NormalizedExecutionPolicy | null,
+  ) {
+    if (!executionPolicy?.returnAssigneeAgentId) {
+      return executionPolicy;
+    }
+
+    const returnAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+      companyId,
+      executionPolicy.returnAssigneeAgentId,
+    );
+    return {
+      ...executionPolicy,
+      returnAssigneeAgentId,
+    };
+  }
+
+  function mergeReturnAssigneeOnlyExecutionPolicyPatch(
+    rawExecutionPolicy: unknown,
+    previousExecutionPolicy: NormalizedExecutionPolicy | null,
+  ) {
+    if (!previousExecutionPolicy || !rawExecutionPolicy || typeof rawExecutionPolicy !== "object" || Array.isArray(rawExecutionPolicy)) {
+      return rawExecutionPolicy;
+    }
+    const rawStages = (rawExecutionPolicy as { stages?: unknown }).stages;
+    const hasDefaultedEmptyStages = Array.isArray(rawStages) && rawStages.length === 0;
+    if (Object.prototype.hasOwnProperty.call(rawExecutionPolicy, "returnAssigneeAgentId") && hasDefaultedEmptyStages) {
+      return {
+        ...previousExecutionPolicy,
+        returnAssigneeAgentId: (rawExecutionPolicy as { returnAssigneeAgentId?: unknown }).returnAssigneeAgentId,
+      };
+    }
+    return rawExecutionPolicy;
+  }
+
   function toValidTimestamp(value: Date | string | null | undefined) {
     if (!value) return null;
     const timestamp = value instanceof Date ? value.getTime() : new Date(value).getTime();
@@ -2041,10 +2078,15 @@ export function issueRoutes(
     ) {
       updateFields.status = "todo";
     }
-    if (req.body.executionPolicy !== undefined) {
-      updateFields.executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
-    }
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+    if (req.body.executionPolicy !== undefined) {
+      updateFields.executionPolicy = await normalizeExecutionPolicyReturnAssigneeAgent(
+        existing.companyId,
+        normalizeIssueExecutionPolicy(
+          mergeReturnAssigneeOnlyExecutionPolicyPatch(req.body.executionPolicy, previousExecutionPolicy),
+        ),
+      );
+    }
     const nextExecutionPolicy =
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)

@@ -203,6 +203,7 @@ export interface IssueExecutionPolicy {
   mode: IssueExecutionPolicyMode;
   commentRequired: boolean;
   stages: IssueExecutionStage[];
+  returnAssigneeAgentId?: string | null;
 }
 
 export interface IssueReviewRequest {
