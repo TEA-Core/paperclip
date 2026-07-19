@@ -46,7 +46,22 @@ import {
 import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { instanceSettingsService } from "./instance-settings.js";
-import { redactCurrentUserText } from "../log-redaction.js";
+import {
+  type CurrentUserRedactionOptions,
+  redactCurrentUserText,
+  redactSecretTokens,
+} from "../log-redaction.js";
+
+/**
+ * SUP-8631: scrubs an issue comment body before it is persisted.
+ *
+ * This is the single choke point for every comment writer — agent narration
+ * posted by heartbeat/recovery and human-authored bodies from the HTTP routes
+ * alike. Username masking runs first so it is not swallowed by a secret match.
+ */
+export function redactIssueCommentBody(body: string, opts: CurrentUserRedactionOptions) {
+  return redactSecretTokens(redactCurrentUserText(body, opts));
+}
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import {
@@ -3579,7 +3594,7 @@ export function issueService(db: Db) {
       const currentUserRedactionOptions = {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
-      const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
+      const redactedBody = redactIssueCommentBody(body, currentUserRedactionOptions);
       const [comment] = await db
         .insert(issueComments)
         .values({
