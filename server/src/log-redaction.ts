@@ -144,6 +144,11 @@ export function redactCurrentUserText(input: string, opts?: CurrentUserRedaction
 //   * the JWT segment separator "." stays OUTSIDE the segment class
 //     [A-Za-z0-9_-], which is what keeps the segment loops effectively atomic.
 //     Adding "." to that class would make the pattern quadratic.
+//
+// Known residual: this is a per-string filter, so a secret split across two
+// adapter stdout writes is never seen whole and only its leading half is masked.
+// Closing that needs line-buffering in the heartbeat onLog pump (tracked
+// separately) — do not assume the run-log boundary is split-safe.
 
 // Never rewrite a marker we (or redaction.ts) already wrote — keeps the filter
 // idempotent and stops marker churn when both redactors run on one string.
@@ -154,15 +159,20 @@ const NOT_PUBLISHABLE_VALUE = String.raw`(?!sb_publishable_)`;
 const NOT_PUBLIC_NAME = String.raw`(?![A-Za-z0-9_-]{0,128}(?:PUBLISHABLE|ANON_KEY))`;
 
 // A name is secret-shaped when it ENDS in a secret suffix — the leading "_" is
-// load-bearing (without it MONKEY=/TURKEY= would match) — or is one of the
-// well-known lowercase JSON/env field names.
-const SECRET_NAME = String.raw`(?:[A-Za-z0-9_]{0,128}(?:_KEY|_SECRET|_TOKEN|_PASSWORD|SERVICE_ROLE)|x-api-key|api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|auth[-_]?token|service[-_]?role[-_]?key|private[-_]?key|credential|password|passwd|secret)`;
+// load-bearing for the KEY family (without it MONKEY=/TURKEY= would match) — or
+// is one of the well-known lowercase JSON/env field names. The PASSWORD family
+// additionally gets glued-prefix spellings: PGPASSWORD is the canonical Postgres
+// password env var and has no separator to anchor on.
+const SECRET_NAME = String.raw`(?:[A-Za-z0-9_]{0,128}(?:_KEY|_SECRET|_TOKEN|_PASSWORD|SERVICE_ROLE)|PGPASSWORD|PGPASS|MYSQL_PWD|x-api-key|api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|auth[-_]?token|service[-_]?role[-_]?key|private[-_]?key|credential|password|passwd|secret)`;
 const NAME_START = String.raw`(?<![A-Za-z0-9_])`;
 
-// Value terminators are deliberately wide: a match that runs past the secret
-// eats real diagnostic content (and can break enclosing JSON).
+// Quoted/escaped values stop at their closing delimiter so the enclosing
+// structure survives. A BARE value has no enclosing structure to protect, so it
+// runs to whitespace: stopping at punctuation instead emitted a marker followed
+// by the tail of the real secret (`DB_PASSWORD=Ab3#cdefgh` kept `#cdefgh`),
+// which reads as redacted while most of the credential is still on disk.
 const QUOTED_VALUE = String.raw`[^"'\`\r\n]{1,512}`;
-const BARE_VALUE = String.raw`[^\s"'\`,;\\)\]}<>&|#\[]{1,512}`;
+const BARE_VALUE = String.raw`[^\s"'\`]{1,512}`;
 // Consumes JSON escape pairs but stops at the closing \" delimiter, so an
 // escaped secret cannot leak its tail.
 const ESCAPED_JSON_VALUE = String.raw`(?:\\[^"]|[^\\"\r\n]){1,512}`;
@@ -173,6 +183,19 @@ const ESCAPED_JSON_VALUE = String.raw`(?:\\[^"]|[^\\"\r\n]){1,512}`;
 // Tight `NAME=value` — the shape that actually leaks in env dumps and
 // server.log lines — is accepted unconditionally via the (?<==) branch.
 const CREDENTIAL_SHAPED_VALUE = String.raw`(?:(?<==)|(?=[^\s]{0,512}\d)|(?=[^\s]{20}))`;
+// A single "=" that is not part of ==, ===, !=, >=, <=, => or a compound
+// assignment. Without this, `if (apiKey === undefined)` in a pasted code block
+// became `if (apiKey =[REDACTED:secret] undefined)`.
+const ASSIGNMENT_EQUALS = String.raw`\s*(?<![=!<>+\-*/%&|^~?:])=(?![=>])\s*`;
+// `API_KEY=$API_KEY` / `${API_KEY}` / `%API_KEY%` are indirections, not values —
+// they are the safe form the credential-handling doctrine asks people to write.
+const NOT_ENV_INDIRECTION = String.raw`(?!\$[A-Za-z_{])(?!%[A-Za-z_][A-Za-z0-9_]{0,128}%(?:[\s"'\`,;)\]}]|$))`;
+// Keep diagnostic sentinels readable: the run log exists to tell an operator
+// "the key is missing" apart from "the key leaked".
+const NOT_DIAGNOSTIC_VALUE = String.raw`(?!(?:undefined|null|true|false|NaN|none|nil|\d{1,4})(?:[\s"'\`,;)\]}]|$))`;
+// `ACCESS_TOKEN=<paste-here>` is documentation, not a credential.
+const NOT_PLACEHOLDER = String.raw`(?!<[^>\s]{0,128}>)`;
+const VALUE_GUARDS = `${NOT_ALREADY_REDACTED}${NOT_PUBLISHABLE_VALUE}${NOT_ENV_INDIRECTION}${NOT_DIAGNOSTIC_VALUE}${NOT_PLACEHOLDER}`;
 
 const SECRET_ESCAPED_JSON_ASSIGNMENT_RE = new RegExp(
   String.raw`(\\"${NOT_PUBLIC_NAME}${SECRET_NAME}\\"\s*:\s*\\")${NOT_ALREADY_REDACTED}${NOT_PUBLISHABLE_VALUE}${ESCAPED_JSON_VALUE}`,
@@ -185,11 +208,24 @@ const SECRET_QUOTED_ASSIGNMENT_RE = new RegExp(
 // "=" only. An unquoted `NAME: value` form would mangle prose, markdown and
 // YAML references; the quoted/escaped patterns above already cover JSON.
 const SECRET_BARE_ASSIGNMENT_RE = new RegExp(
-  String.raw`(${NAME_START}${NOT_PUBLIC_NAME}${SECRET_NAME}\s*=\s*)${NOT_ALREADY_REDACTED}${NOT_PUBLISHABLE_VALUE}${CREDENTIAL_SHAPED_VALUE}${BARE_VALUE}`,
+  String.raw`(${NAME_START}${NOT_PUBLIC_NAME}${SECRET_NAME}${ASSIGNMENT_EQUALS})${VALUE_GUARDS}${CREDENTIAL_SHAPED_VALUE}${BARE_VALUE}`,
+  "gi",
+);
+// `--password <value>` — the space-separated CLI form the Supabase CLI takes.
+// The `--password=<value>` form is already covered by the bare pattern, since
+// NAME_START admits a leading "-".
+const SECRET_FLAG_RE = new RegExp(
+  String.raw`(--?(?:db-)?(?:password|passwd|token|secret|api[-_]?key|key)\s+)${VALUE_GUARDS}${CREDENTIAL_SHAPED_VALUE}${BARE_VALUE}`,
   "gi",
 );
 
-const CONNECTION_URI_PASSWORD_RE = /([a-z][a-z0-9+.-]{1,31}:\/\/[^\s:@/"'`]{1,256}:)[^\s@/"'`]{1,256}(?=@)/gi;
+// The scheme is optional: Supabase pooler hosts are routinely echoed as a bare
+// `user:password@host` fragment. The host-shaped lookahead is what keeps clock
+// times and prose out. The leading lookbehind is a PERFORMANCE guard, not a
+// correctness one — without it the optional scheme lets the userinfo scan start
+// at every offset, which costs ~256 steps per character on long token runs.
+const CONNECTION_URI_PASSWORD_RE =
+  /(?<![A-Za-z0-9._~%+-])((?:[a-z][a-z0-9+.-]{1,31}:\/\/)?[^\s:@/"'`]{1,256}:)[^\s@/"'`]{1,256}(?=@[A-Za-z0-9.-]{1,253}[.:])/gi;
 // Keeps the scheme word; the digit lookahead stops `basic authentication` and
 // similar prose from being eaten.
 const AUTH_SCHEME_RE =
@@ -223,6 +259,7 @@ export function redactSecretTokens(input: string): string {
     .replace(SECRET_ESCAPED_JSON_ASSIGNMENT_RE, `$1${SECRET_REDACTION_TOKEN}`)
     .replace(SECRET_QUOTED_ASSIGNMENT_RE, `$1${SECRET_REDACTION_TOKEN}`)
     .replace(SECRET_BARE_ASSIGNMENT_RE, `$1${SECRET_REDACTION_TOKEN}`)
+    .replace(SECRET_FLAG_RE, `$1${SECRET_REDACTION_TOKEN}`)
     .replace(CONNECTION_URI_PASSWORD_RE, `$1${SECRET_REDACTION_TOKEN}`)
     .replace(AUTH_SCHEME_RE, `$1${SECRET_REDACTION_TOKEN}`)
     .replace(SUPABASE_SECRET_KEY_RE, SECRET_REDACTION_TOKEN)

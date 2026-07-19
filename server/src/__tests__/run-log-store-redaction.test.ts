@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SECRET_REDACTION_TOKEN } from "../log-redaction.js";
 import { createLocalFileRunLogStore } from "../services/run-log-store.js";
+import { createLocalFileWorkspaceOperationLogStore } from "../services/workspace-operation-log-store.js";
 
 const tempRoots: string[] = [];
 
@@ -61,6 +62,30 @@ describe("run log store redaction", () => {
       GITHUB_TOKEN: SECRET_REDACTION_TOKEN,
       ok: true,
     });
+  });
+
+  // The workspace-operation store is the second writer of the same shape — it
+  // persists clone/setup/runtime-service command output and is readable over HTTP.
+  it("masks secrets in the workspace-operation log store too", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-wsop-log-"));
+    tempRoots.push(root);
+    const store = createLocalFileWorkspaceOperationLogStore(root);
+    const handle = await store.begin({
+      companyId: "company-TESTONLY",
+      operationId: "operation-TESTONLY",
+    });
+
+    await store.append(handle, {
+      stream: "stderr",
+      chunk: "fatal: could not read Password for 'https://x@github.com': PGPASSWORD=TESTONLYpw1234\n",
+      ts: new Date(0).toISOString(),
+    });
+
+    const { content } = await store.read(handle);
+
+    expect(content).not.toContain("TESTONLYpw1234");
+    expect(content).toContain(SECRET_REDACTION_TOKEN);
+    expect(JSON.parse(content.trim()) as { stream: string }).toMatchObject({ stream: "stderr" });
   });
 
   it("reports the byte count of the redacted line", async () => {

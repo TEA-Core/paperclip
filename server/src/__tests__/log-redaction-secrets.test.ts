@@ -135,18 +135,54 @@ describe("redactSecretTokens — name-driven assignments", () => {
     expect(result).toContain(`\\"API_TOKEN\\"`);
   });
 
-  it("keeps structure after the masked value", () => {
-    expect(redactSecretTokens(`API_KEY=${FAKE}&region=us-east-1&debug=true`)).toBe(
-      `API_KEY=${SECRET_REDACTION_TOKEN}&region=us-east-1&debug=true`,
+  it("masks a bare value whole, including punctuation inside the credential", () => {
+    // Terminating at punctuation used to emit a marker followed by the tail of
+    // the real secret — `DB_PASSWORD=Ab3#cdefgh` kept `#cdefgh` on disk.
+    for (const punctuation of ["#", ",", "&", "|", ";", ")", "]", "}", "[", "(", "{", "\\", "<"]) {
+      const password = `Xk9${punctuation}TESTONLYtail123`;
+
+      const result = redactSecretTokens(`DB_PASSWORD=${password}`);
+
+      expect(result).toBe(`DB_PASSWORD=${SECRET_REDACTION_TOKEN}`);
+      expect(result).not.toContain("TESTONLYtail");
+    }
+  });
+
+  it("masks glued-prefix password env vars", () => {
+    for (const name of ["PGPASSWORD", "PGPASS", "MYSQL_PWD"]) {
+      expect(redactSecretTokens(`${name}=${FAKE} psql -h db.example.supabase.co`)).toBe(
+        `${name}=${SECRET_REDACTION_TOKEN} psql -h db.example.supabase.co`,
+      );
+      expect(redactSecretTokens(`${name}="${FAKE}"`)).toBe(
+        `${name}="${SECRET_REDACTION_TOKEN}"`,
+      );
+    }
+  });
+
+  it("masks the space-separated CLI password flag", () => {
+    expect(redactSecretTokens(`supabase link --project-ref abcd --password ${FAKE}`)).toBe(
+      `supabase link --project-ref abcd --password ${SECRET_REDACTION_TOKEN}`,
     );
-    expect(redactSecretTokens(`API_KEY=${FAKE}|next=ok`)).toBe(
-      `API_KEY=${SECRET_REDACTION_TOKEN}|next=ok`,
+    expect(redactSecretTokens(`supabase db push --db-password ${FAKE}`)).toBe(
+      `supabase db push --db-password ${SECRET_REDACTION_TOKEN}`,
     );
-    expect(redactSecretTokens(`API_KEY=${FAKE}#comment`)).toBe(
-      `API_KEY=${SECRET_REDACTION_TOKEN}#comment`,
+  });
+
+  it("masks a scheme-less user:password@host connection fragment", () => {
+    const result = redactSecretTokens(
+      "postgres.abcdefgh:TESTONLYdbpass123@aws-0-eu-west-2.pooler.supabase.com:6543",
     );
+
+    expect(result).not.toContain("TESTONLYdbpass123");
+    expect(result).toContain("@aws-0-eu-west-2.pooler.supabase.com:6543");
+  });
+
+  it("keeps quoted and JSON structure after the masked value", () => {
     expect(redactSecretTokens(`{"ADMIN_TOKEN": "${FAKE}", "region": "us"}`)).toBe(
       `{"ADMIN_TOKEN": "${SECRET_REDACTION_TOKEN}", "region": "us"}`,
+    );
+    expect(redactSecretTokens(`API_KEY="${FAKE}" region=us-east-1`)).toBe(
+      `API_KEY="${SECRET_REDACTION_TOKEN}" region=us-east-1`,
     );
   });
 
@@ -199,6 +235,41 @@ describe("redactSecretTokens — false positives", () => {
 
   it("leaves a secret-shaped name with a non-secret suffix untouched", () => {
     expect(redactSecretTokens("FOO_KEY_ID=plainvalue")).toBe("FOO_KEY_ID=plainvalue");
+  });
+
+  it("does not corrupt comparison operators in pasted code", () => {
+    const code = [
+      "if (apiKey === undefined) {}",
+      "if (apiKey == null) return;",
+      "if (SESSION_TOKEN !== previous) {}",
+      "const ok = password >= minimum;",
+      "const fn = (API_KEY) => API_KEY;",
+      "credential ??= fallback;",
+      "secret += suffix;",
+    ].join("\n");
+
+    expect(redactSecretTokens(code)).toBe(code);
+  });
+
+  it("leaves env-var indirections intact — they are the safe form to write", () => {
+    const indirections = [
+      "export ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY",
+      "docker run -e OPENAI_API_KEY=${OPENAI_API_KEY} app",
+      "set API_KEY=%API_KEY%",
+    ].join("\n");
+
+    expect(redactSecretTokens(indirections)).toBe(indirections);
+  });
+
+  it("leaves diagnostic sentinel values readable", () => {
+    const diagnostics = [
+      "API_KEY=undefined",
+      "SUPABASE_SERVICE_ROLE_KEY=null is not a valid key",
+      "DB_PASSWORD=false",
+      "TOKEN_TTL_SECRET=3600",
+    ].join("\n");
+
+    expect(redactSecretTokens(diagnostics)).toBe(diagnostics);
   });
 });
 

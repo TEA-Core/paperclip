@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { redactSecretTokens } from "../log-redaction.js";
 
 export type WorkspaceOperationLogStoreType = "local_file";
 
@@ -50,7 +51,7 @@ function resolveWithin(basePath: string, relativePath: string) {
   return resolved;
 }
 
-function createLocalFileWorkspaceOperationLogStore(basePath: string): WorkspaceOperationLogStore {
+export function createLocalFileWorkspaceOperationLogStore(basePath: string): WorkspaceOperationLogStore {
   async function ensureDir(relativeDir: string) {
     const dir = resolveWithin(basePath, relativeDir);
     await fs.mkdir(dir, { recursive: true });
@@ -109,10 +110,13 @@ function createLocalFileWorkspaceOperationLogStore(basePath: string): WorkspaceO
     async append(handle, event) {
       if (handle.store !== "local_file") return;
       const absPath = resolveWithin(basePath, handle.logRef);
+      // SUP-8631: same choke point as run-log-store.append(). Clone/setup and
+      // runtime-service command output lands here and this NDJSON is readable
+      // over HTTP. Redact before JSON.stringify so the line stays well-formed.
       const line = JSON.stringify({
         ts: event.ts,
         stream: event.stream,
-        chunk: event.chunk,
+        chunk: redactSecretTokens(event.chunk),
       });
       await fs.appendFile(absPath, `${line}\n`, "utf8");
     },
