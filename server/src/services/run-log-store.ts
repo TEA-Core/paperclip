@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { redactSecretTokens } from "../log-redaction.js";
 
 export type RunLogStoreType = "local_file";
 
@@ -50,7 +51,7 @@ function resolveWithin(basePath: string, relativePath: string) {
   return resolved;
 }
 
-function createLocalFileRunLogStore(basePath: string): RunLogStore {
+export function createLocalFileRunLogStore(basePath: string): RunLogStore {
   async function ensureDir(relativeDir: string) {
     const dir = resolveWithin(basePath, relativeDir);
     await fs.mkdir(dir, { recursive: true });
@@ -109,10 +110,14 @@ function createLocalFileRunLogStore(basePath: string): RunLogStore {
     async append(handle, event) {
       if (handle.store !== "local_file") return 0;
       const absPath = resolveWithin(basePath, handle.logRef);
+      // SUP-8631: mask secret-shaped tokens before they reach disk. Redacting
+      // the chunk BEFORE JSON.stringify (rather than the serialized line after)
+      // keeps the NDJSON well-formed by construction, and lets the value
+      // terminators see real newlines and quotes instead of their escaped forms.
       const line = JSON.stringify({
         ts: event.ts,
         stream: event.stream,
-        chunk: event.chunk,
+        chunk: redactSecretTokens(event.chunk),
       });
       const persisted = `${line}\n`;
       await fs.appendFile(absPath, persisted, "utf8");
