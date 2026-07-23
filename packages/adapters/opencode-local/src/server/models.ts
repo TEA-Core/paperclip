@@ -199,11 +199,44 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
     return [{ id: model, label: model }];
   }
 
-  const models = await discoverOpenCodeModelsCached({
+  // __PC_OC_MODELVAL_FAILOPEN_PATCHED__ (sectoid TEA fork; reconciled onto 722)
+  let models = await discoverOpenCodeModelsCached({
     command: input.command,
     cwd: input.cwd,
     env: input.env,
   });
+
+  // Transient-blip resilience: `opencode models` can exit 0 yet omit a
+  // registry/auth-backed provider (observed: zai-coding-plan) on a models.dev /
+  // OAuth enumeration blip, while statically-configured providers
+  // (cloudflare-ai-gateway, ollama) always appear. When the configured model is
+  // missing, re-run discovery UNCACHED (bypassing the ${MODELS_CACHE_TTL_MS}ms
+  // result cache) a bounded number of times before treating it as truly absent.
+  if (models.length > 0 && !models.some((entry) => entry.id === model)) {
+    const retriesRaw = Number.parseInt(
+      process.env.PAPERCLIP_OPENCODE_MODEL_VALIDATION_RETRIES ?? "2",
+      10,
+    );
+    const maxRetries =
+      Number.isFinite(retriesRaw) && retriesRaw >= 0 ? Math.min(retriesRaw, 10) : 2;
+    for (
+      let attempt = 1;
+      attempt <= maxRetries && !models.some((entry) => entry.id === model);
+      attempt++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 750 * attempt));
+      try {
+        const fresh = await discoverOpenCodeModels({
+          command: input.command,
+          cwd: input.cwd,
+          env: input.env,
+        });
+        if (fresh.length > 0) models = fresh;
+      } catch {
+        // transient discovery failure; keep the prior list and retry
+      }
+    }
+  }
 
   if (models.length === 0) {
     throw new Error("OpenCode returned no models. Run `opencode models` and verify provider auth.");
@@ -211,9 +244,16 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
 
   if (!models.some((entry) => entry.id === model)) {
     const sample = models.slice(0, 12).map((entry) => entry.id).join(", ");
-    throw new Error(
-      `Configured OpenCode model is unavailable: ${model}. Available models: ${sample}${models.length > 12 ? ", ..." : ""}`,
+    const tail = models.length > 12 ? ", ..." : "";
+    if (isTruthyEnvFlag(process.env.PAPERCLIP_OPENCODE_STRICT_MODEL_VALIDATION)) {
+      throw new Error(
+        `Configured OpenCode model is unavailable: ${model}. Available models: ${sample}${tail}`,
+      );
+    }
+    console.warn(
+      `[paperclip-opencode] Configured model ${model} not present in \`opencode models\` output after re-discovery; proceeding anyway. Model discovery is unreliable for registry/auth-backed providers (e.g. zai-coding-plan); opencode validates the model at invocation. Available sample: ${sample}${tail}. Set PAPERCLIP_OPENCODE_STRICT_MODEL_VALIDATION=1 to restore the hard-fail.`,
     );
+    return [{ id: model, label: model }];
   }
 
   return models;

@@ -371,6 +371,35 @@ function buildCodexTransientHandoffNote(input: {
     .join("\n");
 }
 
+type SessionStartedAtMetadata = {
+  ms: number;
+  iso: string;
+};
+
+function readSessionStartedAtMetadata(
+  sessionParams: Record<string, unknown> | null,
+): SessionStartedAtMetadata | null {
+  if (!sessionParams) return null;
+  const iso = asString(sessionParams.sessionStartedAt, "").trim();
+  if (iso.length > 0) {
+    const parsed = Date.parse(iso);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return { ms: parsed, iso };
+    }
+  }
+
+  const asMs = asNumber(sessionParams.sessionStartedAtMs, Number.NaN);
+  if (Number.isFinite(asMs) && asMs > 0) {
+    return { ms: asMs, iso: new Date(asMs).toISOString() };
+  }
+
+  return null;
+}
+
+function isAgentsInstructionsFile(filePath: string): boolean {
+  return path.basename(filePath).toLowerCase() === "agents.md";
+}
+
 export async function ensureCodexSkillsInjected(
   onLog: AdapterExecutionContext["onLog"],
   options: EnsureCodexSkillsInjectedOptions = {},
@@ -861,14 +890,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
     const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
     const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
+    const runtimeSessionStartedAt = readSessionStartedAtMetadata(runtimeSessionParams);
     const canResumeSession =
       runtimeSessionId.length > 0 &&
       (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
       adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
+    const resumeInstructionsFilePath = asString(config.instructionsFilePath, "").trim();
+    let forceFreshSessionForAgentsMtime = false;
+    let agentsMtimeBypassNote: string | null = null;
+    if (
+      canResumeSession &&
+      resumeInstructionsFilePath.length > 0 &&
+      isAgentsInstructionsFile(resumeInstructionsFilePath)
+    ) {
+      if (!runtimeSessionStartedAt) {
+        forceFreshSessionForAgentsMtime = true;
+        agentsMtimeBypassNote =
+          "Forced a fresh Codex session because AGENTS.md guard could not read the saved session start metadata.";
+      } else {
+        try {
+          const instructionsStat = await fs.stat(resumeInstructionsFilePath);
+          if (instructionsStat.mtimeMs > runtimeSessionStartedAt.ms) {
+            forceFreshSessionForAgentsMtime = true;
+            agentsMtimeBypassNote =
+              "Forced a fresh Codex session because AGENTS.md changed after the saved session start.";
+          }
+        } catch {
+          // keep resume behavior; a warning for unreadable files is emitted below.
+        }
+      }
+    }
     const codexTransientFallbackMode = readCodexTransientFallbackMode(context);
     const forceSaferInvocation = fallbackModeUsesSaferInvocation(codexTransientFallbackMode);
     const forceFreshSession = fallbackModeUsesFreshSession(codexTransientFallbackMode);
-    const sessionId = canResumeSession && !forceFreshSession ? runtimeSessionId : null;
+    const sessionId =
+      canResumeSession && !forceFreshSession && !forceFreshSessionForAgentsMtime ? runtimeSessionId : null;
     if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
       await onLog(
         "stdout",
@@ -878,6 +934,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await onLog(
         "stdout",
         `[paperclip] Codex session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
+      );
+    }
+    if (runtimeSessionId && forceFreshSessionForAgentsMtime && agentsMtimeBypassNote) {
+      await onLog(
+        "stdout",
+        `[paperclip] ${agentsMtimeBypassNote} sessionId="${runtimeSessionId}" instructionsFilePath="${resumeInstructionsFilePath}".\n`,
       );
     }
     const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
@@ -1011,6 +1073,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     const runAttempt = async (resumeSessionId: string | null) => {
+      let attemptStartedAt = new Date().toISOString();
       const execArgs = buildCodexExecArgs(
         forceSaferInvocation ? { ...config, fastMode: false } : config,
         {
@@ -1090,6 +1153,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       const wrappedOnSpawn = async (meta: { pid: number; processGroupId: number | null; startedAt: string }) => {
         killTarget = { pid: meta.pid ?? null, processGroupId: meta.processGroupId };
+        attemptStartedAt = meta.startedAt;
         if (onSpawn) {
           await onSpawn(meta);
         }
@@ -1125,6 +1189,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           },
           rawStderr: proc.stderr,
           parsed: parseCodexJsonl(proc.stdout),
+          attemptedResumeSessionId: resumeSessionId,
+          attemptStartedAt,
           monitor: monitorFired
             ? {
                 fired: true as const,
@@ -1152,6 +1218,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string };
         rawStderr: string;
         parsed: ReturnType<typeof parseCodexJsonl>;
+        attemptedResumeSessionId: string | null;
+        attemptStartedAt: string;
         monitor?:
           | { fired: false }
           | { fired: true; terminationSignal: NodeJS.Signals | null; elapsedMsSinceLastEvent: number; timeoutMs: number };
@@ -1202,13 +1270,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
 
-      const canFallbackToRuntimeSession = !isRetry && !forceFreshSession;
+      const canFallbackToRuntimeSession = !isRetry && !forceFreshSession && !forceFreshSessionForAgentsMtime;
       const resolvedSessionId =
         attempt.parsed.sessionId ??
         (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null);
+      const resumedExistingSession = Boolean(
+        attempt.attemptedResumeSessionId &&
+        !isRetry &&
+        !forceFreshSession &&
+        !forceFreshSessionForAgentsMtime &&
+        resolvedSessionId &&
+        runtimeSessionId &&
+        resolvedSessionId === runtimeSessionId,
+      );
+      const resolvedSessionStartedAt =
+        resumedExistingSession && runtimeSessionStartedAt
+          ? runtimeSessionStartedAt.iso
+          : attempt.attemptStartedAt;
       const resolvedSessionParams = resolvedSessionId
         ? ({
           sessionId: resolvedSessionId,
+          sessionStartedAt: resolvedSessionStartedAt,
+          sessionStartedAtMs: Date.parse(resolvedSessionStartedAt),
           cwd: effectiveExecutionCwd,
           ...(executionTargetIsRemote
             ? {
