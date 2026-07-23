@@ -5,6 +5,7 @@ import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
+import { redactSecretTokens } from "../log-redaction.js";
 
 export type RunLogStoreType = "local_file";
 
@@ -171,10 +172,14 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     async append(handle, event) {
       if (handle.store !== "local_file") return 0;
       const absPath = resolveWithin(basePath, handle.logRef);
+      // SUP-8631: mask secret-shaped tokens before they reach disk. Redacting
+      // the chunk BEFORE JSON.stringify (rather than the serialized line after)
+      // keeps the NDJSON well-formed by construction, and lets the value
+      // terminators see real newlines and quotes instead of their escaped forms.
       const line = JSON.stringify({
         ts: event.ts,
         stream: event.stream,
-        chunk: event.chunk,
+        chunk: redactSecretTokens(event.chunk),
         // Monotonic per-run sequence so readers can dedupe and order records
         // even when several identical chunks share the same millisecond ts
         // (common for ACP-style token deltas).
@@ -232,6 +237,13 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       return readS3Range(handle.logRef, offset, limitBytes);
     },
   };
+}
+
+// Local-only run-log store (no S3 mirror). Thin alias over the durable store so
+// SUP-8631's redaction test can construct a store without S3 wiring; the durable
+// store degrades to pod-local when no s3 option is passed.
+export function createLocalFileRunLogStore(basePath: string): RunLogStore {
+  return createDurableRunLogStore({ basePath });
 }
 
 // Build the run-log S3 mirror from dedicated RUN_LOG_S3_* env. Deliberately

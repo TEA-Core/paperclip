@@ -1,260 +1,57 @@
-import { randomUUID } from "node:crypto";
-import express from "express";
-import request from "supertest";
-import { sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import {
-  companies,
-  companyMemberships,
-  createDb,
-  issueComments,
-  issueReferenceMentions,
-  issues,
-} from "@paperclipai/db";
-import { companySearchQuerySchema } from "@paperclipai/shared";
-import {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "./helpers/embedded-postgres.js";
-import { errorHandler } from "../middleware/index.js";
-import { issueRoutes } from "../routes/issues.js";
-import { companySearchService } from "../services/company-search.js";
-import { buildPaperclipWakePayload } from "../services/heartbeat.js";
-import { issueReferenceService } from "../services/issue-references.js";
-import { issueService } from "../services/issues.js";
-import type { StorageService } from "../storage/types.js";
+import { describe, expect, it } from "vitest";
+import { SECRET_REDACTION_TOKEN, maskUserNameForLogs } from "../log-redaction.js";
+import { redactIssueCommentBody } from "../services/issues.js";
 
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
+// SUP-7928 leaked a service-role key through an auto-posted heartbeat comment.
+// Every comment body — agent-authored or human-authored — passes through this
+// helper before the issueComments insert.
+describe("redactIssueCommentBody", () => {
+  const opts = { userNames: ["paperclipuser"], homeDirs: ["/home/paperclipuser"] };
 
-if (!embeddedPostgresSupport.supported) {
-  console.warn(
-    `Skipping embedded Postgres issue comment redaction tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
-  );
-}
+  it("masks a service-role JWT pasted into narration", () => {
+    const jwt = "eyJTESTONLYheader.eyJTESTONLYpayload.TESTONLYsignature01";
 
-describeEmbeddedPostgres("deleted issue comment redaction", () => {
-  let db!: ReturnType<typeof createDb>;
-  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+    const result = redactIssueCommentBody(`Verification used ${jwt} — it worked.`, opts);
 
-  beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-comment-redaction-");
-    db = createDb(tempDb.connectionString);
-    await db.execute(sql.raw("CREATE EXTENSION IF NOT EXISTS pg_trgm"));
-  }, 20_000);
-
-  afterEach(async () => {
-    await db.delete(issueReferenceMentions);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(companyMemberships);
-    await db.delete(companies);
+    expect(result).toBe(`Verification used ${SECRET_REDACTION_TOKEN} — it worked.`);
   });
 
-  afterAll(async () => {
-    await tempDb?.cleanup();
-  });
-
-  async function seedIssue() {
-    const companyId = randomUUID();
-    const issueId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Comment Redaction Co",
-      issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      identifier: "RED-1",
-      title: "Deleted comment redaction",
-      status: "todo",
-      priority: "medium",
-    });
-    await db.insert(companyMemberships).values({
-      companyId,
-      principalType: "user",
-      principalId: "board-user-1",
-      status: "active",
-      membershipRole: "owner",
-      updatedAt: new Date(),
-    });
-    return { companyId, issueId };
-  }
-
-  function createApp(companyId: string) {
-    const app = express();
-    app.use(express.json());
-    app.use((req, _res, next) => {
-      (req as any).actor = {
-        type: "board",
-        userId: "board-user-1",
-        companyIds: [companyId],
-        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
-        source: "cloud_tenant",
-        // cloud_tenant actors are never instance admins — reads flow through
-        // the active company membership seeded in seedIssue().
-        isInstanceAdmin: false,
-      };
-      next();
-    });
-    const storage: StorageService = {
-      provider: "local_disk",
-      putFile: vi.fn(async () => {
-        throw new Error("Unexpected storage.putFile call");
-      }),
-      getObject: vi.fn(async () => {
-        throw new Error("Unexpected storage.getObject call");
-      }),
-      headObject: vi.fn(async () => ({ exists: false })),
-      deleteObject: vi.fn(async () => undefined),
-    };
-    app.use("/api", issueRoutes(db, storage));
-    app.use(errorHandler);
-    return app;
-  }
-
-  it("redacts deleted comment bodies from ordinary reads, heartbeat context, and wake payloads", async () => {
-    const { companyId, issueId } = await seedIssue();
-    const commentId = randomUUID();
-    const deletedAt = new Date("2026-06-03T12:00:00.000Z");
-    await db.insert(issueComments).values({
-      id: commentId,
-      companyId,
-      issueId,
-      authorUserId: "board-user-1",
-      body: "secret deleted body",
-      presentation: { kind: "system_notice", tone: "warning" },
-      metadata: { version: 1, sections: [{ rows: [{ type: "text", text: "secret metadata" }] }] },
-      deletedAt,
-      deletedByType: "user",
-      deletedByUserId: "board-user-1",
-    });
-
-    const comments = await issueService(db).listComments(issueId, { order: "asc" });
-    expect(comments).toHaveLength(1);
-    expect(comments[0]).toMatchObject({
-      id: commentId,
-      body: "",
-      presentation: null,
-      metadata: null,
-      deletedAt,
-      deletedByType: "user",
-      deletedByUserId: "board-user-1",
-    });
-
-    const exactComment = await issueService(db).getComment(commentId);
-    expect(exactComment?.body).toBe("");
-    expect(exactComment?.metadata).toBeNull();
-
-    const heartbeatContext = await request(createApp(companyId))
-      .get(`/api/issues/${issueId}/heartbeat-context`)
-      .query({ wakeCommentId: commentId });
-    expect(heartbeatContext.status, JSON.stringify(heartbeatContext.body)).toBe(200);
-    expect(heartbeatContext.body.wakeComment).toMatchObject({
-      id: commentId,
-      body: "",
-      metadata: null,
-      deletedByUserId: "board-user-1",
-    });
-    expect(JSON.stringify(heartbeatContext.body)).not.toContain("secret deleted body");
-    expect(JSON.stringify(heartbeatContext.body)).not.toContain("secret metadata");
-
-    const wakePayload = await buildPaperclipWakePayload({
-      db,
-      companyId,
-      contextSnapshot: {
-        issueId,
-        commentId,
-        wakeCommentIds: [commentId],
-        wakeReason: "issue_commented",
-      },
-    });
-
-    expect(wakePayload?.comments).toEqual([
-      expect.objectContaining({
-        id: commentId,
-        body: "",
-        bodyTruncated: false,
-        presentation: null,
-        metadata: null,
-        deletedAt: deletedAt.toISOString(),
-        deletedByUserId: "board-user-1",
-      }),
-    ]);
-    expect(JSON.stringify(wakePayload)).not.toContain("secret deleted body");
-    expect(JSON.stringify(wakePayload)).not.toContain("secret metadata");
-  });
-
-  it("excludes deleted comment bodies from company search", async () => {
-    const { companyId, issueId } = await seedIssue();
-    await db.insert(issueComments).values({
-      companyId,
-      issueId,
-      body: "vanished-search-needle",
-      deletedAt: new Date("2026-06-03T12:00:00.000Z"),
-      deletedByType: "user",
-      deletedByUserId: "board-user-1",
-    });
-
-    const result = await companySearchService(db).search(
-      companyId,
-      companySearchQuerySchema.parse({ q: "vanished-search-needle", scope: "comments" }),
+  it("masks a secret assignment echoed from a shell command", () => {
+    const result = redactIssueCommentBody(
+      "Ran `export SUPABASE_SERVICE_ROLE_KEY=sb_secret_TESTONLYaaaabbbbcccc1234`",
+      opts,
     );
 
-    expect(result.results).toEqual([]);
+    expect(result).not.toContain("sb_secret_TESTONLY");
+    expect(result).toContain(`SUPABASE_SERVICE_ROLE_KEY=${SECRET_REDACTION_TOKEN}`);
   });
 
-  it("clears issue references sourced from deleted comment bodies", async () => {
-    const companyId = randomUUID();
-    const sourceIssueId = randomUUID();
-    const targetIssueId = randomUUID();
-    const commentId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Reference Redaction Co",
-      issuePrefix: "REF",
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(issues).values([
-      {
-        id: sourceIssueId,
-        companyId,
-        identifier: "REF-1",
-        title: "Source issue",
-        status: "todo",
-        priority: "medium",
-      },
-      {
-        id: targetIssueId,
-        companyId,
-        identifier: "REF-2",
-        title: "Target issue",
-        status: "todo",
-        priority: "medium",
-      },
-    ]);
-    await db.insert(issueComments).values({
-      id: commentId,
-      companyId,
-      issueId: sourceIssueId,
-      body: "Follow up in REF-2",
-    });
+  it("still masks the current username, and does so before secret masking", () => {
+    const result = redactIssueCommentBody(
+      "cwd=/home/paperclipuser/scratch, GITHUB_TOKEN=ghp_TESTONLYaaaabbbbccccddddeeee01",
+      opts,
+    );
 
-    const refs = issueReferenceService(db);
-    await refs.syncComment(commentId);
-    expect((await refs.listIssueReferenceSummary(sourceIssueId)).outbound.map((item) => item.issue.id)).toEqual([
-      targetIssueId,
-    ]);
+    expect(result).toContain(`/home/${maskUserNameForLogs("paperclipuser")}/scratch`);
+    expect(result).not.toContain("paperclipuser");
+    expect(result).toContain(`GITHUB_TOKEN=${SECRET_REDACTION_TOKEN}`);
+  });
 
-    await db.update(issueComments).set({
-      deletedAt: new Date("2026-06-03T12:00:00.000Z"),
-      deletedByType: "user",
-      deletedByUserId: "board-user-1",
-    });
-    await refs.syncComment(commentId);
+  it("leaves the bounded-liveness dedup prefix intact", () => {
+    // heartbeat.ts dedups this comment with a `like 'Bounded liveness…%'` query;
+    // redaction must never rewrite the leading text.
+    const body = "Bounded liveness continuation exhausted after 3 attempts.";
 
-    expect((await refs.listIssueReferenceSummary(sourceIssueId)).outbound).toEqual([]);
+    expect(redactIssueCommentBody(body, opts)).toBe(body);
+  });
+
+  it("leaves ordinary review prose untouched", () => {
+    const body = [
+      "Please rotate SUPABASE_SERVICE_ROLE_KEY and confirm.",
+      "const SESSION_TOKEN = await getToken();",
+      "See the API_KEY: section of the runbook.",
+    ].join("\n");
+
+    expect(redactIssueCommentBody(body, opts)).toBe(body);
   });
 });

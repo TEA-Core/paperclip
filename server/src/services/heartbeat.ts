@@ -226,6 +226,7 @@ import {
 import {
   redactCurrentUserText,
   redactCurrentUserValue,
+  redactSecretTokens,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
@@ -13187,8 +13188,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const sanitizedChunk = compactRunLogChunk(
-          redactCurrentUserText(chunk, currentUserRedactionOptions),
+        // SUP-8631: redactSecretTokens MUST sit OUTSIDE compactRunLogChunk —
+        // it then runs on the 64KB-capped output rather than an unbounded raw
+        // adapter chunk, and only after inline base64 image payloads have been
+        // replaced. This also covers the stdout/stderr excerpt DB columns below,
+        // which never reach the run-log store.
+        const sanitizedChunk = redactSecretTokens(
+          compactRunLogChunk(redactCurrentUserText(chunk, currentUserRedactionOptions)),
         );
         if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
         if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
