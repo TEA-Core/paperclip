@@ -496,7 +496,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : "";
     const instructionsDir = resolvedInstructionsFilePath ? `${path.dirname(resolvedInstructionsFilePath)}/` : "";
     let instructionsPrefix = "";
-    if (resolvedInstructionsFilePath) {
+    if (resolvedInstructionsFilePath && !sessionId) {
       try {
         const instructionsContents = await fs.readFile(resolvedInstructionsFilePath, "utf8");
         instructionsPrefix =
@@ -515,6 +515,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const commandNotes = (() => {
       const notes = [...preparedRuntimeConfig.notes];
       if (!resolvedInstructionsFilePath) return notes;
+      if (sessionId) {
+        notes.push(`Skipped instructions prepend (resumed session ${sessionId})`);
+        return notes;
+      }
       if (instructionsPrefix.length > 0) {
         notes.push(`Loaded agent instructions from ${resolvedInstructionsFilePath}`);
         notes.push(
