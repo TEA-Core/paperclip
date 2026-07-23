@@ -6180,6 +6180,13 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      if (Object.prototype.hasOwnProperty.call(issueData, "executionPolicy")) {
+        const normalizedPolicy = normalizeIssueExecutionPolicy(issueData.executionPolicy ?? null);
+        issueData.executionPolicy = (normalizedPolicy as Record<string, unknown> | null) ?? null;
+        if (normalizedPolicy?.returnAssigneeAgentId) {
+          await assertAssignableAgent(db, companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
+        }
+      }
       return db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
@@ -6546,6 +6553,15 @@ export function issueService(db: Db) {
       }
       if (issueData.assigneeUserId) {
         await assertAssignableUser(existing.companyId, issueData.assigneeUserId);
+      }
+      if (Object.prototype.hasOwnProperty.call(issueData, "executionPolicy")) {
+        const normalizedPolicy = normalizeIssueExecutionPolicy(issueData.executionPolicy ?? null);
+        const normalizedPolicyRecord = (normalizedPolicy as Record<string, unknown> | null) ?? null;
+        issueData.executionPolicy = normalizedPolicyRecord;
+        patch.executionPolicy = normalizedPolicyRecord;
+        if (normalizedPolicy?.returnAssigneeAgentId) {
+          await assertAssignableAgent(dbOrTx as Db, existing.companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
+        }
       }
       let nextProjectId = issueData.projectId !== undefined ? issueData.projectId : existing.projectId;
       const nextProjectWorkspaceId =

@@ -7042,7 +7042,9 @@ export function issueRoutes(
       assigneeUserId: rawCreateBody.assigneeUserId ?? null,
     };
     await assertTaskBridgeCreateAllowed(req, companyId, createAssignmentScope);
-    if (rawCreateBody.assigneeAgentId || rawCreateBody.assigneeUserId) {
+    const createReturnAssigneeAgentId =
+      normalizeIssueExecutionPolicy(createBody.executionPolicy)?.returnAssigneeAgentId ?? null;
+    if (rawCreateBody.assigneeAgentId || rawCreateBody.assigneeUserId || createReturnAssigneeAgentId) {
       await assertCanAssignTasks(req, companyId, createAssignmentScope);
     }
     await assertIssueEnvironmentSelection(companyId, createBody.executionWorkspaceSettings?.environmentId);
@@ -7222,7 +7224,9 @@ export function issueRoutes(
       assigneeUserId: createBody.assigneeUserId ?? null,
     };
     await assertTaskBridgeCreateAllowed(req, parent.companyId, childAssignmentScope);
-    if (sanitizedBody.assigneeAgentId || sanitizedBody.assigneeUserId) {
+    const childReturnAssigneeAgentId =
+      normalizeIssueExecutionPolicy(createBody.executionPolicy)?.returnAssigneeAgentId ?? null;
+    if (sanitizedBody.assigneeAgentId || sanitizedBody.assigneeUserId || childReturnAssigneeAgentId) {
       await assertCanAssignTasks(req, parent.companyId, childAssignmentScope);
     }
     await assertIssueEnvironmentSelection(parent.companyId, createBody.executionWorkspaceSettings?.environmentId);
@@ -7828,6 +7832,29 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
+    if (updateFields.executionPolicy !== undefined) {
+      const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
+      const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;
+      if (prevReturnAssignee !== nextReturnAssignee) {
+        await assertCanAssignTasks(req, existing.companyId, {
+          issueId: existing.id,
+          projectId: await resolveAssignmentProjectId({
+            companyId: existing.companyId,
+            projectId: updateFields.projectId === undefined
+              ? existing.projectId
+              : (updateFields.projectId as string | null | undefined),
+            parentIssueId: (updateFields.parentId === undefined
+              ? existing.parentId
+              : updateFields.parentId) as string | null | undefined,
+          }),
+          parentIssueId: (updateFields.parentId === undefined
+            ? existing.parentId
+            : updateFields.parentId) as string | null | undefined,
+          assigneeAgentId: nextReturnAssignee,
+          assigneeUserId: null,
+        });
+      }
+    }
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }

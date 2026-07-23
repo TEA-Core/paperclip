@@ -389,13 +389,23 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
 
   const reviewPreset = parsed.data.reviewPreset;
   const authorizationPolicy = parsed.data.authorizationPolicy;
+  const returnAssigneeAgentId = parsed.data.returnAssigneeAgentId ?? null;
 
-  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy) return null;
+  if (
+    stages.length === 0 &&
+    !monitor &&
+    !reviewPreset &&
+    !authorizationPolicy &&
+    !returnAssigneeAgentId
+  ) {
+    return null;
+  }
 
   return {
     mode: parsed.data.mode ?? "normal",
     commentRequired: true,
     stages,
+    ...(returnAssigneeAgentId ? { returnAssigneeAgentId } : {}),
     ...(monitor ? { monitor } : {}),
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
@@ -562,12 +572,13 @@ function buildPendingState(input: {
   };
 }
 
-function buildChangesRequestedState(previous: IssueExecutionState, currentStage: IssueExecutionStage): IssueExecutionState {
+function buildChangesRequestedState(previous: IssueExecutionState, currentStage: IssueExecutionStage, returnAssignee: IssueExecutionStagePrincipal): IssueExecutionState {
   return {
     ...previous,
     status: CHANGES_REQUESTED_STATUS,
     currentStageId: currentStage.id,
     currentStageType: currentStage.type,
+    returnAssignee,
     reviewRequest: null,
     lastDecisionOutcome: "changes_requested",
   };
@@ -605,6 +616,17 @@ function clearExecutionStatePatch(input: {
     input.patch.status = "in_progress";
     Object.assign(input.patch, patchForPrincipal(input.returnAssignee));
   }
+}
+
+function resolveReturnAssignee(input: {
+  policy: IssueExecutionPolicy | null;
+  existingState: IssueExecutionState | null;
+  currentAssignee: IssueExecutionStagePrincipal | null;
+}): IssueExecutionStagePrincipal | null {
+  if (input.policy?.returnAssigneeAgentId) {
+    return { type: "agent", agentId: input.policy.returnAssigneeAgentId, userId: null };
+  }
+  return input.existingState ? input.existingState.returnAssignee : input.currentAssignee;
 }
 
 function canAutoSkipPendingStage(input: {
@@ -669,7 +691,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     const currentParticipant =
       existingState?.currentParticipant ??
       selectStageParticipant(activeStage, {
-        exclude: existingState?.returnAssignee ?? null,
+        exclude: resolveReturnAssignee({
+          policy: input.policy,
+          existingState,
+          currentAssignee,
+        }),
       });
     if (!currentParticipant) {
       throw unprocessable(`No eligible ${activeStage.type} participant is configured for this issue`);
@@ -678,14 +704,22 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     if (!stageHasParticipant(activeStage, currentParticipant)) {
       const participant = selectStageParticipant(activeStage, {
         preferred: explicitAssignee ?? existingState?.currentParticipant ?? null,
-        exclude: existingState?.returnAssignee ?? null,
+        exclude: resolveReturnAssignee({
+          policy: input.policy,
+          existingState,
+          currentAssignee,
+        }),
       });
       if (!participant) {
         clearExecutionStatePatch({
           patch,
           issueStatus: input.issue.status,
           requestedStatus,
-          returnAssignee: existingState?.returnAssignee ?? null,
+          returnAssignee: resolveReturnAssignee({
+            policy: input.policy,
+            existingState,
+            currentAssignee,
+          }),
         });
         return { patch };
       }
@@ -696,7 +730,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         policy: input.policy,
         stage: activeStage,
         participant,
-        returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+        returnAssignee: resolveReturnAssignee({
+          policy: input.policy,
+          existingState,
+          currentAssignee,
+        }) ?? actor,
         reviewRequest: effectiveReviewRequest,
       });
       return {
@@ -733,7 +771,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
         const participant = selectStageParticipant(nextStage, {
           preferred: explicitAssignee,
-          exclude: existingState?.returnAssignee ?? null,
+          exclude: resolveReturnAssignee({
+            policy: input.policy,
+            existingState,
+            currentAssignee,
+          }),
         });
         if (!participant) {
           throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
@@ -745,7 +787,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           policy: input.policy,
           stage: nextStage,
           participant,
-          returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+          returnAssignee: resolveReturnAssignee({
+            policy: input.policy,
+            existingState,
+            currentAssignee,
+          }) ?? actor,
           reviewRequest: input.reviewRequest ?? null,
         });
         return {
@@ -764,12 +810,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         if (!input.commentBody?.trim()) {
           throw unprocessable("Requesting changes requires a comment");
         }
-        if (!existingState?.returnAssignee) {
+        const returnAssignee = resolveReturnAssignee({
+          policy: input.policy,
+          existingState,
+          currentAssignee,
+        });
+        if (!returnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
         }
         patch.status = "in_progress";
-        Object.assign(patch, patchForPrincipal(existingState.returnAssignee));
-        patch.executionState = buildChangesRequestedState(existingState, activeStage);
+        Object.assign(patch, patchForPrincipal(returnAssignee));
+        patch.executionState = buildChangesRequestedState(existingState!, activeStage, returnAssignee);
         return {
           patch,
           decision: {
@@ -802,7 +853,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         policy: input.policy,
         stage: activeStage,
         participant: currentParticipant,
-        returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+        returnAssignee: resolveReturnAssignee({
+          policy: input.policy,
+          existingState,
+          currentAssignee,
+        }) ?? actor,
         reviewRequest: effectiveReviewRequest,
       });
       return {
@@ -834,7 +889,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       : nextPendingStage(input.policy, existingState);
   if (!pendingStage) return { patch };
 
-  const returnAssignee = existingState?.returnAssignee ?? currentAssignee;
+  const returnAssignee = resolveReturnAssignee({
+    policy: input.policy,
+    existingState,
+    currentAssignee,
+  });
   const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
   let participant = selectStageParticipant(pendingStage, {
     preferred:

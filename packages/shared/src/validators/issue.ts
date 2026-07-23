@@ -201,6 +201,7 @@ export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
   stages: z.array(issueExecutionStageSchema).default([]),
+  returnAssigneeAgentId: z.string().trim().uuid().optional().nullable(),
   monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),

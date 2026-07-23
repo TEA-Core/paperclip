@@ -619,6 +619,7 @@ export interface IssueExecutionPolicy {
   mode: IssueExecutionPolicyMode;
   commentRequired: boolean;
   stages: IssueExecutionStage[];
+  returnAssigneeAgentId?: string | null;
   monitor?: IssueExecutionMonitorPolicy | null;
   reviewPreset?: LowTrustReviewPresetPolicy;
   authorizationPolicy?: TrustAuthorizationPolicy;
