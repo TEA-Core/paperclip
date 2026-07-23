@@ -196,6 +196,7 @@ import { externalObjectService } from "../services/external-objects.js";
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
+  force: z.boolean().optional(),
 });
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
@@ -7853,6 +7854,56 @@ export function issueRoutes(
           assigneeAgentId: nextReturnAssignee,
           assigneeUserId: null,
         });
+      }
+    }
+    // SUP-9156 R1/R2 (pending-interaction assignment pin): reject stripping a
+    // board user-assignee onto an agent while a pending wake_assignee interaction
+    // is live, unless force:true. Applies to ALL actor identities (observed writer
+    // holds a USER token). Deliberate handoff still possible with force:true.
+    {
+      const stripsUserOntoAgent =
+        typeof existing.assigneeUserId === "string" &&
+        existing.assigneeUserId.trim().length > 0 &&
+        typeof normalizedAssigneeAgentId === "string" &&
+        normalizedAssigneeAgentId.trim().length > 0 &&
+        (req.body.assigneeUserId === null ||
+          (req.body.assigneeUserId === undefined &&
+            normalizedAssigneeAgentId !== existing.assigneeAgentId));
+      if (stripsUserOntoAgent && req.body.force !== true) {
+        const pinInteractions = await issueThreadInteractionService(db).listForIssue(existing.id);
+        const blockingInteraction = pinInteractions.find(
+          (it) =>
+            it.status === "pending" &&
+            (it.continuationPolicy === "wake_assignee" ||
+              it.continuationPolicy === "wake_assignee_on_accept"),
+        );
+        if (blockingInteraction) {
+          let targetIsPullOnly = false;
+          try {
+            const tgt = await agentsSvc.getById(normalizedAssigneeAgentId);
+            targetIsPullOnly = !!tgt && tgt.adapterType === "process";
+          } catch {
+            /* best-effort adapterType probe */
+          }
+          res.status(409).json({
+            error:
+              "Refusing to reassign a board gate off its user assignee while a board interaction is pending",
+            code: "pending_interaction_assignment_pin",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              fromAssigneeUserId: existing.assigneeUserId,
+              toAssigneeAgentId: normalizedAssigneeAgentId,
+              targetIsPullOnly,
+              interactionId: blockingInteraction.id,
+              interactionKind: blockingInteraction.kind,
+              continuationPolicy: blockingInteraction.continuationPolicy,
+              remedy:
+                "Answer or cancel the pending interaction first, or resend with force:true for a deliberate handoff.",
+            },
+          });
+          return;
+        }
       }
     }
     if (normalizedAssigneeAgentId !== undefined) {
