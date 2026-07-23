@@ -11421,7 +11421,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
         }
-        continue;
+        // SUP-6706: bound the detached window. A run whose pid stays alive but
+        // whose in-memory handle is lost would otherwise be pinned `running`
+        // forever. After 10 min, fall through to process_lost convergence below.
+        const detachedRefMs = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+        const DETACHED_RUN_MAX_MS = 10 * 60 * 1000;
+        if (!(detachedRefMs > 0 && Date.now() - detachedRefMs >= DETACHED_RUN_MAX_MS)) {
+          continue;
+        }
       }
 
       let descendantOnlyCleanup = false;

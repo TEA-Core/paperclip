@@ -968,6 +968,10 @@ export async function listUnfinalizedExecutionWorkspaceIds(
   const latestByWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
   for (const row of rows) {
     if (!row.executionWorkspaceId) continue;
+    // SUP-9048: only workspace_finalize ops determine finalization. A later
+    // failed worktree_prepare must not poison a workspace with prior succeeded
+    // finalizes (which wedged every dependent of every done blocker).
+    if (row.phase !== "workspace_finalize") continue;
     const current = latestByWorkspace.get(row.executionWorkspaceId);
     if (!current || row.startedAt > current.startedAt) {
       latestByWorkspace.set(row.executionWorkspaceId, {
