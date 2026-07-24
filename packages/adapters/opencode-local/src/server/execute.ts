@@ -207,6 +207,30 @@ async function buildOpenCodeSkillsDir(config: Record<string, unknown>): Promise<
   return target;
 }
 
+// OpenCode 1.18+ resolves the directory its session is rooted at from PWD, not
+// from the process cwd, so a stale inherited PWD silently moves the session (and
+// the directory its write permissions are scoped to) off the provisioned
+// execution workspace. runChildProcess now keeps PWD aligned with the spawn cwd;
+// passing --dir as well pins the run directory explicitly instead of relying on
+// that env side channel alone.
+export function buildOpenCodeRunArgs(input: {
+  dir: string;
+  model: string;
+  variant: string;
+  extraArgs: string[];
+  printLogs: boolean;
+  resumeSessionId: string | null;
+}): string[] {
+  const args = ["run", "--format", "json"];
+  if (input.printLogs) args.push("--print-logs");
+  if (input.dir) args.push("--dir", input.dir);
+  if (input.resumeSessionId) args.push("--session", input.resumeSessionId);
+  if (input.model) args.push("--model", input.model);
+  if (input.variant) args.push("--variant", input.variant);
+  if (input.extraArgs.length > 0) args.push(...input.extraArgs);
+  return args;
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
   const executionTarget = readAdapterExecutionTarget({
@@ -576,15 +600,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const printLogs = isTruthyEnvFlag(
       env.PAPERCLIP_OPENCODE_PRINT_LOGS ?? process.env.PAPERCLIP_OPENCODE_PRINT_LOGS,
     );
-    const buildArgs = (resumeSessionId: string | null) => {
-      const args = ["run", "--format", "json"];
-      if (printLogs) args.push("--print-logs");
-      if (resumeSessionId) args.push("--session", resumeSessionId);
-      if (model) args.push("--model", model);
-      if (variant) args.push("--variant", variant);
-      if (extraArgs.length > 0) args.push(...extraArgs);
-      return args;
-    };
+    const buildArgs = (resumeSessionId: string | null) =>
+      buildOpenCodeRunArgs({
+        dir: effectiveExecutionCwd,
+        model,
+        variant,
+        extraArgs,
+        printLogs,
+        resumeSessionId,
+      });
 
     const runAttempt = async (resumeSessionId: string | null) => {
       const args = buildArgs(resumeSessionId);

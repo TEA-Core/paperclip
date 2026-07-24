@@ -1,6 +1,65 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ensureRemoteOpenCodeModelConfiguredAndAvailable } from "./execute.js";
+import { buildOpenCodeRunArgs, ensureRemoteOpenCodeModelConfiguredAndAvailable } from "./execute.js";
+
+describe("buildOpenCodeRunArgs", () => {
+  // SUP-9238: OpenCode 1.18+ re-roots its session on PWD rather than the real
+  // process cwd, so relying on the spawn cwd alone let a stale inherited PWD
+  // move the whole session (and its write permissions) off the provisioned
+  // execution workspace. Pin the run directory on the command line too.
+  it("pins the execution directory with --dir", () => {
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "",
+        extraArgs: [],
+        printLogs: false,
+        resumeSessionId: null,
+      }),
+    ).toEqual(["run", "--format", "json", "--dir", "/workspaces/SUP-9238", "--model", "router/coder"]);
+  });
+
+  it("omits --dir when no execution directory is known", () => {
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "",
+        model: "",
+        variant: "",
+        extraArgs: [],
+        printLogs: false,
+        resumeSessionId: null,
+      }),
+    ).toEqual(["run", "--format", "json"]);
+  });
+
+  it("keeps resume, variant and caller-supplied args alongside --dir", () => {
+    expect(
+      buildOpenCodeRunArgs({
+        dir: "/workspaces/SUP-9238",
+        model: "router/coder",
+        variant: "high",
+        extraArgs: ["--auto"],
+        printLogs: true,
+        resumeSessionId: "ses_123",
+      }),
+    ).toEqual([
+      "run",
+      "--format",
+      "json",
+      "--print-logs",
+      "--dir",
+      "/workspaces/SUP-9238",
+      "--session",
+      "ses_123",
+      "--model",
+      "router/coder",
+      "--variant",
+      "high",
+      "--auto",
+    ]);
+  });
+});
 
 describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
   afterEach(() => {

@@ -390,6 +390,61 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  // SUP-9238: `spawn`'s `cwd` option does not rewrite PWD, so the Paperclip
+  // server's own PWD leaks into every process adapter. Tools that resolve their
+  // project root from PWD instead of the real cwd (OpenCode 1.18+) then root the
+  // session at the server directory and treat the execution workspace as an
+  // external directory, so agent edits never land in the provisioned worktree.
+  it("sets PWD to the spawn cwd instead of leaking the parent PWD", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pwd-"));
+    const realWorkspaceDir = await fs.realpath(workspaceDir);
+    try {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", "process.stdout.write(JSON.stringify({ pwd: process.env.PWD, cwd: process.cwd() }));"],
+        {
+          cwd: realWorkspaceDir,
+          env: {},
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      const observed = JSON.parse(result.stdout) as { pwd?: string; cwd?: string };
+      expect(observed.cwd).toBe(realWorkspaceDir);
+      expect(observed.pwd).toBe(realWorkspaceDir);
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("lets an explicit PWD override in opts.env win over the spawn cwd", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pwd-explicit-"));
+    const realWorkspaceDir = await fs.realpath(workspaceDir);
+    try {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", "process.stdout.write(String(process.env.PWD));"],
+        {
+          cwd: realWorkspaceDir,
+          env: { PWD: "/explicit/override" },
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("/explicit/override");
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),

@@ -3067,8 +3067,20 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        const spawnCwd = target.cwd ?? opts.cwd;
+        // `spawn`'s cwd option changes the child's real cwd but leaves PWD as
+        // inherited from the Paperclip server process. Adapter runtimes that
+        // resolve their project root from PWD rather than the real cwd (OpenCode
+        // 1.18+ re-roots its session on PWD) would otherwise root every run at
+        // the server's own directory and treat the provisioned execution
+        // workspace as an external directory. Keep PWD in sync with the cwd we
+        // actually spawn into, unless a caller pinned PWD explicitly.
+        if (spawnCwd && opts.env.PWD === undefined && target.env?.PWD === undefined) {
+          childEnv.PWD = spawnCwd;
+          delete childEnv.OLDPWD;
+        }
         const child = spawn(target.command, target.args, {
-          cwd: target.cwd ?? opts.cwd,
+          cwd: spawnCwd,
           env: childEnv,
           detached: process.platform !== "win32",
           shell: false,
