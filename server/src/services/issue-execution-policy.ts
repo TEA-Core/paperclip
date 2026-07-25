@@ -336,7 +336,15 @@ export function setIssueExecutionPolicyMonitorScheduledBy(
   };
 }
 
-export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
+export function normalizeIssueExecutionPolicy(
+  input: unknown,
+  // Untrusted callers (the API routes) redact `monitor.externalRef` because it is
+  // secret-adjacent. Trusted internal writers set it to a Paperclip run id they must
+  // be able to read back — `hasPendingProviderQuotaRecoveryMonitor` compares the
+  // persisted ref against the latest run id to avoid restamping a live monitor — so
+  // they opt out of redaction.
+  options?: { preserveMonitorExternalRef?: boolean },
+): IssueExecutionPolicy | null {
   if (input == null) return null;
   const parsed = issueExecutionPolicySchema.safeParse(input);
   if (!parsed.success) {
@@ -380,7 +388,9 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       scheduledBy: parsed.data.monitor.scheduledBy,
       kind: parsed.data.monitor.kind ?? null,
       serviceName: normalizeMonitorText(parsed.data.monitor.serviceName),
-      externalRef: redactIssueMonitorExternalRef(parsed.data.monitor.externalRef),
+      externalRef: options?.preserveMonitorExternalRef
+        ? normalizeMonitorText(parsed.data.monitor.externalRef)
+        : redactIssueMonitorExternalRef(parsed.data.monitor.externalRef),
       timeoutAt: parsed.data.monitor.timeoutAt ?? null,
       maxAttempts: parsed.data.monitor.maxAttempts ?? null,
       recoveryPolicy: parsed.data.monitor.recoveryPolicy ?? null,

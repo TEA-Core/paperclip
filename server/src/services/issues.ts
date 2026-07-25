@@ -6555,7 +6555,12 @@ export function issueService(db: Db) {
         await assertAssignableUser(existing.companyId, issueData.assigneeUserId);
       }
       if (Object.prototype.hasOwnProperty.call(issueData, "executionPolicy")) {
-        const normalizedPolicy = normalizeIssueExecutionPolicy(issueData.executionPolicy ?? null);
+        // Routes already normalize (and redact) before reaching the service, so the
+        // only writers still carrying a raw `monitor.externalRef` here are internal
+        // ones that need to read it back — see normalizeIssueExecutionPolicy.
+        const normalizedPolicy = normalizeIssueExecutionPolicy(issueData.executionPolicy ?? null, {
+          preserveMonitorExternalRef: true,
+        });
         const normalizedPolicyRecord = (normalizedPolicy as Record<string, unknown> | null) ?? null;
         issueData.executionPolicy = normalizedPolicyRecord;
         patch.executionPolicy = normalizedPolicyRecord;
