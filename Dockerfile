@@ -68,6 +68,9 @@ RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/cod
   && mkdir -p /paperclip \
   && chown node:node /paperclip
 
+# CodeGraph CLI — agent code-exploration index (doctrine/exploration.md: CodeGraph FIRST)
+RUN npm install --global --omit=dev @colbymchenry/codegraph@1.5.0
+
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
