@@ -1001,6 +1001,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         if (forceFreshSession) {
           notes.push("Codex transient fallback forced a fresh session with a continuation handoff.");
         }
+        if (agentsMtimeBypassNote) {
+          notes.push(agentsMtimeBypassNote);
+        }
         return notes;
       }
       if (instructionsPrefix.length > 0) {
@@ -1016,6 +1019,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           if (forceFreshSession) {
             notes.push("Codex transient fallback forced a fresh session with a continuation handoff.");
           }
+          if (agentsMtimeBypassNote) {
+            notes.push(agentsMtimeBypassNote);
+          }
           return notes;
         }
         const notes = [
@@ -1029,6 +1035,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         if (forceFreshSession) {
           notes.push("Codex transient fallback forced a fresh session with a continuation handoff.");
         }
+        if (agentsMtimeBypassNote) {
+          notes.push(agentsMtimeBypassNote);
+        }
         return notes;
       }
       const notes = [
@@ -1040,6 +1049,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
       if (forceFreshSession) {
         notes.push("Codex transient fallback forced a fresh session with a continuation handoff.");
+      }
+      if (agentsMtimeBypassNote) {
+        notes.push(agentsMtimeBypassNote);
       }
       return notes;
     })();
