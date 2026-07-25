@@ -155,7 +155,21 @@ type ProcessOutputAccumulator = {
   finish(): ProcessOutputCapture;
 };
 
-export async function resetRuntimeServicesForTests() {
+export async function resetRuntimeServicesForTests(options?: { keepProcessesRunning?: boolean }) {
+  // Stop what is still registered instead of merely forgetting it. These maps
+  // are the only handle on a spawned child, so clearing them while a service is
+  // still running orphans that process permanently — nothing can reap it
+  // afterwards and it holds its port for the life of the host. Any service a
+  // test did not stop itself lands here.
+  //
+  // keepProcessesRunning is for the adoption tests, which need a live service to
+  // survive the reset so they can model a Paperclip restart. Callers that pass it
+  // own the resulting process and must stop it themselves.
+  if (!options?.keepProcessesRunning) {
+    for (const serviceId of Array.from(runtimeServicesById.keys())) {
+      await stopRuntimeService(serviceId).catch(() => undefined);
+    }
+  }
   for (const record of runtimeServicesById.values()) {
     clearIdleTimer(record);
   }
@@ -3545,7 +3559,14 @@ export function resolveWorkspaceRuntimeReadinessTimeoutSec(service: Record<strin
   return looksLikeWorkspaceDevServerCommand(asString(service.command, "")) ? 90 : 30;
 }
 
-async function waitForReadiness(input: {
+function isReadinessProbeTimeout(err: unknown) {
+  // AbortSignal.timeout rejects with a TimeoutError DOMException; undici can
+  // also surface the abort as a plain AbortError.
+  return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+}
+
+// Exported for tests only, alongside resolveWorkspaceRuntimeReadinessTimeoutSec.
+export async function waitForReadiness(input: {
   service: Record<string, unknown>;
   serviceName?: string | null;
   command?: string | null;
@@ -3565,17 +3586,30 @@ async function waitForReadiness(input: {
   }
   const timeoutSec = resolveWorkspaceRuntimeReadinessTimeoutSec(input.service);
   const intervalMs = Math.max(100, asNumber(readiness.intervalMs, 500));
+  // Each probe needs its own bound. `fetch` has no default timeout, and a
+  // connect to a not-yet-listening port can stall for tens of seconds on a
+  // loaded host instead of refusing immediately. The loop only re-checks the
+  // deadline between attempts, so one stalled probe consumed the entire budget
+  // and reported a service dead after a single attempt — while it was in fact
+  // listening and healthy. Capping well under the total makes a stall cost one
+  // retry instead of the whole window.
+  const probeBudgetMs = Math.max(1_000, intervalMs * 4);
   const deadline = Date.now() + timeoutSec * 1000;
   let lastError = "service did not become ready";
   while (Date.now() < deadline) {
+    const probeTimeoutMs = Math.min(probeBudgetMs, deadline - Date.now());
     try {
-      const response = await fetch(readinessUrl);
+      const response = await fetch(readinessUrl, { signal: AbortSignal.timeout(probeTimeoutMs) });
       if (response.ok) return;
       lastError = `received HTTP ${response.status}`;
     } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
+      lastError = isReadinessProbeTimeout(err)
+        ? `probe timed out after ${probeTimeoutMs}ms`
+        : err instanceof Error
+          ? err.message
+          : String(err);
     }
-    await delay(intervalMs);
+    await delay(Math.min(intervalMs, Math.max(0, deadline - Date.now())));
   }
   throw new Error(`Readiness check failed for ${readinessUrl}: ${lastError}`);
 }

@@ -2,6 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -40,6 +41,7 @@ import {
   sanitizeRuntimeServiceBaseEnv,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
+  waitForReadiness,
   type RealizedExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
 import {
@@ -4127,6 +4129,84 @@ describe("resolveShell (shell fallback)", () => {
   });
 });
 
+describe("waitForReadiness", () => {
+  // A server that accepts the connection and then never answers. This is the
+  // shape that used to burn the whole readiness budget in a single attempt:
+  // fetch has no default timeout, so the loop never got back to its deadline
+  // check until the socket gave up on its own.
+  async function startStallingServer(onRequest: (attempt: number) => "stall" | "ok") {
+    let attempts = 0;
+    // Every accepted socket is tracked, not just the stalled ones. The probe
+    // goes through fetch, whose agent keeps connections alive, so server.close()
+    // would otherwise sit waiting on an idle keep-alive socket and leave this
+    // listener holding its port well into the tests that follow.
+    const sockets = new Set<net.Socket>();
+    const server = http.createServer((_req, res) => {
+      attempts += 1;
+      if (onRequest(attempts) === "ok") res.end("ok");
+      // Otherwise hold the request open and never answer.
+    });
+    server.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    return {
+      url: `http://127.0.0.1:${port}`,
+      getAttempts: () => attempts,
+      async close() {
+        for (const socket of sockets) socket.destroy();
+        sockets.clear();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      },
+    };
+  }
+
+  it("retries past a stalled probe instead of spending the whole budget on it", async () => {
+    // The first probe stalls forever and the second would succeed. Without a
+    // per-probe bound the first consumes the entire window and readiness fails;
+    // with one it is abandoned and the retry answers.
+    const server = await startStallingServer((attempt) => (attempt === 1 ? "stall" : "ok"));
+    try {
+      const startedAt = Date.now();
+      await waitForReadiness({
+        service: { readiness: { type: "http", intervalMs: 100, timeoutSec: 30 } },
+        serviceName: "web",
+        command: "node server.js",
+        url: server.url,
+        readinessUrl: server.url,
+      });
+      expect(server.getAttempts()).toBeGreaterThan(1);
+      expect(Date.now() - startedAt).toBeLessThan(30_000);
+    } finally {
+      await server.close();
+    }
+  }, 60_000);
+
+  it("reports the probe timeout rather than a stale error when nothing ever answers", async () => {
+    const server = await startStallingServer(() => "stall");
+    try {
+      await expect(
+        waitForReadiness({
+          // 6s of budget against a 1s per-probe bound leaves room for several
+          // attempts even when this host is loaded.
+          service: { readiness: { type: "http", intervalMs: 100, timeoutSec: 6 } },
+          serviceName: "web",
+          command: "node server.js",
+          url: server.url,
+          readinessUrl: server.url,
+        }),
+      ).rejects.toThrow(/probe timed out after \d+ms/);
+      expect(server.getAttempts()).toBeGreaterThan(1);
+    } finally {
+      await server.close();
+    }
+  }, 60_000);
+});
+
 describe("readLocalServicePortOwner", () => {
   const originalPlatform = process.platform;
 
@@ -5282,7 +5362,9 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     await expect(fetch(service!.url!)).resolves.toMatchObject({ ok: true });
 
     await fs.rm(paperclipHome, { recursive: true, force: true });
-    await resetRuntimeServicesForTests();
+    // The service has to outlive the reset here: this models a Paperclip restart
+    // finding its own service still running. It is stopped at the end of the test.
+    await resetRuntimeServicesForTests({ keepProcessesRunning: true });
 
     const result = await reconcilePersistedRuntimeServicesOnStartup(db);
     expect(result).toMatchObject({ reconciled: 1, adopted: 1, stopped: 0 });
