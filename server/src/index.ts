@@ -949,6 +949,11 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
         }
 
+        const hardStopped = await heartbeat.scanTerminableSilentActiveRuns();
+        if (hardStopped.terminated > 0) {
+          logger.warn({ ...hardStopped }, "startup active-run output watchdog terminated runs with no child output");
+        }
+
         const swept = await heartbeat.sweepStaleIssueLocks();
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
@@ -1078,6 +1083,15 @@ export async function startServer(): Promise<StartedServer> {
               const scanned = await heartbeat.scanSilentActiveRuns();
               if (scanned.created > 0 || scanned.escalated > 0) {
                 logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
+              }
+            })
+            .then(async () => {
+              const hardStopped = await heartbeat.scanTerminableSilentActiveRuns();
+              if (hardStopped.terminated > 0) {
+                logger.warn(
+                  { ...hardStopped },
+                  "periodic active-run output watchdog terminated runs with no child output",
+                );
               }
             })
             .then(async () => {

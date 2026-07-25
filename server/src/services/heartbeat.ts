@@ -323,6 +323,7 @@ const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
+  ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
@@ -2914,6 +2915,65 @@ export function resolveRuntimeSessionParamsForWorkspace(input: {
       `Project workspace "${projectCwd}" is now available. ` +
       `Attempting to resume session "${previousSessionId}" that was previously saved in fallback workspace "${previousCwd}".`,
   };
+}
+
+const RUNTIME_STATE_SESSION_WORKSPACE_KEYS = ["cwd", "workspaceId", "repoUrl", "repoRef"] as const;
+
+/**
+ * `agentRuntimeState.sessionId` is the resume source for wakes that carry no
+ * task/issue key, but `stateJson` was left `{}`, so that session travelled with
+ * no record of the directory it was created in. Workspace resolution then had no
+ * `previousSessionParams.cwd` to honour and fell through to the agent-home
+ * fallback, while the session id was still handed to the adapter — which for
+ * `opencode_local` means `--session <s> --dir <other>`, a combination that hangs
+ * the child forever.
+ *
+ * Persisting the workspace next to the session id lets the next run resolve back
+ * through the `source: "task_session"` branch instead.
+ */
+export function buildRuntimeStateSessionJson(
+  previousStateJson: unknown,
+  session: { sessionId: string | null; params: Record<string, unknown> | null },
+): Record<string, unknown> {
+  const stateJson = parseObject(previousStateJson);
+  const sessionId = readNonEmptyString(session.sessionId);
+  if (!sessionId) {
+    delete stateJson.session;
+    return stateJson;
+  }
+  const params = parseObject(session.params);
+  const stored: Record<string, unknown> = { sessionId };
+  for (const key of RUNTIME_STATE_SESSION_WORKSPACE_KEYS) {
+    const value = readNonEmptyString(params[key]);
+    if (value) stored[key] = value;
+  }
+  stateJson.session = stored;
+  return stateJson;
+}
+
+/**
+ * Counterpart to `buildRuntimeStateSessionJson`. Returns resume params only when
+ * the stored state describes the session we are actually about to resume and
+ * records the directory it belongs to; anything less is not proof of a workspace
+ * and is better left to start a fresh session.
+ */
+export function readRuntimeStateSessionParams(
+  stateJson: unknown,
+  legacySessionId: string | null,
+): Record<string, unknown> | null {
+  const sessionId = readNonEmptyString(legacySessionId);
+  if (!sessionId) return null;
+  const stored = parseObject(parseObject(stateJson).session);
+  if (readNonEmptyString(stored.sessionId) !== sessionId) return null;
+  const cwd = readNonEmptyString(stored.cwd);
+  if (!cwd) return null;
+  const params: Record<string, unknown> = { sessionId, cwd };
+  for (const key of RUNTIME_STATE_SESSION_WORKSPACE_KEYS) {
+    if (key === "cwd") continue;
+    const value = readNonEmptyString(stored[key]);
+    if (value) params[key] = value;
+  }
+  return params;
 }
 
 function parseIssueAssigneeAdapterOverrides(
@@ -11591,6 +11651,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.scanSilentActiveRuns({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  // Deliberately not scoped by the worktree execution cutoff: a hung child is
+  // hung whether or not its run is bound to a recent issue, and the run that
+  // exposed this had no issue context at all.
+  async function scanTerminableSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
+    return recovery.scanTerminableSilentActiveRuns(opts);
+  }
+
   async function reconcileProductivityReviews(opts?: { now?: Date; companyId?: string }) {
     return productivityReviews.reconcileProductivityReviews({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
@@ -11627,10 +11694,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
     result: AdapterExecutionResult,
-    session: { legacySessionId: string | null },
+    session: { legacySessionId: string | null; sessionParams?: Record<string, unknown> | null },
     normalizedUsage?: UsageTotals | null,
   ) {
-    await ensureRuntimeState(agent);
+    const runtimeStateBefore = await ensureRuntimeState(agent);
     const usage = normalizedUsage ?? normalizeUsageTotals(result.usage);
     const inputTokens = usage?.inputTokens ?? 0;
     const outputTokens = usage?.outputTokens ?? 0;
@@ -11653,6 +11720,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         adapterType: agent.adapterType,
         sessionId: session.legacySessionId,
+        stateJson: buildRuntimeStateSessionJson(runtimeStateBefore.stateJson, {
+          sessionId: session.legacySessionId,
+          params: session.sessionParams ?? null,
+        }),
         lastRunId: run.id,
         lastRunStatus: run.status,
         lastError: result.errorMessage ?? null,
@@ -12414,7 +12485,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         stripPaperclipSessionMetadataFromSessionParams(
           sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
         ),
-      );
+      ) ??
+      // Mirrors the `runtimeSessionFallback` gate below: when the wake carries no
+      // task key we resume `agentRuntimeState.sessionId`, so pair it with the
+      // workspace that session was persisted against instead of letting workspace
+      // resolution fall through to the agent-home default.
+      (taskKey || resetTaskSession
+        ? null
+        : normalizeResumeParamsForAdapter(
+            agent.adapterType,
+            readRuntimeStateSessionParams(runtime.stateJson, runtime.sessionId),
+          ));
     const {
       selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
       workspace: resolvedWorkspace,
@@ -14001,6 +14082,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (finalizedRun) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
+          sessionParams: nextSessionState.params,
         }, normalizedUsage);
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
@@ -14137,6 +14219,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           errorMessage: message,
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
+          sessionParams: runtimeForAdapter.sessionParams,
         });
 
         if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
@@ -16986,6 +17069,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileIssueGraphLiveness,
 
     scanSilentActiveRuns,
+    scanTerminableSilentActiveRuns,
 
     reconcileProductivityReviews,
 

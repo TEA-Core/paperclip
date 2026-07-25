@@ -19,6 +19,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
@@ -685,6 +686,131 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
     expect(staleResult).toMatchObject({ created: 0, snoozed: 1 });
     expect(noisyResult).toMatchObject({ scanned: 0, created: 0 });
+  });
+
+  // `scanSilentActiveRuns` only ever files an evaluation issue and a wake request;
+  // `heartbeat_run_watchdog_decisions` had zero rows ever recorded, and while the
+  // owning agent is paused nothing acts on the issue at all, so a child that has
+  // gone silent stays alive and the run stays `running` indefinitely. Zero output
+  // *since spawn* is the narrow, safe predicate for hard-stopping one.
+  describe("zero-output hard stop", () => {
+    async function seedTerminableRun(opts: { now: Date; ageMs: number; withOutput?: boolean }) {
+      const seeded = await seedRunningRun({ now: opts.now, ageMs: opts.ageMs, withOutput: opts.withOutput });
+      const processStartedAt = new Date(opts.now.getTime() - opts.ageMs);
+      await db
+        .update(heartbeatRuns)
+        .set({
+          processStartedAt,
+          processPid: 2_147_480_000,
+          processGroupId: 2_147_480_000,
+        })
+        .where(eq(heartbeatRuns.id, seeded.runId));
+      return seeded;
+    }
+
+    it("terminates and finalizes a run whose child never emitted a byte", async () => {
+      const now = new Date("2026-04-22T20:00:00.000Z");
+      const { companyId, runId } = await seedTerminableRun({
+        now,
+        ageMs: ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS + 60_000,
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.scanTerminableSilentActiveRuns({ now, companyId });
+
+      expect(result).toMatchObject({ scanned: 1, terminated: 1 });
+
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run.status).toBe("failed");
+      expect(run.errorCode).toBe("child_no_output_timeout");
+      expect(run.finishedAt).not.toBeNull();
+
+      const decisions = await db
+        .select()
+        .from(heartbeatRunWatchdogDecisions)
+        .where(eq(heartbeatRunWatchdogDecisions.runId, runId));
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0].decision).toBe("terminated_no_output");
+    });
+
+    it("leaves a run that has produced output alone, however slowly", async () => {
+      const now = new Date("2026-04-22T20:00:00.000Z");
+      const { companyId, runId } = await seedTerminableRun({
+        now,
+        ageMs: ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS + 60_000,
+        withOutput: true,
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.scanTerminableSilentActiveRuns({ now, companyId });
+
+      expect(result).toMatchObject({ scanned: 0, terminated: 0 });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run.status).toBe("running");
+    });
+
+    it("leaves a silent run alone until the termination threshold", async () => {
+      const now = new Date("2026-04-22T20:00:00.000Z");
+      const { companyId, runId } = await seedTerminableRun({
+        now,
+        ageMs: ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS - 60_000,
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.scanTerminableSilentActiveRuns({ now, companyId });
+
+      expect(result).toMatchObject({ scanned: 0, terminated: 0 });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run.status).toBe("running");
+    });
+
+    // Without process metadata there is no child to hard-stop; that run belongs to
+    // the evaluation path, not here.
+    it("leaves a run with no recorded process alone", async () => {
+      const now = new Date("2026-04-22T20:00:00.000Z");
+      const { companyId, runId } = await seedRunningRun({
+        now,
+        ageMs: ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS + 60_000,
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.scanTerminableSilentActiveRuns({ now, companyId });
+
+      expect(result).toMatchObject({ scanned: 0, terminated: 0 });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run.status).toBe("running");
+    });
+
+    it("honours an operator snooze", async () => {
+      const now = new Date("2026-04-22T20:00:00.000Z");
+      const { companyId, runId } = await seedTerminableRun({
+        now,
+        ageMs: ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS + 60_000,
+      });
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId,
+        runId,
+        decision: "snooze",
+        snoozedUntil: new Date(now.getTime() + 60 * 60 * 1000),
+        reason: "Intentional quiet run",
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.scanTerminableSilentActiveRuns({ now, companyId });
+
+      expect(result).toMatchObject({ scanned: 1, terminated: 0, snoozed: 1 });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run.status).toBe("running");
+    });
+
+    it("fires well before the critical evaluation threshold", () => {
+      expect(ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS).toBeGreaterThan(
+        ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
+      );
+      expect(ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS).toBeLessThan(
+        ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+      );
+    });
   });
 
   it("records watchdog decisions through recovery owner authorization", async () => {

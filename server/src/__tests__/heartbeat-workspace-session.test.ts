@@ -14,6 +14,7 @@ import {
   assertPushCapabilityCheckoutValid,
   buildExplicitResumeSessionOverride,
   buildEffectiveRunSessionConfigMetadata,
+  buildRuntimeStateSessionJson,
   buildEffectiveRunWorkspaceConfigMetadata,
   buildWorkspaceConfigFreshnessOperation,
   deriveTaskKeyWithHeartbeatFallback,
@@ -25,6 +26,7 @@ import {
   prioritizeProjectWorkspaceCandidatesForRun,
   parseSessionCompactionPolicy,
   provisionExecutionWorkspaceForFreshnessDecision,
+  readRuntimeStateSessionParams,
   resolveExecutionWorkspaceConfigFreshness,
   resolveExecutionWorkspaceReuseRequestForIssue,
   resolveExecutionWorkspaceReuseProvisioningPolicy,
@@ -961,6 +963,80 @@ describe("resolveRuntimeSessionParamsForWorkspace", () => {
       workspaceId: "workspace-1",
     });
     expect(result.warning).toBeNull();
+  });
+});
+
+// `agent_runtime_state.session_id` is the resume source for wakes that carry no
+// task/issue key, but `state_json` was left `{}`, so that session travelled with
+// no recorded workspace. Workspace resolution then had no `previousSessionParams.cwd`
+// to honour and fell through to the agent-home fallback, and the adapter resumed
+// the session into it anyway. Persist the workspace alongside the session id so
+// the next run resolves back to the directory the session actually lives in.
+describe("runtime state session persistence", () => {
+  it("persists the session workspace alongside the legacy session id", () => {
+    expect(
+      buildRuntimeStateSessionJson(
+        { unrelated: "keep-me" },
+        {
+          sessionId: "ses_1",
+          params: {
+            sessionId: "ses_1",
+            cwd: "/workspaces/wt-a",
+            workspaceId: "workspace-1",
+            repoUrl: "https://example.test/repo.git",
+            repoRef: "main",
+          },
+        },
+      ),
+    ).toEqual({
+      unrelated: "keep-me",
+      session: {
+        sessionId: "ses_1",
+        cwd: "/workspaces/wt-a",
+        workspaceId: "workspace-1",
+        repoUrl: "https://example.test/repo.git",
+        repoRef: "main",
+      },
+    });
+  });
+
+  it("omits workspace fields the run never resolved", () => {
+    expect(
+      buildRuntimeStateSessionJson(null, {
+        sessionId: "ses_1",
+        params: { sessionId: "ses_1", cwd: "/workspaces/wt-a" },
+      }),
+    ).toEqual({ session: { sessionId: "ses_1", cwd: "/workspaces/wt-a" } });
+  });
+
+  it("clears the stored session when the run ends without one", () => {
+    expect(
+      buildRuntimeStateSessionJson(
+        { session: { sessionId: "ses_1", cwd: "/workspaces/wt-a" }, unrelated: "keep-me" },
+        { sessionId: null, params: null },
+      ),
+    ).toEqual({ unrelated: "keep-me" });
+  });
+
+  it("reads the stored workspace back for the legacy session id", () => {
+    expect(
+      readRuntimeStateSessionParams(
+        { session: { sessionId: "ses_1", cwd: "/workspaces/wt-a", workspaceId: "workspace-1" } },
+        "ses_1",
+      ),
+    ).toEqual({ sessionId: "ses_1", cwd: "/workspaces/wt-a", workspaceId: "workspace-1" });
+  });
+
+  it("ignores stored state that belongs to a different session", () => {
+    expect(
+      readRuntimeStateSessionParams({ session: { sessionId: "ses_1", cwd: "/workspaces/wt-a" } }, "ses_2"),
+    ).toBeNull();
+  });
+
+  it("returns nothing when the stored session has no workspace to honour", () => {
+    expect(readRuntimeStateSessionParams({ session: { sessionId: "ses_1" } }, "ses_1")).toBeNull();
+    expect(readRuntimeStateSessionParams({}, "ses_1")).toBeNull();
+    expect(readRuntimeStateSessionParams({ session: { sessionId: "ses_1", cwd: "/w" } }, null)).toBeNull();
   });
 });
 

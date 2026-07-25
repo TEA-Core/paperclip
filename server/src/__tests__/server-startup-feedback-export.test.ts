@@ -54,6 +54,13 @@ const {
     })),
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
+    scanTerminableSilentActiveRuns: vi.fn(async () => ({
+      scanned: 0,
+      terminated: 0,
+      snoozed: 0,
+      skipped: 0,
+      runIds: [],
+    })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
     reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),

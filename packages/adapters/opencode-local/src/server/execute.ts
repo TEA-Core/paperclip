@@ -207,6 +207,47 @@ async function buildOpenCodeSkillsDir(config: Record<string, unknown>): Promise<
   return target;
 }
 
+export type OpenCodeSessionResumeDecision =
+  | { resume: true; sessionId: string }
+  | {
+      resume: false;
+      sessionId: string | null;
+      reason: "no_session" | "unknown_cwd" | "cwd_mismatch" | "execution_target_mismatch";
+    };
+
+// `opencode run --session <s> --dir <d>` hangs forever when <d> is not the
+// directory <s> was created in: opencode bootstraps <d>, then bootstraps the
+// session's own recorded directory, exits its prompt loop, and then never
+// terminates or writes a byte to stdout. Because the process adapter waits on
+// child exit, that pins the heartbeat run at `running` with no exit code.
+//
+// So a resume requires positive proof that the session belongs to the directory
+// we are about to run in. An unknown session cwd is NOT proof: sessions carried
+// on the legacy `agent_runtime_state.session_id` fallback have no recorded cwd,
+// and resuming those into whatever workspace resolution picked is exactly how
+// the hang was reached. A fresh session that works beats a resumed session that
+// hangs.
+export function resolveOpenCodeSessionResume(input: {
+  sessionId: string;
+  sessionCwd: string;
+  executionCwd: string;
+  executionTargetMatches: boolean;
+}): OpenCodeSessionResumeDecision {
+  if (input.sessionId.length === 0) {
+    return { resume: false, sessionId: null, reason: "no_session" };
+  }
+  if (!input.executionTargetMatches) {
+    return { resume: false, sessionId: input.sessionId, reason: "execution_target_mismatch" };
+  }
+  if (input.sessionCwd.length === 0) {
+    return { resume: false, sessionId: input.sessionId, reason: "unknown_cwd" };
+  }
+  if (path.resolve(input.sessionCwd) !== path.resolve(input.executionCwd)) {
+    return { resume: false, sessionId: input.sessionId, reason: "cwd_mismatch" };
+  }
+  return { resume: true, sessionId: input.sessionId };
+}
+
 // OpenCode 1.18+ resolves the directory its session is rooted at from PWD, not
 // from the process cwd, so a stale inherited PWD silently moves the session (and
 // the directory its write permissions are scoped to) off the provisioned
@@ -498,17 +539,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
     const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
     const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
-    const canResumeSession =
-      runtimeSessionId.length > 0 &&
-      (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
-      adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
-    const sessionId = canResumeSession ? runtimeSessionId : null;
-    if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
+    const resumeDecision = resolveOpenCodeSessionResume({
+      sessionId: runtimeSessionId,
+      sessionCwd: runtimeSessionCwd,
+      executionCwd: effectiveExecutionCwd,
+      executionTargetMatches: adapterExecutionTargetSessionMatches(
+        runtimeRemoteExecution,
+        runtimeExecutionTarget,
+      ),
+    });
+    const sessionId = resumeDecision.resume ? resumeDecision.sessionId : null;
+    if (!resumeDecision.resume && resumeDecision.reason === "execution_target_mismatch") {
       await onLog(
         "stdout",
         `[paperclip] OpenCode session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
       );
-    } else if (runtimeSessionId && !canResumeSession) {
+    } else if (!resumeDecision.resume && resumeDecision.reason === "unknown_cwd") {
+      await onLog(
+        "stdout",
+        `[paperclip] OpenCode session "${runtimeSessionId}" has no recorded workspace directory, so it cannot be proven to belong to "${effectiveExecutionCwd}" and will not be resumed. Starting a fresh session.\n`,
+      );
+    } else if (!resumeDecision.resume && resumeDecision.reason === "cwd_mismatch") {
       await onLog(
         "stdout",
         `[paperclip] OpenCode session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,

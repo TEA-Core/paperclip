@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -80,6 +80,13 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+// The evaluation path above only ever files review work; nothing in it terminates
+// a process, and while the owning agent is paused nothing acts on the issue at
+// all, so a child that hung after finishing its work stayed alive indefinitely
+// and pinned its run at `running`. Hard-stop that case on a bounded timer, after
+// the suspicion evaluation has had a chance to reach a human but well before the
+// critical mark.
+export const ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS = 90 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
@@ -2229,6 +2236,187 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     return result;
+  }
+
+  /**
+   * Bounded hard-stop for a run whose child has emitted nothing at all since it
+   * was spawned.
+   *
+   * The predicate is deliberately narrow: `lastOutputAt` before `processStartedAt`
+   * (or absent) means every byte on the run belongs to Paperclip's own pre-spawn
+   * banner and the child itself has said nothing. A run that is merely producing
+   * output slowly always has output *after* spawn and is never a candidate here —
+   * it stays with the evaluation path in `scanSilentActiveRuns`.
+   *
+   * Process metadata is required: with no pid or process group there is no child
+   * to stop, and finalizing such a run would be a guess rather than a hard-stop.
+   */
+  async function scanTerminableSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
+    const now = opts?.now ?? new Date();
+    const terminateBefore = new Date(now.getTime() - ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS);
+    const candidates = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
+          eq(heartbeatRuns.status, "running"),
+          isNotNull(heartbeatRuns.processStartedAt),
+          sql`(${heartbeatRuns.processPid} is not null or ${heartbeatRuns.processGroupId} is not null)`,
+          sql`(${heartbeatRuns.lastOutputAt} is null or ${heartbeatRuns.lastOutputAt} < ${heartbeatRuns.processStartedAt})`,
+          sql`${heartbeatRuns.processStartedAt} <= ${terminateBefore.toISOString()}::timestamptz`,
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.createdAt))
+      .limit(100);
+
+    const result = {
+      scanned: candidates.length,
+      terminated: 0,
+      snoozed: 0,
+      skipped: 0,
+      runIds: [] as string[],
+    };
+
+    for (const run of candidates) {
+      if (await latestActiveOutputQuietUntilDecision(run.companyId, run.id, now)) {
+        result.snoozed += 1;
+        continue;
+      }
+      const runningAgent = await db
+        .select()
+        .from(agents)
+        .where(eq(agents.id, run.agentId))
+        .then((rows) => rows[0] ?? null);
+      if (!runningAgent || !SESSIONED_LOCAL_ADAPTERS.has(runningAgent.adapterType)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const silenceAgeMs = run.processStartedAt ? now.getTime() - run.processStartedAt.getTime() : null;
+      const cleanup = await cleanupSourceResolvedRunProcess({ run, runningAgent });
+      const terminated = await terminateSilentActiveRun({ run, cleanup, silenceAgeMs, now });
+      if (!terminated) {
+        result.skipped += 1;
+        continue;
+      }
+      result.terminated += 1;
+      result.runIds.push(run.id);
+    }
+
+    return result;
+  }
+
+  async function terminateSilentActiveRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    cleanup: Awaited<ReturnType<typeof cleanupSourceResolvedRunProcess>>;
+    silenceAgeMs: number | null;
+    now: Date;
+  }) {
+    const errorMessage =
+      `Child process produced no output for ${formatDuration(input.silenceAgeMs ?? 0)} after spawn and was terminated by the recovery watchdog.`;
+    const resultJson = {
+      ...parseObject(input.run.resultJson),
+      noOutputTerminationWatchdog: {
+        processStartedAt: input.run.processStartedAt?.toISOString() ?? null,
+        lastOutputAt: input.run.lastOutputAt?.toISOString() ?? null,
+        silenceAgeMs: input.silenceAgeMs,
+        thresholdMs: ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS,
+        cleanup: input.cleanup,
+      },
+    };
+
+    const finalizedRun = await db.transaction(async (tx) => {
+      const [updatedRun] = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          finishedAt: input.now,
+          error: errorMessage,
+          errorCode: "child_no_output_timeout",
+          resultJson,
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, input.run.id),
+            eq(heartbeatRuns.companyId, input.run.companyId),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        )
+        .returning();
+      if (!updatedRun) return null;
+
+      if (input.run.wakeupRequestId) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "failed",
+            finishedAt: input.now,
+            error: errorMessage,
+            updatedAt: input.now,
+          })
+          .where(
+            and(
+              eq(agentWakeupRequests.id, input.run.wakeupRequestId),
+              eq(agentWakeupRequests.companyId, input.run.companyId),
+            ),
+          );
+      }
+
+      await tx
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: input.now,
+        })
+        .where(and(eq(issues.companyId, input.run.companyId), eq(issues.executionRunId, input.run.id)));
+
+      await tx.insert(heartbeatRunWatchdogDecisions).values({
+        companyId: input.run.companyId,
+        runId: input.run.id,
+        evaluationIssueId: null,
+        decision: "terminated_no_output",
+        snoozedUntil: null,
+        reason: errorMessage,
+        createdByAgentId: null,
+        createdByUserId: null,
+        createdByRunId: null,
+      });
+
+      return updatedRun;
+    });
+    if (!finalizedRun) return false;
+
+    await appendRecoveryRunEvent(finalizedRun, {
+      level: "error",
+      message: errorMessage,
+      payload: { source: "recovery.no_output_termination", cleanup: input.cleanup },
+    });
+    await logActivity(db, {
+      companyId: finalizedRun.companyId,
+      actorType: "system",
+      actorId: "recovery",
+      agentId: finalizedRun.agentId,
+      runId: finalizedRun.id,
+      action: "heartbeat.run_terminated_no_output",
+      entityType: "heartbeat_run",
+      entityId: finalizedRun.id,
+      details: {
+        source: "recovery.no_output_termination",
+        silenceAgeMs: input.silenceAgeMs,
+        thresholdMs: ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS,
+        cleanup: input.cleanup,
+      },
+    });
+    // Settle the agent back to idle rather than error: the failure is durably
+    // recorded on the run, the activity log and the watchdog decision, and a
+    // wedged child is not a reason to make the agent need manual clearing before
+    // it can take new work. Paused/terminated agents are left as they are.
+    await finalizeAgentAfterSourceResolvedRun(finalizedRun, "cancelled");
+    return true;
   }
 
   async function recordWatchdogDecision(input: {
@@ -5405,6 +5593,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     escalateStrandedAssignedIssue,
     recordWatchdogDecision,
     scanSilentActiveRuns,
+    scanTerminableSilentActiveRuns,
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
     buildIssueGraphLivenessAutoRecoveryPreview,
