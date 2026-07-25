@@ -1,12 +1,14 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
+  create: vi.fn(),
   createChild: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
@@ -134,7 +136,9 @@ type TestActor =
       type: "board";
       userId: string;
       companyIds: string[];
-      source: "local_implicit";
+      // `oauth` is the un-elevated external caller: the same board shape, but it
+      // does not carry the implicit local grant, so permission gates are enforced.
+      source: "local_implicit" | "oauth";
       isInstanceAdmin: boolean;
     }
   | {
@@ -652,5 +656,206 @@ describe("issue execution policy routes", () => {
         details: expect.not.objectContaining({ externalRef: expect.anything() }),
       }),
     );
+  });
+
+  describe("returnAssigneeAgentId assignment authorization", () => {
+    // The default board actor carries `local_implicit`, which bypasses the
+    // permission gate. These cases need a caller that does not, so they build the
+    // same board shape over an `oauth` source. The 403 bodies are matched rather
+    // than compared whole because this tree's deny response also carries
+    // `details.reason`, which is not what these cases are about.
+    function externalActor(): TestActor {
+      return {
+        type: "board",
+        userId: "external-user",
+        companyIds: ["company-1"],
+        source: "oauth",
+        isInstanceAdmin: false,
+      };
+    }
+
+    it("requires tasks:assign to create an issue with returnAssigneeAgentId in policy", async () => {
+      const assigneeAgentId = randomUUID();
+      const reviewerAgentId = randomUUID();
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: assigneeAgentId,
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        }],
+      })!;
+
+      mockIssueService.create.mockResolvedValue({
+        id: randomUUID(),
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        title: "Policy issue",
+      } as any);
+
+      const res = await request(await createApp(externalActor()))
+        .post("/api/companies/company-1/issues")
+        .send({ title: "Policy issue", executionPolicy: policy });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ error: "Missing permission: tasks:assign" });
+    });
+
+    it("requires tasks:assign to create a child issue with returnAssigneeAgentId in policy", async () => {
+      const assigneeAgentId = randomUUID();
+      const reviewerAgentId = randomUUID();
+      const parentId = randomUUID();
+      const childId = randomUUID();
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: assigneeAgentId,
+        stages: [{
+          type: "approval",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        }],
+      })!;
+
+      // The child route gates parent read access before it reaches the assign
+      // gate, and the shared test grant only allows `issue:read` for a
+      // `local_implicit` board actor. Grant every action except `tasks:assign`
+      // so this case lands on the gate it is actually about.
+      mockAccessService.decide.mockImplementation(async (input: { action?: string }) => {
+        const allowed = input.action !== "tasks:assign";
+        return {
+          allowed,
+          action: input.action,
+          reason: allowed ? "allow_explicit_grant" : "deny_missing_grant",
+          explanation: allowed ? "Allowed by test grant." : `Missing permission: ${input.action ?? "action"}`,
+        };
+      });
+
+      mockIssueService.getById.mockResolvedValue({ id: parentId, companyId: "company-1" });
+      mockIssueService.createChild.mockResolvedValue({
+        issue: {
+          id: childId,
+          companyId: "company-1",
+          status: "todo",
+        } as any,
+        parentBlockerAdded: false,
+      });
+
+      const res = await request(await createApp(externalActor()))
+        .post(`/api/issues/${parentId}/children`)
+        .send({ title: "Child policy issue", executionPolicy: policy });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ error: "Missing permission: tasks:assign" });
+    });
+
+    it("requires tasks:assign to set returnAssigneeAgentId via issue update", async () => {
+      const issueId = randomUUID();
+      const returnAssigneeAgentId = randomUUID();
+      const reviewerAgentId = randomUUID();
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-42",
+        title: "Execution policy edit",
+        executionPolicy: null,
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: { returnAssigneeAgentId, stages: [] } } as any);
+
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId,
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        }],
+      })!;
+
+      const res = await request(await createApp(externalActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: policy });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ error: "Missing permission: tasks:assign" });
+    });
+
+    it("requires tasks:assign to change returnAssigneeAgentId via issue update", async () => {
+      const issueId = randomUUID();
+      const oldReturnAssigneeAgentId = randomUUID();
+      const newReturnAssigneeAgentId = randomUUID();
+      const reviewerAgentId = randomUUID();
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-43",
+        title: "Execution policy change",
+        executionPolicy: normalizeIssueExecutionPolicy({
+          returnAssigneeAgentId: oldReturnAssigneeAgentId,
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+        }),
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: { returnAssigneeAgentId: newReturnAssigneeAgentId, stages: [] } } as any);
+
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: newReturnAssigneeAgentId,
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        }],
+      })!;
+
+      const res = await request(await createApp(externalActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: policy });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ error: "Missing permission: tasks:assign" });
+    });
+
+    it("requires tasks:assign to clear returnAssigneeAgentId via issue update", async () => {
+      const issueId = randomUUID();
+      const returnAssigneeAgentId = randomUUID();
+      const reviewerAgentId = randomUUID();
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-44",
+        title: "Execution policy clear",
+        executionPolicy: normalizeIssueExecutionPolicy({
+          returnAssigneeAgentId,
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+        }),
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: { stages: [] } } as any);
+
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        }],
+      })!;
+
+      const res = await request(await createApp(externalActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: policy });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ error: "Missing permission: tasks:assign" });
+    });
   });
 });
