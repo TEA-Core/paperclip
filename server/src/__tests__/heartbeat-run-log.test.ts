@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SECRET_REDACTION_TOKEN, redactSecretTokens } from "../log-redaction.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { compactRunLogChunk } from "../services/heartbeat.js";
 
 describe("compactRunLogChunk", () => {
@@ -54,8 +55,25 @@ describe("compactRunLogChunk composed with redactSecretTokens", () => {
 
     const result = redactSecretTokens(compactRunLogChunk(chunk));
 
+    // Two filters cover this line and the inner one wins: compactRunLogChunk
+    // itself runs redactSensitiveText, which masks `NAME=value` shapes before
+    // redactSecretTokens ever sees them. What matters here is that the tail of
+    // an oversized chunk is retained AND masked, not which filter did it.
     expect(result).not.toContain(secret);
-    expect(result).toContain(`SUPABASE_SECRET_KEY=${SECRET_REDACTION_TOKEN}`);
+    expect(result).toContain(`SUPABASE_SECRET_KEY=${REDACTED_EVENT_VALUE}`);
+  });
+
+  it("masks a bare secret-shaped token in the tail of an oversized chunk", () => {
+    // No `NAME=` assignment, so redactSensitiveText does not fire and this is
+    // the SUP-8631 filter working alone — the case that justifies running it
+    // outside compaction rather than relying on the inner one.
+    const secret = "sb_secret_TESTONLYaaaabbbbcccc1234";
+    const chunk = `${"x".repeat(90_000)}\nleaked value ${secret} here\n`;
+
+    const result = redactSecretTokens(compactRunLogChunk(chunk));
+
+    expect(result).not.toContain(secret);
+    expect(result).toContain(`leaked value ${SECRET_REDACTION_TOKEN} here`);
   });
 
   it("does not emit a secret marker inside inline base64 image data", () => {
