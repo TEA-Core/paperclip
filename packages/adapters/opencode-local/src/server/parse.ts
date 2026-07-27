@@ -21,7 +21,9 @@ function errorText(value: unknown): string {
 
 export function parseOpenCodeJsonl(stdout: string) {
   let sessionId: string | null = null;
-  const messages: string[] = [];
+  // Text parts are held with their owning message id so an auto-compaction
+  // summary can be retracted once the compaction is confirmed (see below).
+  const messages: { messageId: string; text: string }[] = [];
   const errors: string[] = [];
   const toolErrors: string[] = [];
   const usage = {
@@ -45,8 +47,25 @@ export function parseOpenCodeJsonl(stdout: string) {
 
     if (type === "text") {
       const part = parseObject(event.part);
+      const metadata = parseObject(part.metadata);
+
+      // OpenCode auto-compacts an overflowing session by emitting the session
+      // summary as an ordinary assistant text message, immediately followed by
+      // this synthetic "continue" part. The summary carries no marker of its
+      // own, so the nudge is the only signal that the preceding message was a
+      // compaction artifact rather than agent output — retract it here.
+      // Without this, every compaction leaks a full "## Objective / Work State"
+      // document into the issue comment body.
+      if (part.synthetic === true && metadata.compaction_continue === true) {
+        const summaryMessageId = messages.at(-1)?.messageId;
+        if (summaryMessageId !== undefined) {
+          while (messages.at(-1)?.messageId === summaryMessageId) messages.pop();
+        }
+        continue;
+      }
+
       const text = asString(part.text, "").trim();
-      if (text) messages.push(text);
+      if (text) messages.push({ messageId: asString(part.messageID, ""), text });
       continue;
     }
 
@@ -80,7 +99,7 @@ export function parseOpenCodeJsonl(stdout: string) {
 
   return {
     sessionId,
-    summary: messages.join("\n\n").trim(),
+    summary: messages.map((m) => m.text).join("\n\n").trim(),
     usage,
     costUsd,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,

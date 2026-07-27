@@ -69,6 +69,80 @@ describe("parseOpenCodeJsonl", () => {
     expect(parsed.toolErrors).toEqual(["File not found: e2b-adapter-result.txt"]);
   });
 
+  it("drops auto-compaction summaries and their continue nudge", () => {
+    // OpenCode auto-compacts an overflowing session by emitting the session
+    // summary as an ordinary assistant text message, then a synthetic
+    // `compaction_continue` part. Neither is agent output: leaking them turns a
+    // ~450B issue comment into an N-KB pile of repeated "## Objective" blocks.
+    const stdout = [
+      JSON.stringify({
+        type: "text",
+        sessionID: "session_123",
+        part: { messageID: "msg_real_1", text: "Reproduced the failure locally." },
+      }),
+      JSON.stringify({
+        type: "text",
+        sessionID: "session_123",
+        part: {
+          messageID: "msg_compaction_summary",
+          text: "## Objective\n- Fix the harness\n\n## Work State\n### Completed\n- (none)",
+        },
+      }),
+      JSON.stringify({
+        type: "text",
+        sessionID: "session_123",
+        part: {
+          messageID: "msg_compaction_continue",
+          synthetic: true,
+          metadata: { compaction_continue: true },
+          text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+        },
+      }),
+      JSON.stringify({
+        type: "text",
+        sessionID: "session_123",
+        part: { messageID: "msg_real_2", text: "Test passes now." },
+      }),
+    ].join("\n");
+
+    const parsed = parseOpenCodeJsonl(stdout);
+    expect(parsed.summary).toBe("Reproduced the failure locally.\n\nTest passes now.");
+    expect(parsed.summary).not.toContain("## Objective");
+    expect(parsed.summary).not.toContain("Continue if you have next steps");
+  });
+
+  it("drops a multi-part compaction summary sharing one message id", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "text",
+        sessionID: "session_123",
+        part: { messageID: "msg_real_1", text: "Kept." },
+      }),
+      JSON.stringify({
+        type: "text",
+        sessionID: "session_123",
+        part: { messageID: "msg_summary", text: "## Objective\n- part one" },
+      }),
+      JSON.stringify({
+        type: "text",
+        sessionID: "session_123",
+        part: { messageID: "msg_summary", text: "## Work State\n- part two" },
+      }),
+      JSON.stringify({
+        type: "text",
+        sessionID: "session_123",
+        part: {
+          messageID: "msg_continue",
+          synthetic: true,
+          metadata: { compaction_continue: true },
+          text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+        },
+      }),
+    ].join("\n");
+
+    expect(parseOpenCodeJsonl(stdout).summary).toBe("Kept.");
+  });
+
   it("detects unknown session errors", () => {
     expect(isOpenCodeUnknownSessionError("Session not found: s_123", "")).toBe(true);
     expect(isOpenCodeUnknownSessionError("", "unknown session id")).toBe(true);
