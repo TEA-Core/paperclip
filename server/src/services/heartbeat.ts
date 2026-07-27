@@ -199,6 +199,7 @@ import {
   findExistingFinishSuccessfulRunHandoffWake,
   findExistingRunLivenessContinuationWake,
   isSuccessfulRunHandoffValidPathSkip,
+  readPaperclipToolCallCount,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
 } from "./recovery/index.js";
@@ -8156,6 +8157,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       livenessState: run.livenessState as RunLivenessState | null,
       detectedProgressSummary,
+      paperclipToolCallCount: readPaperclipToolCallCount(run.resultJson),
       taskKey,
       hasActiveExecutionPath: Boolean(activeExecutionPath),
       hasQueuedWake: Boolean(queuedWake),

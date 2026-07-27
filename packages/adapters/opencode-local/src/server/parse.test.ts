@@ -149,3 +149,61 @@ describe("parseOpenCodeJsonl", () => {
     expect(isOpenCodeUnknownSessionError("all good", "")).toBe(false);
   });
 });
+
+describe("parseOpenCodeJsonl paperclip tool-call counter", () => {
+  function toolEvent(tool: string, callID: string, status = "completed") {
+    return JSON.stringify({
+      type: "tool_use",
+      sessionID: "session_123",
+      part: { tool, callID, state: { status } },
+    });
+  }
+
+  it("counts Paperclip tool calls and ignores every other tool", () => {
+    const stdout = [
+      toolEvent("paperclip_paperclipGetIssue", "call_1"),
+      toolEvent("bash", "call_2"),
+      toolEvent("paperclip_paperclipUpdateIssue", "call_3"),
+      toolEvent("bash", "call_4"),
+      toolEvent("bash", "call_5"),
+      JSON.stringify({ type: "text", sessionID: "session_123", part: { text: "done" } }),
+    ].join("\n");
+
+    expect(parseOpenCodeJsonl(stdout).paperclipToolCallCount).toBe(2);
+  });
+
+  it("counts a re-emitted tool part once per call id", () => {
+    const stdout = [
+      toolEvent("paperclip_paperclipUpdateIssue", "call_1", "pending"),
+      toolEvent("paperclip_paperclipUpdateIssue", "call_1", "running"),
+      toolEvent("paperclip_paperclipUpdateIssue", "call_1", "completed"),
+    ].join("\n");
+
+    expect(parseOpenCodeJsonl(stdout).paperclipToolCallCount).toBe(1);
+  });
+
+  it("reports zero for a run that only wrote prose", () => {
+    const stdout = [
+      toolEvent("bash", "call_1"),
+      JSON.stringify({
+        type: "text",
+        sessionID: "session_123",
+        part: { text: "## Blocked\n\nPlease provide the plan section." },
+      }),
+    ].join("\n");
+
+    expect(parseOpenCodeJsonl(stdout).paperclipToolCallCount).toBe(0);
+  });
+
+  it("counts unprefixed camelCase Paperclip tool names and `tool` part events", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "tool",
+        sessionID: "session_123",
+        part: { tool: "paperclipUpdateIssue", callID: "call_1", state: { status: "completed" } },
+      }),
+    ].join("\n");
+
+    expect(parseOpenCodeJsonl(stdout).paperclipToolCallCount).toBe(1);
+  });
+});

@@ -12,6 +12,7 @@ import {
   isSuccessfulRunHandoffValidPathSkip,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
+  readPaperclipToolCallCount,
 } from "./successful-run-handoff.js";
 import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
 
@@ -47,6 +48,7 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
     agent,
     livenessState: "advanced",
     detectedProgressSummary: "Run produced concrete action evidence: 1 issue comment(s)",
+    paperclipToolCallCount: null,
     taskKey: "issue-1",
     hasActiveExecutionPath: false,
     hasQueuedWake: false,
@@ -184,6 +186,62 @@ describe("successful run handoff decision", () => {
       kind: "skip",
       reason: "active routine continuation owns the next action",
     });
+  });
+
+  it("queues a corrective wake when a successful run made zero Paperclip tool calls", () => {
+    const decision = decide({
+      livenessState: null,
+      detectedProgressSummary: null,
+      paperclipToolCallCount: 0,
+    });
+
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.targetAgentId).toBe(run.agentId);
+    expect(decision.payload).toMatchObject({
+      issueId: "issue-1",
+      sourceRunId: "run-1",
+      handoffRequired: true,
+      handoffReason: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+    });
+  });
+
+  it("still skips a run with Paperclip tool calls but no progress signal", () => {
+    expect(
+      decide({ livenessState: null, detectedProgressSummary: null, paperclipToolCallCount: 3 }),
+    ).toEqual({
+      kind: "skip",
+      reason: "successful run did not produce handoff-relevant progress",
+    });
+  });
+
+  it("treats an unreported tool-call count exactly as before the counter existed", () => {
+    expect(
+      decide({ livenessState: null, detectedProgressSummary: null, paperclipToolCallCount: null }),
+    ).toEqual({
+      kind: "skip",
+      reason: "successful run did not produce handoff-relevant progress",
+    });
+    expect(
+      decide({ livenessState: "advanced", detectedProgressSummary: null, paperclipToolCallCount: null })
+        .kind,
+    ).toBe("enqueue");
+  });
+
+  it.each([
+    ["agent status paused is not invokable", { agent: { ...agent, status: "paused" } as any }],
+    ["issue already has an active execution path", { hasActiveExecutionPath: true }],
+    ["issue already has a queued or deferred wake", { hasQueuedWake: true }],
+    ["pending interaction or approval owns the next action", { hasPendingInteractionOrApproval: true }],
+  ])("still skips (%s) even at zero Paperclip tool calls", (reason, overrides) => {
+    expect(
+      decide({
+        livenessState: null,
+        detectedProgressSummary: null,
+        paperclipToolCallCount: 0,
+        ...overrides,
+      }),
+    ).toEqual({ kind: "skip", reason });
   });
 
   it("does not queue when a successful run has no progress signal", () => {
@@ -376,5 +434,26 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## Successful run missing issue disposition\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## This issue still needs a next step\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("Unrelated comment")).toBe(false);
+  });
+});
+
+describe("readPaperclipToolCallCount", () => {
+  it("reads a reported count", () => {
+    expect(readPaperclipToolCallCount({ paperclipToolCallCount: 0 })).toBe(0);
+    expect(readPaperclipToolCallCount({ paperclipToolCallCount: 4 })).toBe(4);
+  });
+
+  it("returns null when the adapter did not report one", () => {
+    expect(readPaperclipToolCallCount(null)).toBeNull();
+    expect(readPaperclipToolCallCount(undefined)).toBeNull();
+    expect(readPaperclipToolCallCount({})).toBeNull();
+    expect(readPaperclipToolCallCount({ stdout: "", stderr: "" })).toBeNull();
+    expect(readPaperclipToolCallCount([{ paperclipToolCallCount: 0 }])).toBeNull();
+  });
+
+  it("rejects malformed counts rather than treating them as zero", () => {
+    expect(readPaperclipToolCallCount({ paperclipToolCallCount: "0" })).toBeNull();
+    expect(readPaperclipToolCallCount({ paperclipToolCallCount: Number.NaN })).toBeNull();
+    expect(readPaperclipToolCallCount({ paperclipToolCallCount: -1 })).toBeNull();
   });
 });

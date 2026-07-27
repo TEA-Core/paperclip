@@ -19,8 +19,18 @@ function errorText(value: unknown): string {
   }
 }
 
+// OpenCode exposes MCP tools as "<serverName>_<toolName>", so the Paperclip MCP
+// server surfaces as `paperclip_paperclipUpdateIssue` and friends. Some clients
+// pass the bare camelCase tool name through instead, so accept both spellings.
+const PAPERCLIP_TOOL_NAME_PATTERN = /^paperclip_|^paperclip[A-Z]/;
+
 export function parseOpenCodeJsonl(stdout: string) {
   let sessionId: string | null = null;
+  // Distinct Paperclip tool invocations. A run that made zero of these cannot
+  // have recorded an issue disposition, however confident its prose sounds --
+  // the successful-run handoff decision keys off this (Mode A, 2026-07-27).
+  const paperclipToolCallIds = new Set<string>();
+  let paperclipToolCallIndex = 0;
   // Text parts are held with their owning message id so an auto-compaction
   // summary can be retracted once the compaction is confirmed (see below).
   const messages: { messageId: string; text: string }[] = [];
@@ -80,9 +90,17 @@ export function parseOpenCodeJsonl(stdout: string) {
       continue;
     }
 
-    if (type === "tool_use") {
+    if (type === "tool_use" || type === "tool") {
       const part = parseObject(event.part);
       const state = parseObject(part.state);
+      const toolName = asString(part.tool, "").trim();
+      if (PAPERCLIP_TOOL_NAME_PATTERN.test(toolName)) {
+        // The same tool part is re-emitted as its state advances
+        // (pending -> running -> completed); key on the call id so one
+        // invocation counts once.
+        const callId = asString(part.callID, "").trim() || asString(part.id, "").trim();
+        paperclipToolCallIds.add(callId || `__anonymous_${paperclipToolCallIndex++}`);
+      }
       if (asString(state.status, "") === "error") {
         const text = asString(state.error, "").trim();
         if (text) toolErrors.push(text);
@@ -104,6 +122,7 @@ export function parseOpenCodeJsonl(stdout: string) {
     costUsd,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,
+    paperclipToolCallCount: paperclipToolCallIds.size,
   };
 }
 

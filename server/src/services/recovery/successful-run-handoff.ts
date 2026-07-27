@@ -323,10 +323,29 @@ function isCommentDrivenWake(run: HeartbeatRunRow) {
     wakeReason === "issue_reopened_via_comment";
 }
 
+/**
+ * Reads the adapter-reported count of Paperclip tool calls made during a run.
+ *
+ * Returns `null` when the adapter did not report one — runs that predate the
+ * counter, and adapters that do not implement it, must keep their previous
+ * behaviour rather than being swept into corrective wakes.
+ */
+export function readPaperclipToolCallCount(resultJson: unknown): number | null {
+  if (!resultJson || typeof resultJson !== "object" || Array.isArray(resultJson)) return null;
+  const value = (resultJson as Record<string, unknown>).paperclipToolCallCount;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+  return value;
+}
+
 function isProductiveSuccessfulRun(input: {
   livenessState: RunLivenessState | null;
   detectedProgressSummary: string | null;
+  paperclipToolCallCount: number | null;
 }) {
+  // A run that never touched a Paperclip tool cannot have recorded a
+  // disposition, regardless of what its prose claims. Always hand it off.
+  // (Mode A, 2026-07-27)
+  if (input.paperclipToolCallCount === 0) return true;
   if (input.livenessState && PRODUCTIVE_SUCCESS_LIVENESS_STATES.has(input.livenessState)) return true;
   return Boolean(input.detectedProgressSummary);
 }
@@ -365,6 +384,7 @@ export function decideSuccessfulRunHandoff(input: {
   agent: AgentRow | null;
   livenessState: RunLivenessState | null;
   detectedProgressSummary: string | null;
+  paperclipToolCallCount: number | null;
   taskKey: string | null;
   hasActiveExecutionPath: boolean;
   hasQueuedWake: boolean;
