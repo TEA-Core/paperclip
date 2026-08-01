@@ -11,8 +11,6 @@
  * run that is merely slow still writes log bytes, records output, or has a pid, so it is excluded.
  */
 
-export const STILLBORN_RUN_ERROR_CODE = "stillborn_run";
-
 /**
  * Adapters that run the agent as a tracked local child process.
  *
