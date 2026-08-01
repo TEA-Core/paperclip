@@ -77,6 +77,14 @@ export interface AdapterExecutionResult {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
+  /**
+   * Reason reported by the terminal `step_finish` event of the agent's own stream, when the
+   * adapter emits one. `unknown` means the stream was cut off mid-step and `length` means the
+   * output-token cap was hit — both are truncations that still exit 0, so the run finaliser
+   * needs this to avoid recording them as successes. Adapters that emit no step stream (pull
+   * agents running `/bin/echo`) leave this undefined, which is not a failure signal.
+   */
+  finishReason?: string | null;
   errorMessage?: string | null;
   errorCode?: string | null;
   errorFamily?: AdapterExecutionErrorFamily | null;

@@ -707,6 +707,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       exitCode: attempt.proc.exitCode,
       signal: attempt.proc.signal,
       timedOut: false,
+      finishReason: attempt.parsed.finishReason,
       errorMessage:
         (attempt.proc.exitCode ?? 0) === 0
           ? null

@@ -3148,6 +3148,125 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   };
 }
 
+/** Namespace for refs that keep rescued work reachable after its worktree is gone. */
+export const WORKTREE_RESCUE_REF_PREFIX = "refs/paperclip/rescue";
+
+/**
+ * How long a rescue ref is kept. A ref keeps its whole commit reachable, so without expiry every
+ * dirty teardown would pin another tree in the base repo forever and `git gc` could never reclaim
+ * any of it. Long enough that a lost diff is still recoverable days later by a human who noticed.
+ */
+export const WORKTREE_RESCUE_REF_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Identity plus an explicit signing opt-out: a host with `commit.gpgsign=true` in global config
+// would otherwise block this commit on a passphrase it can never be given, and the work the
+// commit exists to save would be destroyed by the removal below anyway.
+const RESCUE_COMMIT_IDENTITY = [
+  "-c",
+  "user.name=Paperclip",
+  "-c",
+  "user.email=paperclip@localhost",
+  "-c",
+  "commit.gpgsign=false",
+];
+
+/**
+ * Drops rescue refs older than the TTL. Best-effort and never throws: failing to prune is not a
+ * reason to fail the preservation that just succeeded.
+ */
+async function pruneExpiredWorktreeRescueRefs(cwd: string, ttlMs = WORKTREE_RESCUE_REF_TTL_MS) {
+  try {
+    const listed = await runGit(
+      ["for-each-ref", "--format=%(refname) %(committerdate:unix)", WORKTREE_RESCUE_REF_PREFIX],
+      cwd,
+    );
+    const cutoffSeconds = (Date.now() - ttlMs) / 1000;
+    for (const line of listed.split("\n")) {
+      const [refName, committedAt] = line.trim().split(/\s+/);
+      if (!refName || !committedAt) continue;
+      const committedSeconds = Number(committedAt);
+      if (!Number.isFinite(committedSeconds) || committedSeconds >= cutoffSeconds) continue;
+      await runGit(["update-ref", "-d", refName], cwd);
+    }
+  } catch {
+    // Pruning is housekeeping; a failure here must not surface as a preservation failure.
+  }
+}
+
+/**
+ * Commits whatever is sitting uncommitted in a worktree before the worktree is destroyed.
+ *
+ * `git worktree remove --force` discards the working tree unconditionally, so a run that produced a
+ * real diff but stopped before committing loses it with no warning. Committing first puts the work
+ * in the base repo's object store, where two things keep it reachable: the follow-on `git branch -d`
+ * is the *safe* delete and refuses an unmerged branch, and a `refs/paperclip/rescue/<workspaceId>`
+ * ref covers the detached-HEAD and merged-branch cases where the branch alone would not.
+ *
+ * Preservation is best-effort by construction: every failure is returned as a warning and teardown
+ * continues, because a worktree that cannot be cleaned up is a worse failure than a lost diff.
+ */
+async function preserveUncommittedWorktreeWork(input: {
+  workspacePath: string;
+  workspaceId: string;
+  branchName: string | null;
+  sourceIssueId: string | null;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ preserved: boolean; commitSha: string | null; warning: string | null }> {
+  const notPreserved = { preserved: false, commitSha: null, warning: null } as const;
+  try {
+    const status = await runGit(["status", "--porcelain", "--untracked-files=all"], input.workspacePath);
+    if (!status.trim()) return notPreserved;
+
+    const rescueRef = `${WORKTREE_RESCUE_REF_PREFIX}/${input.workspaceId}`;
+    const message =
+      `wip(paperclip): preserve uncommitted work from workspace ${input.workspaceId}` +
+      `${input.sourceIssueId ? `\n\nIssue: ${input.sourceIssueId}` : ""}` +
+      `\nRescue ref: ${rescueRef}` +
+      "\n\nCommitted automatically before the worktree was removed. This is not a reviewed change.";
+
+    await runGit(["add", "--all"], input.workspacePath);
+    await runGit(
+      [...RESCUE_COMMIT_IDENTITY, "commit", "--no-verify", "--message", message],
+      input.workspacePath,
+    );
+    const commitSha = await runGit(["rev-parse", "HEAD"], input.workspacePath);
+    await runGit(["update-ref", rescueRef, commitSha], input.workspacePath);
+    await pruneExpiredWorktreeRescueRefs(input.workspacePath);
+
+    if (input.recorder) {
+      await input.recorder.recordOperation({
+        phase: "worktree_cleanup",
+        command: formatCommandForDisplay("git", ["commit", "--all"]),
+        cwd: input.workspacePath,
+        metadata: {
+          workspaceId: input.workspaceId,
+          workspacePath: input.workspacePath,
+          branchName: input.branchName,
+          cleanupAction: "preserve_uncommitted_work",
+          commitSha,
+          rescueRef,
+        },
+        run: async () => ({
+          status: "succeeded",
+          exitCode: 0,
+          system:
+            `Preserved uncommitted work as ${commitSha} before removing the worktree ` +
+            `(recoverable from ${rescueRef}${input.branchName ? ` or branch ${input.branchName}` : ""})\n`,
+        }),
+      });
+    }
+
+    return { preserved: true, commitSha, warning: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      preserved: false,
+      commitSha: null,
+      warning: `Could not preserve uncommitted work in "${input.workspacePath}" before removal: ${message}`,
+    };
+  }
+}
+
 export async function cleanupExecutionWorkspaceArtifacts(input: {
   workspace: {
     id: string;
@@ -3220,6 +3339,17 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   if (input.workspace.providerType === "git_worktree" && workspacePath) {
     const worktreeExists = await directoryExists(workspacePath);
     if (worktreeExists) {
+      // Runs regularly stop before committing; `worktree remove --force` below would discard that
+      // work silently, so put it in the object store first.
+      const preservation = await preserveUncommittedWorktreeWork({
+        workspacePath,
+        workspaceId: input.workspace.id,
+        branchName: input.workspace.branchName,
+        sourceIssueId: input.workspace.sourceIssueId,
+        recorder: input.recorder,
+      });
+      if (preservation.warning) warnings.push(preservation.warning);
+
       if (!repoRoot) {
         warnings.push(`Could not resolve git repo root for "${workspacePath}".`);
       } else {

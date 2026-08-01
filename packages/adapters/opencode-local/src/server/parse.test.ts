@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+import {
+  parseOpenCodeJsonl,
+  isOpenCodeUnknownSessionError,
+  describeIncompleteOpenCodeStream,
+} from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
   it("parses assistant text, usage, cost, and errors", () => {
@@ -205,5 +209,59 @@ describe("parseOpenCodeJsonl paperclip tool-call counter", () => {
     ].join("\n");
 
     expect(parseOpenCodeJsonl(stdout).paperclipToolCallCount).toBe(1);
+  });
+});
+
+describe("incomplete OpenCode streams", () => {
+  const streamEndingWith = (part: Record<string, unknown>) =>
+    [
+      JSON.stringify({ type: "step_start", sessionID: "session_trunc" }),
+      JSON.stringify({ type: "step_finish", sessionID: "session_trunc", part }),
+    ].join("\n");
+
+  it("surfaces a truncated stream that exited cleanly with no error", () => {
+    // The observed shape: a bare step_start, then minutes later a bare finish with no
+    // closing text and no tool call. Exit code 0, no error event -> currently `succeeded`.
+    const parsed = parseOpenCodeJsonl(
+      streamEndingWith({ reason: "unknown", tokens: { input: 0, output: 0 } }),
+    );
+
+    expect(parsed.finalStepReason).toBe("unknown");
+    expect(parsed.errorMessage).toBeNull();
+    expect(describeIncompleteOpenCodeStream(parsed.finalStepReason)).toMatch(/incomplete/);
+  });
+
+  it("surfaces a run that hit the output-token cap mid-step", () => {
+    const parsed = parseOpenCodeJsonl(
+      streamEndingWith({ reason: "length", tokens: { input: 900, output: 8000 } }),
+    );
+
+    expect(parsed.finalStepReason).toBe("length");
+    expect(describeIncompleteOpenCodeStream(parsed.finalStepReason)).toMatch(/output-token cap/);
+  });
+
+  it("leaves a healthy multi-step run alone", () => {
+    const stdout = [
+      JSON.stringify({ type: "step_finish", part: { reason: "tool-calls", tokens: { input: 10, output: 5 } } }),
+      JSON.stringify({ type: "step_finish", part: { reason: "stop", tokens: { input: 10, output: 5 } } }),
+    ].join("\n");
+    const parsed = parseOpenCodeJsonl(stdout);
+
+    expect(parsed.finalStepReason).toBe("stop");
+    expect(describeIncompleteOpenCodeStream(parsed.finalStepReason)).toBeNull();
+  });
+
+  it("does not fail closed on an unrecognised terminal reason", () => {
+    // "done" is emitted by real runs; an allowlist of known-bad reasons must ignore it.
+    expect(describeIncompleteOpenCodeStream("done")).toBeNull();
+    expect(describeIncompleteOpenCodeStream("")).toBeNull();
+    expect(describeIncompleteOpenCodeStream(null)).toBeNull();
+  });
+
+  it("reports no reason when the adapter emits no step_finish at all", () => {
+    const parsed = parseOpenCodeJsonl(JSON.stringify({ type: "text", part: { text: "hi" } }));
+
+    expect(parsed.finalStepReason).toBeNull();
+    expect(describeIncompleteOpenCodeStream(parsed.finalStepReason)).toBeNull();
   });
 });

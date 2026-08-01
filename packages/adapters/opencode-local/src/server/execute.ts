@@ -45,7 +45,11 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
+import {
+  describeIncompleteOpenCodeStream,
+  isOpenCodeUnknownSessionError,
+  parseOpenCodeJsonl,
+} from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -732,11 +736,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : null;
 
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
+      // A stream that stopped early exits 0 and reports no error, so without this it reaches
+      // the heartbeat as exitCode 0 + no errorMessage and is recorded `succeeded`.
+      const incompleteStreamError = describeIncompleteOpenCodeStream(attempt.parsed.finalStepReason) ?? "";
+      const effectiveParsedError = parsedError || incompleteStreamError;
       const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
       const rawExitCode = attempt.proc.exitCode;
-      const synthesizedExitCode = parsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+      const synthesizedExitCode = effectiveParsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
       const fallbackErrorMessage =
-        parsedError ||
+        effectiveParsedError ||
         stderrLine ||
         `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
       const modelId = model || null;
@@ -745,6 +753,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
+        finishReason: attempt.parsed.finalStepReason,
         errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,

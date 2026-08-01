@@ -116,6 +116,16 @@ import {
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
+import {
+  resolveAdapterRunOutcome,
+  type RunTruncationVerdict,
+} from "./run-truncation.js";
+import {
+  buildStillbornRunMessage,
+  canDetectStillbornRun,
+  isStillbornRun,
+  DEFAULT_STILLBORN_RUN_TTL_MS,
+} from "./run-stillborn.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
@@ -545,6 +555,12 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "execution_changes_requested",
   "approval_approved",
 ]);
+// Adapters that keep a resumable session. Deliberately its own list rather than an alias of
+// LOCAL_CHILD_PROCESS_ADAPTER_TYPES in run-stillborn.ts: the two answer different questions, and
+// they only happen to hold the same members today. Sharing one list would mean registering a
+// session-keeping adapter that talks to a remote service silently enables stillborn reaping for
+// it — and such an adapter has no pid and writes nothing until it returns, so a live run would be
+// force-failed mid-flight. Keeping them apart makes drift safe in that direction.
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -11407,8 +11423,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; stillbornTtlMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const stillbornTtlMs = opts?.stillbornTtlMs ?? DEFAULT_STILLBORN_RUN_TTL_MS;
     const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
@@ -11448,10 +11465,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      // A stillborn run is tracked in memory but never executed, so the in-memory check below
+      // would protect it forever. It has no timeout armed either, because arming one needs a
+      // resultJson it never wrote, so this sweep is the only thing that can end it.
+      //
+      // Restricted to adapters that spawn a tracked local child, because that is the only case
+      // where "no pid and no process start" proves nothing was ever launched. A gateway or
+      // HTTP-backed adapter legitimately has no pid, and one that makes a single long upstream
+      // call writes no output, usage or result until it finishes — reaping that would kill a live
+      // run and throw away its work.
+      const stillborn = canDetectStillbornRun(adapterType) && isStillbornRun(run, now, stillbornTtlMs);
+
+      if (!stillborn && (runningProcesses.has(run.id) || activeRunExecutions.has(run.id))) continue;
 
       // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
+      if (!stillborn && staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
@@ -11516,7 +11544,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
         monitorDispatchLostWithoutFutureWake
       );
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      // Stillborn reaps deliberately keep `process_lost` below rather than taking a code of their
+      // own: `process_lost` is a typed recovery cause consumed by the stop-metadata mapper, the
+      // infrastructure-failure classifier and recovery routing, and a distinct code would silently
+      // opt these runs out of all of it. The distinction rides in the message instead, which is
+      // enough to tell them apart in triage.
+      const baseMessage = stillborn
+        ? buildStillbornRunMessage(run, stillbornTtlMs)
+        : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
       const unmanagedBackgroundTaskEvidence = descendantOnlyCleanup
         ? {
           kind: "orphaned_process_group_cleanup",
@@ -13804,16 +13839,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
       }
+      // Needed by the outcome decision below, which reads output tokens to tell a truncated
+      // stream apart from a pull agent's legitimate no-op wake.
+      const rawUsage = normalizeUsageTotals(adapterResult.usage);
       let outcome: RunSessionOutcome;
+      // A clean exit is not proof of completion: a stream cut off mid-step and an output-token cap
+      // both exit 0 with no error message. `truncationVerdict` carries the reason so the failure is
+      // distinguishable from a generic `adapter_failed` during triage.
+      let truncationVerdict: RunTruncationVerdict | null = null;
       const latestRun = await getRun(run.id);
       if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
         outcome = latestRun.status;
-      } else if (adapterResult.timedOut) {
-        outcome = "timed_out";
-      } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
-        outcome = "succeeded";
       } else {
-        outcome = "failed";
+        const resolved = resolveAdapterRunOutcome({
+          timedOut: adapterResult.timedOut,
+          exitCode: adapterResult.exitCode,
+          errorMessage: adapterResult.errorMessage,
+          finishReason: adapterResult.finishReason,
+          outputTokens: rawUsage?.outputTokens,
+        });
+        outcome = resolved.outcome;
+        truncationVerdict = resolved.verdict;
       }
 
       const nextSessionState = resolveNextSessionState({
@@ -13825,7 +13871,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         previousDisplayId: runtimeForAdapter.sessionDisplayId,
         previousLegacySessionId: runtimeForAdapter.sessionId,
       });
-      const rawUsage = normalizeUsageTotals(adapterResult.usage);
       const sessionUsageResolution = await resolveNormalizedUsageForSession({
         agentId: agent.id,
         runId: run.id,
@@ -13840,7 +13885,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : outcome === "succeeded"
             ? null
             : redactCurrentUserText(
-                adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+                adapterResult.errorMessage ??
+                  truncationVerdict?.errorMessage ??
+                  (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
                 currentUserRedactionOptions,
               );
       const recordedResponsibleUserDenialCode =
@@ -13851,7 +13898,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : outcome === "cancelled"
             ? (latestRun?.errorCode ?? "cancelled")
             : outcome === "failed"
-              ? (adapterResult.errorCode ?? recordedResponsibleUserDenialCode ?? "adapter_failed")
+              ? (adapterResult.errorCode ??
+                recordedResponsibleUserDenialCode ??
+                truncationVerdict?.errorCode ??
+                "adapter_failed")
               : null;
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;

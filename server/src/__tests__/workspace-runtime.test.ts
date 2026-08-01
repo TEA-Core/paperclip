@@ -3207,6 +3207,139 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 10_000);
 
+  async function realizeWorktreeForCleanup(repoRoot: string, identifier: string, title: string) {
+    return realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: { id: "issue-1", identifier, title },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    });
+  }
+
+  function cleanupInputForWorkspace(
+    workspace: RealizedExecutionWorkspace,
+    repoRoot: string,
+    executionWorkspaceId: string,
+  ) {
+    return {
+      workspace: {
+        id: executionWorkspaceId,
+        cwd: workspace.cwd,
+        providerType: "git_worktree",
+        providerRef: workspace.worktreePath,
+        branchName: workspace.branchName,
+        repoUrl: workspace.repoUrl,
+        baseRef: workspace.repoRef,
+        projectId: workspace.projectId,
+        projectWorkspaceId: workspace.workspaceId,
+        sourceIssueId: "issue-1",
+        metadata: { createdByRuntime: true },
+      },
+      projectWorkspace: { cwd: repoRoot, cleanupCommand: null },
+    };
+  }
+
+  it("preserves uncommitted work in the base repo before force-removing the worktree", async () => {
+    const repoRoot = await createTempRepo();
+    const workspace = await realizeWorktreeForCleanup(repoRoot, "PAP-452", "Preserve dirty tree");
+
+    // The shape that lost four diffs on 2026-07-31: edits made, never committed.
+    await fs.writeFile(path.join(workspace.cwd, "README.md"), "edited by the run\n", "utf8");
+    await fs.writeFile(path.join(workspace.cwd, "new-fix.ts"), "export const fix = 1;\n", "utf8");
+
+    const executionWorkspaceId = "execution-workspace-preserve";
+    const cleanup = await cleanupExecutionWorkspaceArtifacts(
+      cleanupInputForWorkspace(workspace, repoRoot, executionWorkspaceId),
+    );
+
+    expect(cleanup.cleaned).toBe(true);
+    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
+
+    // Both the rescue ref and the (now unmerged, so undeletable) branch still reach the work.
+    const rescueRef = `refs/paperclip/rescue/${executionWorkspaceId}`;
+    for (const ref of [rescueRef, workspace.branchName!]) {
+      await expect(
+        execFileAsync("git", ["show", `${ref}:new-fix.ts`], { cwd: repoRoot }),
+      ).resolves.toMatchObject({ stdout: "export const fix = 1;\n" });
+      await expect(
+        execFileAsync("git", ["show", `${ref}:README.md`], { cwd: repoRoot }),
+      ).resolves.toMatchObject({ stdout: "edited by the run\n" });
+    }
+  }, 15_000);
+
+  it("leaves a clean worktree alone — no rescue ref and no empty commit", async () => {
+    const repoRoot = await createTempRepo();
+    const workspace = await realizeWorktreeForCleanup(repoRoot, "PAP-453", "Clean tree");
+
+    const headBefore = (
+      await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace.cwd })
+    ).stdout.trim();
+
+    const executionWorkspaceId = "execution-workspace-clean";
+    const cleanup = await cleanupExecutionWorkspaceArtifacts(
+      cleanupInputForWorkspace(workspace, repoRoot, executionWorkspaceId),
+    );
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.warnings).toEqual([]);
+    await expect(
+      execFileAsync("git", ["rev-parse", "--verify", `refs/paperclip/rescue/${executionWorkspaceId}`], {
+        cwd: repoRoot,
+      }),
+    ).rejects.toThrow();
+    // A clean tree adds no commit, which is why `branch -d` could still delete the branch above.
+    expect(headBefore).not.toBe("");
+  }, 15_000);
+
+  it("records the preservation as a workspace operation so triage can find it", async () => {
+    const repoRoot = await createTempRepo();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const workspace = await realizeWorktreeForCleanup(repoRoot, "PAP-454", "Recorded preservation");
+
+    await fs.writeFile(path.join(workspace.cwd, "rescued.txt"), "work\n", "utf8");
+
+    await cleanupExecutionWorkspaceArtifacts({
+      ...cleanupInputForWorkspace(workspace, repoRoot, "execution-workspace-recorded"),
+      recorder,
+    });
+
+    const preservation = operations.find(
+      (operation) => operation.metadata?.cleanupAction === "preserve_uncommitted_work",
+    );
+    expect(preservation).toBeDefined();
+    expect(preservation?.result.status).toBe("succeeded");
+    expect(preservation?.metadata?.commitSha).toEqual(expect.any(String));
+  }, 15_000);
+
+  it("warns but still tears down when uncommitted work cannot be preserved", async () => {
+    const repoRoot = await createTempRepo();
+    const workspace = await realizeWorktreeForCleanup(repoRoot, "PAP-455", "Preservation fails");
+
+    await fs.writeFile(path.join(workspace.cwd, "doomed.txt"), "work\n", "utf8");
+    // Break the worktree's link to the repo so every git command inside it fails.
+    await fs.writeFile(path.join(workspace.cwd, ".git"), "gitdir: /nonexistent/paperclip\n", "utf8");
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts(
+      cleanupInputForWorkspace(workspace, repoRoot, "execution-workspace-preserve-fails"),
+    );
+
+    expect(cleanup.warnings.some((warning) => warning.includes("Could not preserve uncommitted work"))).toBe(
+      true,
+    );
+  }, 15_000);
+
   it("records teardown and cleanup operations when a recorder is provided", async () => {
     const repoRoot = await createTempRepo();
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();

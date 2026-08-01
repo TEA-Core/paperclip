@@ -224,6 +224,130 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     },
   );
 
+  /**
+   * A stillborn run — created, `running`, and then never executed. It never reaches a terminal
+   * status, so a terminal-only staleness check leaves its issue pinned with no actor able to
+   * clear it: the assignee is refused for not holding the lock and everyone else for not being
+   * the assignee.
+   */
+  async function insertStillbornRun(companyId: string, agentId: string, ageMs = 30 * 60 * 1000) {
+    const stillbornRunId = randomUUID();
+    const startedAt = new Date(Date.now() - ageMs);
+    await db.insert(heartbeatRuns).values({
+      id: stillbornRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt,
+      createdAt: startedAt,
+    });
+    return stillbornRunId;
+  }
+
+  it("allows an assigned agent PATCH to break a stillborn execution lock that never went terminal", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const stillbornRunId = await insertStillbornRun(companyId, agentId);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stillborn execution lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: stillbornRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Recovered stillborn lock" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: currentRunId, executionRunId: currentRunId });
+  });
+
+  it("still refuses to break an execution lock held by a live foreign run", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const liveForeignRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: liveForeignRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      lastOutputAt: new Date(),
+      logBytes: 4096,
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live execution lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: liveForeignRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Should not steal a live lock" });
+
+    expect(res.status).toBe(409);
+
+    const row = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionRunId).toBe(liveForeignRunId);
+  });
+
+  it("lets the assignee release an issue pinned by a stillborn checkout run", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const stillbornRunId = await insertStillbornRun(companyId, agentId);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stillborn checkout release",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: stillbornRunId,
+      executionRunId: stillbornRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/release`)
+      .send();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: null, executionRunId: null });
+  });
+
   it("allows the rightful assignee to release after the owning run failed", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
