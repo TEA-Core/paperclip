@@ -126,7 +126,7 @@ import {
   isStillbornRun,
   DEFAULT_STILLBORN_RUN_TTL_MS,
 } from "./run-stillborn.js";
-import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import { logActivity, logActivityInTransaction, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
@@ -10117,7 +10117,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(executionWorkspaces.companyId, run.companyId),
               ));
 
-            await logActivity(tx as unknown as Db, {
+            await logActivityInTransaction(tx as unknown as Db, {
               companyId: run.companyId,
               actorType: "system",
               actorId: "heartbeat",
@@ -15994,7 +15994,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: now,
             });
-            await logActivity(tx as unknown as Db, {
+            await logActivityInTransaction(tx as unknown as Db, {
               companyId: issue.companyId,
               actorType: "system",
               actorId: "system",
