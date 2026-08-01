@@ -376,6 +376,16 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(schema: z.ZodObje
   }, schema);
 }
 
+/**
+ * Strict on purpose. Zod strips unrecognized keys by default, so a payload naming a field that
+ * does not exist — `blockedBy` instead of `blockedByIssueIds`, `labels` instead of `labelIds` —
+ * used to return 2xx with the field silently discarded. Nothing surfaced the loss, so a caller
+ * that set dependencies at create time produced a tree that looked fired and had zero dependency
+ * edges. Strictness turns every such payload into a 400 that names the offending key.
+ *
+ * `.strict()` propagates through `.partial()`, `.omit()` and `.extend()`, so the update, input and
+ * child schemas derived from this one inherit it.
+ */
 const createIssueBaseSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
   projectWorkspaceId: z.string().uuid().optional().nullable(),
@@ -409,7 +419,7 @@ const createIssueBaseSchema = z.object({
     agentId: z.string().uuid(),
     instructions: multilineTextSchema.optional().nullable(),
   }).strict().optional().nullable(),
-});
+}).strict();
 
 const createIssueDuplicateGuardSchema = {
   idempotencyKey: z.string().trim().min(1).max(255).optional().nullable(),

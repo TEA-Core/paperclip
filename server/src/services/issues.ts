@@ -106,6 +106,7 @@ export function redactIssueCommentBody(body: string, opts: CurrentUserRedactionO
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
+import { canDetectStillbornRun, isStillbornRun } from "./run-stillborn.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import {
   summarizeIssueWatchdog,
@@ -4444,7 +4445,13 @@ export function issueService(db: Db) {
         .from(issues)
         .where(and(eq(issues.companyId, companyId), inArray(issues.id, deduped)));
       if (relatedIssues.length !== deduped.length) {
-        throw unprocessable("Blocked-by issues must belong to the same company");
+        // Name the ids that did not resolve. "must belong to the same company" reads as an
+        // authorization problem when the usual cause is an id that does not exist at all.
+        const foundIds = new Set(relatedIssues.map((row: { id: string }) => row.id));
+        throw unprocessable(
+          "Blocked-by issues must exist and belong to the same company",
+          { unknownBlockedByIssueIds: deduped.filter((candidate) => !foundIds.has(candidate)) },
+        );
       }
       await assertNoBlockingCycles(companyId, issueId, deduped, dbOrTx);
     }
@@ -4473,14 +4480,43 @@ export function issueService(db: Db) {
     );
   }
 
+  /**
+   * True when a run cannot be executing any more: it is terminal, gone, or stillborn — a row that
+   * says `running` but never produced a process, output, usage or liveness.
+   *
+   * A stillborn run never reaches a terminal status, so a terminal-only test leaves the issue it
+   * holds pinned with no actor able to clear it: the assignee is refused for not holding the lock,
+   * and anyone else for not being the assignee. That intersection is empty, which is what made the
+   * condition unrecoverable without operator help.
+   */
   async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
     const run = await dbOrTx
-      .select({ status: heartbeatRuns.status })
+      .select({
+        adapterType: agents.adapterType,
+        status: heartbeatRuns.status,
+        finishedAt: heartbeatRuns.finishedAt,
+        startedAt: heartbeatRuns.startedAt,
+        createdAt: heartbeatRuns.createdAt,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        processStartedAt: heartbeatRuns.processStartedAt,
+        lastOutputAt: heartbeatRuns.lastOutputAt,
+        lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+        livenessState: heartbeatRuns.livenessState,
+        logBytes: heartbeatRuns.logBytes,
+        usageJson: heartbeatRuns.usageJson,
+        resultJson: heartbeatRuns.resultJson,
+      })
       .from(heartbeatRuns)
+      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+    // Same gate as the reaper: the stillborn signature only proves anything for adapters that
+    // spawn a tracked local child. Declaring a live gateway run dead here would let an assignee
+    // take a lock out from under it.
+    return canDetectStillbornRun(run.adapterType) && isStillbornRun(run, new Date());
   }
 
   async function adoptStaleCheckoutRun(input: {
@@ -4646,12 +4682,9 @@ export function issueService(db: Db) {
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
-      const run = await tx
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, issue.executionRunId))
-        .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      // Stillborn runs never reach a terminal status, so a terminal-only check would leave the
+      // lock in place forever.
+      if (!(await isTerminalOrMissingHeartbeatRun(issue.executionRunId, tx))) return false;
 
       const updated = await tx
         .update(issues)
@@ -4694,12 +4727,9 @@ export function issueService(db: Db) {
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
       );
-      const run = await tx
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, issue.checkoutRunId))
-        .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      // Stillborn runs never reach a terminal status, so a terminal-only check would leave the
+      // lock in place forever.
+      if (!(await isTerminalOrMissingHeartbeatRun(issue.checkoutRunId, tx))) return false;
 
       if (issue.executionRunId && issue.executionRunId !== issue.checkoutRunId) {
         await tx.execute(
@@ -6520,6 +6550,22 @@ export function issueService(db: Db) {
         ...issueData,
         updatedAt: new Date(),
       };
+
+      // A status change that hands work back to the assignee — a `changes_requested` bounce, most
+      // often — re-stamps `startedAt` while leaving whatever `executionRunId` was already there.
+      // If that holder is dead the issue keeps a lock nobody can clear, and the refreshed timestamp
+      // hides how old it is. Clearing it here is safe because a live holder is never touched.
+      if (
+        issueData.status &&
+        issueData.status !== existing.status &&
+        existing.executionRunId &&
+        issueData.executionRunId === undefined &&
+        (await isTerminalOrMissingHeartbeatRun(existing.executionRunId, dbOrTx))
+      ) {
+        patch.executionRunId = null;
+        patch.executionAgentNameKey = null;
+        patch.executionLockedAt = null;
+      }
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
       }

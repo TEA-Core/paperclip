@@ -1,6 +1,9 @@
 import type { Request, Response, NextFunction } from "express";
 import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
+
+/** Upper bound on caller-supplied key names echoed back in a validation error. */
+const MAX_ECHOED_UNRECOGNIZED_KEYS = 10;
 import { HttpError } from "../errors.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -118,7 +121,30 @@ export function errorHandler(
   }
 
   if (err instanceof ZodError) {
-    res.status(400).json({ error: "Validation error", details: err.errors });
+    // Name unrecognized fields in `error` itself: a caller that misspells a field otherwise sees a
+    // generic message and has to dig through `details` to learn which key was rejected.
+    const unrecognizedKeys = [
+      ...new Set(
+        err.errors.flatMap((issue) =>
+          issue.code === "unrecognized_keys"
+            ? issue.keys.map((key) => [...issue.path, String(key).slice(0, 64)].join("."))
+            : [],
+        ),
+      ),
+    ];
+    // Key names are caller-supplied, so echo a bounded sample rather than the whole set: a body
+    // with thousands of unknown keys would otherwise turn a small request into a huge response.
+    const sampledKeys = unrecognizedKeys.slice(0, MAX_ECHOED_UNRECOGNIZED_KEYS);
+    const omittedKeyCount = unrecognizedKeys.length - sampledKeys.length;
+    res.status(400).json({
+      error:
+        unrecognizedKeys.length > 0
+          ? `Unrecognized field(s): ${sampledKeys.join(", ")}${
+              omittedKeyCount > 0 ? ` (and ${omittedKeyCount} more)` : ""
+            }`
+          : "Validation error",
+      details: err.errors,
+    });
     return;
   }
 
