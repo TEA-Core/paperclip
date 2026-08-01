@@ -6565,6 +6565,12 @@ export function issueService(db: Db) {
         patch.executionRunId = null;
         patch.executionAgentNameKey = null;
         patch.executionLockedAt = null;
+        // Clear the whole lock pair. Leaving `checkoutRunId` pointing at the same dead run just
+        // inverts the problem: `adoptUnownedCheckoutRun` requires a null checkoutRunId, so the
+        // issue would still not be adoptable.
+        if (existing.checkoutRunId === existing.executionRunId) {
+          patch.checkoutRunId = null;
+        }
       }
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);

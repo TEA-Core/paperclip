@@ -125,7 +125,6 @@ import {
   canDetectStillbornRun,
   isStillbornRun,
   DEFAULT_STILLBORN_RUN_TTL_MS,
-  LOCAL_CHILD_PROCESS_ADAPTER_TYPES,
 } from "./run-stillborn.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import {
@@ -556,7 +555,21 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "execution_changes_requested",
   "approval_approved",
 ]);
-const SESSIONED_LOCAL_ADAPTERS = LOCAL_CHILD_PROCESS_ADAPTER_TYPES;
+// Adapters that keep a resumable session. Deliberately its own list rather than an alias of
+// LOCAL_CHILD_PROCESS_ADAPTER_TYPES in run-stillborn.ts: the two answer different questions, and
+// they only happen to hold the same members today. Sharing one list would mean registering a
+// session-keeping adapter that talks to a remote service silently enables stillborn reaping for
+// it — and such an adapter has no pid and writes nothing until it returns, so a live run would be
+// force-failed mid-flight. Keeping them apart makes drift safe in that direction.
+const SESSIONED_LOCAL_ADAPTERS = new Set([
+  "claude_local",
+  "codex_local",
+  "cursor",
+  "gemini_local",
+  "hermes_local",
+  "opencode_local",
+  "pi_local",
+]);
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
@@ -11531,11 +11544,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
         monitorDispatchLostWithoutFutureWake
       );
-      // Deliberately still `process_lost`. That code is a typed recovery cause consumed by the
-      // stop-metadata mapper, the infrastructure-failure classifier and recovery routing; a new
-      // code here would silently opt these runs out of all of it. The stillborn distinction is
-      // carried in the message instead, which is enough to tell them apart in triage.
-      const reapErrorCode = "process_lost";
+      // Stillborn reaps deliberately keep `process_lost` below rather than taking a code of their
+      // own: `process_lost` is a typed recovery cause consumed by the stop-metadata mapper, the
+      // infrastructure-failure classifier and recovery routing, and a distinct code would silently
+      // opt these runs out of all of it. The distinction rides in the message instead, which is
+      // enough to tell them apart in triage.
       const baseMessage = stillborn
         ? buildStillbornRunMessage(run, stillbornTtlMs)
         : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
@@ -11552,7 +11565,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: reapErrorCode,
+        errorCode: "process_lost",
         finishedAt: now,
         resultJson: (() => {
           const result = mergeRunStopMetadataForAgent(
@@ -11560,7 +11573,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "failed",
             {
               resultJson: parseObject(run.resultJson),
-              errorCode: reapErrorCode,
+              errorCode: "process_lost",
               errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
             },
           );
