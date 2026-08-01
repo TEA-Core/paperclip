@@ -46,7 +46,7 @@ import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { routineService } from "./routines.js";
 import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, logActivityInTransaction } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -2843,7 +2843,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       .returning({ id: routines.id });
     if (updated.length === 0) return;
     const actorPatch = activityActorPatch(input.actor);
-    await logActivity(dbOrTx as Db, {
+    await logActivityInTransaction(dbOrTx as Db, {
       companyId: input.companyId,
       ...actorPatch,
       action: "routine.origin_stamped",
@@ -2891,7 +2891,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       .returning({ id: routines.id, originId: routines.originId });
     if (updated.length === 0) return;
     const actorPatch = activityActorPatch(input.actor);
-    await logActivity(dbOrTx as Db, {
+    await logActivityInTransaction(dbOrTx as Db, {
       companyId: input.companyId,
       ...actorPatch,
       action: "routine.origin_cleared",
@@ -3768,7 +3768,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         );
         const envKeys = Object.keys(normalizedEnv ?? {}).sort();
         const secretRefs = secretRefsFromEnv(normalizedEnv);
-        await logActivity(txDb, {
+        await logActivityInTransaction(txDb, {
           companyId: input.companyId,
           ...activityActorPatch(input.actor),
           action: "pipeline.stage_automation_env_updated",

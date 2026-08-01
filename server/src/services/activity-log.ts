@@ -69,19 +69,30 @@ function readNonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActivityInput) {
-  if (input.actorType === "user") return readNonEmptyString(input.actorId);
-
+/**
+ * Look up the run row `input.runId` points at, if any. Returns `null` when there is no
+ * usable run id, and `{ row: null }` when the id is well-formed but no such run exists in
+ * this database (which is what an `x-paperclip-run-id` minted against another instance
+ * looks like — and what would otherwise blow up the `activity_log.run_id` foreign key).
+ */
+async function lookupActivityRun(db: Db, input: LogActivityInput) {
   const runId = readNonEmptyString(input.runId);
-  if (runId && isUuidLike(runId)) {
-    const run = await db
-      .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, runId)))
-      .then((rows) => rows[0] ?? null);
-    const runResponsibleUserId = readNonEmptyString(run?.responsibleUserId);
-    if (runResponsibleUserId) return runResponsibleUserId;
-  }
+  if (!runId || !isUuidLike(runId)) return null;
+  const row = await db
+    .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, runId)))
+    .then((rows) => rows[0] ?? null);
+  return { runId, row };
+}
+
+async function resolveResponsibleUserIdWithRun(
+  db: Db,
+  input: LogActivityInput,
+  run: Awaited<ReturnType<typeof lookupActivityRun>>,
+) {
+  const runResponsibleUserId = readNonEmptyString(run?.row?.responsibleUserId);
+  if (runResponsibleUserId) return runResponsibleUserId;
 
   const issueIdCandidate = readNonEmptyString(input.issueId)
     ?? (input.entityType === "issue" ? readNonEmptyString(input.entityId) : null);
@@ -124,7 +135,12 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
   return readNonEmptyString(company?.defaultResponsibleUserId);
 }
 
-export async function logActivity(db: Db, input: LogActivityInput) {
+export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActivityInput) {
+  if (input.actorType === "user") return readNonEmptyString(input.actorId);
+  return resolveResponsibleUserIdWithRun(db, input, await lookupActivityRun(db, input));
+}
+
+async function writeActivity(db: Db, input: LogActivityInput) {
   const currentUserRedactionOptions = {
     enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
   };
@@ -132,7 +148,25 @@ export async function logActivity(db: Db, input: LogActivityInput) {
   const redactedDetails = sanitizedDetails
     ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
     : null;
-  const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
+  const run = await lookupActivityRun(db, input);
+  const responsibleUserId = input.actorType === "user"
+    ? readNonEmptyString(input.actorId)
+    : await resolveResponsibleUserIdWithRun(db, input, run);
+  // Only stamp run_id when the run actually exists here; a dangling reference would trip the
+  // `activity_log_run_id_heartbeat_runs_id_fk` foreign key and cost us the whole audit row.
+  const runId = run?.row ? run.runId : null;
+  if (run && !run.row) {
+    logger.warn(
+      {
+        companyId: input.companyId,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId,
+        runId: run.runId,
+      },
+      "activity log references an unknown run; recording the entry without a run id",
+    );
+  }
   await db.insert(activityLog).values({
     companyId: input.companyId,
     actorType: input.actorType,
@@ -141,7 +175,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
     entityType: input.entityType,
     entityId: input.entityId,
     agentId: input.agentId ?? null,
-    runId: input.runId ?? null,
+    runId,
     responsibleUserId,
     details: redactedDetails,
   });
@@ -156,7 +190,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
       entityType: input.entityType,
       entityId: input.entityId,
       agentId: input.agentId ?? null,
-      runId: input.runId ?? null,
+      runId,
       responsibleUserId,
       details: redactedDetails,
     },
@@ -176,10 +210,50 @@ export async function logActivity(db: Db, input: LogActivityInput) {
       payload: {
         ...redactedDetails,
         agentId: input.agentId ?? null,
-        runId: input.runId ?? null,
+        runId,
         responsibleUserId,
       },
     };
     publishPluginDomainEvent(event);
   }
+}
+
+/**
+ * Record an audit entry. Best-effort by design: nearly every caller runs *after* its mutation
+ * has already committed, so letting an audit failure propagate would turn a successful write
+ * into an HTTP 500 — and a client that correctly retries on 500 then double-posts. A failed
+ * audit write is logged with the entity it belonged to instead (SUP-9856).
+ *
+ * Callers running inside a transaction must use {@link logActivityInTransaction}.
+ */
+export async function logActivity(db: Db, input: LogActivityInput) {
+  try {
+    await writeActivity(db, input);
+  } catch (err) {
+    logger.error(
+      {
+        err,
+        companyId: input.companyId,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId,
+        issueId: input.issueId ?? null,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId ?? null,
+        runId: input.runId ?? null,
+      },
+      "activity log write failed; the audited mutation is unaffected",
+    );
+  }
+}
+
+/**
+ * Transaction-scoped variant that propagates failures. Swallowing an error inside a
+ * transaction is not an option: Postgres marks the transaction aborted, so every later
+ * statement fails anyway with a far less useful error. Here the audit entry and the mutation
+ * share a fate, which is exactly the guarantee a caller opens a transaction for.
+ */
+export async function logActivityInTransaction(tx: Db, input: LogActivityInput) {
+  await writeActivity(tx, input);
 }

@@ -136,7 +136,7 @@ export { executionWorkspaceService } from "./execution-workspaces.js";
 export { workspaceOperationService } from "./workspace-operations.js";
 export { workspaceFileResourceService } from "./workspace-file-resources.js";
 export { workProductService } from "./work-products.js";
-export { logActivity, type LogActivityInput } from "./activity-log.js";
+export { logActivity, logActivityInTransaction, type LogActivityInput } from "./activity-log.js";
 export { summarySlotService, SUMMARIZER_BUILT_IN_KEY } from "./summary-slots.js";
 export { notifyHireApproved, type NotifyHireApprovedInput } from "./hire-hook.js";
 export { publishLiveEvent, subscribeCompanyLiveEvents } from "./live-events.js";
