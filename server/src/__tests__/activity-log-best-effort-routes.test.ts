@@ -36,8 +36,18 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let app!: express.Express;
   let currentActor!: Express.Request["actor"];
+  let previousSchedulingSuppression: string | undefined;
 
   beforeAll(async () => {
+    // Comment and status mutations fire `void heartbeat.wakeup(...)`, which queues a
+    // real run and executes it in the background. Those runs outlive the request and
+    // keep querying while `afterAll` shuts the embedded Postgres down, which surfaces
+    // as a vitest unhandled error even though every assertion passed. This suite is
+    // about the audit write on the request path, so suppress the run engine outright;
+    // `PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS` is read only by
+    // `resolveHeartbeatSchedulingSuppression`, so nothing else changes behavior.
+    previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-activity-log-best-effort-");
     db = createDb(tempDb.connectionString);
     app = createApp();
@@ -49,6 +59,11 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+    if (previousSchedulingSuppression === undefined) {
+      delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    } else {
+      process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
+    }
   });
 
   function createApp() {
