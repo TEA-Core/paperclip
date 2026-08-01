@@ -41,7 +41,11 @@ import {
   readPaperclipRuntimeSkillEntries,
   resolvePaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
+import {
+  describeIncompleteOpenCodeStream,
+  isOpenCodeUnknownSessionError,
+  parseOpenCodeJsonl,
+} from "./parse.js";
 import { ensureOpenCodeModelConfiguredAndAvailable } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
@@ -509,11 +513,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : null;
 
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
+      // A stream that stopped early exits 0 and reports no error, so without this it reaches
+      // the heartbeat as exitCode 0 + no errorMessage and is recorded `succeeded`.
+      const incompleteStreamError = describeIncompleteOpenCodeStream(attempt.parsed.finalStepReason) ?? "";
+      const effectiveParsedError = parsedError || incompleteStreamError;
       const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
       const rawExitCode = attempt.proc.exitCode;
-      const synthesizedExitCode = parsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+      const synthesizedExitCode = effectiveParsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
       const fallbackErrorMessage =
-        parsedError ||
+        effectiveParsedError ||
         stderrLine ||
         `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
       const modelId = model || null;

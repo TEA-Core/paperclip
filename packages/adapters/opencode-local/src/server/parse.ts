@@ -19,8 +19,38 @@ function errorText(value: unknown): string {
   }
 }
 
+/**
+ * Final `step_finish` reasons that mean the stream stopped early rather than finishing.
+ *
+ * OpenCode reports a terminal reason on the last `step_finish` event. Two values mean the
+ * model never got to the end of its turn:
+ *   - "length"  the output-token cap was hit mid-step
+ *   - "unknown" the stream ended without a terminal step at all (truncated)
+ *
+ * Deliberately a narrow allowlist of KNOWN-BAD reasons rather than "anything that is not
+ * a known-good reason": OpenCode emits several healthy terminal reasons in the wild
+ * ("stop", "done", ...) and treating an unrecognised one as a failure would fail closed
+ * on working runs.
+ */
+const INCOMPLETE_FINAL_STEP_REASONS: Record<string, string> = {
+  length:
+    'OpenCode hit the model output-token cap before finishing (step_finish reason="length"); the run is incomplete.',
+  unknown:
+    'OpenCode\'s stream ended without a terminal step (step_finish reason="unknown"); the run is incomplete.',
+};
+
+/**
+ * Describe why a stream is incomplete, or null when the final step looks healthy.
+ * `null`/empty input is treated as healthy so adapters that emit no `step_finish` are unaffected.
+ */
+export function describeIncompleteOpenCodeStream(finalStepReason: string | null | undefined): string | null {
+  if (!finalStepReason) return null;
+  return INCOMPLETE_FINAL_STEP_REASONS[finalStepReason] ?? null;
+}
+
 export function parseOpenCodeJsonl(stdout: string) {
   let sessionId: string | null = null;
+  let finalStepReason: string | null = null;
   const messages: string[] = [];
   const errors: string[] = [];
   const toolErrors: string[] = [];
@@ -52,6 +82,8 @@ export function parseOpenCodeJsonl(stdout: string) {
 
     if (type === "step_finish") {
       const part = parseObject(event.part);
+      // Last one wins: the terminal step is the one that says how the turn ended.
+      finalStepReason = asString(part.reason, "").trim().toLowerCase();
       const tokens = parseObject(part.tokens);
       const cache = parseObject(tokens.cache);
       usage.inputTokens += asNumber(tokens.input, 0);
@@ -80,6 +112,7 @@ export function parseOpenCodeJsonl(stdout: string) {
 
   return {
     sessionId,
+    finalStepReason,
     summary: messages.join("\n\n").trim(),
     usage,
     costUsd,
