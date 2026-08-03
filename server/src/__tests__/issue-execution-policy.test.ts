@@ -1019,6 +1019,51 @@ describe("issue execution policy transitions", () => {
       expect(result.patch.assigneeAgentId).toBeUndefined();
     });
 
+    it("does not deadlock when the sole approval participant is also the return assignee", () => {
+      const policy = makePolicy([
+        { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+        { type: "approval", participants: [{ type: "agent", agentId: coderAgentId }] },
+      ]);
+      const reviewStageId = policy.stages[0].id;
+      const approvalStageId = policy.stages[1].id;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: ctoUserId,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: approvalStageId,
+            currentStageIndex: 1,
+            currentStageType: "approval",
+            currentParticipant: { type: "agent", agentId: coderAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [reviewStageId],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Approved",
+      });
+
+      expect(result.patch.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: expect.arrayContaining([reviewStageId, approvalStageId]),
+        lastDecisionOutcome: "approved",
+      });
+      expect(result.decision).toMatchObject({
+        stageId: approvalStageId,
+        stageType: "approval",
+        outcome: "approved",
+      });
+    });
+
     it("skips a self-review-only review stage and advances to approval", () => {
       const policy = makePolicy([
         {
@@ -1057,6 +1102,58 @@ describe("issue execution policy transitions", () => {
           returnAssignee: { type: "agent", agentId: coderAgentId },
           completedStageIds: [policy.stages[0].id],
         },
+      });
+    });
+  });
+
+  describe("deadlock: sole approval participant is also the return assignee", () => {
+    it("does not deadlock when starting workflow into an approval stage whose sole participant is the return assignee", () => {
+      const policy = makePolicy([
+        { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+        { type: "approval", participants: [{ type: "agent", agentId: coderAgentId }] },
+      ]);
+      const reviewStageId = policy.stages[0].id;
+      const approvalStageId = policy.stages[1].id;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "QA signoff complete",
+      });
+
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: approvalStageId,
+        currentStageType: "approval",
+        currentParticipant: { type: "agent", agentId: coderAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [reviewStageId],
+      });
+      expect(result.decision).toMatchObject({
+        stageId: reviewStageId,
+        stageType: "review",
+        outcome: "approved",
       });
     });
   });
