@@ -33,7 +33,7 @@ import {
   writeLocalServiceRegistryRecord,
 } from "./local-service-supervisor.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
-import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { executionWorkspaceService, readExecutionWorkspaceConfig, type ExecutionWorkspaceBranchReconcileMode } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 
@@ -997,6 +997,12 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const registeredBranchMatchesHead = Boolean(registered && registeredBranchRef === actualBranchRef);
   const sameHead = Boolean(expectedHeadSha && actualHeadSha && expectedHeadSha === actualHeadSha);
   const expectedBranchExists = Boolean(expectedHeadSha);
+  const defaultBranch = input.repoRoot ? await detectDefaultBranch(input.repoRoot) : null;
+  const actualBranchIsDefaultBranch =
+    Boolean(input.actualBranchName) &&
+    Boolean(defaultBranch) &&
+    normalizeDefaultBranchForComparison(input.actualBranchName) ===
+      normalizeDefaultBranchForComparison(defaultBranch);
   const ancestryVerdict = await getGitWorktreeBranchAncestryVerdict({
     repoRoot: input.repoRoot,
     expectedHeadSha,
@@ -1029,14 +1035,25 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     ancestryVerdict === "ancestor" &&
     !sameHead &&
     registeredBranchMatchesHead;
+  const canRebindDeletedBranchToDefaultBranch =
+    cleanliness === "clean" &&
+    !expectedBranchExists &&
+    actualBranchExists === true &&
+    registeredBranchMatchesHead &&
+    actualBranchIsDefaultBranch;
   const eligible =
-    canCheckoutRecordedBranch || canAdoptForwardActualBranch || canAttachRecordedBranchToDetachedHead;
+    canCheckoutRecordedBranch ||
+    canAdoptForwardActualBranch ||
+    canAttachRecordedBranchToDetachedHead ||
+    canRebindDeletedBranchToDefaultBranch;
   const safeRepairReason = eligible
     ? canCheckoutRecordedBranch
       ? "clean worktree and expected branch points at the current HEAD"
       : canAdoptForwardActualBranch
         ? "clean worktree and checked-out branch is forward of the recorded branch"
-        : "clean detached worktree HEAD is forward of the recorded branch"
+        : canAttachRecordedBranchToDetachedHead
+          ? "clean detached worktree HEAD is forward of the recorded branch"
+          : "clean worktree with deleted recorded branch is already on the default branch"
     : cleanliness !== "clean"
       ? inProgressOperation
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
@@ -1046,7 +1063,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
       : !registeredBranchMatchesHead
         ? "registered worktree branch does not match HEAD"
       : !expectedBranchExists
-        ? "expected branch does not exist"
+        ? actualBranchIsDefaultBranch
+          ? "recorded branch is deleted but worktree is clean and already on the default branch"
+          : "expected branch does not exist"
         : !sameHead
           ? "expected branch and current HEAD differ"
           : "safe repair could not be proven";
@@ -1095,6 +1114,8 @@ async function inspectGitWorktreeBranchIncoherence(input: {
       actualHeadSha,
       sameHead,
       ancestryVerdict,
+      defaultBranch,
+      actualBranchIsDefaultBranch,
       plainLanguageReason,
     },
     safeRepair: {
@@ -1571,7 +1592,7 @@ async function logForwardBranchReconcileActivity(input: {
   executionWorkspaceId: string;
   sourceIssueId: string | null;
   runId: string | null;
-  mode: "forward";
+  mode: ExecutionWorkspaceBranchReconcileMode;
   reason: string | null;
   fromBranch: string;
   toBranch: string;
@@ -1919,6 +1940,87 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     };
   }
 
+  if (
+    !evidence.provenance.expectedBranchExists &&
+    currentBranch &&
+    evidence.provenance.actualBranchExists === true &&
+    evidence.provenance.actualBranchIsDefaultBranch &&
+    evidence.provenance.registeredBranchMatchesHead
+  ) {
+    if (input.db && input.executionWorkspaceId) {
+      const reason = `Automatic default-branch rebind: recorded branch "${expectedBranchName}" was deleted; clean worktree is on the default branch "${currentBranch}".`;
+      try {
+        const result = await executionWorkspaceService(input.db).reconcileExecutionWorkspaceBranch(
+          input.executionWorkspaceId,
+          {
+            mode: "default_branch_rebind",
+            reason,
+            alternateRecoveryFingerprints: [evidence.fingerprint],
+            actor: { actorType: "system", actorId: "workspace_runtime", agentId: null, runId: input.heartbeatRunId ?? null },
+          },
+        );
+        await logForwardBranchReconcileActivity({
+          db: input.db,
+          companyId: result.workspace.companyId,
+          executionWorkspaceId: result.workspace.id,
+          sourceIssueId: result.workspace.sourceIssueId ?? evidence.sourceIssueId ?? null,
+          runId: input.heartbeatRunId ?? null,
+          mode: "default_branch_rebind",
+          reason,
+          fromBranch: result.inspection.fromBranch,
+          toBranch: result.inspection.toBranch,
+          fromSha: result.inspection.fromSha,
+          toSha: result.inspection.toSha,
+          ancestryVerdict: result.inspection.ancestryVerdict,
+          fingerprint: result.inspection.fingerprint,
+          auditCommentId: result.auditCommentId,
+          recoveryActionId: result.recoveryAction?.id ?? null,
+        });
+        await recordForwardBranchReconcileOperation({
+          recorder: input.recorder,
+          phase: input.reconcileOperationPhase,
+          cwd: input.worktreePath,
+          repoRoot: result.inspection.repoRoot,
+          worktreePath: result.inspection.worktreePath,
+          expectedBranchName: result.inspection.fromBranch,
+          actualBranchName: result.inspection.toBranch,
+          executionWorkspaceId: result.workspace.id,
+          sourceIssueId: result.workspace.sourceIssueId ?? evidence.sourceIssueId ?? null,
+          fingerprint: result.inspection.fingerprint,
+          expectedHeadSha: result.inspection.fromSha,
+          actualHeadSha: result.inspection.toSha,
+          ancestryVerdict: result.inspection.ancestryVerdict,
+          mode: "record_updated",
+          auditCommentId: result.auditCommentId,
+          recoveryActionId: result.recoveryAction?.id ?? null,
+        });
+        evidence.safeRepair.succeeded = true;
+        evidence.safeRepair.reason = "clean worktree with deleted recorded branch rebound to the default branch and persisted";
+        return {
+          branchName: result.inspection.toBranch,
+          reconciledForward: false,
+          warnings: [
+            `${warningPrefix} The recorded branch "${expectedBranchName}" was deleted from the repository, but the worktree is clean and already on the default branch "${currentBranch}". Paperclip adopted the default branch as the workspace branch.`,
+          ],
+        };
+      } catch (error) {
+        evidence.safeRepair.succeeded = false;
+        evidence.safeRepair.reason = `default branch rebind persistence failed: ${error instanceof Error ? error.message : String(error)}`;
+        throw branchIncoherenceValidationFailure(evidence);
+      }
+    }
+
+    evidence.safeRepair.succeeded = true;
+    evidence.safeRepair.reason = "clean worktree with deleted recorded branch is already on the default branch";
+    return {
+      branchName: currentBranch,
+      reconciledForward: false,
+      warnings: [
+        `${warningPrefix} The recorded branch "${expectedBranchName}" was deleted from the repository, but the worktree is clean and already on the default branch "${currentBranch}". Paperclip adopted the default branch as the workspace branch.`,
+      ],
+    };
+  }
+
   try {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
@@ -2158,7 +2260,7 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
 }
 
-async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
+export async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
   const originMasterRef = "origin/master";
   await refreshRemoteTrackingBaseRef(repoRoot, originMasterRef);
   if (await resolveBaseRefSha(repoRoot, originMasterRef)) {
@@ -2191,6 +2293,11 @@ async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
   }
 
   return null;
+}
+
+export function normalizeDefaultBranchForComparison(branch: string | null | undefined): string | null {
+  if (!branch) return null;
+  return branch.replace(/^origin\//, "");
 }
 
 async function directoryExists(value: string) {
