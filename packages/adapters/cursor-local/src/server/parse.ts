@@ -53,6 +53,7 @@ export function parseCursorJsonl(stdout: string) {
   let sessionId: string | null = null;
   const messages: string[] = [];
   let errorMessage: string | null = null;
+  let finishReason: string | null = null;
   let totalCostUsd = 0;
   const usage = {
     inputTokens: 0,
@@ -136,6 +137,9 @@ export function parseCursorJsonl(stdout: string) {
       usage.cachedInputTokens += asNumber(cache.read, 0);
       usage.outputTokens += asNumber(tokens.output, 0);
       totalCostUsd += asNumber(part.cost, 0);
+      // Last one wins: the terminal step is the one that says how the turn ended. Normalized to
+      // match opencode-local so the shared field carries one vocabulary across adapters.
+      finishReason = asString(part.reason, "").trim().toLowerCase() || null;
       continue;
     }
   }
@@ -145,6 +149,7 @@ export function parseCursorJsonl(stdout: string) {
     summary: messages.join("\n\n").trim(),
     usage,
     costUsd: totalCostUsd > 0 ? totalCostUsd : null,
+    finishReason,
     errorMessage,
   };
 }

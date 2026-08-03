@@ -4,7 +4,7 @@ import { workspaceOperations } from "@paperclipai/db";
 import type { WorkspaceOperation, WorkspaceOperationPhase, WorkspaceOperationStatus } from "@paperclipai/shared";
 import { asc, desc, eq, inArray, isNull, or, and } from "drizzle-orm";
 import { notFound } from "../errors.js";
-import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
+import { redactCurrentUserText, redactCurrentUserValue, redactSecretTokens } from "../log-redaction.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
 
@@ -16,6 +16,7 @@ function toWorkspaceOperation(row: WorkspaceOperationRow): WorkspaceOperation {
     companyId: row.companyId,
     executionWorkspaceId: row.executionWorkspaceId ?? null,
     heartbeatRunId: row.heartbeatRunId ?? null,
+    issueId: row.issueId ?? null,
     phase: row.phase as WorkspaceOperationPhase,
     command: row.command ?? null,
     cwd: row.cwd ?? null,
@@ -89,6 +90,7 @@ export function workspaceOperationService(db: Db) {
       companyId: string;
       heartbeatRunId?: string | null;
       executionWorkspaceId?: string | null;
+      issueId?: string | null;
     }): WorkspaceOperationRecorder {
       let executionWorkspaceId = input.executionWorkspaceId ?? null;
       const createdIds: string[] = [];
@@ -121,7 +123,12 @@ export function workspaceOperationService(db: Db) {
           let stderrExcerpt = "";
           const append = async (stream: "stdout" | "stderr" | "system", chunk: string | null | undefined) => {
             if (!chunk) return;
-            const sanitizedChunk = redactCurrentUserText(chunk, currentUserRedactionOptions);
+            // SUP-8631: mirrors the heartbeat onLog wiring — the secret filter
+            // also covers the stdout/stderr excerpt DB columns, which never
+            // reach the log store.
+            const sanitizedChunk = redactSecretTokens(
+              redactCurrentUserText(chunk, currentUserRedactionOptions),
+            );
             if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
             if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
             await logStore.append(handle, {
@@ -136,6 +143,7 @@ export function workspaceOperationService(db: Db) {
             companyId: input.companyId,
             executionWorkspaceId,
             heartbeatRunId: input.heartbeatRunId ?? null,
+            issueId: input.issueId ?? null,
             phase: recordInput.phase,
             command: recordInput.command ?? null,
             cwd: recordInput.cwd ?? null,

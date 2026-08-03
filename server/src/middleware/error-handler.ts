@@ -1,8 +1,17 @@
 import type { Request, Response, NextFunction } from "express";
+import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
+
+/** Upper bound on caller-supplied key names echoed back in a validation error. */
+const MAX_ECHOED_UNRECOGNIZED_KEYS = 10;
 import { HttpError } from "../errors.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
+import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
+import { logger } from "./logger.js";
+import {
+  recordResponsibleUserDenialOnActiveRun,
+} from "../services/responsible-user-denial-run-outcomes.js";
 
 export interface ErrorContext {
   error: { message: string; stack?: string; name?: string; details?: unknown; raw?: unknown };
@@ -11,6 +20,10 @@ export interface ErrorContext {
   reqBody?: unknown;
   reqParams?: unknown;
   reqQuery?: unknown;
+}
+
+function isRedactedSkillPolicyDenial(details: Record<string, unknown> | null) {
+  return details?.code === "skill_policy_denied";
 }
 
 function attachErrorContext(
@@ -32,6 +45,36 @@ function attachErrorContext(
   }
 }
 
+function getPaperclipDb(req: Request): Db | null {
+  const locals = req.app?.locals as { paperclipDb?: Db; db?: Db } | undefined;
+  return locals?.paperclipDb ?? locals?.db ?? null;
+}
+
+function recordResponsibleUserDenialFromHttpError(
+  req: Request,
+  details: Record<string, unknown> | null,
+) {
+  if (req.actor?.type !== "agent") return;
+  const db = getPaperclipDb(req);
+  if (!db) return;
+
+  void recordResponsibleUserDenialOnActiveRun(db, {
+    runId: req.actor.runId ?? null,
+    agentId: req.actor.agentId ?? null,
+    companyId: req.actor.companyId ?? null,
+    code: details?.code,
+  }).catch((recordErr) => {
+    logger.warn(
+      {
+        err: recordErr,
+        runId: req.actor?.runId ?? null,
+        agentId: req.actor?.type === "agent" ? req.actor.agentId ?? null : null,
+      },
+      "failed to record responsible-user denial on heartbeat run",
+    );
+  });
+}
+
 export function errorHandler(
   err: unknown,
   req: Request,
@@ -39,6 +82,19 @@ export function errorHandler(
   _next: NextFunction,
 ) {
   if (err instanceof HttpError) {
+    const details = err.details && typeof err.details === "object" && !Array.isArray(err.details)
+      ? err.details as Record<string, unknown>
+      : null;
+    const redactedSkillPolicyDenial = isRedactedSkillPolicyDenial(details);
+    const structuredConnectionError = new Set([
+      "user_authorization_required",
+      "grant_revoked",
+      "needs_reauthorization",
+      "installation_required",
+      "connection_not_installed",
+      "subject_not_permitted",
+    ]).has(typeof details?.code === "string" ? details.code : "");
+    recordResponsibleUserDenialFromHttpError(req, details);
     if (err.status >= 500) {
       attachErrorContext(
         req,
@@ -51,13 +107,44 @@ export function errorHandler(
     }
     res.status(err.status).json({
       error: err.message,
-      ...(err.details ? { details: err.details } : {}),
+      ...(typeof details?.code === "string" ? { code: details.code } : {}),
+      ...(redactedSkillPolicyDenial && typeof details?.reason === "string" ? { reason: details.reason } : {}),
+      ...(typeof details?.remediation === "string" || (structuredConnectionError && details?.remediation && typeof details.remediation === "object")
+        ? { remediation: details.remediation }
+        : {}),
+      ...(structuredConnectionError && details?.connection ? { connection: details.connection } : {}),
+      ...(structuredConnectionError && details?.subject ? { subject: details.subject } : {}),
+      ...(structuredConnectionError && typeof details?.grantId === "string" ? { grantId: details.grantId } : {}),
+      ...(!redactedSkillPolicyDenial && err.details ? { details: err.details } : {}),
     });
     return;
   }
 
   if (err instanceof ZodError) {
-    res.status(400).json({ error: "Validation error", details: err.errors });
+    // Name unrecognized fields in `error` itself: a caller that misspells a field otherwise sees a
+    // generic message and has to dig through `details` to learn which key was rejected.
+    const unrecognizedKeys = [
+      ...new Set(
+        err.errors.flatMap((issue) =>
+          issue.code === "unrecognized_keys"
+            ? issue.keys.map((key) => [...issue.path, String(key).slice(0, 64)].join("."))
+            : [],
+        ),
+      ),
+    ];
+    // Key names are caller-supplied, so echo a bounded sample rather than the whole set: a body
+    // with thousands of unknown keys would otherwise turn a small request into a huge response.
+    const sampledKeys = unrecognizedKeys.slice(0, MAX_ECHOED_UNRECOGNIZED_KEYS);
+    const omittedKeyCount = unrecognizedKeys.length - sampledKeys.length;
+    res.status(400).json({
+      error:
+        unrecognizedKeys.length > 0
+          ? `Unrecognized field(s): ${sampledKeys.join(", ")}${
+              omittedKeyCount > 0 ? ` (and ${omittedKeyCount} more)` : ""
+            }`
+          : "Validation error",
+      details: err.errors,
+    });
     return;
   }
 
@@ -74,5 +161,14 @@ export function errorHandler(
   const tc = getTelemetryClient();
   if (tc) trackErrorHandlerCrash(tc, { errorCode: rootError.name });
 
-  res.status(500).json({ error: "Internal server error" });
+  res.status(500).json({
+    error: "Internal server error",
+    ...(shouldExposeTrustedCloudTenantImportError(req) ? { message: rootError.message } : {}),
+  });
+}
+
+function shouldExposeTrustedCloudTenantImportError(req: Request) {
+  return req.actor?.source === "cloud_tenant"
+    && req.method === "POST"
+    && req.originalUrl.split("?")[0] === COMPANY_IMPORT_API_PATH;
 }

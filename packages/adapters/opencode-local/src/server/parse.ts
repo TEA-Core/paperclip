@@ -19,9 +19,51 @@ function errorText(value: unknown): string {
   }
 }
 
+// OpenCode exposes MCP tools as "<serverName>_<toolName>", so the Paperclip MCP
+// server surfaces as `paperclip_paperclipUpdateIssue` and friends. Some clients
+// pass the bare camelCase tool name through instead, so accept both spellings.
+const PAPERCLIP_TOOL_NAME_PATTERN = /^paperclip_|^paperclip[A-Z]/;
+
+/**
+ * Final `step_finish` reasons that mean the stream stopped early rather than finishing.
+ *
+ * OpenCode reports a terminal reason on the last `step_finish` event. Two values mean the
+ * model never got to the end of its turn:
+ *   - "length"  the output-token cap was hit mid-step
+ *   - "unknown" the stream ended without a terminal step at all (truncated)
+ *
+ * Deliberately a narrow allowlist of KNOWN-BAD reasons rather than "anything that is not
+ * a known-good reason": OpenCode emits several healthy terminal reasons in the wild
+ * ("stop", "done", ...) and treating an unrecognised one as a failure would fail closed
+ * on working runs.
+ */
+const INCOMPLETE_FINAL_STEP_REASONS: Record<string, string> = {
+  length:
+    'OpenCode hit the model output-token cap before finishing (step_finish reason="length"); the run is incomplete.',
+  unknown:
+    'OpenCode\'s stream ended without a terminal step (step_finish reason="unknown"); the run is incomplete.',
+};
+
+/**
+ * Describe why a stream is incomplete, or null when the final step looks healthy.
+ * `null`/empty input is treated as healthy so adapters that emit no `step_finish` are unaffected.
+ */
+export function describeIncompleteOpenCodeStream(finalStepReason: string | null | undefined): string | null {
+  if (!finalStepReason) return null;
+  return INCOMPLETE_FINAL_STEP_REASONS[finalStepReason] ?? null;
+}
+
 export function parseOpenCodeJsonl(stdout: string) {
   let sessionId: string | null = null;
-  const messages: string[] = [];
+  let finalStepReason: string | null = null;
+  // Distinct Paperclip tool invocations. A run that made zero of these cannot
+  // have recorded an issue disposition, however confident its prose sounds --
+  // the successful-run handoff decision keys off this (Mode A, 2026-07-27).
+  const paperclipToolCallIds = new Set<string>();
+  let paperclipToolCallIndex = 0;
+  // Text parts are held with their owning message id so an auto-compaction
+  // summary can be retracted once the compaction is confirmed (see below).
+  const messages: { messageId: string; text: string }[] = [];
   const errors: string[] = [];
   const toolErrors: string[] = [];
   const usage = {
@@ -45,13 +87,32 @@ export function parseOpenCodeJsonl(stdout: string) {
 
     if (type === "text") {
       const part = parseObject(event.part);
+      const metadata = parseObject(part.metadata);
+
+      // OpenCode auto-compacts an overflowing session by emitting the session
+      // summary as an ordinary assistant text message, immediately followed by
+      // this synthetic "continue" part. The summary carries no marker of its
+      // own, so the nudge is the only signal that the preceding message was a
+      // compaction artifact rather than agent output — retract it here.
+      // Without this, every compaction leaks a full "## Objective / Work State"
+      // document into the issue comment body.
+      if (part.synthetic === true && metadata.compaction_continue === true) {
+        const summaryMessageId = messages.at(-1)?.messageId;
+        if (summaryMessageId !== undefined) {
+          while (messages.at(-1)?.messageId === summaryMessageId) messages.pop();
+        }
+        continue;
+      }
+
       const text = asString(part.text, "").trim();
-      if (text) messages.push(text);
+      if (text) messages.push({ messageId: asString(part.messageID, ""), text });
       continue;
     }
 
     if (type === "step_finish") {
       const part = parseObject(event.part);
+      // Last one wins: the terminal step is the one that says how the turn ended.
+      finalStepReason = asString(part.reason, "").trim().toLowerCase() || null;
       const tokens = parseObject(part.tokens);
       const cache = parseObject(tokens.cache);
       usage.inputTokens += asNumber(tokens.input, 0);
@@ -61,9 +122,17 @@ export function parseOpenCodeJsonl(stdout: string) {
       continue;
     }
 
-    if (type === "tool_use") {
+    if (type === "tool_use" || type === "tool") {
       const part = parseObject(event.part);
       const state = parseObject(part.state);
+      const toolName = asString(part.tool, "").trim();
+      if (PAPERCLIP_TOOL_NAME_PATTERN.test(toolName)) {
+        // The same tool part is re-emitted as its state advances
+        // (pending -> running -> completed); key on the call id so one
+        // invocation counts once.
+        const callId = asString(part.callID, "").trim() || asString(part.id, "").trim();
+        paperclipToolCallIds.add(callId || `__anonymous_${paperclipToolCallIndex++}`);
+      }
       if (asString(state.status, "") === "error") {
         const text = asString(state.error, "").trim();
         if (text) toolErrors.push(text);
@@ -80,11 +149,13 @@ export function parseOpenCodeJsonl(stdout: string) {
 
   return {
     sessionId,
-    summary: messages.join("\n\n").trim(),
+    finalStepReason,
+    summary: messages.map((m) => m.text).join("\n\n").trim(),
     usage,
     costUsd,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,
+    paperclipToolCallCount: paperclipToolCallIds.size,
   };
 }
 
