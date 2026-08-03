@@ -1307,6 +1307,76 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     );
   });
 
+  it("wakes dependents blocked on the source issue when recovery resolution closes it", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const dependentIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: dependentIssueId,
+      companyId,
+      title: "Dependent work",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: sourceIssueId,
+      relatedIssueId: dependentIssueId,
+      type: "blocks",
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:dependent-cascade",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const wakeCalls: Array<{ agentId: string; wakeup: any }> = [];
+    const app = createApp({ type: "board", source: "local_implicit" }, {
+      recoveryActionEnqueueWakeup: (async (agentId: string, wakeup: any) => {
+        wakeCalls.push({ agentId, wakeup });
+        return null;
+      }) as any,
+    });
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "done",
+        resolutionNote: "Owner confirmed the source issue is complete.",
+      })
+      .expect(200);
+
+    const dependencyWakes = wakeCalls.filter(
+      (call) => call.wakeup?.reason === "issue_blockers_resolved",
+    );
+    expect(dependencyWakes).toHaveLength(1);
+    expect(dependencyWakes[0]!.agentId).toBe(coderId);
+    expect(dependencyWakes[0]!.wakeup).toMatchObject({
+      reason: "issue_blockers_resolved",
+      idempotencyKey: `issue_blockers_resolved:${dependentIssueId}:${sourceIssueId}`,
+      payload: {
+        issueId: dependentIssueId,
+        resolvedBlockerIssueId: sourceIssueId,
+      },
+      contextSnapshot: {
+        issueId: dependentIssueId,
+        taskId: dependentIssueId,
+        wakeReason: "issue_blockers_resolved",
+      },
+    });
+  });
+
   it("hands restored work back to the recorded return owner and records the outcome", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db

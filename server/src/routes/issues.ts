@@ -5691,6 +5691,54 @@ export function issueRoutes(
       }
     }
 
+    // A recovery-path close is still a close: dependents blocked on this issue must
+    // get the same issue_blockers_resolved cascade that PATCH /issues/:id performs,
+    // otherwise they strand until someone unblocks them by hand. Cancelled blockers
+    // deliberately do not fire this wake, so only a transition to done cascades.
+    if (existing.status !== "done" && result.issue.status === "done") {
+      try {
+        const dependents = await svc.listWakeableBlockedDependents(result.issue.id);
+        for (const dependent of dependents) {
+          const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+            dependentIssueId: dependent.id,
+            resolvedBlockerIssueId: result.issue.id,
+          });
+          const existingWake = await findExistingIssueBlockersResolvedWake(db, {
+            companyId: result.issue.companyId,
+            idempotencyKey,
+          });
+          if (existingWake) continue;
+          await enqueueRecoveryActionWakeup(dependent.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+            payload: {
+              issueId: dependent.id,
+              resolvedBlockerIssueId: result.issue.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+              mutation: "recovery_action_resolution",
+            },
+            idempotencyKey,
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: dependent.id,
+              taskId: dependent.id,
+              wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+              source: "issue.blockers_resolved",
+              resolvedBlockerIssueId: result.issue.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+            },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err, issueId: result.issue.id },
+          "failed to wake dependents after recovery action closed the source issue",
+        );
+      }
+    }
+
     res.json({
       issue: {
         ...result.issue,
