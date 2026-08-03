@@ -71,6 +71,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
+  expirePendingInteractionsOnTerminalIssueStatus: vi.fn(async () => []),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
   link: vi.fn(),

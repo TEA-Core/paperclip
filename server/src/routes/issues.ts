@@ -27,6 +27,7 @@ import {
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
   cancelIssueThreadInteractionSchema,
+  withdrawIssueThreadInteractionSchema,
   companySearchExtractQuerySchema,
   companySearchQuerySchema,
   createIssueAttachmentMetadataSchema,
@@ -8883,6 +8884,23 @@ export function issueRoutes(
         !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
       if (becameTerminal) {
         await destroyReusableSandboxLeasesForTerminalIssue(issue);
+
+        const expiredInteractions = await issueThreadInteractionService(db).expirePendingInteractionsOnTerminalIssueStatus(
+          issue,
+          issue.status,
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        );
+        if (expiredInteractions.length > 0) {
+          await logExpiredRequestConfirmations({
+            issue,
+            interactions: expiredInteractions,
+            actor,
+            source: "issue.status_terminal",
+          });
+        }
       }
       if (becameTerminal && issue.parentId) {
         const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
@@ -9595,6 +9613,86 @@ export function issueRoutes(
         actor,
         source: "issue.interaction.cancel",
       });
+
+      res.json(interaction);
+    },
+  );
+
+  router.post(
+    "/issues/:id/interactions/:interactionId/withdraw",
+    validate(withdrawIssueThreadInteractionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+
+      const actor = getActorInfo(req);
+      const interaction = await issueThreadInteractionService(db).withdrawInteraction(
+        issue,
+        interactionId,
+        req.body,
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.thread_interaction_withdrawn",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          withdrawalReason:
+            interaction.result && "reason" in interaction.result
+              ? (interaction.result.reason ?? null)
+              : null,
+        },
+      });
+
+      if (issue.assigneeAgentId) {
+        void heartbeat.wakeup(issue.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_commented",
+          payload: {
+            issueId: issue.id,
+            interactionId: interaction.id,
+            interactionKind: interaction.kind,
+            interactionStatus: interaction.status,
+            sourceCommentId: interaction.sourceCommentId ?? null,
+            sourceRunId: interaction.sourceRunId ?? null,
+            mutation: "interaction",
+          },
+          idempotencyKey: `issue.interaction.withdraw:${interaction.id}`,
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: issue.id,
+            interactionId: interaction.id,
+            interactionKind: interaction.kind,
+            interactionStatus: interaction.status,
+            sourceCommentId: interaction.sourceCommentId ?? null,
+            sourceRunId: interaction.sourceRunId ?? null,
+            wakeReason: "issue_commented",
+            source: "issue.interaction.withdraw",
+          },
+        }).catch((err) => logger.warn({
+          err,
+          issueId: issue.id,
+          interactionId: interaction.id,
+          agentId: issue.assigneeAgentId,
+        }, "Failed to enqueue interaction withdrawal wake"));
+      }
 
       res.json(interaction);
     },
