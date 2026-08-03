@@ -2110,6 +2110,7 @@ export type ResolvedWorkspaceForRun = {
     cwd: string | null;
     repoUrl: string | null;
     repoRef: string | null;
+    defaultRef: string | null;
   }>;
   warnings: string[];
 };
@@ -7378,6 +7379,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       cwd: readNonEmptyString(workspace.cwd),
       repoUrl: readNonEmptyString(workspace.repoUrl),
       repoRef: readNonEmptyString(workspace.defaultRef) ?? readNonEmptyString(workspace.repoRef),
+      defaultRef: readNonEmptyString(workspace.defaultRef),
     }));
 
     if (projectWorkspaceRows.length > 0) {
@@ -7422,7 +7424,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             projectId: resolvedProjectId,
             workspaceId: workspace.id,
             repoUrl: workspace.repoUrl,
-            repoRef: workspace.defaultRef ?? workspace.repoRef,
+            repoRef: readNonEmptyString(workspace.defaultRef) ?? readNonEmptyString(workspace.repoRef),
             workspaceHints,
             warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
               (value): value is string => Boolean(value),
@@ -7461,7 +7463,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         projectId: resolvedProjectId,
         workspaceId: projectWorkspaceRows[0]?.id ?? null,
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
-        repoRef: projectWorkspaceRows[0]?.defaultRef ?? projectWorkspaceRows[0]?.repoRef ?? null,
+        repoRef:
+          readNonEmptyString(projectWorkspaceRows[0]?.defaultRef) ??
+          readNonEmptyString(projectWorkspaceRows[0]?.repoRef),
         workspaceHints,
         warnings,
       };
