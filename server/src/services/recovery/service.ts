@@ -38,7 +38,7 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import { IssueDependencyReadiness, TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
   normalizeIssueExecutionPolicy,
@@ -94,6 +94,7 @@ const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiv
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+const BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT = 500;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -684,6 +685,10 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
     "",
     "This issue now keeps its existing blockers and is also blocked by the escalation issue so dependency wakeups remain explicit.",
   ].join("\n");
+}
+
+export function isBlockedWithoutBlockers(input: { status: string; blockerIssueIds: string[] }): boolean {
+  return input.status === "blocked" && input.blockerIssueIds.length === 0;
 }
 
 export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
@@ -5587,6 +5592,112 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  const BLOCKED_WITHOUT_BLOCKERS_RELOG_INTERVAL_MS = 5 * 60_000;
+  let lastBlockedWithoutBlockersLogAt: Date | null = null;
+
+  async function reconcileBlockedWithoutBlockers(opts?: { issueCreatedAtGte?: Date | null }) {
+    const result = {
+      reported: 0,
+      skipped: 0,
+      issueIds: [] as string[],
+    };
+
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          visibleIssueCondition(),
+          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+        ),
+      )
+      .orderBy(asc(issues.id))
+      .limit(BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT);
+
+    const candidatesByCompany = new Map<string, typeof candidates>();
+    for (const candidate of candidates) {
+      const companyCandidates = candidatesByCompany.get(candidate.companyId) ?? [];
+      companyCandidates.push(candidate);
+      candidatesByCompany.set(candidate.companyId, companyCandidates);
+    }
+
+    const readinessMap = new Map<string, IssueDependencyReadiness>();
+    for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
+      const companyReadiness = await issuesSvc.listDependencyReadiness(
+        companyId,
+        companyCandidates.map((candidate) => candidate.id),
+      );
+      for (const [issueId, readiness] of companyReadiness.entries()) {
+        readinessMap.set(issueId, readiness);
+      }
+    }
+
+    const now = new Date();
+    const shouldLog = !lastBlockedWithoutBlockersLogAt ||
+      now.getTime() - lastBlockedWithoutBlockersLogAt.getTime() >= BLOCKED_WITHOUT_BLOCKERS_RELOG_INTERVAL_MS;
+
+    for (const candidate of candidates) {
+      const readiness = readinessMap.get(candidate.id);
+      const blockerIssueIds = readiness?.blockerIssueIds ?? [];
+      if (!isBlockedWithoutBlockers({ status: candidate.status, blockerIssueIds })) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasActiveExecutionPath(candidate.companyId, candidate.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasPendingWakeInteraction(candidate.companyId, candidate.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      result.reported += 1;
+      result.issueIds.push(candidate.id);
+
+      if (shouldLog) {
+        await logActivity(db, {
+          companyId: candidate.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "issue.blocked_without_blockers_detected",
+          entityType: "issue",
+          entityId: candidate.id,
+          details: {
+            source: "recovery.reconcile_blocked_without_blockers",
+            identifier: candidate.identifier,
+            blockerIssueIds,
+          },
+        });
+      }
+    }
+
+    if (result.reported > 0 && shouldLog) {
+      lastBlockedWithoutBlockersLogAt = now;
+      logger.warn(
+        { reported: result.reported, issueIds: result.issueIds },
+        "swept blocked-without-blockers issues (report-only)",
+      );
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -5596,6 +5707,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     scanTerminableSilentActiveRuns,
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
+    reconcileBlockedWithoutBlockers,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
     reconcileIssueGraphLiveness,
