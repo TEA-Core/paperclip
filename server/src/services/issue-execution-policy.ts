@@ -476,15 +476,25 @@ function selectStageParticipant(
   opts?: {
     preferred?: IssueExecutionStagePrincipal | null;
     exclude?: IssueExecutionStagePrincipal | null;
+    allowSelfAsFallback?: boolean;
   },
 ): IssueExecutionStagePrincipal | null {
-  const participants = stage.participants.filter((participant) => !principalsEqual(participant, opts?.exclude ?? null));
-  if (participants.length === 0) return null;
+  const exclude = opts?.exclude ?? null;
+  const participants = stage.participants.filter((participant) => !principalsEqual(participant, exclude));
+  // When the exclude would leave zero participants (e.g. a sole participant who
+  // is also the return assignee), fall back to the full participant list so the
+  // stage remains reachable instead of deadlocking. This is skipped when
+  // allowSelfAsFallback is false, which is used by the auto-skip path to
+  // correctly detect self-review-only stages.
+  const eligible = participants.length > 0 || opts?.allowSelfAsFallback === false
+    ? participants
+    : stage.participants;
+  if (eligible.length === 0) return null;
   if (opts?.preferred) {
-    const preferred = participants.find((participant) => principalsEqual(participant, opts.preferred ?? null));
+    const preferred = eligible.find((participant) => principalsEqual(participant, opts.preferred ?? null));
     if (preferred) return preferred;
   }
-  const first = participants[0];
+  const first = eligible[0];
   return first ? { type: first.type, agentId: first.agentId ?? null, userId: first.userId ?? null } : null;
 }
 
@@ -911,6 +921,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         ? explicitAssignee ?? existingState.currentParticipant ?? null
         : explicitAssignee,
     exclude: returnAssignee,
+    allowSelfAsFallback: false,
   });
   while (!participant && canAutoSkipPendingStage({ stage: pendingStage, returnAssignee, requestedStatus })) {
     skippedStageIds.push(pendingStage.id);
@@ -930,6 +941,16 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       });
       return { patch };
     }
+    participant = selectStageParticipant(pendingStage, {
+      preferred:
+        existingState?.status === CHANGES_REQUESTED_STATUS
+          ? explicitAssignee ?? existingState.currentParticipant ?? null
+          : explicitAssignee,
+      exclude: returnAssignee,
+      allowSelfAsFallback: false,
+    });
+  }
+  if (!participant) {
     participant = selectStageParticipant(pendingStage, {
       preferred:
         existingState?.status === CHANGES_REQUESTED_STATUS
