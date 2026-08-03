@@ -174,13 +174,13 @@ test("built artifact assertion rejects a malformed returnAssigneeAgentId validat
       "returnAssigneeAgentId: z.boolean()",
     )
     .replace(
-      /(\}\);)(\s*\n\s*export const issueExecutionStateSchema)/,
+      /(\}\);)(\s*\n\s*export const issueReviewRequestSchema)/,
       "$1\nexport const returnAssigneeAgentId = z.string().trim().uuid().optional().nullable();$2",
     );
 
   assert.throws(
     () => assertArtifactHasValidReturnAssigneeAgentId(malformed),
     /issueExecutionPolicySchema initializer must contain returnAssigneeAgentId/,
-    "malformed fixture with z.boolean() in the policy schema and a decoy field outside it must be rejected",
+    "malformed fixture with z.boolean() in the policy schema and a correctly shaped decoy field outside the schema initializer must be rejected",
   );
 });
