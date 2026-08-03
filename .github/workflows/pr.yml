@@ -138,6 +138,9 @@ jobs:
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry
 
+      - name: Verify release source branch gate
+        run: pnpm run test:release-source
+
   general_tests:
     name: General tests (${{ matrix.group_label }})
     needs: [policy]
@@ -345,9 +348,9 @@ jobs:
       # workspace build sees a lockfile that matches the manifest.
       - name: Release canary dry run via release.sh internal build
         env:
+          RELEASE_ALLOW_DIVERGENT_SOURCE: "1"
           USED_ARTIFACT_LOCKFILE: ${{ needs.policy.outputs.lockfile_regenerated || '0' }}
         run: |
-          git checkout -B master HEAD
           if [ "$USED_ARTIFACT_LOCKFILE" = "1" ]; then
             git add pnpm-lock.yaml
             if ! git diff --cached --quiet; then
