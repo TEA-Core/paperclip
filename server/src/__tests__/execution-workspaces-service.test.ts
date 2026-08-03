@@ -2347,6 +2347,122 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(unrelatedPersisted?.branchName).toBe(recordedBranch);
   }, 30_000);
 
+  it("persists a default_branch_rebind, resolves the alternate recovery fingerprint when the original is absent", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-rebind-alt-${randomUUID()}`);
+    tempDirs.add(worktreePath);
+
+    const recordedBranch = "PAP-463-deleted-recorded";
+    await runGit(repoRoot, ["branch", recordedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath]);
+    await runGit(worktreePath, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await runGit(worktreePath, ["reset", "--hard", "HEAD"]);
+    await runGit(repoRoot, ["branch", "-D", recordedBranch]);
+
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const issueId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Branch reconcile",
+      status: "in_progress",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Source task",
+      identifier: "PAP-463",
+      status: "blocked",
+      priority: "medium",
+    });
+
+    const actualBranch = await readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    const inspectionFingerprint = await fingerprintWorkspaceBranchIncoherenceForTest({
+      repoRoot,
+      worktreePath,
+      sourceIssueId: issueId,
+      executionWorkspaceId,
+      expectedBranch: recordedBranch,
+      actualBranch,
+    });
+    const alternateFingerprint = `workspace_incoherence:v1:sha256:alternate-${randomUUID()}`;
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: recordedBranch,
+      status: "idle",
+      providerType: "git_worktree",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      branchName: recordedBranch,
+      baseRef: "main",
+    });
+
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "workspace_validation",
+      status: "active",
+      ownerType: "board",
+      cause: "workspace_validation_failed",
+      fingerprint: alternateFingerprint,
+      evidence: { workspaceValidation: { fingerprint: alternateFingerprint } },
+      nextAction: "Repair the source issue workspace link.",
+    });
+
+    const result = await svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
+      mode: "default_branch_rebind",
+      reason: "Automatic default-branch rebind: recorded branch was deleted; clean worktree is on the default branch.",
+      alternateRecoveryFingerprints: [alternateFingerprint],
+      actor: {
+        actorType: "system",
+        actorId: "workspace_runtime",
+        agentId: null,
+        runId: null,
+      },
+    });
+
+    expect(result.workspace.branchName).toBe("main");
+    expect(result.recoveryAction).toMatchObject({
+      kind: "workspace_validation",
+      status: "resolved",
+      outcome: "restored",
+      fingerprint: alternateFingerprint,
+    });
+
+    const [persistedRow] = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    expect(persistedRow?.branchName).toBe("main");
+
+    const [persistedRecoveryAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(persistedRecoveryAction).toMatchObject({
+      status: "resolved",
+      outcome: "restored",
+      fingerprint: alternateFingerprint,
+    });
+  }, 30_000);
+
   it("returns a bounded company-scoped workspace overview with service and linked issue summaries", async () => {
     const companyId = randomUUID();
     const otherCompanyId = randomUUID();
