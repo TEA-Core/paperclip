@@ -269,11 +269,21 @@ require_clean_worktree() {
   fi
 }
 
-require_on_master_branch() {
-  local current_branch
-  current_branch="$(git_current_branch)"
-  if [ "$current_branch" != "master" ]; then
-    release_fail "this release step must run from branch master, but current branch is ${current_branch:-<detached>}."
+require_on_release_source_branch() {
+  local publish_remote="${1:-}"
+  local current_sha="${2:-}"
+  local expected_branch="${RELEASE_SOURCE_BRANCH:-main}"
+
+  [ -n "$publish_remote" ] || release_fail "require_on_release_source_branch: PUBLISH_REMOTE is required."
+  [ -n "$current_sha" ] || release_fail "require_on_release_source_branch: CURRENT_SHA is required."
+
+  local authoritative_ref="${publish_remote}/${expected_branch}"
+  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$authoritative_ref" >/dev/null 2>&1; then
+    release_fail "authoritative source lineage could not be resolved: remote ref '${authoritative_ref}' is unavailable. Refuse to publish a divergent lineage."
+  fi
+
+  if ! git -C "$REPO_ROOT" merge-base --is-ancestor "$current_sha" "$authoritative_ref" 2>/dev/null; then
+    release_fail "authoritative source lineage: current commit ${current_sha} is not an ancestor of ${authoritative_ref}. Refuse to publish a divergent lineage."
   fi
 }
 
