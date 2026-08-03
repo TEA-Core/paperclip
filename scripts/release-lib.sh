@@ -269,11 +269,12 @@ require_clean_worktree() {
   fi
 }
 
-require_on_master_branch() {
+require_on_release_source_branch() {
   local current_branch
+  local expected_branch="${RELEASE_SOURCE_BRANCH:-main}"
   current_branch="$(git_current_branch)"
-  if [ "$current_branch" != "master" ]; then
-    release_fail "this release step must run from branch master, but current branch is ${current_branch:-<detached>}."
+  if [ "$current_branch" != "$expected_branch" ]; then
+    release_fail "this release step must run from the authoritative source branch ${expected_branch} (set RELEASE_SOURCE_BRANCH to override), but current branch is ${current_branch:-<detached>}."
   fi
 }
 
