@@ -144,8 +144,9 @@ TARGET_STABLE_VERSION="$(next_stable_version "$RELEASE_DATE" "${PUBLIC_PACKAGE_N
 TARGET_PUBLISH_VERSION="$TARGET_STABLE_VERSION"
 DIST_TAG="latest"
 
+require_on_release_source_branch "$PUBLISH_REMOTE" "$CURRENT_SHA"
+
 if [ "$channel" = "canary" ]; then
-  require_on_master_branch
   TARGET_PUBLISH_VERSION="$(next_canary_version "$TARGET_STABLE_VERSION" "${PUBLIC_PACKAGE_NAMES[@]}")"
   DIST_TAG="canary"
   tag_name="$(canary_tag_name "$TARGET_PUBLISH_VERSION")"
