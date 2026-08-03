@@ -54,6 +54,8 @@ export interface GitWorktreeBranchIncoherenceEvidence {
     actualHeadSha: string | null;
     sameHead: boolean;
     ancestryVerdict: GitWorktreeBranchAncestryVerdict;
+    defaultBranch: string | null;
+    actualBranchIsDefaultBranch: boolean;
     plainLanguageReason: string;
   };
   safeRepair: {

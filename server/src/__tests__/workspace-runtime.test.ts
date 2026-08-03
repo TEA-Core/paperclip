@@ -2771,6 +2771,164 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 15_000);
 
+  it("rebinds deleted recorded branch to default branch when worktree is clean and on default", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-460-deleted-recorded-branch";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, expectedBranch]);
+    await runGit(repoRoot, ["worktree", "remove", worktreePath]);
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath]);
+    await runGit(worktreePath, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await runGit(worktreePath, ["reset", "--hard", "HEAD"]);
+
+    const result = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-deleted-branch-default",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: expectedBranch,
+      },
+      issue: {
+        id: "issue-deleted-branch-default",
+        identifier: "PAP-460",
+        title: "Rebind deleted branch to default",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      enableWorkspaceBranchReconcileForward: true,
+    });
+
+    expect(result.branchName).toBe("main");
+    expect(result.pendingForwardBranchReconcile).toBeUndefined();
+  }, 15_000);
+
+  it("does NOT rebind a dirty worktree with deleted recorded branch to the default branch", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-463-dirty-deleted";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, expectedBranch]);
+    await runGit(repoRoot, ["worktree", "remove", worktreePath]);
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath]);
+    await runGit(worktreePath, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await runGit(worktreePath, ["reset", "--hard", "HEAD"]);
+    await fs.writeFile(path.join(worktreePath, "dirty.txt"), "dirty work\n", "utf8");
+
+    let error: unknown = null;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          id: "execution-workspace-dirty-deleted",
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: worktreePath,
+          providerRef: worktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-1",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName: expectedBranch,
+        },
+        issue: {
+          id: "issue-dirty-deleted",
+          identifier: "PAP-463",
+          title: "Dirty deleted branch non-rebind",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+        enableWorkspaceBranchReconcileForward: true,
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "git_worktree_branch_incoherence",
+          cleanliness: "dirty",
+          provenance: expect.objectContaining({
+            expectedBranchExists: false,
+            actualBranchIsDefaultBranch: true,
+          }),
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+            reason: "worktree is not clean",
+          }),
+        }),
+      },
+    });
+  }, 15_000);
+
+  it("does NOT rebind a deleted recorded branch when the worktree is on an unrelated registered task branch", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-464-deleted-unrelated";
+    const actualBranch = "PAP-999-unrelated-task";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await runGit(repoRoot, ["checkout", "-b", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded-task.txt"), "recorded task work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded-task.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded task work"]);
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "main"]);
+    await fs.writeFile(path.join(worktreePath, "unrelated-task.txt"), "unrelated task work\n", "utf8");
+    await runGit(worktreePath, ["add", "unrelated-task.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add unrelated task work"]);
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-unrelated-deleted",
+      executionWorkspaceId: "execution-workspace-unrelated-deleted",
+      expectedAncestryVerdict: "unknown",
+      expectedReason: "expected branch does not exist",
+    });
+  }, 15_000);
+
   it("keeps forward reconciliation fail-closed for same-content rewritten history", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-content";

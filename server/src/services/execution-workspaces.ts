@@ -38,6 +38,7 @@ import {
   listCurrentRuntimeServicesForExecutionWorkspaces,
   listCurrentRuntimeServicesForProjectWorkspaces,
 } from "./workspace-runtime-read-model.js";
+import { detectDefaultBranch, normalizeDefaultBranchForComparison } from "./workspace-runtime.js";
 
 type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
@@ -47,7 +48,7 @@ const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 
-export type ExecutionWorkspaceBranchReconcileMode = "forward" | "override" | "quarantine_restore";
+export type ExecutionWorkspaceBranchReconcileMode = "forward" | "override" | "quarantine_restore" | "default_branch_rebind";
 
 export type ExecutionWorkspaceBranchReconcileActor = {
   actorType: "agent" | "user" | "system";
@@ -68,6 +69,8 @@ export type ExecutionWorkspaceBranchReconcileInspection = {
   cleanliness: "clean" | "dirty" | "unknown";
   statusEntryCount: number | null;
   plainLanguageReason: string;
+  defaultBranch: string | null;
+  actualBranchIsDefaultBranch: boolean;
 };
 
 export type ExecutionWorkspaceBranchReconcileResult = {
@@ -305,6 +308,13 @@ async function inspectExecutionWorkspaceBranchForReconcile(
     actualHeadSha: toSha,
   });
 
+  const defaultBranch = repoRoot ? await detectDefaultBranch(repoRoot) : null;
+  const actualBranchIsDefaultBranch =
+    Boolean(toBranch) &&
+    Boolean(defaultBranch) &&
+    normalizeDefaultBranchForComparison(toBranch) ===
+      normalizeDefaultBranchForComparison(defaultBranch);
+
   return {
     fingerprint: fingerprintWorkspaceBranchIncoherence({
       sourceIssueId: workspace.sourceIssueId ?? null,
@@ -325,6 +335,8 @@ async function inspectExecutionWorkspaceBranchForReconcile(
     ancestryVerdict,
     cleanliness,
     statusEntryCount: statusLines?.length ?? null,
+    defaultBranch,
+    actualBranchIsDefaultBranch,
     plainLanguageReason: explainGitWorktreeBranchReconcileInspection({
       fromBranch,
       toBranch,
@@ -518,6 +530,12 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
   }
 }
 
+async function localBranchExists(repoRoot: string, branch: string): Promise<boolean> {
+  return runGit(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot)
+    .then(() => true)
+    .catch(() => false);
+}
+
 async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<{
   git: ExecutionWorkspaceCloseGitReadiness | null;
   warnings: string[];
@@ -554,6 +572,9 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
         behindCount: null,
         isMergedIntoBase: null,
         createdByRuntime,
+        recordedBranchExists: null,
+        recordedBranchDeleted: false,
+        safeRebindToDefaultBranch: false,
       },
       warnings,
     };
@@ -628,6 +649,44 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
     }
   }
 
+  let recordedBranchExists: boolean | null = null;
+  let recordedBranchDeleted = false;
+  let safeRebindToDefaultBranch = false;
+
+  if (repoRoot && workspace.branchName) {
+    recordedBranchExists = await localBranchExists(repoRoot, workspace.branchName);
+    if (!recordedBranchExists) {
+      recordedBranchDeleted = true;
+      const isClean = dirtyEntryCount === 0 && untrackedEntryCount === 0;
+      if (isClean) {
+        const currentBranch = await readGitStdout(
+          ["symbolic-ref", "--quiet", "--short", "HEAD"],
+          workspacePath,
+        ).catch(() => null);
+        const defaultBranch = await detectDefaultBranch(repoRoot);
+        const isOnDefaultBranch =
+          Boolean(currentBranch) &&
+          Boolean(defaultBranch) &&
+          normalizeDefaultBranchForComparison(currentBranch) ===
+            normalizeDefaultBranchForComparison(defaultBranch);
+        if (isOnDefaultBranch) {
+          safeRebindToDefaultBranch = true;
+          warnings.push(
+            `The recorded branch "${workspace.branchName}" no longer exists in the repository. Since the worktree is clean and HEAD is on the default branch "${currentBranch}", Paperclip can safely rebind this workspace to the default branch without destroying any work.`,
+          );
+        } else {
+          warnings.push(
+            `The recorded branch "${workspace.branchName}" no longer exists in the repository, and the worktree is clean, but HEAD is not on the default branch. Paperclip cannot safely rebind to the default branch until the worktree is moved to the default branch.`,
+          );
+        }
+      } else {
+        warnings.push(
+          `The recorded branch "${workspace.branchName}" no longer exists in the repository, but the worktree is dirty. Paperclip cannot safely rebind to the default branch until the dirty state is resolved.`,
+        );
+      }
+    }
+  }
+
   return {
     git: {
       repoRoot,
@@ -642,6 +701,9 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
       behindCount,
       isMergedIntoBase,
       createdByRuntime,
+      recordedBranchExists,
+      recordedBranchDeleted,
+      safeRebindToDefaultBranch,
     },
     warnings,
   };
@@ -1534,7 +1596,7 @@ export function executionWorkspaceService(db: Db) {
         });
       }
 
-      if (git?.createdByRuntime && executionWorkspace.branchName) {
+      if (git?.createdByRuntime && executionWorkspace.branchName && !git?.recordedBranchDeleted) {
         plannedActions.push({
           kind: "git_branch_delete",
           label: "Delete runtime-created branch",
@@ -1634,6 +1696,27 @@ export function executionWorkspaceService(db: Db) {
         );
       }
 
+      if (input.mode === "default_branch_rebind") {
+        if (inspection.fromSha !== null) {
+          throw unprocessable(
+            "Default branch rebind requires the recorded branch to be deleted from the repository",
+            { inspection },
+          );
+        }
+        if (inspection.cleanliness !== "clean") {
+          throw unprocessable(
+            "Default branch rebind requires a clean worktree",
+            { inspection },
+          );
+        }
+        if (!inspection.actualBranchIsDefaultBranch) {
+          throw unprocessable(
+            "Default branch rebind requires the worktree to be on the default branch",
+            { inspection },
+          );
+        }
+      }
+
       const reason = readNullableString(input.reason);
       const rescueRef = input.mode === "quarantine_restore"
         ? await (async () => {
@@ -1660,7 +1743,7 @@ export function executionWorkspaceService(db: Db) {
         : null;
       const now = new Date();
       const allowActiveWorkspace =
-        input.mode === "forward" &&
+        (input.mode === "forward" || input.mode === "default_branch_rebind") &&
         input.actor.actorType === "system" &&
         input.actor.actorId === "workspace_runtime" &&
         Boolean(input.actor.runId);
