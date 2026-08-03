@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, gt, inArray, isNotNull, isNull, notInArray, or, sql, count } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -74,6 +74,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { loadConfig, type Config } from "../../config.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -138,6 +139,9 @@ type ResolvedDependencyWakeBackstopSource =
   | "workspace.finalize";
 
 type ResolvedDependencyWakeBackstopOptions = {
+  rearmWindowMs?: number;
+  rearmMaxCount?: number;
+  now?: Date;
   runId?: string | null;
   companyId?: string | null;
   blockerIssueId?: string | null;
@@ -697,6 +701,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
   const instanceSettings = instanceSettingsService(db);
+  const config = loadConfig();
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
 
@@ -5130,6 +5135,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       pauseHoldSkipped: 0,
       notReadySkipped: 0,
       candidateLimitSkipped: 0,
+      reArmCapSkipped: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
       issueIds: [] as string[],
@@ -5143,6 +5149,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       ? "workspace_finalize_reconciliation"
       : "issue_graph_liveness_reconciliation";
     const useCursor = !opts?.blockerIssueId;
+    const windowMs = opts?.rearmWindowMs ?? config.resolvedDependencyWakeRearmWindowMs;
+    const maxCount = opts?.rearmMaxCount ?? config.resolvedDependencyWakeRearmMaxCount;
+    const cutoff = opts?.now ? new Date(opts.now.getTime() - windowMs) : new Date(Date.now() - windowMs);
 
     const queryCandidates = (afterIssueId: string | null) => {
       const filters = [
@@ -5259,9 +5268,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         const existingWake = await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
           companyId,
           idempotencyKeys,
+          completedRearmCutoff: cutoff,
         });
         if (existingWake) {
           result.existingWakeSkipped += 1;
+          continue;
+        }
+        const consumedWakes = idempotencyKeys.length > 0 ? await db
+          .select({ count: count() })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, companyId),
+              inArray(agentWakeupRequests.idempotencyKey, idempotencyKeys),
+              inArray(agentWakeupRequests.status, ["completed","failed","timed_out"]),
+            ),
+          )
+          .then((rows) => rows[0]?.count ?? 0) : 0;
+        if (consumedWakes >= maxCount) {
+          result.reArmCapSkipped += 1;
+          logger.warn(
+            {
+              issueId: candidate.id,
+              identifier: candidate.identifier,
+              agentId,
+              idempotencyKeys,
+              consumedCount: consumedWakes,
+              maxCount,
+              source,
+            },
+            "resolved dependency wake re-arm cap reached — dependent stuck, needs escalation",
+          );
           continue;
         }
 

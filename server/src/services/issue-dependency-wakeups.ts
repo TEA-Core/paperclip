@@ -1,13 +1,17 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, gte, inArray, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests } from "@paperclipai/db";
 
 export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
 
-const IDEMPOTENT_DEPENDENCY_WAKE_STATUSES = [
+export const IN_FLIGHT_DEPENDENCY_WAKE_STATUSES = [
   "queued",
   "deferred_issue_execution",
   "claimed",
+] as const;
+
+const IDEMPOTENT_DEPENDENCY_WAKE_STATUSES = [
+  ...IN_FLIGHT_DEPENDENCY_WAKE_STATUSES,
   "completed",
 ] as const;
 
@@ -156,10 +160,22 @@ export async function findExistingIssueBlockersResolvedWakeForAnyKey(
   input: {
     companyId: string;
     idempotencyKeys: string[];
+    completedRearmCutoff?: Date | null;
   },
 ) {
   const idempotencyKeys = [...new Set(input.idempotencyKeys.filter(Boolean))];
   if (idempotencyKeys.length === 0) return null;
+
+  const inFlightStatuses = [...IN_FLIGHT_DEPENDENCY_WAKE_STATUSES];
+  const statusFilter = input.completedRearmCutoff
+    ? or(
+        inArray(agentWakeupRequests.status, inFlightStatuses),
+        and(
+          eq(agentWakeupRequests.status, "completed"),
+          gte(agentWakeupRequests.updatedAt, input.completedRearmCutoff),
+        ),
+      )
+    : inArray(agentWakeupRequests.status, [...IDEMPOTENT_DEPENDENCY_WAKE_STATUSES]);
 
   return db
     .select({
@@ -172,7 +188,7 @@ export async function findExistingIssueBlockersResolvedWakeForAnyKey(
       and(
         eq(agentWakeupRequests.companyId, input.companyId),
         inArray(agentWakeupRequests.idempotencyKey, idempotencyKeys),
-        inArray(agentWakeupRequests.status, [...IDEMPOTENT_DEPENDENCY_WAKE_STATUSES]),
+        statusFilter,
       ),
     )
     .limit(1)
