@@ -45,7 +45,10 @@ export function resolveInboxIssueBlockerAttention(
   return {
     state: "covered",
     reason: "active_child",
+    computed: true,
     unresolvedBlockerCount: blockerAttention?.unresolvedBlockerCount ?? 0,
+    explicitBlockerCount: blockerAttention?.explicitBlockerCount ?? 0,
+    childBlockerCount: liveDescendantCount,
     coveredBlockerCount: liveDescendantCount,
     stalledBlockerCount: blockerAttention?.stalledBlockerCount ?? 0,
     attentionBlockerCount: blockerAttention?.attentionBlockerCount ?? 0,

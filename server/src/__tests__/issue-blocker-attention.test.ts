@@ -166,6 +166,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "covered",
       reason: "active_child",
       unresolvedBlockerCount: 1,
+      explicitBlockerCount: 1,
+      childBlockerCount: 0,
       coveredBlockerCount: 1,
       attentionBlockerCount: 0,
       sampleBlockerIdentifier: "PBC-2",
@@ -190,6 +192,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "needs_attention",
       reason: "attention_required",
       unresolvedBlockerCount: 1,
+      explicitBlockerCount: 1,
+      childBlockerCount: 0,
       coveredBlockerCount: 0,
       stalledBlockerCount: 0,
       attentionBlockerCount: 1,
@@ -215,6 +219,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "covered",
       reason: "active_dependency",
       unresolvedBlockerCount: 1,
+      explicitBlockerCount: 1,
+      childBlockerCount: 0,
       coveredBlockerCount: 1,
       attentionBlockerCount: 0,
       sampleBlockerIdentifier: "PBU-2",
@@ -249,6 +255,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "needs_attention",
       reason: "attention_required",
       unresolvedBlockerCount: 2,
+      explicitBlockerCount: 2,
+      childBlockerCount: 0,
       coveredBlockerCount: 1,
       attentionBlockerCount: 1,
       sampleBlockerIdentifier: "PBM-3",
@@ -291,6 +299,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "covered",
       reason: "active_dependency",
       unresolvedBlockerCount: 2,
+      explicitBlockerCount: 2,
+      childBlockerCount: 0,
       coveredBlockerCount: 2,
       stalledBlockerCount: 0,
       attentionBlockerCount: 0,
@@ -319,6 +329,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "covered",
       reason: "active_dependency",
       unresolvedBlockerCount: 1,
+      explicitBlockerCount: 1,
+      childBlockerCount: 0,
       coveredBlockerCount: 1,
       attentionBlockerCount: 0,
       sampleBlockerIdentifier: "PBR-3",
@@ -345,6 +357,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "needs_attention",
       reason: "attention_required",
       unresolvedBlockerCount: 1,
+      explicitBlockerCount: 1,
+      childBlockerCount: 0,
       coveredBlockerCount: 0,
       attentionBlockerCount: 1,
       sampleBlockerIdentifier: "PBS-2",
@@ -370,6 +384,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "needs_attention",
       reason: "attention_required",
       unresolvedBlockerCount: 1,
+      explicitBlockerCount: 1,
+      childBlockerCount: 0,
       coveredBlockerCount: 0,
       attentionBlockerCount: 1,
       sampleBlockerIdentifier: "PBX-2",
@@ -394,6 +410,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "stalled",
       reason: "stalled_review",
       unresolvedBlockerCount: 1,
+      explicitBlockerCount: 1,
+      childBlockerCount: 0,
       coveredBlockerCount: 0,
       stalledBlockerCount: 1,
       attentionBlockerCount: 0,
@@ -472,6 +490,9 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(parent?.blockerAttention).toMatchObject({
       state: "needs_attention",
       reason: "attention_required",
+      unresolvedBlockerCount: 2,
+      explicitBlockerCount: 2,
+      childBlockerCount: 0,
       coveredBlockerCount: 0,
       stalledBlockerCount: 1,
       attentionBlockerCount: 1,
@@ -520,6 +541,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "covered",
       reason: "active_dependency",
       unresolvedBlockerCount: 2,
+      explicitBlockerCount: 2,
+      childBlockerCount: 0,
       coveredBlockerCount: 2,
       attentionBlockerCount: 0,
     });
@@ -580,6 +603,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "needs_attention",
       reason: "attention_required",
       unresolvedBlockerCount: 1,
+      explicitBlockerCount: 1,
+      childBlockerCount: 0,
       coveredBlockerCount: 0,
       attentionBlockerCount: 1,
       sampleBlockerIdentifier: "PBY-2",
@@ -918,5 +943,41 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await expect(
       svc.count(companyId, { attention: "blocked", assigneeAgentId: "not-a-uuid" }),
     ).rejects.toThrow(/assigneeAgentId/i);
+  });
+
+  it("separates explicit blocker count from child blocker count", async () => {
+    const { companyId, agentId } = await createCompany("PEX");
+    const parentId = await insertIssue({ companyId, identifier: "PEX-1", title: "Parent", status: "blocked" });
+    const explicitBlockerId = await insertIssue({
+      companyId,
+      identifier: "PEX-2",
+      title: "Explicit blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const childId = await insertIssue({
+      companyId,
+      identifier: "PEX-3",
+      title: "Child blocker",
+      status: "todo",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: explicitBlockerId, blockedIssueId: parentId });
+    await activeRun({ companyId, agentId, issueId: explicitBlockerId });
+    await activeRun({ companyId, agentId, issueId: childId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 2,
+      explicitBlockerCount: 1,
+      childBlockerCount: 1,
+      coveredBlockerCount: 2,
+      stalledBlockerCount: 0,
+      attentionBlockerCount: 0,
+    });
   });
 });
