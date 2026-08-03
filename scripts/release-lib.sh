@@ -270,12 +270,34 @@ require_clean_worktree() {
 }
 
 require_on_release_source_branch() {
-  local current_branch
+  local publish_remote="${1:-}"
+  local current_sha="${2:-}"
   local expected_branch="${RELEASE_SOURCE_BRANCH:-main}"
-  current_branch="$(git_current_branch)"
-  if [ "$current_branch" != "$expected_branch" ]; then
-    release_fail "this release step must run from the authoritative source branch ${expected_branch} (set RELEASE_SOURCE_BRANCH to override), but current branch is ${current_branch:-<detached>}."
+  local authoritative_ref
+
+  if [ -z "$publish_remote" ]; then
+    publish_remote="$(resolve_release_remote)"
   fi
+
+  authoritative_ref="$publish_remote/$expected_branch"
+
+  if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/$authoritative_ref"; then
+    release_fail "authoritative remote ref ${authoritative_ref} cannot be resolved on ${publish_remote}. Fetch ${publish_remote} and confirm ${expected_branch} exists before releasing."
+  fi
+
+  if [ -z "$current_sha" ]; then
+    current_sha="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  fi
+
+  if [ -z "$current_sha" ]; then
+    release_fail "could not resolve the current commit SHA to gate against ${authoritative_ref}."
+  fi
+
+  if git -C "$REPO_ROOT" merge-base --is-ancestor "$current_sha" "$authoritative_ref" 2>/dev/null; then
+    return 0
+  fi
+
+  release_fail "release source lineage check failed: ${current_sha} is not an ancestor of the authoritative source lineage ${authoritative_ref}. The current source does not belong to ${expected_branch}; refusing to publish a divergent lineage."
 }
 
 require_npm_publish_auth() {
