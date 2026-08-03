@@ -718,7 +718,9 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         }),
       });
     if (!currentParticipant) {
-      throw unprocessable(`No eligible ${activeStage.type} participant is configured for this issue`);
+      throw unprocessable(
+        `No eligible ${activeStage.type} participant is configured for this issue (stage ${activeStage.id}); the return assignee is excluded from participant selection`,
+      );
     }
 
     if (!stageHasParticipant(activeStage, currentParticipant)) {
@@ -798,7 +800,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           }),
         });
         if (!participant) {
-          throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
+          throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue (stage ${nextStage.id}); the return assignee is excluded from participant selection`);
         }
 
         buildPendingStagePatch({
@@ -958,9 +960,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           : explicitAssignee,
       exclude: returnAssignee,
     });
-  }
-  if (!participant) {
-    throw unprocessable(`No eligible ${pendingStage.type} participant is configured for this issue`);
+    if (!participant) {
+      throw unprocessable(
+        `No eligible ${pendingStage.type} participant is configured for this issue (stage ${pendingStage.id}); the return assignee is excluded from participant selection`,
+      );
+    }
   }
 
   buildPendingStagePatch({
