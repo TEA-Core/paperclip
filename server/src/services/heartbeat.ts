@@ -2442,7 +2442,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceId: workspace.id,
       cwd: readNonEmptyString(workspace.cwd),
       repoUrl: readNonEmptyString(workspace.repoUrl),
-      repoRef: readNonEmptyString(workspace.repoRef),
+      repoRef: readNonEmptyString(workspace.repoRef) ?? readNonEmptyString(workspace.defaultRef),
     }));
 
     if (projectWorkspaceRows.length > 0) {
@@ -2487,7 +2487,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             projectId: resolvedProjectId,
             workspaceId: workspace.id,
             repoUrl: workspace.repoUrl,
-            repoRef: workspace.repoRef,
+            repoRef: workspace.repoRef ?? workspace.defaultRef,
             workspaceHints,
             warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
               (value): value is string => Boolean(value),
@@ -2526,7 +2526,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         projectId: resolvedProjectId,
         workspaceId: projectWorkspaceRows[0]?.id ?? null,
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
-        repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
+        repoRef: projectWorkspaceRows[0]?.repoRef ?? projectWorkspaceRows[0]?.defaultRef ?? null,
         workspaceHints,
         warnings,
       };
