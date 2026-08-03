@@ -195,6 +195,9 @@ const closeReadinessReady: ExecutionWorkspaceCloseReadiness = {
     behindCount: 0,
     isMergedIntoBase: false,
     createdByRuntime: true,
+    recordedBranchExists: true,
+    recordedBranchDeleted: false,
+    safeRebindToDefaultBranch: false,
   },
   runtimeServices: storybookExecutionWorkspaces[0]?.runtimeServices ?? [],
 };

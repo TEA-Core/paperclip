@@ -71,8 +71,11 @@ describeEmbeddedPostgres("companyService", () => {
       issuePrefix: "ARO",
     });
 
+    // The create route always stamps a defaultResponsibleUserId (owner principal),
+    // and bundled-routine provisioning needs one — see SUP-9932.
     const created = await companyService(db).create({
       name: "Aron & Sharon",
+      defaultResponsibleUserId: "local-board",
     });
 
     expect(created.issuePrefix).toBe("AROA");
@@ -84,6 +87,7 @@ describeEmbeddedPostgres("companyService", () => {
   it("auto-provisions one paused Reflection Coach bundle for a freshly created company", async () => {
     const created = await companyService(db).create({
       name: "Fresh Company",
+      defaultResponsibleUserId: "local-board",
     });
 
     const agentRows = await db.select().from(agents).where(eq(agents.companyId, created.id));
