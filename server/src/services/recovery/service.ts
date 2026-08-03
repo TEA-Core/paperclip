@@ -38,7 +38,7 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import { IssueDependencyReadiness, TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
   normalizeIssueExecutionPolicy,
@@ -5613,19 +5613,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(
         and(
           eq(issues.status, "blocked"),
+          visibleIssueCondition(),
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       )
       .orderBy(asc(issues.id))
       .limit(BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT);
 
-    const candidateIds = candidates.map((candidate) => candidate.id);
-    const readinessMap = candidateIds.length > 0
-      ? await issuesSvc.listDependencyReadiness(
-          candidates[0].companyId,
-          candidateIds,
-        )
-      : new Map();
+    const candidatesByCompany = new Map<string, typeof candidates>();
+    for (const candidate of candidates) {
+      const companyCandidates = candidatesByCompany.get(candidate.companyId) ?? [];
+      companyCandidates.push(candidate);
+      candidatesByCompany.set(candidate.companyId, companyCandidates);
+    }
+
+    const readinessMap = new Map<string, IssueDependencyReadiness>();
+    for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
+      const companyReadiness = await issuesSvc.listDependencyReadiness(
+        companyId,
+        companyCandidates.map((candidate) => candidate.id),
+      );
+      for (const [issueId, readiness] of companyReadiness.entries()) {
+        readinessMap.set(issueId, readiness);
+      }
+    }
 
     const now = new Date();
     const shouldLog = !lastBlockedWithoutBlockersLogAt ||
