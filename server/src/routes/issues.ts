@@ -1517,8 +1517,8 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
 
 const ACTIVE_REVIEW_APPROVAL_STATUSES = new Set(["pending", "revision_requested"]);
 
-const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
-  "invalid_issue_disposition: Agent-authored updates that move an issue to in_review must include a real review path. " +
+const INVALID_IN_REVIEW_DISPOSITION_MESSAGE =
+  "invalid_issue_disposition: Updates that move an issue to in_review must include a real review path. " +
   "This request would leave the issue in_review without anyone or anything owning the next action. " +
   "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
   "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
@@ -3197,7 +3197,7 @@ export function issueRoutes(
     const nextStatus = typeof input.updateFields.status === "string"
       ? input.updateFields.status
       : input.existing.status;
-    if (input.actorType !== "agent" || input.existing.status === "in_review" || nextStatus !== "in_review") return;
+    if (input.existing.status === "in_review" || nextStatus !== "in_review") return;
 
     const nextAssigneeUserId = input.updateFields.assigneeUserId === undefined
       ? input.existing.assigneeUserId
@@ -3222,7 +3222,7 @@ export function issueRoutes(
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
 
-    throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
+    throw unprocessable(INVALID_IN_REVIEW_DISPOSITION_MESSAGE, {
       code: "invalid_issue_disposition",
       missing: "review_path",
       validReviewPaths: [
