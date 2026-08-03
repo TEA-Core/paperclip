@@ -417,4 +417,36 @@ describe("issue validators", () => {
 
     expect(parsed.success).toBe(false);
   });
+
+  it("preserves returnAssigneeAgentId in a create execution policy", () => {
+    const agentId = "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e";
+    const parsed = createIssueSchema.parse({
+      title: "Persist return assignee",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "agent", agentId }],
+          },
+        ],
+        returnAssigneeAgentId: agentId,
+      },
+    });
+
+    expect(parsed.executionPolicy?.returnAssigneeAgentId).toBe(agentId);
+  });
+
+  it("preserves returnAssigneeAgentId in an update execution policy", () => {
+    const agentId = "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e";
+    const parsed = updateIssueSchema.parse({
+      executionPolicy: {
+        returnAssigneeAgentId: agentId,
+      },
+    });
+
+    expect(parsed.executionPolicy?.returnAssigneeAgentId).toBe(agentId);
+  });
 });
