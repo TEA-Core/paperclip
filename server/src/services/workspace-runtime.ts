@@ -1976,7 +1976,11 @@ async function resolveAuthoritativeBaseRef(
 
   const configured = configuredBaseRef?.trim();
   if (!configured || configured === "HEAD") {
-    return { baseRef: await detectOrHead(), warnings, refreshed: false };
+    const detected = await detectOrHead();
+    warnings.push(
+      `No baseRef configured on the workspace strategy, project workspace repoRef, or defaultRef; falling back to detected default branch "${detected}". Set project executionWorkspacePolicy.workspaceStrategy.baseRef or the workspace defaultRef to pin the base.`,
+    );
+    return { baseRef: detected, warnings, refreshed: false };
   }
 
   if (parseRemoteTrackingRef(configured)) {

@@ -720,7 +720,9 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.cwd).toBe(initial.cwd);
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(advancedHead);
     expect(reused.baseRefSha).toBe(advancedHead);
-    expect(reused.warnings).toEqual([]);
+    expect(reused.warnings).toEqual([
+      expect.stringContaining("No baseRef configured"),
+    ]);
   });
 
   it("does not reset a reused worktree that already has task commits", async () => {
@@ -739,6 +741,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.created).toBe(false);
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(taskHead);
     expect(reused.warnings).toEqual([
+      expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
   });
@@ -760,6 +763,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
+      expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
   });
@@ -785,6 +789,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
+      expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
   });
@@ -3077,6 +3082,137 @@ describe("realizeExecutionWorkspace", () => {
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
     expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
+  }, 10_000);
+
+  it("emits a warning when no baseRef, repoRef, or defaultRef is configured and falls back to the detected default branch", async () => {
+    const repoRoot = await createTempRepo("master");
+    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-bare-"));
+    await runGit(bareRemote, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
+    await runGit(repoRoot, ["push", "-u", "origin", "master"]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: null,
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-462",
+        title: "Warn on unconfigured base",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(workspace.warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("No baseRef configured"),
+      ]),
+    );
+  }, 10_000);
+
+  it("uses the repoRef from base input when no strategy baseRef is set", async () => {
+    const repoRoot = await createTempRepo("main");
+    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-bare-"));
+    await runGit(bareRemote, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
+    await runGit(repoRoot, ["push", "-u", "origin", "main"]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/main",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-463",
+        title: "Use repoRef from base",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      recorder,
+    });
+
+    expect(workspace.strategy).toBe("git_worktree");
+    expect(workspace.created).toBe(true);
+    const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
+    expect(worktreeOp).toBeDefined();
+    expect(worktreeOp!.metadata!.baseRef).toBe("origin/main");
+  }, 10_000);
+
+  it("uses the strategy baseRef over the base input repoRef", async () => {
+    const repoRoot = await createTempRepo("main");
+    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-bare-"));
+    await runGit(bareRemote, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
+    await runGit(repoRoot, ["push", "-u", "origin", "main"]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/some-other-branch",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          baseRef: "origin/main",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-464",
+        title: "Strategy baseRef wins",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      recorder,
+    });
+
+    expect(workspace.strategy).toBe("git_worktree");
+    expect(workspace.created).toBe(true);
+    const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
+    expect(worktreeOp).toBeDefined();
+    // strategy baseRef "origin/main" should beat the base input repoRef "origin/some-other-branch"
+    expect(worktreeOp!.metadata!.baseRef).toBe("origin/main");
   }, 10_000);
 
   it("removes a created git worktree and branch during cleanup", async () => {
