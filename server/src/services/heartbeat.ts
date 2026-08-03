@@ -2123,6 +2123,25 @@ export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWork
   return [rows[preferredIndex]!, ...rows.slice(0, preferredIndex), ...rows.slice(preferredIndex + 1)];
 }
 
+type ProjectWorkspaceBaseRef = {
+  defaultRef?: string | null;
+  repoRef?: string | null;
+};
+
+/**
+ * Resolve the git base ref used when provisioning an execution workspace from a
+ * project workspace. The operator-configured `defaultRef` must win over the
+ * legacy `repoRef` column: `repoRef` is frequently null, and falling through to
+ * it makes provisioning cut new worktrees from the repository's default branch
+ * instead of the branch the project workspace is pinned to.
+ */
+export function resolveProjectWorkspaceBaseRef(
+  workspace: ProjectWorkspaceBaseRef | null | undefined,
+): string | null {
+  if (!workspace) return null;
+  return readNonEmptyString(workspace.defaultRef) ?? readNonEmptyString(workspace.repoRef);
+}
+
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
@@ -7372,7 +7391,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceId: workspace.id,
       cwd: readNonEmptyString(workspace.cwd),
       repoUrl: readNonEmptyString(workspace.repoUrl),
-      repoRef: readNonEmptyString(workspace.defaultRef) ?? readNonEmptyString(workspace.repoRef),
+      repoRef: resolveProjectWorkspaceBaseRef(workspace),
     }));
 
     if (projectWorkspaceRows.length > 0) {
@@ -7417,7 +7436,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             projectId: resolvedProjectId,
             workspaceId: workspace.id,
             repoUrl: workspace.repoUrl,
-            repoRef: workspace.defaultRef ?? workspace.repoRef,
+            repoRef: resolveProjectWorkspaceBaseRef(workspace),
             workspaceHints,
             warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
               (value): value is string => Boolean(value),
@@ -7456,7 +7475,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         projectId: resolvedProjectId,
         workspaceId: projectWorkspaceRows[0]?.id ?? null,
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
-        repoRef: projectWorkspaceRows[0]?.defaultRef ?? projectWorkspaceRows[0]?.repoRef ?? null,
+        repoRef: resolveProjectWorkspaceBaseRef(projectWorkspaceRows[0]),
         workspaceHints,
         warnings,
       };

@@ -31,6 +31,7 @@ import {
   resolveExecutionWorkspaceReuseRequestForIssue,
   resolveExecutionWorkspaceReuseProvisioningPolicy,
   resolveNextSessionState,
+  resolveProjectWorkspaceBaseRef,
   resolveTaskSessionConfigFreshness,
   requiresPushCapabilityPreflight,
   resolveWorkspaceAfterLowTrustPreflight,
@@ -2612,6 +2613,43 @@ describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
     expect(
       prioritizeProjectWorkspaceCandidatesForRun(rows, "workspace-9").map((row) => row.id),
     ).toEqual(["workspace-1", "workspace-2"]);
+  });
+});
+
+describe("resolveProjectWorkspaceBaseRef", () => {
+  it("prefers the project workspace defaultRef over the legacy repoRef", () => {
+    expect(
+      resolveProjectWorkspaceBaseRef({
+        defaultRef: "fold/tea-patches-v2026.722.0",
+        repoRef: "origin/master",
+      }),
+    ).toBe("fold/tea-patches-v2026.722.0");
+  });
+
+  it("uses defaultRef when repoRef is null, so provisioning does not fall back to the repo default branch", () => {
+    expect(
+      resolveProjectWorkspaceBaseRef({
+        defaultRef: "fold/tea-patches-v2026.722.0",
+        repoRef: null,
+      }),
+    ).toBe("fold/tea-patches-v2026.722.0");
+  });
+
+  it("falls back to repoRef when defaultRef is missing or blank", () => {
+    expect(resolveProjectWorkspaceBaseRef({ defaultRef: null, repoRef: "origin/release" })).toBe(
+      "origin/release",
+    );
+    expect(resolveProjectWorkspaceBaseRef({ defaultRef: "   ", repoRef: "origin/release" })).toBe(
+      "origin/release",
+    );
+    expect(resolveProjectWorkspaceBaseRef({ repoRef: "origin/release" })).toBe("origin/release");
+  });
+
+  it("returns null when neither ref is usable", () => {
+    expect(resolveProjectWorkspaceBaseRef({ defaultRef: null, repoRef: null })).toBeNull();
+    expect(resolveProjectWorkspaceBaseRef({ defaultRef: "", repoRef: "  " })).toBeNull();
+    expect(resolveProjectWorkspaceBaseRef(null)).toBeNull();
+    expect(resolveProjectWorkspaceBaseRef(undefined)).toBeNull();
   });
 });
 
