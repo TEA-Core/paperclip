@@ -1164,19 +1164,18 @@ async function listIssueDependencyReadinessMap(
   for (const row of blockerRows) {
     const current = readinessMap.get(row.issueId) ?? createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Terminal blockers (done or cancelled) resolve their dependents — a
-    // cancelled blocker is a terminal state that cannot make forward progress,
-    // so it must not gate checkout of the dependent (SUP-10347). This must
-    // stay consistent with the blocker-attention read model, which already
-    // treats cancelled children as terminal via BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES.
-    const isTerminalBlocker = row.blockerStatus === "done" || row.blockerStatus === "cancelled";
-    if (!isTerminalBlocker) {
+    // Only done blockers resolve dependents; cancelled blockers stay unresolved
+    // until an operator removes or replaces the blocker relationship explicitly.
+    // A cancelled blocker means the blocking work was abandoned, which may
+    // invalidate the dependent's premise, so the edge is held and issue-graph
+    // liveness raises `blocked_by_cancelled_issue` ("Replace blocker") instead.
+    // See the SUP-10347 reconcile decision (PR #37).
+    if (row.blockerStatus !== "done") {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
       current.allBlockersDone = false;
       current.isDependencyReady = false;
     } else if (
-      row.blockerStatus === "done" &&
       row.blockerExecutionWorkspaceId &&
       pendingFinalizeBlockerIssueIds.has(row.blockerIssueId)
     ) {
@@ -1212,11 +1211,8 @@ async function listUnresolvedBlockerIssueIds(
       and(
         eq(issues.companyId, companyId),
         inArray(issues.id, uniqueBlockerIssueIds),
-        // Terminal blockers (done or cancelled) resolve dependents — a
-        // cancelled blocker is terminal and cannot gate checkout (SUP-10347).
-        // This mirrors listIssueDependencyReadinessMap so the in_progress
-        // status gate stays consistent with the checkout gate.
-        notInArray(issues.status, ["done", "cancelled"]),
+        // Cancelled blockers intentionally remain unresolved until the relation changes.
+        ne(issues.status, "done"),
       ),
     )
     .then((rows) => rows.map((row) => row.id));

@@ -4071,61 +4071,6 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ]);
   });
 
-  it("resolves cancelled blockers so dependents can be checked out (SUP-10347)", async () => {
-    const companyId = randomUUID();
-    const assigneeAgentId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: assigneeAgentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
-
-    const cancelledBlockerId = randomUUID();
-    const blockedIssueId = randomUUID();
-    await db.insert(issues).values([
-      { id: cancelledBlockerId, companyId, title: "Cancelled blocker", status: "cancelled", priority: "medium" },
-      {
-        id: blockedIssueId,
-        companyId,
-        title: "Blocked issue",
-        status: "blocked",
-        priority: "medium",
-        assigneeAgentId,
-      },
-    ]);
-
-    await svc.update(blockedIssueId, { blockedByIssueIds: [cancelledBlockerId] });
-
-    await expect(svc.getDependencyReadiness(blockedIssueId)).resolves.toMatchObject({
-      isDependencyReady: true,
-      unresolvedBlockerIssueIds: [],
-      unresolvedBlockerCount: 0,
-    });
-
-    const checkoutRunId = randomUUID();
-    await db.insert(heartbeatRuns).values({
-      id: checkoutRunId,
-      companyId,
-      agentId: assigneeAgentId,
-      status: "running",
-      contextSnapshot: { issueId: blockedIssueId },
-    });
-
-    await expect(svc.checkout(blockedIssueId, assigneeAgentId, ["blocked"], checkoutRunId)).resolves.toBeTruthy();
-  });
-
   it("treats done blockers on a shared workspace as ready while a foreign issue is in-flight", async () => {
     const {
       companyId,
