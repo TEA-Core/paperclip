@@ -979,5 +979,46 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       stalledBlockerCount: 0,
       attentionBlockerCount: 0,
     });
+
+    // Cross-check: explicitBlockerCount must agree with diagnostics/blockers
+    // readiness.unresolvedBlockerCount (both count explicit "blocks" edges only).
+    const diagnostics = await svc.getBlockerDiagnostics(parentId);
+    expect(diagnostics.readiness.unresolvedBlockerCount).toBe(1);
+    expect(parent?.blockerAttention?.explicitBlockerCount).toBe(
+      diagnostics.readiness.unresolvedBlockerCount,
+    );
+  });
+
+  it("emits computed:false for a non-blocked issue with an unresolved explicit blocker", async () => {
+    const { companyId, agentId } = await createCompany("PEX2");
+    const todoId = await insertIssue({
+      companyId,
+      identifier: "PEX2-1",
+      title: "Todo source",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PEX2-2",
+      title: "Unresolved blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: todoId });
+
+    const todo = (await svc.list(companyId, { status: "todo" })).find((issue) => issue.id === todoId);
+
+    expect(todo?.blockerAttention).toMatchObject({
+      computed: false,
+      state: "none",
+      reason: null,
+    });
+
+    // The diagnostics readiness endpoint still reports the unresolved blocker,
+    // demonstrating the non-blocked issue is distinguishable from a zero-blocker issue.
+    const diagnostics = await svc.getBlockerDiagnostics(todoId);
+    expect(diagnostics.readiness.unresolvedBlockerCount).toBe(1);
+    expect(diagnostics.readiness.allBlockersDone).toBe(false);
   });
 });
