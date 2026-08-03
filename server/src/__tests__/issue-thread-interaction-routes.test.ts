@@ -1299,4 +1299,248 @@ describe.sequential("issue thread interaction routes", () => {
       },
     );
   });
+
+  it("wakes the interaction creator when an ask_user_questions is answered on an unassigned issue", async () => {
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({
+      status: "in_progress",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }));
+    mockInteractionService.answerQuestions.mockResolvedValueOnce({
+      id: "interaction-questions-unassigned",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: "comment-questions",
+      sourceRunId: "run-questions",
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Scope?",
+          selectionMode: "single",
+          options: [{ id: "phase-1", label: "Phase 1" }],
+        }],
+      },
+      result: {
+        version: 1,
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      },
+      createdByAgentId: CREATED_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:06:00.000Z",
+      resolvedAt: "2026-04-20T12:06:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-questions-unassigned/respond")
+      .send({
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      CREATED_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        payload: expect.objectContaining({
+          interactionId: "interaction-questions-unassigned",
+          interactionKind: "ask_user_questions",
+          interactionStatus: "answered",
+        }),
+      }),
+    );
+  });
+
+  it("wakes the issue assignee (not the creator) when an ask_user_questions is answered on an assigned issue", async () => {
+    mockInteractionService.answerQuestions.mockResolvedValueOnce({
+      id: "interaction-questions-assigned",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: "comment-questions",
+      sourceRunId: "run-questions",
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Scope?",
+          selectionMode: "single",
+          options: [{ id: "phase-1", label: "Phase 1" }],
+        }],
+      },
+      result: {
+        version: 1,
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      },
+      createdByAgentId: CREATED_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:06:00.000Z",
+      resolvedAt: "2026-04-20T12:06:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-questions-assigned/respond")
+      .send({
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        payload: expect.objectContaining({
+          interactionId: "interaction-questions-assigned",
+        }),
+      }),
+    );
+  });
+
+  it("does not wake when an ask_user_questions is answered on a terminal-status issue", async () => {
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({
+      status: "done",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }));
+    mockInteractionService.answerQuestions.mockResolvedValueOnce({
+      id: "interaction-questions-terminal",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: "comment-questions",
+      sourceRunId: "run-questions",
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Scope?",
+          selectionMode: "single",
+          options: [{ id: "phase-1", label: "Phase 1" }],
+        }],
+      },
+      result: {
+        version: 1,
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      },
+      createdByAgentId: CREATED_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:06:00.000Z",
+      resolvedAt: "2026-04-20T12:06:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-questions-terminal/respond")
+      .send({
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not wake when both issue.assigneeAgentId and interaction.createdByAgentId are null", async () => {
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({
+      status: "in_progress",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }));
+    mockInteractionService.answerQuestions.mockResolvedValueOnce({
+      id: "interaction-questions-both-null",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: "comment-questions",
+      sourceRunId: "run-questions",
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Scope?",
+          selectionMode: "single",
+          options: [{ id: "phase-1", label: "Phase 1" }],
+        }],
+      },
+      result: {
+        version: 1,
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      },
+      createdByAgentId: null,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:06:00.000Z",
+      resolvedAt: "2026-04-20T12:06:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-questions-both-null/respond")
+      .send({
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not wake on rejected wake_assignee_on_accept even when the creator would be the fallback target", async () => {
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({
+      status: "in_progress",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }));
+    mockInteractionService.rejectInteraction.mockResolvedValueOnce({
+      id: "interaction-questions-rejected",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "rejected",
+      continuationPolicy: "wake_assignee_on_accept",
+      idempotencyKey: null,
+      sourceCommentId: "comment-questions",
+      sourceRunId: "run-questions",
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Scope?",
+          selectionMode: "single",
+          options: [{ id: "phase-1", label: "Phase 1" }],
+        }],
+      },
+      result: {
+        version: 1,
+        answers: [],
+        cancellationReason: "Not needed",
+      },
+      createdByAgentId: CREATED_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:06:00.000Z",
+      resolvedAt: "2026-04-20T12:06:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-questions-rejected/reject")
+      .send({ reason: "Not needed" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
 });
