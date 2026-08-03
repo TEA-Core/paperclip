@@ -147,6 +147,17 @@ const SHARED_DIST = resolve(
   "issue.js",
 );
 
+function ensureSharedBuilt() {
+  try {
+    execFileSync("test", ["-f", SHARED_DIST]);
+    return;
+  } catch {
+  }
+  execFileSync("bash", ["-c", `cd "${resolve(REPO_ROOT, "packages", "shared")}" && npx tsc`], {
+    stdio: "pipe",
+  });
+}
+
 const REQUIRED_VALIDATOR =
   /returnAssigneeAgentId:\s*z\.string\(\)\.trim\(\)\.uuid\(\)\.optional\(\)\.nullable\(\)/;
 
@@ -164,11 +175,13 @@ function assertArtifactHasValidReturnAssigneeAgentId(source) {
 }
 
 test("built @paperclipai/shared issueExecutionPolicySchema exposes returnAssigneeAgentId as optional nullable UUID", () => {
+  ensureSharedBuilt();
   const source = execFileSync("bash", ["-c", `cat "${SHARED_DIST}"`], { encoding: "utf8" });
   assertArtifactHasValidReturnAssigneeAgentId(source);
 });
 
 test("built artifact assertion rejects a malformed returnAssigneeAgentId validator", () => {
+  ensureSharedBuilt();
   const source = execFileSync("bash", ["-c", `cat "${SHARED_DIST}"`], { encoding: "utf8" });
 
   const malformed = source
