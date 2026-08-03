@@ -1878,6 +1878,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
     kind: string;
     status: string;
     continuationPolicy: string;
+    createdByAgentId?: string | null;
     sourceCommentId?: string | null;
     sourceRunId?: string | null;
     payload?: unknown;
@@ -1899,7 +1900,18 @@ function queueResolvedInteractionContinuationWakeup(input: {
     && input.interaction.status !== "accepted"
   ) return;
   if (input.interaction.status === "expired") return;
-  if (!input.issue.assigneeAgentId || isClosedIssueStatus(input.issue.status)) return;
+  if (isClosedIssueStatus(input.issue.status)) return;
+  const wakeTargetAgentId = input.issue.assigneeAgentId ?? input.interaction.createdByAgentId ?? null;
+  if (!wakeTargetAgentId) {
+    logger.warn({
+      issueId: input.issue.id,
+      interactionId: input.interaction.id,
+      interactionKind: input.interaction.kind,
+      interactionStatus: input.interaction.status,
+      continuationPolicy: input.interaction.continuationPolicy,
+    }, "interaction resolution did not wake an agent: neither issue.assigneeAgentId nor interaction.createdByAgentId is set");
+    return;
+  }
 
   const forceFreshSession = input.forceFreshSession === true;
   const workspaceRefreshReason = readNonEmptyString(input.workspaceRefreshReason);
@@ -1925,7 +1937,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
           result: interactionResult,
         }
       : null;
-  void input.heartbeat.wakeup(input.issue.assigneeAgentId, {
+  void input.heartbeat.wakeup(wakeTargetAgentId, {
     source: "automation",
     triggerDetail: "system",
     reason: "issue_commented",
@@ -1966,7 +1978,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
     err,
     issueId: input.issue.id,
     interactionId: input.interaction.id,
-    agentId: input.issue.assigneeAgentId,
+    agentId: wakeTargetAgentId,
   }, "failed to wake assignee on issue interaction resolution"));
 }
 
