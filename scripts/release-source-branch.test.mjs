@@ -147,40 +147,38 @@ const SHARED_DIST = resolve(
   "issue.js",
 );
 
-function extractIssueExecutionPolicySchemaInitializer(source) {
+function assertIssueExecutionPolicySchemaHasReturnAssigneeAgentId(source) {
   const match = source.match(/export const issueExecutionPolicySchema = z\.object\(\{([\s\S]*?)\}\);/);
   assert.ok(match, "built shared artifact must define issueExecutionPolicySchema as z.object({...})");
-  return match[1];
-}
-
-test("built @paperclipai/shared issueExecutionPolicySchema exposes returnAssigneeAgentId as optional nullable UUID", () => {
-  const source = execFileSync("bash", ["-c", `cat "${SHARED_DIST}"`], { encoding: "utf8" });
-  const initializer = extractIssueExecutionPolicySchemaInitializer(source);
-
+  const initializer = match[1];
   assert.match(
     initializer,
     /returnAssigneeAgentId:\s*z\.string\(\)\.trim\(\)\.uuid\(\)\.optional\(\)\.nullable\(\)/,
     "issueExecutionPolicySchema initializer must contain returnAssigneeAgentId: z.string().trim().uuid().optional().nullable()",
   );
+}
+
+test("built @paperclipai/shared issueExecutionPolicySchema exposes returnAssigneeAgentId as optional nullable UUID", () => {
+  const source = execFileSync("bash", ["-c", `cat "${SHARED_DIST}"`], { encoding: "utf8" });
+  assertIssueExecutionPolicySchemaHasReturnAssigneeAgentId(source);
 });
 
 test("built artifact assertion rejects a malformed returnAssigneeAgentId validator", () => {
   const source = execFileSync("bash", ["-c", `cat "${SHARED_DIST}"`], { encoding: "utf8" });
-  const initializer = extractIssueExecutionPolicySchemaInitializer(source);
 
-  const malformed = initializer
+  const malformedSource = source
     .replace(
       /returnAssigneeAgentId:\s*z\.string\(\)\.trim\(\)\.uuid\(\)\.optional\(\)\.nullable\(\)/,
       "returnAssigneeAgentId: z.boolean()",
     )
     .replace(
-      /returnAssigneeAgentId:\s*z\.boolean\(\)/,
-      "returnAssigneeAgentId: z.boolean(), decoyReturnAssigneeAgentId: z.string().trim().uuid().optional().nullable()",
+      /export const issueExecutionPolicySchema = z\.object\(\{([\s\S]*?)\}\);/,
+      "$&\nexport const returnAssigneeAgentId = z.string().trim().uuid().optional().nullable();",
     );
 
-  assert.doesNotMatch(
-    malformed,
-    /returnAssigneeAgentId:\s*z\.string\(\)\.trim\(\)\.uuid\(\)\.optional\(\)\.nullable\(\)/,
-    "malformed fixture must not match the required validator chain",
+  assert.throws(
+    () => assertIssueExecutionPolicySchemaHasReturnAssigneeAgentId(malformedSource),
+    /issueExecutionPolicySchema initializer must contain returnAssigneeAgentId/,
+    "artifact-level helper must reject a malformed returnAssigneeAgentId validator scoped to issueExecutionPolicySchema, even when a correctly shaped decoy exists outside the schema",
   );
 });
