@@ -1763,9 +1763,11 @@ type IssueBlockerAttentionInputNode =
   >
   & { executionRunId?: string | null };
 
+type IssueBlockerAttentionEdgeKind = "explicit" | "child";
 type IssueBlockerAttentionEdge = {
   issueId: string;
   blockerIssueId: string;
+  kind: IssueBlockerAttentionEdgeKind;
 };
 type IssueBlockerAttentionQueryRow = IssueBlockerAttentionNode & {
   issueId: string | null;
@@ -1904,7 +1906,10 @@ function createIssueBlockerAttention(input: Partial<IssueBlockerAttention> = {})
   return {
     state: input.state ?? "none",
     reason: input.reason ?? null,
+    computed: input.computed ?? false,
     unresolvedBlockerCount: input.unresolvedBlockerCount ?? 0,
+    explicitBlockerCount: input.explicitBlockerCount ?? 0,
+    childBlockerCount: input.childBlockerCount ?? 0,
     coveredBlockerCount: input.coveredBlockerCount ?? 0,
     stalledBlockerCount: input.stalledBlockerCount ?? 0,
     attentionBlockerCount: input.attentionBlockerCount ?? 0,
@@ -2152,7 +2157,7 @@ async function listIssueBlockerAttentionMap(
   const attentionMap = new Map<string, IssueBlockerAttention>();
   for (const row of issueRows) {
     if (row.status !== "blocked") {
-      attentionMap.set(row.id, createIssueBlockerAttention());
+      attentionMap.set(row.id, createIssueBlockerAttention({ computed: false }));
     }
   }
   if (roots.length === 0) return attentionMap;
@@ -2222,10 +2227,10 @@ async function listIssueBlockerAttentionMap(
       appendBlockerAttentionEdges(edgesByIssueId, [
         ...explicitBlockerRows
           .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
-          .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
+          .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId, kind: "explicit" as const })),
         ...childRows
           .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
-          .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
+          .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId, kind: "child" as const })),
       ]);
 
       for (const row of [...explicitBlockerRows, ...childRows]) {
@@ -2475,6 +2480,7 @@ async function listIssueBlockerAttentionMap(
       attentionMap.set(root.id, createIssueBlockerAttention({
         state: "needs_attention",
         reason: "attention_required",
+        computed: true,
       }));
       continue;
     }
@@ -2486,6 +2492,8 @@ async function listIssueBlockerAttentionMap(
     const coveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
     const stalledBlockerCount = classified.filter((entry) => entry.result.stalled).length;
     const attentionBlockerCount = classified.length - coveredBlockerCount - stalledBlockerCount;
+    const explicitBlockerCount = topLevelEdges.filter((edge) => edge.kind === "explicit").length;
+    const childBlockerCount = topLevelEdges.filter((edge) => edge.kind === "child").length;
     const hardAttentionEntry = classified.find((entry) => !entry.result.covered && !entry.result.stalled);
     const stalledEntry = classified.find((entry) => entry.result.stalled);
     const sampleEntry = hardAttentionEntry ?? stalledEntry ?? classified[0] ?? null;
@@ -2512,7 +2520,10 @@ async function listIssueBlockerAttentionMap(
     attentionMap.set(root.id, createIssueBlockerAttention({
       state,
       reason,
+      computed: true,
       unresolvedBlockerCount: topLevelEdges.length,
+      explicitBlockerCount,
+      childBlockerCount,
       coveredBlockerCount,
       stalledBlockerCount,
       attentionBlockerCount,

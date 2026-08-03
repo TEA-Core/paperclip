@@ -395,7 +395,14 @@ export type IssueBlockerAttentionReason =
 export interface IssueBlockerAttention {
   state: IssueBlockerAttentionState;
   reason: IssueBlockerAttentionReason;
+  /** Whether the blocker-attention fields were computed for this issue. `false` for non-`blocked` issues where attention is a placeholder. */
+  computed: boolean;
+  /** Total count of unresolved top-level blockers (explicit + child). Kept for backward compat; prefer the split counts. */
   unresolvedBlockerCount: number;
+  /** Count of unresolved explicit "blocks" relation edges at the top level. */
+  explicitBlockerCount: number;
+  /** Count of unresolved child/parent edges at the top level. */
+  childBlockerCount: number;
   coveredBlockerCount: number;
   stalledBlockerCount: number;
   attentionBlockerCount: number;

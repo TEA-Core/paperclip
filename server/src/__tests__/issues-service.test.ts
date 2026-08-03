@@ -4359,6 +4359,84 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  // A cancelled blocker is deliberately NOT self-resolving: cancellation means the
+  // blocking work was abandoned, which may invalidate the dependent's premise, so the
+  // edge is held until an operator removes or replaces it. The dependent is not
+  // stranded — issue-graph liveness raises `blocked_by_cancelled_issue` ("Replace
+  // blocker") against it. Do not "fix" this by treating cancelled as terminal here:
+  // that silently drops the repair signal and lets dependents proceed on a dead
+  // premise. See the cancelled-blocker cases in issue-liveness.test.ts.
+  it("keeps a cancelled blocker unresolved and refuses dependent execution", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const blockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "todo", priority: "medium" },
+      { id: blockedId, companyId, title: "Blocked", status: "todo", priority: "medium", assigneeAgentId },
+    ]);
+    await svc.update(blockedId, { blockedByIssueIds: [blockerId] });
+
+    await svc.update(blockerId, { status: "cancelled" });
+
+    // Read model still reports the cancelled blocker as unresolved...
+    await expect(svc.getDependencyReadiness(blockedId)).resolves.toMatchObject({
+      issueId: blockedId,
+      blockerIssueIds: [blockerId],
+      unresolvedBlockerIssueIds: [blockerId],
+      unresolvedBlockerCount: 1,
+      allBlockersDone: false,
+      isDependencyReady: false,
+    });
+
+    // ...and the relation stays visible rather than being silently dropped.
+    await expect(svc.getRelationSummaries(blockedId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: blockerId, status: "cancelled" })],
+    });
+
+    // ...so both execution gates agree with that read model. This is the pairing
+    // SUP-10347 was filed against: they must never disagree.
+    await expect(
+      svc.update(blockedId, { status: "in_progress" }),
+    ).rejects.toMatchObject({ status: 422 });
+
+    await expect(
+      svc.checkout(blockedId, assigneeAgentId, ["todo", "blocked"], null),
+    ).rejects.toMatchObject({ status: 422 });
+
+    // Cancelling a blocker must not fire issue_blockers_resolved for the dependent.
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
+
+    // Removing the stale edge is the sanctioned repair, and it does unblock.
+    await svc.update(blockedId, { blockedByIssueIds: [] });
+    await expect(svc.getDependencyReadiness(blockedId)).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      isDependencyReady: true,
+    });
+    await expect(
+      svc.checkout(blockedId, assigneeAgentId, ["todo", "blocked"], null),
+    ).resolves.toMatchObject({ id: blockedId });
+  });
+
   it("unblocks a source issue when a liveness escalation recovery issue is marked done", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({

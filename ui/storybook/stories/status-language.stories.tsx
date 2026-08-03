@@ -55,7 +55,10 @@ function attention(
   return {
     state: partial.state,
     reason: partial.reason,
+    computed: partial.computed ?? true,
     unresolvedBlockerCount: partial.unresolvedBlockerCount ?? 0,
+    explicitBlockerCount: partial.explicitBlockerCount ?? 0,
+    childBlockerCount: partial.childBlockerCount ?? 0,
     coveredBlockerCount: partial.coveredBlockerCount ?? 0,
     stalledBlockerCount: partial.stalledBlockerCount ?? 0,
     attentionBlockerCount: partial.attentionBlockerCount ?? 0,
