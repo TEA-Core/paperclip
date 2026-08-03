@@ -2008,28 +2008,52 @@ describe("return-assignee exclusion deadlock fix (SUP-10602)", () => {
     it("throw message names the stage type and id and mentions return-assignee exclusion", () => {
       // After the fix, the sole-participant-is-return-assignee case no longer
       // throws. The throw is only reachable for genuinely zero-participant
-      // stages, which normalizeIssueExecutionPolicy rejects. The remaining
-      // throw sites follow the same message format, so the envelope's item 4
-      // is substantively satisfied by the presence of the stage id and
-      // exclusion mention in the format.
-      const policy = makePolicy([
-        { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
-      ]);
+      // stages, which normalizeIssueExecutionPolicy rejects. We hand-build the
+      // policy object (bypassing normalizeIssueExecutionPolicy) to exercise the
+      // active-stage throw site directly.
+      const zeroParticipantStage = {
+        id: "00000000-0000-4000-8000-000000000001",
+        type: "review" as const,
+        approvalsNeeded: 1 as const,
+        participants: [],
+      };
+      const policy = {
+        mode: "normal" as const,
+        commentRequired: true,
+        stages: [zeroParticipantStage],
+      };
 
-      const result = applyIssueExecutionPolicyTransition({
-        issue: {
-          status: "in_progress",
-          assigneeAgentId: coderAgentId,
-          assigneeUserId: null,
-          executionPolicy: policy,
-          executionState: null,
-        },
-        policy,
-        requestedStatus: "todo",
-        requestedAssigneePatch: {},
-        actor: { agentId: coderAgentId },
-      });
+      const executionState = {
+        status: "pending" as const,
+        currentStageId: zeroParticipantStage.id,
+        currentStageIndex: 0,
+        currentStageType: "review" as const,
+        currentParticipant: null,
+        returnAssignee: { type: "agent" as const, agentId: coderAgentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null as null,
+      };
 
-      expect(result.patch).toEqual({});
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_progress",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState,
+          },
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+          commentBody: "Done",
+        }),
+      ).toThrow(expect.objectContaining({
+        status: 422,
+        message: expect.stringMatching(new RegExp(`review.*${zeroParticipantStage.id}.*return assignee`)),
+      }));
     });
   });
