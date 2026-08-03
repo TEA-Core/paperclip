@@ -147,7 +147,11 @@ TARGET_STABLE_VERSION="$(next_stable_version "$RELEASE_DATE" "${PUBLIC_PACKAGE_N
 TARGET_PUBLISH_VERSION="$TARGET_STABLE_VERSION"
 DIST_TAG="latest"
 
-require_on_release_source_branch "$PUBLISH_REMOTE" "$CURRENT_SHA"
+if [ "$dry_run" = true ] && [ "${RELEASE_ALLOW_DIVERGENT_SOURCE:-}" = "1" ]; then
+  release_warn "release source lineage gate bypassed: --dry-run with RELEASE_ALLOW_DIVERGENT_SOURCE=1. Nothing is published, so the divergent lineage of $CURRENT_SHA is tolerated here."
+else
+  require_on_release_source_branch "$PUBLISH_REMOTE" "$CURRENT_SHA"
+fi
 
 if [ "$channel" = "canary" ]; then
   TARGET_PUBLISH_VERSION="$(next_canary_version "$TARGET_STABLE_VERSION" "${PUBLIC_PACKAGE_NAMES[@]}")"

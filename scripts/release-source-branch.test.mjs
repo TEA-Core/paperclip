@@ -123,6 +123,53 @@ test("release.sh invokes the source-lineage gate once before the canary/stable c
   );
 });
 
+test("the lineage gate can only be bypassed by an explicit opt-in on a dry run", () => {
+  const releaseSh = readFileSync(RELEASE_SH_PATH, "utf8");
+
+  assert.match(
+    releaseSh,
+    /if \[ "\$dry_run" = true \] && \[ "\$\{RELEASE_ALLOW_DIVERGENT_SOURCE:-\}" = "1" \]; then/,
+    "the bypass must require both --dry-run and RELEASE_ALLOW_DIVERGENT_SOURCE=1",
+  );
+
+  const bypassIndex = releaseSh.indexOf('"${RELEASE_ALLOW_DIVERGENT_SOURCE:-}"');
+  const gateIndex = releaseSh.indexOf("require_on_release_source_branch");
+  assert.ok(
+    bypassIndex !== -1 && bypassIndex < gateIndex,
+    "the bypass condition must guard the gate call, not follow it",
+  );
+});
+
+test("the PR workflow dry run opts out of the lineage gate instead of forging a branch name", () => {
+  const prWorkflow = readFileSync(resolve(REPO_ROOT, ".github", "workflows", "pr.yml"), "utf8");
+
+  assert.match(
+    prWorkflow,
+    /RELEASE_ALLOW_DIVERGENT_SOURCE: "1"/,
+    "the PR canary dry run must opt out of the lineage gate explicitly",
+  );
+  assert.doesNotMatch(
+    prWorkflow,
+    /git checkout -B (main|master) HEAD/,
+    "the PR canary dry run must not fake the release source branch name",
+  );
+  assert.match(
+    prWorkflow,
+    /\.\/scripts\/release\.sh canary --skip-verify --dry-run/,
+    "the PR canary dry run must still run release.sh in dry-run mode",
+  );
+});
+
+test("the release workflow never opts out of the lineage gate", () => {
+  const releaseWorkflow = readFileSync(resolve(REPO_ROOT, ".github", "workflows", "release.yml"), "utf8");
+
+  assert.doesNotMatch(
+    releaseWorkflow,
+    /RELEASE_ALLOW_DIVERGENT_SOURCE/,
+    "publish and stable preview jobs must stay gated on main lineage",
+  );
+});
+
 const SHARED_DIST = resolve(
   REPO_ROOT,
   "packages",
