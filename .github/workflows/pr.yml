@@ -3,7 +3,7 @@ name: PR
 on:
   pull_request:
     branches:
-      - master
+      - main
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}
@@ -83,12 +83,19 @@ jobs:
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry
 
+      - name: Verify release source branch gate
+        run: pnpm run test:release-source
+
       - name: Build
         run: pnpm build
 
       - name: Release canary dry run
+        env:
+          # A PR head is never an ancestor of origin/main, so the release
+          # source lineage gate cannot pass here. This dry run publishes
+          # nothing, so it opts out explicitly instead of faking a branch name.
+          RELEASE_ALLOW_DIVERGENT_SOURCE: "1"
         run: |
-          git checkout -B master HEAD
           git checkout -- pnpm-lock.yaml
           ./scripts/release.sh canary --skip-verify --dry-run
 
