@@ -2145,7 +2145,7 @@ async function listIssueBlockerAttentionMap(
   companyId: string,
   issueRows: IssueBlockerAttentionInputNode[],
 ): Promise<Map<string, IssueBlockerAttention>> {
-   const roots = issueRows.filter((row) => row.companyId === companyId && row.status === "blocked");
+  const roots = issueRows.filter((row) => row.companyId === companyId && row.status === "blocked");
   const attentionMap = new Map<string, IssueBlockerAttention>();
   for (const row of issueRows) {
     if (row.status !== "blocked") {
