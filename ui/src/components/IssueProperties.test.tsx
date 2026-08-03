@@ -779,6 +779,7 @@ describe("IssueProperties", () => {
           unresolvedBlockerCount: 1,
           explicitBlockerCount: 1,
           childBlockerCount: 0,
+          computed: true,
           coveredBlockerCount: 1,
           stalledBlockerCount: 0,
           attentionBlockerCount: 0,
