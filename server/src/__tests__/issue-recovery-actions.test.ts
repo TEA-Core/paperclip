@@ -1950,21 +1950,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .send({
         actionId: action.id,
         outcome: "false_positive",
-        sourceIssueStatus: "in_review",
-        resolutionNote: "Recovery signal was stale; return to review.",
+        sourceIssueStatus: "done",
+        resolutionNote: "Recovery signal was stale; issue is actually complete.",
       })
       .expect(200);
 
     expect(resolved.body.issue).toMatchObject({
       id: sourceIssueId,
-      status: "in_review",
+      status: "done",
       activeRecoveryAction: null,
     });
     expect(resolved.body.recoveryAction).toMatchObject({
       id: action.id,
       status: "resolved",
       outcome: "false_positive",
-      resolutionNote: "Recovery signal was stale; return to review.",
+      resolutionNote: "Recovery signal was stale; issue is actually complete.",
     });
   });
 
@@ -2005,5 +2005,52 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  it("rejects a board-authored recovery restore to in_review without a review path", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "todo", assigneeAgentId: managerId, executionState: null })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:fingerprint",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp({ type: "board", source: "local_implicit" });
+
+    const res = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "in_review",
+        resolutionNote: "Board bulk-resolved as restored.",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("invalid_issue_disposition");
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "review_path",
+    });
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow?.status).toBe("active");
+
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(issueRow?.status).toBe("todo");
   });
 });
