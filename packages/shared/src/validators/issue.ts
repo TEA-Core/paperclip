@@ -725,7 +725,8 @@ export const askUserQuestionsResultSchema = z.object({
   answers: z.array(askUserQuestionsAnswerSchema).max(20),
   cancelled: z.literal(true).optional(),
   cancellationReason: z.string().trim().max(4000).nullable().optional(),
-  expirationReason: z.literal("superseded_by_comment").optional(),
+  expirationReason: z.literal("superseded_by_comment").or(z.literal("expired_issue_terminal")).or(z.literal("withdrawn_by_author")).optional(),
+  reason: z.string().trim().max(500).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   summaryMarkdown: z.string().max(20000).nullable().optional(),
 });
@@ -919,7 +920,7 @@ export const requestConfirmationToolActionResultSchema = z.object({
 
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target"]),
+  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target", "withdrawn_by_author", "expired_issue_terminal"]),
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
@@ -1041,10 +1042,11 @@ export const requestItemVerdictsResultItemSchema = z.object({
 
 export const requestItemVerdictsResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["resolved", "superseded_by_comment", "stale_target", "cancelled"]),
+  outcome: z.enum(["resolved", "superseded_by_comment", "stale_target", "cancelled", "withdrawn_by_author", "expired_issue_terminal"]),
   complete: z.boolean(),
   items: z.array(requestItemVerdictsResultItemSchema)
     .max(REQUEST_ITEM_VERDICTS_ITEM_LIMIT),
+  reason: z.string().trim().max(500).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
 }).superRefine((value, ctx) => {
@@ -1159,6 +1161,11 @@ export const cancelIssueThreadInteractionSchema = z.object({
   reason: z.string().trim().max(4000).optional(),
 });
 export type CancelIssueThreadInteraction = z.infer<typeof cancelIssueThreadInteractionSchema>;
+
+export const withdrawIssueThreadInteractionSchema = z.object({
+  reason: z.string().trim().max(500).optional().transform((value) => (value && value.length > 0 ? value : null)),
+});
+export type WithdrawIssueThreadInteraction = z.infer<typeof withdrawIssueThreadInteractionSchema>;
 
 export const respondIssueThreadInteractionSchema = z.object({
   answers: z.array(askUserQuestionsAnswerSchema).max(20),

@@ -1026,7 +1026,8 @@ export interface AskUserQuestionsResult {
   answers: AskUserQuestionsAnswer[];
   cancelled?: true;
   cancellationReason?: string | null;
-  expirationReason?: "superseded_by_comment";
+  expirationReason?: "superseded_by_comment" | "expired_issue_terminal" | "withdrawn_by_author";
+  reason?: string | null;
   commentId?: string | null;
   summaryMarkdown?: string | null;
 }
@@ -1157,7 +1158,7 @@ export interface RequestItemVerdictsPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target";
+  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "withdrawn_by_author" | "expired_issue_terminal";
   reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
@@ -1189,9 +1190,10 @@ export interface RequestItemVerdictsResultItem {
 
 export interface RequestItemVerdictsResult {
   version: 1;
-  outcome: "resolved" | "superseded_by_comment" | "stale_target" | "cancelled";
+  outcome: "resolved" | "superseded_by_comment" | "stale_target" | "cancelled" | "withdrawn_by_author" | "expired_issue_terminal";
   complete: boolean;
   items: RequestItemVerdictsResultItem[];
+  reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
 }
