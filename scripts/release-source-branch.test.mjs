@@ -150,8 +150,11 @@ const SHARED_DIST = resolve(
 const REQUIRED_VALIDATOR =
   /returnAssigneeAgentId:\s*z\.string\(\)\.trim\(\)\.uuid\(\)\.optional\(\)\.nullable\(\)/;
 
+const ISSUE_EXECUTION_POLICY_INITIALIZER_RE =
+  /export const issueExecutionPolicySchema = z\.object\(\{([\s\S]*?)\}\);/;
+
 function assertArtifactHasValidReturnAssigneeAgentId(source) {
-  const match = source.match(/export const issueExecutionPolicySchema = z\.object\(\{([\s\S]*?)\}\);/);
+  const match = source.match(ISSUE_EXECUTION_POLICY_INITIALIZER_RE);
   assert.ok(match, "built shared artifact must define issueExecutionPolicySchema as z.object({...})");
   assert.match(
     match[1],
@@ -175,7 +178,7 @@ test("built artifact assertion rejects a malformed returnAssigneeAgentId validat
     )
     .replace(
       /(\}\);)(\s*\n\s*export const issueReviewRequestSchema)/,
-      "$1\nexport const returnAssigneeAgentId = z.string().trim().uuid().optional().nullable();$2",
+      "$1\nexport const decoySchema = z.object({ returnAssigneeAgentId: z.string().trim().uuid().optional().nullable() });$2",
     );
 
   assert.throws(
