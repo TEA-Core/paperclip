@@ -5,6 +5,7 @@ import {
   activityLog,
   agents,
   companies,
+  companyMemberships,
   companySecretBindings,
   companySecrets,
   companySecretVersions,
@@ -81,6 +82,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
     await db.delete(instanceSettings);
   });
@@ -1029,6 +1031,16 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const { companyId, agentId, projectId, svc } = await seedFixture();
     const responsibleUserId = randomUUID();
     const driftUserId = randomUUID();
+    // The creator must hold an active membership, otherwise the routine's responsible user
+    // falls back to the company default and this test would assert on the wrong thing.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: responsibleUserId,
+      status: "active",
+      membershipRole: "owner",
+      updatedAt: new Date(),
+    });
     const routine = await svc.create(
       companyId,
       {

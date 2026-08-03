@@ -123,8 +123,32 @@ async function resolveCompanyDefaultResponsibleUserId(db: Db, companyId: string)
   return owner?.userId ?? null;
 }
 
+/**
+ * Whether `userId` holds an active membership in the company — the same condition
+ * `assertCompanyAccess` applies to an agent's on-behalf-of user.
+ */
+async function hasActiveCompanyMembership(db: Db, companyId: string, userId: string) {
+  return await db
+    .select({ id: companyMemberships.id })
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, userId),
+        eq(companyMemberships.status, "active"),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows.length > 0);
+}
+
 async function resolveRoutineResponsibleUserId(db: Db, companyId: string, actorUserId: string | null | undefined, parentIssueId?: string | null) {
-  if (actorUserId) return actorUserId;
+  // Only accept an actor that could actually authorize. Seeding actors like `built-in-bundles`
+  // are attribution labels, not users: they are truthy, so they clear the emptiness gate in
+  // middleware/auth.ts and then fail the membership check in routes/authz.ts — after being
+  // baked into the responsible user of every run the routine spawns.
+  if (actorUserId && await hasActiveCompanyMembership(db, companyId, actorUserId)) return actorUserId;
   if (parentIssueId) {
     const parent = await db
       .select({ responsibleUserId: issues.responsibleUserId, createdByUserId: issues.createdByUserId })
