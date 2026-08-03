@@ -1355,6 +1355,290 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 
+  it("enqueues a run for the new owner after cancelling a stale review handoff", async () => {
+    // SUP-10605: a review handoff moves the issue to in_review and reassigns it to
+    // the reviewer while the outgoing assignee still has a queued run. Cancelling
+    // that run used to leave the issue with no queued run and no executionRunId,
+    // and nothing else re-dispatches it, so the issue parked forever — even though
+    // the cancellation reason promised "the new owner will be woken instead".
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "OutgoingCoder" });
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "ReviewerAgent",
+      role: "qa",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Handed off to review",
+      status: "in_review",
+      priority: "high",
+      // The execution policy mirrors the current participant onto the assignee,
+      // so the reviewer owns the issue on both axes.
+      assigneeAgentId: reviewerAgentId,
+      executionState: {
+        status: "pending",
+        currentStageId: randomUUID(),
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_assigned",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    const handedOff = await waitForCondition(async () => {
+      const rows = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, reviewerAgentId));
+      return rows.length > 0;
+    }, 10_000);
+    expect(handedOff).toBe(true);
+
+    const staleRun = await db
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        startedAt: heartbeatRuns.startedAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(staleRun?.status).toBe("cancelled");
+    expect(staleRun?.errorCode).toBe("issue_assignee_changed");
+    expect(staleRun?.startedAt).toBeNull();
+    expect(countExecuteCallsForRun(runId)).toBe(0);
+
+    const handoffRuns = await db
+      .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerAgentId));
+    expect(handoffRuns).toHaveLength(1);
+    expect(handoffRuns[0]?.contextSnapshot).toMatchObject({
+      issueId,
+      staleRunHandoffFromRunId: runId,
+      staleRunHandoffFromAgentId: agentId,
+      staleRunHandoffErrorCode: "issue_assignee_changed",
+      staleRunHandoffHops: 1,
+    });
+
+    // The new owner's run is a real dispatch, not another cancellation.
+    const reached = await waitForCondition(async () => {
+      const row = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, handoffRuns[0]!.id))
+        .then((rows) => rows[0] ?? null);
+      return row?.status === "succeeded";
+    }, 10_000);
+    expect(reached).toBe(true);
+    expect(countExecuteCallsForRun(handoffRuns[0]!.id)).toBe(1);
+  });
+
+  it("enqueues a run for the current review participant after cancelling a stale participant run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "StaleParticipant" });
+    const participantAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: participantAgentId,
+      companyId,
+      name: "CurrentParticipant",
+      role: "qa",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "In-review stage advanced to another participant",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      executionState: {
+        status: "pending",
+        currentStageId: randomUUID(),
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: participantAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_assigned",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    const handedOff = await waitForCondition(async () => {
+      const rows = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, participantAgentId));
+      return rows.length > 0;
+    }, 10_000);
+    expect(handedOff).toBe(true);
+
+    const staleRun = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(staleRun?.status).toBe("cancelled");
+    expect(staleRun?.errorCode).toBe("issue_review_participant_changed");
+
+    const handoffRuns = await db
+      .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, participantAgentId));
+    expect(handoffRuns).toHaveLength(1);
+    expect(handoffRuns[0]?.contextSnapshot).toMatchObject({
+      issueId,
+      staleRunHandoffFromRunId: runId,
+      staleRunHandoffErrorCode: "issue_review_participant_changed",
+      staleRunHandoffHops: 1,
+    });
+
+    // evaluateQueuedRunStaleness already exempts the current review participant
+    // from the assignee check, so the handoff run is dispatchable, not re-cancelled.
+    const reached = await waitForCondition(async () => {
+      const row = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, handoffRuns[0]!.id))
+        .then((rows) => rows[0] ?? null);
+      return row?.status === "succeeded";
+    }, 10_000);
+    expect(reached).toBe(true);
+  });
+
+  it("does not enqueue a handoff when a stale cancellation promises no wake", async () => {
+    // issue_terminal_status is a deliberate no-enqueue case: its reason string
+    // makes no wake promise, and no replacement run may be created.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Already-completed task",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_assigned",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const allRuns = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(allRuns).toHaveLength(1);
+    expect(allRuns[0]?.id).toBe(runId);
+  });
+
+  it("stops handing off after one hop instead of ping-ponging runs between two agents", async () => {
+    // A handoff run that is itself found stale means ownership is contradictory.
+    // The chain must terminate rather than bounce runs between the two agents.
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "AssigneeAgent" });
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Contradictory ownership",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: otherAgentId,
+    });
+
+    // Seed a run for a third party so the first hop targets otherAgentId, whose
+    // own handoff attempt is then hop 2 and must be refused.
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_assigned",
+      contextExtras: { staleRunHandoffHops: 1 },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    }, 10_000);
+
+    // Give any runaway ping-pong a chance to produce more runs.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const allRuns = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(allRuns).toHaveLength(1);
+    expect(allRuns[0]?.id).toBe(runId);
+  });
+
   it("still runs comment-driven wakes on in_review issues even when the agent is no longer the current participant", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const otherAgentId = randomUUID();

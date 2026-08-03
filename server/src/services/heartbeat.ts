@@ -331,6 +331,11 @@ const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+const STALE_RUN_HANDOFF_HOPS_KEY = "staleRunHandoffHops";
+// A handoff wake that is itself cancelled as stale means issue ownership is still
+// contradictory (e.g. assignee and review participant disagree). Stop after one hop
+// so two agents cannot ping-pong queued runs at each other forever.
+const STALE_RUN_HANDOFF_MAX_HOPS = 1;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
@@ -10792,11 +10797,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
       if (staleness.stale) {
-        await cancelQueuedRunForStaleIssue(run, issueId, staleness);
+        const cancelledRun = await cancelQueuedRunForStaleIssue(run, issueId, staleness);
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
         );
+        if (cancelledRun) {
+          // Runs after the cancellation so the issue execution lock is already
+          // released and enqueueWakeup can queue the replacement immediately.
+          await enqueueStaleRunHandoffWake({
+            cancelledRun,
+            previousContext: context,
+            issueId,
+            staleness,
+          });
+        }
         return null;
       }
     }
@@ -10942,6 +10957,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_review_participant_changed"
           | "issue_continuation_waiting_on_review";
         details: Record<string, unknown>;
+        // Agent that owns the issue now and must be woken in the cancelled run's
+        // place. null means this is a deliberate no-enqueue case (the issue is
+        // gone, terminal, parked, or has no agent owner) — the reason string must
+        // then not promise a wake.
+        handoffAgentId: string | null;
       };
 
   async function evaluateQueuedRunStaleness(
@@ -10967,6 +10987,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         errorCode: "issue_not_found",
         reason: "Cancelled because the target issue no longer exists",
         details: { issueId },
+        handoffAgentId: null,
       };
     }
 
@@ -11004,6 +11025,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             retryReason,
             nextAction: continuationSummaryBody,
           },
+          handoffAgentId: null,
         };
       }
     }
@@ -11016,16 +11038,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reviewParticipant.agentId === run.agentId;
 
     if (issue.assigneeAgentId !== run.agentId && !isInteractionWake && !isCurrentReviewParticipant) {
+      // Prefer the in-review participant when one is set: on an in_review issue
+      // that agent is the owner the staleness gate below will actually accept,
+      // so waking it converges in one hop instead of bouncing via the assignee.
+      const nextOwnerAgentId =
+        (reviewParticipant?.type === "agent" ? reviewParticipant.agentId : null) ??
+        issue.assigneeAgentId;
+      const handoffAgentId = nextOwnerAgentId && nextOwnerAgentId !== run.agentId
+        ? nextOwnerAgentId
+        : null;
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
-        reason:
-          "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead",
+        reason: handoffAgentId
+          ? "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead"
+          : "Cancelled because issue assignee changed before the queued run could start; the issue has no agent owner, so no replacement run was queued",
         details: {
           issueId,
           previousAssigneeAgentId: run.agentId,
           currentAssigneeAgentId: issue.assigneeAgentId,
         },
+        handoffAgentId,
       };
     }
 
@@ -11036,6 +11069,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           errorCode: "issue_terminal_status",
           reason: `Cancelled because issue reached terminal status (${issue.status}) before the queued run could start`,
           details: { issueId, currentStatus: issue.status },
+          handoffAgentId: null,
         };
       }
     }
@@ -11046,6 +11080,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         errorCode: "issue_not_in_progress",
         reason: `Cancelled because max-turn continuation issue is no longer in_progress (current status: ${issue.status}) before the queued run could start`,
         details: { issueId, currentStatus: issue.status, requiredStatus: "in_progress" },
+        handoffAgentId: null,
       };
     }
 
@@ -11060,6 +11095,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           expectedExecutionRunId: run.id,
           currentExecutionRunId: issue.executionRunId,
         },
+        handoffAgentId: null,
       };
     }
 
@@ -11069,16 +11105,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const participantMatches =
           currentParticipant.type === "agent" && currentParticipant.agentId === run.agentId;
         if (!participantMatches && !wakeCommentId) {
+          const participantAgentId =
+            currentParticipant.type === "agent" ? currentParticipant.agentId ?? null : null;
+          const handoffAgentId = participantAgentId && participantAgentId !== run.agentId
+            ? participantAgentId
+            : null;
           return {
             stale: true,
             errorCode: "issue_review_participant_changed",
-            reason:
-              "Cancelled because the in-review participant changed before the queued run could start; the current participant will be woken instead",
+            reason: handoffAgentId
+              ? "Cancelled because the in-review participant changed before the queued run could start; the current participant will be woken instead"
+              : "Cancelled because the in-review participant changed before the queued run could start; the current participant is not an agent, so no replacement run was queued",
             details: {
               issueId,
               currentStageType: reviewExecutionState?.currentStageType ?? null,
               currentParticipant,
             },
+            handoffAgentId,
           };
         }
       }
@@ -11138,6 +11181,105 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     return cancelled;
+  }
+
+  // Cancelling a stale queued run leaves the issue with no queued run and no
+  // executionRunId. Nothing else re-dispatches it (the inbox, the stranded
+  // reconciler and agent resume are all blind to in_review), so the issue parks
+  // forever unless we wake the agent that owns it now.
+  async function enqueueStaleRunHandoffWake(input: {
+    cancelledRun: typeof heartbeatRuns.$inferSelect;
+    previousContext: Record<string, unknown>;
+    issueId: string;
+    staleness: Extract<QueuedRunStaleness, { stale: true }>;
+  }) {
+    const { cancelledRun, previousContext, issueId, staleness } = input;
+    const handoffAgentId = staleness.handoffAgentId;
+    if (!handoffAgentId || handoffAgentId === cancelledRun.agentId) return null;
+
+    const previousHopsRaw = Number(previousContext[STALE_RUN_HANDOFF_HOPS_KEY] ?? 0);
+    const previousHops =
+      Number.isFinite(previousHopsRaw) && previousHopsRaw > 0 ? Math.floor(previousHopsRaw) : 0;
+    const hops = previousHops + 1;
+
+    const recordOutcome = async (level: "info" | "warn", message: string, extra: Record<string, unknown>) => {
+      await appendRunEvent(cancelledRun, await nextRunEventSeq(cancelledRun.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level,
+        message,
+        payload: { issueId, handoffAgentId, errorCode: staleness.errorCode, hops, ...extra },
+      });
+    };
+
+    if (hops > STALE_RUN_HANDOFF_MAX_HOPS) {
+      logger.warn(
+        { runId: cancelledRun.id, issueId, handoffAgentId, hops },
+        "claimQueuedRun: stale-run handoff hop limit reached; not re-enqueueing",
+      );
+      await recordOutcome(
+        "warn",
+        "Stale-run handoff stopped at the hop limit; issue ownership is still contradictory",
+        {},
+      );
+      return null;
+    }
+
+    try {
+      const handoffRun = await enqueueWakeup(handoffAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId, staleRunHandoffFromRunId: cancelledRun.id },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+          source: "heartbeat.stale_run_handoff",
+          staleRunHandoffFromRunId: cancelledRun.id,
+          staleRunHandoffFromAgentId: cancelledRun.agentId,
+          staleRunHandoffErrorCode: staleness.errorCode,
+          [STALE_RUN_HANDOFF_HOPS_KEY]: hops,
+        },
+        idempotencyKey: `stale-run-handoff:${cancelledRun.id}:${handoffAgentId}`,
+        requestedByActorType: "system",
+        requestedByActorId: "heartbeat",
+      });
+
+      if (handoffRun) {
+        logger.info(
+          { runId: cancelledRun.id, issueId, handoffAgentId, handoffRunId: handoffRun.id },
+          "claimQueuedRun: queued stale-run handoff wake for the issue's current owner",
+        );
+        await recordOutcome("info", "Queued a replacement run for the issue's current owner", {
+          handoffRunId: handoffRun.id,
+        });
+      } else {
+        // enqueueWakeup returns null when it deferred or skipped the wake (issue
+        // execution lock held, dependencies blocked, heartbeat disabled). Those
+        // paths have their own re-dispatch, but record that no run exists yet.
+        logger.warn(
+          { runId: cancelledRun.id, issueId, handoffAgentId },
+          "claimQueuedRun: stale-run handoff wake was deferred or skipped",
+        );
+        await recordOutcome(
+          "warn",
+          "Stale-run handoff wake was deferred or skipped; no replacement run is queued yet",
+          { handoffRunId: null },
+        );
+      }
+      return handoffRun;
+    } catch (err) {
+      logger.error(
+        { err, runId: cancelledRun.id, issueId, handoffAgentId },
+        "claimQueuedRun: stale-run handoff wake failed",
+      );
+      await recordOutcome("warn", "Stale-run handoff wake failed; no replacement run is queued", {
+        handoffRunId: null,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
   }
 
   function truncateAgentErrorReason(reason: string | null | undefined): string | null {
