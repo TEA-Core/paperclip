@@ -152,6 +152,7 @@ import {
   buildIssueBlockersResolvedWakeup,
   findExistingIssueBlockersResolvedWake,
 } from "../services/issue-dependency-wakeups.js";
+import { isBlockedWithoutBlockers } from "../services/recovery/service.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { decisionTrainingService } from "../services/decision-training.js";
@@ -8264,6 +8265,53 @@ export function issueRoutes(
         blockedBy: updatedRelations.blockedBy,
         blocks: updatedRelations.blocks,
       };
+    }
+
+    // SUP-10658 (board fix 5): telemetry-only signal when a PATCH commits
+    // status='blocked' with an empty blocker set. Never fails the request and
+    // never alters the response; actor attribution distinguishes
+    // platform-internal writers from agent writers.
+    if (issue.status === "blocked") {
+      try {
+        const committedRelations = updatedRelations ?? (await svc.getRelationSummaries(issue.id));
+        const committedBlockerIssueIds = committedRelations.blockedBy.map((relation) => relation.id);
+        if (isBlockedWithoutBlockers({ status: issue.status, blockerIssueIds: committedBlockerIssueIds })) {
+          logger.warn(
+            {
+              issueId: issue.id,
+              companyId: issue.companyId,
+              identifier: issue.identifier,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              actorSource: actor.actorSource,
+            },
+            "issue PATCH committed blocked with an empty blocker set",
+          );
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.blocked_without_blockers_written",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              source: "issue_update_route",
+              identifier: issue.identifier,
+              blockerIssueIds: committedBlockerIssueIds,
+              actorSource: actor.actorSource,
+              statusChanged: existing.status !== issue.status,
+              blockersPatched: Array.isArray(req.body.blockedByIssueIds),
+            },
+          });
+        }
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id }, "failed to emit blocked-without-blockers telemetry");
+      }
     }
     await routinesSvc.syncRunStatusForIssue(issue.id);
 
