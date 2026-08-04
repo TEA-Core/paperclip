@@ -20,6 +20,10 @@ vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClien
 
 import { recoveryService } from "../services/recovery/service.js";
 
+// Explicit sweep interval so the seeded staleness windows below are independent
+// of RECOVERY_ACTION_WAKE_INTERVAL_MS in the ambient environment.
+const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -31,7 +35,7 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
+describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded action backstop)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
@@ -99,7 +103,7 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
     const prefix = `SR${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
     const now = new Date();
     // Default updatedAt to 30 min ago so it predates the 20-min staleAt window
-    // used by seedRecoveryAction. The moved-issue test explicitly updates it.
+    // used by seedRecoveryAction.
     const updatedAt = updatedAtOverride ?? new Date(now.getTime() - 30 * 60 * 1000);
     await db.insert(issues).values({
       id: issueId,
@@ -164,11 +168,11 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
-    expect(result.reQueued).toBe(1);
+    expect(result.reFired).toBe(1);
     expect(result.rerouted).toBe(0);
-    expect(result.skipped).toBe(0);
+    expect(result.nonWakeableSkipped).toBe(0);
     expect(result.skippedTerminalSource).toBe(0);
     expect(result.actionIds).toEqual([actionId]);
 
@@ -200,11 +204,11 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
-    expect(result.reQueued).toBe(0);
+    expect(result.reFired).toBe(0);
     expect(result.rerouted).toBe(0);
-    expect(result.skipped).toBe(0);
+    expect(result.nonWakeableSkipped).toBe(0);
     expect(result.skippedTerminalSource).toBe(1);
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
@@ -221,7 +225,7 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
     expect(result.skippedTerminalSource).toBe(1);
     expect(enqueueWakeup).not.toHaveBeenCalled();
@@ -247,11 +251,11 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
-    expect(result.reQueued).toBe(0);
+    expect(result.reFired).toBe(0);
     expect(result.rerouted).toBe(0);
-    expect(result.skipped).toBe(2);
+    expect(result.nonWakeableSkipped).toBe(2);
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
@@ -268,11 +272,11 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
     expect(result.rerouted).toBe(1);
-    expect(result.reQueued).toBe(0);
-    expect(result.skipped).toBe(0);
+    expect(result.reFired).toBe(0);
+    expect(result.nonWakeableSkipped).toBe(0);
     expect(result.actionIds).toEqual([actionId]);
 
     const updated = await db
@@ -314,11 +318,11 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
     expect(result.rerouted).toBe(0);
-    expect(result.reQueued).toBe(0);
-    expect(result.skipped).toBe(1);
+    expect(result.reFired).toBe(0);
+    expect(result.nonWakeableSkipped).toBe(1);
     expect(enqueueWakeup).not.toHaveBeenCalled();
 
     const updated = await db
@@ -341,11 +345,11 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
-    expect(result.reQueued).toBe(0);
+    expect(result.reFired).toBe(0);
     expect(result.rerouted).toBe(0);
-    expect(result.skipped).toBe(1);
+    expect(result.nonWakeableSkipped).toBe(1);
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
@@ -362,11 +366,11 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
-    expect(result.reQueued).toBe(0);
+    expect(result.reFired).toBe(0);
     expect(result.rerouted).toBe(0);
-    expect(result.skipped).toBe(0);
+    expect(result.nonWakeableSkipped).toBe(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
@@ -383,11 +387,11 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
-    expect(result.reQueued).toBe(0);
+    expect(result.reFired).toBe(0);
     expect(result.rerouted).toBe(0);
-    expect(result.skipped).toBe(0);
+    expect(result.nonWakeableSkipped).toBe(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
@@ -404,11 +408,11 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
 
-    const first = await recovery.sweepStrandedRecoveryActions();
-    expect(first.reQueued).toBe(1);
+    const first = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
+    expect(first.reFired).toBe(1);
 
-    const second = await recovery.sweepStrandedRecoveryActions();
-    expect(second.reQueued).toBe(0);
+    const second = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
+    expect(second.reFired).toBe(0);
     expect(second.rerouted).toBe(0);
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
@@ -433,9 +437,9 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
-    expect(result.reQueued).toBe(2);
+    expect(result.reFired).toBe(2);
     expect(result.actionIds).toHaveLength(2);
     expect(result.actionIds).toContain(actionId1);
     expect(result.actionIds).toContain(actionId2);
@@ -455,11 +459,11 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
-    expect(result.reQueued).toBe(0);
+    expect(result.reFired).toBe(0);
     expect(result.rerouted).toBe(0);
-    expect(result.skippedCeilingExhausted).toBe(1);
+    expect(result.maxAttemptsReached).toBe(1);
     expect(enqueueWakeup).not.toHaveBeenCalled();
 
     const updated = await db
@@ -484,9 +488,9 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
 
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
-    expect(result.skippedCeilingExhausted).toBe(1);
+    expect(result.maxAttemptsReached).toBe(1);
 
     const issue = await db
       .select({ status: issues.status })
@@ -503,27 +507,4 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
     expect(comments.some((c) => (c.body ?? "").includes("escalated to the board"))).toBe(true);
   });
 
-  it("skips actions whose source issue moved after lastAttemptAt", async () => {
-    const { companyId, ctoId, coderId } = await seedCompany();
-    const sourceIssueId = await seedSourceIssue(companyId, coderId);
-    const staleAt = new Date(Date.now() - 20 * 60 * 1000);
-    const movedAt = new Date(Date.now() - 5 * 60 * 1000);
-    await seedRecoveryAction({
-      companyId,
-      sourceIssueId,
-      ownerAgentId: ctoId,
-      wakePolicy: { type: "wake_owner" },
-      lastAttemptAt: staleAt,
-    });
-    await db.update(issues).set({ updatedAt: movedAt }).where(eq(issues.id, sourceIssueId));
-
-    const enqueueWakeup = vi.fn(async () => null);
-    const recovery = recoveryService(db, { enqueueWakeup });
-    const result = await recovery.sweepStrandedRecoveryActions();
-
-    expect(result.reQueued).toBe(0);
-    expect(result.rerouted).toBe(0);
-    expect(result.skipped).toBe(1);
-    expect(enqueueWakeup).not.toHaveBeenCalled();
-  });
 });

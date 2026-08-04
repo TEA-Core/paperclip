@@ -959,14 +959,14 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
 
-        const sweptRecoveryActions = await heartbeat.sweepStrandedRecoveryActions();
-        if (sweptRecoveryActions.reQueued > 0 || sweptRecoveryActions.rerouted > 0) {
-          logger.warn({ ...sweptRecoveryActions }, "startup stranded-recovery-action sweeper re-queued recovery wakes");
-        }
-
         const blockedWithoutBlockers = await heartbeat.reconcileBlockedWithoutBlockers();
         if (blockedWithoutBlockers.reported > 0) {
           logger.warn({ ...blockedWithoutBlockers }, "startup blocked-without-blockers sweep reported issues");
+        }
+
+        const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
+        if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {
+          logger.warn({ ...staleWakes }, "startup stale recovery action wake sweep re-fired wakes");
         }
 
         const reviewed = await heartbeat.reconcileProductivityReviews();
@@ -1111,15 +1111,13 @@ export async function startServer(): Promise<StartedServer> {
               }
             })
             .then(async () => {
-              const sweptRecoveryActions = await heartbeat.sweepStrandedRecoveryActions();
-              if (sweptRecoveryActions.reQueued > 0 || sweptRecoveryActions.rerouted > 0) {
-                logger.warn({ ...sweptRecoveryActions }, "periodic stranded-recovery-action sweeper re-queued recovery wakes");
-              }
-            })
-            .then(async () => {
               const blockedWithoutBlockers = await heartbeat.reconcileBlockedWithoutBlockers();
               if (blockedWithoutBlockers.reported > 0) {
                 logger.warn({ ...blockedWithoutBlockers }, "periodic blocked-without-blockers sweep reported issues");
+              }
+              const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
+              if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {
+                logger.warn({ ...staleWakes }, "periodic stale recovery action wake sweep re-fired wakes");
               }
             })
             .then(async () => {

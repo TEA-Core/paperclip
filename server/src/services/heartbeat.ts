@@ -11821,8 +11821,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileBlockedWithoutBlockers({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
-  async function sweepStrandedRecoveryActions() {
-    return recovery.sweepStrandedRecoveryActions();
+  async function reconcileStaleRecoveryActionWakes(opts?: { intervalMs?: number }) {
+    return recovery.reconcileStaleRecoveryActionWakes(opts);
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -17271,7 +17271,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     sweepStaleIssueLocks,
 
     reconcileBlockedWithoutBlockers,
-    sweepStrandedRecoveryActions,
+    reconcileStaleRecoveryActionWakes,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 

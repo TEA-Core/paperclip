@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, notInArray, or, sql, count } from "drizzle-orm";
+import { and, asc, desc, eq, gte, gt, inArray, isNotNull, isNull, lt, notInArray, or, sql, count } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -7,6 +7,7 @@ import {
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueRecoveryAction,
   type IssueRecoveryActionKind,
 } from "@paperclipai/shared";
 import {
@@ -117,6 +118,11 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
   60_000,
   Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
+);
+
+export const RECOVERY_ACTION_WAKE_INTERVAL_MS = Math.max(
+  60_000,
+  Number(process.env.RECOVERY_ACTION_WAKE_INTERVAL_MS) || 5 * 60 * 1000,
 );
 
 type RecoveryWakeupOptions = {
@@ -3032,7 +3038,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       monitorPolicy: recoveryCause === "provider_quota" && !ownerAgentId
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
-      maxAttempts: MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS,
+      // Left null: the backstop sweep defaults a null ceiling to
+      // MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS, so persisting it here would only
+      // freeze the ceiling at creation time.
+      maxAttempts: null,
       lastAttemptAt: now,
     });
 
@@ -3598,7 +3607,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
         externalRef: input.latestRun.id,
         timeoutAt: null,
-      maxAttempts: null,
+        maxAttempts: null,
         recoveryPolicy: "wake_owner" as const,
       },
     };
@@ -5736,36 +5745,55 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
-  const STRANDED_RECOVERY_ACTION_SWEEP_STALE_AFTER_MS = 15 * 60 * 1000;
+  // Ceiling applied to source-scoped recovery actions so the level-triggered
+  // backstop below cannot re-fire the same wake forever.
   const MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS = 5;
-  const SWEEP_MOVED_ISSUE_EPSILON_MS = 1000;
-
-  function readRecoveryWakePolicy(action: typeof issueRecoveryActions.$inferSelect) {
-    return parseObject(action.wakePolicy);
-  }
+  // Per-action linear backoff: attempt N waits N * intervalMs before the next
+  // re-fire, capped so a long-lived action still gets swept periodically.
+  const RECOVERY_ACTION_WAKE_BACKOFF_MAX_MULTIPLIER = 6;
 
   function readRecoveryWakePolicyType(action: typeof issueRecoveryActions.$inferSelect) {
-    const policy = readRecoveryWakePolicy(action);
-    return readNonEmptyString(policy.type);
+    return readNonEmptyString(parseObject(action.wakePolicy).type);
   }
 
-  function readRecoveryEvidenceLatestRunId(action: typeof issueRecoveryActions.$inferSelect) {
-    const evidence = parseObject(action.evidence);
-    return readNonEmptyString(evidence.latestRunId);
-  }
+  // Level-triggered backstop for stranded recovery actions.
+  //
+  // The owner wake fires exactly once, at action creation
+  // (enqueueSourceScopedStrandedRecoveryWake). If that single edge is lost
+  // (worker restart mid-enqueue, queue drop, owner deactivated between creation
+  // and delivery) the `active` action stays in the table forever and holds its
+  // source issue with no further attempts. This sweep looks at the *state* of
+  // active actions instead of at events and re-drives any action whose
+  // `lastAttemptAt` is older than its backoff window:
+  //
+  //   - terminal/missing source issues are dropped (nothing left to recover)
+  //   - `monitor_only` / `manual_repair_required` policies and non-wakeable
+  //     causes are skipped without burning an attempt
+  //   - `board_escalation` actions are rerouted to an invokable agent owner when
+  //     one can be resolved, instead of waiting on a human forever
+  //   - attemptCount/lastAttemptAt are bumped under a compare-and-swap on the
+  //     pre-image, so concurrent sweeps cannot double-fire
+  //   - at `maxAttempts` the action is escalated and the source issue is blocked
+  //     with a board comment, so exhaustion is visible rather than silent
+  async function reconcileStaleRecoveryActionWakes(opts?: { intervalMs?: number }) {
+    const intervalMs = opts?.intervalMs ?? RECOVERY_ACTION_WAKE_INTERVAL_MS;
+    const now = new Date();
+    const threshold = new Date(now.getTime() - intervalMs);
 
-  async function sweepStrandedRecoveryActions() {
     const result = {
-      reQueued: 0,
+      checked: 0,
+      reFired: 0,
       rerouted: 0,
-      skipped: 0,
+      maxAttemptsReached: 0,
+      nonWakeableSkipped: 0,
       skippedTerminalSource: 0,
-      skippedCeilingExhausted: 0,
+      skippedBackoff: 0,
+      enqueueFailed: 0,
+      issueIds: [] as string[],
       actionIds: [] as string[],
     };
 
-    const staleBefore = new Date(Date.now() - STRANDED_RECOVERY_ACTION_SWEEP_STALE_AFTER_MS);
-    const staleActions = await db
+    const candidates = await db
       .select()
       .from(issueRecoveryActions)
       .where(
@@ -5773,234 +5801,246 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(issueRecoveryActions.status, "active"),
           or(
             isNull(issueRecoveryActions.lastAttemptAt),
-            lt(issueRecoveryActions.lastAttemptAt, staleBefore),
+            lt(issueRecoveryActions.lastAttemptAt, threshold),
           ),
         ),
-      );
+      )
+      .orderBy(asc(issueRecoveryActions.lastAttemptAt));
 
-    for (const action of staleActions) {
+    result.checked = candidates.length;
+
+    for (const candidate of candidates) {
+      const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
+
+      if (candidate.attemptCount >= effectiveMaxAttempts) {
+        result.maxAttemptsReached += 1;
+        await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
+        continue;
+      }
+
       const sourceIssue = await db
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          status: issues.status,
-          identifier: issues.identifier,
-          assigneeAgentId: issues.assigneeAgentId,
-          createdByAgentId: issues.createdByAgentId,
-          updatedAt: issues.updatedAt,
-        })
+        .select()
         .from(issues)
-        .where(eq(issues.id, action.sourceIssueId))
+        .where(eq(issues.id, candidate.sourceIssueId))
         .then((rows) => rows[0] ?? null);
 
+      // Nothing left to recover: the source issue is gone or already terminal.
       if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
         result.skippedTerminalSource += 1;
         continue;
       }
 
-      const wakePolicyType = readRecoveryWakePolicyType(action);
+      // Mirror the early-return guards in enqueueSourceScopedStrandedRecoveryWake
+      // so we don't burn an attempt on actions that can never be re-fired.
+      const wakePolicyType = readRecoveryWakePolicyType(candidate);
       if (wakePolicyType === "monitor_only" || wakePolicyType === "manual_repair_required") {
-        result.skipped += 1;
+        result.nonWakeableSkipped += 1;
+        continue;
+      }
+      if (candidate.cause === "configuration_incomplete") {
+        result.nonWakeableSkipped += 1;
+        continue;
+      }
+      if (candidate.cause === "provider_quota" && !candidate.ownerAgentId) {
+        result.nonWakeableSkipped += 1;
+        continue;
+      }
+      if (!candidate.ownerAgentId && wakePolicyType !== "board_escalation") {
+        result.nonWakeableSkipped += 1;
         continue;
       }
 
-      const now = new Date();
-      const strandedRunId = readRecoveryEvidenceLatestRunId(action);
-
-      if (action.lastAttemptAt && sourceIssue.updatedAt &&
-        sourceIssue.updatedAt.getTime() > action.lastAttemptAt.getTime() + SWEEP_MOVED_ISSUE_EPSILON_MS) {
-        result.skipped += 1;
-        continue;
-      }
-
-      const effectiveMax = action.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
-      if (action.attemptCount >= effectiveMax) {
-        await db
-          .update(issueRecoveryActions)
-          .set({
-            status: "escalated",
-            outcome: "exhausted",
-            lastAttemptAt: now,
-            attemptCount: action.attemptCount + 1,
-            updatedAt: now,
-          })
-          .where(eq(issueRecoveryActions.id, action.id));
-
-        await issuesSvc.update(sourceIssue.id, { status: "blocked" });
-        const prefix = await getCompanyIssuePrefix(sourceIssue.companyId);
-        await issuesSvc.addComment(
-          sourceIssue.id,
-          `Recovery action \`${action.id}\` exhausted its attempt ceiling (${action.attemptCount}/${effectiveMax}). ` +
-            "The source issue has been blocked and escalated to the board. " +
-            "A board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
-          {},
-          { authorType: "system" },
+      // Per-action backoff: an action that has already been re-fired several
+      // times waits proportionally longer before the next attempt.
+      if (candidate.lastAttemptAt) {
+        const multiplier = Math.min(
+          Math.max(candidate.attemptCount, 1),
+          RECOVERY_ACTION_WAKE_BACKOFF_MAX_MULTIPLIER,
         );
-        await logActivity(db, {
-          companyId: sourceIssue.companyId,
-          actorType: "system",
-          actorId: "system",
-          agentId: null,
-          runId: null,
-          action: "issue.updated",
-          entityType: "issue",
-          entityId: sourceIssue.id,
-          details: {
-            identifier: sourceIssue.identifier,
-            status: "blocked",
-            previousStatus: sourceIssue.status,
-            source: "recovery.sweep_stranded_recovery_actions_exhausted",
-            recoveryActionId: action.id,
-            attemptCount: action.attemptCount,
-            maxAttempts: effectiveMax,
-          },
-        });
-
-        result.skippedCeilingExhausted += 1;
-        continue;
+        const backoffBefore = new Date(now.getTime() - intervalMs * multiplier);
+        if (candidate.lastAttemptAt >= backoffBefore) {
+          result.skippedBackoff += 1;
+          continue;
+        }
       }
 
-      if (action.lastAttemptAt) {
-        const backoffMultiplier = Math.min(action.attemptCount || 1, 6);
-        const perActionStaleMs = STRANDED_RECOVERY_ACTION_SWEEP_STALE_AFTER_MS * backoffMultiplier;
-        const perActionStaleBefore = new Date(Date.now() - perActionStaleMs);
-        if (action.lastAttemptAt >= perActionStaleBefore) continue;
-      }
-
+      // `board_escalation` means action creation could not find an invokable
+      // owner. Re-resolve now: an agent may have become invokable since (budget
+      // unblocked, reactivated, manager assigned) and should own the recovery
+      // instead of the action waiting on a human indefinitely.
+      let rerouteOwnerAgentId: string | null = null;
       if (wakePolicyType === "board_escalation") {
-        const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(
-          sourceIssue as typeof issues.$inferSelect,
-          action.previousOwnerAgentId,
+        rerouteOwnerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(
+          sourceIssue,
+          candidate.previousOwnerAgentId,
         );
-        if (!ownerAgentId) {
+        if (!rerouteOwnerAgentId) {
+          // Still no invokable owner: burn the attempt so the action walks
+          // toward its ceiling instead of re-resolving on every sweep.
           await db
             .update(issueRecoveryActions)
             .set({
+              attemptCount: candidate.attemptCount + 1,
               lastAttemptAt: now,
-              attemptCount: action.attemptCount + 1,
               updatedAt: now,
             })
-            .where(eq(issueRecoveryActions.id, action.id));
-          result.skipped += 1;
+            .where(
+              and(
+                eq(issueRecoveryActions.id, candidate.id),
+                eq(issueRecoveryActions.status, "active"),
+                eq(issueRecoveryActions.attemptCount, candidate.attemptCount),
+              ),
+            );
+          result.nonWakeableSkipped += 1;
           continue;
         }
-
-        await recoveryActionsSvc.upsertSourceScoped({
-          companyId: sourceIssue.companyId,
-          sourceIssueId: sourceIssue.id,
-          kind: action.kind as IssueRecoveryActionKind,
-          ownerType: "agent",
-          ownerAgentId,
-          previousOwnerAgentId: action.previousOwnerAgentId,
-          returnOwnerAgentId: action.returnOwnerAgentId,
-          cause: action.cause,
-          fingerprint: action.fingerprint,
-          evidence: action.evidence as Record<string, unknown>,
-          nextAction: action.nextAction,
-          wakePolicy: {
-            type: "wake_owner",
-            reason: "source_scoped_recovery_action",
-            ownerAgentId,
-          },
-          monitorPolicy: action.monitorPolicy as Record<string, unknown> | null,
-          maxAttempts: effectiveMax,
-          lastAttemptAt: now,
-        });
-
-        await deps.enqueueWakeup(ownerAgentId, {
-          source: "assignment",
-          triggerDetail: "system",
-          reason: "source_scoped_recovery_action",
-          idempotencyKey: `source_scoped_recovery_action:${action.id}:${action.attemptCount + 1}`,
-          payload: withRecoveryModelProfileHint({
-            issueId: sourceIssue.id,
-            sourceIssueId: sourceIssue.id,
-            recoveryActionId: action.id,
-            strandedRunId,
-            recoveryCause: action.cause,
-          }, "status_only"),
-          requestedByActorType: "system",
-          requestedByActorId: null,
-          contextSnapshot: withRecoveryModelProfileHint({
-            issueId: sourceIssue.id,
-            taskId: sourceIssue.id,
-            wakeReason: "source_scoped_recovery_action",
-            skipIssueComment: true,
-            source: "issue_recovery_action",
-            recoveryActionId: action.id,
-            sourceIssueId: sourceIssue.id,
-            strandedRunId,
-            recoveryCause: action.cause,
-          }, "status_only"),
-        });
-
-        result.rerouted += 1;
-        result.actionIds.push(action.id);
-        continue;
       }
 
-      if (!action.ownerAgentId) {
-        result.skipped += 1;
-        continue;
-      }
-
-      await recoveryActionsSvc.upsertSourceScoped({
-        companyId: sourceIssue.companyId,
-        sourceIssueId: sourceIssue.id,
-          kind: action.kind as IssueRecoveryActionKind,
-          ownerType: "agent",
-          ownerAgentId: action.ownerAgentId,
-          previousOwnerAgentId: action.previousOwnerAgentId,
-          returnOwnerAgentId: action.returnOwnerAgentId,
-          cause: action.cause,
-          fingerprint: action.fingerprint,
-          evidence: action.evidence as Record<string, unknown>,
-          nextAction: action.nextAction,
-          wakePolicy: action.wakePolicy as Record<string, unknown> | null,
-          monitorPolicy: action.monitorPolicy as Record<string, unknown> | null,
-          maxAttempts: effectiveMax,
+      // Compare-and-swap: bump attemptCount + lastAttemptAt only if the row
+      // still matches the pre-image (status active + same attemptCount), so a
+      // concurrent sweep or an event-triggered wake cannot double-fire.
+      const [updated] = await db
+        .update(issueRecoveryActions)
+        .set({
+          attemptCount: candidate.attemptCount + 1,
           lastAttemptAt: now,
+          updatedAt: now,
+          ...(rerouteOwnerAgentId
+            ? {
+              ownerType: "agent" as const,
+              ownerAgentId: rerouteOwnerAgentId,
+              wakePolicy: {
+                type: "wake_owner",
+                reason: "source_scoped_recovery_action",
+                ownerAgentId: rerouteOwnerAgentId,
+              },
+            }
+            : {}),
+        })
+        .where(
+          and(
+            eq(issueRecoveryActions.id, candidate.id),
+            eq(issueRecoveryActions.status, "active"),
+            eq(issueRecoveryActions.attemptCount, candidate.attemptCount),
+          ),
+        )
+        .returning();
+
+      if (!updated) continue;
+
+      const action = updated as unknown as IssueRecoveryAction;
+      const latestRun = await getLatestIssueRun(candidate.companyId, candidate.sourceIssueId);
+
+      try {
+        await enqueueSourceScopedStrandedRecoveryWake({
+          action,
+          issue: sourceIssue,
+          latestRun,
+          recoveryCause: candidate.cause as StrandedRecoveryCause,
         });
-
-      await deps.enqueueWakeup(action.ownerAgentId, {
-        source: "assignment",
-        triggerDetail: "system",
-        reason: "source_scoped_recovery_action",
-        idempotencyKey: `source_scoped_recovery_action:${action.id}:${action.attemptCount + 1}`,
-        payload: withRecoveryModelProfileHint({
-          issueId: sourceIssue.id,
-          sourceIssueId: sourceIssue.id,
-          recoveryActionId: action.id,
-          strandedRunId,
-          recoveryCause: action.cause,
-        }, "status_only"),
-        requestedByActorType: "system",
-        requestedByActorId: null,
-        contextSnapshot: withRecoveryModelProfileHint({
-          issueId: sourceIssue.id,
-          taskId: sourceIssue.id,
-          wakeReason: "source_scoped_recovery_action",
-          skipIssueComment: true,
-          source: "issue_recovery_action",
-          recoveryActionId: action.id,
-          sourceIssueId: sourceIssue.id,
-          strandedRunId,
-          recoveryCause: action.cause,
-        }, "status_only"),
-      });
-
-      result.reQueued += 1;
-      result.actionIds.push(action.id);
+        if (rerouteOwnerAgentId) result.rerouted += 1;
+        else result.reFired += 1;
+        result.issueIds.push(candidate.sourceIssueId);
+        result.actionIds.push(candidate.id);
+      } catch (err) {
+        result.enqueueFailed += 1;
+        logger.warn(
+          { err, recoveryActionId: candidate.id, sourceIssueId: candidate.sourceIssueId },
+          "failed to re-fire stale recovery action wake",
+        );
+      }
     }
 
-    if (result.reQueued > 0 || result.rerouted > 0) {
-      logger.warn(
-        { ...result },
-        "swept stranded recovery actions",
-      );
+    if (result.reFired > 0 || result.rerouted > 0 || result.maxAttemptsReached > 0) {
+      logger.warn({ ...result }, "swept stale recovery action wakes");
     }
 
     return result;
+  }
+
+  // At the attempt ceiling the backstop stops re-firing. Escalate the action and
+  // block the source issue so exhaustion surfaces on the board instead of the
+  // issue sitting silently with an active-but-dead recovery action. Does not
+  // bump attemptCount: the attempt was never made.
+  async function escalateExhaustedRecoveryAction(
+    action: typeof issueRecoveryActions.$inferSelect,
+    effectiveMaxAttempts: number,
+    now: Date,
+  ) {
+    const [escalated] = await db
+      .update(issueRecoveryActions)
+      .set({
+        status: "escalated",
+        outcome: "exhausted",
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.id, action.id),
+          eq(issueRecoveryActions.status, "active"),
+        ),
+      )
+      .returning();
+
+    await logActivity(db, {
+      companyId: action.companyId,
+      actorType: "system",
+      actorId: "recovery.sweep_stale_recovery_action_wakes",
+      agentId: action.ownerAgentId,
+      runId: null,
+      action: "issue.recovery_action_max_attempts_reached",
+      entityType: "issue",
+      entityId: action.sourceIssueId,
+      details: {
+        source: "recovery.sweep_stale_recovery_action_wakes",
+        recoveryActionId: action.id,
+        attemptCount: action.attemptCount,
+        maxAttempts: effectiveMaxAttempts,
+        cause: action.cause,
+      },
+    });
+
+    // Only the sweep that won the CAS blocks the issue and comments.
+    if (!escalated) return;
+
+    const sourceIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, action.sourceIssueId))
+      .then((rows) => rows[0] ?? null);
+    if (!sourceIssue) return;
+    if (sourceIssue.status === "done" || sourceIssue.status === "cancelled" || sourceIssue.status === "blocked") {
+      return;
+    }
+
+    await issuesSvc.update(sourceIssue.id, { status: "blocked" });
+    await issuesSvc.addComment(
+      sourceIssue.id,
+      `Recovery action \`${action.id}\` exhausted its attempt ceiling (${action.attemptCount}/${effectiveMaxAttempts}). ` +
+        "The source issue has been blocked and escalated to the board. " +
+        "A board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
+      {},
+      { authorType: "system" },
+    );
+    await logActivity(db, {
+      companyId: sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: sourceIssue.id,
+      details: {
+        identifier: sourceIssue.identifier,
+        status: "blocked",
+        previousStatus: sourceIssue.status,
+        source: "recovery.sweep_stale_recovery_action_wakes_exhausted",
+        recoveryActionId: action.id,
+        attemptCount: action.attemptCount,
+        maxAttempts: effectiveMaxAttempts,
+      },
+    });
   }
 
   return {
@@ -6013,7 +6053,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
     reconcileBlockedWithoutBlockers,
-    sweepStrandedRecoveryActions,
+    reconcileStaleRecoveryActionWakes,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
     reconcileIssueGraphLiveness,
