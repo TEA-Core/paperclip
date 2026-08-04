@@ -44,9 +44,12 @@ import {
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
+  signalRunningProcess,
+  runningProcesses,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   describeIncompleteOpenCodeStream,
+  isOpenCodeTerminalBillingError,
   isOpenCodeUnknownSessionError,
   parseOpenCodeJsonl,
 } from "./parse.js";
@@ -681,6 +684,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       }
 
+      let terminalBillingErrorDetected: string | null = null;
+      const earlyAbortOnLog: typeof onLog = async (stream, chunk) => {
+        await onLog(stream, chunk);
+        if (stream === "stderr" && terminalBillingErrorDetected === null) {
+          const detected = isOpenCodeTerminalBillingError("", chunk);
+          if (detected) {
+            terminalBillingErrorDetected = detected;
+            await onLog(
+              "stdout",
+              `[paperclip] Terminal provider billing/usage error detected in stderr; aborting run early: ${detected}\n`,
+            );
+            const running = runningProcesses.get(runId);
+            if (running) {
+              signalRunningProcess(running, "SIGTERM");
+            }
+          }
+        }
+      };
+
       const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
         cwd,
         env: preparedRuntimeConfig.env,
@@ -689,7 +711,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         graceSec,
         onSpawn,
         onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog,
+        onLog: earlyAbortOnLog,
         runLogTail: paperclipBridge?.runLogTail,
       });
       return {
@@ -714,6 +736,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
           clearSession: clearSessionOnMissingSession,
+        };
+      }
+
+      const terminalBillingError = isOpenCodeTerminalBillingError(
+        "",
+        attempt.proc.stderr,
+      );
+      if (terminalBillingError) {
+        const billingModelId = model || null;
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          finishReason: attempt.parsed.finalStepReason,
+          errorMessage: `Terminal provider billing/usage error: ${terminalBillingError}`,
+          usage: {
+            inputTokens: attempt.parsed.usage.inputTokens,
+            outputTokens: attempt.parsed.usage.outputTokens,
+            cachedInputTokens: attempt.parsed.usage.cachedInputTokens,
+          },
+          sessionId: attempt.parsed.sessionId ?? runtimeSessionId ?? runtime.sessionId ?? null,
+          sessionParams: null,
+          sessionDisplayId: attempt.parsed.sessionId ?? runtimeSessionId ?? runtime.sessionId ?? null,
+          provider: parseModelProvider(billingModelId),
+          biller: resolveOpenCodeBiller(runtimeEnv, parseModelProvider(billingModelId)),
+          model: billingModelId,
+          billingType: "unknown",
+          costUsd: attempt.parsed.costUsd,
+          resultJson: {
+            stdout: attempt.proc.stdout,
+            stderr: attempt.proc.stderr,
+            paperclipToolCallCount: attempt.parsed.paperclipToolCallCount,
+          },
+          summary: attempt.parsed.summary,
+          clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
         };
       }
 

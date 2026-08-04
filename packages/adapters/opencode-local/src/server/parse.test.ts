@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseOpenCodeJsonl,
   isOpenCodeUnknownSessionError,
+  isOpenCodeTerminalBillingError,
   describeIncompleteOpenCodeStream,
 } from "./parse.js";
 
@@ -151,6 +152,176 @@ describe("parseOpenCodeJsonl", () => {
     expect(isOpenCodeUnknownSessionError("Session not found: s_123", "")).toBe(true);
     expect(isOpenCodeUnknownSessionError("", "unknown session id")).toBe(true);
     expect(isOpenCodeUnknownSessionError("all good", "")).toBe(false);
+  });
+});
+
+describe("isOpenCodeTerminalBillingError", () => {
+  it("detects insufficient quota in stderr", () => {
+    const stderr = "Error: insufficient quota for model gpt-4o";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Error: insufficient quota for model gpt-4o");
+  });
+
+  it("detects quota exceeded in stderr", () => {
+    const stderr = "quota exceeded";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("quota exceeded");
+  });
+
+  it("detects quota exhausted in stderr", () => {
+    const stderr = "quota exhausted";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("quota exhausted");
+  });
+
+  it("detects quota limit reached in stderr", () => {
+    const stderr = "quota limit reached for this model";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("quota limit reached for this model");
+  });
+
+  it("detects usage limit in stderr", () => {
+    const stderr = "usage limit reached";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("usage limit reached");
+  });
+
+  it("detects billing required errors", () => {
+    const stderr = "Billing required: your account has no payment method";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Billing required: your account has no payment method");
+  });
+
+  it("detects billing not configured errors", () => {
+    const stderr = "Billing not configured for this account";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Billing not configured for this account");
+  });
+
+  it("detects payment method errors", () => {
+    const stderr = "Payment method required";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Payment method required");
+  });
+
+  it("detects credit balance exhausted", () => {
+    const stderr = "Your credit balance is exhausted";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Your credit balance is exhausted");
+  });
+
+  it("detects credit balance expired", () => {
+    const stderr = "Credit balance expired";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Credit balance expired");
+  });
+
+  it("detects spend limit reached", () => {
+    const stderr = "Spend limit reached for this month";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Spend limit reached for this month");
+  });
+
+  it("detects budget exceeded", () => {
+    const stderr = "Budget exceeded: daily budget limit reached";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Budget exceeded: daily budget limit reached");
+  });
+
+  it("detects account suspended", () => {
+    const stderr = "Account suspended due to billing issues";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Account suspended due to billing issues");
+  });
+
+  it("detects account disabled", () => {
+    const stderr = "Account disabled";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Account disabled");
+  });
+
+  it("detects token limit reached", () => {
+    const stderr = "token limit reached";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("token limit reached");
+  });
+
+  it("detects maximum spend", () => {
+    const stderr = "maximum spend exceeded";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("maximum spend exceeded");
+  });
+
+  it("detects plan required", () => {
+    const stderr = "plan required to access this model";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("plan required to access this model");
+  });
+
+  it("detects plan upgrade required", () => {
+    const stderr = "plan upgrade needed";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("plan upgrade needed");
+  });
+
+  it("detects subscription expired", () => {
+    const stderr = "Subscription expired";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Subscription expired");
+  });
+
+  it("detects subscription inactive", () => {
+    const stderr = "subscription inactive";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("subscription inactive");
+  });
+
+  it("detects trial expired", () => {
+    const stderr = "Trial period has ended";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("Trial period has ended");
+  });
+
+  it("detects trial not available", () => {
+    const stderr = "trial not available";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("trial not available");
+  });
+
+  it("detects no available models", () => {
+    const stderr = "no available models";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("no available models");
+  });
+
+  it("detects no available providers", () => {
+    const stderr = "no available providers";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("no available providers");
+  });
+
+  it("returns null for non-billing errors", () => {
+    expect(isOpenCodeTerminalBillingError("", "")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "some random error")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "File not found")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "Network timeout")).toBeNull();
+  });
+
+  it("returns null for transient errors that must keep retrying", () => {
+    expect(isOpenCodeTerminalBillingError("", "rate limit reached for requests")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "Rate limit exceeded")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "permission denied")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "access denied")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "unauthorized")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "forbidden")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "provider unavailable")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "provider not available")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "model unavailable")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "model not found")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "model does not exist")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "authentication failed")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "api key invalid")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "api key expired")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "api key revoked")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "is temporarily at capacity")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "server is temporarily at capacity, please try again")).toBeNull();
+  });
+
+  it("does not scan stdout for billing errors", () => {
+    const stdout = "Error: insufficient quota for model gpt-4o";
+    expect(isOpenCodeTerminalBillingError(stdout, "")).toBeNull();
+  });
+
+  it("searches stderr only", () => {
+    const stderr = "insufficient quota";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("insufficient quota");
+  });
+
+  it("matches case-insensitively in stderr", () => {
+    const stderr = "INSUFFICIENT QUOTA";
+    expect(isOpenCodeTerminalBillingError("", stderr)).toBe("INSUFFICIENT QUOTA");
+  });
+
+  it("does not match 'is temporarily at capacity' (transient, must retry)", () => {
+    expect(isOpenCodeTerminalBillingError("", "The model is temporarily at capacity")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "Server is temporarily at capacity")).toBeNull();
+    expect(isOpenCodeTerminalBillingError("", "temporarily at capacity, please try again later")).toBeNull();
   });
 });
 
