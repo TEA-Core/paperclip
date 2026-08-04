@@ -708,6 +708,44 @@ export function isBlockedWithoutBlockers(input: { status: string; blockerIssueId
   return input.status === "blocked" && input.blockerIssueIds.length === 0;
 }
 
+async function unresolvedBlockerIssues(db: Db, companyId: string, issueId: string) {
+  return db
+    .select({ id: issueRelations.issueId, identifier: issues.identifier })
+    .from(issueRelations)
+    .innerJoin(
+      issues,
+      and(
+        eq(issues.companyId, issueRelations.companyId),
+        eq(issues.id, issueRelations.issueId),
+      ),
+    )
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.relatedIssueId, issueId),
+        eq(issueRelations.type, "blocks"),
+        notInArray(issues.status, ["done", "cancelled"]),
+      ),
+    );
+}
+
+// status:"blocked" with an empty blocker set is permanently unwakeable — skip the write instead.
+export async function blockIssueWithUnresolvedBlockers(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null; status: string },
+  opts: { source: string; previousStatus: string; extraUpdate?: Record<string, unknown> },
+) {
+  const blockedByIssueIds = (await unresolvedBlockerIssues(db, issue.companyId, issue.id)).map((row) => row.id);
+  if (blockedByIssueIds.length === 0) {
+    logger.warn(
+      { issueId: issue.id, identifier: issue.identifier, source: opts.source, previousStatus: opts.previousStatus },
+      "recovery skipped blocked-write: resulting blocker set is empty",
+    );
+    return null;
+  }
+  return (await issueService(db).update(issue.id, { status: "blocked", blockedByIssueIds, ...opts.extraUpdate })) ?? null;
+}
+
 export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
@@ -3243,7 +3281,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
-    const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
+    const updated = await blockIssueWithUnresolvedBlockers(db, input.issue, {
+      source: "recovery.reconcile_stranded_recovery_issue",
+      previousStatus: input.previousStatus,
+    });
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -3298,24 +3339,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function existingUnresolvedBlockerIssues(companyId: string, issueId: string) {
-    return db
-      .select({ id: issueRelations.issueId, identifier: issues.identifier })
-      .from(issueRelations)
-      .innerJoin(
-        issues,
-        and(
-          eq(issues.companyId, issueRelations.companyId),
-          eq(issues.id, issueRelations.issueId),
-        ),
-      )
-      .where(
-        and(
-          eq(issueRelations.companyId, companyId),
-          eq(issueRelations.relatedIssueId, issueId),
-          eq(issueRelations.type, "blocks"),
-          notInArray(issues.status, ["done", "cancelled"]),
-        ),
-      );
+    return unresolvedBlockerIssues(db, companyId, issueId);
   }
 
   async function existingUnresolvedBlockerIssueIds(companyId: string, issueId: string) {
@@ -3389,6 +3413,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+    const escalationSource = input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+      ? "recovery.reconcile_successful_run_handoff_missing_state"
+      : input.recoveryCause === "workspace_validation_failed"
+        ? "recovery.reconcile_workspace_validation_failed"
+      : input.recoveryCause === "configuration_incomplete"
+        ? "recovery.reconcile_configuration_incomplete"
+      : input.recoveryCause === "execution_review_participant_recovery"
+        ? "recovery.reconcile_execution_review_participant"
+      : "recovery.reconcile_stranded_assigned_issue";
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
       previousStatus: input.previousStatus,
@@ -3408,13 +3441,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         agentId: recoveryAction.returnOwnerAgentId,
       });
     }
-    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
-      assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+    const nextAssigneeAgentId = recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId;
+    const updated = await blockIssueWithUnresolvedBlockers(db, input.issue, {
+      source: escalationSource,
+      previousStatus: input.previousStatus,
+      extraUpdate: { assigneeAgentId: nextAssigneeAgentId },
     });
     if (!updated) return null;
+    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
     if (isProviderQuotaWait) return updated;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -3504,15 +3538,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         identifier: input.issue.identifier,
         status: "blocked",
         previousStatus: input.previousStatus,
-        source: input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-          ? "recovery.reconcile_successful_run_handoff_missing_state"
-          : input.recoveryCause === "workspace_validation_failed"
-            ? "recovery.reconcile_workspace_validation_failed"
-          : input.recoveryCause === "configuration_incomplete"
-            ? "recovery.reconcile_configuration_incomplete"
-          : input.recoveryCause === "execution_review_participant_recovery"
-            ? "recovery.reconcile_execution_review_participant"
-          : "recovery.reconcile_stranded_assigned_issue",
+        source: escalationSource,
         recoveryCause: input.recoveryCause ?? "stranded_assigned_issue",
         latestRunId: input.latestRun?.id ?? null,
         latestRunStatus: input.latestRun?.status ?? null,
@@ -3546,10 +3572,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         (currentIssue.status !== "blocked" ||
           currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
       ) {
-        const reblocked = await issuesSvc.update(input.issue.id, {
-          status: "blocked",
-          blockedByIssueIds: blockerIds,
-          assigneeAgentId: recoveryAction.ownerAgentId,
+        const reblocked = await blockIssueWithUnresolvedBlockers(db, input.issue, {
+          source: escalationSource,
+          previousStatus: input.previousStatus,
+          extraUpdate: { assigneeAgentId: recoveryAction.ownerAgentId },
         });
         if (reblocked) return reblocked;
       }

@@ -22,6 +22,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
@@ -218,6 +219,28 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   }
 
+  // Backlog + unassigned so it never enters reconcileStrandedAssignedIssues' own candidate scan.
+  async function seedUnresolvedBlocker(input: { companyId: string; prefix: string; relatedIssueId: string }) {
+    const blockerIssueId = randomUUID();
+    const issueNumber = 1000 + Math.floor(Math.random() * 900000);
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId: input.companyId,
+      title: "Real dependency blocking the source issue",
+      status: "backlog",
+      priority: "medium",
+      issueNumber,
+      identifier: `${input.prefix}-${issueNumber}`,
+    });
+    await db.insert(issueRelations).values({
+      companyId: input.companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: input.relatedIssueId,
+      type: "blocks",
+    });
+    return blockerIssueId;
+  }
+
   function createApp(
     actor: any = { type: "board", source: "local_implicit" },
     opts: Parameters<typeof issueRoutes>[2] = {},
@@ -270,7 +293,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   });
 
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
-    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const { companyId, coderId, sourceIssue, prefix } = await seedCompany();
+    const blockerIssueId = await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
     const latestRun = {
@@ -315,6 +339,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(updatedIssue).toMatchObject({
       status: "blocked",
     });
+    const relations = await db
+      .select()
+      .from(issueRelations)
+      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.relatedIssueId, sourceIssue.id)));
+    expect(relations.map((row) => row.issueId)).toEqual([blockerIssueId]);
     const recoveryIssues = await db
       .select()
       .from(issues)
@@ -328,6 +357,148 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("does not write status:blocked with an empty blocker set when escalating stranded assigned work", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    expect(updated).toBeNull();
+    const [afterEscalate] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(afterEscalate?.status).toBe("in_progress");
+    const relations = await db
+      .select()
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, sourceIssue.id));
+    expect(relations).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      {
+        issueId: sourceIssue.id,
+        identifier: sourceIssue.identifier,
+        source: "recovery.reconcile_stranded_assigned_issue",
+        previousStatus: "in_progress",
+      },
+      expect.any(String),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("does not write status:blocked with an empty blocker set when escalating a recovery issue in place", async () => {
+    const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
+    const recoveryIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: recoveryIssueId,
+      companyId,
+      title: "Recover stalled issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: managerId,
+      parentId: sourceIssueId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+      originKind: "stranded_issue_recovery",
+      originId: sourceIssueId,
+      originFingerprint: `stranded_issue_recovery:${sourceIssueId}`,
+    });
+    const [recoveryIssue] = await db.select().from(issues).where(eq(issues.id, recoveryIssueId));
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: recoveryIssue!,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: managerId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+      },
+    });
+
+    expect(updated).toBeNull();
+    const [afterEscalate] = await db.select().from(issues).where(eq(issues.id, recoveryIssueId));
+    expect(afterEscalate?.status).toBe("in_progress");
+    const relations = await db
+      .select()
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, recoveryIssueId));
+    expect(relations).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(
+      {
+        issueId: recoveryIssueId,
+        identifier: `${prefix}-2`,
+        source: "recovery.reconcile_stranded_recovery_issue",
+        previousStatus: "in_progress",
+      },
+      expect.any(String),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("does not re-block with an empty blocker set when a recovery owner re-takes an issue it already owns", async () => {
+    const { companyId, coderId, sourceIssue, prefix } = await seedCompany();
+    const blockerIssueId = await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const enqueueWakeup = vi.fn(async () => {
+      // Simulate a race: the blocker resolves and the issue leaves "blocked" between the
+      // site-2 write and the reblock check, so the reblock attempt sees an empty blocker set.
+      await db.delete(issueRelations).where(eq(issueRelations.issueId, blockerIssueId));
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, sourceIssue.id));
+      return null;
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "process lost",
+      errorCode: "process_lost",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+    });
+
+    expect(updated).not.toBeNull();
+    const [afterEscalate] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(afterEscalate?.status).toBe("in_progress");
+    expect(warnSpy).toHaveBeenCalledWith(
+      {
+        issueId: sourceIssue.id,
+        identifier: sourceIssue.identifier,
+        source: "recovery.reconcile_stranded_assigned_issue",
+        previousStatus: "in_progress",
+      },
+      expect.any(String),
+    );
+    warnSpy.mockRestore();
+  });
+
   it.each([
     ["process_lost", undefined, "coder"],
     ["adapter_failed", "successful_run_missing_state", "coder"],
@@ -337,7 +508,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   ] as const)(
     "routes %s recovery through the cause-keyed playbook",
     async (errorCode, explicitCause, expectedOwner) => {
-      const { managerId, coderId, sourceIssue } = await seedCompany();
+      const { companyId, managerId, coderId, sourceIssue, prefix } = await seedCompany();
+      await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
       const enqueueWakeup = vi.fn(async () => null);
       const recovery = recoveryService(db, { enqueueWakeup });
       const latestRun = {
@@ -756,7 +928,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   });
 
   it("blocks a cross-agent review participant with incomplete configuration", async () => {
-    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssueId });
     const stageId = randomUUID();
     await db.update(issues).set({
       status: "in_review",
@@ -849,7 +1022,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   });
 
   it("classifies model lookup failures as configuration incomplete without waking a recovery owner", async () => {
-    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const { companyId, coderId, sourceIssueId, prefix } = await seedCompany();
+    await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssueId });
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -915,7 +1089,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   });
 
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {
-    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const { companyId, managerId, coderId, sourceIssue, prefix } = await seedCompany();
+    await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
     const firstLatestRun = {
@@ -970,7 +1145,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   });
 
   it("deduplicates workspace-incoherence recovery actions by the typed workspace fingerprint", async () => {
-    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const { companyId, coderId, sourceIssue, prefix } = await seedCompany();
+    await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
     const workspaceFingerprint = `workspace_incoherence:v1:sha256:${"a".repeat(64)}`;
@@ -1073,7 +1249,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   });
 
   it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {
-    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const { companyId, managerId, coderId, sourceIssue, prefix } = await seedCompany();
+    await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
     const enqueueWakeup = vi.fn(async () => {
       await db
@@ -1154,6 +1331,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       originId: sourceIssueId,
       originFingerprint: `stranded_issue_recovery:${sourceIssueId}`,
     });
+    await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: recoveryIssueId });
     const [recoveryIssue] = await db.select().from(issues).where(eq(issues.id, recoveryIssueId));
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
 
