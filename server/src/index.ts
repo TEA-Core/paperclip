@@ -964,6 +964,11 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...blockedWithoutBlockers }, "startup blocked-without-blockers sweep reported issues");
         }
 
+        const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
+        if (staleWakes.reFired > 0 || staleWakes.maxAttemptsReached > 0) {
+          logger.warn({ ...staleWakes }, "startup stale recovery action wake sweep re-fired wakes");
+        }
+
         const reviewed = await heartbeat.reconcileProductivityReviews();
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
@@ -1109,6 +1114,10 @@ export async function startServer(): Promise<StartedServer> {
               const blockedWithoutBlockers = await heartbeat.reconcileBlockedWithoutBlockers();
               if (blockedWithoutBlockers.reported > 0) {
                 logger.warn({ ...blockedWithoutBlockers }, "periodic blocked-without-blockers sweep reported issues");
+              }
+              const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
+              if (staleWakes.reFired > 0 || staleWakes.maxAttemptsReached > 0) {
+                logger.warn({ ...staleWakes }, "periodic stale recovery action wake sweep re-fired wakes");
               }
             })
             .then(async () => {
