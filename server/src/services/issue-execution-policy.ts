@@ -422,6 +422,24 @@ export function normalizeIssueExecutionPolicy(
   };
 }
 
+/**
+ * Normalizes a project-level default execution policy for issue creation.
+ *
+ * Unlike `normalizeIssueExecutionPolicy`, a malformed stored default returns
+ * null instead of throwing: the default is injected on behalf of the project,
+ * not supplied by the caller, so a bad project row must not make every issue
+ * create in that project fail with 422. Issues then keep the pre-existing
+ * null-policy behavior rather than being rejected outright.
+ */
+export function resolveProjectDefaultIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
+  if (input == null) return null;
+  try {
+    return normalizeIssueExecutionPolicy(input);
+  } catch {
+    return null;
+  }
+}
+
 export function parseIssueExecutionState(input: unknown): IssueExecutionState | null {
   if (input == null) return null;
   const parsed = issueExecutionStateSchema.safeParse(input);

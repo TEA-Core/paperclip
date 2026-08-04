@@ -84,7 +84,11 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import {
+  buildInitialIssueMonitorFields,
+  normalizeIssueExecutionPolicy,
+  resolveProjectDefaultIssueExecutionPolicy,
+} from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
   type CurrentUserRedactionOptions,
@@ -6553,9 +6557,9 @@ export function issueService(db: Db) {
             .from(projects)
             .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
             .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
-          if (projectDefaultPolicy) {
-            const normalized = normalizeIssueExecutionPolicy(projectDefaultPolicy);
-            issueData.executionPolicy = (normalized as Record<string, unknown> | null) ?? null;
+          const normalized = resolveProjectDefaultIssueExecutionPolicy(projectDefaultPolicy);
+          if (normalized) {
+            issueData.executionPolicy = normalized as unknown as Record<string, unknown>;
           }
         }
         // Cache the project policy lookup for this insert so the default
