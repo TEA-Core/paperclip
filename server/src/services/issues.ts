@@ -1062,17 +1062,15 @@ export async function listPermanentlyUnfinalizableBlockers(
       ),
     );
 
-  if (blockerRows.length === 0) return [];
+  // The `isNotNull` predicate above already excludes null workspaces; this narrows the
+  // column's `string | null` type to match, and never drops a row the query returned.
+  const scopedBlockerRows = blockerRows.filter(
+    (row): row is typeof row & { executionWorkspaceId: string } => row.executionWorkspaceId !== null,
+  );
 
-  // `executionWorkspaceId` is nullable on the column but the query filters
-  // `isNotNull`, so this narrowing never drops a row at runtime.
-  const executionWorkspaceIds = [
-    ...new Set(
-      blockerRows
-        .map((row) => row.executionWorkspaceId)
-        .filter((id): id is string => id !== null),
-    ),
-  ];
+  if (scopedBlockerRows.length === 0) return [];
+
+  const executionWorkspaceIds = [...new Set(scopedBlockerRows.map((row) => row.executionWorkspaceId))];
 
   const opRows = await dbOrTx
     .select({
@@ -1106,7 +1104,8 @@ export async function listPermanentlyUnfinalizableBlockers(
 
   const nonTerminalRunIds = new Set<string>();
   for (const row of opRows) {
-    if (!row.heartbeatRunId || !row.executionWorkspaceId) continue;
+    if (!row.heartbeatRunId) continue;
+    if (!row.executionWorkspaceId) continue;
     const current = liveRunByWorkspace.get(row.executionWorkspaceId);
     if (current === undefined) {
       liveRunByWorkspace.set(row.executionWorkspaceId, false);
@@ -1174,7 +1173,7 @@ export async function listPermanentlyUnfinalizableBlockers(
     gatedDependentsByBlocker.set(row.blockerIssueId, dependents);
   }
 
-  for (const blockerRow of blockerRows) {
+  for (const blockerRow of scopedBlockerRows) {
     const { executionWorkspaceId, blockerIssueId, checkoutRunId, executionRunId } = blockerRow;
     if (!executionWorkspaceId) continue;
 
