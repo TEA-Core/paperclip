@@ -16,6 +16,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issueRelations,
   issueTreeHoldMembers,
   issueTreeHolds,
@@ -130,6 +131,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await db.delete(costEvents);
     await db.delete(workspaceOperations);
     await db.delete(issueComments);
+    await db.delete(issueRecoveryActions);
     await db.delete(issueTreeHoldMembers);
     await db.delete(issueTreeHolds);
     await db.delete(issueRelations);
@@ -369,6 +371,67 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     }
 
     return { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId };
+  }
+
+  async function seedZeroBlockerBackstopFixture(opts: {
+    withActiveRecoveryAction?: boolean;
+  } = {}) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `Z${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: randomUUID(),
+      membershipRole: "owner",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Priya",
+      role: "engineer",
+      status: "idle",
+      adapterType: "test_adapter",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Synthetic zero-blocker blocked issue",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    if (opts.withActiveRecoveryAction) {
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: blockedIssueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: agentId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `zero-blocker-test:${companyId}:${blockedIssueId}`,
+        evidence: {},
+        nextAction: "Restore a live execution path",
+      });
+    }
+
+    return { companyId, agentId, blockedIssueId };
   }
 
   it("keeps liveness findings advisory when auto recovery is disabled", async () => {
@@ -645,6 +708,95 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(wakes[0]?.idempotencyKey).toBe(
       `issue_blockers_resolved:${blockedIssueId}:${blockerIdNotUsedByBackstop}`,
     );
+  });
+
+  it("heals a zero-blocker blocked issue with an assignee and no live recovery action", async () => {
+    const { companyId, agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture();
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.dependencyWakeZeroBlockerObserved).toBe(1);
+    expect(result.dependencyWakeZeroBlockerHealed).toBe(1);
+    expect(result.dependencyWakesHealed).toBe(1);
+    expect(result.dependencyWakeNotReadySkipped).toBe(0);
+    expect(result.dependencyWakeIssueIds).toEqual([blockedIssueId]);
+
+    const wake = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .orderBy(agentWakeupRequests.requestedAt)
+      .then((rows) => rows[0] ?? null);
+
+    expect(wake?.reason).toBe("issue_blockers_resolved");
+    expect(wake?.idempotencyKey).toBe(`issue_blockers_resolved:${blockedIssueId}:zero_blocker`);
+    expect(["queued", "claimed", "completed"]).toContain(wake?.status);
+
+    const events = await db
+      .select({ action: activityLog.action, entityId: activityLog.entityId, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.blockers_resolved_wake_emitted")));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      entityId: blockedIssueId,
+      details: expect.objectContaining({ zeroBlockerHeal: true }),
+    });
+  });
+
+  it("does not re-wake a zero-blocker issue whose heal wake already exists", async () => {
+    const { companyId, agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture();
+    const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:zero_blocker`;
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        zeroBlockerHeal: true,
+      },
+      status: "completed",
+      finishedAt: new Date(),
+      idempotencyKey,
+    });
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.dependencyWakeZeroBlockerObserved).toBe(1);
+    expect(result.dependencyWakeZeroBlockerHealed).toBe(0);
+    expect(result.dependencyWakesHealed).toBe(0);
+    expect(result.dependencyWakeExistingSkipped).toBe(1);
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id, idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "issue_blockers_resolved")));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.idempotencyKey).toBe(idempotencyKey);
+  });
+
+  it("skips a zero-blocker blocked issue with a live recovery action", async () => {
+    const { companyId, blockedIssueId } = await seedZeroBlockerBackstopFixture({
+      withActiveRecoveryAction: true,
+    });
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.dependencyWakeZeroBlockerObserved).toBe(1);
+    expect(result.dependencyWakeZeroBlockerActiveRecoverySkipped).toBe(1);
+    expect(result.dependencyWakeZeroBlockerHealed).toBe(0);
+    expect(result.dependencyWakesHealed).toBe(0);
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakes).toHaveLength(0);
   });
 
   it("counts null dependency wake returns as deferred instead of enqueue failures", async () => {
