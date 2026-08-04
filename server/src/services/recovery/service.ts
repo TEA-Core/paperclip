@@ -7,6 +7,7 @@ import {
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueRecoveryActionKind,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -3031,7 +3032,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       monitorPolicy: recoveryCause === "provider_quota" && !ownerAgentId
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
-      maxAttempts: null,
+      maxAttempts: MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS,
       lastAttemptAt: now,
     });
 
@@ -3597,7 +3598,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
         externalRef: input.latestRun.id,
         timeoutAt: null,
-        maxAttempts: null,
+      maxAttempts: null,
         recoveryPolicy: "wake_owner" as const,
       },
     };
@@ -5736,6 +5737,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   const STRANDED_RECOVERY_ACTION_SWEEP_STALE_AFTER_MS = 15 * 60 * 1000;
+  const MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS = 5;
+  const SWEEP_MOVED_ISSUE_EPSILON_MS = 1000;
 
   function readRecoveryWakePolicy(action: typeof issueRecoveryActions.$inferSelect) {
     return parseObject(action.wakePolicy);
@@ -5757,6 +5760,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       rerouted: 0,
       skipped: 0,
       skippedTerminalSource: 0,
+      skippedCeilingExhausted: 0,
       actionIds: [] as string[],
     };
 
@@ -5783,6 +5787,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           identifier: issues.identifier,
           assigneeAgentId: issues.assigneeAgentId,
           createdByAgentId: issues.createdByAgentId,
+          updatedAt: issues.updatedAt,
         })
         .from(issues)
         .where(eq(issues.id, action.sourceIssueId))
@@ -5802,6 +5807,66 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       const now = new Date();
       const strandedRunId = readRecoveryEvidenceLatestRunId(action);
 
+      if (action.lastAttemptAt && sourceIssue.updatedAt &&
+        sourceIssue.updatedAt.getTime() > action.lastAttemptAt.getTime() + SWEEP_MOVED_ISSUE_EPSILON_MS) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const effectiveMax = action.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
+      if (action.attemptCount >= effectiveMax) {
+        await db
+          .update(issueRecoveryActions)
+          .set({
+            status: "escalated",
+            outcome: "exhausted",
+            lastAttemptAt: now,
+            attemptCount: action.attemptCount + 1,
+            updatedAt: now,
+          })
+          .where(eq(issueRecoveryActions.id, action.id));
+
+        await issuesSvc.update(sourceIssue.id, { status: "blocked" });
+        const prefix = await getCompanyIssuePrefix(sourceIssue.companyId);
+        await issuesSvc.addComment(
+          sourceIssue.id,
+          `Recovery action \`${action.id}\` exhausted its attempt ceiling (${action.attemptCount}/${effectiveMax}). ` +
+            "The source issue has been blocked and escalated to the board. " +
+            "A board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
+          {},
+          { authorType: "system" },
+        );
+        await logActivity(db, {
+          companyId: sourceIssue.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: sourceIssue.id,
+          details: {
+            identifier: sourceIssue.identifier,
+            status: "blocked",
+            previousStatus: sourceIssue.status,
+            source: "recovery.sweep_stranded_recovery_actions_exhausted",
+            recoveryActionId: action.id,
+            attemptCount: action.attemptCount,
+            maxAttempts: effectiveMax,
+          },
+        });
+
+        result.skippedCeilingExhausted += 1;
+        continue;
+      }
+
+      if (action.lastAttemptAt) {
+        const backoffMultiplier = Math.min(action.attemptCount || 1, 6);
+        const perActionStaleMs = STRANDED_RECOVERY_ACTION_SWEEP_STALE_AFTER_MS * backoffMultiplier;
+        const perActionStaleBefore = new Date(Date.now() - perActionStaleMs);
+        if (action.lastAttemptAt >= perActionStaleBefore) continue;
+      }
+
       if (wakePolicyType === "board_escalation") {
         const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(
           sourceIssue as typeof issues.$inferSelect,
@@ -5820,21 +5885,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        await db
-          .update(issueRecoveryActions)
-          .set({
+        await recoveryActionsSvc.upsertSourceScoped({
+          companyId: sourceIssue.companyId,
+          sourceIssueId: sourceIssue.id,
+          kind: action.kind as IssueRecoveryActionKind,
+          ownerType: "agent",
+          ownerAgentId,
+          previousOwnerAgentId: action.previousOwnerAgentId,
+          returnOwnerAgentId: action.returnOwnerAgentId,
+          cause: action.cause,
+          fingerprint: action.fingerprint,
+          evidence: action.evidence as Record<string, unknown>,
+          nextAction: action.nextAction,
+          wakePolicy: {
+            type: "wake_owner",
+            reason: "source_scoped_recovery_action",
             ownerAgentId,
-            ownerType: "agent",
-            wakePolicy: {
-              type: "wake_owner",
-              reason: "source_scoped_recovery_action",
-              ownerAgentId,
-            },
-            lastAttemptAt: now,
-            attemptCount: action.attemptCount + 1,
-            updatedAt: now,
-          })
-          .where(eq(issueRecoveryActions.id, action.id));
+          },
+          monitorPolicy: action.monitorPolicy as Record<string, unknown> | null,
+          maxAttempts: effectiveMax,
+          lastAttemptAt: now,
+        });
 
         await deps.enqueueWakeup(ownerAgentId, {
           source: "assignment",
@@ -5873,14 +5944,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      await db
-        .update(issueRecoveryActions)
-        .set({
+      await recoveryActionsSvc.upsertSourceScoped({
+        companyId: sourceIssue.companyId,
+        sourceIssueId: sourceIssue.id,
+          kind: action.kind as IssueRecoveryActionKind,
+          ownerType: "agent",
+          ownerAgentId: action.ownerAgentId,
+          previousOwnerAgentId: action.previousOwnerAgentId,
+          returnOwnerAgentId: action.returnOwnerAgentId,
+          cause: action.cause,
+          fingerprint: action.fingerprint,
+          evidence: action.evidence as Record<string, unknown>,
+          nextAction: action.nextAction,
+          wakePolicy: action.wakePolicy as Record<string, unknown> | null,
+          monitorPolicy: action.monitorPolicy as Record<string, unknown> | null,
+          maxAttempts: effectiveMax,
           lastAttemptAt: now,
-          attemptCount: action.attemptCount + 1,
-          updatedAt: now,
-        })
-        .where(eq(issueRecoveryActions.id, action.id));
+        });
 
       await deps.enqueueWakeup(action.ownerAgentId, {
         source: "assignment",

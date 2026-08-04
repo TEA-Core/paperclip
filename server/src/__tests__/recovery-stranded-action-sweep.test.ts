@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
+  issueComments,
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
@@ -39,6 +41,8 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
+    await db.delete(issueComments);
     await db.delete(issueRecoveryActions);
     await db.delete(issues);
     await db.delete(agents);
@@ -89,10 +93,14 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
   }
 
   let issueNumberSeq = 0;
-  async function seedSourceIssue(companyId: string, assigneeAgentId: string, status = "in_progress") {
+  async function seedSourceIssue(companyId: string, assigneeAgentId: string, status = "in_progress", updatedAtOverride?: Date) {
     const issueId = randomUUID();
     issueNumberSeq += 1;
     const prefix = `SR${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    const now = new Date();
+    // Default updatedAt to 30 min ago so it predates the 20-min staleAt window
+    // used by seedRecoveryAction. The moved-issue test explicitly updates it.
+    const updatedAt = updatedAtOverride ?? new Date(now.getTime() - 30 * 60 * 1000);
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -102,6 +110,8 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
       assigneeAgentId,
       issueNumber: issueNumberSeq,
       identifier: `${prefix}-${issueNumberSeq}`,
+      createdAt: now,
+      updatedAt,
     });
     return issueId;
   }
@@ -430,5 +440,90 @@ describeEmbeddedPostgres("recovery sweepStrandedRecoveryActions", () => {
     expect(result.actionIds).toContain(actionId1);
     expect(result.actionIds).toContain(actionId2);
     expect(enqueueWakeup).toHaveBeenCalledTimes(2);
+  });
+
+  it("escalates and does not re-wake when attemptCount reaches the ceiling", async () => {
+    const { companyId, ctoId, coderId } = await seedCompany();
+    const sourceIssueId = await seedSourceIssue(companyId, coderId);
+    const actionId = await seedRecoveryAction({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: ctoId,
+      wakePolicy: { type: "wake_owner", reason: "test" },
+      attemptCount: 5,
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.sweepStrandedRecoveryActions();
+
+    expect(result.reQueued).toBe(0);
+    expect(result.rerouted).toBe(0);
+    expect(result.skippedCeilingExhausted).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const updated = await db
+      .select({ status: issueRecoveryActions.status, outcome: issueRecoveryActions.outcome })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId))
+      .then((rows) => rows[0]);
+    expect(updated?.status).toBe("escalated");
+    expect(updated?.outcome).toBe("exhausted");
+  });
+
+  it("blocks the source issue and posts a board escalation comment when the ceiling is exhausted", async () => {
+    const { companyId, ctoId, coderId } = await seedCompany();
+    const sourceIssueId = await seedSourceIssue(companyId, coderId);
+    const actionId = await seedRecoveryAction({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: ctoId,
+      wakePolicy: { type: "wake_owner", reason: "test" },
+      attemptCount: 5,
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.sweepStrandedRecoveryActions();
+
+    expect(result.skippedCeilingExhausted).toBe(1);
+
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId))
+      .then((rows) => rows[0]);
+    expect(issue?.status).toBe("blocked");
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    expect(comments.some((c) => (c.body ?? "").includes("exhausted its attempt ceiling"))).toBe(true);
+    expect(comments.some((c) => (c.body ?? "").includes("escalated to the board"))).toBe(true);
+  });
+
+  it("skips actions whose source issue moved after lastAttemptAt", async () => {
+    const { companyId, ctoId, coderId } = await seedCompany();
+    const sourceIssueId = await seedSourceIssue(companyId, coderId);
+    const staleAt = new Date(Date.now() - 20 * 60 * 1000);
+    const movedAt = new Date(Date.now() - 5 * 60 * 1000);
+    await seedRecoveryAction({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: ctoId,
+      wakePolicy: { type: "wake_owner" },
+      lastAttemptAt: staleAt,
+    });
+    await db.update(issues).set({ updatedAt: movedAt }).where(eq(issues.id, sourceIssueId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.sweepStrandedRecoveryActions();
+
+    expect(result.reQueued).toBe(0);
+    expect(result.rerouted).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 });
