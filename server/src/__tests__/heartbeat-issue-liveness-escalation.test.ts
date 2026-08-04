@@ -41,6 +41,12 @@ const mockAdapterExecute = vi.hoisted(() =>
   })),
 );
 
+const loadConfigMock = vi.hoisted(() => vi.fn());
+
+vi.mock("../config.js", () => ({
+  loadConfig: loadConfigMock,
+}));
+
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
 }));
@@ -70,7 +76,7 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
-import { DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS } from "../services/recovery/service.ts";
+import { DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS, recoveryService } from "../services/recovery/service.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -85,13 +91,30 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
 
+  function buildTestConfig() {
+    return {
+      deploymentMode: "authenticated" as const,
+      bind: "loopback" as const,
+      resolvedDependencyWakeRearmWindowMs: 6 * 60 * 60 * 1000,
+      resolvedDependencyWakeRearmMaxCount: 3,
+    };
+  }
+
+  function recoveryServiceWithMocks(deps: { enqueueWakeup?: (agentId: string) => Promise<{ id: string } | null> } = {}) {
+    loadConfigMock.mockReturnValue(buildTestConfig());
+    const enqueueWakeup = deps.enqueueWakeup ?? vi.fn(async () => ({ id: randomUUID() }));
+    return recoveryService(db as never, { enqueueWakeup: enqueueWakeup as never });
+  }
+
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-issue-liveness-");
     db = createDb(tempDb.connectionString);
+    loadConfigMock.mockReturnValue(buildTestConfig());
   }, 30_000);
 
   afterEach(async () => {
     vi.clearAllMocks();
+    loadConfigMock.mockReturnValue(buildTestConfig());
     runningProcesses.clear();
     // reconcileIssueGraphLiveness heals dependency wakes by enqueuing an
     // on-demand wake, which dispatches a heartbeat run fire-and-forget (see
@@ -1322,4 +1345,210 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
     expect(result.findings).toBe(0);
   });
-});
+
+  it("re-arms a resolved dependency wake when the prior wake completed outside the re-arm window", async () => {
+    await enableAutoRecovery();
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`;
+    const windowMs = 6 * 60 * 60 * 1000;
+    const outsideWindow = new Date(Date.now() - windowMs - 60_000);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+        blockerIssueIds: [blockerIssueId],
+      },
+      status: "completed",
+      idempotencyKey,
+      createdAt: outsideWindow,
+      updatedAt: outsideWindow,
+      finishedAt: outsideWindow,
+    });
+
+    const result = await recoveryServiceWithMocks().reconcileResolvedDependencyWakeBackstop({
+      now: new Date(),
+      rearmWindowMs: windowMs,
+    });
+
+    const wakes = await db
+      .select({
+        status: agentWakeupRequests.status,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+        ),
+      );
+
+    expect(result.healed).toBe(1);
+    expect(result.existingWakeSkipped).toBe(0);
+    expect(result.issueIds).toEqual([blockedIssueId]);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.status).toBe("completed");
+  });
+
+  it("skips re-arming when a completed wake exists within the re-arm window", async () => {
+    await enableAutoRecovery();
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`;
+    const windowMs = 6 * 60 * 60 * 1000;
+    const withinWindow = new Date(Date.now() - 30 * 60 * 1000);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+        blockerIssueIds: [blockerIssueId],
+      },
+      status: "completed",
+      idempotencyKey,
+      createdAt: withinWindow,
+      updatedAt: withinWindow,
+      finishedAt: withinWindow,
+    });
+
+    const result = await recoveryServiceWithMocks().reconcileResolvedDependencyWakeBackstop({
+      now: new Date(),
+      rearmWindowMs: windowMs,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.existingWakeSkipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+
+    const wakes = await db
+      .select({
+        status: agentWakeupRequests.status,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+        ),
+      )
+      .orderBy(agentWakeupRequests.requestedAt);
+
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.status).toBe("completed");
+  });
+
+  it.each(["queued", "claimed", "deferred_issue_execution"] as const)(
+    "skips re-arming when an in-flight wake (%s) exists regardless of window",
+    async (inFlightStatus) => {
+      await enableAutoRecovery();
+      const { companyId, agentId, blockedIssueId, blockerIssueId } =
+        await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`;
+      const farPast = new Date(Date.now() - 48 * 60 * 60 * 1000);
+
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: blockedIssueId,
+          resolvedBlockerIssueId: blockerIssueId,
+          blockerIssueIds: [blockerIssueId],
+        },
+        status: inFlightStatus,
+        idempotencyKey,
+        createdAt: farPast,
+        updatedAt: farPast,
+      });
+
+      const result = await recoveryServiceWithMocks().reconcileResolvedDependencyWakeBackstop({
+        now: new Date(),
+      });
+
+      expect(result.healed).toBe(0);
+      expect(result.existingWakeSkipped).toBe(1);
+
+      const wakes = await db
+        .select({
+          status: agentWakeupRequests.status,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+          ),
+        );
+
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]?.status).toBe(inFlightStatus);
+    },
+  );
+
+  it("enforces the re-arm cap and suppresses further wakes once consumed count reaches the limit", async () => {
+    await enableAutoRecovery();
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`;
+    const windowMs = 6 * 60 * 60 * 1000;
+    const withinWindow = new Date(Date.now() - 30 * 60 * 1000);
+    const maxCount = 3;
+
+    for (let i = 0; i < maxCount; i++) {
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: blockedIssueId,
+          resolvedBlockerIssueId: blockerIssueId,
+          blockerIssueIds: [blockerIssueId],
+        },
+        status: "completed",
+        idempotencyKey,
+        createdAt: withinWindow,
+        updatedAt: withinWindow,
+        finishedAt: withinWindow,
+      });
+    }
+
+    const result = await recoveryServiceWithMocks().reconcileResolvedDependencyWakeBackstop({
+      now: new Date(withinWindow.getTime() + windowMs + 1),
+      rearmWindowMs: windowMs,
+      rearmMaxCount: maxCount,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.reArmCapSkipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+
+    const wakes = await db
+      .select({
+        status: agentWakeupRequests.status,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+        ),
+      );
+
+    expect(wakes).toHaveLength(maxCount);
+    expect(wakes.every((wake) => wake.status === "completed")).toBe(true);
+  });
+ });
