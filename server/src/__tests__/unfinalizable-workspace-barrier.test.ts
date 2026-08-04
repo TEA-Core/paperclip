@@ -413,6 +413,35 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     expect(result.findings).toEqual([]);
   });
 
+  it("ignores a terminal issue with no execution workspace without dropping real findings", async () => {
+    // The blocker query filters `isNotNull(executionWorkspaceId)` in SQL, but the column type
+    // stays `string | null`. Narrowing that type must not change which rows survive: a terminal
+    // issue that never had a workspace is not a finalize barrier and must stay excluded, while a
+    // genuine unfinalizable blocker in the same company must still report.
+    const { companyId, agentId, projectId } = await seedCompanyAndAgent();
+
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Terminal issue that never had a workspace",
+      status: "done",
+      priority: "high",
+      executionWorkspaceId: null,
+    });
+
+    const wsId = randomUUID();
+    const blockerId = await seedBlocker({ companyId, projectId, executionWorkspaceId: wsId, status: "done" });
+    await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
+    await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+
+    expect(result.reported).toBe(1);
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.executionWorkspaceId).toBe(wsId);
+  });
+
   it("does not report a blocker whose latest op is a provision-phase succeeded op", async () => {
     const { companyId, agentId, projectId } = await seedCompanyAndAgent();
     const wsId = randomUUID();
