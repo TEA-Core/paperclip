@@ -41,8 +41,9 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../services/execution-workspace-policy.ts";
-import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH, type IssueWorkMode } from "@paperclipai/shared";
+import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH, type IssueExecutionPolicy, type IssueWorkMode } from "@paperclipai/shared";
 
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -6696,5 +6697,151 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
     const comment = await svc.addComment(issueId, "hello from a live run", { runId });
 
     expect(await createdByRunIdFor(comment.id)).toBe(runId);
+  });
+});
+
+describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-create-default-policy-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  const defaultPolicyAgentId = randomUUID();
+  const explicitReviewerAgentId = randomUUID();
+
+  const defaultPolicy: IssueExecutionPolicy = {
+    mode: "normal",
+    commentRequired: true,
+    stages: [
+      {
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId: defaultPolicyAgentId, userId: null }],
+      },
+    ],
+  };
+
+  it("inherits the project defaultExecutionPolicy when the issue is created without one", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Policy project",
+      status: "in_progress",
+      defaultExecutionPolicy: defaultPolicy as unknown as Record<string, unknown>,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId,
+      title: "Issue without explicit policy",
+    });
+
+    expect(issue.executionPolicy).toMatchObject({
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        {
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [expect.objectContaining({ type: "agent", agentId: defaultPolicyAgentId })],
+        },
+      ],
+    });
+  });
+
+  it("leaves executionPolicy null when the project has no default", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "No-policy project",
+      status: "in_progress",
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId,
+      title: "Issue without explicit policy and no project default",
+    });
+
+    expect(issue.executionPolicy).toBeNull();
+  });
+
+  it("does not override an explicitly provided executionPolicy with the project default", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const explicitPolicy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: explicitReviewerAgentId }] }],
+    })!;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Policy project",
+      status: "in_progress",
+      defaultExecutionPolicy: defaultPolicy as unknown as Record<string, unknown>,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId,
+      title: "Issue with explicit policy",
+      executionPolicy: explicitPolicy,
+    });
+
+    expect(issue.executionPolicy).toMatchObject({
+      stages: [
+        expect.objectContaining({
+          participants: [expect.objectContaining({ agentId: explicitReviewerAgentId })],
+        }),
+      ],
+    });
   });
 });

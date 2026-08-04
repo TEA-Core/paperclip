@@ -84,7 +84,11 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import {
+  buildInitialIssueMonitorFields,
+  normalizeIssueExecutionPolicy,
+  resolveProjectDefaultIssueExecutionPolicy,
+} from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
   type CurrentUserRedactionOptions,
@@ -6552,6 +6556,21 @@ export function issueService(db: Db) {
           issueData.projectId = workspace.projectId;
         }
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
+
+        // Default the execution policy from the project when the issue was created
+        // without one. Issues with a null execution policy have no path to a
+        // terminal state once a disposition is missed (SUP-10835).
+        if (!issueData.executionPolicy && issueData.projectId) {
+          const projectDefaultPolicy = await tx
+            .select({ defaultExecutionPolicy: projects.defaultExecutionPolicy })
+            .from(projects)
+            .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
+            .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
+          const normalized = resolveProjectDefaultIssueExecutionPolicy(projectDefaultPolicy);
+          if (normalized) {
+            issueData.executionPolicy = normalized as unknown as Record<string, unknown>;
+          }
+        }
         // Cache the project policy lookup for this insert so the default
         // workspace-settings block does not re-query the project row.
         let projectPolicyCached: ReturnType<typeof parseProjectExecutionWorkspacePolicy> | null = null;
