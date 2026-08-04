@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -14,12 +14,16 @@ import {
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
+  executionWorkspaces,
+  projects,
+  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueService } from "../services/issues.js";
+import { recoveryService } from "../services/recovery/service.js";
 import { buildIssueGraphLivenessIncidentKey } from "../services/recovery/origins.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -37,6 +41,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
+    process.env.PAPERCLIP_BIND = "loopback";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-blocker-attention-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
@@ -53,6 +58,9 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(workspaceOperations);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(companies);
   });
 
@@ -1074,4 +1082,192 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(diagnostics.readiness.unresolvedBlockerCount).toBe(1);
     expect(diagnostics.readiness.allBlockersDone).toBe(false);
   });
+
+  // ---------------------------------------------------------------------------
+  // Permanently unfinalizable blocker sweep tests
+  // ---------------------------------------------------------------------------
+
+  async function createProject(companyId: string) {
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Test Project",
+    });
+    return projectId;
+  }
+
+  async function createExecutionWorkspace(companyId: string, projectId: string) {
+    const executionWorkspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "test-workspace",
+    });
+    return executionWorkspaceId;
+  }
+
+  async function insertWorkspaceOp(input: {
+    companyId: string;
+    executionWorkspaceId: string;
+    issueId?: string | null;
+    phase: string;
+    status: string;
+  }) {
+    await db.insert(workspaceOperations).values({
+      companyId: input.companyId,
+      executionWorkspaceId: input.executionWorkspaceId,
+      issueId: input.issueId ?? null,
+      phase: input.phase,
+      status: input.status,
+    });
+  }
+
+  it("detects permanently unfinalizable blockers and logs activity", async () => {
+    const { companyId, agentId } = await createCompany("PUF");
+    const projectId = await createProject(companyId);
+    const executionWorkspaceId = await createExecutionWorkspace(companyId, projectId);
+
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PUF-1",
+      title: "Done blocker with failed finalize",
+      status: "done",
+      assigneeAgentId: agentId,
+    });
+    await db.update(issues).set({ executionWorkspaceId }).where(eq(issues.id, blockerId));
+
+    const blockedId = await insertIssue({
+      companyId,
+      identifier: "PUF-2",
+      title: "Blocked by failed finalize",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId });
+
+    await insertWorkspaceOp({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "failed",
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const result = await recovery.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+
+    expect(result.reported).toBe(1);
+    expect(result.findings.length).toBe(1)
+    expect(result.findings[0].gatedDependentIssueIds).toContain(blockedId);
+
+    const logEntries = await db.select().from(activityLog).where(
+      eq(activityLog.action, "issue.unfinalizable_workspace_barrier_detected")
+    );
+    expect(logEntries).toHaveLength(1);
+    expect(logEntries[0].entityId).toBe(executionWorkspaceId);
+  });
+
+  it("does not report when workspace finalize succeeded", async () => {
+    const { companyId, agentId } = await createCompany("PUS");
+    const projectId = await createProject(companyId);
+    const executionWorkspaceId = await createExecutionWorkspace(companyId, projectId);
+
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PUS-1",
+      title: "Done blocker with succeeded finalize",
+      status: "done",
+      assigneeAgentId: agentId,
+    });
+    await db.update(issues).set({ executionWorkspaceId }).where(eq(issues.id, blockerId));
+
+    const blockedId = await insertIssue({
+      companyId,
+      identifier: "PUS-2",
+      title: "Blocked issue (not permanently unfinalizable)",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId });
+
+    await insertWorkspaceOp({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const result = await recovery.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+
+    expect(result.reported).toBe(0);
+  });
+
+  it("does not report when done blocker has no execution workspace", async () => {
+    const { companyId, agentId } = await createCompany("PUN");
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PUN-1",
+      title: "Done blocker without workspace",
+      status: "done",
+      assigneeAgentId: agentId,
+    });
+
+    const blockedId = await insertIssue({
+      companyId,
+      identifier: "PUN-2",
+      title: "Blocked by no-workspace blocker",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId });
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const result = await recovery.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+
+    expect(result.reported).toBe(0);
+  });
+
+  it("does not report when workspace has no finalize operations recorded", async () => {
+    const { companyId, agentId } = await createCompany("PUNF");
+    const projectId = await createProject(companyId);
+    const executionWorkspaceId = await createExecutionWorkspace(companyId, projectId);
+
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PUNF-1",
+      title: "Done blocker without finalize ops",
+      status: "done",
+      assigneeAgentId: agentId,
+    });
+    await db.update(issues).set({ executionWorkspaceId }).where(eq(issues.id, blockerId));
+
+    const blockedId = await insertIssue({
+      companyId,
+      identifier: "PUNF-2",
+      title: "Blocked by unfinalized workspace",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId });
+
+    await insertWorkspaceOp({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "provision",
+      status: "succeeded",
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const result = await recovery.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+
+    expect(result.reported).toBe(0);
+  });
+
 });

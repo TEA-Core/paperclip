@@ -39,7 +39,12 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { IssueDependencyReadiness, TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import {
+  IssueDependencyReadiness,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+  issueService,
+  listPermanentlyUnfinalizableBlockers as listPermanentlyUnfinalizableBlockersFromIssues,
+} from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
   normalizeIssueExecutionPolicy,
@@ -5888,6 +5893,147 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  const PERMANENTLY_UNFINALIZABLE_BLOCKERS_CANDIDATE_LIMIT = 500;
+  const PERMANENTLY_UNFINALIZABLE_RELOG_INTERVAL_MS = 15 * 60_000;
+  let lastPermanentlyUnfinalizableLogAt: Date | null = null;
+
+  /**
+   * Report-only sweep for issues that are gated by a permanently-unfinalizable
+   * blocker — a blocker whose execution workspace has permanently failed the
+   * workspace_finalize barrier (latest `workspace_operations` row for the
+   * blocker's `executionWorkspaceId` IS a `workspace_finalize` attempt that did
+   * NOT succeed, and no live run holds that workspace).
+   *
+   * This sweep does NOT heal or wake anything; it only reports via activity
+   * log and logger so operators can triage permanently-stuck dependency chains.
+   *
+   * Returns per-workspace findings: one finding per affected execution workspace,
+   * each carrying the blocker issue id, its identifier, and the list of gated
+   * dependent issue ids.
+   */
+  async function reconcileUnfinalizableWorkspaceBarriers(opts?: {
+    issueCreatedAtGte?: Date | null;
+    companyId?: string | null;
+  }) {
+    const result = {
+      reported: 0,
+      skipped: 0,
+      findings: [] as Array<{
+        executionWorkspaceId: string;
+        blockerIssueId: string;
+        identifier: string | null;
+        gatedDependentIssueIds: string[];
+      }>,
+    };
+
+    const candidateFilters = [
+      inArray(issues.status, ["todo", "blocked"]),
+      visibleIssueCondition(),
+      sql`${issues.assigneeAgentId} is not null`,
+    ];
+    if (opts?.issueCreatedAtGte) candidateFilters.push(gte(issues.createdAt, opts.issueCreatedAtGte));
+    if (opts?.companyId) candidateFilters.push(eq(issues.companyId, opts.companyId));
+
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(and(...candidateFilters))
+      .orderBy(asc(issues.id))
+      .limit(PERMANENTLY_UNFINALIZABLE_BLOCKERS_CANDIDATE_LIMIT);
+
+    const candidateIdsByCompany = new Map<string, Set<string>>();
+    for (const candidate of candidates) {
+      const companySet = candidateIdsByCompany.get(candidate.companyId) ?? new Set<string>();
+      companySet.add(candidate.id);
+      candidateIdsByCompany.set(candidate.companyId, companySet);
+    }
+
+    const now = new Date();
+    const shouldLog =
+      !lastPermanentlyUnfinalizableLogAt ||
+      now.getTime() - lastPermanentlyUnfinalizableLogAt.getTime() >= PERMANENTLY_UNFINALIZABLE_RELOG_INTERVAL_MS;
+
+    for (const [companyId, candidateIds] of candidateIdsByCompany.entries()) {
+
+      const blockers = await listPermanentlyUnfinalizableBlockersFromIssues(
+        db,
+        companyId,
+        opts ? { issueCreatedAtGte: opts.issueCreatedAtGte } : undefined,
+      );
+
+      if (blockers.length === 0) continue;
+
+      const blockerIds = new Set<string>();
+      for (const blocker of blockers) {
+        blockerIds.add(blocker.blockerIssueId);
+      }
+
+      const blockerRows = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+        })
+        .from(issues)
+        .where(inArray(issues.id, [...blockerIds]));
+      const identifierByBlocker = new Map(blockerRows.map((row) => [row.id, row.identifier]));
+
+      for (const blocker of blockers) {
+        const gatedCandidateIds = blocker.gatedDependentIssueIds.filter((dependentId) =>
+          candidateIds.has(dependentId),
+        );
+
+        if (gatedCandidateIds.length === 0) {
+          result.skipped += 1;
+          continue;
+        }
+
+        result.reported += 1;
+
+        const finding = {
+          executionWorkspaceId: blocker.executionWorkspaceId,
+          blockerIssueId: blocker.blockerIssueId,
+          identifier: identifierByBlocker.get(blocker.blockerIssueId) ?? null,
+          gatedDependentIssueIds: gatedCandidateIds,
+        };
+        result.findings.push(finding);
+
+        if (shouldLog) {
+          await logActivity(db, {
+            companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.unfinalizable_workspace_barrier_detected",
+            entityType: "execution_workspace",
+            entityId: blocker.executionWorkspaceId,
+            details: {
+              source: "recovery.reconcile_unfinalizable_workspace_barriers",
+              blockerIssueId: blocker.blockerIssueId,
+              gatedDependentIssueIds: gatedCandidateIds,
+              latestOp: blocker.latestOp,
+            },
+          });
+        }
+      }
+    }
+
+    if (result.reported > 0 && shouldLog) {
+      lastPermanentlyUnfinalizableLogAt = now;
+      logger.warn(
+        { reported: result.reported, findings: result.findings },
+        "swept unfinalizable workspace barriers (report-only)",
+      );
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -5899,6 +6045,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     sweepStaleIssueLocks,
     reconcileBlockedWithoutBlockers,
     reconcileStaleRecoveryActionWakes,
+    reconcileUnfinalizableWorkspaceBarriers,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
     reconcileIssueGraphLiveness,
