@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issueComments,
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
@@ -37,6 +38,7 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(issueComments);
     await db.delete(issueRecoveryActions);
     await db.delete(heartbeatRuns);
     await db.delete(issues);

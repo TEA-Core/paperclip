@@ -1060,7 +1060,15 @@ export async function listPermanentlyUnfinalizableBlockers(
 
   if (blockerRows.length === 0) return [];
 
-  const executionWorkspaceIds = [...new Set(blockerRows.map((row) => row.executionWorkspaceId))];
+  // `executionWorkspaceId` is nullable on the column but the query filters
+  // `isNotNull`, so this narrowing never drops a row at runtime.
+  const executionWorkspaceIds = [
+    ...new Set(
+      blockerRows
+        .map((row) => row.executionWorkspaceId)
+        .filter((id): id is string => id !== null),
+    ),
+  ];
 
   const opRows = await dbOrTx
     .select({
@@ -1094,7 +1102,7 @@ export async function listPermanentlyUnfinalizableBlockers(
 
   const nonTerminalRunIds = new Set<string>();
   for (const row of opRows) {
-    if (!row.heartbeatRunId) continue;
+    if (!row.heartbeatRunId || !row.executionWorkspaceId) continue;
     const current = liveRunByWorkspace.get(row.executionWorkspaceId);
     if (current === undefined) {
       liveRunByWorkspace.set(row.executionWorkspaceId, false);
@@ -1164,6 +1172,7 @@ export async function listPermanentlyUnfinalizableBlockers(
 
   for (const blockerRow of blockerRows) {
     const { executionWorkspaceId, blockerIssueId, checkoutRunId, executionRunId } = blockerRow;
+    if (!executionWorkspaceId) continue;
 
     const latest = latestOpByWorkspace.get(executionWorkspaceId);
     // Only a workspace whose latest op is itself a non-succeeded workspace_finalize

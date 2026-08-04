@@ -965,7 +965,7 @@ export async function startServer(): Promise<StartedServer> {
         }
 
         const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
-        if (staleWakes.reFired > 0 || staleWakes.maxAttemptsReached > 0) {
+        if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {
           logger.warn({ ...staleWakes }, "startup stale recovery action wake sweep re-fired wakes");
         }
 
@@ -1121,7 +1121,7 @@ export async function startServer(): Promise<StartedServer> {
                 logger.warn({ ...blockedWithoutBlockers }, "periodic blocked-without-blockers sweep reported issues");
               }
               const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
-              if (staleWakes.reFired > 0 || staleWakes.maxAttemptsReached > 0) {
+              if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {
                 logger.warn({ ...staleWakes }, "periodic stale recovery action wake sweep re-fired wakes");
               }
             })
