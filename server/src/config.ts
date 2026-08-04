@@ -87,6 +87,7 @@ export interface Config {
   heartbeatSchedulerIntervalMs: number;
   resolvedDependencyWakeRearmWindowMs: number;
   resolvedDependencyWakeRearmMaxCount: number;
+  recoveryActionWakeIntervalMs: number;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
 }
@@ -335,6 +336,7 @@ export function loadConfig(): Config {
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
     resolvedDependencyWakeRearmWindowMs: Math.max(30 * 60 * 1000, Number(process.env.RESOLVED_DEPENDENCY_WAKE_REARM_WINDOW_MS) || 6 * 60 * 60 * 1000),
     resolvedDependencyWakeRearmMaxCount: Math.max(1, Number(process.env.RESOLVED_DEPENDENCY_WAKE_REARM_MAX_COUNT) || 3),
+    recoveryActionWakeIntervalMs: Math.max(60000, Number(process.env.RECOVERY_ACTION_WAKE_INTERVAL_MS) || 300000),
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
