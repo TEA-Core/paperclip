@@ -2673,6 +2673,53 @@ async function recordWorkspaceCommandOperation(
   );
 }
 
+export async function assertWorktreeWritableByProcessUser(worktreePath: string): Promise<void> {
+  let trackedPaths: string[];
+  try {
+    const proc = await executeProcess({
+      command: "git",
+      args: ["-C", worktreePath, "ls-files", "-z"],
+      cwd: worktreePath,
+    });
+    if (proc.code !== 0) {
+      throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ls-files failed in ${worktreePath}`);
+    }
+    trackedPaths = proc.stdout.split("\0").filter((p) => p.length > 0);
+  } catch (error) {
+    throw new Error(
+      `Execution worktree at ${worktreePath} is not a valid git repository or is missing: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const uid = process.getuid != null ? process.getuid() : null;
+  const gid = process.getgid != null ? process.getgid() : null;
+  const failures: string[] = [];
+  const MAX_FAILURES = 10;
+
+  if (await fs.access(worktreePath, fs.constants.W_OK).then(() => true, () => false)) {
+    // writable
+  } else {
+    failures.push(worktreePath);
+  }
+
+  for (const relPath of trackedPaths) {
+    if (failures.length >= MAX_FAILURES) break;
+    const fullPath = path.join(worktreePath, relPath);
+    const writable = await fs.access(fullPath, fs.constants.W_OK).then(() => true, () => false);
+    if (!writable) {
+      failures.push(fullPath);
+    }
+  }
+
+  if (failures.length > 0) {
+    const uidPart = uid != null ? `uid ${uid}` : "current user";
+    const gidPart = gid != null ? `:${gid}` : "";
+    throw new Error(
+      `Execution worktree at ${worktreePath} contains ${failures.length} files not writable by the server user (${uidPart}${gidPart}): ${failures.join(", ")}. A host-side process likely wrote them as another user (e.g. root). Repair on the host with: chown -R ${uid != null ? uid : ""}${gidPart} ${worktreePath} — then retry provisioning.`,
+    );
+  }
+}
+
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -2686,6 +2733,7 @@ async function provisionExecutionWorktree(input: {
 }) {
   const provisionCommand = asString(input.strategy.provisionCommand, "").trim();
   if (!provisionCommand) return;
+  await assertWorktreeWritableByProcessUser(input.worktreePath);
   const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
 
   await recordWorkspaceCommandOperation(input.recorder, {
