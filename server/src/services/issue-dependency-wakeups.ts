@@ -26,6 +26,22 @@ export function buildIssueBlockersResolvedWakeIdempotencyKey(input: {
   ].join(":");
 }
 
+/**
+ * Zero-blocker heal wakes have no resolved blocker to key on, so they get
+ * their own key leaf in the same namespace. The key is per-issue and
+ * permanent: once the heal wake row exists in an idempotent status the
+ * backstop never re-wakes that issue on a later sweep pass.
+ */
+export function buildIssueZeroBlockerHealWakeIdempotencyKey(input: {
+  dependentIssueId: string;
+}) {
+  return [
+    ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+    input.dependentIssueId,
+    "zero_blocker",
+  ].join(":");
+}
+
 export async function findExistingIssueBlockersResolvedWake(
   db: Db,
   input: {

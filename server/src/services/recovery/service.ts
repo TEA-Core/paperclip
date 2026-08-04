@@ -47,6 +47,7 @@ import {
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
+  buildIssueZeroBlockerHealWakeIdempotencyKey,
   findExistingIssueBlockersResolvedWakeForAnyKey,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
@@ -865,6 +866,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(issueThreadInteractions.issueId, issueId),
           eq(issueThreadInteractions.status, "pending"),
           inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  async function hasActiveOrEscalatedRecoveryAction(companyId: string, issueId: string) {
+    return db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
         ),
       )
       .limit(1)
@@ -5138,6 +5154,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       reArmCapSkipped: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
+      zeroBlockerObserved: 0,
+      zeroBlockerHealed: 0,
+      zeroBlockerActiveRecoverySkipped: 0,
       issueIds: [] as string[],
     };
 
@@ -5245,7 +5264,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         const readiness = readinessMap.get(candidate.id);
         const resolvedBlockerIssueId = readiness?.blockerIssueIds[0] ?? null;
-        if (
+        const zeroBlockerHeal =
+          readiness != null &&
+          readiness.isDependencyReady &&
+          readiness.blockerIssueIds.length === 0;
+        if (zeroBlockerHeal) {
+          result.zeroBlockerObserved += 1;
+        } else if (
           !readiness ||
           !readiness.isDependencyReady ||
           readiness.blockerIssueIds.length === 0 ||
@@ -5255,16 +5280,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        const idempotencyKeys = readiness.blockerIssueIds.map((blockerIssueId) =>
-          buildIssueBlockersResolvedWakeIdempotencyKey({
-            dependentIssueId: candidate.id,
-            resolvedBlockerIssueId: blockerIssueId,
-          })
-        );
-        const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
-          dependentIssueId: candidate.id,
-          resolvedBlockerIssueId,
-        });
+        // Zero-blocker heal path: a live recovery action owns the issue, so
+        // waking it here would race that path and re-create the re-arm ->
+        // re-dead loop. Skip and count instead.
+        if (zeroBlockerHeal && (await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id))) {
+          result.zeroBlockerActiveRecoverySkipped += 1;
+          continue;
+        }
+
+        const idempotencyKeys = zeroBlockerHeal
+          ? [buildIssueZeroBlockerHealWakeIdempotencyKey({ dependentIssueId: candidate.id })]
+          : (readiness?.blockerIssueIds ?? []).map((blockerIssueId) =>
+              buildIssueBlockersResolvedWakeIdempotencyKey({
+                dependentIssueId: candidate.id,
+                resolvedBlockerIssueId: blockerIssueId,
+              })
+            );
+        const idempotencyKey = idempotencyKeys[0];
         const existingWake = await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
           companyId,
           idempotencyKeys,
@@ -5328,8 +5360,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             payload: {
               issueId: candidate.id,
               resolvedBlockerIssueId,
-              blockerIssueIds: readiness.blockerIssueIds,
+              blockerIssueIds: readiness?.blockerIssueIds ?? [],
               backstop: payloadBackstop,
+              ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
             idempotencyKey,
             requestedByActorType: "system",
@@ -5340,7 +5373,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
               source,
               resolvedBlockerIssueId,
-              blockerIssueIds: readiness.blockerIssueIds,
+              blockerIssueIds: readiness?.blockerIssueIds ?? [],
+              ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
           });
           if (!wake) {
@@ -5352,6 +5386,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           }
 
           result.healed += 1;
+          if (zeroBlockerHeal) result.zeroBlockerHealed += 1;
           result.issueIds.push(candidate.id);
 
           await logActivity(db, {
@@ -5368,7 +5403,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               wakeupRunId: wake.id,
               idempotencyKey,
               resolvedBlockerIssueId,
-              blockerIssueIds: readiness.blockerIssueIds,
+              blockerIssueIds: readiness?.blockerIssueIds ?? [],
+              ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
           });
         } catch (err) {
@@ -5386,6 +5422,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       logger.warn(
         { healed: result.healed, issueIds: result.issueIds, source, blockerIssueId: opts?.blockerIssueId ?? null },
         "issue graph liveness backstop healed resolved blocked dependency wakes",
+      );
+    }
+
+    if (result.zeroBlockerObserved > 0) {
+      logger.warn(
+        {
+          observed: result.zeroBlockerObserved,
+          healed: result.zeroBlockerHealed,
+          activeRecoverySkipped: result.zeroBlockerActiveRecoverySkipped,
+          source,
+        },
+        "issue graph liveness backstop swept zero-blocker blocked issues",
       );
     }
 
@@ -5459,6 +5507,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       dependencyWakeCandidateLimitSkipped: 0,
       dependencyWakeDeferredOrFailed: 0,
       dependencyWakeEnqueueFailed: 0,
+      dependencyWakeZeroBlockerObserved: 0,
+      dependencyWakeZeroBlockerHealed: 0,
+      dependencyWakeZeroBlockerActiveRecoverySkipped: 0,
       dependencyWakeIssueIds: [] as string[],
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
@@ -5478,6 +5529,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.dependencyWakeCandidateLimitSkipped = dependencyWakeBackstop.candidateLimitSkipped;
     result.dependencyWakeDeferredOrFailed = dependencyWakeBackstop.deferredOrFailed;
     result.dependencyWakeEnqueueFailed = dependencyWakeBackstop.enqueueFailed;
+    result.dependencyWakeZeroBlockerObserved = dependencyWakeBackstop.zeroBlockerObserved;
+    result.dependencyWakeZeroBlockerHealed = dependencyWakeBackstop.zeroBlockerHealed;
+    result.dependencyWakeZeroBlockerActiveRecoverySkipped = dependencyWakeBackstop.zeroBlockerActiveRecoverySkipped;
     result.dependencyWakeIssueIds = dependencyWakeBackstop.issueIds;
 
     if (!autoRecoveryEnabled) {
