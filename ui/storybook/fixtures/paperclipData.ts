@@ -616,6 +616,7 @@ function createProject(overrides: Partial<Project> = {}): Project {
       runtimePolicy: null,
       cleanupPolicy: null,
     },
+    defaultExecutionPolicy: null,
     codebase: {
       workspaceId: "workspace-board-ui",
       repoUrl: "https://github.com/paperclipai/paperclip",
@@ -696,6 +697,7 @@ export const storybookProjects: Project[] = [
       runtimePolicy: null,
       cleanupPolicy: null,
     },
+    defaultExecutionPolicy: null,
     archivedAt: recent(2_400),
     updatedAt: recent(2_400),
   }),

@@ -307,6 +307,7 @@ const storybookProject: Project = {
   pauseReason: null,
   pausedAt: null,
   executionWorkspacePolicy: null,
+  defaultExecutionPolicy: null,
   codebase: {
     workspaceId: "workspace-board-ui",
     repoUrl: "https://github.com/paperclipai/paperclip",
