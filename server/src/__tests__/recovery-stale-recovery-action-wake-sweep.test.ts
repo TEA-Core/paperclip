@@ -16,6 +16,9 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { recoveryService } from "../services/recovery/service.js";
 
+// loadConfig() in recovery/service.ts validates bind mode eagerly.
+process.env.PAPERCLIP_BIND = "loopback";
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
