@@ -912,6 +912,54 @@ describe("issue execution policy transitions", () => {
 
       expect(result.patch).toEqual({});
     });
+
+    it("null policy + in_review degrades gracefully instead of throwing", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: null,
+        },
+        policy: null,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch).toEqual({});
+    });
+
+    it("null policy + in_review with existing state clears execution state", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: boardUserId,
+          executionPolicy: null,
+          executionState: {
+            status: "pending",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy: null,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch).toMatchObject({
+        executionState: null,
+      });
+    });
   });
 
   describe("multi-participant stages", () => {
