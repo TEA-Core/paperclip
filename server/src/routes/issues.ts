@@ -59,7 +59,8 @@ import {
   updateIssueWorkProductSchema,
   updateDocumentAnnotationThreadSchema,
   upsertIssueDocumentSchema,
-  updateIssueSchema,
+  updateIssueObjectSchema,
+  stripCreateOnlyIssueAttribution,
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
   isUuidLike,
@@ -196,10 +197,12 @@ import {
 import { externalObjectService } from "../services/external-objects.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
-const updateIssueRouteSchema = updateIssueSchema.extend({
+// Strip must be re-applied after `.extend()`: the handler below rest-spreads the parsed body into
+// the column update, so the create-only attribution keys must not survive into `updateFields`.
+const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObjectSchema.extend({
   interrupt: z.boolean().optional(),
   force: z.boolean().optional(),
-});
+}));
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
 }).strict();

@@ -20,7 +20,7 @@ import {
   testAdapterEnvironmentSchema,
   // Issue
   createIssueSchema,
-  updateIssueSchema,
+  updateIssueObjectSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
   checkoutIssueSchema,
@@ -1917,7 +1917,12 @@ registry.registerPath({
   summary: "Update an issue",
   request: {
     params: z.object({ id: z.string() }),
-    body: jsonBody(updateIssueSchema.partial()),
+    // Documented shape omits the create-only attribution keys: they are accepted-and-ignored, not
+    // updatable, so advertising them would imply a mutation the server will never perform.
+    body: jsonBody(updateIssueObjectSchema.omit({
+      createdByUserId: true,
+      responsibleUserId: true,
+    }).partial()),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
 });
