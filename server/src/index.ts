@@ -959,6 +959,11 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
 
+        const sweptRecoveryActions = await heartbeat.sweepStrandedRecoveryActions();
+        if (sweptRecoveryActions.reQueued > 0 || sweptRecoveryActions.rerouted > 0) {
+          logger.warn({ ...sweptRecoveryActions }, "startup stranded-recovery-action sweeper re-queued recovery wakes");
+        }
+
         const blockedWithoutBlockers = await heartbeat.reconcileBlockedWithoutBlockers();
         if (blockedWithoutBlockers.reported > 0) {
           logger.warn({ ...blockedWithoutBlockers }, "startup blocked-without-blockers sweep reported issues");
@@ -1103,6 +1108,12 @@ export async function startServer(): Promise<StartedServer> {
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .then(async () => {
+              const sweptRecoveryActions = await heartbeat.sweepStrandedRecoveryActions();
+              if (sweptRecoveryActions.reQueued > 0 || sweptRecoveryActions.rerouted > 0) {
+                logger.warn({ ...sweptRecoveryActions }, "periodic stranded-recovery-action sweeper re-queued recovery wakes");
               }
             })
             .then(async () => {

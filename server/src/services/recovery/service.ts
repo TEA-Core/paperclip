@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, gt, inArray, isNotNull, isNull, notInArray, or, sql, count } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, notInArray, or, sql, count } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -5735,6 +5735,194 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  const STRANDED_RECOVERY_ACTION_SWEEP_STALE_AFTER_MS = 15 * 60 * 1000;
+
+  function readRecoveryWakePolicy(action: typeof issueRecoveryActions.$inferSelect) {
+    return parseObject(action.wakePolicy);
+  }
+
+  function readRecoveryWakePolicyType(action: typeof issueRecoveryActions.$inferSelect) {
+    const policy = readRecoveryWakePolicy(action);
+    return readNonEmptyString(policy.type);
+  }
+
+  function readRecoveryEvidenceLatestRunId(action: typeof issueRecoveryActions.$inferSelect) {
+    const evidence = parseObject(action.evidence);
+    return readNonEmptyString(evidence.latestRunId);
+  }
+
+  async function sweepStrandedRecoveryActions() {
+    const result = {
+      reQueued: 0,
+      rerouted: 0,
+      skipped: 0,
+      skippedTerminalSource: 0,
+      actionIds: [] as string[],
+    };
+
+    const staleBefore = new Date(Date.now() - STRANDED_RECOVERY_ACTION_SWEEP_STALE_AFTER_MS);
+    const staleActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.status, "active"),
+          or(
+            isNull(issueRecoveryActions.lastAttemptAt),
+            lt(issueRecoveryActions.lastAttemptAt, staleBefore),
+          ),
+        ),
+      );
+
+    for (const action of staleActions) {
+      const sourceIssue = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          identifier: issues.identifier,
+          assigneeAgentId: issues.assigneeAgentId,
+          createdByAgentId: issues.createdByAgentId,
+        })
+        .from(issues)
+        .where(eq(issues.id, action.sourceIssueId))
+        .then((rows) => rows[0] ?? null);
+
+      if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
+        result.skippedTerminalSource += 1;
+        continue;
+      }
+
+      const wakePolicyType = readRecoveryWakePolicyType(action);
+      if (wakePolicyType === "monitor_only" || wakePolicyType === "manual_repair_required") {
+        result.skipped += 1;
+        continue;
+      }
+
+      const now = new Date();
+      const strandedRunId = readRecoveryEvidenceLatestRunId(action);
+
+      if (wakePolicyType === "board_escalation") {
+        const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(
+          sourceIssue as typeof issues.$inferSelect,
+          action.previousOwnerAgentId,
+        );
+        if (!ownerAgentId) {
+          await db
+            .update(issueRecoveryActions)
+            .set({
+              lastAttemptAt: now,
+              attemptCount: action.attemptCount + 1,
+              updatedAt: now,
+            })
+            .where(eq(issueRecoveryActions.id, action.id));
+          result.skipped += 1;
+          continue;
+        }
+
+        await db
+          .update(issueRecoveryActions)
+          .set({
+            ownerAgentId,
+            ownerType: "agent",
+            wakePolicy: {
+              type: "wake_owner",
+              reason: "source_scoped_recovery_action",
+              ownerAgentId,
+            },
+            lastAttemptAt: now,
+            attemptCount: action.attemptCount + 1,
+            updatedAt: now,
+          })
+          .where(eq(issueRecoveryActions.id, action.id));
+
+        await deps.enqueueWakeup(ownerAgentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "source_scoped_recovery_action",
+          idempotencyKey: `source_scoped_recovery_action:${action.id}:${action.attemptCount + 1}`,
+          payload: withRecoveryModelProfileHint({
+            issueId: sourceIssue.id,
+            sourceIssueId: sourceIssue.id,
+            recoveryActionId: action.id,
+            strandedRunId,
+            recoveryCause: action.cause,
+          }, "status_only"),
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: withRecoveryModelProfileHint({
+            issueId: sourceIssue.id,
+            taskId: sourceIssue.id,
+            wakeReason: "source_scoped_recovery_action",
+            skipIssueComment: true,
+            source: "issue_recovery_action",
+            recoveryActionId: action.id,
+            sourceIssueId: sourceIssue.id,
+            strandedRunId,
+            recoveryCause: action.cause,
+          }, "status_only"),
+        });
+
+        result.rerouted += 1;
+        result.actionIds.push(action.id);
+        continue;
+      }
+
+      if (!action.ownerAgentId) {
+        result.skipped += 1;
+        continue;
+      }
+
+      await db
+        .update(issueRecoveryActions)
+        .set({
+          lastAttemptAt: now,
+          attemptCount: action.attemptCount + 1,
+          updatedAt: now,
+        })
+        .where(eq(issueRecoveryActions.id, action.id));
+
+      await deps.enqueueWakeup(action.ownerAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "source_scoped_recovery_action",
+        idempotencyKey: `source_scoped_recovery_action:${action.id}:${action.attemptCount + 1}`,
+        payload: withRecoveryModelProfileHint({
+          issueId: sourceIssue.id,
+          sourceIssueId: sourceIssue.id,
+          recoveryActionId: action.id,
+          strandedRunId,
+          recoveryCause: action.cause,
+        }, "status_only"),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryModelProfileHint({
+          issueId: sourceIssue.id,
+          taskId: sourceIssue.id,
+          wakeReason: "source_scoped_recovery_action",
+          skipIssueComment: true,
+          source: "issue_recovery_action",
+          recoveryActionId: action.id,
+          sourceIssueId: sourceIssue.id,
+          strandedRunId,
+          recoveryCause: action.cause,
+        }, "status_only"),
+      });
+
+      result.reQueued += 1;
+      result.actionIds.push(action.id);
+    }
+
+    if (result.reQueued > 0 || result.rerouted > 0) {
+      logger.warn(
+        { ...result },
+        "swept stranded recovery actions",
+      );
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -5745,6 +5933,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
     reconcileBlockedWithoutBlockers,
+    sweepStrandedRecoveryActions,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
     reconcileIssueGraphLiveness,
