@@ -170,3 +170,56 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
     haystack,
   );
 }
+
+/**
+ * Detect terminal provider billing/usage-limit errors in the stderr log stream.
+ *
+ * These are errors where the provider (OpenAI, Anthropic, Google, etc.) refuses
+ * to serve the request because of a billing/quota condition that cannot be
+ * resolved by retrying. Burning the full run timeout on these is wasteful, so
+ * the adapter aborts early.
+ *
+ * Only stderr is scanned: stdout carries the agent JSONL stream (text, tool_use,
+ * step_finish events) where error-shaped strings can appear as ordinary
+ * content — scanning it would produce false-positive kills of healthy runs.
+ *
+ * Returns the matched error message (trimmed) when a terminal billing error is
+ * detected, or null otherwise.
+ */
+export function isOpenCodeTerminalBillingError(stdout: string, stderr: string): string | null {
+  void stdout;
+  const lines = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const patterns: RegExp[] = [
+    /insufficient\s+quota/i,
+    /quota\s+(?:exhausted|exceeded|reached|limit)/i,
+    /usage\s+limit/i,
+    /billing\s+(?:required|not\s+configured|issue|account)/i,
+    /payment\s+(?:required|method|needed)/i,
+    /credit\s+(?:balance|exhausted|expired|required)/i,
+    /spend\s+limit/i,
+    /budget\s+(?:exceeded|limit|reached)/i,
+    /unpaid\s+balance/i,
+    /account\s+(?:suspended|disabled|deactivated|not\s+active)/i,
+    /token\s+limit\s+reached/i,
+    /maximum\s+spend/i,
+    /plan\s+(?:required|upgrade|exceeded)/i,
+    /subscription\s+(?:required|expired|inactive)/i,
+    /trial\s+(?:expired|ended|not\s+available)/i,
+    /trial\s+period\s+(?:has\s+)?(?:ended|expired)/i,
+    /no\s+available\s+(?:models|providers)/i,
+  ];
+
+  for (const line of lines) {
+    for (const pattern of patterns) {
+      if (pattern.test(line)) {
+        return line;
+      }
+    }
+  }
+
+  return null;
+}
