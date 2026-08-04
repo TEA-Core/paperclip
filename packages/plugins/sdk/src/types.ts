@@ -236,6 +236,16 @@ export interface PluginJobContext {
   trigger: "schedule" | "manual" | "retry";
   /** ISO 8601 timestamp when the run was scheduled to start. */
   scheduledAt: string;
+  /**
+   * UUID of the company this run is scoped to.
+   *
+   * A manifest declares a job once; the host fans it out to one run per
+   * company the plugin is enabled for. This is the company that run belongs
+   * to, and the one `ctx.config.get()` and `ctx.issues.list()` resolve
+   * against. Optional for backwards compatibility with hosts that predate
+   * scoped job dispatch.
+   */
+  companyId?: string | null;
 }
 
 // ---------------------------------------------------------------------------

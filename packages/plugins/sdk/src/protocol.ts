@@ -366,6 +366,14 @@ export interface OnEventParams {
  * @see PLUGIN_SPEC.md §13.6 — `runJob`
  */
 export interface RunJobParams {
+  /**
+   * Host-authorized company scope for this run.
+   *
+   * Read by the worker manager to register an invocation scope, which is what
+   * permits company-scoped host calls (`config.get`, `issues.list`) from
+   * inside the job handler.
+   */
+  companyId?: string | null;
   /** Job execution context. */
   job: PluginJobContext;
 }
