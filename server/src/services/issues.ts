@@ -1145,12 +1145,13 @@ export async function listPermanentlyUnfinalizableBlockers(
       blockerIssueId: issueRelations.issueId,
     })
     .from(issueRelations)
-    .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+    .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
     .where(
       and(
         eq(issueRelations.companyId, companyId),
         eq(issueRelations.type, "blocks"),
         inArray(issueRelations.issueId, blockerIds),
+        notInArray(issues.status, ["done", "cancelled"]),
       ),
     );
 

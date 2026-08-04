@@ -969,7 +969,7 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...staleWakes }, "startup stale recovery action wake sweep re-fired wakes");
         }
 
-        const permanentlyUnfinalizable = await heartbeat.listPermanentlyUnfinalizableBlockers();
+        const permanentlyUnfinalizable = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
         if (permanentlyUnfinalizable.reported > 0) {
           logger.warn({ ...permanentlyUnfinalizable }, "startup permanently-unfinalizable-blocker sweep reported issues");
         }
@@ -1126,7 +1126,7 @@ export async function startServer(): Promise<StartedServer> {
               }
             })
             .then(async () => {
-              const permanentlyUnfinalizable = await heartbeat.listPermanentlyUnfinalizableBlockers();
+              const permanentlyUnfinalizable = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
               if (permanentlyUnfinalizable.reported > 0) {
                 logger.warn({ ...permanentlyUnfinalizable }, "periodic permanently-unfinalizable-blocker sweep reported issues");
               }

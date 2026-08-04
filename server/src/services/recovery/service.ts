@@ -5906,20 +5906,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
    *
    * This sweep does NOT heal or wake anything; it only reports via activity
    * log and logger so operators can triage permanently-stuck dependency chains.
+   *
+   * Returns per-workspace findings: one finding per affected execution workspace,
+   * each carrying the blocker issue id, its identifier, and the list of gated
+   * dependent issue ids.
    */
-  async function listPermanentlyUnfinalizableBlockers(opts?: {
+  async function reconcileUnfinalizableWorkspaceBarriers(opts?: {
     issueCreatedAtGte?: Date | null;
     companyId?: string | null;
   }) {
     const result = {
       reported: 0,
       skipped: 0,
-      issueIds: [] as string[],
       findings: [] as Array<{
-        dependentIssueId: string;
-        blockerIssueId: string;
         executionWorkspaceId: string;
-        latestOp: { phase: string; status: string; startedAt: Date } | null;
+        blockerIssueId: string;
+        identifier: string | null;
+        gatedDependentIssueIds: string[];
       }>,
     };
 
@@ -5943,11 +5946,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .orderBy(asc(issues.id))
       .limit(PERMANENTLY_UNFINALIZABLE_BLOCKERS_CANDIDATE_LIMIT);
 
-    const candidatesByCompany = new Map<string, typeof candidates>();
+    const candidateIdsByCompany = new Map<string, Set<string>>();
     for (const candidate of candidates) {
-      const companyCandidates = candidatesByCompany.get(candidate.companyId) ?? [];
-      companyCandidates.push(candidate);
-      candidatesByCompany.set(candidate.companyId, companyCandidates);
+      const companySet = candidateIdsByCompany.get(candidate.companyId) ?? new Set<string>();
+      companySet.add(candidate.id);
+      candidateIdsByCompany.set(candidate.companyId, companySet);
     }
 
     const now = new Date();
@@ -5955,7 +5958,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       !lastPermanentlyUnfinalizableLogAt ||
       now.getTime() - lastPermanentlyUnfinalizableLogAt.getTime() >= PERMANENTLY_UNFINALIZABLE_RELOG_INTERVAL_MS;
 
-    for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
+    for (const [companyId, candidateIds] of candidateIdsByCompany.entries()) {
 
       const blockers = await listPermanentlyUnfinalizableBlockersFromIssues(
         db,
@@ -5965,51 +5968,55 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       if (blockers.length === 0) continue;
 
-      const findingsByDependent = new Map<string, typeof blockers>();
+      const blockerIds = new Set<string>();
       for (const blocker of blockers) {
-        for (const dependentId of blocker.gatedDependentIssueIds) {
-          const existing = findingsByDependent.get(dependentId) ?? [];
-          existing.push(blocker);
-          findingsByDependent.set(dependentId, existing);
-        }
+        blockerIds.add(blocker.blockerIssueId);
       }
 
-      if (findingsByDependent.size === 0) continue;
+      const blockerRows = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+        })
+        .from(issues)
+        .where(inArray(issues.id, [...blockerIds]));
+      const identifierByBlocker = new Map(blockerRows.map((row) => [row.id, row.identifier]));
 
-      for (const candidate of companyCandidates) {
-        const candidateFindings = findingsByDependent.get(candidate.id);
-        if (!candidateFindings || candidateFindings.length === 0) continue;
+      for (const blocker of blockers) {
+        const gatedCandidateIds = blocker.gatedDependentIssueIds.filter((dependentId) =>
+          candidateIds.has(dependentId),
+        );
+
+        if (gatedCandidateIds.length === 0) {
+          result.skipped += 1;
+          continue;
+        }
 
         result.reported += 1;
-        result.issueIds.push(candidate.id);
 
-        for (const finding of candidateFindings) {
-          result.findings.push({
-            dependentIssueId: candidate.id,
-            blockerIssueId: finding.blockerIssueId,
-            executionWorkspaceId: finding.executionWorkspaceId,
-            latestOp: finding.latestOp,
-          });
-        }
+        const finding = {
+          executionWorkspaceId: blocker.executionWorkspaceId,
+          blockerIssueId: blocker.blockerIssueId,
+          identifier: identifierByBlocker.get(blocker.blockerIssueId) ?? null,
+          gatedDependentIssueIds: gatedCandidateIds,
+        };
+        result.findings.push(finding);
 
         if (shouldLog) {
           await logActivity(db, {
-            companyId: candidate.companyId,
+            companyId,
             actorType: "system",
             actorId: "system",
             agentId: null,
             runId: null,
-            action: "issue.permanently_unfinalizable_blocker_detected",
-            entityType: "issue",
-            entityId: candidate.id,
+            action: "issue.unfinalizable_workspace_barrier_detected",
+            entityType: "execution_workspace",
+            entityId: blocker.executionWorkspaceId,
             details: {
-              source: "recovery.list_permanently_unfinalizable_blockers",
-              identifier: candidate.identifier,
-              findings: candidateFindings.map((f) => ({
-                blockerIssueId: f.blockerIssueId,
-                executionWorkspaceId: f.executionWorkspaceId,
-                latestOp: f.latestOp,
-              })),
+              source: "recovery.reconcile_unfinalizable_workspace_barriers",
+              blockerIssueId: blocker.blockerIssueId,
+              gatedDependentIssueIds: gatedCandidateIds,
+              latestOp: blocker.latestOp,
             },
           });
         }
@@ -6019,8 +6026,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (result.reported > 0 && shouldLog) {
       lastPermanentlyUnfinalizableLogAt = now;
       logger.warn(
-        { reported: result.reported, issueIds: result.issueIds },
-        "swept permanently-unfinalizable-blocker issues (report-only)",
+        { reported: result.reported, findings: result.findings },
+        "swept unfinalizable workspace barriers (report-only)",
       );
     }
 
@@ -6038,7 +6045,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     sweepStaleIssueLocks,
     reconcileBlockedWithoutBlockers,
     reconcileStaleRecoveryActionWakes,
-    listPermanentlyUnfinalizableBlockers,
+    reconcileUnfinalizableWorkspaceBarriers,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
     reconcileIssueGraphLiveness,

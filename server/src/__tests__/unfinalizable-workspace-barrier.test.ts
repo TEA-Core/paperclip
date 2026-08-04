@@ -267,18 +267,16 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.listPermanentlyUnfinalizableBlockers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
 
     expect(result.reported).toBe(1);
-    expect(result.issueIds).toEqual([dependentId]);
-    expect(result.findings.length).toBeGreaterThanOrEqual(1);
-    const finding = result.findings.find((f) => f.dependentIssueId === dependentId);
+    expect(result.findings.length).toBe(1);
+    expect(result.findings.length).toBe(1);
+    const finding = result.findings[0];
     expect(finding).toBeDefined();
-    expect(finding!.blockerIssueId).toBe(blockerId);
-    expect(finding!.executionWorkspaceId).toBe(wsId);
-    expect(finding!.latestOp).toEqual(
-      expect.objectContaining({ phase: "workspace_finalize", status: "failed" }),
-    );
+    expect(finding.blockerIssueId).toBe(blockerId);
+    expect(finding.executionWorkspaceId).toBe(wsId);
+    expect(finding.gatedDependentIssueIds).toContain(dependentId)
   });
 
   it("reports a todo dependent gated by a permanently-unfinalizable blocker", async () => {
@@ -289,12 +287,12 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.listPermanentlyUnfinalizableBlockers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
 
     expect(result.reported).toBe(1);
-    expect(result.issueIds).toEqual([dependentId]);
-    expect(result.findings.length).toBeGreaterThanOrEqual(1);
-    const finding = result.findings.find((f) => f.dependentIssueId === dependentId);
+    expect(result.findings.length).toBe(1);
+    expect(result.findings.length).toBe(1);
+    const finding = result.findings[0];
     expect(finding).toBeDefined();
   });
 
@@ -314,10 +312,10 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedActiveRun({ companyId, agentId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.listPermanentlyUnfinalizableBlockers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
 
     expect(result.reported).toBe(0);
-    expect(result.issueIds).toEqual([]);
+    expect(result.findings).toEqual([]);
   });
 
   it("excludes a dependent whose done blocker has a successful finalize", async () => {
@@ -328,10 +326,10 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedSucceededFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.listPermanentlyUnfinalizableBlockers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
 
     expect(result.reported).toBe(0);
-    expect(result.issueIds).toEqual([]);
+    expect(result.findings).toEqual([]);
   });
 
   it("does not write issue status or wake anything (report-only)", async () => {
@@ -342,7 +340,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.listPermanentlyUnfinalizableBlockers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
 
     expect(result.reported).toBe(1);
 
@@ -362,18 +360,18 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.listPermanentlyUnfinalizableBlockers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
 
     expect(result.reported).toBe(1);
 
     const audit = await db
-      .select({ action: activityLog.action, details: activityLog.details })
+      .select({ action: activityLog.action, entityId: activityLog.entityId, details: activityLog.details })
       .from(activityLog)
-      .where(eq(activityLog.entityId, dependentId))
+      .where(eq(activityLog.entityId, wsId))
       .then((rows) => rows[0]);
-    expect(audit?.action).toBe("issue.permanently_unfinalizable_blocker_detected");
+    expect(audit?.action).toBe("issue.unfinalizable_workspace_barrier_detected");
     expect((audit?.details as Record<string, unknown> | null)?.source).toBe(
-      "recovery.list_permanently_unfinalizable_blockers",
+      "recovery.reconcile_unfinalizable_workspace_barriers",
     );
   });
 });

@@ -11825,8 +11825,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStaleRecoveryActionWakes(opts);
   }
 
-  async function listPermanentlyUnfinalizableBlockers() {
-    return recovery.listPermanentlyUnfinalizableBlockers({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+  async function reconcileUnfinalizableWorkspaceBarriers() {
+    return recovery.reconcileUnfinalizableWorkspaceBarriers({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -17277,7 +17277,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileBlockedWithoutBlockers,
     reconcileStaleRecoveryActionWakes,
 
-    listPermanentlyUnfinalizableBlockers,
+    reconcileUnfinalizableWorkspaceBarriers,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 

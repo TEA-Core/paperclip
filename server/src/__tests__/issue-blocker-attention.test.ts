@@ -1158,16 +1158,17 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
 
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
-    const result = await recovery.listPermanentlyUnfinalizableBlockers({ companyId });
+    const result = await recovery.reconcileUnfinalizableWorkspaceBarriers({ companyId });
 
     expect(result.reported).toBe(1);
-    expect(result.issueIds).toContain(blockedId);
+    expect(result.findings.length).toBe(1)
+    expect(result.findings[0].gatedDependentIssueIds).toContain(blockedId);
 
     const logEntries = await db.select().from(activityLog).where(
-      eq(activityLog.action, "issue.permanently_unfinalizable_blocker_detected")
+      eq(activityLog.action, "issue.unfinalizable_workspace_barrier_detected")
     );
     expect(logEntries).toHaveLength(1);
-    expect(logEntries[0].entityId).toBe(blockedId);
+    expect(logEntries[0].entityId).toBe(executionWorkspaceId);
   });
 
   it("does not report when workspace finalize succeeded", async () => {
@@ -1202,7 +1203,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
 
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
-    const result = await recovery.listPermanentlyUnfinalizableBlockers({ companyId });
+    const result = await recovery.reconcileUnfinalizableWorkspaceBarriers({ companyId });
 
     expect(result.reported).toBe(0);
   });
@@ -1227,7 +1228,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await block({ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId });
 
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
-    const result = await recovery.listPermanentlyUnfinalizableBlockers({ companyId });
+    const result = await recovery.reconcileUnfinalizableWorkspaceBarriers({ companyId });
 
     expect(result.reported).toBe(0);
   });
@@ -1264,7 +1265,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
 
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
-    const result = await recovery.listPermanentlyUnfinalizableBlockers({ companyId });
+    const result = await recovery.reconcileUnfinalizableWorkspaceBarriers({ companyId });
 
     expect(result.reported).toBe(0);
   });
