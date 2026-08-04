@@ -38,6 +38,7 @@ const mockConfig = vi.hoisted(() => ({
 vi.mock("../config.ts", () => ({ loadConfig: () => mockConfig }));
 
 import { heartbeatService } from "../services/heartbeat.ts";
+import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -373,5 +374,205 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     expect((audit?.details as Record<string, unknown> | null)?.source).toBe(
       "recovery.reconcile_unfinalizable_workspace_barriers",
     );
+  });
+
+  it("reports a dependent whose blocker is cancelled (terminal) with a failed finalize", async () => {
+    const { companyId, agentId, projectId } = await seedCompanyAndAgent();
+    const wsId = randomUUID();
+    const blockerId = await seedBlocker({
+      companyId,
+      projectId,
+      executionWorkspaceId: wsId,
+      status: "cancelled",
+    });
+    const dependentId = await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
+    await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+
+    expect(result.reported).toBe(1);
+    expect(result.findings.length).toBe(1);
+    const finding = result.findings[0];
+    expect(finding).toBeDefined();
+    expect(finding.blockerIssueId).toBe(blockerId);
+    expect(finding.executionWorkspaceId).toBe(wsId);
+    expect(finding.gatedDependentIssueIds).toContain(dependentId);
+  });
+
+  it("does not report a blocker with no workspace operations at all", async () => {
+    const { companyId, agentId, projectId } = await seedCompanyAndAgent();
+    const wsId = randomUUID();
+    const blockerId = await seedBlocker({ companyId, projectId, executionWorkspaceId: wsId, status: "done" });
+    const dependentId = await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+
+    expect(result.reported).toBe(0);
+    expect(result.findings).toEqual([]);
+  });
+
+  it("does not report a blocker whose latest op is a provision-phase succeeded op", async () => {
+    const { companyId, agentId, projectId } = await seedCompanyAndAgent();
+    const wsId = randomUUID();
+    const blockerId = await seedBlocker({ companyId, projectId, executionWorkspaceId: wsId, status: "done" });
+    const dependentId = await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
+    await db.insert(workspaceOperations).values({
+      id: randomUUID(),
+      companyId,
+      executionWorkspaceId: wsId,
+      phase: "provision",
+      status: "succeeded",
+      startedAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+
+    expect(result.reported).toBe(0);
+    expect(result.findings).toEqual([]);
+  });
+
+  it("keeps listDependencyReadiness unchanged for a permanently-unfinalizable blocker (gate still holds)", async () => {
+    const { companyId, agentId, projectId } = await seedCompanyAndAgent();
+    const wsId = randomUUID();
+    const blockerId = await seedBlocker({ companyId, projectId, executionWorkspaceId: wsId, status: "done" });
+    const dependentId = await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
+    await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
+
+    const svc = issueService(db);
+    const readinessMap = await svc.listDependencyReadiness(companyId, [dependentId]);
+    const readiness = readinessMap.get(dependentId);
+    expect(readiness).toBeDefined();
+    expect(readiness!.blockerIssueIds).toContain(blockerId);
+    expect(readiness!.unresolvedBlockerIssueIds).toContain(blockerId);
+    expect(readiness!.unresolvedBlockerCount).toBe(1);
+    expect(readiness!.pendingFinalizeBlockerIssueIds).toContain(blockerId);
+    expect(readiness!.allBlockersDone).toBe(false);
+    expect(readiness!.isDependencyReady).toBe(false);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    expect(result.reported).toBe(1);
+
+    const readinessMapAfter = await svc.listDependencyReadiness(companyId, [dependentId]);
+    const readinessAfter = readinessMapAfter.get(dependentId);
+    expect(readinessAfter).toBeDefined();
+    expect(readinessAfter!.blockerIssueIds).toEqual(readiness!.blockerIssueIds);
+    expect(readinessAfter!.unresolvedBlockerIssueIds).toEqual(readiness!.unresolvedBlockerIssueIds);
+    expect(readinessAfter!.unresolvedBlockerCount).toBe(readiness!.unresolvedBlockerCount);
+    expect(readinessAfter!.pendingFinalizeBlockerIssueIds).toEqual(readiness!.pendingFinalizeBlockerIssueIds);
+    expect(readinessAfter!.allBlockersDone).toBe(readiness!.allBlockersDone);
+    expect(readinessAfter!.isDependencyReady).toBe(readiness!.isDependencyReady);
+  });
+
+  it("performs no writes to workspace_operations or issues (report-only)", async () => {
+    const { companyId, agentId, projectId } = await seedCompanyAndAgent();
+    const wsId = randomUUID();
+    const blockerId = await seedBlocker({ companyId, projectId, executionWorkspaceId: wsId, status: "done" });
+    const dependentId = await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
+    await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
+
+    const opsBefore = await db
+      .select({ id: workspaceOperations.id })
+      .from(workspaceOperations)
+      .where(eq(workspaceOperations.executionWorkspaceId, wsId));
+    const blockerBefore = await db
+      .select({ id: issues.id, status: issues.status, executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, blockerId))
+      .then((rows) => rows[0]);
+    const dependentBefore = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, dependentId))
+      .then((rows) => rows[0]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    expect(result.reported).toBe(1);
+
+    const opsAfter = await db
+      .select({ id: workspaceOperations.id })
+      .from(workspaceOperations)
+      .where(eq(workspaceOperations.executionWorkspaceId, wsId));
+    expect(opsAfter.length).toBe(opsBefore.length);
+
+    const blockerAfter = await db
+      .select({ id: issues.id, status: issues.status, executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, blockerId))
+      .then((rows) => rows[0]);
+    expect(blockerAfter).toEqual(blockerBefore);
+
+    const dependentAfter = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, dependentId))
+      .then((rows) => rows[0]);
+    expect(dependentAfter).toEqual(dependentBefore);
+  });
+
+  it("reports exactly one finding for the e0036165 fixture (SUP-10197 + four gated dependents)", async () => {
+    const { companyId, agentId, projectId } = await seedCompanyAndAgent();
+    const wsId = "e0036165-c342-4eb9-a382-8da6ed199ea0";
+    const blockerId = await seedBlocker({ companyId, projectId, executionWorkspaceId: wsId, status: "done" });
+    const depBlocked1 = await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
+    const depTodo = await seedDependent({ companyId, agentId, blockerId, status: "todo" });
+    const depBlocked2 = await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
+    const depBlocked3 = await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
+
+    const finalizeStartedAt = new Date("2026-08-02T18:34:17.182Z");
+    await db.insert(workspaceOperations).values([
+      {
+        id: randomUUID(),
+        companyId,
+        executionWorkspaceId: wsId,
+        phase: "checkout",
+        status: "succeeded",
+        startedAt: new Date("2026-08-02T17:39:52Z"),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        executionWorkspaceId: wsId,
+        phase: "workspace_finalize",
+        status: "failed",
+        startedAt: finalizeStartedAt,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+
+    expect(result.reported).toBe(1);
+    expect(result.findings.length).toBe(1);
+    const finding = result.findings[0];
+    expect(finding).toBeDefined();
+    expect(finding.blockerIssueId).toBe(blockerId);
+    expect(finding.executionWorkspaceId).toBe(wsId);
+    expect(finding.gatedDependentIssueIds).toHaveLength(4);
+    expect(finding.gatedDependentIssueIds).toEqual(
+      expect.arrayContaining([depBlocked1, depTodo, depBlocked2, depBlocked3]),
+    );
+
+    const audit = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, wsId))
+      .then((rows) => rows[0]);
+    expect(audit?.action).toBe("issue.unfinalizable_workspace_barrier_detected");
+    const details = audit?.details as Record<string, unknown> | null;
+    expect(details?.latestOp).toBeDefined();
+    expect((details?.latestOp as Record<string, unknown>)?.phase).toBe("workspace_finalize");
+    expect((details?.latestOp as Record<string, unknown>)?.status).toBe("failed");
+    expect((details?.latestOp as Record<string, unknown>)?.startedAt).toBe(finalizeStartedAt.toISOString());
   });
 });
