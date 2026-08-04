@@ -2473,11 +2473,21 @@ async function listIssueBlockerAttentionMap(
   for (const root of roots) {
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
     if (topLevelEdges.length === 0) {
-      attentionMap.set(root.id, createIssueBlockerAttention({
-        state: "needs_attention",
-        reason: "attention_required",
-        computed: true,
-      }));
+      if (explicitWaitingIssueIds.has(root.id)) {
+        attentionMap.set(root.id, createIssueBlockerAttention({
+          state: "covered",
+          reason: "active_dependency",
+          computed: true,
+          unresolvedBlockerCount: 0,
+          coveredBlockerCount: 0,
+        }));
+      } else {
+        attentionMap.set(root.id, createIssueBlockerAttention({
+          state: "needs_attention",
+          reason: "attention_required",
+          computed: true,
+        }));
+      }
       continue;
     }
 

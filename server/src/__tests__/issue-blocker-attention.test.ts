@@ -11,6 +11,7 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueRelations,
+  issueRecoveryActions,
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
@@ -48,6 +49,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issueRecoveryActions);
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(agents);
@@ -389,6 +391,57 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       coveredBlockerCount: 0,
       attentionBlockerCount: 1,
       sampleBlockerIdentifier: "PBX-2",
+    });
+  });
+
+  it("classifies a zero-edge blocked issue with an active recovery action as covered", async () => {
+    const { companyId, agentId } = await createCompany("PZR");
+    const parentId = await insertIssue({
+      companyId,
+      identifier: "PZR-1",
+      title: "Blocked with no edges but active recovery",
+      status: "blocked",
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: parentId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      cause: "test_recovery",
+      fingerprint: "test-fingerprint",
+      nextAction: "observe",
+    });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 0,
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 0,
+    });
+  });
+
+  it("classifies a zero-edge blocked issue without an active recovery action as needs_attention", async () => {
+    const { companyId } = await createCompany("PZU");
+    const parentId = await insertIssue({
+      companyId,
+      identifier: "PZU-1",
+      title: "Blocked with no edges and no recovery",
+      status: "blocked",
+    });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 0,
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 0,
     });
   });
 
