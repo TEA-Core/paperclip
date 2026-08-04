@@ -6554,7 +6554,8 @@ export function issueService(db: Db) {
             .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
             .then((rows) => rows[0]?.defaultExecutionPolicy ?? null);
           if (projectDefaultPolicy) {
-            issueData.executionPolicy = normalizeIssueExecutionPolicy(projectDefaultPolicy);
+            const normalized = normalizeIssueExecutionPolicy(projectDefaultPolicy);
+            issueData.executionPolicy = (normalized as Record<string, unknown> | null) ?? null;
           }
         }
         // Cache the project policy lookup for this insert so the default
