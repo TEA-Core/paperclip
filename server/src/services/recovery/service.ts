@@ -5901,8 +5901,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
    * Report-only sweep for issues that are gated by a permanently-unfinalizable
    * blocker — a blocker whose execution workspace has permanently failed the
    * workspace_finalize barrier (latest `workspace_operations` row for the
-   * blocker's `executionWorkspaceId` is NOT `workspace_finalize`+`succeeded`,
-   * and no live run holds that workspace).
+   * blocker's `executionWorkspaceId` IS a `workspace_finalize` attempt that did
+   * NOT succeed, and no live run holds that workspace).
    *
    * This sweep does NOT heal or wake anything; it only reports via activity
    * log and logger so operators can triage permanently-stuck dependency chains.

@@ -1010,11 +1010,11 @@ export async function listUnfinalizedExecutionWorkspaceIds(
 
 /**
  * Returns blockers whose execution workspace has permanently failed the
- * workspace_finalize barrier — i.e. the latest `workspace_operations` row for
- * the blocker's `executionWorkspaceId` is NOT `workspace_finalize`+`succeeded`,
- * AND no live run holds that workspace (the blocker's `checkoutRunId` and
- * `executionRunId` are null, and no non-terminal heartbeat run references the
- * workspace via `workspace_operations`).
+ * workspace_finalize barrier - i.e. the latest `workspace_operations` row for
+ * the blocker's `executionWorkspaceId` IS a `workspace_finalize` attempt that
+ * did NOT succeed, AND no live run holds that workspace (the blocker's
+ * `checkoutRunId` and `executionRunId` are null, and no non-terminal heartbeat
+ * run references the workspace via `workspace_operations`).
  *
  * A barrier is *permanently unfinalizable* when ALL of:
  * 1. blocker issue status is terminal (`done` or `cancelled`), and
