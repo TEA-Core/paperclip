@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, inArray, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -1006,6 +1006,193 @@ export async function listUnfinalizedExecutionWorkspaceIds(
   }
 
   return unfinalized;
+}
+
+/**
+ * Returns blockers whose execution workspace has permanently failed the
+ * workspace_finalize barrier - i.e. the latest `workspace_operations` row for
+ * the blocker's `executionWorkspaceId` IS a `workspace_finalize` attempt that
+ * did NOT succeed, AND no live run holds that workspace (the blocker's
+ * `checkoutRunId` and `executionRunId` are null, and no non-terminal heartbeat
+ * run references the workspace via `workspace_operations`).
+ *
+ * A barrier is *permanently unfinalizable* when ALL of:
+ * 1. blocker issue status is terminal (`done` or `cancelled`), and
+ * 2. latest `workspace_operations` row for its `executionWorkspaceId` IS a
+ *    `workspace_finalize` attempt that did NOT succeed, and
+ * 3. no live run holds that workspace (blocker's `checkoutRunId` and
+ *    `executionRunId` are null, and no non-terminal run references the workspace).
+ *
+ * Workspaces whose latest op IS `workspace_finalize`+`succeeded`, that have no
+ * recorded ops, or whose latest op is some other phase (finalize was never
+ * attempted, e.g. still mid-provision) are NOT returned. Workspaces held by a
+ * live run are also excluded — the run may still finalize the workspace.
+ */
+export async function listPermanentlyUnfinalizableBlockers(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  opts?: { issueCreatedAtGte?: Date | null },
+): Promise<
+  Array<{
+    executionWorkspaceId: string;
+    blockerIssueId: string;
+    latestOp: { phase: string; status: string; startedAt: Date } | null;
+    gatedDependentIssueIds: string[];
+  }>
+> {
+  const blockerRows = await dbOrTx
+    .select({
+      blockerIssueId: issues.id,
+      executionWorkspaceId: issues.executionWorkspaceId,
+      checkoutRunId: issues.checkoutRunId,
+      executionRunId: issues.executionRunId,
+      createdAt: issues.createdAt,
+    })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        inArray(issues.status, ["done", "cancelled"]),
+        isNotNull(issues.executionWorkspaceId),
+        opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : sql`true`,
+      ),
+    );
+
+  if (blockerRows.length === 0) return [];
+
+  // `executionWorkspaceId` is nullable on the column but the query filters
+  // `isNotNull`, so this narrowing never drops a row at runtime.
+  const executionWorkspaceIds = [
+    ...new Set(
+      blockerRows
+        .map((row) => row.executionWorkspaceId)
+        .filter((id): id is string => id !== null),
+    ),
+  ];
+
+  const opRows = await dbOrTx
+    .select({
+      executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+      heartbeatRunId: workspaceOperations.heartbeatRunId,
+      phase: workspaceOperations.phase,
+      status: workspaceOperations.status,
+      startedAt: workspaceOperations.startedAt,
+    })
+    .from(workspaceOperations)
+    .where(
+      and(
+        eq(workspaceOperations.companyId, companyId),
+        inArray(workspaceOperations.executionWorkspaceId, executionWorkspaceIds),
+      ),
+    );
+
+  const latestOpByWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
+  const liveRunByWorkspace = new Map<string, boolean>();
+  for (const row of opRows) {
+    if (!row.executionWorkspaceId) continue;
+    const current = latestOpByWorkspace.get(row.executionWorkspaceId);
+    if (!current || row.startedAt > current.startedAt) {
+      latestOpByWorkspace.set(row.executionWorkspaceId, {
+        phase: row.phase,
+        status: row.status,
+        startedAt: row.startedAt,
+      });
+    }
+  }
+
+  const nonTerminalRunIds = new Set<string>();
+  for (const row of opRows) {
+    if (!row.heartbeatRunId || !row.executionWorkspaceId) continue;
+    const current = liveRunByWorkspace.get(row.executionWorkspaceId);
+    if (current === undefined) {
+      liveRunByWorkspace.set(row.executionWorkspaceId, false);
+    }
+  }
+
+  const runStatusRows = await dbOrTx
+    .select({
+      id: heartbeatRuns.id,
+      status: heartbeatRuns.status,
+    })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, companyId),
+        inArray(
+          heartbeatRuns.id,
+          [...new Set(opRows.map((row) => row.heartbeatRunId).filter(Boolean))] as string[],
+        ),
+      ),
+    );
+
+  for (const runRow of runStatusRows) {
+    if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(runRow.status)) {
+      nonTerminalRunIds.add(runRow.id);
+    }
+  }
+
+  for (const row of opRows) {
+    if (!row.executionWorkspaceId || !row.heartbeatRunId) continue;
+    if (nonTerminalRunIds.has(row.heartbeatRunId)) {
+      liveRunByWorkspace.set(row.executionWorkspaceId, true);
+    }
+  }
+
+  const result: Array<{
+    executionWorkspaceId: string;
+    blockerIssueId: string;
+    latestOp: { phase: string; status: string; startedAt: Date } | null;
+    gatedDependentIssueIds: string[];
+  }> = [];
+
+  const blockerIds = [...new Set(blockerRows.map((row) => row.blockerIssueId))];
+
+  const dependentRows = await dbOrTx
+    .select({
+      dependentIssueId: issueRelations.relatedIssueId,
+      blockerIssueId: issueRelations.issueId,
+    })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.type, "blocks"),
+        inArray(issueRelations.issueId, blockerIds),
+        notInArray(issues.status, ["done", "cancelled"]),
+      ),
+    );
+
+  const gatedDependentsByBlocker = new Map<string, string[]>();
+  for (const row of dependentRows) {
+    const dependents = gatedDependentsByBlocker.get(row.blockerIssueId) ?? [];
+    dependents.push(row.dependentIssueId);
+    gatedDependentsByBlocker.set(row.blockerIssueId, dependents);
+  }
+
+  for (const blockerRow of blockerRows) {
+    const { executionWorkspaceId, blockerIssueId, checkoutRunId, executionRunId } = blockerRow;
+    if (!executionWorkspaceId) continue;
+
+    const latest = latestOpByWorkspace.get(executionWorkspaceId);
+    // Only a workspace whose latest op is itself a non-succeeded workspace_finalize
+    // attempt is a barrier — no ops, or a latest op that never reached finalize
+    // (e.g. still mid-provision), means finalize simply hasn't been attempted yet.
+    if (!latest || latest.phase !== "workspace_finalize" || latest.status === "succeeded") continue;
+
+    if (checkoutRunId !== null || executionRunId !== null) continue;
+
+    if (liveRunByWorkspace.get(executionWorkspaceId) === true) continue;
+
+    result.push({
+      executionWorkspaceId,
+      blockerIssueId,
+      latestOp: latest ?? null,
+      gatedDependentIssueIds: gatedDependentsByBlocker.get(blockerIssueId) ?? [],
+    });
+  }
+
+  return result;
 }
 
 async function listPendingFinalizeBlockerIssueIds(

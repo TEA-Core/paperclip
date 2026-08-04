@@ -472,9 +472,38 @@ export const createIssueLabelSchema = z.object({
 
 export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 
-export const updateIssueSchema = createIssueBaseSchema.omit({
-  createdByUserId: true,
-  responsibleUserId: true,
+/**
+ * Attribution is create-only, but "create-only" is not the same failure class as a misspelled key.
+ * `blockedBy` for `blockedByIssueIds` is a caller bug with no correct reading, so it must 400 (see
+ * `createIssueBaseSchema`). `createdByUserId` on an update is a *known* server-owned field that a
+ * caller round-tripping a full issue object — GET, edit one field, PATCH — legitimately carries,
+ * and the only sensible reading is "ignore it". Rejecting that breaks every such client, so these
+ * keys are accepted for shape and then dropped from the parsed output.
+ */
+export const ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS = ["createdByUserId", "responsibleUserId"] as const;
+
+/**
+ * Drops the create-only attribution keys from an update payload after validation.
+ *
+ * Dropping rather than merely undefining is load-bearing: the PATCH handler rest-spreads the
+ * parsed body into the column update (`...updateFields` in `server/src/routes/issues.ts`), so a
+ * key left present — zod keeps a key whose validator yields `undefined` when the key was supplied —
+ * would reach the write path. Deleting it keeps attribution unmutable exactly as `.omit()` did.
+ */
+export function stripCreateOnlyIssueAttribution<Schema extends z.ZodObject<z.ZodRawShape>>(schema: Schema) {
+  return schema.transform((value) => {
+    const next: Record<string, unknown> = { ...value };
+    for (const key of ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS) delete next[key];
+    return next as Omit<z.infer<Schema>, (typeof ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS)[number]>;
+  });
+}
+
+/**
+ * ZodObject form of the update payload, for consumers that need `.extend()` / `.merge()` /
+ * `.partial()` — those methods do not exist on the transformed schema. Anything that parses a real
+ * update payload must wrap this with `stripCreateOnlyIssueAttribution`.
+ */
+export const updateIssueObjectSchema = createIssueBaseSchema.omit({
   watchdog: true,
 }).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
@@ -486,6 +515,8 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
 });
+
+export const updateIssueSchema = stripCreateOnlyIssueAttribution(updateIssueObjectSchema);
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
 export type IssueExecutionWorkspaceSettings = z.infer<typeof issueExecutionWorkspaceSettingsSchema>;
