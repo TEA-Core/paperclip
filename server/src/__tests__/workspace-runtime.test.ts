@@ -25,6 +25,7 @@ import {
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
+  assertWorktreeWritableByProcessUser,
   buildWorkspaceRuntimeDesiredStatePatch,
   cleanupExecutionWorkspaceArtifacts,
   ensurePersistedExecutionWorkspaceAvailable,
@@ -350,6 +351,57 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
   await resetRuntimeServicesForTests();
+});
+
+describe("assertWorktreeWritableByProcessUser", () => {
+  it("resolves when the worktree and all tracked files are writable", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10633-writable-guard";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    await expect(assertWorktreeWritableByProcessUser(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("throws when the worktree directory itself is not writable", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10633-dir-not-writable";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await fs.chmod(worktreePath, 0o555);
+
+    try {
+      await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(/not writable/);
+    } finally {
+      await fs.chmod(worktreePath, 0o755);
+    }
+  });
+
+  it("throws when a tracked file is not writable", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10633-file-not-writable";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await fs.writeFile(path.join(worktreePath, "README.md"), "hello\n", "utf8");
+    await fs.chmod(path.join(worktreePath, "README.md"), 0o444);
+
+    try {
+      await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(/not writable/);
+    } finally {
+      await fs.chmod(path.join(worktreePath, "README.md"), 0o644);
+    }
+  });
+
+  it("throws when the path is not a valid git repository", async () => {
+    const nonRepoPath = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-non-repo-"));
+
+    await expect(assertWorktreeWritableByProcessUser(nonRepoPath)).rejects.toThrow(
+      /not a valid git repository or is missing/,
+    );
+  });
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {
@@ -827,7 +879,51 @@ describe("realizeExecutionWorkspace", () => {
           companyId: "company-1",
         },
       }),
-    ).rejects.toThrow(/not a reusable git worktree \(path is not registered in `git worktree list`\)\./);
+     ).rejects.toThrow(/not a reusable git worktree \(path is not registered in `git worktree list`\)\./);
+  });
+
+  it("rejects provisioning a worktree that is not writable", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-999-non-writable";
+
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await fs.chmod(worktreePath, 0o555);
+
+    try {
+      await expect(
+        realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-1",
+            workspaceId: "workspace-1",
+            repoUrl: null,
+            repoRef: "HEAD",
+          },
+          config: {
+            workspaceStrategy: {
+              type: "git_worktree",
+              branchTemplate: branchName,
+              provisionCommand: "bash ./scripts/provision.sh",
+            },
+          },
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-999",
+            title: "Non-writable worktree",
+          },
+          agent: {
+            id: "agent-1",
+            name: "Codex Coder",
+            companyId: "company-1",
+          },
+        }),
+      ).rejects.toThrow(/not writable/);
+    } finally {
+      await fs.chmod(worktreePath, 0o755);
+    }
   });
 
   it("reuses the current linked worktree instead of nesting another worktree inside it", async () => {
