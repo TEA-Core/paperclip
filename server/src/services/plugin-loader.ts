@@ -2174,12 +2174,16 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       const jobDeclarations = manifest.jobs ?? [];
       if (jobDeclarations.length > 0) {
-        await jobStore.syncJobDeclarations(pluginId, jobDeclarations);
+        // One row per (company, job) — see syncJobDeclarations. Resolve the
+        // enabled-company set here so a job dispatched later carries a scope.
+        const jobCompanyIds = await registry.listEnabledCompanyIds(pluginId);
+
+        await jobStore.syncJobDeclarations(pluginId, jobDeclarations, jobCompanyIds);
         await jobScheduler.registerPlugin(pluginId);
         registered.jobs = jobDeclarations.length;
 
         log.info(
-          { pluginId, pluginKey, jobs: jobDeclarations.length },
+          { pluginId, pluginKey, jobs: jobDeclarations.length, companies: jobCompanyIds.length },
           "plugin-loader: job declarations synced and plugin registered with scheduler",
         );
       }

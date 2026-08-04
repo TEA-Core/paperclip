@@ -16,8 +16,13 @@ import type { PluginJobStatus, PluginJobRunStatus, PluginJobRunTrigger } from "@
  * `plugin_jobs` table — registration and runtime configuration for
  * scheduled jobs declared by plugins in their manifests.
  *
- * Each row represents one scheduled job entry for a plugin. The
- * `job_key` matches the key declared in the manifest's `jobs` array.
+ * Each row represents one scheduled job entry for a plugin **in one
+ * company**. The `job_key` matches the key declared in the manifest's
+ * `jobs` array, and a manifest declaration is fanned out to one row per
+ * company the plugin is enabled for — that is what gives a scheduled run
+ * a company scope, so `ctx.config.get()` and `ctx.issues.list()` work
+ * from inside a job handler.
+ *
  * The `schedule` column stores the cron expression or interval string
  * used by the job scheduler to decide when to fire the job.
  *
@@ -36,6 +41,14 @@ export const pluginJobs = pgTable(
     pluginId: uuid("plugin_id")
       .notNull()
       .references(() => plugins.id, { onDelete: "cascade" }),
+    /**
+     * Company scope for this job row. Cascades on delete.
+     *
+     * Nullable only to carry pre-fan-out rows through the migration — those
+     * legacy rows are paused on the next job sync and never dispatched. Every
+     * row created after that migration has a company.
+     */
+    companyId: uuid("company_id").references(() => companies.id, { onDelete: "cascade" }),
     /** Identifier matching the key in the plugin manifest's `jobs` array. */
     jobKey: text("job_key").notNull(),
     /** Cron expression (e.g. `"0 * * * *"`) or interval string. */
@@ -51,8 +64,13 @@ export const pluginJobs = pgTable(
   },
   (table) => ({
     pluginIdx: index("plugin_jobs_plugin_idx").on(table.pluginId),
+    companyIdx: index("plugin_jobs_company_idx").on(table.companyId),
     nextRunIdx: index("plugin_jobs_next_run_idx").on(table.nextRunAt),
-    uniqueJobIdx: uniqueIndex("plugin_jobs_unique_idx").on(table.pluginId, table.jobKey),
+    uniqueJobIdx: uniqueIndex("plugin_jobs_unique_idx").on(
+      table.pluginId,
+      table.companyId,
+      table.jobKey,
+    ),
   }),
 );
 

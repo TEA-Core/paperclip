@@ -10,8 +10,10 @@
  *
  * 1. **Sync job declarations** — When a plugin is installed or started, the
  *    host calls `syncJobDeclarations()` to upsert the manifest's declared jobs
- *    into the `plugin_jobs` table. Jobs removed from the manifest are marked
- *    `paused` (not deleted) to preserve history.
+ *    into the `plugin_jobs` table, fanned out to one row per company the
+ *    plugin is enabled for. Jobs removed from the manifest — and rows for
+ *    companies no longer enabled — are marked `paused` (not deleted) to
+ *    preserve history.
  *
  * 2. **Job CRUD** — List, get, pause, and resume jobs for a given plugin.
  *
@@ -60,6 +62,8 @@ export interface CreateJobRunInput {
   jobId: string;
   /** FK to the plugins row. */
   pluginId: string;
+  /** Company this run is scoped to. Null only for legacy unscoped job rows. */
+  companyId?: string | null;
   /** What triggered this run. */
   trigger: PluginJobRunTrigger;
 }
@@ -87,11 +91,13 @@ export interface CompleteJobRunInput {
  * ```ts
  * const jobStore = pluginJobStore(db);
  *
- * // On plugin install/start — sync declared jobs into the DB
- * await jobStore.syncJobDeclarations(pluginId, manifest.jobs ?? []);
+ * // On plugin install/start — sync declared jobs into the DB, one row per
+ * // company the plugin is enabled for
+ * const companyIds = await registry.listEnabledCompanyIds(pluginId);
+ * await jobStore.syncJobDeclarations(pluginId, manifest.jobs ?? [], companyIds);
  *
  * // Before dispatching a runJob RPC — create a run record
- * const run = await jobStore.createRun({ jobId, pluginId, trigger: "schedule" });
+ * const run = await jobStore.createRun({ jobId, pluginId, companyId, trigger: "schedule" });
  *
  * // After the RPC completes — record the result
  * await jobStore.completeRun(run.id, {
@@ -125,25 +131,33 @@ export function pluginJobStore(db: Db) {
     // =====================================================================
 
     /**
-     * Sync declared jobs from a plugin manifest into the `plugin_jobs` table.
+     * Sync declared jobs from a plugin manifest into the `plugin_jobs` table,
+     * fanned out across the companies the plugin is enabled for.
      *
-     * This is called at plugin install and on each worker startup so the DB
-     * always reflects the manifest's declared jobs:
+     * A manifest declares a job once; the scheduler needs one row per company
+     * so each dispatch carries a company scope (SUP-10856). This is called at
+     * plugin install and on each worker startup so the DB always reflects the
+     * manifest crossed with the current enabled-company set:
      *
-     * - **New jobs** are inserted with status `active`.
-     * - **Existing jobs** have their `schedule` updated if it changed.
-     * - **Removed jobs** (present in DB but absent from the manifest) are
-     *   set to `paused` so their history is preserved.
+     * - **New (company, job) pairs** are inserted with status `active`.
+     * - **Existing pairs** have their `schedule` updated if it changed.
+     * - **Rows whose job is no longer declared, or whose company is no longer
+     *   enabled**, are set to `paused` so their run history is preserved.
+     * - **Legacy rows with no company** (created before the fan-out) are
+     *   paused for the same reason — they can never be dispatched safely
+     *   because there is no company to attribute the run to.
      *
-     * The unique constraint `(pluginId, jobKey)` is used for conflict
-     * resolution.
+     * The unique constraint `(pluginId, companyId, jobKey)` is used for
+     * conflict resolution.
      *
      * @param pluginId - UUID of the owning plugin
      * @param declarations - Job declarations from the plugin manifest
+     * @param companyIds - Companies the plugin is enabled for
      */
     async syncJobDeclarations(
       pluginId: string,
       declarations: PluginJobDeclaration[],
+      companyIds: string[],
     ): Promise<void> {
       await assertPluginExists(pluginId);
 
@@ -153,49 +167,63 @@ export function pluginJobStore(db: Db) {
         .from(pluginJobs)
         .where(eq(pluginJobs.pluginId, pluginId));
 
+      const rowKey = (companyId: string, jobKey: string) => `${companyId}:${jobKey}`;
+
       const existingByKey = new Map(
-        existingJobs.map((j) => [j.jobKey, j]),
+        existingJobs
+          .filter((j) => j.companyId !== null)
+          .map((j) => [rowKey(j.companyId!, j.jobKey), j]),
       );
 
       const declaredKeys = new Set<string>();
 
-      // Upsert each declared job
-      for (const decl of declarations) {
-        declaredKeys.add(decl.jobKey);
+      // Upsert each declared job, once per enabled company
+      for (const companyId of companyIds) {
+        for (const decl of declarations) {
+          const key = rowKey(companyId, decl.jobKey);
+          declaredKeys.add(key);
 
-        const existing = existingByKey.get(decl.jobKey);
-        const schedule = decl.schedule ?? "";
+          const existing = existingByKey.get(key);
+          const schedule = decl.schedule ?? "";
 
-        if (existing) {
-          // Update schedule if it changed; re-activate if it was paused
-          const updates: Record<string, unknown> = {
-            updatedAt: new Date(),
-          };
-          if (existing.schedule !== schedule) {
-            updates.schedule = schedule;
+          if (existing) {
+            // Update schedule if it changed; re-activate if it was paused
+            const updates: Record<string, unknown> = {
+              updatedAt: new Date(),
+            };
+            if (existing.schedule !== schedule) {
+              updates.schedule = schedule;
+            }
+            if (existing.status === "paused") {
+              updates.status = "active";
+            }
+
+            await db
+              .update(pluginJobs)
+              .set(updates)
+              .where(eq(pluginJobs.id, existing.id));
+          } else {
+            // Insert new job
+            await db.insert(pluginJobs).values({
+              pluginId,
+              companyId,
+              jobKey: decl.jobKey,
+              schedule,
+              status: "active",
+            });
           }
-          if (existing.status === "paused") {
-            updates.status = "active";
-          }
-
-          await db
-            .update(pluginJobs)
-            .set(updates)
-            .where(eq(pluginJobs.id, existing.id));
-        } else {
-          // Insert new job
-          await db.insert(pluginJobs).values({
-            pluginId,
-            jobKey: decl.jobKey,
-            schedule,
-            status: "active",
-          });
         }
       }
 
-      // Pause jobs that are no longer declared in the manifest
+      // Pause rows that no longer correspond to a declared job in an enabled
+      // company. Covers three cases at once: the job was dropped from the
+      // manifest, the company was disabled, and legacy rows with no company.
       for (const existing of existingJobs) {
-        if (!declaredKeys.has(existing.jobKey) && existing.status !== "paused") {
+        const stillDeclared =
+          existing.companyId !== null &&
+          declaredKeys.has(rowKey(existing.companyId, existing.jobKey));
+
+        if (!stillDeclared && existing.status !== "paused") {
           await db
             .update(pluginJobs)
             .set({ status: "paused", updatedAt: new Date() })
@@ -225,14 +253,20 @@ export function pluginJobStore(db: Db) {
     },
 
     /**
-     * Get a single job by its composite key `(pluginId, jobKey)`.
+     * Get a single job by its composite key `(pluginId, companyId, jobKey)`.
+     *
+     * `(pluginId, jobKey)` alone no longer identifies one row — a manifest
+     * declaration fans out to one row per enabled company — so the company is
+     * required rather than letting an arbitrary tenant's row come back.
      *
      * @param pluginId - UUID of the owning plugin
+     * @param companyId - Company whose copy of the job to fetch
      * @param jobKey - Stable job identifier from the manifest
      * @returns The job row, or `null` if not found
      */
     async getJobByKey(
       pluginId: string,
+      companyId: string,
       jobKey: string,
     ): Promise<(typeof pluginJobs.$inferSelect) | null> {
       const rows = await db
@@ -241,6 +275,7 @@ export function pluginJobStore(db: Db) {
         .where(
           and(
             eq(pluginJobs.pluginId, pluginId),
+            eq(pluginJobs.companyId, companyId),
             eq(pluginJobs.jobKey, jobKey),
           ),
         );
@@ -356,6 +391,7 @@ export function pluginJobStore(db: Db) {
         .values({
           jobId: input.jobId,
           pluginId: input.pluginId,
+          companyId: input.companyId ?? null,
           trigger: input.trigger,
           status: "queued",
         })
