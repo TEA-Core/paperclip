@@ -39,7 +39,12 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { IssueDependencyReadiness, TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import {
+  IssueDependencyReadiness,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+  issueService,
+  listPermanentlyUnfinalizableBlockers as listPermanentlyUnfinalizableBlockersFromIssues,
+} from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
   normalizeIssueExecutionPolicy,
@@ -5888,6 +5893,140 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  const PERMANENTLY_UNFINALIZABLE_BLOCKERS_CANDIDATE_LIMIT = 500;
+  const PERMANENTLY_UNFINALIZABLE_RELOG_INTERVAL_MS = 15 * 60_000;
+  let lastPermanentlyUnfinalizableLogAt: Date | null = null;
+
+  /**
+   * Report-only sweep for issues that are gated by a permanently-unfinalizable
+   * blocker — a blocker whose execution workspace has permanently failed the
+   * workspace_finalize barrier (latest `workspace_operations` row for the
+   * blocker's `executionWorkspaceId` is NOT `workspace_finalize`+`succeeded`,
+   * and no live run holds that workspace).
+   *
+   * This sweep does NOT heal or wake anything; it only reports via activity
+   * log and logger so operators can triage permanently-stuck dependency chains.
+   */
+  async function listPermanentlyUnfinalizableBlockers(opts?: {
+    issueCreatedAtGte?: Date | null;
+    companyId?: string | null;
+  }) {
+    const result = {
+      reported: 0,
+      skipped: 0,
+      issueIds: [] as string[],
+      findings: [] as Array<{
+        dependentIssueId: string;
+        blockerIssueId: string;
+        executionWorkspaceId: string;
+        latestOp: { phase: string; status: string; startedAt: Date } | null;
+      }>,
+    };
+
+    const candidateFilters = [
+      inArray(issues.status, ["todo", "blocked"]),
+      visibleIssueCondition(),
+      sql`${issues.assigneeAgentId} is not null`,
+    ];
+    if (opts?.issueCreatedAtGte) candidateFilters.push(gte(issues.createdAt, opts.issueCreatedAtGte));
+    if (opts?.companyId) candidateFilters.push(eq(issues.companyId, opts.companyId));
+
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(and(...candidateFilters))
+      .orderBy(asc(issues.id))
+      .limit(PERMANENTLY_UNFINALIZABLE_BLOCKERS_CANDIDATE_LIMIT);
+
+    const candidatesByCompany = new Map<string, typeof candidates>();
+    for (const candidate of candidates) {
+      const companyCandidates = candidatesByCompany.get(candidate.companyId) ?? [];
+      companyCandidates.push(candidate);
+      candidatesByCompany.set(candidate.companyId, companyCandidates);
+    }
+
+    const now = new Date();
+    const shouldLog =
+      !lastPermanentlyUnfinalizableLogAt ||
+      now.getTime() - lastPermanentlyUnfinalizableLogAt.getTime() >= PERMANENTLY_UNFINALIZABLE_RELOG_INTERVAL_MS;
+
+    for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
+
+      const blockers = await listPermanentlyUnfinalizableBlockersFromIssues(
+        db,
+        companyId,
+        opts ? { issueCreatedAtGte: opts.issueCreatedAtGte } : undefined,
+      );
+
+      if (blockers.length === 0) continue;
+
+      const findingsByDependent = new Map<string, typeof blockers>();
+      for (const blocker of blockers) {
+        for (const dependentId of blocker.gatedDependentIssueIds) {
+          const existing = findingsByDependent.get(dependentId) ?? [];
+          existing.push(blocker);
+          findingsByDependent.set(dependentId, existing);
+        }
+      }
+
+      if (findingsByDependent.size === 0) continue;
+
+      for (const candidate of companyCandidates) {
+        const candidateFindings = findingsByDependent.get(candidate.id);
+        if (!candidateFindings || candidateFindings.length === 0) continue;
+
+        result.reported += 1;
+        result.issueIds.push(candidate.id);
+
+        for (const finding of candidateFindings) {
+          result.findings.push({
+            dependentIssueId: candidate.id,
+            blockerIssueId: finding.blockerIssueId,
+            executionWorkspaceId: finding.executionWorkspaceId,
+            latestOp: finding.latestOp,
+          });
+        }
+
+        if (shouldLog) {
+          await logActivity(db, {
+            companyId: candidate.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.permanently_unfinalizable_blocker_detected",
+            entityType: "issue",
+            entityId: candidate.id,
+            details: {
+              source: "recovery.list_permanently_unfinalizable_blockers",
+              identifier: candidate.identifier,
+              findings: candidateFindings.map((f) => ({
+                blockerIssueId: f.blockerIssueId,
+                executionWorkspaceId: f.executionWorkspaceId,
+                latestOp: f.latestOp,
+              })),
+            },
+          });
+        }
+      }
+    }
+
+    if (result.reported > 0 && shouldLog) {
+      lastPermanentlyUnfinalizableLogAt = now;
+      logger.warn(
+        { reported: result.reported, issueIds: result.issueIds },
+        "swept permanently-unfinalizable-blocker issues (report-only)",
+      );
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -5899,6 +6038,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     sweepStaleIssueLocks,
     reconcileBlockedWithoutBlockers,
     reconcileStaleRecoveryActionWakes,
+    listPermanentlyUnfinalizableBlockers,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
     reconcileIssueGraphLiveness,
