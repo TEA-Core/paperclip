@@ -5485,6 +5485,14 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export function truncateAgentErrorReason(reason: string | null | undefined): string | null {
+  if (!reason) return null;
+  const plain = reason.replace(/\x1b\[[0-9;]*m/g, "");
+  const trimmed = plain.trim();
+  if (!trimmed) return null;
+  return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
+}
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
@@ -11288,7 +11296,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   function truncateAgentErrorReason(reason: string | null | undefined): string | null {
     if (!reason) return null;
-    const trimmed = reason.trim();
+    const plain = reason.replace(/\x1b\[[0-9;]*m/g, "");
+    const trimmed = plain.trim();
     if (!trimmed) return null;
     return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
   }
@@ -13398,7 +13407,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Atomic conditional UPDATE is the sole gate (no read-then-write); 0 rows => abort.
       const runningAgent = await db
         .update(agents)
-        .set({ status: "running", updatedAt: new Date() })
+        .set({ status: "running", errorReason: null, updatedAt: new Date() })
         .where(and(eq(agents.id, agent.id), notInArray(agents.status, [...DIRECT_NON_INVOKABLE_STATUSES])))
         .returning()
         .then((rows) => rows[0] ?? null);
