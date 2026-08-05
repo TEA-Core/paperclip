@@ -1983,7 +1983,7 @@ export function authorizationService(db: Db) {
     }
 
     if (
-      (input.action === "issue:comment" || input.action === "issue:mutate") &&
+      input.action === "issue:comment" &&
       input.resource.type === "issue" &&
       input.resource.assigneeAgentId &&
       await isManagerOf(companyId, actorAgentId, input.resource.assigneeAgentId)
@@ -2128,5 +2128,6 @@ export function authorizationService(db: Db) {
   return {
     decide,
     decidePrincipalGrant,
+    isManagerOf,
   };
 }

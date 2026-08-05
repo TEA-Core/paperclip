@@ -3646,9 +3646,6 @@ export function issueRoutes(
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
         return true;
       }
-      if (boundaryDecision.reason === "allow_manager_chain") {
-        return boundaryDecision;
-      }
       if (issue.status === "in_progress") {
         res.status(409).json({
           error: "Issue is checked out by another agent",
@@ -7771,8 +7768,35 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    const mutationAccess = await assertAgentIssueMutationAllowed(req, res, existing);
-    if (!mutationAccess) return;
+    let mutationAccess:
+      | boolean
+      | { allowed: boolean; reason: string; action: string; explanation: string } = await assertAgentIssueMutationAllowed(
+      req,
+      res,
+      existing,
+    );
+    if (!mutationAccess) {
+      // Escape hatch: an org-chain ancestor of the assignee may perform a
+      // limited PATCH (assigneeAgentId, status, blockedByIssueIds). This is
+      // gated here, in the PATCH handler only, so the ~20 other mutation
+      // routes that share assertAgentIssueMutationAllowed retain their
+      // pre-change 403 for non-assignee actors.
+      if (
+        req.actor.type === "agent" &&
+        req.actor.agentId &&
+        existing.assigneeAgentId &&
+        (await access.isManagerOf(existing.companyId, req.actor.agentId, existing.assigneeAgentId))
+      ) {
+        mutationAccess = {
+          allowed: true,
+          reason: "allow_manager_chain",
+          action: "issue:mutate",
+          explanation: "Allowed because the actor is an org-chain ancestor of the issue assignee.",
+        };
+      } else {
+        return;
+      }
+    }
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);

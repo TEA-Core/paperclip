@@ -2158,7 +2158,7 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
 
-  it("allows an org-chain ancestor to comment on and mutate an issue pinned to a descendant", async () => {
+  it("allows an org-chain ancestor to comment on, but not mutate, an issue pinned to a descendant", async () => {
     const company = await createCompany(db, "AncestorEscapeHatch");
     const managerAgent = await createAgent(db, company.id, { role: "manager" });
     const midAgent = await createAgent(db, company.id, { reportsTo: managerAgent.id });
@@ -2187,13 +2187,16 @@ describeEmbeddedPostgres("authorization service", () => {
       allowed: true,
       reason: "allow_manager_chain",
     });
+    // issue:mutate is intentionally NOT granted through decideBase: the
+    // org-chain escape hatch for mutation is a narrow, inline ancestor check
+    // in the PATCH /issues/:id handler only (SUP-10963).
     await expect(decideAs(managerAgent.id, "issue:mutate")).resolves.toMatchObject({
-      allowed: true,
-      reason: "allow_manager_chain",
+      allowed: false,
+      reason: "deny_missing_grant",
     });
     await expect(decideAs(midAgent.id, "issue:mutate")).resolves.toMatchObject({
-      allowed: true,
-      reason: "allow_manager_chain",
+      allowed: false,
+      reason: "deny_missing_grant",
     });
   });
 
