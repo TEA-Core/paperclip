@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
+import { isTruthyEnvFlag } from "./models.js";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
@@ -188,6 +189,36 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   // for the anthropic provider); when that provider is repointed at a gateway that
   // does not serve that exact model, the title-gen call fails and aborts the run.
   // Setting small_model to a gateway-served model keeps every call on supported models.
+  // Turn opencode's snapshot tracking off (SUP-10914). OpenCode fires
+  // `git gc --prune=7.days` against its snapshot git store on run start,
+  // fire-and-forget, and the CLI tears the child down when the run ends — so on
+  // short Paperclip heartbeat runs the gc is killed mid-repack every time. git
+  // only sweeps stale `tmp_pack_*` files during a gc that COMPLETES, so each
+  // killed attempt leaks a full-size temp pack. One measured store held 21 of
+  // them at 2.66 GB each: 56 GB of garbage, 92% of the store, against 3 GB of
+  // real content. A completed gc on that same content took 15s and reclaimed
+  // 4.4 GB -> 21 MB, so the cost is not the gc itself — it is that it never
+  // finishes. Paperclip runs in its own git worktrees and does not use
+  // opencode's undo/revert, so the feature is redundant here.
+  //
+  // Only `snapshot` is written. The v2 schema calls the same flag `snapshots`,
+  // but opencode 1.17.9 validates this config strictly and rejects the whole
+  // file on an unrecognised key ("Configuration is invalid ... Unrecognized
+  // key: snapshots", exit 1) — writing both would break every run. An explicit
+  // setting in the operator's own opencode.json wins, and
+  // PAPERCLIP_OPENCODE_SNAPSHOTS opts back in wholesale.
+  const snapshotsOptedIn = isTruthyEnvFlag(
+    input.env.PAPERCLIP_OPENCODE_SNAPSHOTS ?? process.env.PAPERCLIP_OPENCODE_SNAPSHOTS,
+  );
+  const snapshotAlreadyConfigured =
+    "snapshot" in existingConfig || "snapshots" in existingConfig;
+  if (!snapshotsOptedIn && !snapshotAlreadyConfigured) {
+    nextConfig.snapshot = false;
+    notes.push(
+      "Disabled OpenCode snapshot tracking; its per-run `git gc` is killed at run exit and leaks a full temp pack each time.",
+    );
+  }
+
   const smallModel = (input.env.PAPERCLIP_OPENCODE_SMALL_MODEL ?? process.env.PAPERCLIP_OPENCODE_SMALL_MODEL)?.trim();
   if (smallModel) {
     nextConfig.small_model = smallModel;

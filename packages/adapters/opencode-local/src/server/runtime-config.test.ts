@@ -65,6 +65,67 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     await expect(fs.access(prepared.env.XDG_CONFIG_HOME)).rejects.toThrow();
   });
 
+  // SUP-10914: opencode fires `git gc --prune=7.days` against its snapshot git
+  // store on run start, fire-and-forget, and the CLI tears the child down when
+  // the run ends. On one measured store that left 21 abandoned `tmp_pack_*`
+  // files of 2.66 GB each — 56 GB, 92% of the store — because git only sweeps
+  // stale temp packs during a gc that actually completes. Paperclip runs in its
+  // own git worktrees and does not use opencode's undo/revert, so turn snapshot
+  // tracking off rather than pay for a gc that never finishes.
+  it("disables opencode snapshot tracking by default", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(runtimeConfig.snapshot).toBe(false);
+    // opencode 1.17.9 validates this file strictly and exits 1 on an
+    // unrecognised key, so the v2 spelling must NOT be written alongside it.
+    expect("snapshots" in runtimeConfig).toBe(false);
+    expect(prepared.notes.some((n) => n.includes("snapshot"))).toBe(true);
+    await prepared.cleanup();
+  });
+
+  it("keeps snapshots enabled when PAPERCLIP_OPENCODE_SNAPSHOTS opts back in", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, PAPERCLIP_OPENCODE_SNAPSHOTS: "1" },
+      config: {},
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(runtimeConfig.snapshot).toBeUndefined();
+    expect(runtimeConfig.snapshots).toBeUndefined();
+    await prepared.cleanup();
+  });
+
+  it("does not override an explicit snapshot setting in the source config", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" }, snapshot: true });
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(runtimeConfig.snapshot).toBe(true);
+    expect(runtimeConfig.snapshots).toBeUndefined();
+    await prepared.cleanup();
+  });
+
   it("merges custom providers from PAPERCLIP_OPENCODE_PROVIDERS into the config", async () => {
     const configHome = await makeConfigHome({ permission: { read: "allow" } });
     const providers = {
