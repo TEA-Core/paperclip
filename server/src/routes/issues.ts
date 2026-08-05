@@ -3464,43 +3464,43 @@ export function issueRoutes(
     await assertCanAssignTasks(req, companyId, assignmentScope);
   }
 
-   async function decideIssueAccess(
-     req: Request,
-     issue: {
-       id: string;
-       companyId: string;
-       projectId: string | null;
-       parentId: string | null;
-       assigneeAgentId: string | null;
-       assigneeUserId: string | null;
-       status: string;
-       createdByAgentId: string | null;
-     },
-     action: "issue:comment" | "issue:read" | "issue:mutate",
-   ) {
-     return access.decide({
-       actor: req.actor,
-       action,
-       resource: {
-         type: "issue",
-         companyId: issue.companyId,
-         issueId: issue.id,
-         projectId: issue.projectId,
-         parentIssueId: issue.parentId,
-         assigneeAgentId: issue.assigneeAgentId,
-         assigneeUserId: issue.assigneeUserId,
-         status: issue.status,
-         createdByAgentId: issue.createdByAgentId,
-       },
-       scope: {
-         issueId: issue.id,
-         projectId: issue.projectId,
-         parentIssueId: issue.parentId,
-         assigneeAgentId: issue.assigneeAgentId,
-         assigneeUserId: issue.assigneeUserId,
-       },
-     });
-   }
+  async function decideIssueAccess(
+    req: Request,
+    issue: {
+      id: string;
+      companyId: string;
+      projectId: string | null;
+      parentId: string | null;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+      status: string;
+      createdByAgentId: string | null;
+    },
+    action: "issue:comment" | "issue:read" | "issue:mutate",
+  ) {
+    return access.decide({
+      actor: req.actor,
+      action,
+      resource: {
+        type: "issue",
+        companyId: issue.companyId,
+        issueId: issue.id,
+        projectId: issue.projectId,
+        parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+        status: issue.status,
+        createdByAgentId: issue.createdByAgentId,
+      },
+      scope: {
+        issueId: issue.id,
+        projectId: issue.projectId,
+        parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+      },
+    });
+  }
 
   async function assertIssueReadAllowed(req: Request, res: Response, issue: Parameters<typeof decideIssueAccess>[1]) {
     const decision = await decideIssueAccess(req, issue, "issue:read");
@@ -3509,20 +3509,20 @@ export function issueRoutes(
     return false;
   }
 
-   async function assertAgentIssueCommentAllowed(
-     req: Request,
-     res: Response,
-     issue: {
-       id: string;
-       companyId: string;
-       projectId: string | null;
-       parentId: string | null;
-       status: string;
-       assigneeAgentId: string | null;
-       assigneeUserId: string | null;
-       createdByAgentId: string | null;
-     },
-   ) {
+  async function assertAgentIssueCommentAllowed(
+    req: Request,
+    res: Response,
+    issue: {
+      id: string;
+      companyId: string;
+      projectId: string | null;
+      parentId: string | null;
+      status: string;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+      createdByAgentId: string | null;
+    },
+  ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) {
@@ -3591,65 +3591,65 @@ export function issueRoutes(
     return decision.allowed;
   }
 
-   async function assertAgentIssueMutationAllowed(
-     req: Request,
-     res: Response,
-     issue: {
-       id: string;
-       companyId: string;
-       projectId: string | null;
-       parentId: string | null;
-       status: string;
-       assigneeAgentId: string | null;
-       assigneeUserId: string | null;
-       createdByAgentId: string | null;
-     },
-   ) {
-     if (req.actor.type !== "agent") return true;
-     const actorAgentId = req.actor.agentId;
-     if (!actorAgentId) {
-       res.status(403).json({ error: "Agent authentication required" });
-       return false;
-     }
-     // Task-watchdog runs receive a scoped *grant* to mutate issues inside the
-     // watched subtree. This must be evaluated before the base assignee-ownership
-     // boundary below: that boundary denies an agent mutating an issue owned by a
-     // different agent, which is exactly the watchdog's primary job
-     // (SPEC-implementation §9.9 — comment, transition, reassign within the
-     // watched subtree). The watchdog scope can only widen access to the watched
-     // subtree; downstream status-transition, assignment, recovery, and budget
-     // guards in the route handlers still apply.
-     const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
-     if (watchdogScope.kind !== "none") {
-       const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, issue);
-       if (scopeResult.kind === "invalid") {
-         res.status(403).json({
-           error: scopeResult.detail,
-           details: {
-             issueId: issue.id,
-             securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
-           },
-         });
-         return false;
-       }
-       return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
-     }
-     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
-     if (!boundaryDecision.allowed) {
-       res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
-       return false;
-     }
-     if (issue.assigneeAgentId === null) {
-       return true;
-     }
-     if (issue.assigneeAgentId !== actorAgentId) {
-       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
-         return true;
-       }
-       if (boundaryDecision.reason === "allow_manager_chain") {
-         return boundaryDecision;
-       }
-       if (issue.status === "in_progress") {
+  async function assertAgentIssueMutationAllowed(
+    req: Request,
+    res: Response,
+    issue: {
+      id: string;
+      companyId: string;
+      projectId: string | null;
+      parentId: string | null;
+      status: string;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+      createdByAgentId: string | null;
+    },
+  ) {
+    if (req.actor.type !== "agent") return true;
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) {
+      res.status(403).json({ error: "Agent authentication required" });
+      return false;
+    }
+    // Task-watchdog runs receive a scoped *grant* to mutate issues inside the
+    // watched subtree. This must be evaluated before the base assignee-ownership
+    // boundary below: that boundary denies an agent mutating an issue owned by a
+    // different agent, which is exactly the watchdog's primary job
+    // (SPEC-implementation §9.9 — comment, transition, reassign within the
+    // watched subtree). The watchdog scope can only widen access to the watched
+    // subtree; downstream status-transition, assignment, recovery, and budget
+    // guards in the route handlers still apply.
+    const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (watchdogScope.kind !== "none") {
+      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, issue);
+      if (scopeResult.kind === "invalid") {
+        res.status(403).json({
+          error: scopeResult.detail,
+          details: {
+            issueId: issue.id,
+            securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+          },
+        });
+        return false;
+      }
+      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+    }
+    const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+    if (!boundaryDecision.allowed) {
+      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      return false;
+    }
+    if (issue.assigneeAgentId === null) {
+      return true;
+    }
+    if (issue.assigneeAgentId !== actorAgentId) {
+      if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
+        return true;
+      }
+      if (boundaryDecision.reason === "allow_manager_chain") {
+        return boundaryDecision;
+      }
+      if (issue.status === "in_progress") {
         res.status(409).json({
           error: "Issue is checked out by another agent",
           details: {
@@ -7794,8 +7794,8 @@ export function issueRoutes(
       resume: resumeRequested,
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
-       ...updateFields
-     } = req.body;
+      ...updateFields
+    } = req.body;
     if (
       mutationAccess !== true &&
       typeof mutationAccess === "object" &&
