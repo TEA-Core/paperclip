@@ -491,6 +491,13 @@ export function agentService(db: Db) {
       }
     }
 
+    if (data.status === "paused" && !data.pauseReason) {
+      throw conflict("Cannot pause agent without a pause reason; use POST /agents/:id/pause", {
+        code: "pause_reason_required",
+        agentId: id,
+      });
+    }
+
     if (data.reportsTo !== undefined) {
       if (data.reportsTo) {
         await ensureManager(existing.companyId, data.reportsTo);
