@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { clampIssueRequestDepth, isAgentStatusAssignableToWork } from "@paperclipai/shared";
+import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
   activityLog,
   agents,
@@ -631,12 +631,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       seen.add(candidate.id);
       const fullCandidate = await getAgent(candidate.id);
       if (!fullCandidate || fullCandidate.companyId !== sourceIssue.companyId) continue;
-      if (!isAgentStatusAssignableToWork(fullCandidate.status)) continue;
-      const budgetBlock = await budgets.getInvocationBlock(sourceIssue.companyId, candidate.id, {
-        issueId: sourceIssue.id,
-        projectId: sourceIssue.projectId ?? null,
-      });
-      if (!budgetBlock) return candidate.id;
+      if (fullCandidate.status === "terminated") continue;
+      return candidate.id;
     }
     return null;
   }
@@ -778,7 +774,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         companyId: evidence.sourceIssue.companyId,
         actorType: "system",
         actorId: "system",
-        action: "issue.productivity_review_no_owner",
+        action: "issue.productivity_review_owner_unresolved",
         entityType: "issue",
         entityId: evidence.sourceIssue.id,
         agentId: evidence.sourceAgent.id,
