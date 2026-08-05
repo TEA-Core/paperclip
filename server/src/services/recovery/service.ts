@@ -161,9 +161,6 @@ type ResolvedDependencyWakeBackstopOptions = {
   companyId?: string | null;
   blockerIssueId?: string | null;
   source?: ResolvedDependencyWakeBackstopSource;
-  now?: Date | null;
-  rearmWindowMs?: number | null;
-  rearmMaxCount?: number | null;
 };
 
 type LatestIssueRun = Pick<
@@ -5214,6 +5211,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { kind: "created" as const, escalationIssueId: escalation.id };
   }
 
+  const DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS = 5 * 60_000;
+  let lastDependencyWakeReArmCapActivityLogAt: Date | null = null;
+
   async function reconcileResolvedDependencyWakeBackstop(opts?: ResolvedDependencyWakeBackstopOptions) {
     const result = {
       checked: 0,
@@ -5247,6 +5247,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const windowMs = opts?.rearmWindowMs ?? config.resolvedDependencyWakeRearmWindowMs;
     const maxCount = opts?.rearmMaxCount ?? config.resolvedDependencyWakeRearmMaxCount;
     const cutoff = opts?.now ? new Date(opts.now.getTime() - windowMs) : new Date(Date.now() - windowMs);
+    const reArmCapNow = opts?.now ?? new Date();
+    const shouldLogReArmCap =
+      !lastDependencyWakeReArmCapActivityLogAt ||
+      reArmCapNow.getTime() -
+        lastDependencyWakeReArmCapActivityLogAt.getTime() >=
+      DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS;
 
     const queryCandidates = (afterIssueId: string | null) => {
       const filters = [
@@ -5327,11 +5333,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       companyCandidates.push(candidate);
       candidatesByCompany.set(candidate.companyId, companyCandidates);
     }
-
-    const reArmCapNow = opts?.now ?? new Date();
-    const shouldLogReArmCap =
-      !lastDependencyWakeReArmCapActivityLogAt ||
-      reArmCapNow.getTime() - lastDependencyWakeReArmCapActivityLogAt.getTime() >= DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS;
 
     for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
       const readinessMap = await issuesSvc.listDependencyReadiness(
@@ -5567,10 +5568,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
     }
 
-    if (shouldLogReArmCap && result.reArmCapSkipped > 0) {
-      lastDependencyWakeReArmCapActivityLogAt = reArmCapNow;
-    }
-
     if (result.healed > 0) {
       logger.warn(
         { healed: result.healed, issueIds: result.issueIds, source, blockerIssueId: opts?.blockerIssueId ?? null },
@@ -5588,6 +5585,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
         "issue graph liveness backstop swept zero-blocker blocked issues",
       );
+    }
+
+    if (result.reArmCapSkipped > 0 && shouldLogReArmCap) {
+      lastDependencyWakeReArmCapActivityLogAt = reArmCapNow;
     }
 
     return result;
@@ -6514,9 +6515,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     return result;
   }
-
-  const DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS = 5 * 60_000;
-  let lastDependencyWakeReArmCapActivityLogAt: Date | null = null;
 
   return {
     buildRunOutputSilence,
