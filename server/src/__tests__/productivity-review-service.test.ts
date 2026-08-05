@@ -737,4 +737,276 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
   });
+
+  it("falls back to a second-pass cto/ceo owner when pass-1 candidates are not invokable", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await db
+      .update(agents)
+      .set({ status: "terminated" })
+      .where(eq(agents.id, seeded.managerId));
+    const fallbackId = randomUUID();
+    await db.insert(agents).values({
+      id: fallbackId,
+      companyId: seeded.companyId,
+      name: "Fallback CEO",
+      role: "ceo",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.noOwner).toBe(0);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.assigneeAgentId).toBe(fallbackId);
+  });
+
+  it("falls back to a paused cto/ceo in pass 2 when pass-1 candidates are paused", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await db
+      .update(agents)
+      .set({ status: "paused" })
+      .where(eq(agents.id, seeded.managerId));
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.noOwner).toBe(0);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.assigneeAgentId).toBe(seeded.managerId);
+  });
+
+  it("refuses to create an ownerless review card when no cto/ceo owner can be resolved", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await db
+      .update(agents)
+      .set({ status: "terminated" })
+      .where(eq(agents.id, seeded.managerId));
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.noOwner).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_owner_unresolved"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.entityId).toBe(seeded.issueId);
+  });
+
+  it("assigns to a paused cto/ceo in pass 2 when pass-1 invokable candidates are exhausted", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const companyId = randomUUID();
+    const ctoId = randomUUID();
+    const ceoId = randomUUID();
+    const coderId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `PR${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const createdAt = new Date("2026-04-28T10:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paused CTO CEO Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: ctoId,
+        companyId,
+        name: "Paused CTO",
+        role: "cto",
+        status: "paused",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: ceoId,
+        companyId,
+        name: "Paused CEO",
+        role: "ceo",
+        status: "paused",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: ctoId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Implement data import",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      originKind: "manual",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: createdAt,
+      createdAt,
+      updatedAt: createdAt,
+    });
+    await insertRuns({
+      companyId,
+      agentId: coderId,
+      issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.noOwner).toBe(0);
+    const reviews = await listProductivityReviews(companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.assigneeAgentId).toBe(ctoId);
+  });
+
+  it("creates a review card assigned to a paused cto when the company is also paused (company-scope budget block ignored in pass 2)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const companyId = randomUUID();
+    const ctoId = randomUUID();
+    const ceoId = randomUUID();
+    const coderId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `PR${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const createdAt = new Date("2026-04-28T10:00:00.000Z");
+
+    await db
+      .insert(companies)
+      .values({
+        id: companyId,
+        name: "Paused Company Co",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        status: "paused",
+      });
+    await db.insert(agents).values([
+      {
+        id: ctoId,
+        companyId,
+        name: "Paused CTO",
+        role: "cto",
+        status: "paused",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: ceoId,
+        companyId,
+        name: "Paused CEO",
+        role: "ceo",
+        status: "paused",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: ctoId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Implement data import",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      originKind: "manual",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: createdAt,
+      createdAt,
+      updatedAt: createdAt,
+    });
+    await insertRuns({
+      companyId,
+      agentId: coderId,
+      issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.noOwner).toBe(0);
+    const reviews = await listProductivityReviews(companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.assigneeAgentId).toBe(ctoId);
+  });
 });
