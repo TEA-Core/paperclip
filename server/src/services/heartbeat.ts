@@ -256,6 +256,7 @@ import {
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
+import { agentService } from "./agents.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
@@ -333,6 +334,8 @@ const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retr
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
+const CONSECUTIVE_EMPTY_TIMEOUT_BREAKER_WINDOW = 3;
+const CONSECUTIVE_EMPTY_TIMEOUT_BREAKER_MAX_LOG_BYTES = 10000;
 export {
   ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
@@ -11225,6 +11228,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return mergeHeartbeatRunStopMetadata(options?.resultJson ?? null, stopMetadata);
   }
 
+  async function checkConsecutiveEmptyTimeoutBreaker(options: {
+    agentId: string;
+    companyId: string;
+  }) {
+    const window = CONSECUTIVE_EMPTY_TIMEOUT_BREAKER_WINDOW;
+    const recentRuns = await db
+      .select({
+        errorCode: heartbeatRuns.errorCode,
+        logBytes: heartbeatRuns.logBytes,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, options.agentId),
+          eq(heartbeatRuns.companyId, options.companyId),
+          inArray(heartbeatRuns.status, HEARTBEAT_RUN_TERMINAL_STATUSES),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(window);
+
+    if (recentRuns.length < window) return false;
+
+    const allEmptyTimeouts = recentRuns.every(
+      (run) => run.errorCode === "timeout" && (run.logBytes ?? 0) < CONSECUTIVE_EMPTY_TIMEOUT_BREAKER_MAX_LOG_BYTES,
+    );
+    if (!allEmptyTimeouts) return false;
+
+    logger.warn(
+      { agentId: options.agentId, window },
+      "Pausing agent: consecutive empty-output timeouts detected",
+    );
+    await agentService(db).pause(options.agentId, "consecutive_empty_timeouts");
+    return true;
+  }
+
   function countValue(value: unknown) {
     const parsed = Number(value ?? 0);
     return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
@@ -14004,6 +14043,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "skipping late run finalization because the run already left running state",
         );
         return;
+      }
+
+      if (runErrorCode === "timeout") {
+        try {
+          await checkConsecutiveEmptyTimeoutBreaker({
+            agentId: run.agentId,
+            companyId: run.companyId,
+          });
+        } catch (err) {
+          logger.warn(
+            { err, runId: run.id, agentId: run.agentId },
+            "failed to run consecutive empty-output timeout breaker after run finalization",
+          );
+        }
       }
 
       let persistedRun = persistedRunWrite.run;
