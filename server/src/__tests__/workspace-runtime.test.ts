@@ -402,6 +402,21 @@ describe("assertWorktreeWritableByProcessUser", () => {
       /not a valid git repository or is missing/,
     );
   });
+
+  it("throws a workspace validation failure when the worktree git index is truncated to zero bytes", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10995-truncated-index";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    const indexFile = path.join(repoRoot, ".git", "worktrees", branchName, "index");
+    await fs.writeFile(indexFile, Buffer.alloc(0));
+
+    await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(
+      /git index.*0 bytes \(truncated\)|truncated.*git index/i,
+    );
+  });
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {

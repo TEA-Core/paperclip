@@ -14450,7 +14450,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      await finalizeAgentStatus(agent.id, "failed", message);
+      await finalizeAgentStatus(agent.id, "failed", message, {
+        keepIdleOnFailure: workspaceValidationFailure != null,
+      });
     }
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
@@ -14550,7 +14552,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // path owned the terminal transition. If another path already finalized
           // the run, keep that terminal outcome authoritative.
           if (setupFailureWrite.updated) {
-            await finalizeAgentStatus(run.agentId, "failed", message).catch(() => undefined);
+            await finalizeAgentStatus(run.agentId, "failed", message, {
+              // A workspace that cannot be realized (e.g. truncated git index)
+              // is permanent corruption, not a transient agent fault. Keeping the
+              // agent idle — instead of error — stops one broken worktree from
+              // crash-looping the whole agent while operators repair the index.
+              keepIdleOnFailure: workspaceValidationSetupFailure != null,
+            }).catch(() => undefined);
           }
         } finally {
           const latestRun = await getRun(run.id).catch(() => null);
