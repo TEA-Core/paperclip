@@ -1198,6 +1198,33 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  it("still inherits the run workspace when reuse_existing names no workspace id", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        issueId,
+        executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      }),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Reuse the current worktree",
+        executionWorkspacePreference: "reuse_existing",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({
+        title: "Reuse the current worktree",
+        executionWorkspacePreference: "reuse_existing",
+        inheritExecutionWorkspaceFromIssueId: issueId,
+      }),
+    );
+  });
+
   it("preserves explicit workspace choices on agent-created root issues", async () => {
     const app = await createApp(
       ownerActor(),
