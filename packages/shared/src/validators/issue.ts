@@ -422,7 +422,6 @@ const createIssueBaseSchema = z.object({
   parkDeliberately: z.boolean().optional().default(false),
 }).strict();
 
-
 export function isAssignedBacklogBlockingCreate(input: {
   status?: unknown;
   assigneeAgentId?: unknown;

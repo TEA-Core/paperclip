@@ -7400,9 +7400,8 @@ export function issueRoutes(
       parent.companyId,
       sanitizedBody.assigneeAgentId as string | null | undefined,
     );
-    const childData = sanitizedBody;
     const createBody = {
-      ...childData,
+      ...sanitizedBody,
       ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
     };
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, parent, createBody))) return;
