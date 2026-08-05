@@ -894,6 +894,35 @@ async function assertGitIndexIsUnlocked(worktreePath: string) {
   }
 }
 
+// Detect a truncated (zero-byte) git index before any git read/write that would
+// fatal on it. A zero-byte index is unrecoverable worktree corruption, not a
+// transient lock — surfacing it as a workspace validation failure keeps the
+// dispatch loop from crash-looping the agent into `error` and leaves the run
+// with an errorCode operators can search on.
+export async function assertGitIndexIntegrity(worktreePath: string): Promise<void> {
+  const indexFile = await runGit(["rev-parse", "--git-path", "index"], worktreePath).catch(() => null);
+  if (!indexFile) return;
+  try {
+    const stats = await fs.stat(indexFile);
+    if (stats.size === 0) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Git index at "${indexFile}" is 0 bytes (truncated). The worktree git index is corrupted and must be repaired before the worktree can be used.`,
+        {
+          workspaceValidation: {
+            reason: "git_index_truncated",
+            worktreePath,
+            indexFile,
+            size: 0,
+          },
+        },
+      );
+    }
+  } catch (error) {
+    if (error instanceof WorkspaceRuntimeValidationFailure) throw error;
+    // Index file absent (fresh repo) or unstat-able — nothing to guard.
+  }
+}
+
 function fingerprintWorkspaceBranchIncoherence(input: {
   sourceIssueId: string | null;
   executionWorkspaceId: string | null;
@@ -2426,14 +2455,16 @@ async function validateLinkedGitWorktree(input: {
     worktreePath: input.worktreePath,
     expectedBranchName: input.expectedBranchName,
   });
-  return inspection.valid
-    ? { valid: true }
-    : {
-        valid: false,
-        reason: inspection.reason ?? "unknown git worktree mismatch",
-        reasonCode: inspection.reasonCode ?? "not_a_git_checkout",
-        actualBranchName: inspection.actualBranchName,
-      };
+  if (!inspection.valid) {
+    return {
+      valid: false,
+      reason: inspection.reason ?? "unknown git worktree mismatch",
+      reasonCode: inspection.reasonCode ?? "not_a_git_checkout",
+      actualBranchName: inspection.actualBranchName,
+    };
+  }
+  await assertGitIndexIntegrity(input.worktreePath);
+  return { valid: true };
 }
 
 export function formatManagedGitWorktreeBranchInspection(input: ManagedGitWorktreeBranchInspection) {
@@ -2674,6 +2705,7 @@ async function recordWorkspaceCommandOperation(
 }
 
 export async function assertWorktreeWritableByProcessUser(worktreePath: string): Promise<void> {
+  await assertGitIndexIntegrity(worktreePath);
   let trackedPaths: string[];
   try {
     const proc = await executeProcess({
