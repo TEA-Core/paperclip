@@ -1579,6 +1579,63 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
   }
 }
 
+export async function assertProjectPrimaryBaseWorkspaceReady(input: {
+  requestedExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
+  config: Record<string, unknown>;
+  agentId: string;
+  issue: {
+    id: string;
+    identifier: string | null;
+    projectId: string | null;
+    projectWorkspaceId: string | null;
+    executionWorkspaceId?: string | null;
+    executionWorkspacePreference?: string | null;
+  } | null;
+  base: ExecutionWorkspaceInput;
+}) {
+  if (!input.issue) return;
+
+  const strategyType = resolveEffectiveWorkspaceStrategyType(
+    input.requestedExecutionWorkspaceMode,
+    input.config,
+  );
+  if (strategyType === "git_worktree") return;
+
+  const workspaceExpectation =
+    Boolean(input.issue.projectWorkspaceId) ||
+    Boolean(input.base.workspaceId);
+  if (!workspaceExpectation) return;
+
+  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
+  const resolvedToAgentFallbackCwd =
+    input.base.source === "agent_home" ||
+    (Boolean(input.base.baseCwd) && sameResolvedPath(input.base.baseCwd, agentFallbackCwd));
+  if (!resolvedToAgentFallbackCwd) return;
+
+  const issueLabel = input.issue.identifier ?? input.issue.id;
+  const remediation = "This task needs a project / project workspace or a reusable execution workspace before it can run.";
+  throw new WorkspaceValidationFailure(
+    `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with project_primary, but no project cwd was resolved; refusing to create a project_primary execution workspace from agent fallback cwd "${input.base.baseCwd}". ${remediation}`,
+    {
+      workspaceValidation: {
+        reason: "project_primary_base_agent_home",
+        issueId: input.issue.id,
+        issueIdentifier: input.issue.identifier,
+        issueProjectId: input.issue.projectId,
+        issueProjectWorkspaceId: input.issue.projectWorkspaceId,
+        issueExecutionWorkspaceId: input.issue.executionWorkspaceId ?? null,
+        issueExecutionWorkspacePreference: input.issue.executionWorkspacePreference ?? null,
+        requestedExecutionWorkspaceMode: input.requestedExecutionWorkspaceMode,
+        workspaceStrategyType: strategyType,
+        resolvedWorkspaceSource: input.base.source,
+        resolvedProjectId: input.base.projectId,
+        resolvedProjectWorkspaceId: input.base.workspaceId,
+        resolvedWorkspaceCwd: input.base.baseCwd,
+      },
+    },
+  );
+}
+
 export async function assertPushCapabilityCheckoutValid(input: {
   enabled: boolean;
   issue: {
@@ -12750,6 +12807,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await assertGitWorktreeBaseWorkspaceReady({
       requestedExecutionWorkspaceMode,
       config: hostExecutionWorkspaceConfig,
+      issue: issueRef,
+      base: executionWorkspaceBase,
+    });
+    await assertProjectPrimaryBaseWorkspaceReady({
+      requestedExecutionWorkspaceMode,
+      config: hostExecutionWorkspaceConfig,
+      agentId: agent.id,
       issue: issueRef,
       base: executionWorkspaceBase,
     });
