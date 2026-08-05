@@ -1,7 +1,5 @@
-# Scope for SUP-11036 (redo of SUP-10903) on the shared SUP-10903 errorReason branch.
-# Files owned by this branch's PR: the classifying-errorCode composition, the
-# broadened ANSI strip, and their tests.
-server/src/services/heartbeat.ts
-server/src/__tests__/heartbeat-truncate-agent-error-reason.test.ts
-server/src/__tests__/heartbeat-agent-error-reason-clears-on-running.test.ts
-server/src/__tests__/heartbeat-error-reason-classifying-detail.test.ts
+# Scope for SUP-11052 on this branch.
+# Files owned by this branch's PR: the OpenAPI registration of the author
+# withdraw interaction route and its spec test.
+server/src/routes/openapi.ts
+server/src/__tests__/openapi-routes.test.ts
