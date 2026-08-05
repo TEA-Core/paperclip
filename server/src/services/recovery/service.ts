@@ -133,6 +133,8 @@ export const RECOVERY_ACTION_WAKE_INTERVAL_MS = Math.max(
   Number(process.env.RECOVERY_ACTION_WAKE_INTERVAL_MS) || 5 * 60 * 1000,
 );
 
+const NO_LIVE_PATH_GRACE_THRESHOLD_MS = 15 * 60 * 1000;
+
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -3756,6 +3758,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           or(
             sql`${issues.assigneeAgentId} is not null`,
             eq(issues.status, "in_review"),
+            and(
+              inArray(issues.status, ["todo", "in_progress"]),
+              isNull(issues.assigneeAgentId),
+            ),
           ),
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
@@ -3775,10 +3781,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
       skipped: 0,
+      noLivePathUnowned: 0,
+      reviewStageUnarmed: 0,
+      noLivePathOwnerUnavailable: 0,
       issueIds: [] as string[],
     };
 
     for (const issue of candidates) {
+      const now = new Date();
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
         : null;
@@ -3791,7 +3801,53 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ? participantAgentId
         : issue.assigneeAgentId;
       if (!agentId) {
-        result.skipped += 1;
+        if (issue.status === "in_review") {
+          result.skipped += 1;
+          continue;
+        }
+        const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
+        if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
+          result.skipped += 1;
+          continue;
+        }
+        const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+        if (existingAction?.kind === "no_live_path_unowned") {
+          result.skipped += 1;
+          continue;
+        }
+        await recoveryActionsSvc.upsertSourceScoped({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          kind: "no_live_path_unowned",
+          ownerType: "board",
+          previousOwnerAgentId: issue.assigneeAgentId ?? null,
+          cause: "no_live_path_unowned",
+          fingerprint: `no_live_path_unowned:${issue.companyId}:${issue.id}`,
+          evidence: {
+            identifier: issue.identifier,
+            status: issue.status,
+            msSinceUpdate,
+          },
+          nextAction: "Assign an owner agent or record an intentional manual resolution.",
+          wakePolicy: null,
+          monitorPolicy: null,
+          maxAttempts: null,
+          lastAttemptAt: now,
+        });
+        result.noLivePathUnowned += 1;
+        result.issueIds.push(issue.id);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "issue_graph_liveness_no_live_path_unowned",
+          action: "issue.no_live_path_unowned_escalated",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            source: "recovery.reconcile_no_live_path_unowned",
+            fingerprint: `no_live_path_unowned:${issue.companyId}:${issue.id}`,
+          },
+        });
         continue;
       }
 
@@ -3800,7 +3856,50 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ? await isAgentInvokable(agent)
         : false;
       if (issue.status !== "in_review" && !agentInvokable) {
-        result.skipped += 1;
+        const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
+        if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
+          result.skipped += 1;
+          continue;
+        }
+        const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+        if (existingAction?.kind === "no_live_path_owner_unavailable") {
+          result.skipped += 1;
+          continue;
+        }
+        await recoveryActionsSvc.upsertSourceScoped({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          kind: "no_live_path_owner_unavailable",
+          ownerType: "board",
+          previousOwnerAgentId: issue.assigneeAgentId ?? null,
+          cause: "no_live_path_owner_unavailable",
+          fingerprint: `no_live_path_owner_unavailable:${issue.companyId}:${issue.id}`,
+          evidence: {
+            identifier: issue.identifier,
+            status: issue.status,
+            agentId,
+            msSinceUpdate,
+          },
+          nextAction: "Restore a live execution path, reactivate or replace the assignee, or record an intentional manual resolution.",
+          wakePolicy: null,
+          monitorPolicy: null,
+          maxAttempts: null,
+          lastAttemptAt: now,
+        });
+        result.noLivePathOwnerUnavailable += 1;
+        result.issueIds.push(issue.id);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "issue_graph_liveness_no_live_path_owner_unavailable",
+          action: "issue.no_live_path_owner_unavailable_escalated",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            source: "recovery.reconcile_no_live_path_owner_unavailable",
+            fingerprint: `no_live_path_owner_unavailable:${issue.companyId}:${issue.id}`,
+          },
+        });
         continue;
       }
 
@@ -3995,7 +4094,49 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       if (issue.status === "in_review") {
         if (!participantAgentId || !pendingExecutionState) {
-          result.skipped += 1;
+          const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
+          if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
+            result.skipped += 1;
+            continue;
+          }
+          const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+          if (existingAction?.kind === "review_stage_unarmed") {
+            result.skipped += 1;
+            continue;
+          }
+          await recoveryActionsSvc.upsertSourceScoped({
+            companyId: issue.companyId,
+            sourceIssueId: issue.id,
+            kind: "review_stage_unarmed",
+            ownerType: "board",
+            previousOwnerAgentId: issue.assigneeAgentId ?? null,
+            cause: "review_stage_unarmed",
+            fingerprint: `review_stage_unarmed:${issue.companyId}:${issue.id}`,
+            evidence: {
+              identifier: issue.identifier,
+              status: issue.status,
+              msSinceUpdate,
+            },
+            nextAction: "Re-arm the execution review stage by setting the current participant and state, or record an intentional manual resolution.",
+            wakePolicy: null,
+            monitorPolicy: null,
+            maxAttempts: null,
+            lastAttemptAt: now,
+          });
+          result.reviewStageUnarmed += 1;
+          result.issueIds.push(issue.id);
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "issue_graph_liveness_review_stage_unarmed",
+            action: "issue.review_stage_unarmed_escalated",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              source: "recovery.reconcile_review_stage_unarmed",
+              fingerprint: `review_stage_unarmed:${issue.companyId}:${issue.id}`,
+            },
+          });
           continue;
         }
         const participantLatestRun = participantLatestRunForRecovery;
