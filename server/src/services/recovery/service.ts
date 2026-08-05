@@ -5221,6 +5221,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       notReadySkipped: 0,
       candidateLimitSkipped: 0,
       reArmCapSkipped: 0,
+      reArmCapEscalated: 0,
+      reArmCapEscalatedIssueIds: [] as string[],
       deferredOrFailed: 0,
       enqueueFailed: 0,
       zeroBlockerObserved: 0,
@@ -5390,46 +5392,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           )
           .then((rows) => rows[0]?.count ?? 0) : 0;
         if (consumedWakes >= maxCount) {
-          result.reArmCapSkipped += 1;
-          logger.warn(
-            {
-              issueId: candidate.id,
-              identifier: candidate.identifier,
-              agentId,
-              idempotencyKeys,
-              consumedCount: consumedWakes,
-              maxCount,
-              source,
-            },
-            "resolved dependency wake re-arm cap reached — dependent stuck, needs escalation",
-          );
-          const reArmCapNow = new Date();
-          const shouldLogReArmCap =
-            !lastDependencyWakeReArmCapActivityLogAt ||
-            reArmCapNow.getTime() -
-              lastDependencyWakeReArmCapActivityLogAt.getTime() >=
-              DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS;
-          if (shouldLogReArmCap) {
-            await logActivity(db, {
-              companyId: candidate.companyId,
-              actorType: "system",
-              actorId: "system",
-              agentId: null,
-              runId: null,
-              action: "issue.dependency_wake_rearm_cap_reached",
-              entityType: "issue",
-              entityId: candidate.id,
-              details: {
-                source,
-                identifier: candidate.identifier,
-                idempotencyKeys,
-                consumedCount: consumedWakes,
-                maxCount,
-                blockerIssueIds: readiness?.blockerIssueIds ?? [],
-              },
-            });
-            lastDependencyWakeReArmCapActivityLogAt = reArmCapNow;
+          if (await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id)) {
+            result.reArmCapSkipped += 1;
+            continue;
           }
+          const reArmSvc = issueRecoveryActionService(db);
+          await reArmSvc.upsertSourceScoped({
+            companyId,
+            sourceIssueId: candidate.id,
+            kind: "blocked_without_blockers",
+            ownerType: "board",
+            previousOwnerAgentId: candidate.assigneeAgentId ?? null,
+            cause: "dependency_wake_rearm_cap_exhausted",
+            fingerprint: `drearm:${companyId}:${candidate.id}`,
+            evidence: {
+              identifier: candidate.identifier,
+              reArmCount: consumedWakes,
+              reArmMax: maxCount,
+            },
+            nextAction:
+              "This issue has been woken multiple times after its blockers resolved. Review and take action.",
+            wakePolicy: null,
+            monitorPolicy: null,
+            maxAttempts: null,
+            lastAttemptAt: new Date(),
+          });
+          result.reArmCapEscalated++;
+          result.reArmCapEscalatedIssueIds.push(candidate.id);
           continue;
         }
 
@@ -5609,6 +5598,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       dependencyWakeZeroBlockerObserved: 0,
       dependencyWakeZeroBlockerHealed: 0,
       dependencyWakeZeroBlockerActiveRecoverySkipped: 0,
+      dependencyWakeReArmCapEscalated: 0,
+      dependencyWakeReArmCapEscalatedIssueIds: [] as string[],
       dependencyWakeIssueIds: [] as string[],
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
@@ -5631,6 +5622,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.dependencyWakeZeroBlockerObserved = dependencyWakeBackstop.zeroBlockerObserved;
     result.dependencyWakeZeroBlockerHealed = dependencyWakeBackstop.zeroBlockerHealed;
     result.dependencyWakeZeroBlockerActiveRecoverySkipped = dependencyWakeBackstop.zeroBlockerActiveRecoverySkipped;
+    result.dependencyWakeReArmCapEscalated = dependencyWakeBackstop.reArmCapEscalated;
+    result.dependencyWakeReArmCapEscalatedIssueIds = dependencyWakeBackstop.reArmCapEscalatedIssueIds;
     result.dependencyWakeIssueIds = dependencyWakeBackstop.issueIds;
 
     if (!autoRecoveryEnabled) {
@@ -6364,9 +6357,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     return result;
   }
-
-  const DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS = 5 * 60_000;
-  let lastDependencyWakeReArmCapActivityLogAt: Date | null = null;
 
   return {
     buildRunOutputSilence,

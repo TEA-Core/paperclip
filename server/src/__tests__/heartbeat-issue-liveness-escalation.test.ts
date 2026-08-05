@@ -1727,17 +1727,23 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
 
     expect(result.healed).toBe(0);
-    expect(result.reArmCapSkipped).toBe(1);
+    expect(result.reArmCapEscalated).toBe(1);
+    expect(result.reArmCapSkipped).toBe(0);
     expect(result.issueIds).toEqual([]);
 
-    const activities = await db
-      .select({ action: activityLog.action, entityId: activityLog.entityId })
-      .from(activityLog)
-      .where(eq(activityLog.entityId, blockedIssueId));
-    expect(activities).toHaveLength(1);
-    expect(activities[0]?.action).toBe(
-      "issue.dependency_wake_rearm_cap_reached",
-    );
+    const action = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId))
+      .then((rows) => rows[0]);
+    expect(action).toMatchObject({
+      companyId,
+      sourceIssueId: blockedIssueId,
+      kind: "blocked_without_blockers",
+      ownerType: "board",
+      cause: "dependency_wake_rearm_cap_exhausted",
+      fingerprint: `drearm:${companyId}:${blockedIssueId}`,
+    });
 
     const result2 =
       await svc.reconcileResolvedDependencyWakeBackstop({
@@ -1746,11 +1752,14 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         rearmMaxCount: maxCount,
       });
 
-    const activities2 = await db
-      .select({ action: activityLog.action })
-      .from(activityLog)
-      .where(eq(activityLog.entityId, blockedIssueId));
-    expect(activities2).toHaveLength(1);
+    expect(result2.reArmCapEscalated).toBe(0);
+    expect(result2.reArmCapSkipped).toBe(1);
+
+    const actions2 = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    expect(actions2).toHaveLength(1);
 
     const issue = await db.query.issues.findFirst({
       where: eq(issues.id, blockedIssueId),
