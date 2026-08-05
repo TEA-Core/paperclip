@@ -223,3 +223,8 @@ export function isOpenCodeTerminalBillingError(stdout: string, stderr: string): 
 
   return null;
 }
+
+export function isOpenCodeTransientStatementError(stderr: string): boolean {
+  const lower = stderr.toLowerCase();
+  return lower.includes("failed to execute statement") || lower.includes("unexpected server error");
+}
