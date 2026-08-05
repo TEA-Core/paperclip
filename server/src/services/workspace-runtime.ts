@@ -1041,11 +1041,19 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     actualBranchExists === true &&
     registeredBranchMatchesHead &&
     actualBranchIsDefaultBranch;
+  const canCheckoutRecordedBranchOnDivergedWorktree =
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    !sameHead &&
+    registeredBranchMatchesHead &&
+    input.actualBranchName !== null &&
+    ancestryVerdict !== "ancestor";
   const eligible =
     canCheckoutRecordedBranch ||
     canAdoptForwardActualBranch ||
     canAttachRecordedBranchToDetachedHead ||
-    canRebindDeletedBranchToDefaultBranch;
+    canRebindDeletedBranchToDefaultBranch ||
+    canCheckoutRecordedBranchOnDivergedWorktree;
   const safeRepairReason = eligible
     ? canCheckoutRecordedBranch
       ? "clean worktree and expected branch points at the current HEAD"
@@ -1053,7 +1061,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
         ? "clean worktree and checked-out branch is forward of the recorded branch"
         : canAttachRecordedBranchToDetachedHead
           ? "clean detached worktree HEAD is forward of the recorded branch"
-          : "clean worktree with deleted recorded branch is already on the default branch"
+          : canRebindDeletedBranchToDefaultBranch
+            ? "clean worktree with deleted recorded branch is already on the default branch"
+            : "clean worktree and expected branch can be checked out despite diverged branch history"
     : cleanliness !== "clean"
       ? inProgressOperation
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
@@ -2024,7 +2034,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   try {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
-      args: ["checkout", expectedBranchName],
+      args: ["checkout", "--ignore-other-worktrees", expectedBranchName],
       cwd: input.worktreePath,
       metadata: {
         repoRoot: input.repoRoot,
@@ -2948,6 +2958,32 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   async function validateReusableWorktree(reusablePath: string) {
+    const currentBranch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], reusablePath).catch(() => null);
+    if (currentBranch && currentBranch !== branchName) {
+      const status = await runGit(
+        ["status", "--porcelain", "--untracked-files=all"],
+        reusablePath,
+      ).catch(() => null);
+      if (status !== null && status.trim().length === 0) {
+        const expectedBranchExists = await localBranchExists(repoRoot, branchName);
+        if (expectedBranchExists) {
+          await recordGitOperation(input.recorder, {
+            phase: "worktree_prepare",
+            args: ["checkout", "--ignore-other-worktrees", branchName],
+            cwd: reusablePath,
+            metadata: {
+              repoRoot,
+              worktreePath: reusablePath,
+              branchName,
+              previousBranch: currentBranch,
+              branchResetOnReuse: true,
+            },
+            successMessage: `Reset diverged worktree at ${reusablePath} from "${currentBranch}" to "${branchName}"\n`,
+            failureLabel: `git checkout ${branchName} in reused worktree`,
+          }).catch(() => null);
+        }
+      }
+    }
     const validation = await validateLinkedGitWorktree({
       repoRoot,
       worktreePath: reusablePath,
