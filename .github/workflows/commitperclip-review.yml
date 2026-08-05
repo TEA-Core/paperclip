@@ -34,8 +34,24 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Detect gate scripts on base branch
+        id: gates
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # The gates deliberately run from base-branch code, so they can only run
+          # once these scripts are on the base branch. Until then (i.e. on the PR
+          # that introduces this workflow) skip them instead of failing the job.
+          if [ -f .github/scripts/run-quality-gates.mjs ] && [ -f .github/scripts/check-pr-security.mjs ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Gate scripts are not on $BASE_REF yet; skipping quality and security gates."
+          fi
+
       - name: Generate commitperclip token
         id: token
+        if: steps.gates.outputs.present == 'true'
         run: |
           if [ -n "$COMMITPERCLIP_KEY" ]; then
             TOKEN=$(node .github/scripts/get-bot-token.mjs)
@@ -55,7 +71,9 @@ jobs:
 
       - name: Run quality gates
         id: quality
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        if: >-
+          steps.gates.outputs.present == 'true' &&
+          github.event.pull_request.user.login != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         env:
@@ -66,6 +84,7 @@ jobs:
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
 
       - name: Run security gates
+        if: steps.gates.outputs.present == 'true'
         run: node .github/scripts/check-pr-security.mjs
         continue-on-error: true
         timeout-minutes: 3
@@ -77,6 +96,7 @@ jobs:
 
       - name: Fail if quality gates failed
         if: >-
+          steps.gates.outputs.present == 'true' &&
           github.event.pull_request.user.login != 'dependabot[bot]' &&
           steps.quality.outcome == 'failure'
         run: |
