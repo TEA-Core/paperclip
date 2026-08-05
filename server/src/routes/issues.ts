@@ -40,6 +40,7 @@ import {
   createDocumentAnnotationThreadSchema,
   createChildIssueSchema,
   createIssueSchema,
+  isAssignedBacklogBlockingCreate,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
   feedbackTargetTypeSchema,
@@ -7111,6 +7112,20 @@ export function issueRoutes(
       return;
     }
     if (await assertLowTrustControlPlaneDenied(req, res, companyId, null)) return;
+    const statusDefault = res.locals.createIssueStatusDefault as
+      | { status: string; reason: string; defaulted: boolean }
+      | undefined;
+    if (
+      statusDefault?.reason === "explicit" &&
+      statusDefault?.status === "backlog" &&
+      isAssignedBacklogBlockingCreate(req.body)
+    ) {
+      res.status(422).json({
+        error:
+          "An assigned issue that blocks a parent or another issue cannot be created as `backlog` — it will never be woken (assignment wakeup skips `backlog`). Use `status: \"todo\"`, or set `parkDeliberately: true` if it is genuinely parked.",
+      });
+      return;
+    }
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     const sanitizedBody = await sanitizeIssueCreateAttribution(db, req, res, companyId, req.body, {
       surface: "issues.create",
@@ -7361,6 +7376,20 @@ export function issueRoutes(
     if (!isTaskBridgeKeyActor(req) && !(await assertIssueReadAllowed(req, res, parent))) return;
     if (!(await assertTaskWatchdogCreateIssueAllowed(req, res, parent.companyId, parent))) return;
     if (await assertLowTrustControlPlaneDenied(req, res, parent.companyId, parent)) return;
+    const statusDefault = res.locals.createIssueStatusDefault as
+      | { status: string; reason: string; defaulted: boolean }
+      | undefined;
+    if (
+      statusDefault?.reason === "explicit" &&
+      statusDefault?.status === "backlog" &&
+      isAssignedBacklogBlockingCreate({ ...req.body, parentId: parent.id })
+    ) {
+      res.status(422).json({
+        error:
+          "An assigned issue that blocks a parent or another issue cannot be created as `backlog` — it will never be woken (assignment wakeup skips `backlog`). Use `status: \"todo\"`, or set `parkDeliberately: true` if it is genuinely parked.",
+      });
+      return;
+    }
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     const sanitizedBody = await sanitizeIssueCreateAttribution(db, req, res, parent.companyId, req.body, {
       surface: "issues.children.create",
@@ -7371,8 +7400,9 @@ export function issueRoutes(
       parent.companyId,
       sanitizedBody.assigneeAgentId as string | null | undefined,
     );
+    const childData = sanitizedBody;
     const createBody = {
-      ...sanitizedBody,
+      ...childData,
       ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
     };
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, parent, createBody))) return;

@@ -3,6 +3,8 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const assigneeAgentId = "22222222-2222-4222-8222-222222222222";
+const parentUuid = "33333333-3333-4333-8333-333333333333";
+const blockerUuid = "44444444-4444-4444-8444-444444444444";
 
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
@@ -335,6 +337,126 @@ describe("assigned backlog creation contract", () => {
           assignmentWakeSkipped: true,
           assignmentWakeSkipReason: "assigned_backlog",
         }),
+      }),
+    );
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("rejects explicit backlog + assignee + parentId with 422", async () => {
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Gating child as backlog",
+        assigneeAgentId,
+        status: "backlog",
+        parentId: parentUuid,
+      });
+
+    expect(res.status).toBe(422);
+    expect(String(res.body?.error ?? res.text)).toMatch(/cannot be created as `backlog`/);
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("rejects explicit backlog + assignee + blockedByIssueIds with 422", async () => {
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Gating child as backlog",
+        assigneeAgentId,
+        status: "backlog",
+        blockedByIssueIds: [blockerUuid],
+      });
+
+    expect(res.status).toBe(422);
+    expect(String(res.body?.error ?? res.text)).toMatch(/cannot be created as `backlog`/);
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("rejects explicit backlog + assignee on child create (implicit parent) with 422", async () => {
+    const res = await request(await createApp())
+      .post("/api/issues/parent-1/children")
+      .send({
+        title: "Gating child as backlog",
+        assigneeAgentId,
+        status: "backlog",
+      });
+
+    expect(res.status).toBe(422);
+    expect(String(res.body?.error ?? res.text)).toMatch(/cannot be created as `backlog`/);
+    expect(mockIssueService.createChild).not.toHaveBeenCalled();
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("allows explicit backlog + assignee + parentId with parkDeliberately: true", async () => {
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Deliberately parked gating child",
+        assigneeAgentId,
+        status: "backlog",
+        parentId: parentUuid,
+        parkDeliberately: true,
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        title: "Deliberately parked gating child",
+        assigneeAgentId,
+        status: "backlog",
+        parentId: parentUuid,
+        parkDeliberately: true,
+      }),
+    );
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("allows explicit backlog + assignee + blockedByIssueIds with parkDeliberately: true", async () => {
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Deliberately parked blocking child",
+        assigneeAgentId,
+        status: "backlog",
+        blockedByIssueIds: [blockerUuid],
+        parkDeliberately: true,
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        title: "Deliberately parked blocking child",
+        assigneeAgentId,
+        status: "backlog",
+        blockedByIssueIds: [blockerUuid],
+        parkDeliberately: true,
+      }),
+    );
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("allows explicit backlog + assignee on child create with parkDeliberately: true", async () => {
+    const res = await request(await createApp())
+      .post("/api/issues/parent-1/children")
+      .send({
+        title: "Deliberately parked child",
+        assigneeAgentId,
+        status: "backlog",
+        parkDeliberately: true,
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.createChild).toHaveBeenCalledWith(
+      "parent-1",
+      expect.objectContaining({
+        title: "Deliberately parked child",
+        assigneeAgentId,
+        status: "backlog",
+        parkDeliberately: true,
       }),
     );
     expect(mockWakeup).not.toHaveBeenCalled();

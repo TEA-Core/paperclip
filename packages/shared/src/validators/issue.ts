@@ -419,7 +419,25 @@ const createIssueBaseSchema = z.object({
     agentId: z.string().uuid(),
     instructions: multilineTextSchema.optional().nullable(),
   }).strict().optional().nullable(),
+  parkDeliberately: z.boolean().optional().default(false),
 }).strict();
+
+
+export function isAssignedBacklogBlockingCreate(input: {
+  status?: unknown;
+  assigneeAgentId?: unknown;
+  parentId?: unknown;
+  blockedByIssueIds?: unknown;
+  parkDeliberately?: unknown;
+}): boolean {
+  if (input.parkDeliberately === true) return false;
+  if (typeof input.status !== "string" || input.status !== "backlog") return false;
+  const hasAssignee = typeof input.assigneeAgentId === "string" && input.assigneeAgentId.length > 0;
+  if (!hasAssignee) return false;
+  const hasParent = typeof input.parentId === "string" && input.parentId.length > 0;
+  const hasBlockers = Array.isArray(input.blockedByIssueIds) && input.blockedByIssueIds.length > 0;
+  return hasParent || hasBlockers;
+}
 
 const createIssueDuplicateGuardSchema = {
   idempotencyKey: z.string().trim().min(1).max(255).optional().nullable(),
@@ -505,6 +523,7 @@ export function stripCreateOnlyIssueAttribution<Schema extends z.ZodObject<z.Zod
  */
 export const updateIssueObjectSchema = createIssueBaseSchema.omit({
   watchdog: true,
+  parkDeliberately: true,
 }).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
