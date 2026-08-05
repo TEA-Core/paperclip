@@ -25,6 +25,7 @@ import {
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
+  assertGitIndexIntegrity,
   assertWorktreeWritableByProcessUser,
   buildWorkspaceRuntimeDesiredStatePatch,
   cleanupExecutionWorkspaceArtifacts,
@@ -414,6 +415,33 @@ describe("assertWorktreeWritableByProcessUser", () => {
     await fs.writeFile(indexFile, Buffer.alloc(0));
 
     await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(
+      /git index.*0 bytes \(truncated\)|truncated.*git index/i,
+    );
+  });
+});
+
+describe("assertGitIndexIntegrity", () => {
+  it("resolves when the git index is healthy (non-zero)", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11017-healthy-index";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    await expect(assertGitIndexIntegrity(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("throws a workspace validation failure when the worktree git index is truncated to zero bytes", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11017-truncated-index";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    const indexFile = path.join(repoRoot, ".git", "worktrees", branchName, "index");
+    await fs.writeFile(indexFile, Buffer.alloc(0));
+
+    await expect(assertGitIndexIntegrity(worktreePath)).rejects.toThrow(
       /git index.*0 bytes \(truncated\)|truncated.*git index/i,
     );
   });
