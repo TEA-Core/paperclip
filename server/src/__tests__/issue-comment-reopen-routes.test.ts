@@ -18,6 +18,7 @@ const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
   decide: vi.fn(),
   hasPermission: vi.fn(),
+  isManagerOf: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({

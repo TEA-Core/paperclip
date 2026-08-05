@@ -3474,6 +3474,7 @@ export function issueRoutes(
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
       status: string;
+      createdByAgentId: string | null;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
   ) {
@@ -3489,6 +3490,7 @@ export function issueRoutes(
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
         status: issue.status,
+        createdByAgentId: issue.createdByAgentId,
       },
       scope: {
         issueId: issue.id,
@@ -3496,6 +3498,7 @@ export function issueRoutes(
         parentIssueId: issue.parentId,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
+        createdByAgentId: issue.createdByAgentId,
       },
     });
   }
@@ -3518,6 +3521,7 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId: string | null;
     },
   ) {
     if (req.actor.type !== "agent") return true;
@@ -3549,8 +3553,20 @@ export function issueRoutes(
     return boundaryDecision;
   }
 
-  function isIssueMentionGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
-    return decision !== true && decision.reason === "allow_issue_mention_grant";
+  function isCommentOnlyBoundaryGrant(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return (
+      decision !== true &&
+      (decision.reason === "allow_issue_mention_grant" ||
+        decision.reason === "allow_creator" ||
+        decision.reason === "allow_manager_chain")
+    );
+  }
+
+  function commentAuthorizationPathForDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    if (decision === true) return null;
+    if (decision.reason === "allow_manager_chain") return "escape_hatch_manager_chain";
+    if (decision.reason === "allow_creator") return "escape_hatch_creator";
+    return null;
   }
 
   async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
@@ -3599,6 +3615,7 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      createdByAgentId: string | null;
     },
   ) {
     if (req.actor.type !== "agent") return true;
@@ -5874,6 +5891,7 @@ export function issueRoutes(
           assigneeAgentId: issueRows.assigneeAgentId,
           assigneeUserId: issueRows.assigneeUserId,
           status: issueRows.status,
+          createdByAgentId: issueRows.createdByAgentId,
         })
         .from(issueRows)
         .where(and(eq(issueRows.companyId, companyId), inArray(issueRows.id, requestedIssueIds)))
@@ -7763,7 +7781,52 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    const actorAgentId = req.actor.type === "agent" ? req.actor.agentId : null;
+    let mutationAccess:
+      | boolean
+      | { allowed: boolean; reason: string; action: string; explanation: string };
+    if (req.actor.type !== "agent" || !actorAgentId) {
+      mutationAccess = true;
+    } else {
+      const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+      if (watchdogScope.kind !== "none") {
+        const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, existing);
+        if (scopeResult.kind === "invalid") {
+          res.status(403).json({
+            error: scopeResult.detail,
+            details: {
+              issueId: existing.id,
+              securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+            },
+          });
+          return;
+        }
+        mutationAccess = await assertFreshTaskWatchdogSourceMutation(res, watchdogScope, existing);
+        if (!mutationAccess) return;
+      } else {
+        const boundaryDecision = await decideIssueAccess(req, existing, "issue:mutate");
+        if (boundaryDecision.allowed) {
+          mutationAccess = await assertAgentIssueMutationAllowed(req, res, existing);
+          if (!mutationAccess) return;
+        } else if (
+          existing.assigneeAgentId &&
+          (await access.isManagerOf(existing.companyId, actorAgentId, existing.assigneeAgentId))
+        ) {
+          mutationAccess = {
+            allowed: true,
+            reason: "allow_manager_chain",
+            action: "issue:mutate",
+            explanation: "Allowed because the actor is an org-chain ancestor of the issue assignee.",
+          };
+        } else {
+          mutationAccess = false;
+        }
+      }
+    }
+    if (!mutationAccess) {
+      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      return;
+    }
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -7787,6 +7850,21 @@ export function issueRoutes(
       hiddenAt: hiddenAtRaw,
       ...updateFields
     } = req.body;
+    if (
+      mutationAccess !== true &&
+      typeof mutationAccess === "object" &&
+      mutationAccess.reason === "allow_manager_chain"
+    ) {
+      const ANCESTOR_ALLOWED_FIELDS = new Set(["assigneeAgentId", "status", "blockedByIssueIds"]);
+      const forbidden = Object.keys(updateFields).filter((k) => !ANCESTOR_ALLOWED_FIELDS.has(k));
+      if (forbidden.length > 0) {
+        res.status(403).json({
+          error: "Ancestor escape hatch only permits assigneeAgentId, status, and blockedByIssueIds changes",
+          details: { forbiddenFields: forbidden },
+        });
+        return;
+      }
+    }
     const shouldCancelActiveRunForCancelledStatus =
       existing.status !== "cancelled" && updateFields.status === "cancelled";
     if (resumeRequested === true && !commentBody) {
@@ -8402,6 +8480,9 @@ export function issueRoutes(
         ...(commentBody ? { source: "comment" } : {}),
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
+        ...(mutationAccess !== true && typeof mutationAccess === "object" && mutationAccess.reason === "allow_manager_chain"
+          ? { authorizationPath: "escape_hatch_manager_chain" }
+          : {}),
         ...(scheduledRetrySupersededByComment
           ? {
               scheduledRetrySupersededByComment: true,
@@ -8666,6 +8747,9 @@ export function issueRoutes(
           bodySnippet: comment.body.slice(0, 120),
           identifier: issue.identifier,
           issueTitle: issue.title,
+          ...(mutationAccess !== true && typeof mutationAccess === "object" && mutationAccess.reason === "allow_manager_chain"
+            ? { authorizationPath: "escape_hatch_manager_chain" }
+            : {}),
           ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
           ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
           ...(scheduledRetrySupersededByComment
@@ -10005,22 +10089,23 @@ export function issueRoutes(
     const interruptRequested = req.body.interrupt === true;
     const isClosed = isClosedIssueStatus(issue.status);
     const isBlocked = issue.status === "blocked";
-    const mentionGrantedPeerAgentCommentOnly =
+    const commentOnlyBoundaryGrantComment =
       isClosed &&
       req.actor.type === "agent" &&
       issue.assigneeAgentId !== null &&
       issue.assigneeAgentId !== req.actor.agentId &&
       !reopenRequested &&
       !resumeRequested &&
-      isIssueMentionGrantDecision(commentAccessDecision);
-    const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
-    const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
+      isCommentOnlyBoundaryGrant(commentAccessDecision);
+    const effectiveReopenRequested = commentOnlyBoundaryGrantComment ? false : reopenRequested;
+    const effectiveResumeRequested = commentOnlyBoundaryGrantComment ? false : resumeRequested;
+    const commentAuthorizationPath = commentAuthorizationPathForDecision(commentAccessDecision);
     if (
       isClosed &&
       req.actor.type === "agent" &&
       issue.assigneeAgentId !== null &&
       issue.assigneeAgentId !== req.actor.agentId &&
-      !mentionGrantedPeerAgentCommentOnly
+      !commentOnlyBoundaryGrantComment
     ) {
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     }
@@ -10332,6 +10417,7 @@ export function issueRoutes(
         bodySnippet: comment.body.slice(0, 120),
         identifier: currentIssue.identifier,
         issueTitle: currentIssue.title,
+        ...(commentAuthorizationPath ? { authorizationPath: commentAuthorizationPath } : {}),
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
         ...(scheduledRetrySupersededByComment
