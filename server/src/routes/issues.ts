@@ -430,6 +430,13 @@ const ISSUE_WORKSPACE_AUDIT_FIELDS = new Set([
   "executionWorkspaceSettings",
 ]);
 
+/**
+ * The only fields an org-chain ancestor may change through the manager escape
+ * hatch. The hatch exists to unstick an issue pinned to a non-executing
+ * assignee, not to edit content or drive review/approval flows.
+ */
+const ANCESTOR_ALLOWED_FIELDS = new Set(["assigneeAgentId", "status", "blockedByIssueIds"]);
+
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
@@ -7829,6 +7836,20 @@ export function issueRoutes(
     }
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
+    if (
+      mutationAccess !== true &&
+      typeof mutationAccess === "object" &&
+      mutationAccess.reason === "allow_manager_chain"
+    ) {
+      const forbidden = Object.keys(req.body).filter((k) => !ANCESTOR_ALLOWED_FIELDS.has(k));
+      if (forbidden.length > 0) {
+        res.status(403).json({
+          error: "Ancestor escape hatch only permits assigneeAgentId, status, and blockedByIssueIds changes",
+          details: { forbiddenFields: forbidden },
+        });
+        return;
+      }
+    }
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
@@ -7850,21 +7871,6 @@ export function issueRoutes(
       hiddenAt: hiddenAtRaw,
       ...updateFields
     } = req.body;
-    if (
-      mutationAccess !== true &&
-      typeof mutationAccess === "object" &&
-      mutationAccess.reason === "allow_manager_chain"
-    ) {
-      const ANCESTOR_ALLOWED_FIELDS = new Set(["assigneeAgentId", "status", "blockedByIssueIds"]);
-      const forbidden = Object.keys(updateFields).filter((k) => !ANCESTOR_ALLOWED_FIELDS.has(k));
-      if (forbidden.length > 0) {
-        res.status(403).json({
-          error: "Ancestor escape hatch only permits assigneeAgentId, status, and blockedByIssueIds changes",
-          details: { forbiddenFields: forbidden },
-        });
-        return;
-      }
-    }
     const shouldCancelActiveRunForCancelledStatus =
       existing.status !== "cancelled" && updateFields.status === "cancelled";
     if (resumeRequested === true && !commentBody) {
