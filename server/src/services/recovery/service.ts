@@ -161,6 +161,9 @@ type ResolvedDependencyWakeBackstopOptions = {
   companyId?: string | null;
   blockerIssueId?: string | null;
   source?: ResolvedDependencyWakeBackstopSource;
+  now?: Date | null;
+  rearmWindowMs?: number | null;
+  rearmMaxCount?: number | null;
 };
 
 type LatestIssueRun = Pick<
@@ -5325,6 +5328,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       candidatesByCompany.set(candidate.companyId, companyCandidates);
     }
 
+    const reArmCapNow = opts?.now ?? new Date();
+    const shouldLogReArmCap =
+      !lastDependencyWakeReArmCapActivityLogAt ||
+      reArmCapNow.getTime() - lastDependencyWakeReArmCapActivityLogAt.getTime() >= DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS;
+
     for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
       const readinessMap = await issuesSvc.listDependencyReadiness(
         companyId,
@@ -5441,6 +5449,58 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        const rearmWindowMs = opts?.rearmWindowMs;
+        const rearmMaxCount = opts?.rearmMaxCount;
+        if (rearmWindowMs && rearmMaxCount) {
+          const since = new Date(reArmCapNow.getTime() - rearmWindowMs);
+          const wakeCount = await db
+            .select({ count: sql<number>`count(*)::int` })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, companyId),
+                eq(agentWakeupRequests.reason, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON),
+                sql`${agentWakeupRequests.payload} ->> 'issueId' = ${candidate.id}`,
+                gte(agentWakeupRequests.requestedAt, since),
+              ),
+            )
+            .then((rows) => rows[0]?.count ?? 0);
+          if (wakeCount >= rearmMaxCount) {
+            result.reArmCapSkipped += 1;
+            logger.warn(
+              {
+                issueId: candidate.id,
+                identifier: candidate.identifier,
+                wakeCount,
+                rearmMaxCount,
+                rearmWindowMs,
+              },
+              "resolved dependency wake re-arm cap reached — dependent stuck, needs escalation",
+            );
+            if (shouldLogReArmCap) {
+              await logActivity(db, {
+                companyId,
+                actorType: "system",
+                actorId: "system",
+                agentId: null,
+                runId: null,
+                action: "issue.dependency_wake_rearm_cap_reached",
+                entityType: "issue",
+                entityId: candidate.id,
+                details: {
+                  source,
+                  identifier: candidate.identifier,
+                  idempotencyKeys,
+                  consumedCount: wakeCount,
+                  maxCount: rearmMaxCount,
+                  blockerIssueIds: readiness?.blockerIssueIds ?? [],
+                },
+              });
+            }
+            continue;
+          }
+        }
+
         try {
           const wake = await deps.enqueueWakeup(agentId, {
             source: "automation",
@@ -5505,6 +5565,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           );
         }
       }
+    }
+
+    if (shouldLogReArmCap && result.reArmCapSkipped > 0) {
+      lastDependencyWakeReArmCapActivityLogAt = reArmCapNow;
     }
 
     if (result.healed > 0) {
@@ -6450,6 +6514,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     return result;
   }
+
+  const DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS = 5 * 60_000;
+  let lastDependencyWakeReArmCapActivityLogAt: Date | null = null;
 
   return {
     buildRunOutputSilence,
