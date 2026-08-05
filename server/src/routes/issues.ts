@@ -10520,6 +10520,23 @@ export function issueRoutes(
         ["done", "cancelled"].includes(currentIssue.status);
       if (becameTerminal) {
         await destroyReusableSandboxLeasesForTerminalIssue(currentIssue);
+
+        const expiredInteractions = await issueThreadInteractionService(db).expirePendingInteractionsOnTerminalIssueStatus(
+          currentIssue,
+          currentIssue.status,
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        );
+        if (expiredInteractions.length > 0) {
+          await logExpiredRequestConfirmations({
+            issue: currentIssue,
+            interactions: expiredInteractions,
+            actor,
+            source: "issue.comment.auto_approval",
+          });
+        }
       }
       if (becameTerminal && currentIssue.parentId) {
         const parent = await svc.getWakeableParentAfterChildCompletion(currentIssue.parentId);

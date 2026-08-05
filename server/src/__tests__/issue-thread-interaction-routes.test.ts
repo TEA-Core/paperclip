@@ -8,6 +8,9 @@ const CREATED_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   update: vi.fn(),
+  addComment: vi.fn(),
+  getCurrentScheduledRetry: vi.fn(async () => null),
+  findMentionedAgents: vi.fn(async () => []),
   listWakeableBlockedDependents: vi.fn(async () => []),
   getWakeableParentAfterChildCompletion: vi.fn(async () => null),
 }));
@@ -19,6 +22,7 @@ const mockInteractionService = vi.hoisted(() => ({
   acceptSuggestedTasks: vi.fn(),
   rejectInteraction: vi.fn(),
   rejectSuggestedTasks: vi.fn(),
+  expireRequestConfirmationsSupersededByComment: vi.fn(),
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(),
   answerQuestions: vi.fn(),
   submitItemVerdicts: vi.fn(),
@@ -47,8 +51,14 @@ const mockDbSelectWhere = vi.hoisted(() => {
 });
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
+const mockTxInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
+const mockTxInsert = vi.hoisted(() => vi.fn(() => ({ values: mockTxInsertValues })));
+const mockTx = vi.hoisted(() => ({
+  insert: mockTxInsert,
+}));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
+  transaction: vi.fn(async (callback: (tx: typeof mockTx) => unknown) => callback(mockTx)),
 }));
 
 vi.mock("@paperclipai/shared/telemetry", () => ({
@@ -198,7 +208,18 @@ describe.sequential("issue thread interaction routes", () => {
     mockIssueService.getById.mockResolvedValue(createIssue());
     mockInteractionService.listForIssue.mockResolvedValue([]);
     mockInteractionService.expireRequestConfirmationsSupersededByHistoricalComments.mockResolvedValue([]);
+    mockInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockInteractionService.expirePendingInteractionsOnTerminalIssueStatus.mockResolvedValue([]);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-auto-approval",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      body: "## Review: APPROVED\n\nLooks good.",
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
     mockInteractionService.create.mockResolvedValue({
       id: "interaction-1",
       companyId: "company-1",
@@ -1746,6 +1767,77 @@ describe.sequential("issue thread interaction routes", () => {
         details: expect.objectContaining({
           interactionId: "interaction-expired",
           interactionKind: "request_confirmation",
+          result: expect.objectContaining({
+            outcome: "expired_issue_terminal",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("expires pending interactions when a review comment auto-approves an issue to a terminal status", async () => {
+    mockIssueService.getById.mockResolvedValue(createIssue({
+      status: "in_review",
+      executionPolicy: {
+        stages: [{
+          id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          type: "review",
+          participants: [{ type: "user", userId: "local-board" }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", userId: "local-board" },
+        returnAssignee: { type: "user", userId: "local-board" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...createIssue(),
+      ...patch,
+      executionState: patch.executionState,
+    }));
+    mockInteractionService.expirePendingInteractionsOnTerminalIssueStatus.mockResolvedValue([
+      {
+        id: "interaction-expired-by-auto-approval",
+        kind: "request_confirmation",
+        status: "expired",
+        result: {
+          version: 1,
+          outcome: "expired_issue_terminal",
+        },
+      },
+    ]);
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/comments")
+      .send({ body: "## Review: APPROVED\n\nLooks good." });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({ status: "done" }),
+      expect.anything(),
+    );
+    expect(mockInteractionService.expirePendingInteractionsOnTerminalIssueStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "done",
+      expect.objectContaining({ userId: "local-board" }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.thread_interaction_expired",
+        details: expect.objectContaining({
+          interactionId: "interaction-expired-by-auto-approval",
+          interactionKind: "request_confirmation",
+          source: "issue.comment.auto_approval",
           result: expect.objectContaining({
             outcome: "expired_issue_terminal",
           }),
