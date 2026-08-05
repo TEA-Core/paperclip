@@ -1227,7 +1227,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     let skipped = 0;
     const issueIds: string[] = [];
     const seen = new Set<string>();
-
     for (const candidate of candidates) {
       if (seen.has(candidate.id)) continue;
       seen.add(candidate.id);
@@ -4953,7 +4952,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return true;
     });
     const budgetBlockedCandidateAgentIds: string[] = [];
-
     for (const candidate of candidates) {
       const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.agentId, {
         issueId: issue.id,
@@ -5328,6 +5326,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const candidatesByCompany = new Map<string, typeof candidates>();
+
     for (const candidate of candidates) {
       const companyCandidates = candidatesByCompany.get(candidate.companyId) ?? [];
       companyCandidates.push(candidate);
@@ -5835,6 +5834,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const candidates = rows.map(({ totalCount: _totalCount, ...candidate }) => candidate);
     const candidatesByCompany = new Map<string, typeof candidates>();
+
     for (const candidate of candidates) {
       const companyCandidates = candidatesByCompany.get(candidate.companyId) ?? [];
       companyCandidates.push(candidate);
@@ -5994,7 +5994,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .orderBy(asc(issueRecoveryActions.lastAttemptAt));
 
     result.checked = candidates.length;
-
     for (const candidate of candidates) {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
 
@@ -6285,6 +6284,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .limit(PERMANENTLY_UNFINALIZABLE_BLOCKERS_CANDIDATE_LIMIT);
 
     const candidateIdsByCompany = new Map<string, Set<string>>();
+
     for (const candidate of candidates) {
       const companySet = candidateIdsByCompany.get(candidate.companyId) ?? new Set<string>();
       companySet.add(candidate.id);
@@ -6379,6 +6379,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const result = {
       archived: 0,
       skippedParentNotBlocked: 0,
+      manual: 0,
       issueIds: [] as string[],
     };
 
@@ -6391,6 +6392,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         companyId: issues.companyId,
         parentId: issues.parentId,
         monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+        executionState: issues.executionState,
       })
       .from(issues)
       .where(
@@ -6399,10 +6401,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           isNotNull(issues.parentId),
           sql`${issues.monitorLastTriggeredAt} is not null`,
           sql`${issues.monitorLastTriggeredAt} <= ${dayAgo}`,
+          sql`${issues.executionState}->>'currentStageType' = 'review'`,
           sql`${issues.id} not in (select ${unWakeableArchives.issueId} from ${unWakeableArchives} where ${unWakeableArchives.policy} = 'stale_in_review_child')`,
         ),
       );
-
     for (const candidate of candidates) {
       const parent = await db
         .select({ status: issues.status })
@@ -6412,6 +6414,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       if (!parent || parent.status !== "blocked") {
         result.skippedParentNotBlocked += 1;
+        continue;
+      }
+
+      const state = parseIssueExecutionState(candidate.executionState);
+      if (!state || state.currentStageType !== "review") {
+        await db.insert(issueComments).values({
+          companyId: candidate.companyId,
+          issueId: candidate.id,
+          authorType: "system",
+          body: "Manual intervention required: stale in_review child with no matching auto-archive rule. The child is in_review but not at a review stage, so it cannot be auto-archived by this sweep.",
+        });
+        result.manual += 1;
         continue;
       }
 
@@ -6455,7 +6469,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       ) {
         lastStaleInReviewChildLogAt = now;
         logger.warn(
-          { archived: result.archived, skipped: result.skippedParentNotBlocked, issueIds: result.issueIds },
+          { archived: result.archived, skipped: result.skippedParentNotBlocked, manual: result.manual, issueIds: result.issueIds },
           "ingested stale in_review child issues",
         );
       }
