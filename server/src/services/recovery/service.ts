@@ -5798,17 +5798,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       candidateLimitSkipped: 0,
       issueIds: [] as string[],
     };
-  
+
     const recoveryActionsSvc = issueRecoveryActionService(db);
     const source = "issue_graph_liveness.blocked_without_blockers";
     const now = opts?.now ?? new Date();
-  
+
     const filters = [
       eq(issues.status, "blocked"),
       visibleIssueCondition(),
     ];
     if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
-  
+
     const rows = await db
       .select({
         id: issues.id,
@@ -5822,10 +5822,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(and(...filters))
       .orderBy(asc(issues.id))
       .limit(BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT);
-  
+
     result.checked = rows.length;
     result.candidateLimitSkipped = Math.max(0, (rows[0]?.totalCount ?? 0) - rows.length);
-  
+
     const candidates = rows.map(({ totalCount: _totalCount, ...candidate }) => candidate);
     const candidatesByCompany = new Map<string, typeof candidates>();
     for (const candidate of candidates) {
@@ -5833,45 +5833,45 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       companyCandidates.push(candidate);
       candidatesByCompany.set(candidate.companyId, companyCandidates);
     }
-  
+
     for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
       const readinessMap = await issuesSvc.listDependencyReadiness(
         companyId,
         companyCandidates.map((candidate) => candidate.id),
       );
-  
+
       for (const candidate of companyCandidates) {
         const readiness = readinessMap.get(candidate.id);
         if (!readiness || readiness.unresolvedBlockerCount !== 0) continue;
-  
+
         const blockedAt = candidate.updatedAt ?? new Date();
         const msInViolation = now.getTime() - blockedAt.getTime();
         if (msInViolation < BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS) {
           result.graceThresholdSkipped++;
           continue;
         }
-  
+
         if (await hasActiveExecutionPath(companyId, candidate.id)) {
           result.livePathSkipped++;
           continue;
         }
-  
+
         if (await hasPendingWakeInteraction(companyId, candidate.id)) {
           result.interactionSkipped++;
           continue;
         }
-  
+
         if (await isAutomaticRecoverySuppressedByPauseHold(db, companyId, candidate.id, treeControlSvc)) {
           result.pauseHoldSkipped++;
           continue;
         }
-  
+
         const existingAction = await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
         if (existingAction?.kind === "blocked_without_blockers") {
           result.alreadyActionedSkipped++;
           continue;
         }
-  
+
         await recoveryActionsSvc.upsertSourceScoped({
           companyId,
           sourceIssueId: candidate.id,
@@ -5893,10 +5893,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           maxAttempts: null,
           lastAttemptAt: now,
         });
-  
+
         result.escalated++;
         result.issueIds.push(candidate.id);
-  
+
         await logActivity(db, {
           companyId,
           actorType: "system",
@@ -5912,14 +5912,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         });
       }
     }
-  
+
     if (result.escalated > 0) {
       logger.warn(
         { escalated: result.escalated, issueIds: result.issueIds, source },
         "blocked-without-blockers escalated to board-owned recovery actions",
       );
     }
-  
+
     return result;
   }
 
