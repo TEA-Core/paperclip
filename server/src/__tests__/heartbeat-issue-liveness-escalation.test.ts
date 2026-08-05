@@ -1678,7 +1678,8 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       });
     }
 
-    const result = await recoveryServiceWithMocks().reconcileResolvedDependencyWakeBackstop({
+    const svc = recoveryServiceWithMocks();
+    const result = await svc.reconcileResolvedDependencyWakeBackstop({
       now: new Date(withinWindow.getTime() + windowMs + 1),
       rearmWindowMs: windowMs,
       rearmMaxCount: maxCount,
@@ -1687,6 +1688,33 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.healed).toBe(0);
     expect(result.reArmCapSkipped).toBe(1);
     expect(result.issueIds).toEqual([]);
+
+    const activities = await db
+      .select({ action: activityLog.action, entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, blockedIssueId));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.action).toBe(
+      "issue.dependency_wake_rearm_cap_reached",
+    );
+
+    const result2 =
+      await svc.reconcileResolvedDependencyWakeBackstop({
+        now: new Date(withinWindow.getTime() + windowMs + 1),
+        rearmWindowMs: windowMs,
+        rearmMaxCount: maxCount,
+      });
+
+    const activities2 = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, blockedIssueId));
+    expect(activities2).toHaveLength(1);
+
+    const issue = await db.query.issues.findFirst({
+      where: eq(issues.id, blockedIssueId),
+    });
+    expect(issue?.status).toBe("blocked");
 
     const wakes = await db
       .select({

@@ -5346,6 +5346,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             },
             "resolved dependency wake re-arm cap reached — dependent stuck, needs escalation",
           );
+          const reArmCapNow = new Date();
+          const shouldLogReArmCap =
+            !lastDependencyWakeReArmCapActivityLogAt ||
+            reArmCapNow.getTime() -
+              lastDependencyWakeReArmCapActivityLogAt.getTime() >=
+              DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS;
+          if (shouldLogReArmCap) {
+            await logActivity(db, {
+              companyId: candidate.companyId,
+              actorType: "system",
+              actorId: "system",
+              agentId: null,
+              runId: null,
+              action: "issue.dependency_wake_rearm_cap_reached",
+              entityType: "issue",
+              entityId: candidate.id,
+              details: {
+                source,
+                identifier: candidate.identifier,
+                idempotencyKeys,
+                consumedCount: consumedWakes,
+                maxCount,
+                blockerIssueIds: readiness?.blockerIssueIds ?? [],
+              },
+            });
+            lastDependencyWakeReArmCapActivityLogAt = reArmCapNow;
+          }
           continue;
         }
 
@@ -6242,6 +6269,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     return result;
   }
+
+  const DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS = 5 * 60_000;
+  let lastDependencyWakeReArmCapActivityLogAt: Date | null = null;
 
   return {
     buildRunOutputSilence,
