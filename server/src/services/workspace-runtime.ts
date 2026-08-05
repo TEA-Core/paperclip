@@ -2706,7 +2706,17 @@ export async function assertWorktreeWritableByProcessUser(worktreePath: string):
 
   for (const relPath of trackedPaths) {
     const fullPath = path.join(worktreePath, relPath);
-    const writable = await fs.access(fullPath, fs.constants.W_OK).then(() => true, () => false);
+    const writable = await fs.access(fullPath, fs.constants.W_OK).then(
+      () => true,
+      (err: NodeJS.ErrnoException) =>
+        // A tracked file that is absent is an uncommitted deletion — ordinary
+        // work in progress — and says nothing about whether we can write here.
+        // Treating ENOENT as a permission failure blocked provisioning for any
+        // issue whose agent had deleted a file, and told the operator to run a
+        // `chown` that could not have fixed it. Only real permission failures
+        // count; everything else this check exists for still reports.
+        err?.code === "ENOENT",
+    );
     if (!writable) {
       totalFailures++;
       if (failures.length < MAX_FAILURES) {

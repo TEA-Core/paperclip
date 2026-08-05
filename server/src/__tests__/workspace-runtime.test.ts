@@ -402,6 +402,57 @@ describe("assertWorktreeWritableByProcessUser", () => {
       /not a valid git repository or is missing/,
     );
   });
+
+  // An agent deleting a tracked file is ordinary uncommitted work. `fs.access`
+  // reports ENOENT for it, which is not a permission problem — counting it as one
+  // blocked provisioning for any issue mid-change and told the operator to run a
+  // `chown` that could not possibly help. Observed on the live instance: two
+  // worktrees reported "3 files not writable" and "110 files not writable" whose
+  // failing counts exactly matched `git ls-files --deleted`, with every remaining
+  // file owned correctly.
+  it("resolves when a tracked file has been deleted from the worktree", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10633-tracked-file-deleted";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    const tracked = path.join(worktreePath, "delete-me.md");
+    await fs.writeFile(tracked, "hello\n", "utf8");
+    await execFileAsync("git", ["add", "delete-me.md"], { cwd: worktreePath });
+    await execFileAsync("git", ["commit", "-m", "add tracked file"], { cwd: worktreePath });
+    await fs.rm(tracked);
+
+    // Still tracked in the index, absent on disk — the exact live condition.
+    const { stdout } = await execFileAsync("git", ["ls-files", "--deleted"], { cwd: worktreePath });
+    expect(stdout).toContain("delete-me.md");
+
+    await expect(assertWorktreeWritableByProcessUser(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("still throws for a genuinely unreadable file alongside a deleted one", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10633-deleted-plus-unwritable";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    await fs.writeFile(path.join(worktreePath, "gone.md"), "gone\n", "utf8");
+    await fs.writeFile(path.join(worktreePath, "locked.md"), "locked\n", "utf8");
+    await execFileAsync("git", ["add", "gone.md", "locked.md"], { cwd: worktreePath });
+    await execFileAsync("git", ["commit", "-m", "add two tracked files"], { cwd: worktreePath });
+    await fs.rm(path.join(worktreePath, "gone.md"));
+    await fs.chmod(path.join(worktreePath, "locked.md"), 0o444);
+
+    try {
+      // The deletion is ignored; the real permission failure is still reported.
+      await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(
+        /1 files not writable/,
+      );
+    } finally {
+      await fs.chmod(path.join(worktreePath, "locked.md"), 0o644);
+    }
+  });
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {
