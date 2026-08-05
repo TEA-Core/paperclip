@@ -5487,7 +5487,9 @@ export function resolveHeartbeatSchedulingSuppression(
 
 export function truncateAgentErrorReason(reason: string | null | undefined): string | null {
   if (!reason) return null;
-  const plain = reason.replace(/\x1b\[[0-9;]*m/g, "");
+  const plain = reason
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b(?:[@-Z\\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
   const trimmed = plain.trim();
   if (!trimmed) return null;
   return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
@@ -11298,7 +11300,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
     failureReason?: string | null,
-    options?: { keepIdleOnFailure?: boolean },
+    options?: { keepIdleOnFailure?: boolean; errorCode?: string | null },
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -11324,7 +11326,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Persist a human-readable reason on the agent record when it enters
         // error so operators see it on the agent page without digging into run
         // events; clear it whenever the agent leaves error.
-        errorReason: nextStatus === "error" ? truncateAgentErrorReason(failureReason) : null,
+        errorReason: nextStatus === "error" ? truncateAgentErrorReason(options?.errorCode ? `[${options.errorCode}] ${failureReason ?? ""}` : failureReason) : null,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -11778,7 +11780,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "failed", baseMessage);
+      await finalizeAgentStatus(run.agentId, "failed", baseMessage, { errorCode: "process_lost" });
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
@@ -14339,6 +14341,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           keepIdleOnFailure:
             outcome === "failed" &&
             (finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota"),
+          errorCode: outcome === "succeeded" ? null : runErrorCode,
         },
       );
     } catch (err) {
@@ -14465,6 +14468,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await finalizeAgentStatus(agent.id, "failed", message, {
         keepIdleOnFailure: workspaceValidationFailure != null,
+        errorCode: failureErrorCode,
       });
     }
     } catch (outerErr) {
@@ -14571,6 +14575,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // agent idle — instead of error — stops one broken worktree from
               // crash-looping the whole agent while operators repair the index.
               keepIdleOnFailure: workspaceValidationSetupFailure != null,
+              errorCode: setupFailureErrorCode,
             }).catch(() => undefined);
           }
         } finally {
