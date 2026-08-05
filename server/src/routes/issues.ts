@@ -7788,22 +7788,39 @@ export function issueRoutes(
     if (req.actor.type !== "agent" || !actorAgentId) {
       mutationAccess = true;
     } else {
-      const boundaryDecision = await decideIssueAccess(req, existing, "issue:mutate");
-      if (boundaryDecision.allowed) {
-        mutationAccess = await assertAgentIssueMutationAllowed(req, res, existing);
+      const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+      if (watchdogScope.kind !== "none") {
+        const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, existing);
+        if (scopeResult.kind === "invalid") {
+          res.status(403).json({
+            error: scopeResult.detail,
+            details: {
+              issueId: existing.id,
+              securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+            },
+          });
+          return;
+        }
+        mutationAccess = await assertFreshTaskWatchdogSourceMutation(res, watchdogScope, existing);
         if (!mutationAccess) return;
-      } else if (
-        existing.assigneeAgentId &&
-        (await access.isManagerOf(existing.companyId, actorAgentId, existing.assigneeAgentId))
-      ) {
-        mutationAccess = {
-          allowed: true,
-          reason: "allow_manager_chain",
-          action: "issue:mutate",
-          explanation: "Allowed because the actor is an org-chain ancestor of the issue assignee.",
-        };
       } else {
-        mutationAccess = false;
+        const boundaryDecision = await decideIssueAccess(req, existing, "issue:mutate");
+        if (boundaryDecision.allowed) {
+          mutationAccess = await assertAgentIssueMutationAllowed(req, res, existing);
+          if (!mutationAccess) return;
+        } else if (
+          existing.assigneeAgentId &&
+          (await access.isManagerOf(existing.companyId, actorAgentId, existing.assigneeAgentId))
+        ) {
+          mutationAccess = {
+            allowed: true,
+            reason: "allow_manager_chain",
+            action: "issue:mutate",
+            explanation: "Allowed because the actor is an org-chain ancestor of the issue assignee.",
+          };
+        } else {
+          mutationAccess = false;
+        }
       }
     }
     if (!mutationAccess) {
