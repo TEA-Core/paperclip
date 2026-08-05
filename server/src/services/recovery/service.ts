@@ -729,7 +729,24 @@ async function unresolvedBlockerIssues(db: Db, companyId: string, issueId: strin
     );
 }
 
-// status:"blocked" with an empty blocker set is permanently unwakeable — skip the write instead.
+/**
+ * Write status:"blocked" with the issue's current unresolved blocker set, from one place.
+ *
+ * A `blocked` row with an **empty** blocker set is not stranded in this fork — it has two
+ * wake paths, and which one applies depends on whether a recovery action owns it:
+ *
+ * - no live action → the dependency-wake backstop's zero-blocker heal (#41, SUP-10663) wakes
+ *   the assignee directly; that path exists for exactly these rows.
+ * - a live action → the heal defers to it (`hasActiveOrEscalatedRecoveryAction`), and the
+ *   owner — or the #46 (SUP-10792) sweep when the owner stalls — re-arms the issue.
+ *
+ * So the write always happens. Refusing it would be worse than a no-op: contained workspace
+ * failures usually carry no issue-level blocker at all (the blocker is environmental), and
+ * dropping the write leaves the issue `in_progress` and free to be re-dispatched onto the
+ * workspace that just failed containment. See heartbeat-workspace-branch-containment.test.ts.
+ *
+ * The empty case is logged rather than blocked, so the heal path stays observable.
+ */
 export async function blockIssueWithUnresolvedBlockers(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null; status: string },
@@ -737,11 +754,10 @@ export async function blockIssueWithUnresolvedBlockers(
 ) {
   const blockedByIssueIds = (await unresolvedBlockerIssues(db, issue.companyId, issue.id)).map((row) => row.id);
   if (blockedByIssueIds.length === 0) {
-    logger.warn(
+    logger.info(
       { issueId: issue.id, identifier: issue.identifier, source: opts.source, previousStatus: opts.previousStatus },
-      "recovery skipped blocked-write: resulting blocker set is empty",
+      "recovery blocked-write has an empty blocker set; zero-blocker heal or recovery owner will wake it",
     );
-    return null;
   }
   return (await issueService(db).update(issue.id, { status: "blocked", blockedByIssueIds, ...opts.extraUpdate })) ?? null;
 }

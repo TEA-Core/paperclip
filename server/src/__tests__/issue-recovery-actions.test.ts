@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -357,9 +357,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
-  it("does not write status:blocked with an empty blocker set when escalating stranded assigned work", async () => {
-    const { coderId, sourceIssue } = await seedCompany();
-    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+  it("blocks with an empty blocker set when escalating stranded assigned work, because the recovery action owns the wake", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => undefined as never);
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
     const latestRun = {
@@ -379,16 +379,30 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       comment: "Automatic continuation recovery failed.",
     });
 
-    expect(updated).toBeNull();
+    // The escalation records an owned recovery action before it writes. That action —
+    // and the #46 sweep behind it — is the wake path, so the empty issue-level blocker
+    // set is not grounds to skip the write. Skipping here would leave the issue
+    // in_progress and re-dispatchable, which is what containment must prevent.
+    expect(updated).not.toBeNull();
     const [afterEscalate] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterEscalate?.status).toBe("in_progress");
+    expect(afterEscalate?.status).toBe("blocked");
     const relations = await db
       .select()
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, sourceIssue.id));
     expect(relations).toHaveLength(0);
-    expect(enqueueWakeup).not.toHaveBeenCalled();
-    expect(warnSpy).toHaveBeenCalledWith(
+    const ownedActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssue.id),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ),
+      );
+    expect(ownedActions.length).toBeGreaterThan(0);
+    expect(infoSpy).toHaveBeenCalledWith(
       {
         issueId: sourceIssue.id,
         identifier: sourceIssue.identifier,
@@ -397,10 +411,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       },
       expect.any(String),
     );
-    warnSpy.mockRestore();
+    infoSpy.mockRestore();
   });
 
-  it("does not write status:blocked with an empty blocker set when escalating a recovery issue in place", async () => {
+  it("blocks a recovery issue in place with an empty blocker set and logs it for the zero-blocker heal", async () => {
     const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
     const recoveryIssueId = randomUUID();
     await db.insert(issues).values({
@@ -418,7 +432,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       originFingerprint: `stranded_issue_recovery:${sourceIssueId}`,
     });
     const [recoveryIssue] = await db.select().from(issues).where(eq(issues.id, recoveryIssueId));
-    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => undefined as never);
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
 
@@ -436,15 +450,18 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       },
     });
 
-    expect(updated).toBeNull();
+    // No issue-level blocker and no recovery action owns the recovery issue itself, so the
+    // dependency-wake backstop's zero-blocker heal (#41) is what wakes it. The write must
+    // still happen — skipping it would leave the recovery issue dispatchable.
+    expect(updated).not.toBeNull();
     const [afterEscalate] = await db.select().from(issues).where(eq(issues.id, recoveryIssueId));
-    expect(afterEscalate?.status).toBe("in_progress");
+    expect(afterEscalate?.status).toBe("blocked");
     const relations = await db
       .select()
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, recoveryIssueId));
     expect(relations).toHaveLength(0);
-    expect(warnSpy).toHaveBeenCalledWith(
+    expect(infoSpy).toHaveBeenCalledWith(
       {
         issueId: recoveryIssueId,
         identifier: `${prefix}-2`,
@@ -453,13 +470,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       },
       expect.any(String),
     );
-    warnSpy.mockRestore();
+    infoSpy.mockRestore();
   });
 
-  it("does not re-block with an empty blocker set when a recovery owner re-takes an issue it already owns", async () => {
+  it("re-blocks with an empty blocker set when a recovery owner re-takes an issue it already owns", async () => {
     const { companyId, coderId, sourceIssue, prefix } = await seedCompany();
     const blockerIssueId = await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
-    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => undefined as never);
     const enqueueWakeup = vi.fn(async () => {
       // Simulate a race: the blocker resolves and the issue leaves "blocked" between the
       // site-2 write and the reblock check, so the reblock attempt sees an empty blocker set.
@@ -484,10 +501,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       latestRun,
     });
 
+    // The blocker resolved mid-flight, so the reblock sees an empty blocker set — but the
+    // recovery owner still holds the issue, so the reblock proceeds rather than leaving the
+    // issue in_progress for the dispatcher to pick up again.
     expect(updated).not.toBeNull();
     const [afterEscalate] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterEscalate?.status).toBe("in_progress");
-    expect(warnSpy).toHaveBeenCalledWith(
+    expect(afterEscalate?.status).toBe("blocked");
+    expect(infoSpy).toHaveBeenCalledWith(
       {
         issueId: sourceIssue.id,
         identifier: sourceIssue.identifier,
@@ -496,7 +516,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       },
       expect.any(String),
     );
-    warnSpy.mockRestore();
+    infoSpy.mockRestore();
   });
 
   it.each([

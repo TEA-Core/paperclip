@@ -45,7 +45,6 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { logger } from "../middleware/logger.js";
 import { runningProcesses } from "../adapters/index.ts";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
@@ -793,41 +792,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId, runId, wakeupRequestId, issueId, rootIssueId };
   }
 
-  // The recovery service now refuses to write status:"blocked" when the resulting
-  // unresolved-blocker set is empty (an empty blocker set is permanently unwakeable).
-  // Tests that assert an issue gets escalated into "blocked" must seed a real,
-  // unresolved dependency blocker first. Use status "backlog" with no assignee so this
-  // blocker issue is never itself picked up by reconcileStrandedAssignedIssues' own
-  // todo-dispatch scan (which would pollute wake-count assertions).
-  async function seedUnresolvedBlocker(input: {
-    companyId: string;
-    issuePrefix: string;
-    relatedIssueId: string;
-  }) {
-    const blockerIssueId = randomUUID();
-    const issueNumber = 100000 + Math.floor(Math.random() * 900000);
-    await db.insert(issues).values({
-      id: blockerIssueId,
-      companyId: input.companyId,
-      title: "Real dependency blocking the escalated issue",
-      status: "backlog",
-      priority: "medium",
-      issueNumber,
-      identifier: `${input.issuePrefix}-${issueNumber}`,
-      // Hidden so pre-escalation guards (findExplicitBlockerPath, hasPersistedDurableWaitPath,
-      // listIssueDependencyReadinessMap) skip it, while unresolvedBlockerIssues (no hiddenAt
-      // filter) still finds it to satisfy the empty-blocker guard.
-      hiddenAt: new Date("2099-01-01"),
-    });
-    await db.insert(issueRelations).values({
-      companyId: input.companyId,
-      issueId: blockerIssueId,
-      relatedIssueId: input.relatedIssueId,
-      type: "blocks",
-    });
-    return blockerIssueId;
-  }
-
   async function seedInReviewParticipantRunFixture(input?: {
     wakeReason?: string;
     retryReason?: string | null;
@@ -1016,13 +980,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     kind?: string;
     previousOwnerAgentId?: string | null;
     returnOwnerAgentId?: string | null;
-    // Set when the test seeded a real unresolved dependency blocker on the escalated
-    // issue to satisfy the empty-blocker write guard. With a genuine blocker present,
-    // `enqueueWakeup`'s own dependency-readiness gate (independent of the write guard)
-    // correctly defers the recovery-owner wake instead of dispatching it immediately —
-    // waking someone to work a still-blocked issue would be pointless. In that case we
-    // verify the wake was deferred rather than asserting it dispatched a recovery run.
-    ownerWakeDeferredByBlocker?: boolean;
   }) {
     const action = await waitForValue(async () =>
       db.select().from(issueRecoveryActions).where(
@@ -1073,32 +1030,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(issues.originId, input.issueId),
       ));
     expect(recoveryIssues).toHaveLength(0);
-
-    if (input.ownerWakeDeferredByBlocker) {
-      const deferredWakeup = await waitForValue(async () => {
-        const wakeups = await db
-          .select()
-          .from(agentWakeupRequests)
-          .where(eq(agentWakeupRequests.agentId, input.agentId));
-        return wakeups.find((wakeup) => {
-          const payload = wakeup.payload as Record<string, unknown> | null;
-          return payload?.issueId === input.issueId && wakeup.reason === "issue_dependencies_blocked";
-        }) ?? null;
-      });
-      expect(deferredWakeup).toMatchObject({
-        companyId: input.companyId,
-        reason: "issue_dependencies_blocked",
-        status: "skipped",
-      });
-      await waitForHeartbeatIdle(db);
-      const sourceIssue = await db
-        .select()
-        .from(issues)
-        .where(eq(issues.id, input.issueId))
-        .then((rows) => rows[0] ?? null);
-      expect(sourceIssue?.status).toBe("blocked");
-      return action;
-    }
 
     const recoveryWakeup = await waitForValue(async () => {
       const wakeups = await db
@@ -1423,11 +1354,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
     });
 
-    await seedUnresolvedBlocker({
-      companyId: secondAttempt.companyId,
-      issuePrefix: `T${secondAttempt.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: secondAttempt.issueId,
-    });
     const secondLoss = await heartbeat.reapOrphanedRuns();
     expect(secondLoss).toEqual({ reaped: 1, runIds: [secondAttempt.runId] });
 
@@ -1459,7 +1385,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "in_progress",
       retryReason: "issue_continuation_needed",
       cause: "process_lost",
-      ownerWakeDeferredByBlocker: true,
     });
   });
 
@@ -1990,7 +1915,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       relatedIssueId: issueId,
       type: "blocks",
     });
-    const warnSpy = vi.spyOn(logger, "warn");
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reapOrphanedRuns();
@@ -2008,43 +1932,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: "issue_continuation_needed",
       retryOfRunId: runId,
     });
+
+    const blockedIssue = await waitForValue(async () =>
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+        const issue = rows[0] ?? null;
+        return issue?.status === "blocked" ? issue : null;
+      })
+    );
+    expect(blockedIssue?.status).toBe("blocked");
+    expect(blockedIssue?.executionRunId).toBeNull();
+    expect(blockedIssue?.checkoutRunId).toBeNull();
     if (!continuationRun?.id) throw new Error("Expected continuation recovery run to exist");
 
-    // With no real unresolved blocker, the empty-blocker guard skips the
-    // blocked write entirely — the issue stays live and no escalation
-    // comment/wake fires. See recovery/service.ts:blockIssueWithUnresolvedBlockers.
-    await waitForValue(async () =>
-      warnSpy.mock.calls.some((call) =>
-        (call[0] as Record<string, unknown> | undefined)?.issueId === issueId
-      ) ? true : null
-    );
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        issueId,
-        source: "recovery.reconcile_stranded_assigned_issue",
-        previousStatus: "in_progress",
-      }),
-      expect.any(String),
-    );
-
-    const liveIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(liveIssue?.status).toBe("in_progress");
-
-    const recoveryAction = await waitForValue(async () =>
-      db.select().from(issueRecoveryActions).where(
-        and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)),
-      ).then((rows) => rows[0] ?? null)
-    );
-    expect(recoveryAction).toMatchObject({
-      kind: "stranded_assigned_issue",
-      status: "active",
-      ownerAgentId: agentId,
+    const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId: continuationRun.id,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
     });
 
-    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([resolvedBlockerId]);
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments).toHaveLength(0);
+    const comments = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.length > 0 ? rows : null;
+    });
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("retried continuation");
+    expect(comments[0]?.body).toContain(`Recovery action: \`${recoveryAction.id}\``);
+    expect(comments[0]?.body).toContain("Recovery owner: [CodexCoder]");
   });
 
   it("blocks failed recovery work in place during immediate terminal-run cleanup", async () => {
@@ -2080,7 +1998,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       relatedIssueId: sourceIssueId,
       type: "blocks",
     });
-    await seedUnresolvedBlocker({ companyId, issuePrefix, relatedIssueId: issueId });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reapOrphanedRuns();
@@ -2449,11 +2366,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .update(issues)
       .set({ status: "in_review", executionRunId: runId })
       .where(eq(issues.id, issueId));
-    await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
-    });
 
     const heartbeat = heartbeatService(db);
     const result = await heartbeat.scheduleBoundedRetry(runId, {
@@ -2672,7 +2584,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       })
       .where(eq(issues.id, issueId));
 
-    const warnSpy = vi.spyOn(logger, "warn");
     const heartbeat = heartbeatService(db);
 
     await heartbeat.resumeQueuedRuns();
@@ -2700,30 +2611,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
     });
 
-    // With no real unresolved blocker, the empty-blocker guard skips the
-    // blocked write entirely — the issue stays live and no escalation
-    // comment fires. See recovery/service.ts:blockIssueWithUnresolvedBlockers.
-    await waitForValue(async () =>
-      warnSpy.mock.calls.some((call) =>
-        (call[0] as Record<string, unknown> | undefined)?.issueId === issueId
-      ) ? true : null
-    );
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        issueId,
-        source: "recovery.reconcile_workspace_validation_failed",
-        previousStatus: "in_progress",
+    const issue = await waitForValue(async () =>
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+        const row = rows[0] ?? null;
+        return row?.status === "blocked" ? row : null;
       }),
-      expect.any(String),
     );
+    expect(issue?.executionRunId).toBeNull();
 
-    const recoveryAction = await waitForValue(async () =>
-      db
-        .select()
-        .from(issueRecoveryActions)
-        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)))
-        .then((rows) => rows[0] ?? null)
-    );
+    const recoveryAction = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .then((rows) => rows[0] ?? null);
     expect(recoveryAction).toMatchObject({
       kind: "workspace_validation",
       cause: "workspace_validation_failed",
@@ -2739,8 +2639,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(recoveryAction?.nextAction).toContain("Repair the source issue workspace link");
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments.find((comment) => comment.body.includes("workspace failed validation"))).toBeUndefined();
+    const validationComment = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.find((comment) => comment.body.includes("workspace failed validation")) ?? null;
+    });
+    expect(validationComment).toBeTruthy();
   });
 
   it("blocks before dispatch when a declared secret ref has no binding instead of emitting an opaque setup failure", async () => {
@@ -2765,7 +2668,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       })
       .where(eq(agents.id, agentId));
 
-    const warnSpy = vi.spyOn(logger, "warn");
     const heartbeat = heartbeatService(db);
     await heartbeat.resumeQueuedRuns();
     await waitForRunToSettle(heartbeat, runId, 5_000);
@@ -2802,30 +2704,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // Value-free gate: no secret access events were recorded.
     expect(await svc.listAccessEvents(companyId, secret.id)).toHaveLength(0);
 
-    // With no real unresolved blocker, the empty-blocker guard skips the
-    // blocked write entirely — the issue stays live and no escalation
-    // comment fires. See recovery/service.ts:blockIssueWithUnresolvedBlockers.
-    await waitForValue(async () =>
-      warnSpy.mock.calls.some((call) =>
-        (call[0] as Record<string, unknown> | undefined)?.issueId === issueId
-      ) ? true : null
-    );
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        issueId,
-        source: "recovery.reconcile_configuration_incomplete",
-        previousStatus: "in_progress",
+    const issue = await waitForValue(async () =>
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+        const row = rows[0] ?? null;
+        return row?.status === "blocked" ? row : null;
       }),
-      expect.any(String),
     );
+    expect(issue?.executionRunId).toBeNull();
 
-    const recoveryAction = await waitForValue(async () =>
-      db
-        .select()
-        .from(issueRecoveryActions)
-        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)))
-        .then((rows) => rows[0] ?? null)
-    );
+    const recoveryAction = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .then((rows) => rows[0] ?? null);
     expect(recoveryAction).toMatchObject({
       kind: "configuration_validation",
       cause: "configuration_incomplete",
@@ -2835,8 +2726,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(recoveryAction?.nextAction).toContain("Bind the missing secret");
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments.find((comment) => comment.body.includes("secret/env bindings are missing"))).toBeUndefined();
+    const configurationComment = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.find((comment) => comment.body.includes("secret/env bindings are missing")) ?? null;
+    });
+    expect(configurationComment).toBeTruthy();
   });
 
   it("queues one finish-handoff wake when a successful run leaves in-progress work without a next action", async () => {
@@ -3173,11 +3067,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         },
       })
       .where(eq(heartbeatRuns.id, runId));
-    const blockerIssueId = await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
-    });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -3195,7 +3084,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: null,
       cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
       kind: "missing_disposition",
-      ownerWakeDeferredByBlocker: true,
     });
     expect(recoveryAction.evidence).toMatchObject({
       sourceRunId,
@@ -3208,7 +3096,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(sourceIssue?.status).toBe("blocked");
-    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([blockerIssueId]);
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments[0]?.body).toBe(SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY);
@@ -3268,11 +3156,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         },
       })
       .where(eq(heartbeatRuns.id, runId));
-    await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
-    });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -3289,7 +3172,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: null,
       cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
       kind: "missing_disposition",
-      ownerWakeDeferredByBlocker: true,
     });
     expect(recoveryAction.evidence).toMatchObject({
       sourceRunId,
@@ -4083,7 +3965,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("retries a pending execution-review participant once before blocking with a recovery action", async () => {
     const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
-    const warnSpy = vi.spyOn(logger, "warn");
     const heartbeat = heartbeatService(db);
 
     await heartbeat.resumeQueuedRuns();
@@ -4119,38 +4000,30 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(reviewRecoveryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
 
-    // With no real unresolved blocker, the empty-blocker guard skips the
-    // blocked write entirely — the issue stays live and no escalation
-    // comment/activity fires. See recovery/service.ts:blockIssueWithUnresolvedBlockers.
-    await waitForValue(async () =>
-      warnSpy.mock.calls.some((call) =>
-        (call[0] as Record<string, unknown> | undefined)?.issueId === issueId
-      ) ? true : null,
-      8_000,
-    );
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        issueId,
-        source: "recovery.reconcile_execution_review_participant",
-        previousStatus: "in_review",
-      }),
-      expect.any(String),
-    );
-
-    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(sourceIssue?.status).toBe("in_review");
-
-    const recoveryAction = await waitForValue(async () =>
-      db.select().from(issueRecoveryActions).where(
-        and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)),
-      ).then((rows) => rows[0] ?? null)
-    );
-    expect(recoveryAction).toMatchObject({
-      cause: "execution_review_participant_recovery",
-      status: "active",
-      ownerAgentId: agentId,
+    const sourceIssue = await waitForValue(async () => {
+      const row = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      return row?.status === "blocked" ? row : null;
+    }, 8_000);
+    expect(sourceIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: agentId,
+      executionRunId: null,
     });
-    expect(recoveryAction?.evidence).toMatchObject({
+
+    const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId: reviewRecoveryRun!.id,
+      previousStatus: "in_review",
+      retryReason: "execution_review_participant_recovery",
+      cause: "execution_review_participant_recovery",
+    });
+    expect(recoveryAction.evidence).toMatchObject({
       latestRunId: reviewRecoveryRun?.id,
       latestRunStatus: "succeeded",
       latestRunErrorCode: null,
@@ -4158,13 +4031,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments.find((comment) => comment.body.includes("pending execution-review participant once"))).toBeUndefined();
+    const recoveryComment = comments.find((comment) =>
+      comment.body.includes("pending execution-review participant once") &&
+        comment.body.includes(`Recovery action: \`${recoveryAction.id}\``),
+    );
+    expect(recoveryComment).toBeTruthy();
 
     const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) =>
       (event.details as Record<string, unknown> | null)?.source ===
         "recovery.reconcile_execution_review_participant",
-    )).toBe(false);
+    )).toBe(true);
   });
 
   it("blocks failed execution-review recovery under the reviewer when the source assignee differs", async () => {
@@ -4226,11 +4103,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         error: "review recovery failed before submitting a decision",
       })
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
-    await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
-    });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -4261,7 +4133,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       cause: "execution_review_participant_recovery",
       previousOwnerAgentId: sourceAssigneeAgentId,
       returnOwnerAgentId: sourceAssigneeAgentId,
-      ownerWakeDeferredByBlocker: true,
     });
     expect(recoveryAction.evidence).toMatchObject({
       latestRunId: runId,
@@ -4520,26 +4391,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       });
     }
 
-    const warnSpy = vi.spyOn(logger, "warn");
     const heartbeat = heartbeatService(db);
     const result = await heartbeat.reconcileStrandedAssignedIssues();
 
     expect(result.continuationRequeued).toBe(0);
     expect(result.waitingOnReviewResolved).toBe(0);
-    // With no real unresolved blocker, the empty-blocker guard skips the
-    // blocked write inside escalateStrandedAssignedIssue, so the sweep counts
-    // the issue as skipped rather than escalated. See
-    // recovery/service.ts:blockIssueWithUnresolvedBlockers.
-    expect(result.escalated).toBe(0);
-    expect(result.skipped).toBe(1);
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        issueId,
-        source: "recovery.reconcile_stranded_assigned_issue",
-        previousStatus: "in_review",
-      }),
-      expect.any(String),
-    );
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toContain(issueId);
 
     const [issue, continuationRuns, comments] = await Promise.all([
       db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
@@ -4554,9 +4412,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         )),
       db.select({ body: issueComments.body }).from(issueComments).where(eq(issueComments.issueId, issueId)),
     ]);
-    expect(issue?.status).toBe("in_review");
+    expect(issue?.status).toBe("blocked");
     expect(continuationRuns).toHaveLength(3);
-    expect(comments.some((comment) => comment.body.includes(interactionId))).toBe(false);
+    expect(comments.some((comment) => comment.body.includes(interactionId))).toBe(true);
   });
 
   it("skips accepted interaction recovery after its continuation succeeds", async () => {
@@ -4963,11 +4821,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runErrorCode: "process_lost",
       runError: "Authorization: Bearer sk-test-recovery-secret",
     });
-    await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
-    });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -4986,7 +4839,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "todo",
       retryReason: "assignment_recovery",
       cause: "process_lost",
-      ownerWakeDeferredByBlocker: true,
     });
     expect(JSON.stringify(recoveryAction.evidence)).not.toContain("sk-test-recovery-secret");
 
@@ -5033,7 +4885,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ].join(":"),
       })
       .where(eq(issues.id, issueId));
-    const blockerIssueId = await seedUnresolvedBlocker({ companyId, issuePrefix, relatedIssueId: issueId });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -5066,7 +4917,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           eq(issueRelations.type, "blocks"),
         ),
       );
-    expect(blockerRelations.map((row) => row.issueId)).toEqual([blockerIssueId]);
+    expect(blockerRelations).toHaveLength(0);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
@@ -5370,11 +5221,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
     });
-    await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
-    });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -5393,7 +5239,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "in_progress",
       retryReason: "issue_continuation_needed",
       cause: "process_lost",
-      ownerWakeDeferredByBlocker: true,
     });
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -5412,11 +5257,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runErrorCode: "adapter_exit_code",
       runError: null,
     });
-    await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
-    });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -5429,7 +5269,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runId,
       previousStatus: "in_progress",
       retryReason: "issue_continuation_needed",
-      ownerWakeDeferredByBlocker: true,
     });
     expect(recoveryAction.evidence).toMatchObject({
       latestRunErrorCode: "adapter_exit_code",
@@ -5509,11 +5348,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         updatedAt: finishedAt,
       });
     }
-    await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
-    });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -5531,7 +5365,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runId,
       previousStatus: "in_progress",
       retryReason: "issue_continuation_needed",
-      ownerWakeDeferredByBlocker: true,
     });
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -5652,11 +5485,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runErrorCode: "budget_blocked",
       runError: "Budget exceeded; refusing to dispatch.",
     });
-    await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
-    });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -5674,7 +5502,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runId,
       previousStatus: "in_progress",
       retryReason: null,
-      ownerWakeDeferredByBlocker: true,
     });
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -5784,7 +5611,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       relatedIssueId: sourceIssueId,
       type: "blocks",
     });
-    await seedUnresolvedBlocker({ companyId, issuePrefix, relatedIssueId: issueId });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -5847,7 +5673,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       relatedIssueId: sourceIssueId,
       type: "blocks",
     });
-    await seedUnresolvedBlocker({ companyId, issuePrefix, relatedIssueId: issueId });
     const heartbeat = heartbeatService(db);
 
     const firstResult = await heartbeat.reconcileStrandedAssignedIssues();
@@ -6046,39 +5871,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       livenessState: "advanced",
       resultJson: localWaitEvidence,
     });
-    const warnSpy = vi.spyOn(logger, "warn");
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
     expect(result.continuationRequeued).toBe(0);
-    // With no real unresolved blocker, the empty-blocker guard skips the
-    // blocked write inside escalateStrandedAssignedIssue, so the sweep counts
-    // the issue as skipped (no recovery-owner wake fires) rather than
-    // escalated. See recovery/service.ts:blockIssueWithUnresolvedBlockers.
-    expect(result.escalated).toBe(0);
-    expect(result.skipped).toBe(1);
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        issueId,
-        source: "recovery.reconcile_stranded_assigned_issue",
-        previousStatus: "in_progress",
-      }),
-      expect.any(String),
-    );
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("in_progress");
+    expect(issue?.status).toBe("blocked");
 
-    const recoveryAction = await db.select().from(issueRecoveryActions).where(
-      and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)),
-    ).then((rows) => rows[0] ?? null);
-    expect(recoveryAction).toMatchObject({
-      status: "active",
-      ownerAgentId: agentId,
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
     });
 
     const followupRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-    expect(followupRuns).toHaveLength(1);
+    expect(followupRuns).toHaveLength(2);
   });
 
   it("preserves a persisted issue monitor as the durable external-wait path", async () => {
@@ -6162,11 +5975,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runSource: "issue.productive_terminal_continuation_recovery",
       livenessState: "advanced",
     });
-    await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
-    });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -6184,7 +5992,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runId,
       previousStatus: "in_progress",
       retryReason: "issue_continuation_needed",
-      ownerWakeDeferredByBlocker: true,
     });
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -6341,11 +6148,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       body: "old progress note",
       createdAt: stale,
       updatedAt: stale,
-    });
-    await seedUnresolvedBlocker({
-      companyId,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      relatedIssueId: issueId,
     });
     const heartbeat = heartbeatService(db);
 
