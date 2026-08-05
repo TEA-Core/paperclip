@@ -11293,15 +11293,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
   }
-
-  function truncateAgentErrorReason(reason: string | null | undefined): string | null {
-    if (!reason) return null;
-    const plain = reason.replace(/\x1b\[[0-9;]*m/g, "");
-    const trimmed = plain.trim();
-    if (!trimmed) return null;
-    return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
-  }
-
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
