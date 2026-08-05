@@ -11197,10 +11197,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
-  // Cancelling a stale queued run leaves the issue with no queued run and no
-  // executionRunId. Nothing else re-dispatches it (the inbox, the stranded
-  // reconciler and agent resume are all blind to in_review), so the issue parks
-  // forever unless we wake the agent that owns it now.
   async function enqueueStaleRunHandoffWake(input: {
     cancelledRun: typeof heartbeatRuns.$inferSelect;
     previousContext: Record<string, unknown>;
@@ -11269,9 +11265,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           handoffRunId: handoffRun.id,
         });
       } else {
-        // enqueueWakeup returns null when it deferred or skipped the wake (issue
-        // execution lock held, dependencies blocked, heartbeat disabled). Those
-        // paths have their own re-dispatch, but record that no run exists yet.
         logger.warn(
           { runId: cancelledRun.id, issueId, handoffAgentId },
           "claimQueuedRun: stale-run handoff wake was deferred or skipped",
