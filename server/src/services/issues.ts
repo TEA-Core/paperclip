@@ -2498,7 +2498,18 @@ async function listIssueBlockerAttentionMap(
   const explicitWaitCandidateIds = [...nodesById.values()]
     .filter((node) => node.status !== "done")
     .map((node) => node.id);
+  // explicitWaitingIssueIds marks issues that are on a live waiting path and is
+  // consulted for every node on a blocked chain (classifyPath below). The
+  // zero-edge blocked classification additionally consults zeroEdgeWaitingIssueIds:
+  // a recovery action that has already exhausted its attempts (status 'escalated',
+  // outcome 'exhausted') has given up, so it must NOT keep a zero-blocker issue
+  // rendered as covered/healthy — it would suppress the board heal for it.
   const explicitWaitingIssueIds = new Set<string>();
+  const zeroEdgeWaitingIssueIds = new Set<string>();
+  const addExplicitWait = (issueId: string) => {
+    explicitWaitingIssueIds.add(issueId);
+    zeroEdgeWaitingIssueIds.add(issueId);
+  };
   if (explicitWaitCandidateIds.length > 0) {
     for (const chunk of chunkList(explicitWaitCandidateIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
       const interactionRows: Array<{ issueId: string }> = await dbOrTx
@@ -2511,7 +2522,7 @@ async function listIssueBlockerAttentionMap(
             inArray(issueThreadInteractions.issueId, chunk),
           ),
         );
-      for (const row of interactionRows) explicitWaitingIssueIds.add(row.issueId);
+      for (const row of interactionRows) addExplicitWait(row.issueId);
 
       const approvalRows: Array<{ issueId: string }> = await dbOrTx
         .select({ issueId: issueApprovals.issueId })
@@ -2524,7 +2535,7 @@ async function listIssueBlockerAttentionMap(
             inArray(issueApprovals.issueId, chunk),
           ),
         );
-      for (const row of approvalRows) explicitWaitingIssueIds.add(row.issueId);
+      for (const row of approvalRows) addExplicitWait(row.issueId);
     }
 
     // Recovery rows are intentionally company-wide: a liveness escalation for
@@ -2544,13 +2555,16 @@ async function listIssueBlockerAttentionMap(
     for (const row of recoveryRows) {
       const parsed = parseIssueGraphLivenessIncidentKey(row.originId);
       if (!parsed || parsed.companyId !== companyId) continue;
-      explicitWaitingIssueIds.add(row.id);
-      explicitWaitingIssueIds.add(parsed.issueId);
-      explicitWaitingIssueIds.add(parsed.leafIssueId);
+      addExplicitWait(row.id);
+      addExplicitWait(parsed.issueId);
+      addExplicitWait(parsed.leafIssueId);
     }
 
-    const recoveryActionRows: Array<{ sourceIssueId: string }> = await dbOrTx
-      .select({ sourceIssueId: issueRecoveryActions.sourceIssueId })
+    const recoveryActionRows: Array<{ sourceIssueId: string; outcome: string | null }> = await dbOrTx
+      .select({
+        sourceIssueId: issueRecoveryActions.sourceIssueId,
+        outcome: issueRecoveryActions.outcome,
+      })
       .from(issueRecoveryActions)
       .where(
         and(
@@ -2559,7 +2573,10 @@ async function listIssueBlockerAttentionMap(
           inArray(issueRecoveryActions.sourceIssueId, explicitWaitCandidateIds),
         ),
       );
-    for (const row of recoveryActionRows) explicitWaitingIssueIds.add(row.sourceIssueId);
+    for (const row of recoveryActionRows) {
+      explicitWaitingIssueIds.add(row.sourceIssueId);
+      if (row.outcome !== "exhausted") zeroEdgeWaitingIssueIds.add(row.sourceIssueId);
+    }
   }
 
   const agentRows: IssueBlockerAttentionAgentRow[] = agentIds.size > 0
@@ -2665,7 +2682,7 @@ async function listIssueBlockerAttentionMap(
   for (const root of roots) {
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
     if (topLevelEdges.length === 0) {
-      if (explicitWaitingIssueIds.has(root.id)) {
+      if (zeroEdgeWaitingIssueIds.has(root.id)) {
         attentionMap.set(root.id, createIssueBlockerAttention({
           state: "covered",
           reason: "active_dependency",

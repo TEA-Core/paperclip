@@ -467,15 +467,22 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
     expect(enqueueWakeup).not.toHaveBeenCalled();
 
     const updated = await db
-      .select({ status: issueRecoveryActions.status, outcome: issueRecoveryActions.outcome })
+      .select({
+        status: issueRecoveryActions.status,
+        outcome: issueRecoveryActions.outcome,
+        ownerType: issueRecoveryActions.ownerType,
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+      })
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, actionId))
       .then((rows) => rows[0]);
     expect(updated?.status).toBe("escalated");
     expect(updated?.outcome).toBe("exhausted");
+    expect(updated?.ownerType).toBe("board");
+    expect(updated?.ownerAgentId).toBeNull();
   });
 
-  it("blocks the source issue and posts a board escalation comment when the ceiling is exhausted", async () => {
+  it("releases the source issue and escalates the action to the board when the ceiling is exhausted", async () => {
     const { companyId, ctoId, coderId } = await seedCompany();
     const sourceIssueId = await seedSourceIssue(companyId, coderId);
     const actionId = await seedRecoveryAction({
@@ -497,7 +504,22 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       .from(issues)
       .where(eq(issues.id, sourceIssueId))
       .then((rows) => rows[0]);
-    expect(issue?.status).toBe("blocked");
+    expect(issue?.status).toBe("in_progress");
+
+    const action = await db
+      .select({
+        status: issueRecoveryActions.status,
+        outcome: issueRecoveryActions.outcome,
+        ownerType: issueRecoveryActions.ownerType,
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+      })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId))
+      .then((rows) => rows[0]);
+    expect(action?.status).toBe("escalated");
+    expect(action?.outcome).toBe("exhausted");
+    expect(action?.ownerType).toBe("board");
+    expect(action?.ownerAgentId).toBeNull();
 
     const comments = await db
       .select({ body: issueComments.body })
@@ -505,6 +527,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       .where(eq(issueComments.issueId, sourceIssueId));
     expect(comments.some((c) => (c.body ?? "").includes("exhausted its attempt ceiling"))).toBe(true);
     expect(comments.some((c) => (c.body ?? "").includes("escalated to the board"))).toBe(true);
+    expect(comments.some((c) => (c.body ?? "").includes("source issue has been blocked"))).toBe(false);
   });
 
 });

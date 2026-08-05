@@ -375,6 +375,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
   async function seedZeroBlockerBackstopFixture(opts: {
     withActiveRecoveryAction?: boolean;
+    withExhaustedRecoveryAction?: boolean;
   } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -428,6 +429,24 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         fingerprint: `zero-blocker-test:${companyId}:${blockedIssueId}`,
         evidence: {},
         nextAction: "Restore a live execution path",
+      });
+    }
+
+    if (opts.withExhaustedRecoveryAction) {
+      // Walked its attempt ceiling: escalated to the board, no owner agent left
+      // to re-arm the issue. Must not count as a live recovery action.
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: blockedIssueId,
+        kind: "stranded_assigned_issue",
+        status: "escalated",
+        outcome: "exhausted",
+        ownerType: "board",
+        ownerAgentId: null,
+        cause: "stranded_assigned_issue",
+        fingerprint: `zero-blocker-exhausted-test:${companyId}:${blockedIssueId}`,
+        evidence: {},
+        nextAction: "Assign an invokable recovery owner",
       });
     }
 
@@ -797,6 +816,28 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.companyId, companyId));
     expect(wakes).toHaveLength(0);
+  });
+
+  it("heals a zero-blocker blocked issue whose recovery action exhausted its attempts", async () => {
+    const { agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture({
+      withExhaustedRecoveryAction: true,
+    });
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.dependencyWakeZeroBlockerObserved).toBe(1);
+    expect(result.dependencyWakeZeroBlockerActiveRecoverySkipped).toBe(0);
+    expect(result.dependencyWakeZeroBlockerHealed).toBe(1);
+    expect(result.dependencyWakesHealed).toBe(1);
+    expect(result.dependencyWakeIssueIds).toEqual([blockedIssueId]);
+
+    const wake = await db
+      .select({ reason: agentWakeupRequests.reason, idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wake?.reason).toBe("issue_blockers_resolved");
+    expect(wake?.idempotencyKey).toBe(`issue_blockers_resolved:${blockedIssueId}:zero_blocker`);
   });
 
   it("counts null dependency wake returns as deferred instead of enqueue failures", async () => {
