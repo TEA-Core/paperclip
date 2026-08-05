@@ -308,6 +308,7 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
   "configuration_validation",
   "active_run_watchdog",
   "issue_graph_liveness",
+  "blocked_without_blockers",
 ] as const;
 export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[number];
 
