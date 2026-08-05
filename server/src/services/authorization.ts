@@ -85,6 +85,7 @@ export type AuthorizationResource =
       originKind?: string | null;
       originId?: string | null;
       status?: string | null;
+      createdByAgentId?: string | null;
     };
 
 export type AuthorizationDecision = {
@@ -106,7 +107,8 @@ export type AuthorizationDecision = {
     | "allow_company_agent"
     | "allow_company_member"
     | "allow_simple_company_member"
-    | "allow_manager_chain"
+     | "allow_manager_chain"
+     | "allow_creator"
     | "inbox_target_user_unresolved"
     | "inbox_management_disabled"
     | "inbox_agent_not_allowed"
@@ -242,6 +244,7 @@ type IssueAuthorizationRow = {
   executionPolicy: unknown;
   originKind: string | null;
   originId: string | null;
+  createdByAgentId: string | null;
 };
 
 function evaluateAuthorizationPolicyForAssignment(
@@ -747,6 +750,7 @@ export function authorizationService(db: Db) {
         executionPolicy: issues.executionPolicy,
         originKind: issues.originKind,
         originId: issues.originId,
+        createdByAgentId: issues.createdByAgentId,
       })
       .from(issues)
       .where(eq(issues.id, issueId))
@@ -1975,6 +1979,31 @@ export function authorizationService(db: Db) {
         action: input.action,
         reason: "allow_manager_chain",
         explanation: "Allowed because the actor manages the issue assignee in the reporting chain.",
+      });
+    }
+
+    if (
+      (input.action === "issue:comment" || input.action === "issue:mutate") &&
+      input.resource.type === "issue" &&
+      input.resource.assigneeAgentId &&
+      await isManagerOf(companyId, actorAgentId, input.resource.assigneeAgentId)
+    ) {
+      return allow({
+        action: input.action,
+        reason: "allow_manager_chain",
+        explanation: "Allowed because the actor is an org-chain ancestor of the issue assignee.",
+      });
+    }
+
+    if (
+      input.action === "issue:comment" &&
+      input.resource.type === "issue" &&
+      input.resource.createdByAgentId === actorAgentId
+    ) {
+      return allow({
+        action: input.action,
+        reason: "allow_creator",
+        explanation: "Allowed because the actor created this issue.",
       });
     }
 

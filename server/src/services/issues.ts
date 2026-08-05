@@ -658,6 +658,7 @@ type IssueBlockerDiagnosticsIssueRow = {
   priority: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  createdByAgentId: string | null;
 };
 type IssueWakeDiagnosticsWakeRequestRow = {
   agentId: string;
@@ -2170,6 +2171,7 @@ async function terminalExplicitBlockersByRoot(
           priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          createdByAgentId: issues.createdByAgentId,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -5470,6 +5472,7 @@ export function issueService(db: Db) {
           priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          createdByAgentId: issues.createdByAgentId,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -5657,6 +5660,7 @@ export function issueService(db: Db) {
             priority,
             assignee_agent_id,
             assignee_user_id,
+            created_by_agent_id,
             created_at,
             updated_at,
             0 AS depth,
@@ -5678,6 +5682,7 @@ export function issueService(db: Db) {
             child.priority,
             child.assignee_agent_id,
             child.assignee_user_id,
+            child.created_by_agent_id,
             child.created_at,
             child.updated_at,
             issue_tree.depth + 1,
@@ -5701,6 +5706,7 @@ export function issueService(db: Db) {
           priority,
           assignee_agent_id AS "assigneeAgentId",
           assignee_user_id AS "assigneeUserId",
+          created_by_agent_id AS "createdByAgentId",
           created_at AS "createdAt",
           updated_at AS "updatedAt",
           depth::int AS depth
@@ -5741,6 +5747,7 @@ export function issueService(db: Db) {
               blocker.priority,
               blocker.assignee_agent_id AS "assigneeAgentId",
               blocker.assignee_user_id AS "assigneeUserId",
+              blocker.created_by_agent_id AS "createdByAgentId",
               relation.related_issue_id AS "blockedIssueId",
               relation.created_at AS "relationCreatedAt",
               row_number() OVER (
