@@ -1,0 +1,9 @@
+# Scope for SUP-10963/SUP-10993 redo delivery on the shared SUP-10904 authorization-boundary branch.
+# Files owned by this branch's PR (SUP-10912 parent commits + SUP-10963/SUP-10993 corrective work).
+server/src/__tests__/authorization-service.test.ts
+server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts
+server/src/__tests__/issue-comment-reopen-routes.test.ts
+server/src/routes/issues.ts
+server/src/services/access.ts
+server/src/services/authorization.ts
+server/src/services/issues.ts
