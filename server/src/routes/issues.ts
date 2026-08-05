@@ -3498,6 +3498,7 @@ export function issueRoutes(
         parentIssueId: issue.parentId,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
+        createdByAgentId: issue.createdByAgentId,
       },
     });
   }
@@ -3552,8 +3553,20 @@ export function issueRoutes(
     return boundaryDecision;
   }
 
-  function isIssueMentionGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
-    return decision !== true && decision.reason === "allow_issue_mention_grant";
+  function isCommentOnlyBoundaryGrant(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return (
+      decision !== true &&
+      (decision.reason === "allow_issue_mention_grant" ||
+        decision.reason === "allow_creator" ||
+        decision.reason === "allow_manager_chain")
+    );
+  }
+
+  function commentAuthorizationPathForDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    if (decision === true) return null;
+    if (decision.reason === "allow_manager_chain") return "escape_hatch_manager_chain";
+    if (decision.reason === "allow_creator") return "escape_hatch_creator";
+    return null;
   }
 
   async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
@@ -7768,24 +7781,20 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
+    const actorAgentId = req.actor.type === "agent" ? req.actor.agentId : null;
     let mutationAccess:
       | boolean
-      | { allowed: boolean; reason: string; action: string; explanation: string } = await assertAgentIssueMutationAllowed(
-      req,
-      res,
-      existing,
-    );
-    if (!mutationAccess) {
-      // Escape hatch: an org-chain ancestor of the assignee may perform a
-      // limited PATCH (assigneeAgentId, status, blockedByIssueIds). This is
-      // gated here, in the PATCH handler only, so the ~20 other mutation
-      // routes that share assertAgentIssueMutationAllowed retain their
-      // pre-change 403 for non-assignee actors.
-      if (
-        req.actor.type === "agent" &&
-        req.actor.agentId &&
+      | { allowed: boolean; reason: string; action: string; explanation: string };
+    if (req.actor.type !== "agent" || !actorAgentId) {
+      mutationAccess = true;
+    } else {
+      const boundaryDecision = await decideIssueAccess(req, existing, "issue:mutate");
+      if (boundaryDecision.allowed) {
+        mutationAccess = await assertAgentIssueMutationAllowed(req, res, existing);
+        if (!mutationAccess) return;
+      } else if (
         existing.assigneeAgentId &&
-        (await access.isManagerOf(existing.companyId, req.actor.agentId, existing.assigneeAgentId))
+        (await access.isManagerOf(existing.companyId, actorAgentId, existing.assigneeAgentId))
       ) {
         mutationAccess = {
           allowed: true,
@@ -7794,8 +7803,12 @@ export function issueRoutes(
           explanation: "Allowed because the actor is an org-chain ancestor of the issue assignee.",
         };
       } else {
-        return;
+        mutationAccess = false;
       }
+    }
+    if (!mutationAccess) {
+      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      return;
     }
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
@@ -8450,6 +8463,9 @@ export function issueRoutes(
         ...(commentBody ? { source: "comment" } : {}),
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
+        ...(mutationAccess !== true && typeof mutationAccess === "object" && mutationAccess.reason === "allow_manager_chain"
+          ? { authorizationPath: "escape_hatch_manager_chain" }
+          : {}),
         ...(scheduledRetrySupersededByComment
           ? {
               scheduledRetrySupersededByComment: true,
@@ -8714,6 +8730,9 @@ export function issueRoutes(
           bodySnippet: comment.body.slice(0, 120),
           identifier: issue.identifier,
           issueTitle: issue.title,
+          ...(mutationAccess !== true && typeof mutationAccess === "object" && mutationAccess.reason === "allow_manager_chain"
+            ? { authorizationPath: "escape_hatch_manager_chain" }
+            : {}),
           ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
           ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
           ...(scheduledRetrySupersededByComment
@@ -10053,22 +10072,23 @@ export function issueRoutes(
     const interruptRequested = req.body.interrupt === true;
     const isClosed = isClosedIssueStatus(issue.status);
     const isBlocked = issue.status === "blocked";
-    const mentionGrantedPeerAgentCommentOnly =
+    const commentOnlyBoundaryGrantComment =
       isClosed &&
       req.actor.type === "agent" &&
       issue.assigneeAgentId !== null &&
       issue.assigneeAgentId !== req.actor.agentId &&
       !reopenRequested &&
       !resumeRequested &&
-      isIssueMentionGrantDecision(commentAccessDecision);
-    const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
-    const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
+      isCommentOnlyBoundaryGrant(commentAccessDecision);
+    const effectiveReopenRequested = commentOnlyBoundaryGrantComment ? false : reopenRequested;
+    const effectiveResumeRequested = commentOnlyBoundaryGrantComment ? false : resumeRequested;
+    const commentAuthorizationPath = commentAuthorizationPathForDecision(commentAccessDecision);
     if (
       isClosed &&
       req.actor.type === "agent" &&
       issue.assigneeAgentId !== null &&
       issue.assigneeAgentId !== req.actor.agentId &&
-      !mentionGrantedPeerAgentCommentOnly
+      !commentOnlyBoundaryGrantComment
     ) {
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     }
@@ -10380,6 +10400,7 @@ export function issueRoutes(
         bodySnippet: comment.body.slice(0, 120),
         identifier: currentIssue.identifier,
         issueTitle: currentIssue.title,
+        ...(commentAuthorizationPath ? { authorizationPath: commentAuthorizationPath } : {}),
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
         ...(scheduledRetrySupersededByComment
