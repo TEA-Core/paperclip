@@ -2748,11 +2748,18 @@ export function issueRoutes(
   }
 
   function hasExplicitIssueWorkspaceCreateSelection(input: Record<string, unknown>) {
+    // `reuse_existing` with no id names no workspace of its own, so it must not
+    // suppress the run-derived inheritance source — suppressing it is what left
+    // the issue unbound and minted a fresh worktree instead (SUP-10403).
+    const requestsUnboundWorkspaceReuse =
+      input.executionWorkspacePreference === "reuse_existing" &&
+      input.executionWorkspaceId === undefined &&
+      input.executionWorkspaceSettings === undefined;
     return input.parentId !== undefined ||
       input.inheritExecutionWorkspaceFromIssueId !== undefined ||
       input.projectWorkspaceId !== undefined ||
       input.executionWorkspaceId !== undefined ||
-      input.executionWorkspacePreference !== undefined ||
+      (input.executionWorkspacePreference !== undefined && !requestsUnboundWorkspaceReuse) ||
       input.executionWorkspaceSettings !== undefined;
   }
 

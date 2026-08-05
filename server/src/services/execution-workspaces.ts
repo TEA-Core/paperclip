@@ -732,6 +732,37 @@ export function readExecutionWorkspaceConfig(metadata: Record<string, unknown> |
   return hasConfig ? config : null;
 }
 
+/**
+ * Detach every issue pointing at a closed shared execution workspace.
+ *
+ * Clearing the id alone would strand `executionWorkspacePreference:
+ * "reuse_existing"` with a null id — the unrealizable pair that
+ * `assertReusableExecutionWorkspaceBound` refuses at write time. This write
+ * bypasses issueService, so it clears the paired preference itself (as the
+ * heartbeat detach path does); otherwise the next PATCH touching workspace
+ * fields would 422 on state the close wrote. Other preferences are left alone:
+ * they are mode intents that stay meaningful without an id, and nulling them
+ * would silently move where the next run lands.
+ */
+export async function detachIssuesFromClosedSharedExecutionWorkspace(
+  db: Db,
+  input: { companyId: string; executionWorkspaceId: string },
+) {
+  return db
+    .update(issues)
+    .set({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: sql`case when ${issues.executionWorkspacePreference} = 'reuse_existing' then null else ${issues.executionWorkspacePreference} end`,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(issues.companyId, input.companyId),
+        eq(issues.executionWorkspaceId, input.executionWorkspaceId),
+      ),
+    );
+}
+
 export function mergeExecutionWorkspaceConfig(
   metadata: Record<string, unknown> | null | undefined,
   patch: Partial<ExecutionWorkspaceConfig> | null,

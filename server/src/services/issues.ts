@@ -78,6 +78,9 @@ import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
+  WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_CODE,
+  WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE,
+  WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -207,6 +210,27 @@ function workspaceWorktreeRequiresProjectDetails() {
     code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
     remediation: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
   };
+}
+
+/**
+ * `executionWorkspacePreference: "reuse_existing"` is inert without an
+ * `executionWorkspaceId`: the only consumer ANDs the two
+ * (`resolveExecutionWorkspaceReuseRequestForIssue`), so an unbound preference
+ * silently degraded to "mint a fresh worktree named after this issue" — a clean
+ * tree that reads as a PASS while carrying none of the work it was meant to
+ * reuse (SUP-10403). Refuse the unrealizable pair at write time instead.
+ */
+function assertReusableExecutionWorkspaceBound(input: {
+  executionWorkspaceId: string | null | undefined;
+  executionWorkspacePreference: string | null | undefined;
+}) {
+  if (input.executionWorkspacePreference !== "reuse_existing") return;
+  if (input.executionWorkspaceId) return;
+  throw unprocessable(WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE, {
+    code: WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_CODE,
+    remediation: WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION,
+    field: "executionWorkspaceId",
+  });
 }
 
 function assertExplicitPinnedWorktreeIssueRunnable(input: {
@@ -6537,10 +6561,18 @@ export function issueService(db: Db) {
         const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
           ? null
           : inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
+        // A bare `reuse_existing` with no id is a request TO inherit, not an
+        // override that vetoes inheritance — treating it as an override is what
+        // made `inheritExecutionWorkspaceFromIssueId` look swallowed (SUP-10403).
+        const requestsUnboundWorkspaceReuse =
+          issueData.executionWorkspacePreference === "reuse_existing" &&
+          issueData.executionWorkspaceId === undefined &&
+          issueData.executionWorkspaceSettings === undefined;
         const hasExplicitExecutionWorkspaceOverride =
-          issueData.executionWorkspaceId !== undefined ||
-          issueData.executionWorkspacePreference !== undefined ||
-          issueData.executionWorkspaceSettings !== undefined;
+          !requestsUnboundWorkspaceReuse &&
+          (issueData.executionWorkspaceId !== undefined ||
+            issueData.executionWorkspacePreference !== undefined ||
+            issueData.executionWorkspaceSettings !== undefined);
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(tx, companyId, workspaceInheritanceIssueId);
           if (issueData.projectId == null && workspaceSource.projectId) {
@@ -6651,6 +6683,10 @@ export function issueService(db: Db) {
         if (executionWorkspaceId) {
           await assertValidExecutionWorkspace(companyId, issueData.projectId, executionWorkspaceId, tx);
         }
+        assertReusableExecutionWorkspaceBound({
+          executionWorkspaceId,
+          executionWorkspacePreference,
+        });
         if (isolatedWorkspacesEnabled && issueData.executionWorkspaceSettings !== undefined) {
           assertExplicitPinnedWorktreeIssueRunnable({
             projectId: issueData.projectId ?? null,
@@ -6917,6 +6953,15 @@ export function issueService(db: Db) {
         if (!validatedExecutionWorkspace) {
           await assertValidExecutionWorkspace(existing.companyId, nextProjectId, nextExecutionWorkspaceId);
         }
+      }
+      if (
+        issueData.executionWorkspaceId !== undefined ||
+        issueData.executionWorkspacePreference !== undefined
+      ) {
+        assertReusableExecutionWorkspaceBound({
+          executionWorkspaceId: nextExecutionWorkspaceId ?? null,
+          executionWorkspacePreference: nextExecutionWorkspacePreference ?? null,
+        });
       }
       if (isolatedWorkspacesEnabled && issueData.executionWorkspaceSettings !== undefined) {
         assertExplicitPinnedWorktreeIssueRunnable({
