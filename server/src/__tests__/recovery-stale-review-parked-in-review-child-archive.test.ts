@@ -105,6 +105,19 @@ describeEmbeddedPostgres("recovery ingestStaleInReviewChildIssues", () => {
       parentId,
       assigneeAgentId: agentId,
       monitorLastTriggeredAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      executionState: {
+        status: "pending",
+        currentStageId: "00000000-0000-0000-0000-000000000000",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
     });
 
     const heartbeat = heartbeatService(db);
@@ -151,6 +164,19 @@ describeEmbeddedPostgres("recovery ingestStaleInReviewChildIssues", () => {
       parentId,
       assigneeAgentId: agentId,
       monitorLastTriggeredAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      executionState: {
+        status: "pending",
+        currentStageId: "00000000-0000-0000-0000-000000000000",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
     });
 
     const heartbeat = heartbeatService(db);
@@ -222,6 +248,19 @@ describeEmbeddedPostgres("recovery ingestStaleInReviewChildIssues", () => {
       parentId,
       assigneeAgentId: agentId,
       monitorLastTriggeredAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      executionState: {
+        status: "pending",
+        currentStageId: "00000000-0000-0000-0000-000000000000",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
     });
     await db.insert(unWakeableArchives).values({
       companyId,
@@ -234,6 +273,59 @@ describeEmbeddedPostgres("recovery ingestStaleInReviewChildIssues", () => {
 
     expect(result.archived).toBe(0);
     expect(result.skippedParentNotBlocked).toBe(0);
+  });
+
+  it("skips stale in_review child at approval stage (not review stage)", async () => {
+    const { companyId, agentId } = await seed();
+    const parentId = randomUUID();
+
+    await db.insert(issues).values({
+      id: parentId,
+      companyId,
+      title: "Parent — blocked",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const childId = randomUUID();
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      title: "Child — stale in_review at approval stage",
+      status: "in_review",
+      priority: "high",
+      parentId,
+      assigneeAgentId: agentId,
+      monitorLastTriggeredAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      executionState: {
+        status: "pending",
+        currentStageId: "00000000-0000-0000-0000-000000000000",
+        currentStageIndex: 0,
+        currentStageType: "approval",
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.ingestStaleInReviewChildIssues();
+
+    // Should NOT be archived — approval-stage children are excluded by SQL filter.
+    expect(result.archived).toBe(0);
+    expect(result.manual).toBeGreaterThanOrEqual(0);
+
+    const child = await db
+      .select({ hiddenAt: issues.hiddenAt })
+      .from(issues)
+      .where(eq(issues.id, childId))
+      .then((rows) => rows[0]);
+    expect(child?.hiddenAt).toBeNull();
   });
 
   it("is idempotent — second pass finds nothing to archive", async () => {
@@ -259,6 +351,19 @@ describeEmbeddedPostgres("recovery ingestStaleInReviewChildIssues", () => {
       parentId,
       assigneeAgentId: agentId,
       monitorLastTriggeredAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      executionState: {
+        status: "pending",
+        currentStageId: "00000000-0000-0000-0000-000000000000",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
     });
 
     const heartbeat = heartbeatService(db);
