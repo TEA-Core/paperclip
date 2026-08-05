@@ -72,6 +72,7 @@ import {
   classifyOpenCodeFailure,
   ensureRemoteOpenCodeModelConfiguredAndAvailable,
   execute,
+  resolveOpenCodeDatabaseFile,
   resolveOpenCodeSessionResume,
 } from "./execute.js";
 
@@ -467,4 +468,128 @@ describe("execute — transient statement error retry", () => {
     expect(result.errorMessage).toContain(TRANSIENT_STDERR);
     expect(runAdapterExecutionTargetProcessMock).toHaveBeenCalledTimes(3);
   }, 15000);
+});
+
+// SUP-10914: every opencode_local run wrote to ONE shared SQLite database
+// (`<opencode data dir>/opencode.db`), so a single runaway message held the
+// only write lock and every other agent's write blew opencode's 5s busy
+// timeout — 63 `adapter_failed` in one hour across 7 agents. Giving each agent
+// its own database file keeps a bad run's blast radius inside that agent.
+describe("resolveOpenCodeDatabaseFile", () => {
+  const emptyProcessEnv: NodeJS.ProcessEnv = {};
+
+  it("derives a stable per-agent database filename", () => {
+    expect(
+      resolveOpenCodeDatabaseFile({
+        agentId: "0e61ff36-2135-408f-ab12-360ed3e7702d",
+        env: {},
+        processEnv: emptyProcessEnv,
+      }),
+    ).toBe("opencode-agent-0e61ff36-2135-408f-ab12-360ed3e7702d.db");
+  });
+
+  it("returns a relative filename so opencode keeps resolving it inside its own data dir", () => {
+    const file = resolveOpenCodeDatabaseFile({
+      agentId: "agent-1",
+      env: {},
+      processEnv: emptyProcessEnv,
+    });
+    expect(file?.startsWith("/")).toBe(false);
+  });
+
+  it("sanitises characters that are not safe in a filename", () => {
+    expect(
+      resolveOpenCodeDatabaseFile({
+        agentId: "../../etc/pas swd",
+        env: {},
+        processEnv: emptyProcessEnv,
+      }),
+    ).toBe("opencode-agent-..-..-etc-pas-swd.db");
+  });
+
+  it("never overrides an explicitly configured OPENCODE_DB from the run env", () => {
+    expect(
+      resolveOpenCodeDatabaseFile({
+        agentId: "agent-1",
+        env: { OPENCODE_DB: "custom.db" },
+        processEnv: emptyProcessEnv,
+      }),
+    ).toBeNull();
+  });
+
+  it("never overrides an explicitly configured OPENCODE_DB from the process env", () => {
+    expect(
+      resolveOpenCodeDatabaseFile({
+        agentId: "agent-1",
+        env: {},
+        processEnv: { OPENCODE_DB: "custom.db" },
+      }),
+    ).toBeNull();
+  });
+
+  it("falls back to the shared database when PAPERCLIP_OPENCODE_SHARED_DB is set", () => {
+    expect(
+      resolveOpenCodeDatabaseFile({
+        agentId: "agent-1",
+        env: { PAPERCLIP_OPENCODE_SHARED_DB: "1" },
+        processEnv: emptyProcessEnv,
+      }),
+    ).toBeNull();
+  });
+
+  it("falls back to the shared database when the agent has no id", () => {
+    expect(
+      resolveOpenCodeDatabaseFile({ agentId: "  ", env: {}, processEnv: emptyProcessEnv }),
+    ).toBeNull();
+  });
+});
+
+describe("execute — per-agent opencode database", () => {
+  function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
+    return {
+      runId: "run-db",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Agent",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { model: "router/coder", cwd: process.cwd() },
+      context: {},
+      onLog: async () => {},
+      ...overrides,
+    } as AdapterExecutionContext;
+  }
+
+  beforeEach(() => {
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+    }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.OPENCODE_DB;
+  });
+
+  it("points the run at the agent's own database file", async () => {
+    await execute(makeCtx());
+    const call = runAdapterExecutionTargetProcessMock.mock.calls.at(-1);
+    expect(call?.[4].env.OPENCODE_DB).toBe("opencode-agent-agent-1.db");
+  });
+
+  it("keeps an operator-configured OPENCODE_DB from adapterConfig.env", async () => {
+    await execute(
+      makeCtx({ config: { model: "router/coder", cwd: process.cwd(), env: { OPENCODE_DB: "shared.db" } } }),
+    );
+    const call = runAdapterExecutionTargetProcessMock.mock.calls.at(-1);
+    expect(call?.[4].env.OPENCODE_DB).toBe("shared.db");
+  });
 });

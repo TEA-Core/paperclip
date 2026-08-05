@@ -133,6 +133,43 @@ export function classifyOpenCodeFailure(input: {
   return { errorCode, errorMeta };
 }
 
+// SUP-10914: opencode resolves its SQLite database as
+// `OPENCODE_DB` (joined to its data dir when relative) and otherwise defaults to
+// `<data dir>/opencode.db`. Every Paperclip run shares one HOME, so every agent
+// shared that one database — and opencode opens it with `busy_timeout = 5000`.
+// On 2026-08-04 a single 431 MB assistant message, rewritten in full on every
+// stream delta, held the only write lock long enough that every other agent's
+// write blew that timeout ("Failed to execute statement / database is locked"),
+// producing 63 `adapter_failed` in one hour across 7 agents.
+//
+// Giving each agent its own database file keeps a runaway run's blast radius
+// inside that agent. The name stays RELATIVE so opencode still resolves it
+// inside its own data dir, which keeps `auth.json` and the rest of the data dir
+// shared — only the database is partitioned.
+const OPENCODE_DB_AGENT_PREFIX = "opencode-agent-";
+
+export function resolveOpenCodeDatabaseFile(input: {
+  agentId: string;
+  env: Record<string, string>;
+  processEnv?: NodeJS.ProcessEnv;
+}): string | null {
+  const processEnv = input.processEnv ?? process.env;
+  // Escape hatch: fall back to the single shared database.
+  if (
+    isTruthyEnvFlag(
+      input.env.PAPERCLIP_OPENCODE_SHARED_DB ?? processEnv.PAPERCLIP_OPENCODE_SHARED_DB,
+    )
+  ) {
+    return null;
+  }
+  // An explicitly configured database (adapterConfig.env or the host env) wins.
+  const configured = (input.env.OPENCODE_DB ?? processEnv.OPENCODE_DB ?? "").trim();
+  if (configured.length > 0) return null;
+  const agentId = input.agentId.trim();
+  if (agentId.length === 0) return null;
+  return `${OPENCODE_DB_AGENT_PREFIX}${agentId.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`;
+}
+
 function parseModelProvider(model: string | null): string | null {
   if (!model) return null;
   const trimmed = model.trim();
@@ -436,6 +473,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // selection is already handled via the --model CLI flag.  Set after the
   // envConfig loop so user overrides cannot disable this guard.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
+  // Partition the shared opencode SQLite database per agent (SUP-10914). Set
+  // after the envConfig merge so an operator-configured OPENCODE_DB still wins.
+  const openCodeDatabaseFile = resolveOpenCodeDatabaseFile({ agentId: agent.id, env });
+  if (openCodeDatabaseFile) {
+    env.OPENCODE_DB = openCodeDatabaseFile;
+  }
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
