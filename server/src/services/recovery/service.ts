@@ -5243,6 +5243,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const windowMs = opts?.rearmWindowMs ?? config.resolvedDependencyWakeRearmWindowMs;
     const maxCount = opts?.rearmMaxCount ?? config.resolvedDependencyWakeRearmMaxCount;
     const cutoff = opts?.now ? new Date(opts.now.getTime() - windowMs) : new Date(Date.now() - windowMs);
+    const reArmCapNow = opts?.now ?? new Date();
+
+    const shouldLogReArmCap =
+      !lastDependencyWakeReArmCapActivityLogAt ||
+      reArmCapNow.getTime() - lastDependencyWakeReArmCapActivityLogAt.getTime() >=
+        DEPENDENCY_WAKE_REARM_CAP_RELOG_INTERVAL_MS;
+    if (shouldLogReArmCap) {
+      lastDependencyWakeReArmCapActivityLogAt = reArmCapNow;
+    }
 
     const queryCandidates = (afterIssueId: string | null) => {
       const filters = [
