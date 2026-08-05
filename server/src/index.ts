@@ -960,8 +960,8 @@ export async function startServer(): Promise<StartedServer> {
         }
 
         const blockedWithoutBlockers = await heartbeat.reconcileBlockedWithoutBlockers();
-        if (blockedWithoutBlockers.reported > 0) {
-          logger.warn({ ...blockedWithoutBlockers }, "startup blocked-without-blockers sweep reported issues");
+        if (blockedWithoutBlockers.escalated > 0) {
+          logger.warn({ ...blockedWithoutBlockers }, "startup blocked-without-blockers sweep escalated issues");
         }
 
         const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
@@ -1117,8 +1117,8 @@ export async function startServer(): Promise<StartedServer> {
             })
             .then(async () => {
               const blockedWithoutBlockers = await heartbeat.reconcileBlockedWithoutBlockers();
-              if (blockedWithoutBlockers.reported > 0) {
-                logger.warn({ ...blockedWithoutBlockers }, "periodic blocked-without-blockers sweep reported issues");
+              if (blockedWithoutBlockers.escalated > 0) {
+                logger.warn({ ...blockedWithoutBlockers }, "periodic blocked-without-blockers sweep escalated issues");
               }
               const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
               if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {

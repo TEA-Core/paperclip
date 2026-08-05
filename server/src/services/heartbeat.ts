@@ -11819,7 +11819,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reconcileBlockedWithoutBlockers() {
-    return recovery.reconcileBlockedWithoutBlockers({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+    return recovery.reconcileBlockedWithoutBlockers();
   }
 
   async function reconcileStaleRecoveryActionWakes(opts?: { intervalMs?: number }) {

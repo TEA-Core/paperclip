@@ -8,6 +8,7 @@ import {
   createDb,
   heartbeatRuns,
   issueRelations,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -32,6 +33,8 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+const GRACE_THRESHOLD_MS = 15 * 60 * 1000;
+
 describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -43,6 +46,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
 
   afterEach(async () => {
     await db.delete(issueRelations);
+    await db.delete(issueRecoveryActions);
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
@@ -77,9 +81,14 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     return { companyId, agentId };
   }
 
-  it("reports a blocked issue with zero blocker edges in counter + issueIds", async () => {
+  function oldDate() {
+    return new Date(Date.now() - GRACE_THRESHOLD_MS - 60_000);
+  }
+
+  it("escalates a blocked issue with zero blocker edges into a board-owned recovery action", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
+    const blockedAt = oldDate();
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -87,27 +96,51 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       status: "blocked",
       priority: "high",
       assigneeAgentId: agentId,
+      updatedAt: blockedAt,
     });
 
     const heartbeat = heartbeatService(db);
     const result = await heartbeat.reconcileBlockedWithoutBlockers();
 
-    expect(result.reported).toBe(1);
-    expect(result.skipped).toBe(0);
+    expect(result.checked).toBe(1);
+    expect(result.escalated).toBe(1);
+    expect(result.graceThresholdSkipped).toBe(0);
     expect(result.issueIds).toEqual([issueId]);
+
+    const action = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0]);
+    expect(action).toMatchObject({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "blocked_without_blockers",
+      status: "active",
+      ownerType: "board",
+      previousOwnerAgentId: agentId,
+      cause: "blocked_without_blockers",
+      fingerprint: `bwob:${companyId}:${issueId}`,
+      nextAction: expect.stringContaining("Review this blocked issue"),
+    });
+    expect(action?.evidence).toMatchObject({
+      identifier: null,
+      status: "blocked",
+      msInViolation: expect.any(Number),
+    });
 
     const audit = await db
       .select({ action: activityLog.action, details: activityLog.details })
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows[0]);
-    expect(audit?.action).toBe("issue.blocked_without_blockers_detected");
+    expect(audit?.action).toBe("issue.blocked_without_blockers_escalated");
     expect((audit?.details as { source?: string } | null)?.source).toBe(
-      "recovery.reconcile_blocked_without_blockers",
+      "issue_graph_liveness.blocked_without_blockers",
     );
   });
 
-  it("does not write issues.status and does not enqueueWakeup", async () => {
+  it("does not write issues.status and does not enqueue a wakeup", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -117,12 +150,13 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       status: "blocked",
       priority: "high",
       assigneeAgentId: agentId,
+      updatedAt: oldDate(),
     });
 
     const heartbeat = heartbeatService(db);
     const result = await heartbeat.reconcileBlockedWithoutBlockers();
 
-    expect(result.reported).toBe(1);
+    expect(result.escalated).toBe(1);
     expect(result.issueIds).toEqual([issueId]);
 
     const row = await db
@@ -140,7 +174,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(wakeups).toBe(0);
   });
 
-  it("does not report a blocked issue with >=1 blocker edge", async () => {
+  it("does not escalate a blocked issue with >=1 blocker edge", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const blockedId = randomUUID();
     const blockerId = randomUUID();
@@ -152,6 +186,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
         status: "blocked",
         priority: "high",
         assigneeAgentId: agentId,
+        updatedAt: oldDate(),
       },
       {
         id: blockerId,
@@ -173,7 +208,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     const heartbeat = heartbeatService(db);
     const result = await heartbeat.reconcileBlockedWithoutBlockers();
 
-    expect(result.reported).toBe(0);
+    expect(result.escalated).toBe(0);
     expect(result.issueIds).toEqual([]);
 
     const audit = await db
@@ -184,7 +219,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(audit).toBeUndefined();
   });
 
-  it("does not report a non-blocked issue", async () => {
+  it("does not escalate a non-blocked issue", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -199,11 +234,39 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     const heartbeat = heartbeatService(db);
     const result = await heartbeat.reconcileBlockedWithoutBlockers();
 
-    expect(result.reported).toBe(0);
+    expect(result.escalated).toBe(0);
     expect(result.issueIds).toEqual([]);
   });
 
-  it("dedupes — repeated ticks do not re-log the same issue every pass", async () => {
+  it("skips issues within the grace threshold", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked within grace",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.checked).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.graceThresholdSkipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+
+    const audit = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows[0]);
+    expect(audit).toBeUndefined();
+  });
+
+  it("dedupes — repeated ticks do not re-escalate the same issue", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -213,16 +276,18 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       status: "blocked",
       priority: "high",
       assigneeAgentId: agentId,
+      updatedAt: oldDate(),
     });
 
     const heartbeat = heartbeatService(db);
     const first = await heartbeat.reconcileBlockedWithoutBlockers();
     const second = await heartbeat.reconcileBlockedWithoutBlockers();
 
-    expect(first.reported).toBe(1);
+    expect(first.escalated).toBe(1);
     expect(first.issueIds).toEqual([issueId]);
-    expect(second.reported).toBe(1);
-    expect(second.issueIds).toEqual([issueId]);
+    expect(second.escalated).toBe(0);
+    expect(second.alreadyActionedSkipped).toBe(1);
+    expect(second.issueIds).toEqual([]);
 
     const auditRows = await db
       .select({ id: activityLog.id })

@@ -103,7 +103,8 @@ const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiv
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
-const BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT = 500;
+const BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT = 100;
+const BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS = 15 * 60 * 1000;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -5781,109 +5782,144 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
-  const BLOCKED_WITHOUT_BLOCKERS_RELOG_INTERVAL_MS = 5 * 60_000;
-  let lastBlockedWithoutBlockersLogAt: Date | null = null;
-
-  async function reconcileBlockedWithoutBlockers(opts?: { issueCreatedAtGte?: Date | null }) {
+  async function reconcileBlockedWithoutBlockers(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+  }) {
     const result = {
-      reported: 0,
-      skipped: 0,
+      checked: 0,
+      escalated: 0,
+      livePathSkipped: 0,
+      interactionSkipped: 0,
+      pauseHoldSkipped: 0,
+      graceThresholdSkipped: 0,
+      alreadyActionedSkipped: 0,
+      candidateLimitSkipped: 0,
       issueIds: [] as string[],
     };
-
-    const candidates = await db
+  
+    const recoveryActionsSvc = issueRecoveryActionService(db);
+    const source = "issue_graph_liveness.blocked_without_blockers";
+    const now = opts?.now ?? new Date();
+  
+    const filters = [
+      eq(issues.status, "blocked"),
+      visibleIssueCondition(),
+    ];
+    if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
+  
+    const rows = await db
       .select({
         id: issues.id,
         companyId: issues.companyId,
         identifier: issues.identifier,
-        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        updatedAt: issues.updatedAt,
+        totalCount: sql<number>`count(*) over()::int`,
       })
       .from(issues)
-      .where(
-        and(
-          eq(issues.status, "blocked"),
-          visibleIssueCondition(),
-          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
-        ),
-      )
+      .where(and(...filters))
       .orderBy(asc(issues.id))
       .limit(BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT);
-
+  
+    result.checked = rows.length;
+    result.candidateLimitSkipped = Math.max(0, (rows[0]?.totalCount ?? 0) - rows.length);
+  
+    const candidates = rows.map(({ totalCount: _totalCount, ...candidate }) => candidate);
     const candidatesByCompany = new Map<string, typeof candidates>();
     for (const candidate of candidates) {
       const companyCandidates = candidatesByCompany.get(candidate.companyId) ?? [];
       companyCandidates.push(candidate);
       candidatesByCompany.set(candidate.companyId, companyCandidates);
     }
-
-    const readinessMap = new Map<string, IssueDependencyReadiness>();
+  
     for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
-      const companyReadiness = await issuesSvc.listDependencyReadiness(
+      const readinessMap = await issuesSvc.listDependencyReadiness(
         companyId,
         companyCandidates.map((candidate) => candidate.id),
       );
-      for (const [issueId, readiness] of companyReadiness.entries()) {
-        readinessMap.set(issueId, readiness);
-      }
-    }
-
-    const now = new Date();
-    const shouldLog = !lastBlockedWithoutBlockersLogAt ||
-      now.getTime() - lastBlockedWithoutBlockersLogAt.getTime() >= BLOCKED_WITHOUT_BLOCKERS_RELOG_INTERVAL_MS;
-
-    for (const candidate of candidates) {
-      const readiness = readinessMap.get(candidate.id);
-      const blockerIssueIds = readiness?.blockerIssueIds ?? [];
-      if (!isBlockedWithoutBlockers({ status: candidate.status, blockerIssueIds })) {
-        result.skipped += 1;
-        continue;
-      }
-
-      if (await hasActiveExecutionPath(candidate.companyId, candidate.id)) {
-        result.skipped += 1;
-        continue;
-      }
-
-      if (await hasPendingWakeInteraction(candidate.companyId, candidate.id)) {
-        result.skipped += 1;
-        continue;
-      }
-
-      if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
-        result.skipped += 1;
-        continue;
-      }
-
-      result.reported += 1;
-      result.issueIds.push(candidate.id);
-
-      if (shouldLog) {
+  
+      for (const candidate of companyCandidates) {
+        const readiness = readinessMap.get(candidate.id);
+        if (!readiness || readiness.unresolvedBlockerCount !== 0) continue;
+  
+        const blockedAt = candidate.updatedAt ?? new Date();
+        const msInViolation = now.getTime() - blockedAt.getTime();
+        if (msInViolation < BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS) {
+          result.graceThresholdSkipped++;
+          continue;
+        }
+  
+        if (await hasActiveExecutionPath(companyId, candidate.id)) {
+          result.livePathSkipped++;
+          continue;
+        }
+  
+        if (await hasPendingWakeInteraction(companyId, candidate.id)) {
+          result.interactionSkipped++;
+          continue;
+        }
+  
+        if (await isAutomaticRecoverySuppressedByPauseHold(db, companyId, candidate.id, treeControlSvc)) {
+          result.pauseHoldSkipped++;
+          continue;
+        }
+  
+        const existingAction = await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
+        if (existingAction?.kind === "blocked_without_blockers") {
+          result.alreadyActionedSkipped++;
+          continue;
+        }
+  
+        await recoveryActionsSvc.upsertSourceScoped({
+          companyId,
+          sourceIssueId: candidate.id,
+          kind: "blocked_without_blockers",
+          ownerType: "board",
+          previousOwnerAgentId: candidate.assigneeAgentId ?? null,
+          cause: "blocked_without_blockers",
+          fingerprint: `bwob:${companyId}:${candidate.id}`,
+          evidence: {
+            identifier: candidate.identifier,
+            status: "blocked",
+            blockedAt: candidate.updatedAt,
+            msInViolation,
+          },
+          nextAction:
+            "Review this blocked issue and either (a) add valid blocker relations, (b) unblock it to resume work, or (c) close/cancel it.",
+          wakePolicy: null,
+          monitorPolicy: null,
+          maxAttempts: null,
+          lastAttemptAt: now,
+        });
+  
+        result.escalated++;
+        result.issueIds.push(candidate.id);
+  
         await logActivity(db, {
-          companyId: candidate.companyId,
+          companyId,
           actorType: "system",
-          actorId: "system",
-          agentId: null,
-          runId: null,
-          action: "issue.blocked_without_blockers_detected",
+          actorId: "issue_graph_liveness_blocked_without_blockers",
+          runId: opts?.runId ?? null,
+          action: "issue.blocked_without_blockers_escalated",
           entityType: "issue",
           entityId: candidate.id,
           details: {
-            source: "recovery.reconcile_blocked_without_blockers",
-            identifier: candidate.identifier,
-            blockerIssueIds,
+            source,
+            fingerprint: `bwob:${companyId}:${candidate.id}`,
           },
         });
       }
     }
-
-    if (result.reported > 0 && shouldLog) {
-      lastBlockedWithoutBlockersLogAt = now;
+  
+    if (result.escalated > 0) {
       logger.warn(
-        { reported: result.reported, issueIds: result.issueIds },
-        "swept blocked-without-blockers issues (report-only)",
+        { escalated: result.escalated, issueIds: result.issueIds, source },
+        "blocked-without-blockers escalated to board-owned recovery actions",
       );
     }
-
+  
     return result;
   }
 
