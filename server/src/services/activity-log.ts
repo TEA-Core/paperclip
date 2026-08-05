@@ -38,7 +38,12 @@ export function setPluginEventBus(bus: PluginEventBus): void {
   _pluginEventBus = bus;
 }
 
-function eventTypeForActivityAction(action: string): PluginEventType | null {
+/**
+ * Resolve the plugin event type an activity-log `action` should be forwarded as, or `null`
+ * when the action has no plugin-facing event. Actions that already name a plugin event pass
+ * through; the rest are looked up in `ACTIVITY_ACTION_TO_PLUGIN_EVENT` in underscore form.
+ */
+export function eventTypeForActivityAction(action: string): PluginEventType | null {
   if (PLUGIN_EVENT_SET.has(action)) return action as PluginEventType;
   return ACTIVITY_ACTION_TO_PLUGIN_EVENT[action.replaceAll(".", "_")] ?? null;
 }
