@@ -435,6 +435,7 @@ export {
   type UpdateIssue,
   type IssueExecutionWorkspaceSettings,
   type IssueRecoveryActionReadModel,
+  isAssignedBacklogBlockingCreate,
   type ResolveIssueRecoveryAction,
   type CheckoutIssue,
   type AddIssueComment,

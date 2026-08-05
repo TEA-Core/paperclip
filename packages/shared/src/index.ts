@@ -1556,6 +1556,7 @@ export {
   createChildIssueSchema,
   createAcceptedPlanDecompositionSchema,
   resolveCreateIssueStatusDefault,
+  isAssignedBacklogBlockingCreate,
   createIssueLabelSchema,
   upsertIssueWatchdogSchema,
   issueBlockedInboxAttentionSchema,
