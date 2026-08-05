@@ -11837,6 +11837,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileUnfinalizableWorkspaceBarriers({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  async function ingestStaleInReviewChildIssues() {
+    return recovery.ingestStaleInReviewChildIssues();
+  }
+
   function issueIdFromRunContext(contextSnapshot: unknown) {
     const context = parseObject(contextSnapshot);
     return readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -17298,6 +17302,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileStaleRecoveryActionWakes,
 
     reconcileUnfinalizableWorkspaceBarriers,
+
+    ingestStaleInReviewChildIssues,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
