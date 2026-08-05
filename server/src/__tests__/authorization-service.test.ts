@@ -2269,4 +2269,42 @@ describeEmbeddedPostgres("authorization service", () => {
       })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
     }
   });
+
+  it("denies a peer agent that is neither assignee, creator, nor org-chain ancestor", async () => {
+    const company = await createCompany(db, "PeerDenial");
+    const managerAgent = await createAgent(db, company.id, { role: "manager" });
+    const assigneeAgent = await createAgent(db, company.id, { reportsTo: managerAgent.id });
+    const creatorAgent = await createAgent(db, company.id);
+    const peerAgent = await createAgent(db, company.id);
+    const issue = await createIssue(db, company.id, {
+      title: "Peer boundary test",
+      assigneeAgentId: assigneeAgent.id,
+      createdByAgentId: creatorAgent.id,
+    });
+
+    const decide = (agentId: string, action: "issue:comment" | "issue:mutate") =>
+      authorizationService(db).decide({
+        actor: { type: "agent", agentId, companyId: company.id, source: "agent_key" },
+        action,
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: issue.id,
+          projectId: null,
+          assigneeAgentId: assigneeAgent.id,
+          status: issue.status,
+          createdByAgentId: creatorAgent.id,
+        },
+      });
+
+    // The peer is not the assignee, not the creator, and not an org-chain ancestor.
+    await expect(decide(peerAgent.id, "issue:comment")).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+    await expect(decide(peerAgent.id, "issue:mutate")).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
 });

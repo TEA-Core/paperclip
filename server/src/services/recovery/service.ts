@@ -26,6 +26,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  unWakeableArchives,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -6358,6 +6359,98 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  const STALE_IN_REVIEW_CHILD_RELOG_INTERVAL_MS = 5 * 60_000;
+  let lastStaleInReviewChildLogAt: Date | null = null;
+
+  async function ingestStaleInReviewChildIssues() {
+    const result = {
+      archived: 0,
+      skippedParentNotBlocked: 0,
+      issueIds: [] as string[],
+    };
+
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    const candidates = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        companyId: issues.companyId,
+        parentId: issues.parentId,
+        monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "in_review"),
+          isNotNull(issues.parentId),
+          sql`${issues.monitorLastTriggeredAt} is not null`,
+          sql`${issues.monitorLastTriggeredAt} <= ${dayAgo}`,
+          sql`${issues.id} not in (select ${unWakeableArchives.issueId} from ${unWakeableArchives} where ${unWakeableArchives.policy} = 'stale_in_review_child')`,
+        ),
+      );
+
+    for (const candidate of candidates) {
+      const parent = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, candidate.parentId!))
+        .then((rows) => rows[0] ?? null);
+
+      if (!parent || parent.status !== "blocked") {
+        result.skippedParentNotBlocked += 1;
+        continue;
+      }
+
+      await db
+        .update(issues)
+        .set({ hiddenAt: new Date() })
+        .where(eq(issues.id, candidate.id));
+
+      await db.insert(unWakeableArchives).values({
+        companyId: candidate.companyId,
+        issueId: candidate.id,
+        policy: "stale_in_review_child",
+      });
+
+      result.archived += 1;
+      result.issueIds.push(candidate.id);
+
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.auto_archived",
+        entityType: "issue",
+        entityId: candidate.id,
+        details: {
+          source: "recovery.ingest_stale_in_review_child_issues",
+          parentId: candidate.parentId,
+          policy: "stale_in_review_child",
+          identifier: candidate.identifier,
+        },
+      });
+    }
+
+    if (result.archived > 0) {
+      const now = new Date();
+      if (
+        !lastStaleInReviewChildLogAt ||
+        now.getTime() - lastStaleInReviewChildLogAt.getTime() >= STALE_IN_REVIEW_CHILD_RELOG_INTERVAL_MS
+      ) {
+        lastStaleInReviewChildLogAt = now;
+        logger.warn(
+          { archived: result.archived, skipped: result.skippedParentNotBlocked, issueIds: result.issueIds },
+          "ingested stale in_review child issues",
+        );
+      }
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -6370,6 +6463,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileBlockedWithoutBlockers,
     reconcileStaleRecoveryActionWakes,
     reconcileUnfinalizableWorkspaceBarriers,
+    ingestStaleInReviewChildIssues,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
     reconcileIssueGraphLiveness,

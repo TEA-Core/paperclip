@@ -1495,6 +1495,107 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  describe("ancestor escape hatch field restrictions", () => {
+    function ancestorActor() {
+      return {
+        type: "agent",
+        agentId: peerAgentId,
+        companyId,
+        source: "agent_key",
+        runId: "66666666-6666-4666-8666-666666666666",
+      };
+    }
+
+    beforeEach(() => {
+      // The base authorization boundary denies issue:mutate for the ancestor
+      // (they are not the assignee), but isManagerOf returns true, so the
+      // inline ancestor escape hatch in the PATCH handler applies.
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed:
+          input.action === "tasks:assign" ||
+          input.action === "issue:comment" ||
+          input.action === "issue:read" ||
+          input.action === "company_scope:read",
+        action: input.action,
+        reason:
+          input.action === "tasks:assign" ||
+            input.action === "issue:comment" ||
+            input.action === "issue:read" ||
+            input.action === "company_scope:read"
+            ? "allow_explicit_grant"
+            : "deny_missing_grant",
+        explanation: "Ancestor test boundary default.",
+      }));
+      mockAccessService.isManagerOf.mockResolvedValue(true);
+      mockAgentService.getById.mockImplementation(async (id: string) => ({
+        id,
+        companyId,
+        name: `Agent ${id}`,
+      }));
+      mockAgentService.resolveByReference.mockImplementation(async (_companyId: string, raw: string) => ({
+        agent: { id: raw, companyId, name: `Agent ${raw}`, status: "active" },
+        ambiguous: false,
+      }));
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }),
+      );
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }),
+        ...patch,
+      }));
+    });
+
+    it.each([
+      ["assigneeAgentId", { assigneeAgentId: peerAgentId }],
+      ["status", { status: "blocked" }],
+      ["blockedByIssueIds", { blockedByIssueIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"] }],
+    ])("allows ancestor escape hatch to set %s", async (_field, patch) => {
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send(patch);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining(patch),
+      );
+    });
+
+    it.each([
+      ["title", { title: "Spoofed title" }],
+      ["description", { description: "Spoofed description" }],
+      ["reviewRequest", { reviewRequest: { instructions: "Approve this" } }],
+      ["reopen", { reopen: true }],
+      ["resume", { resume: true }],
+      ["comment", { comment: "Ancestor comment" }],
+      ["assigneeAdapterOverrides", { assigneeAdapterOverrides: { modelProfile: "cheap" } }],
+    ])("rejects ancestor escape hatch from setting %s", async (_field, patch) => {
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send(patch);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe(
+        "Ancestor escape hatch only permits assigneeAgentId, status, and blockedByIssueIds changes",
+      );
+      expect(res.body.details.forbiddenFields).toContain(_field);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects ancestor escape hatch from approving a stage via reviewRequest", async () => {
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ reviewRequest: { instructions: "Please approve" } });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe(
+        "Ancestor escape hatch only permits assigneeAgentId, status, and blockedByIssueIds changes",
+      );
+      expect(res.body.details.forbiddenFields).toContain("reviewRequest");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
   it("allows same-company agent mutations on unassigned in-progress issues", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: null }));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({

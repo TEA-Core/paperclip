@@ -974,6 +974,11 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...permanentlyUnfinalizable }, "startup permanently-unfinalizable-blocker sweep reported issues");
         }
 
+        const staleInReview = await heartbeat.ingestStaleInReviewChildIssues();
+        if (staleInReview.archived > 0) {
+          logger.warn({ ...staleInReview }, "startup stale in_review child archive sweep archived issues");
+        }
+
         const reviewed = await heartbeat.reconcileProductivityReviews();
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
@@ -1129,6 +1134,12 @@ export async function startServer(): Promise<StartedServer> {
               const permanentlyUnfinalizable = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
               if (permanentlyUnfinalizable.reported > 0) {
                 logger.warn({ ...permanentlyUnfinalizable }, "periodic permanently-unfinalizable-blocker sweep reported issues");
+              }
+            })
+            .then(async () => {
+              const staleInReview = await heartbeat.ingestStaleInReviewChildIssues();
+              if (staleInReview.archived > 0) {
+                logger.warn({ ...staleInReview }, "periodic stale in_review child archive sweep archived issues");
               }
             })
             .then(async () => {
