@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, gt, inArray, isNotNull, isNull, lt, notInArray, or, sql, count } from "drizzle-orm";
+import { and, asc, desc, eq, gte, gt, inArray, isNotNull, isNull, lt, ne, notInArray, or, sql, count } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -738,7 +738,9 @@ async function unresolvedBlockerIssues(db: Db, companyId: string, issueId: strin
  * - no live action → the dependency-wake backstop's zero-blocker heal (#41, SUP-10663) wakes
  *   the assignee directly; that path exists for exactly these rows.
  * - a live action → the heal defers to it (`hasActiveOrEscalatedRecoveryAction`), and the
- *   owner — or the #46 (SUP-10792) sweep when the owner stalls — re-arms the issue.
+ *   owner — or the #46 (SUP-10792) sweep when the owner stalls — re-arms the issue. Once that
+ *   sweep exhausts its ceiling the action stops counting as live, so the row falls back to the
+ *   zero-blocker heal above rather than deferring to a path that has given up.
  *
  * So the write always happens. Refusing it would be worse than a no-op: contained workspace
  * failures usually carry no issue-level blocker at all (the blocker is environmental), and
@@ -938,6 +940,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => Boolean(rows[0]));
   }
 
+  // "Live" means the action can still re-arm the issue on its own. An action
+  // that walked its attempt ceiling is `escalated` with `outcome:'exhausted'`:
+  // the sweep has stopped re-firing it and it now waits on a board operator, so
+  // it must NOT be treated as covering the issue. Counting it as live would let
+  // the zero-blocker heal defer forever to a path that has already given up.
+  // `outcome` is null for actions that have not concluded, so NULL counts as live.
   async function hasActiveOrEscalatedRecoveryAction(companyId: string, issueId: string) {
     return db
       .select({ id: issueRecoveryActions.id })
@@ -947,6 +955,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(issueRecoveryActions.companyId, companyId),
           eq(issueRecoveryActions.sourceIssueId, issueId),
           inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          or(
+            isNull(issueRecoveryActions.outcome),
+            ne(issueRecoveryActions.outcome, "exhausted"),
+          ),
         ),
       )
       .limit(1)
@@ -5339,7 +5351,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         // Zero-blocker heal path: a live recovery action owns the issue, so
         // waking it here would race that path and re-create the re-arm ->
-        // re-dead loop. Skip and count instead.
+        // re-dead loop. Skip and count instead. An exhausted action does not
+        // count as live (see hasActiveOrEscalatedRecoveryAction), so the heal
+        // still runs once the sweep has given up.
         if (zeroBlockerHeal && (await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id))) {
           result.zeroBlockerActiveRecoverySkipped += 1;
           continue;
