@@ -74,6 +74,64 @@ function firstNonEmptyLine(text: string): string {
   );
 }
 
+const ANSI_ESCAPE_PATTERN = /\x1b\[[0-9;]*[a-zA-Z]/g;
+
+function stripAnsi(text: string): string {
+  return text.replace(ANSI_ESCAPE_PATTERN, "").trim();
+}
+
+function stderrTail(text: string, maxLines = 10): string {
+  const stripped = stripAnsi(text);
+  const lines = stripped.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return "";
+  return lines.slice(-maxLines).join("\n");
+}
+
+/**
+ * Classify the underlying cause of a non-timeout adapter failure into a
+ * structured errorCode + errorMeta, so the heartbeat layer and downstream
+ * consumers get a machine-readable reason instead of a bare ANSI string.
+ *
+ * Priority order:
+ *   1. non-zero exit code → opencode_exit_<N>
+ *   2. signal termination → opencode_signal_<SIGNAL>
+ *   3. parsed JSONL error → opencode_tool_error
+ *   4. stderr content → opencode_stderr_error
+ *   5. otherwise → null (success)
+ */
+export function classifyOpenCodeFailure(input: {
+  exitCode: number | null;
+  signal: string | null;
+  parsedError: string;
+  stderrLine: string;
+  adapterSessionId: string | null;
+  stderr: string;
+  toolErrors: string[];
+}): { errorCode: string | null; errorMeta: Record<string, unknown> } {
+  const { exitCode, signal, parsedError, stderrLine, adapterSessionId, stderr, toolErrors } = input;
+  const errorMeta: Record<string, unknown> = {
+    adapterSessionId,
+    stderrTail: stderrTail(stderr),
+  };
+  let errorCode: string | null = null;
+  if (exitCode !== null && exitCode !== 0) {
+    errorCode = `opencode_exit_${exitCode}`;
+  } else if (signal) {
+    errorCode = `opencode_signal_${signal}`;
+  } else if (parsedError) {
+    errorCode = "opencode_tool_error";
+  } else if (stderrLine) {
+    errorCode = "opencode_stderr_error";
+  }
+  if (parsedError) {
+    errorMeta.parsedError = parsedError;
+  }
+  if (toolErrors.length > 0) {
+    errorMeta.toolErrors = toolErrors;
+  }
+  return { errorCode, errorMeta };
+}
+
 function parseModelProvider(model: string | null): string | null {
   if (!model) return null;
   const trimmed = model.trim();
@@ -735,6 +793,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           signal: attempt.proc.signal,
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
+          errorCode: "timeout",
+          errorMeta: {
+            stderrTail: stderrTail(attempt.proc.stderr),
+            adapterSessionId: runtimeSessionId ?? runtime.sessionId ?? null,
+          },
           clearSession: clearSessionOnMissingSession,
         };
       }
@@ -802,16 +865,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const synthesizedExitCode = effectiveParsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
       const fallbackErrorMessage =
         effectiveParsedError ||
-        stderrLine ||
-        `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+        (stderrLine
+          ? `OpenCode exited with code ${synthesizedExitCode ?? -1}: ${stderrLine}`
+          : `OpenCode exited with code ${synthesizedExitCode ?? -1}`);
       const modelId = model || null;
+
+      const adapterSessionId = runtimeSessionId ?? runtime.sessionId ?? null;
+      const { errorCode, errorMeta } = classifyOpenCodeFailure({
+        exitCode: synthesizedExitCode,
+        signal: attempt.proc.signal,
+        parsedError: effectiveParsedError,
+        stderrLine,
+        adapterSessionId,
+        stderr: attempt.proc.stderr,
+        toolErrors: attempt.parsed.toolErrors,
+      });
 
       return {
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
         finishReason: attempt.parsed.finalStepReason,
-        errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+        errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : stripAnsi(fallbackErrorMessage),
+        errorCode,
+        errorMeta: Object.keys(errorMeta).length > 0 ? errorMeta : undefined,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
           outputTokens: attempt.parsed.usage.outputTokens,
@@ -829,6 +906,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
           paperclipToolCallCount: attempt.parsed.paperclipToolCallCount,
+          exitCode: synthesizedExitCode,
+          errorCode,
+          ...(Object.keys(errorMeta).length > 0 ? { errorMeta } : {}),
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),

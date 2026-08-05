@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   buildOpenCodeRunArgs,
+  classifyOpenCodeFailure,
   ensureRemoteOpenCodeModelConfiguredAndAvailable,
   resolveOpenCodeSessionResume,
 } from "./execute.js";
@@ -196,5 +197,110 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
         graceSec: 5,
       }),
     ).rejects.toThrow();
+  });
+});
+
+describe("classifyOpenCodeFailure", () => {
+  const base = {
+    parsedError: "",
+    stderrLine: "",
+    adapterSessionId: "ses_abc",
+    stderr: "",
+    toolErrors: [],
+  };
+
+  it("classifies a non-zero exit code as opencode_exit_<N>", () => {
+    const { errorCode, errorMeta } = classifyOpenCodeFailure({ ...base, exitCode: 1, signal: null });
+    expect(errorCode).toBe("opencode_exit_1");
+    expect(errorMeta).toEqual({
+      adapterSessionId: "ses_abc",
+      stderrTail: "",
+    });
+  });
+
+  it("classifies a signal termination as opencode_signal_<SIGNAL>", () => {
+    const { errorCode } = classifyOpenCodeFailure({ ...base, exitCode: null, signal: "SIGTERM" });
+    expect(errorCode).toBe("opencode_signal_SIGTERM");
+  });
+
+  it("classifies a parsed JSONL error as opencode_tool_error", () => {
+    const { errorCode, errorMeta } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 0,
+      signal: null,
+      parsedError: "model unavailable",
+    });
+    expect(errorCode).toBe("opencode_tool_error");
+    expect(errorMeta.parsedError).toBe("model unavailable");
+  });
+
+  it("classifies stderr content as opencode_stderr_error", () => {
+    const { errorCode, errorMeta } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 0,
+      signal: null,
+      stderrLine: "some error line",
+      stderr: "some error line\n",
+    });
+    expect(errorCode).toBe("opencode_stderr_error");
+    expect(errorMeta.stderrTail).toBe("some error line");
+  });
+
+  it("returns null errorCode for a clean success", () => {
+    const { errorCode, errorMeta } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 0,
+      signal: null,
+    });
+    expect(errorCode).toBeNull();
+    expect(errorMeta).toEqual({
+      adapterSessionId: "ses_abc",
+      stderrTail: "",
+    });
+  });
+
+  it("includes toolErrors in errorMeta when present", () => {
+    const { errorMeta } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 1,
+      signal: null,
+      toolErrors: ["tool call failed: timeout"],
+    });
+    expect(errorMeta.toolErrors).toEqual(["tool call failed: timeout"]);
+  });
+
+  it("strips ANSI from stderrTail", () => {
+    const { errorMeta } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 1,
+      signal: null,
+      stderr: "\x1b[31mError: something went wrong\x1b[0m\n",
+    });
+    expect(errorMeta.stderrTail).toBe("Error: something went wrong");
+  });
+
+  it("prioritises exit code over parsed error", () => {
+    const { errorCode } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 2,
+      signal: null,
+      parsedError: "model unavailable",
+    });
+    expect(errorCode).toBe("opencode_exit_2");
+  });
+
+  it("prioritises signal over parsed error", () => {
+    const { errorCode } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 0,
+      signal: "SIGKILL",
+      parsedError: "model unavailable",
+    });
+    expect(errorCode).toBe("opencode_signal_SIGKILL");
+  });
+
+  it("handles null adapterSessionId", () => {
+    const { errorMeta } = classifyOpenCodeFailure({ ...base, exitCode: 1, signal: null, adapterSessionId: null });
+    expect(errorMeta.adapterSessionId).toBeNull();
   });
 });
