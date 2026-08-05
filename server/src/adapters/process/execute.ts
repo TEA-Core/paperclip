@@ -1,9 +1,10 @@
-import type { AdapterExecutionContext, AdapterExecutionResult } from "../types.js";
+import type { AdapterExecutionContext, AdapterExecutionResult, UsageSummary } from "../types.js";
 import {
   asString,
   asNumber,
   asStringArray,
   parseObject,
+  parseJson,
   buildPaperclipEnv,
   isForbiddenConfigEnvKey,
   isPaperclipRuntimeEnvKey,
@@ -12,6 +13,28 @@ import {
   resolveCommandForLogs,
   runChildProcess,
 } from "../utils.js";
+
+function extractPartialUsage(stdout: string): UsageSummary | null {
+  const lines = stdout.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!.trim();
+    if (!line) continue;
+    const parsed = parseJson(line);
+    if (!parsed) continue;
+    const usage = parseObject(parsed.usage);
+    const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : typeof usage.inputTokens === "number" ? usage.inputTokens : null;
+    const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : typeof usage.outputTokens === "number" ? usage.outputTokens : null;
+    const cachedInputTokens = typeof usage.cached_input_tokens === "number" ? usage.cached_input_tokens : typeof usage.cache_read_input_tokens === "number" ? usage.cache_read_input_tokens : typeof usage.cachedInputTokens === "number" ? usage.cachedInputTokens : undefined;
+    if (inputTokens == null && outputTokens == null) continue;
+    const result: UsageSummary = {
+      inputTokens: inputTokens ?? 0,
+      outputTokens: outputTokens ?? 0,
+    };
+    if (cachedInputTokens != null) result.cachedInputTokens = cachedInputTokens;
+    return result;
+  }
+  return null;
+}
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, config, onLog, onMeta, authToken } = ctx;
@@ -70,11 +93,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
 
   if (proc.timedOut) {
+    const partialUsage = extractPartialUsage(proc.stdout);
     return {
       exitCode: proc.exitCode,
       signal: proc.signal,
       timedOut: true,
       errorMessage: `Timed out after ${timeoutSec}s`,
+      resultJson: {
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+      },
+      ...(partialUsage ? { usage: partialUsage, usageBasis: "per_run" as const } : {}),
     };
   }
 
