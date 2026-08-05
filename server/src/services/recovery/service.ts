@@ -82,7 +82,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
-import { loadConfig, type Config } from "../../config.js";
+import { loadConfig } from "../../config.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -768,7 +768,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
   const instanceSettings = instanceSettingsService(db);
-  const config = loadConfig();
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
 
@@ -5225,6 +5224,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       ? "workspace_finalize_reconciliation"
       : "issue_graph_liveness_reconciliation";
     const useCursor = !opts?.blockerIssueId;
+    const config = loadConfig();
     const windowMs = opts?.rearmWindowMs ?? config.resolvedDependencyWakeRearmWindowMs;
     const maxCount = opts?.rearmMaxCount ?? config.resolvedDependencyWakeRearmMaxCount;
     const cutoff = opts?.now ? new Date(opts.now.getTime() - windowMs) : new Date(Date.now() - windowMs);
