@@ -19,6 +19,7 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   issue_document_updated: "issue.document.updated",
   issue_document_deleted: "issue.document.deleted",
   issue_blockers_updated: "issue.relations.updated",
+  issue_dependency_wake_rearm_cap_reached: "issue.dependency_wake_rearm_cap_reached",
   approval_approved: "approval.decided",
   approval_rejected: "approval.decided",
   approval_revision_requested: "approval.decided",
@@ -37,7 +38,12 @@ export function setPluginEventBus(bus: PluginEventBus): void {
   _pluginEventBus = bus;
 }
 
-function eventTypeForActivityAction(action: string): PluginEventType | null {
+/**
+ * Resolve the plugin event type an activity-log `action` should be forwarded as, or `null`
+ * when the action has no plugin-facing event. Actions that already name a plugin event pass
+ * through; the rest are looked up in `ACTIVITY_ACTION_TO_PLUGIN_EVENT` in underscore form.
+ */
+export function eventTypeForActivityAction(action: string): PluginEventType | null {
   if (PLUGIN_EVENT_SET.has(action)) return action as PluginEventType;
   return ACTIVITY_ACTION_TO_PLUGIN_EVENT[action.replaceAll(".", "_")] ?? null;
 }
