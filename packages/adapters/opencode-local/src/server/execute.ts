@@ -50,6 +50,7 @@ import {
 import {
   describeIncompleteOpenCodeStream,
   isOpenCodeTerminalBillingError,
+  isOpenCodeTransientStatementError,
   isOpenCodeUnknownSessionError,
   parseOpenCodeJsonl,
 } from "./parse.js";
@@ -786,6 +787,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsed: ReturnType<typeof parseOpenCodeJsonl>;
       },
       clearSessionOnMissingSession = false,
+      errorCode: string | null = null,
     ): AdapterExecutionResult => {
       if (attempt.proc.timedOut) {
         return {
@@ -871,7 +873,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const modelId = model || null;
 
       const adapterSessionId = runtimeSessionId ?? runtime.sessionId ?? null;
-      const { errorCode, errorMeta } = classifyOpenCodeFailure({
+      const { errorCode: classifiedErrorCode, errorMeta } = classifyOpenCodeFailure({
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         parsedError: effectiveParsedError,
@@ -887,7 +889,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timedOut: false,
         finishReason: attempt.parsed.finalStepReason,
         errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : stripAnsi(fallbackErrorMessage),
-        errorCode,
+        errorCode: errorCode ?? classifiedErrorCode,
         errorMeta: Object.keys(errorMeta).length > 0 ? errorMeta : undefined,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
@@ -907,7 +909,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: attempt.proc.stderr,
           paperclipToolCallCount: attempt.parsed.paperclipToolCallCount,
           exitCode: synthesizedExitCode,
-          errorCode,
+          errorCode: errorCode ?? classifiedErrorCode,
           ...(Object.keys(errorMeta).length > 0 ? { errorMeta } : {}),
         },
         summary: attempt.parsed.summary,
@@ -930,6 +932,42 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
         const retry = await runAttempt(null);
         return toResult(retry, true);
+      }
+
+      if (
+        initialFailed &&
+        !initial.proc.timedOut &&
+        isOpenCodeTransientStatementError(initial.rawStderr) &&
+        initial.parsed.paperclipToolCallCount === 0 &&
+        initial.parsed.summary.trim() === ""
+      ) {
+        const backoffs = [500, 1500];
+        let attempt = initial;
+        for (let attemptIndex = 0; attemptIndex < backoffs.length; attemptIndex++) {
+          const delay = backoffs[attemptIndex];
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          await onLog(
+            "stdout",
+            `[paperclip] transient opencode statement error, retry ${attemptIndex + 1}/2 after ${delay}ms: ${firstNonEmptyLine(attempt.rawStderr)}\n`,
+          );
+          const retry = await runAttempt(sessionId);
+          const retryFailed =
+            !retry.proc.timedOut &&
+            ((retry.proc.exitCode ?? 0) !== 0 || Boolean(retry.parsed.errorMessage));
+          if (!retryFailed) {
+            return toResult(retry);
+          }
+          const retryTransient =
+            !retry.proc.timedOut &&
+            isOpenCodeTransientStatementError(retry.rawStderr) &&
+            retry.parsed.paperclipToolCallCount === 0 &&
+            retry.parsed.summary.trim() === "";
+          if (!retryTransient) {
+            return toResult(retry);
+          }
+          attempt = retry;
+        }
+        return toResult(attempt, false, "opencode_statement_failed");
       }
 
       return toResult(initial);

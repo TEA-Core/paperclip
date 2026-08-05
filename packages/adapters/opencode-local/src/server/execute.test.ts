@@ -1,9 +1,77 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { runAdapterExecutionTargetProcessMock } = vi.hoisted(() => ({
+  runAdapterExecutionTargetProcessMock: vi.fn(),
+}));
+
+vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
+  adapterExecutionTargetIsRemote: () => false,
+  adapterExecutionTargetRemoteCwd: (_target: unknown, cwd: string) => cwd,
+  overrideAdapterExecutionTargetRemoteCwd: (target: unknown) => target,
+  adapterExecutionTargetSessionIdentity: () => ({ kind: "local" }),
+  adapterExecutionTargetSessionMatches: () => true,
+  adapterExecutionTargetUsesManagedHome: () => false,
+  adapterExecutionTargetUsesPaperclipBridge: () => false,
+  describeAdapterExecutionTarget: () => "local",
+  ensureAdapterExecutionTargetCommandResolvable: vi.fn(async () => {}),
+  ensureAdapterExecutionTargetRuntimeCommandInstalled: vi.fn(async () => {}),
+  prepareAdapterExecutionTargetRuntime: vi.fn(async () => ({
+    workspaceRemoteDir: null,
+    restoreWorkspace: async () => {},
+    runtimeRootDir: null,
+    assetDirs: {},
+  })),
+  readAdapterExecutionTarget: ({ executionTarget }: { executionTarget?: unknown }) =>
+    executionTarget ?? { kind: "local" },
+  readAdapterExecutionTargetHomeDir: vi.fn(async () => null),
+  resolveAdapterExecutionTargetTimeoutSec: (_target: unknown, timeoutSec: number) => timeoutSec,
+  resolveAdapterExecutionTargetCommandForLogs: async (command: string) => command,
+  runAdapterExecutionTargetProcess: runAdapterExecutionTargetProcessMock,
+  runAdapterExecutionTargetShellCommand: vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    pid: null,
+    startedAt: new Date().toISOString(),
+  })),
+  startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => null),
+}));
+
+vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/server-utils")>(
+    "@paperclipai/adapter-utils/server-utils",
+  );
+  return {
+    ...actual,
+    readPaperclipRuntimeSkillEntries: async () => [],
+    resolvePaperclipDesiredSkillNames: () => [],
+    removeMaintainerOnlySkillSymlinks: async () => [],
+    ensurePaperclipSkillSymlink: async () => "skipped" as const,
+  };
+});
+
+vi.mock("./models.js", () => ({
+  ensureOpenCodeModelConfiguredAndAvailable: vi.fn(async () => []),
+  isTruthyEnvFlag: (value: unknown) => value === "true" || value === "1",
+  parseOpenCodeModelsOutput: (stdout: string) => [],
+  requireOpenCodeModelId: (model: unknown) => {
+    const s = typeof model === "string" ? model.trim() : "";
+    if (!s || !s.includes("/")) {
+      throw new Error("OpenCode requires `adapterConfig.model` in provider/model format.");
+    }
+    return s;
+  },
+}));
+
+import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
 import {
   buildOpenCodeRunArgs,
   classifyOpenCodeFailure,
   ensureRemoteOpenCodeModelConfiguredAndAvailable,
+  execute,
   resolveOpenCodeSessionResume,
 } from "./execute.js";
 
@@ -303,4 +371,100 @@ describe("classifyOpenCodeFailure", () => {
     const { errorMeta } = classifyOpenCodeFailure({ ...base, exitCode: 1, signal: null, adapterSessionId: null });
     expect(errorMeta.adapterSessionId).toBeNull();
   });
+});
+
+describe("execute — transient statement error retry", () => {
+  const TRANSIENT_STDERR = "Failed to execute statement / Unexpected server error";
+
+  function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
+    return {
+      runId: "run-transient",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Agent",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        model: "router/coder",
+        cwd: process.cwd(),
+      },
+      context: {},
+      onLog: async () => {},
+      ...overrides,
+    };
+  }
+
+  function transientResult() {
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: TRANSIENT_STDERR,
+    };
+  }
+
+  function successResult() {
+    return {
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: [
+        JSON.stringify({ type: "text", part: { text: "Done", messageID: "msg-1" } }),
+        JSON.stringify({ type: "step_finish", part: { reason: "stop", tokens: { input: 10, output: 5, reasoning: 0 }, cost: 0 } }),
+      ].join("\n"),
+      stderr: "",
+    };
+  }
+
+  beforeEach(() => {
+    runAdapterExecutionTargetProcessMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("retries a transient statement failure before any agent output", async () => {
+    const retryLogs: string[] = [];
+    runAdapterExecutionTargetProcessMock
+      .mockImplementationOnce(async () => transientResult())
+      .mockImplementationOnce(async () => transientResult())
+      .mockImplementationOnce(async () => successResult());
+
+    const ctx = makeCtx({
+      onLog: async (stream: "stdout" | "stderr", chunk: string) => {
+        if (chunk.includes("transient opencode statement error")) retryLogs.push(chunk);
+      },
+    });
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorMessage).toBeNull();
+    expect(runAdapterExecutionTargetProcessMock).toHaveBeenCalledTimes(3);
+    expect(retryLogs).toHaveLength(2);
+    expect(retryLogs[0]).toContain("retry 1/2 after 500ms");
+    expect(retryLogs[1]).toContain("retry 2/2 after 1500ms");
+  }, 15000);
+
+  it("terminates after exhausting retries on a persistent statement failure", async () => {
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => transientResult());
+
+    const ctx = makeCtx();
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("opencode_statement_failed");
+    expect(result.errorMessage).toContain(TRANSIENT_STDERR);
+    expect(runAdapterExecutionTargetProcessMock).toHaveBeenCalledTimes(3);
+  }, 15000);
 });
