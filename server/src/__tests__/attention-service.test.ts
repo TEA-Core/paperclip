@@ -608,6 +608,55 @@ describeEmbeddedPostgres("attention service", () => {
     });
   });
 
+  it("surfaces an exhausted recovery action to the board when it is board-owned", async () => {
+    const { companyId } = await seedCompany("ATX");
+    const sourceIssueId = await insertIssue({
+      companyId,
+      identifier: "ATX-1",
+      title: "Exhausted recovery source",
+      status: "in_progress",
+    });
+    const now = new Date();
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      outcome: "exhausted",
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      cause: "stranded_assigned_issue",
+      fingerprint: "exhausted-board-fingerprint",
+      evidence: {},
+      nextAction: "Assign an invokable recovery owner.",
+      wakePolicy: { type: "wake_owner" },
+      monitorPolicy: null,
+      attemptCount: 5,
+      maxAttempts: 5,
+      timeoutAt: null,
+      lastAttemptAt: now,
+      resolutionNote: null,
+      resolvedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    const recoveryItem = feed.items.find((item) => item.sourceKind === "recovery_action");
+    expect(recoveryItem).toBeTruthy();
+    expect(recoveryItem?.subject).toMatchObject({
+      kind: "recovery_action",
+      status: "escalated",
+    });
+    expect(recoveryItem?.subject.metadata).toMatchObject({
+      ownerType: "board",
+      sourceIssueId,
+    });
+  });
+
   it("suppresses failed-run attention after a newer run for the same issue", async () => {
     const { companyId, workerId } = await seedCompany("ATN");
     const issueId = await insertIssue({

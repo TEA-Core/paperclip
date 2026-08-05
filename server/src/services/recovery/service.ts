@@ -5901,8 +5901,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   //     one can be resolved, instead of waiting on a human forever
   //   - attemptCount/lastAttemptAt are bumped under a compare-and-swap on the
   //     pre-image, so concurrent sweeps cannot double-fire
-  //   - at `maxAttempts` the action is escalated and the source issue is blocked
-  //     with a board comment, so exhaustion is visible rather than silent
+  //   - at `maxAttempts` the action is escalated to the board with a comment on
+  //     the source issue, so exhaustion is visible rather than silent; the
+  //     source issue is released (status untouched) rather than parked blocked
   async function reconcileStaleRecoveryActionWakes(opts?: { intervalMs?: number }) {
     const intervalMs = opts?.intervalMs ?? RECOVERY_ACTION_WAKE_INTERVAL_MS;
     const now = new Date();
@@ -6086,10 +6087,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
-  // At the attempt ceiling the backstop stops re-firing. Escalate the action and
-  // block the source issue so exhaustion surfaces on the board instead of the
-  // issue sitting silently with an active-but-dead recovery action. Does not
-  // bump attemptCount: the attempt was never made.
+  // At the attempt ceiling the backstop stops re-firing. Escalate the action to
+  // the board (ownerType 'board', no owner agent) so exhaustion surfaces on the
+  // board feed, and leave the source issue status untouched: writing
+  // status:'blocked' here parked the issue permanently undispatchable with zero
+  // blocker edges and no way to check it out. Does not bump attemptCount: the
+  // attempt was never made.
   async function escalateExhaustedRecoveryAction(
     action: typeof issueRecoveryActions.$inferSelect,
     effectiveMaxAttempts: number,
@@ -6100,6 +6103,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .set({
         status: "escalated",
         outcome: "exhausted",
+        ownerType: "board",
+        ownerAgentId: null,
         updatedAt: now,
       })
       .where(
@@ -6128,7 +6133,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       },
     });
 
-    // Only the sweep that won the CAS blocks the issue and comments.
+    // Only the sweep that won the CAS comments on the source issue.
     if (!escalated) return;
 
     const sourceIssue = await db
@@ -6137,15 +6142,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(eq(issues.id, action.sourceIssueId))
       .then((rows) => rows[0] ?? null);
     if (!sourceIssue) return;
-    if (sourceIssue.status === "done" || sourceIssue.status === "cancelled" || sourceIssue.status === "blocked") {
+    if (sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
       return;
     }
 
-    await issuesSvc.update(sourceIssue.id, { status: "blocked" });
     await issuesSvc.addComment(
       sourceIssue.id,
       `Recovery action \`${action.id}\` exhausted its attempt ceiling (${action.attemptCount}/${effectiveMaxAttempts}). ` +
-        "The source issue has been blocked and escalated to the board. " +
+        "The recovery action is escalated to the board; the source issue status was left untouched. " +
         "A board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
       {},
       { authorType: "system" },
@@ -6156,13 +6160,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       actorId: "system",
       agentId: null,
       runId: null,
-      action: "issue.updated",
+      action: "issue.recovery_action_exhausted",
       entityType: "issue",
       entityId: sourceIssue.id,
       details: {
         identifier: sourceIssue.identifier,
-        status: "blocked",
-        previousStatus: sourceIssue.status,
+        sourceIssueStatus: sourceIssue.status,
         source: "recovery.sweep_stale_recovery_action_wakes_exhausted",
         recoveryActionId: action.id,
         attemptCount: action.attemptCount,
