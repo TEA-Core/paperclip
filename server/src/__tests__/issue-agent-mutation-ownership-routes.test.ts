@@ -1561,6 +1561,24 @@ describe("agent issue mutation checkout ownership", () => {
       );
     });
 
+    it("records escape_hatch_manager_chain in the issue.updated activity when the ancestor escape hatch applies", async () => {
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "blocked" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.updated",
+          entityType: "issue",
+          details: expect.objectContaining({
+            authorizationPath: "escape_hatch_manager_chain",
+          }),
+        }),
+      );
+    });
+
     it.each([
       ["title", { title: "Spoofed title" }],
       ["description", { description: "Spoofed description" }],
@@ -1594,6 +1612,40 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.body.details.forbiddenFields).toContain("reviewRequest");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
+  });
+
+  it("records escape_hatch_creator in the issue.comment_added activity when the creating agent comments via the escape hatch", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:comment" || input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:comment" ? "allow_creator" : "allow_explicit_grant",
+      explanation: "Creator escape hatch boundary.",
+    }));
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: peerAgentId }),
+    );
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Creator follow-up comment." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Creator follow-up comment.",
+      expect.any(Object),
+      expect.any(Object),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_added",
+        entityType: "issue",
+        details: expect.objectContaining({
+          authorizationPath: "escape_hatch_creator",
+        }),
+      }),
+    );
   });
 
   it("allows same-company agent mutations on unassigned in-progress issues", async () => {
