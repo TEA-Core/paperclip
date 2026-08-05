@@ -6,9 +6,12 @@ vi.mock("../../config.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../config.js")>();
   return {
     ...actual,
-    loadConfig: (...args: Parameters<typeof actual.loadConfig>) => {
+    loadConfig: (..._args: Parameters<typeof actual.loadConfig>) => {
       loadConfigCalls();
-      return actual.loadConfig(...args);
+      return {
+        resolvedDependencyWakeRearmWindowMs: 1000,
+        resolvedDependencyWakeRearmMaxCount: 3,
+      } as ReturnType<typeof actual.loadConfig>;
     },
   };
 });
