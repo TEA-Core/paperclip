@@ -26,6 +26,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  detachIssuesFromClosedSharedExecutionWorkspace,
   executionWorkspaceService,
   mergeExecutionWorkspaceConfig,
   readExecutionWorkspaceConfig,
@@ -3117,4 +3118,162 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect.stringContaining("the worktree is dirty"),
     ]));
   }, 20_000);
+});
+
+describeEmbeddedPostgres("detachIssuesFromClosedSharedExecutionWorkspace", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-shared-workspace-detach-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seed() {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const sharedWorkspaceId = randomUUID();
+    const otherWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      isPrimary: true,
+    });
+    for (const [id, name] of [[sharedWorkspaceId, "Shared workspace"], [otherWorkspaceId, "Other workspace"]] as const) {
+      await db.insert(executionWorkspaces).values({
+        id,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name,
+        status: "active",
+        providerType: "project_primary",
+      });
+    }
+
+    return { companyId, projectId, projectWorkspaceId, sharedWorkspaceId, otherWorkspaceId };
+  }
+
+  async function seedIssue(
+    seeded: Awaited<ReturnType<typeof seed>>,
+    input: {
+      issueNumber: number;
+      executionWorkspaceId: string;
+      executionWorkspacePreference: string | null;
+    },
+  ) {
+    const id = randomUUID();
+    await db.insert(issues).values({
+      id,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      projectWorkspaceId: seeded.projectWorkspaceId,
+      title: `Issue ${input.issueNumber}`,
+      status: "todo",
+      priority: "medium",
+      issueNumber: input.issueNumber,
+      identifier: `T-${input.issueNumber}`,
+      executionWorkspaceId: input.executionWorkspaceId,
+      executionWorkspacePreference: input.executionWorkspacePreference,
+    });
+    return id;
+  }
+
+  async function readIssue(id: string) {
+    const [row] = await db
+      .select({
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+      })
+      .from(issues)
+      .where(eq(issues.id, id));
+    return row;
+  }
+
+  it("clears the reuse preference alongside the id so no unrealizable pair is left behind", async () => {
+    const seeded = await seed();
+    const issueId = await seedIssue(seeded, {
+      issueNumber: 1,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+      companyId: seeded.companyId,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+    });
+
+    expect(await readIssue(issueId)).toEqual({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+    });
+  });
+
+  it("preserves mode preferences that stay meaningful without a workspace id", async () => {
+    const seeded = await seed();
+    const issueId = await seedIssue(seeded, {
+      issueNumber: 2,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+      executionWorkspacePreference: "isolated_workspace",
+    });
+
+    await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+      companyId: seeded.companyId,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+    });
+
+    expect(await readIssue(issueId)).toEqual({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: "isolated_workspace",
+    });
+  });
+
+  it("leaves issues bound to other execution workspaces untouched", async () => {
+    const seeded = await seed();
+    const issueId = await seedIssue(seeded, {
+      issueNumber: 3,
+      executionWorkspaceId: seeded.otherWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+      companyId: seeded.companyId,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+    });
+
+    expect(await readIssue(issueId)).toEqual({
+      executionWorkspaceId: seeded.otherWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+  });
 });
