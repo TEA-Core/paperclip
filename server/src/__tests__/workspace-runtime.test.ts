@@ -30,6 +30,7 @@ import {
   assertWorktreeWritableByProcessUser,
   buildWorkspaceRuntimeDesiredStatePatch,
   cleanupExecutionWorkspaceArtifacts,
+  ensureGitWorktreeBranchCoherent,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
@@ -3443,6 +3444,103 @@ describe("realizeExecutionWorkspace", () => {
     expect(restored).not.toBeNull();
     expect(restored!.branchName).toBe(expectedBranch);
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+  }, 15_000);
+
+  it("classifies an orphaned nested worktree directory as worktree_metadata_missing", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "SUP-11169-orphaned-worktree";
+
+    // Create a recorded branch in the parent repository.
+    await runGit(repoRoot, ["checkout", "-b", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    // Create an orphaned, populated directory nested inside the parent repository
+    // without any .git metadata. Git commands run inside it resolve upward to the
+    // parent repository, which previously produced a misleading `diverged` verdict
+    // sourced from the parent repo's working tree.
+    const orphanedPath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await fs.mkdir(path.join(orphanedPath, "src"), { recursive: true });
+    await fs.writeFile(path.join(orphanedPath, "src", "file.ts"), "export const x = 1;\n", "utf8");
+
+    await expect(ensureGitWorktreeBranchCoherent({
+      repoRoot,
+      worktreePath: orphanedPath,
+      expectedBranchName: expectedBranch,
+      sourceIssue: {
+        id: "issue-orphaned",
+        identifier: "PAP-11169",
+        title: "Orphaned nested worktree",
+      },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "worktree_metadata_missing",
+          fingerprint: expect.stringMatching(/^workspace_metadata_missing:v1:sha256:/),
+          sourceIssueId: "issue-orphaned",
+          sourceIdentifier: "PAP-11169",
+          expectedBranch: expectedBranch,
+          actualBranch: null,
+          cleanliness: "unknown",
+          dirtyPathSample: [],
+          provenance: expect.objectContaining({
+            expectedBranchExists: true,
+            actualBranchRef: null,
+            actualHeadSha: null,
+            registeredPathFound: false,
+            ancestryVerdict: "unknown",
+          }),
+          safeRepair: expect.objectContaining({
+            eligible: true,
+            attempted: false,
+            succeeded: false,
+            reason: expect.stringContaining("worktree metadata is missing"),
+          }),
+        }),
+      },
+    });
+  }, 15_000);
+
+  it("classifies a registered worktree whose .git file was lost as worktree_metadata_missing", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "SUP-11169-lost-git-file";
+    const actualBranch = "SUP-11169-lost-git-file-live";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+
+    await fs.writeFile(path.join(worktreePath, "actual.txt"), "live work\n", "utf8");
+    await runGit(worktreePath, ["add", "actual.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add live work"]);
+
+    await fs.unlink(path.join(worktreePath, ".git"));
+
+    await expect(ensureGitWorktreeBranchCoherent({
+      repoRoot,
+      worktreePath,
+      expectedBranchName: expectedBranch,
+      sourceIssue: {
+        id: "issue-lost-git",
+        identifier: "PAP-11169",
+        title: "Lost git file worktree",
+      },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "worktree_metadata_missing",
+          provenance: expect.objectContaining({
+            registeredPathFound: false,
+            ancestryVerdict: "unknown",
+            actualHeadSha: null,
+          }),
+        }),
+      },
+    });
   }, 15_000);
 
   it("does not reuse a missing persisted local filesystem workspace", async () => {
