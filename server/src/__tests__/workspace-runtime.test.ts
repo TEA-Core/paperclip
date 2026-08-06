@@ -25,6 +25,7 @@ import {
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
+  assertGitHeadResolvable,
   assertGitIndexIntegrity,
   assertWorktreeWritableByProcessUser,
   buildWorkspaceRuntimeDesiredStatePatch,
@@ -495,6 +496,77 @@ describe("assertGitIndexIntegrity", () => {
     await expect(assertGitIndexIntegrity(worktreePath)).rejects.toThrow(
       /git index.*0 bytes \(truncated\)|truncated.*git index/i,
     );
+  });
+});
+
+describe("assertGitHeadResolvable", () => {
+  // SUP-10008 / SUP-10933: a reused worktree whose HEAD is a symref to a branch that no longer
+  // exists. git reports it as "000000000" in `git worktree list` and every rev-parse fails, so an
+  // agent dispatched there cannot commit, branch, or diff — its work strands. The reuse preflight
+  // never noticed, because `git symbolic-ref --short HEAD` still returns the expected branch name
+  // whether or not the ref it points at exists, so the branch-coherence check matched and returned.
+  it("throws a workspace validation failure when HEAD is a symref to a branch that no longer exists", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11121-dangling-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    // Delete the branch ref out from under the worktree, leaving HEAD dangling.
+    await fs.rm(path.join(repoRoot, ".git", "refs", "heads", branchName), { force: true });
+    await fs.rm(path.join(repoRoot, ".git", "packed-refs"), { force: true });
+
+    await expect(assertGitHeadResolvable(worktreePath)).rejects.toThrow(/HEAD.*does not resolve/i);
+  });
+
+  // False-positive guards. A refuse-to-proceed check earns its place only by staying silent on the
+  // ordinary states it must not reject — the SUP-10633 lesson, where a writability guard counted
+  // ENOENT from deleted tracked files as a permission failure and blocked every agent that had
+  // removed a file.
+  it("resolves for a healthy worktree", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11121-healthy-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    await expect(assertGitHeadResolvable(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("resolves for a worktree with uncommitted work, including deleted tracked files", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11121-dirty-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    await fs.writeFile(path.join(worktreePath, "untracked.txt"), "new work\n", "utf8");
+    await fs.writeFile(path.join(worktreePath, "README.md"), "modified\n", "utf8");
+    await fs.rm(path.join(worktreePath, "package.json"), { force: true });
+
+    await expect(assertGitHeadResolvable(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("resolves for a detached HEAD", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11121-detached-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await runGit(worktreePath, ["checkout", "--detach"]);
+
+    await expect(assertGitHeadResolvable(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("resolves for a worktree with an interrupted rebase, which is a separate condition", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11121-rebase-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await fs.mkdir(path.join(repoRoot, ".git", "worktrees", branchName, "rebase-merge"), { recursive: true });
+
+    await expect(assertGitHeadResolvable(worktreePath)).resolves.toBeUndefined();
   });
 });
 

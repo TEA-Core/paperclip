@@ -923,6 +923,41 @@ export async function assertGitIndexIntegrity(worktreePath: string): Promise<voi
   }
 }
 
+/**
+ * Refuse a worktree whose HEAD does not resolve to a commit.
+ *
+ * SUP-10008 and SUP-10933 both reached provisioning with HEAD pointing at a branch ref that no
+ * longer existed. `git worktree list` shows such a worktree as `000000000` and every rev-parse
+ * fails, so an agent dispatched there cannot commit, branch, or diff — whatever it does strands.
+ *
+ * The reuse preflight never caught it because the branch-coherence check asks
+ * `git symbolic-ref --short HEAD`, which reports the symref's *target name* whether or not that ref
+ * exists. The name matched the recorded branch, so the check returned early and validation moved
+ * on. The run then failed later and elsewhere — SUP-10008 surfaced as a pnpm lockfile error — which
+ * pointed the operator at the wrong thing entirely.
+ *
+ * Deliberately narrow: this asserts only that HEAD resolves. A dirty tree, deleted tracked files, a
+ * detached HEAD and an interrupted rebase all resolve fine and are none of this guard's business.
+ */
+export async function assertGitHeadResolvable(worktreePath: string): Promise<void> {
+  const head = await runGit(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], worktreePath).catch(() => null);
+  if (head) return;
+
+  const symbolicTarget = await runGit(["symbolic-ref", "--quiet", "HEAD"], worktreePath).catch(() => null);
+  throw new WorkspaceRuntimeValidationFailure(
+    symbolicTarget
+      ? `Git HEAD at "${worktreePath}" does not resolve to a commit: it points at "${symbolicTarget}", which no longer exists. The worktree's branch ref was deleted or was never created, so git cannot commit, branch or diff here. Recreate the branch at the intended commit, or clear the issue's reuse_existing workspace binding so a fresh workspace is provisioned.`
+      : `Git HEAD at "${worktreePath}" does not resolve to a commit. The worktree git metadata is corrupted and must be repaired before the worktree can be used.`,
+    {
+      workspaceValidation: {
+        reason: "git_head_unresolvable",
+        worktreePath,
+        symbolicTarget: symbolicTarget ?? null,
+      },
+    },
+  );
+}
+
 function fingerprintWorkspaceBranchIncoherence(input: {
   sourceIssueId: string | null;
   executionWorkspaceId: string | null;
@@ -2520,6 +2555,7 @@ async function validateLinkedGitWorktree(input: {
     };
   }
   await assertGitIndexIntegrity(input.worktreePath);
+  await assertGitHeadResolvable(input.worktreePath);
   return { valid: true };
 }
 
