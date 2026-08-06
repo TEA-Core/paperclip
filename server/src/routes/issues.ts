@@ -4196,6 +4196,7 @@ export function issueRoutes(
     ) {
       return true;
     }
+    if (!issue.assigneeAgentId && !activeRecoveryAction.ownerAgentId) return true;
     if (activeRecoveryAction.ownerAgentId === actorAgentId) return true;
     if (
       activeRecoveryAction.ownerAgentId &&
