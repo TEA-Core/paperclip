@@ -4110,14 +4110,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(reviewRecoveryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
 
-    const sourceIssue = await waitForValue(async () => {
-      const row = await db
-        .select()
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      return row?.status === "blocked" ? row : null;
+    // Wait on the escalation comment, not on `status === "blocked"`. Other recovery sweeps
+    // also block a stranded issue, and one of them can win the race — polling the status
+    // lets the test read the comments before this path has written its own.
+    const escalationComment = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.find((comment) => comment.body.includes("deferral limit")) ?? null;
     }, 8_000);
+    expect(escalationComment).toBeTruthy();
+
+    const sourceIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
     expect(sourceIssue).toMatchObject({
       status: "blocked",
       assigneeAgentId: agentId,
