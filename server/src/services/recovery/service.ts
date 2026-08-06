@@ -5984,6 +5984,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  const MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS = 5;
+
   async function reconcileBlockedWithoutBlockers(opts?: {
     runId?: string | null;
     companyId?: string | null;
@@ -6073,30 +6075,53 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         const existingAction = await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
-        if (existingAction?.kind === "blocked_without_blockers") {
-          result.alreadyActionedSkipped++;
-          continue;
+
+        // Auto-heal path — setting-gated, default OFF.
+        // Evaluated BEFORE the already-actioned guard so an existing action is
+        // not terminal. Bounded: if the action has already hit the sweep ceiling,
+        // do NOT heal — fall through to the already-actioned guard.
+        if (general.enableBlockedWithoutBlockersAutoHeal && candidate.assigneeAgentId) {
+          const isAtCeiling =
+            existingAction?.kind === "blocked_without_blockers" &&
+            existingAction.attemptCount >= MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
+          if (!isAtCeiling) {
+            if (existingAction?.kind === "blocked_without_blockers") {
+              await db
+                .update(issueRecoveryActions)
+                .set({ attemptCount: existingAction.attemptCount + 1, updatedAt: now })
+                .where(eq(issueRecoveryActions.id, existingAction.id));
+              await recoveryActionsSvc.resolveActiveForIssue({
+                companyId,
+                sourceIssueId: candidate.id,
+                kind: "blocked_without_blockers",
+                status: "resolved",
+                outcome: "false_positive",
+                resolutionNote: "Auto-healed by blocked_without_blockers sweep.",
+              });
+            }
+            await issuesSvc.update(candidate.id, { status: "todo" });
+            await enqueueInitialAssignedTodoDispatch(
+              { id: candidate.id, companyId: candidate.companyId, projectId: null } as typeof issues.$inferSelect,
+              candidate.assigneeAgentId,
+            );
+            result.healed++;
+            result.issueIds.push(candidate.id);
+            await logActivity(db, {
+              companyId,
+              actorType: "system",
+              actorId: "issue_graph_liveness_blocked_without_blockers",
+              runId: opts?.runId ?? null,
+              action: "issue.blocked_without_blockers_healed",
+              entityType: "issue",
+              entityId: candidate.id,
+              details: { source, fingerprint: `bwob:${companyId}:${candidate.id}` },
+            });
+            continue;
+          }
         }
 
-        // Auto-heal path — setting-gated, default OFF
-        if (general.enableBlockedWithoutBlockersAutoHeal && candidate.assigneeAgentId) {
-          await issuesSvc.update(candidate.id, { status: "todo" });
-          await enqueueInitialAssignedTodoDispatch(
-            { id: candidate.id, companyId: candidate.companyId, projectId: null } as typeof issues.$inferSelect,
-            candidate.assigneeAgentId,
-          );
-          result.healed++;
-          result.issueIds.push(candidate.id);
-          await logActivity(db, {
-            companyId,
-            actorType: "system",
-            actorId: "issue_graph_liveness_blocked_without_blockers",
-            runId: opts?.runId ?? null,
-            action: "issue.blocked_without_blockers_healed",
-            entityType: "issue",
-            entityId: candidate.id,
-            details: { source, fingerprint: `bwob:${companyId}:${candidate.id}` },
-          });
+        if (existingAction?.kind === "blocked_without_blockers") {
+          result.alreadyActionedSkipped++;
           continue;
         }
 
@@ -6116,7 +6141,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           },
           nextAction:
             "Review this blocked issue and either (a) add valid blocker relations, (b) unblock it to resume work, or (c) close/cancel it.",
-          wakePolicy: null,
+          wakePolicy: { type: "board_escalation" },
           monitorPolicy: null,
           maxAttempts: null,
           lastAttemptAt: now,
@@ -6158,7 +6183,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   // Ceiling applied to source-scoped recovery actions so the level-triggered
   // backstop below cannot re-fire the same wake forever.
-  const MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS = 5;
+  // MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS is declared above reconcileBlockedWithoutBlockers.
   // Per-action linear backoff: attempt N waits N * intervalMs before the next
   // re-fire, capped so a long-lived action still gets swept periodically.
   const RECOVERY_ACTION_WAKE_BACKOFF_MAX_MULTIPLIER = 6;

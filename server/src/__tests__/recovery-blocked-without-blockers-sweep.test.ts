@@ -764,4 +764,162 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
 
     await drainAgentRuns(agentId);
   });
+
+  it("flag ON + existing blocked_without_blockers action with low attemptCount — heals and resolves the action", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    const blockedAt = oldDate();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked with existing recovery action — should heal",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: blockedAt,
+    });
+
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId: issueId,
+      kind: "blocked_without_blockers",
+      status: "active",
+      ownerType: "board",
+      cause: "blocked_without_blockers",
+      fingerprint: `bwob:${companyId}:${issueId}`,
+      attemptCount: 1,
+      nextAction: "Review this blocked issue.",
+      evidence: { identifier: null },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.alreadyActionedSkipped).toBe(0);
+    expect(result.healed).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("todo");
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0]);
+    expect(wakeup).toBeTruthy();
+
+    const action = await db
+      .select({ status: issueRecoveryActions.status, outcome: issueRecoveryActions.outcome, attemptCount: issueRecoveryActions.attemptCount })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      )
+      .then((rows) => rows[0]);
+    expect(action?.status).toBe("resolved");
+    expect(action?.outcome).toBe("false_positive");
+    expect(action?.attemptCount).toBe(2);
+
+    await drainAgentRuns(agentId);
+  });
+
+  it("flag ON + existing action at attemptCount >= 5 — does NOT heal, alreadyActionedSkipped increments", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked with exhausted action — should not heal",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId: issueId,
+      kind: "blocked_without_blockers",
+      status: "active",
+      ownerType: "board",
+      cause: "blocked_without_blockers",
+      fingerprint: `bwob:${companyId}:${issueId}`,
+      attemptCount: 5,
+      nextAction: "Review this blocked issue.",
+      evidence: { identifier: null },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.healed).toBe(0);
+    expect(result.alreadyActionedSkipped).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+
+    const action = await db
+      .select({ status: issueRecoveryActions.status, attemptCount: issueRecoveryActions.attemptCount })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      )
+      .then((rows) => rows[0]);
+    expect(action?.status).toBe("active");
+    expect(action?.attemptCount).toBe(5);
+  });
+
+  it("flag OFF — escalated action carries wakePolicy board_escalation", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked with no blockers — wakePolicy check",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const action = await db
+      .select({ wakePolicy: issueRecoveryActions.wakePolicy })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      )
+      .then((rows) => rows[0]);
+    expect(action?.wakePolicy).toMatchObject({ type: "board_escalation" });
+  });
 });
