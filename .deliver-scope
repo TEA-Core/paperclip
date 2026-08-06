@@ -1,5 +1,5 @@
-# Scope for SUP-11270 on this branch.
-# Track heal attempts in evidence.healAttemptCount — gate isAtCeiling on that, not attemptCount
-server/src/services/recovery/service.ts
-server/src/services/issue-recovery-actions.ts
-server/src/__tests__/recovery-blocked-without-blockers-sweep.test.ts
+# Scope for SUP-11169 on this branch.
+# Fix: classify orphaned/unregistered worktree as worktree_metadata_missing
+packages/shared/src/types/heartbeat.ts
+server/src/__tests__/workspace-runtime.test.ts
+server/src/services/workspace-runtime.ts

@@ -12,8 +12,10 @@ export type GitWorktreeBranchAncestryVerdict = "ancestor" | "diverged" | "unknow
 
 export type GitWorktreeInProgressOperation = "rebase" | "merge" | "cherry_pick" | "revert" | "bisect";
 
+export type GitWorktreeBranchIncoherenceReason = "git_worktree_branch_incoherence" | "worktree_metadata_missing";
+
 export interface GitWorktreeBranchIncoherenceEvidence {
-  reason: "git_worktree_branch_incoherence";
+  reason: GitWorktreeBranchIncoherenceReason;
   fingerprint: string;
   sourceIssueId: string | null;
   sourceIdentifier: string | null;

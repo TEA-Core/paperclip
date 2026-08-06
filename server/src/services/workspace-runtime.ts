@@ -679,6 +679,7 @@ async function remoteExists(repoRoot: string, remote: string): Promise<boolean> 
 }
 
 const GIT_WORKTREE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
+const WORKTREE_METADATA_MISSING_REASON = "worktree_metadata_missing";
 
 type GitWorktreeCleanliness = SharedGitWorktreeBranchIncoherenceEvidence["cleanliness"];
 
@@ -985,6 +986,25 @@ function fingerprintWorkspaceBranchIncoherence(input: {
   return `workspace_incoherence:v1:sha256:${digest}`;
 }
 
+function fingerprintWorktreeMetadataMissing(input: {
+  sourceIssueId: string | null;
+  executionWorkspaceId: string | null;
+  worktreePath: string;
+  expectedBranch: string;
+}) {
+  const digest = createHash("sha256")
+    .update(stableStringify({
+      version: 1,
+      reason: WORKTREE_METADATA_MISSING_REASON,
+      sourceIssueId: input.sourceIssueId,
+      executionWorkspaceId: input.executionWorkspaceId,
+      worktreePath: path.resolve(input.worktreePath),
+      expectedBranch: input.expectedBranch,
+    }))
+    .digest("hex");
+  return `workspace_metadata_missing:v1:sha256:${digest}`;
+}
+
 async function getGitWorktreeBranchAncestryVerdict(input: {
   repoRoot: string;
   expectedHeadSha: string | null;
@@ -1059,6 +1079,68 @@ function explainGitWorktreeBranchIncoherence(input: {
   return `Paperclip could not determine whether the checked-out branch "${actualBranch}" is forward of the recorded branch "${input.expectedBranchName}".`;
 }
 
+async function buildWorktreeMetadataMissingEvidence(input: {
+  db?: Db | null;
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranchName: string;
+  sourceIssue: ExecutionWorkspaceIssueRef | null;
+  executionWorkspaceId?: string | null;
+}): Promise<GitWorktreeBranchIncoherenceEvidence> {
+  const expectedHeadSha = await runGit(
+    ["rev-parse", "--verify", `refs/heads/${input.expectedBranchName}^{commit}`],
+    input.repoRoot,
+  ).catch(() => null);
+  const expectedBranchExists = Boolean(expectedHeadSha);
+
+  return {
+    reason: WORKTREE_METADATA_MISSING_REASON,
+    fingerprint: fingerprintWorktreeMetadataMissing({
+      sourceIssueId: input.sourceIssue?.id ?? null,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+      worktreePath: input.worktreePath,
+      expectedBranch: input.expectedBranchName,
+    }),
+    sourceIssueId: input.sourceIssue?.id ?? null,
+    sourceIdentifier: input.sourceIssue?.identifier ?? null,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    worktreePath: path.resolve(input.worktreePath),
+    repoRoot: path.resolve(input.repoRoot),
+    expectedBranch: input.expectedBranchName,
+    actualBranch: null,
+    cleanliness: "unknown",
+    inProgressOperation: null,
+    statusEntryCount: null,
+    dirtyPathSample: [],
+    contention: null,
+    provenance: {
+      expectedBranchRef: `refs/heads/${input.expectedBranchName}`,
+      actualBranchRef: null,
+      registeredBranchRef: null,
+      registeredPathFound: false,
+      registeredBranchMatchesHead: false,
+      expectedBranchExists,
+      actualBranchExists: null,
+      expectedHeadSha,
+      actualHeadSha: null,
+      sameHead: false,
+      ancestryVerdict: "unknown",
+      defaultBranch: await detectDefaultBranch(input.repoRoot).catch(() => null),
+      // There is no checked-out branch to compare: the path has no worktree
+      // metadata, so nothing here can be the default branch.
+      actualBranchIsDefaultBranch: false,
+      plainLanguageReason:
+        "The workspace path is not a registered git worktree; its git metadata is missing or resolves to a different repository.",
+    },
+    safeRepair: {
+      eligible: true,
+      attempted: false,
+      succeeded: false,
+      reason: "worktree metadata is missing; relinking or re-provisioning may repair it",
+    },
+  };
+}
+
 async function inspectGitWorktreeBranchIncoherence(input: {
   db?: Db | null;
   repoRoot: string;
@@ -1068,6 +1150,22 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   sourceIssue: ExecutionWorkspaceIssueRef | null;
   executionWorkspaceId?: string | null;
 }): Promise<GitWorktreeBranchIncoherenceEvidence> {
+  const resolvedTopLevel = await runGit(["rev-parse", "--show-toplevel"], input.worktreePath)
+    .then((output) => resolvePathForWorktreeComparison(output))
+    .catch(() => null);
+  const expectedPath = await resolvePathForWorktreeComparison(input.worktreePath);
+  const registered = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  if (!resolvedTopLevel || resolvedTopLevel !== expectedPath || !registered) {
+    return buildWorktreeMetadataMissingEvidence({
+      db: input.db ?? null,
+      repoRoot: input.repoRoot,
+      worktreePath: input.worktreePath,
+      expectedBranchName: input.expectedBranchName,
+      sourceIssue: input.sourceIssue,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+    });
+  }
+
   const status = await runGit(
     ["status", "--porcelain", "--untracked-files=all"],
     input.worktreePath,
@@ -1087,7 +1185,6 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const actualBranchExists = input.actualBranchName
     ? await localBranchExists(input.repoRoot, input.actualBranchName)
     : null;
-  const registered = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
   const actualBranchRef = input.actualBranchName ? `refs/heads/${input.actualBranchName}` : null;
   const registeredBranchRef = registered?.branch ?? null;
   const registeredBranchMatchesHead = Boolean(registered && registeredBranchRef === actualBranchRef);
@@ -1270,8 +1367,11 @@ async function inspectGitWorktreeBranchIncoherence(input: {
 }
 
 function branchIncoherenceValidationFailure(evidence: GitWorktreeBranchIncoherenceEvidence) {
+  const message = evidence.reason === WORKTREE_METADATA_MISSING_REASON
+    ? `Execution workspace at "${evidence.worktreePath}" is missing its git worktree metadata. Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`
+    : `Execution workspace git worktree expected branch "${evidence.expectedBranch}" but found "${formatBranchForMessage(evidence.actualBranch)}" at "${evidence.worktreePath}". Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`;
   return new WorkspaceRuntimeValidationFailure(
-    `Execution workspace git worktree expected branch "${evidence.expectedBranch}" but found "${formatBranchForMessage(evidence.actualBranch)}" at "${evidence.worktreePath}". Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`,
+    message,
     {
       workspaceValidation: evidence,
     },
@@ -1872,6 +1972,10 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     sourceIssue: input.sourceIssue,
     executionWorkspaceId: input.executionWorkspaceId ?? null,
   });
+
+  if (evidence.reason === WORKTREE_METADATA_MISSING_REASON) {
+    throw branchIncoherenceValidationFailure(evidence);
+  }
 
   if (evidence.cleanliness === "dirty" && input.enableWorkspaceDirtyQuarantineRepair === true) {
     if (!input.db) {
