@@ -1,7 +1,9 @@
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { formatDatabaseBackupResult, runDatabaseBackup } from "@paperclipai/db";
+import { resolvePaperclipEnvPathForConfig } from "@paperclipai/shared/home-paths";
 import {
   expandHomePrefix,
   resolveDefaultBackupDir,
@@ -18,20 +20,50 @@ type DbBackupOptions = {
   json?: boolean;
 };
 
+function readEnvFileEntries(envPath: string): Record<string, string> {
+  if (!existsSync(envPath)) return {};
+  const entries: Record<string, string> = {};
+  for (const rawLine of readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (!match) continue;
+    const [, key, rawValue] = match;
+    const value = rawValue.trim();
+    if (
+      (value.startsWith("\"") && value.endsWith("\"")) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      entries[key] = value.slice(1, -1);
+    } else {
+      entries[key] = value.replace(/\s+#.*$/, "").trim();
+    }
+  }
+  return entries;
+}
+
 function resolveConnectionString(configPath?: string): { value: string; source: string } {
   const envUrl = process.env.DATABASE_URL?.trim();
   if (envUrl) return { value: envUrl, source: "DATABASE_URL" };
+
+  const resolvedConfigPath = configPath ?? resolveConfigPath();
+  const envPath = resolvePaperclipEnvPathForConfig(resolvedConfigPath);
+  const envEntries = readEnvFileEntries(envPath);
+  const fileEnvUrl = envEntries.DATABASE_URL?.trim();
+  if (fileEnvUrl) return { value: fileEnvUrl, source: "paperclip-env" };
 
   const config = readConfig(configPath);
   if (config?.database.mode === "postgres" && config.database.connectionString?.trim()) {
     return { value: config.database.connectionString.trim(), source: "config.database.connectionString" };
   }
 
-  const port = config?.database.embeddedPostgresPort ?? 54329;
-  return {
-    value: `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`,
-    source: `embedded-postgres@${port}`,
-  };
+  throw new Error(
+    "No database connection resolved. Tried:\n" +
+      "  1. DATABASE_URL environment variable (not set)\n" +
+      `  2. paperclip-env file (.env) at ${envPath} (not found or no DATABASE_URL)\n` +
+      `  3. config.json database.connectionString at ${resolvedConfigPath} (config not found or no connectionString)\n` +
+      "Set DATABASE_URL to your instance's connection string and retry.",
+  );
 }
 
 function normalizeRetentionDays(value: number | undefined, fallback: number): number {
@@ -52,7 +84,7 @@ export async function dbBackupCommand(opts: DbBackupOptions): Promise<void> {
 
   const configPath = resolveConfigPath(opts.config);
   const config = readConfig(opts.config);
-  const connection = resolveConnectionString(opts.config);
+  const connection = resolveConnectionString(configPath);
   const defaultDir = resolveDefaultBackupDir(resolvePaperclipInstanceId());
   const configuredDir = opts.dir?.trim() || config?.database.backup.dir || defaultDir;
   const backupDir = resolveBackupDir(configuredDir);
