@@ -3497,7 +3497,7 @@ async function pruneExpiredWorktreeRescueRefs(cwd: string, ttlMs = WORKTREE_RESC
     }
   } catch {
     // Pruning is housekeeping; a failure here must not surface as a preservation failure.
-   }
+  }
 }
 
 const WORKTREE_PRESERVATION_REF_PREFIX = "refs/preserved";

@@ -621,91 +621,91 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         return;
       }
 
-       if (readiness.state === "blocked") {
-         res.status(409).json({
-           error: readiness.blockingReasons[0] ?? "Execution workspace cannot be closed right now",
-           closeReadiness: readiness,
-         });
-         return;
-       }
+      if (readiness.state === "blocked") {
+        res.status(409).json({
+          error: readiness.blockingReasons[0] ?? "Execution workspace cannot be closed right now",
+          closeReadiness: readiness,
+        });
+        return;
+      }
 
-       if (
-         existing.providerType === "git_worktree" &&
-         typeof readiness.git?.aheadCount === "number" &&
-         readiness.git.aheadCount > 0 &&
-         readiness.git.repoRoot &&
-         existing.branchName
-       ) {
-         const issueIdentifier = existing.sourceIssueId
-           ? await db
-               .select({ identifier: issues.identifier })
-               .from(issues)
-               .where(eq(issues.id, existing.sourceIssueId))
-               .then((rows) => rows[0]?.identifier ?? null)
-           : null;
+      if (
+        existing.providerType === "git_worktree" &&
+        typeof readiness.git?.aheadCount === "number" &&
+        readiness.git.aheadCount > 0 &&
+        readiness.git.repoRoot &&
+        existing.branchName
+      ) {
+        const issueIdentifier = existing.sourceIssueId
+          ? await db
+              .select({ identifier: issues.identifier })
+              .from(issues)
+              .where(eq(issues.id, existing.sourceIssueId))
+              .then((rows) => rows[0]?.identifier ?? null)
+          : null;
 
-         const preservation = await preserveUnpushedWorktreeCommits({
-           workspacePath: readiness.git.workspacePath ?? existing.providerRef ?? existing.cwd ?? "",
-           branchName: existing.branchName,
-           issueIdentifier,
-           repoRoot: readiness.git.repoRoot,
-         });
+        const preservation = await preserveUnpushedWorktreeCommits({
+          workspacePath: readiness.git.workspacePath ?? existing.providerRef ?? existing.cwd ?? "",
+          branchName: existing.branchName,
+          issueIdentifier,
+          repoRoot: readiness.git.repoRoot,
+        });
 
-         if (!preservation.preserved) {
-           if (existing.sourceIssueId) {
-             await db
-               .insert(issueComments)
-               .values({
-                 companyId: existing.companyId,
-                 issueId: existing.sourceIssueId,
-                 authorAgentId: null,
-                 authorUserId: null,
-                 authorType: "system",
-                 body:
-                   `Archiving execution workspace \`${existing.name}\` was refused: ` +
-                   `unpushed commits could not be preserved.\n\n` +
-                   `${preservation.warning ?? "Unknown preservation failure."}\n`,
-               })
-               .catch(() => null);
-             await db
-               .update(issues)
-               .set({ updatedAt: new Date() })
-               .where(eq(issues.id, existing.sourceIssueId))
-               .catch(() => null);
-           }
+        if (!preservation.preserved) {
+          if (existing.sourceIssueId) {
+            await db
+              .insert(issueComments)
+              .values({
+                companyId: existing.companyId,
+                issueId: existing.sourceIssueId,
+                authorAgentId: null,
+                authorUserId: null,
+                authorType: "system",
+                body:
+                  `Archiving execution workspace \`${existing.name}\` was refused: ` +
+                  `unpushed commits could not be preserved.\n\n` +
+                  `${preservation.warning ?? "Unknown preservation failure."}\n`,
+              })
+              .catch(() => null);
+            await db
+              .update(issues)
+              .set({ updatedAt: new Date() })
+              .where(eq(issues.id, existing.sourceIssueId))
+              .catch(() => null);
+          }
 
-           res.status(409).json({
-             error: "Execution workspace has unpushed commits that could not be preserved; archive refused",
-             closeReadiness: readiness,
-             preservation,
-           });
-           return;
-         }
+          res.status(409).json({
+            error: "Execution workspace has unpushed commits that could not be preserved; archive refused",
+            closeReadiness: readiness,
+            preservation,
+          });
+          return;
+        }
 
-         if (existing.sourceIssueId) {
-           await db
-             .insert(issueComments)
-             .values({
-               companyId: existing.companyId,
-               issueId: existing.sourceIssueId,
-               authorAgentId: null,
-               authorUserId: null,
-               authorType: "system",
-               body:
-                 `Preserved unpushed commits from execution workspace \`${existing.name}\` before archiving.\n\n` +
-                 `Commit: \`${preservation.commitSha}\`\n` +
-                 `Preservation ref: \`${preservation.preservedRef}\`\n`,
-             })
-             .catch(() => null);
-           await db
-             .update(issues)
-             .set({ updatedAt: new Date() })
-             .where(eq(issues.id, existing.sourceIssueId))
-             .catch(() => null);
-         }
-       }
+        if (existing.sourceIssueId) {
+          await db
+            .insert(issueComments)
+            .values({
+              companyId: existing.companyId,
+              issueId: existing.sourceIssueId,
+              authorAgentId: null,
+              authorUserId: null,
+              authorType: "system",
+              body:
+                `Preserved unpushed commits from execution workspace \`${existing.name}\` before archiving.\n\n` +
+                `Commit: \`${preservation.commitSha}\`\n` +
+                `Preservation ref: \`${preservation.preservedRef}\`\n`,
+            })
+            .catch(() => null);
+          await db
+            .update(issues)
+            .set({ updatedAt: new Date() })
+            .where(eq(issues.id, existing.sourceIssueId))
+            .catch(() => null);
+        }
+      }
 
-       const closedAt = new Date();
+      const closedAt = new Date();
       const archivedWorkspace = await svc.update(id, {
         ...patch,
         status: "archived",
