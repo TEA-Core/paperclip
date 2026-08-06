@@ -997,39 +997,123 @@ describe("realizeExecutionWorkspace", () => {
     expect(rescueRefs.some((ref) => ref.endsWith("/head"))).toBe(true);
   });
 
-  it("leaves untracked files in the base repo alone while restoring it", async () => {
+  it("leaves untracked files in the base repo alone while restoring it (never removes files the base ref does not contain)", async () => {
     // The worktrees live at <repoRoot>/.paperclip/worktrees and are untracked in
     // some repos on this fleet, so anything that removes untracked content from
     // the base repo would delete live agent workspaces. Never do that.
     const { repoRoot } = await createClonedRepoWithRemote();
     await runGit(repoRoot, ["checkout", "-b", "parked"]);
-    const untracked = path.join(repoRoot, "untracked-keepme.txt");
-    await fs.writeFile(untracked, "not ours to delete\n", "utf8");
+    await fs.writeFile(path.join(repoRoot, "README.md"), "left dirty by an agent\n", "utf8");
+    await fs.writeFile(path.join(repoRoot, "untracked-keepme.txt"), "not ours to delete\n", "utf8");
 
     await realizeWorktreeForTest(repoRoot, "master");
 
     expect(await readGit(repoRoot, ["symbolic-ref", "--short", "HEAD"])).toBe("master");
-    expect(existsSync(untracked)).toBe(true);
-  });
+    expect(existsSync(path.join(repoRoot, "untracked-keepme.txt"))).toBe(true);
+   });
 
-  it("still provisions when the base repo cannot be restored", async () => {
-    // Hygiene is never a gate. A base repo whose default branch is checked out in
-    // another worktree cannot be returned to it, and the dispatch must not care.
-    const { repoRoot } = await createClonedRepoWithRemote();
-    const stealer = path.join(repoRoot, "..", "master-stealer");
-    await runGit(repoRoot, ["checkout", "-b", "parked-elsewhere"]);
-    await runGit(repoRoot, ["worktree", "add", stealer, "master"]);
+   it("does not restore a base repo already at the base ref on a second dispatch (detached HEAD case)", async () => {
+     // F1: when the default branch is held by an agent worktree, the first dispatch
+     // detaches at the base ref. The second dispatch must see HEAD === baseRefSha and
+     // skip the restore entirely — no "was restored to" warning, no new rescue ref.
+     const { repoRoot } = await createClonedRepoWithRemote();
+     const stealer = path.join(repoRoot, "..", "master-stealer");
+     await runGit(repoRoot, ["checkout", "-b", "parked-elsewhere"]);
+     await fs.writeFile(path.join(repoRoot, "extra.txt"), "extra\n", "utf8");
+     await runGit(repoRoot, ["add", "extra.txt"]);
+     await runGit(repoRoot, ["commit", "-m", "extra commit"]);
+     await runGit(repoRoot, ["worktree", "add", stealer, "master"]);
 
-    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+     const first = await realizeWorktreeForTest(repoRoot, "master");
+     expect(first.warnings).toEqual(
+       expect.arrayContaining([expect.stringContaining("was restored to")]),
+     );
+     const firstRescueRefs = (await readGit(repoRoot, [
+       "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+     ])).split("\n").filter(Boolean);
+     const firstCount = firstRescueRefs.length;
+     expect(firstCount).toBeGreaterThan(0);
 
-    expect(workspace.cwd).toBeTruthy();
-    // Detached at the base ref rather than contending for a branch another
-    // checkout already holds.
-    expect(await readGit(repoRoot, ["rev-parse", "HEAD"]))
-      .toBe(await readGit(repoRoot, ["rev-parse", "origin/master"]));
-    expect(await readGit(repoRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => "DETACHED"))
-      .toBe("DETACHED");
-  });
+     const second = await realizeWorktreeForTest(repoRoot, "master");
+     expect(second.warnings).not.toEqual(
+       expect.arrayContaining([expect.stringContaining("was restored to")]),
+     );
+     const secondRescueRefs = (await readGit(repoRoot, [
+       "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+     ])).split("\n").filter(Boolean);
+     expect(secondRescueRefs.length).toBe(firstCount);
+   });
+
+   it("does not restore a base repo already at the base ref on a second dispatch (SHA baseRef case)", async () => {
+     // F1: same idempotency, but with a SHA baseRef instead of a branch name.
+     const { repoRoot } = await createClonedRepoWithRemote();
+     const baseSha = await readGit(repoRoot, ["rev-parse", "origin/master"]);
+     await runGit(repoRoot, ["checkout", "-b", "parked-elsewhere"]);
+     await fs.writeFile(path.join(repoRoot, "extra.txt"), "extra\n", "utf8");
+     await runGit(repoRoot, ["add", "extra.txt"]);
+     await runGit(repoRoot, ["commit", "-m", "extra commit"]);
+
+     const first = await realizeWorktreeForTest(repoRoot, baseSha);
+     expect(first.warnings).toEqual(
+       expect.arrayContaining([expect.stringContaining("was restored to")]),
+     );
+     const firstRescueRefs = (await readGit(repoRoot, [
+       "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+     ])).split("\n").filter(Boolean);
+     const firstCount = firstRescueRefs.length;
+     expect(firstCount).toBeGreaterThan(0);
+
+     const second = await realizeWorktreeForTest(repoRoot, baseSha);
+     expect(second.warnings).not.toEqual(
+       expect.arrayContaining([expect.stringContaining("was restored to")]),
+     );
+     const secondRescueRefs = (await readGit(repoRoot, [
+       "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+     ])).split("\n").filter(Boolean);
+     expect(secondRescueRefs.length).toBe(firstCount);
+   });
+
+   it("produces distinct rescue-ref prefixes for two dirty base repo restores in the same second", async () => {
+     // F2: the rescue prefix must include a per-run discriminator so concurrent
+     // restores within the same second do not silently overwrite each other.
+     const { repoRoot } = await createClonedRepoWithRemote();
+
+     await runGit(repoRoot, ["checkout", "-b", "dirty-one"]);
+     await fs.writeFile(path.join(repoRoot, "README.md"), "modification one\n", "utf8");
+     await realizeWorktreeForTest(repoRoot, "master");
+
+     await runGit(repoRoot, ["checkout", "-b", "dirty-two"]);
+     await fs.writeFile(path.join(repoRoot, "README.md"), "modification two\n", "utf8");
+     await realizeWorktreeForTest(repoRoot, "master");
+
+     const rescueRefs = (await readGit(repoRoot, [
+       "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+     ])).split("\n").filter(Boolean);
+     const prefixes = new Set(rescueRefs.map((ref) => ref.replace(/\/(head|worktree)$/, "")));
+     expect(prefixes.size).toBe(2);
+   });
+
+   it("still provisions when the base repo cannot be restored", async () => {
+     // Hygiene is never a gate. A base repo whose default branch is checked out in
+     // another worktree cannot be returned to it, and the dispatch must not care.
+     const { repoRoot } = await createClonedRepoWithRemote();
+     const stealer = path.join(repoRoot, "..", "master-stealer");
+     await runGit(repoRoot, ["checkout", "-b", "parked-elsewhere"]);
+     await fs.writeFile(path.join(repoRoot, "extra.txt"), "extra\n", "utf8");
+     await runGit(repoRoot, ["add", "extra.txt"]);
+     await runGit(repoRoot, ["commit", "-m", "extra commit"]);
+     await runGit(repoRoot, ["worktree", "add", stealer, "master"]);
+
+     const workspace = await realizeWorktreeForTest(repoRoot, "master");
+
+     expect(workspace.cwd).toBeTruthy();
+     // Detached at the base ref rather than contending for a branch another
+     // checkout already holds.
+     expect(await readGit(repoRoot, ["rev-parse", "HEAD"]))
+       .toBe(await readGit(repoRoot, ["rev-parse", "origin/master"]));
+     expect(await readGit(repoRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => "DETACHED"))
+       .toBe("DETACHED");
+   });
 
   it("maps a configured local branch base ref to origin/<branch> for fresh worktrees", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();

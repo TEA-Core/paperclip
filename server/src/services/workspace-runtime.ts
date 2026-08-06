@@ -2966,14 +2966,27 @@ export function resolveBaseRepoHygieneDecision(input: {
   dirtyTrackedPathCount: number;
   /** Unmerged index entries — a half-finished merge nobody is going to finish. */
   unmergedPathCount: number;
+  /** Resolved SHA of the base repo's HEAD, or null when unresolvable. */
+  headSha: string | null;
+  /** Resolved SHA of the base ref, or null when unresolvable. */
+  baseRefSha: string | null;
 }): BaseRepoHygieneDecision {
   const reasons: string[] = [];
   const defaultRef = input.defaultRef?.replace(/^origin\//, "") ?? null;
+  if (
+    input.headSha &&
+    input.baseRefSha &&
+    input.headSha === input.baseRefSha &&
+    input.dirtyTrackedPathCount === 0 &&
+    input.unmergedPathCount === 0
+  ) {
+    return { action: "ok" };
+  }
   if (defaultRef && input.currentBranch !== defaultRef) {
     reasons.push(
-      input.currentBranch === null
+      input.currentBranch === null && input.headSha !== input.baseRefSha
         ? "base repo is on a detached HEAD"
-        : `base repo is on "${input.currentBranch}" instead of "${defaultRef}"`,
+        : `base repo is on "${input.currentBranch ?? "a detached HEAD"}" instead of "${defaultRef}"`,
     );
   }
   if (input.unmergedPathCount > 0) {
@@ -3022,7 +3035,7 @@ async function inspectBaseRepoHygiene(repoRoot: string) {
  * nothing the moment we move), then snapshot tracked modifications, only then
  * move the working tree.
  *
- * Never removes untracked files. Never uses `git clean` or `stash -u`: the
+ * Never removes untracked files that the base ref does not itself contain. Never uses `git clean` or `stash -u`: the
  * worktree directory lives inside the base repo and is untracked in some repos,
  * so removing untracked content there would delete live agent workspaces.
  */
@@ -3036,7 +3049,7 @@ async function restoreBaseRepoToDefaultRef(input: {
   const warnings: string[] = [];
   const rescueRefs: string[] = [];
   const shortDefault = input.baseRef.replace(/^origin\//, "");
-  const prefix = `refs/heads/paperclip/rescue/base-repo/${input.timestamp}`;
+  const prefix = `refs/heads/paperclip/rescue/base-repo/${input.timestamp}-${randomUUID().slice(0, 8)}`;
 
   const headSha = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
   if (headSha) {
@@ -3050,11 +3063,14 @@ async function restoreBaseRepoToDefaultRef(input: {
     // or index, so a failure here leaves the repo exactly as it was found.
     const stashSha = await runGit(["stash", "create", `paperclip base repo rescue ${input.timestamp}`], input.repoRoot)
       .then((value) => value || null)
-      .catch(() => null);
+      .catch((err) => {
+        warnings.push(`base repo stash create failed: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      });
     if (stashSha) {
       await runGit(["update-ref", `${prefix}/worktree`, stashSha], input.repoRoot)
         .then(() => rescueRefs.push(`${prefix}/worktree`))
-        .catch(() => undefined);
+        .catch((err) => warnings.push(`could not pin base repo stashed worktree: ${err instanceof Error ? err.message : String(err)}`));
     } else {
       // An unmerged index defeats `stash create`. Fall back to recording the
       // conflicted blobs so nothing is discarded unseen.
@@ -3065,6 +3081,11 @@ async function restoreBaseRepoToDefaultRef(input: {
         );
       }
     }
+  }
+
+  if (input.decision.snapshotTrackedChanges && !rescueRefs.some((ref) => ref.endsWith("/worktree"))) {
+    warnings.push("base repo has tracked modifications that could not be snapshotted; skipping restore to avoid data loss");
+    return { restored: false, warnings, rescueRefs };
   }
 
   const checkout = await runGit(["checkout", "--force", shortDefault], input.repoRoot)
@@ -3223,11 +3244,14 @@ export async function realizeExecutionWorkspace(input: {
   try {
     const hygiene = await inspectBaseRepoHygiene(repoRoot);
     if (hygiene) {
+      const headSha = await runGit(["rev-parse", "HEAD"], repoRoot).catch(() => null);
       const decision = resolveBaseRepoHygieneDecision({
         currentBranch: hygiene.currentBranch,
         defaultRef: baseRef,
         dirtyTrackedPathCount: hygiene.dirtyTrackedPathCount,
         unmergedPathCount: hygiene.unmergedPathCount,
+        headSha,
+        baseRefSha: currentBaseRefSha,
       });
       if (decision.action === "restore") {
         const result = await restoreBaseRepoToDefaultRef({
