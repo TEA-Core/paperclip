@@ -96,6 +96,21 @@ function makeDatabase({ sessions, unit = "ms" }) {
   return { dir, databasePath };
 }
 
+/** Leave the file mostly free pages, so `shouldVacuum` says yes and the vacuum
+ * branch is the thing under test. */
+function bloatThenFree(databasePath) {
+  const db = new DatabaseSync(databasePath);
+  db.exec("BEGIN");
+  const insert = db.prepare("INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, ?)");
+  for (let i = 0; i < 20000; i++) insert.run(`bloat_${i}`, i);
+  db.exec("COMMIT");
+  db.exec("DELETE FROM event_sequence WHERE aggregate_id LIKE 'bloat_%'");
+  const free = db.prepare("PRAGMA freelist_count").get().freelist_count;
+  const pages = db.prepare("PRAGMA page_count").get().page_count;
+  db.close();
+  if (free / pages < 0.25) throw new Error(`fixture did not free enough pages: ${free}/${pages}`);
+}
+
 function counts(databasePath) {
   const db = new DatabaseSync(databasePath, { readOnly: true });
   const read = (table) => db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get().c;
@@ -363,6 +378,105 @@ test("--apply truncates the WAL instead of leaving it at its high-water mark", (
     } finally {
       writer.close();
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The shared fleet database is 51 GB and never idle. VACUUM rewrites the whole
+// file under an exclusive lock, so gating the WHOLE sweep on idleness would mean
+// never pruning or checkpointing it — which is how it got to 51 GB with a 954 MB
+// WAL. Only the VACUUM waits.
+test("a busy database is still pruned and checkpointed, only its VACUUM defers", () => {
+  const { dir, databasePath } = makeDatabase({ sessions: [30, 1] });
+  try {
+    bloatThenFree(databasePath);
+    const report = janitorRunDatabase({
+      databasePath,
+      DatabaseSync,
+      apply: true,
+      olderThanDays: 7,
+      nowMs: NOW_MS,
+      idle: false,
+      // Force the vacuum branch so the deferral is what is being observed.
+      vacuumMinFreeMb: 0,
+    });
+    assert.equal(report.sessionsPruned, 1);
+    assert.equal(report.walTruncated, true);
+    assert.equal(report.vacuumed, false);
+    assert.equal(report.vacuumSkipped, "database in use");
+    assert.equal(counts(databasePath).session, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--no-vacuum defers the vacuum even on an idle database", () => {
+  const { dir, databasePath } = makeDatabase({ sessions: [30] });
+  try {
+    bloatThenFree(databasePath);
+    const report = janitorRunDatabase({
+      databasePath,
+      DatabaseSync,
+      apply: true,
+      olderThanDays: 7,
+      nowMs: NOW_MS,
+      idle: true,
+      allowVacuum: false,
+      vacuumMinFreeMb: 0,
+    });
+    assert.equal(report.vacuumed, false);
+    assert.equal(report.vacuumSkipped, "disabled");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("parseJanitorArgs reads the load-safety flags", () => {
+  const args = parseJanitorArgs(["--no-vacuum", "--delete-batch-size", "50"]);
+  assert.equal(args.noVacuum, true);
+  assert.equal(args.deleteBatchSize, 50);
+});
+
+// One transaction over a large backlog holds the only write lock for as long as
+// it takes — the same shape as the runaway message. The prune has to yield.
+test("the prune deletes in batches and yields the lock between them", () => {
+  const { dir, databasePath } = makeDatabase({ sessions: Array.from({ length: 25 }, () => 30) });
+  try {
+    const pauses = [];
+    const report = janitorRunDatabase({
+      databasePath,
+      DatabaseSync,
+      apply: true,
+      olderThanDays: 7,
+      nowMs: NOW_MS,
+      deleteBatchSize: 10,
+      batchPauseMs: 7,
+      pause: (ms) => pauses.push(ms),
+    });
+    assert.equal(report.sessionsPruned, 25);
+    assert.equal(counts(databasePath).session, 0);
+    // 25 rows at 10 per batch = 3 batches = 2 gaps between them.
+    assert.deepEqual(pauses, [7, 7]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a single batch prunes without pausing at all", () => {
+  const { dir, databasePath } = makeDatabase({ sessions: [30, 29] });
+  try {
+    const pauses = [];
+    janitorRunDatabase({
+      databasePath,
+      DatabaseSync,
+      apply: true,
+      olderThanDays: 7,
+      nowMs: NOW_MS,
+      deleteBatchSize: 200,
+      pause: (ms) => pauses.push(ms),
+    });
+    assert.deepEqual(pauses, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

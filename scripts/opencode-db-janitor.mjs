@@ -38,14 +38,23 @@ const BYTES_PER_MB = 1024 * 1024;
 
 export const DEFAULTS = {
   olderThanDays: 7,
-  // Skip any database touched more recently than this: a live run holds it, and
-  // an exclusive VACUUM against a running agent is exactly the failure mode
-  // this script exists to prevent.
+  // VACUUM rewrites the whole file under an exclusive lock. On the shared 51 GB
+  // database that is minutes of total write starvation — the exact failure this
+  // script exists to prevent. So it runs ONLY against a database nothing has
+  // touched for this long. Pruning and checkpointing do not need the gate;
+  // they take ordinary write locks, briefly, and are the parts that must keep
+  // working on a fleet that never goes idle.
   idleMinutes: 10,
   // Only VACUUM when there is enough dead space to be worth an exclusive lock.
   vacuumMinFreeMb: 256,
   vacuumMinFreeRatio: 0.25,
   busyTimeoutMs: 2000,
+  // A single `DELETE FROM session WHERE time_created < ?` over a large backlog
+  // is one enormous write transaction holding the only write lock — the same
+  // shape as the runaway message. Delete in bounded batches and yield between
+  // them so live runs keep getting the lock.
+  deleteBatchSize: 200,
+  batchPauseMs: 250,
 };
 
 /** Session-scoped tables all cascade from `session`, so deleting the session
@@ -68,6 +77,8 @@ export function parseJanitorArgs(argv) {
     olderThanDays: DEFAULTS.olderThanDays,
     idleMinutes: DEFAULTS.idleMinutes,
     vacuumMinFreeMb: DEFAULTS.vacuumMinFreeMb,
+    deleteBatchSize: DEFAULTS.deleteBatchSize,
+    noVacuum: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -97,6 +108,12 @@ export function parseJanitorArgs(argv) {
         break;
       case "--vacuum-min-free-mb":
         args.vacuumMinFreeMb = readNumber(arg);
+        break;
+      case "--delete-batch-size":
+        args.deleteBatchSize = readNumber(arg);
+        break;
+      case "--no-vacuum":
+        args.noVacuum = true;
         break;
       default:
         throw new Error(`Unknown argument ${JSON.stringify(arg)}`);
@@ -182,6 +199,13 @@ export function formatBytes(bytes) {
   return `${(bytes / BYTES_PER_MB).toFixed(1)} MB`;
 }
 
+/** Synchronous sleep. `DatabaseSync` is synchronous, so yielding the lock
+ * between delete batches has to be too. */
+function pauseSync(ms) {
+  if (!(ms > 0)) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function fileBytes(databasePath) {
   let total = 0;
   for (const suffix of ["", "-wal", "-shm"]) {
@@ -208,6 +232,13 @@ export function janitorRunDatabase({
   nowMs,
   busyTimeoutMs = DEFAULTS.busyTimeoutMs,
   vacuumMinFreeMb = DEFAULTS.vacuumMinFreeMb,
+  deleteBatchSize = DEFAULTS.deleteBatchSize,
+  batchPauseMs = DEFAULTS.batchPauseMs,
+  // Whether nothing has touched this database recently. VACUUM needs it; the
+  // prune and the checkpoint do not.
+  idle = true,
+  allowVacuum = true,
+  pause = pauseSync,
 }) {
   const report = {
     databasePath,
@@ -217,6 +248,7 @@ export function janitorRunDatabase({
     eventSequencesPruned: 0,
     walTruncated: false,
     vacuumed: false,
+    vacuumSkipped: null,
     skipped: null,
   };
 
@@ -242,24 +274,33 @@ export function janitorRunDatabase({
       report.sessionsPruned = doomed.length;
 
       if (doomed.length > 0 && apply) {
-        db.exec("BEGIN");
-        try {
-          const deleteSession = db.prepare("DELETE FROM session WHERE id = ?");
-          // `event` cascades from `event_sequence`, not from `session`, so the
-          // event rows — 33% of all event data in the incident database — are
-          // only reclaimed by deleting the sequence rows too. Scoping this to
-          // the ids we just deleted means that if `aggregate_id` is not a
-          // session id at all, this is a no-op rather than a wrong delete.
-          const deleteEventSequence = db.prepare("DELETE FROM event_sequence WHERE aggregate_id = ?");
-          for (const id of doomed) {
-            deleteSession.run(id);
-            const result = deleteEventSequence.run(id);
-            report.eventSequencesPruned += Number(result?.changes ?? 0);
+        const deleteSession = db.prepare("DELETE FROM session WHERE id = ?");
+        // `event` cascades from `event_sequence`, not from `session`, so the
+        // event rows — 33% of all event data in the incident database — are
+        // only reclaimed by deleting the sequence rows too. Scoping this to
+        // the ids we just deleted means that if `aggregate_id` is not a
+        // session id at all, this is a no-op rather than a wrong delete.
+        const deleteEventSequence = db.prepare("DELETE FROM event_sequence WHERE aggregate_id = ?");
+        const batchSize = Math.max(1, Math.floor(deleteBatchSize));
+
+        // Batched, with the lock released between batches. One transaction over
+        // a large backlog would hold the only write lock for as long as it
+        // takes — the same shape as the runaway message this issue is about.
+        for (let start = 0; start < doomed.length; start += batchSize) {
+          const batch = doomed.slice(start, start + batchSize);
+          db.exec("BEGIN IMMEDIATE");
+          try {
+            for (const id of batch) {
+              deleteSession.run(id);
+              const result = deleteEventSequence.run(id);
+              report.eventSequencesPruned += Number(result?.changes ?? 0);
+            }
+            db.exec("COMMIT");
+          } catch (err) {
+            db.exec("ROLLBACK");
+            throw err;
           }
-          db.exec("COMMIT");
-        } catch (err) {
-          db.exec("ROLLBACK");
-          throw err;
+          if (start + batchSize < doomed.length) pause(batchPauseMs);
         }
       }
     }
@@ -281,7 +322,13 @@ export function janitorRunDatabase({
       pageSize,
       minFreeMb: vacuumMinFreeMb,
     });
-    if (wantsVacuum && apply) {
+    if (wantsVacuum && !allowVacuum) {
+      report.vacuumSkipped = "disabled";
+    } else if (wantsVacuum && !idle) {
+      // The whole point of the gate. A 51 GB rewrite under an exclusive lock
+      // while 13 agents are mid-run is the outage, not the fix.
+      report.vacuumSkipped = "database in use";
+    } else if (wantsVacuum && apply) {
       db.exec("VACUUM");
       report.vacuumed = true;
     } else if (wantsVacuum) {
@@ -317,10 +364,10 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
 
   let reclaimed = 0;
   for (const databasePath of databases) {
-    if (!isDatabaseIdle({ databasePath, nowMs, idleMinutes: args.idleMinutes })) {
-      log(`  skip ${path.basename(databasePath)} — in use within the last ${args.idleMinutes}m`);
-      continue;
-    }
+    // NOT a skip. A fleet that never goes idle would otherwise never be pruned
+    // or checkpointed at all — which is how a 51 GB database and a 954 MB WAL
+    // happen. Only VACUUM waits for quiet.
+    const idle = isDatabaseIdle({ databasePath, nowMs, idleMinutes: args.idleMinutes });
     try {
       const report = janitorRunDatabase({
         databasePath,
@@ -329,12 +376,16 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         olderThanDays: args.olderThanDays,
         nowMs,
         vacuumMinFreeMb: args.vacuumMinFreeMb,
+        deleteBatchSize: args.deleteBatchSize,
+        idle,
+        allowVacuum: !args.noVacuum,
       });
       reclaimed += Math.max(0, report.bytesBefore - report.bytesAfter);
       log(
         `  ${path.basename(databasePath)}: ${report.sessionsPruned} session(s)` +
           `${report.eventSequencesPruned ? `, ${report.eventSequencesPruned} event stream(s)` : ""}` +
           `${report.vacuumed === true ? ", vacuumed" : report.vacuumed ? ", vacuum pending" : ""}` +
+          `${report.vacuumSkipped ? `, vacuum deferred (${report.vacuumSkipped})` : ""}` +
           ` — ${formatBytes(report.bytesBefore)} → ${formatBytes(report.bytesAfter)}` +
           `${report.skipped ? ` (${report.skipped})` : ""}`,
       );
