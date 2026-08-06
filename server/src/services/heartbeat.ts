@@ -3408,6 +3408,12 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueExecutionWorkspacePreference?: string | null;
   existingExecutionWorkspaceStatus?: string | null;
   existingExecutionWorkspaceCleanupReason?: string | null;
+  /**
+   * Whether the workspace's directory is still on disk. `null` when it was not
+   * probed (nothing to probe, or no recorded cwd), which is treated as "cannot
+   * prove it is gone" and therefore fails loudly rather than self-healing.
+   */
+  existingExecutionWorkspaceDirectoryExists?: boolean | null;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
   const requestedReuse =
@@ -3431,13 +3437,28 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   // direct database access can recreate it. Treating a platform-removed
   // workspace as unrestorable makes the run recover on its own instead of
   // looping forever on a pointer we invalidated ourselves.
+  // Two ways to know a binding is beyond repair. The cleanup reason is a fast
+  // path for the writers we control; the directory probe is the general one.
+  //
+  // 2026-08-06: the allowlist alone was not enough. 14 issues were stranded
+  // overnight by a bulk archive that wrote `cleanup_reason = NULL` and a
+  // free-text reason no allowlist could have anticipated — the rows did not come
+  // from this server or from the reaper at all. Keying on an observable fact
+  // rather than on a vocabulary means it does not matter who archived the row or
+  // what prose they wrote in it.
+  //
+  // A directory that is GONE is unrestorable by anyone. A directory that is
+  // still present stays on the loud-failure path: it may be repairable by
+  // unarchiving, and that is a human's call, not ours.
+  const archived =
+    requestedReuse && !existingExecutionWorkspaceAvailable &&
+    input.existingExecutionWorkspaceStatus === "archived";
   const bindingUnrestorable =
-    requestedReuse &&
-    !existingExecutionWorkspaceAvailable &&
-    input.existingExecutionWorkspaceStatus === "archived" &&
-    PLATFORM_REMOVED_EXECUTION_WORKSPACE_CLEANUP_REASONS.has(
+    archived &&
+    (PLATFORM_REMOVED_EXECUTION_WORKSPACE_CLEANUP_REASONS.has(
       input.existingExecutionWorkspaceCleanupReason ?? "",
-    );
+    ) ||
+      input.existingExecutionWorkspaceDirectoryExists === false);
 
   return {
     requestedExecutionWorkspaceId,
@@ -12525,11 +12546,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const requestedExecutionWorkspaceId = readNonEmptyString(issueRef?.executionWorkspaceId);
     const existingExecutionWorkspace =
       requestedExecutionWorkspaceId ? await executionWorkspacesSvc.getById(requestedExecutionWorkspaceId) : null;
+    // Probe the directory only for an archived workspace we would otherwise
+    // refuse to run against: an absent directory is proof the binding can never
+    // be honoured, whoever archived the row and whatever reason they recorded.
+    // Any probe failure leaves this null, which keeps the loud-failure path —
+    // never self-heal on a stat we could not complete.
+    const existingExecutionWorkspaceDirectoryExists = await (async () => {
+      if (existingExecutionWorkspace?.status !== "archived") return null;
+      const workspaceCwd = readNonEmptyString(existingExecutionWorkspace?.cwd);
+      if (!workspaceCwd) return null;
+      try {
+        const stat = await fs.stat(workspaceCwd);
+        return stat.isDirectory();
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return false;
+        return null;
+      }
+    })();
     const workspaceReuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
       existingExecutionWorkspaceCleanupReason: existingExecutionWorkspace?.cleanupReason ?? null,
+      existingExecutionWorkspaceDirectoryExists,
     });
     if (workspaceReuseRequest.bindingUnrestorable && requestedExecutionWorkspaceId) {
       // Clear the dangling pointer as well as running past it. Without this the
