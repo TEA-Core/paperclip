@@ -379,6 +379,11 @@ const OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE = "opencode_db_growth_limit";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
+// A reviewer that runs to completion and comments without deciding is deliberately
+// deferring, not dead, so its stage keeps getting re-armed instead of escalating.
+// Bound the re-arming anyway: a reviewer that defers forever is its own kind of
+// stall, and the recovery owner should hear about it rather than the stage looping.
+const EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT = 3;
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
 const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
@@ -15113,9 +15118,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   function buildExecutionReviewParticipantRecoveryComment(input: {
-    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "status"> | null | undefined;
+    deferralRetriesExhausted?: boolean;
   }) {
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    if (input.deferralRetriesExhausted) {
+      return (
+        "Paperclip re-armed the pending execution-review participant up to the deferral limit " +
+        `(${EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT} attempts). The reviewer ran to completion and ` +
+        `commented each time but never recorded a decision, so the review stage is still pending.${failureSummary ?? ""} ` +
+        "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can record the decision, " +
+        "restore the review stage, or record an intentional manual resolution."
+      );
+    }
+    if (input.latestRun?.status === "succeeded") {
+      return (
+        "Paperclip retried the pending execution-review participant once, but the retry run completed without " +
+        `recording a decision and without leaving any trace on the issue.${failureSummary ?? ""} ` +
+        "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can repair the reviewer runtime, " +
+        "restore the review stage, or record an intentional manual resolution."
+      );
+    }
     return (
       "Paperclip retried the pending execution-review participant once, but the review stage still has no completed decision " +
       `or live reviewer run.${failureSummary ?? ""} ` +
@@ -15561,6 +15584,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
           .limit(1)
           .then((rows) => rows[0] ?? null);
+      // Proof that the reviewer was alive during this run: it left a comment on the issue.
+      // Keyed on createdByRunId so an older comment from a previous wake cannot pass.
+      const findReviewParticipantProofOfLifeComment = () =>
+        tx
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.companyId, issue.companyId),
+              eq(issueComments.issueId, issue.id),
+              eq(issueComments.createdByRunId, run.id),
+              isNull(issueComments.deletedAt),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+      // Issue-scoped rather than stage-scoped on purpose: recovery runs from an earlier
+      // review round still count, so a repeatedly-deferring reviewer escalates sooner
+      // rather than later. Erring toward escalation keeps the dead-reviewer case intact.
+      const countTerminalReviewParticipantRecoveryRuns = () =>
+        tx
+          .select({ count: sql<number>`count(*)::int` })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, issue.companyId),
+              eq(heartbeatRuns.agentId, run.agentId),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON}`,
+            ),
+          )
+          .then((rows) => rows[0]?.count ?? 0);
       const executionState = parseIssueExecutionState(issue.executionState);
       const currentParticipant = executionState?.status === "pending"
         ? executionState.currentParticipant
@@ -15594,16 +15650,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
 
+        // A participant run that finished cleanly AND left a comment on the issue is proof
+        // of life: the reviewer evaluated the stage and deliberately withheld a decision
+        // this wake (e.g. a doctrine staleness self-gate). That is a healthy reviewer, not
+        // a dead execution path, so re-arm the stage instead of blocking the issue and
+        // opening a recovery action naming the reviewer as its own recovery owner.
+        // A reviewer that never ran, was not invokable, crashed, or produced nothing still
+        // escalates: no clean terminal status or no comment means no proof of life.
+        const reviewRecoveryAlreadyAttempted = isExecutionReviewParticipantRecoveryRun(run);
+        const reviewParticipantDeferred =
+          reviewRecoveryAlreadyAttempted &&
+          Boolean(recoveryAgent) &&
+          Boolean(recoveryAgentInvokable) &&
+          run.status === "succeeded" &&
+          !readNonEmptyString(run.errorCode) &&
+          Boolean(await findReviewParticipantProofOfLifeComment());
+        const reviewDeferralRetriesExhausted =
+          reviewParticipantDeferred &&
+          (await countTerminalReviewParticipantRecoveryRuns()) >=
+            EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT;
+
         const shouldBlockReviewRecovery =
           !recoveryAgentInvokable ||
           !recoveryAgent ||
-          isExecutionReviewParticipantRecoveryRun(run);
+          (reviewRecoveryAlreadyAttempted &&
+            !(reviewParticipantDeferred && !reviewDeferralRetriesExhausted));
         if (shouldBlockReviewRecovery) {
           return {
             kind: "blocked" as const,
             issue,
             previousStatus: issue.status,
-            comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
+            comment: buildExecutionReviewParticipantRecoveryComment({
+              latestRun: run,
+              deferralRetriesExhausted: reviewDeferralRetriesExhausted,
+            }),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
             recoveryOwnerAgentId: currentParticipant.agentId,
           };
