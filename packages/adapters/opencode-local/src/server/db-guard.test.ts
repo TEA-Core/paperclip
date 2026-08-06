@@ -330,6 +330,25 @@ describe("describeOpenCodeDatabaseGrowthTrip", () => {
     expect(message).toContain("opencode-agent-agent-1.db");
   });
 
+  // SUP-11268: the message must say what was measured and how it was attributed,
+  // not assert the SUP-10914 runaway-message cause, which is only one of the ways
+  // a run can get here.
+  it("states the attribution basis rather than asserting a cause", () => {
+    const message = describeOpenCodeDatabaseGrowthTrip({
+      databasePath: "/paperclip/.local/share/opencode/opencode-agent-agent-1.db",
+      baselineBytes: 0,
+      observedBytes: 300 * 1024 * 1024,
+      growthBytes: 300 * 1024 * 1024,
+      limitBytes: 256 * 1024 * 1024,
+      attribution: null,
+      sparedTrips: 0,
+    });
+    expect(message).toContain("Attribution basis");
+    expect(message).toContain("per-session");
+    expect(message).not.toContain("runaway-message signature from SUP-10914");
+    expect(message).not.toContain("terminated before it could bloat");
+  });
+
   // An operator reading the failure has to be able to tell "this run did it"
   // from "the guard could not tell whose writes these were".
   it("names the owning session when the growth was attributed", () => {

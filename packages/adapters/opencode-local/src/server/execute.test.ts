@@ -764,6 +764,10 @@ describe("execute — opencode database growth guard", () => {
     );
 
     expect(commandNotes.some((note) => note.includes("database growth guard"))).toBe(true);
+    // SUP-11268: the note must state on what basis the measured growth is
+    // attributed to this run, not just that the guard is on.
+    expect(commandNotes.some((note) => note.includes("Attribution basis"))).toBe(true);
+    expect(commandNotes.some((note) => note.includes("per-session accounting"))).toBe(true);
   });
 
   // On the shared database the growth we would measure may belong to a

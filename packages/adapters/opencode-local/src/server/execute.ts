@@ -158,6 +158,14 @@ export function classifyOpenCodeFailure(input: {
 // inside that agent. The name stays RELATIVE so opencode still resolves it
 // inside its own data dir, which keeps `auth.json` and the rest of the data dir
 // shared — only the database is partitioned.
+//
+// SUP-11268 asked for a per-RUN file so a runaway run could not be confused with
+// its siblings. That is not viable: opencode keeps its sessions in this database,
+// and a fresh file per run would make every cross-run `--session` resume fail as
+// an unknown session (see resolveOpenCodeSessionResume and the unknown-session
+// fallback below), silently losing conversation continuity on every run. The
+// misattribution it targeted is instead handled per SESSION inside the growth
+// guard (SUP-11280), which is why the file stays per agent.
 const OPENCODE_DB_AGENT_PREFIX = "opencode-agent-";
 
 export function resolveOpenCodeDatabaseFile(input: {
@@ -790,7 +798,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let databaseGuardTrip: OpenCodeDatabaseGrowthTrip | null = null;
     if (databaseGuardPath && databaseGuardLimitBytes > 0) {
       commandNotes.push(
-        `Armed OpenCode database growth guard on ${databaseGuardPath} (limit ${formatBytes(databaseGuardLimitBytes)} per run).`,
+        `Armed OpenCode database growth guard on ${databaseGuardPath} (limit ${formatBytes(databaseGuardLimitBytes)} per run). ` +
+          `Attribution basis: per-session accounting. Growth is attributed to this run's own ` +
+          `opencode session before the run is terminated, so a sibling run's writes on this ` +
+          `agent's shared database do not kill this run.`,
       );
     }
 
