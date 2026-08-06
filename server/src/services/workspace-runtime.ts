@@ -2937,6 +2937,181 @@ async function provisionExecutionWorktree(input: {
   });
 }
 
+export type BaseRepoHygieneDecision =
+  | { action: "ok" }
+  | { action: "restore"; reasons: string[]; snapshotTrackedChanges: boolean };
+
+/**
+ * SUP-11285: should the base repo be put back before we cut a worktree from it?
+ *
+ * The primary clone is nobody's workspace, but it is an ancestor directory of
+ * every agent worktree (`<repoRoot>/.paperclip/worktrees/<branch>`), its path is
+ * handed out as PAPERCLIP_WORKSPACE_BASE_CWD, and it is the only checkout holding
+ * the default branch — so any main-branch errand an agent runs has exactly one
+ * home. Observed consequences: primaries parked on task branches or detached,
+ * commits for a dozen issues landing in one shared checkout, a TypeScript source
+ * file left carrying conflict markers for over a day, and orphaned commits
+ * reachable from no ref at all.
+ *
+ * Restoring is hygiene, not a gate. It never blocks the dispatch: refusing to run
+ * because the base repo is untidy would dead-block issues over a condition the
+ * issue did not cause, which is the SUP-11207 mistake.
+ */
+export function resolveBaseRepoHygieneDecision(input: {
+  /** Branch the base repo has checked out; null when detached. */
+  currentBranch: string | null;
+  /** The ref the base repo is expected to sit on, e.g. "main". */
+  defaultRef: string | null;
+  /** Tracked paths with modifications. Untracked paths are deliberately excluded. */
+  dirtyTrackedPathCount: number;
+  /** Unmerged index entries — a half-finished merge nobody is going to finish. */
+  unmergedPathCount: number;
+}): BaseRepoHygieneDecision {
+  const reasons: string[] = [];
+  const defaultRef = input.defaultRef?.replace(/^origin\//, "") ?? null;
+  if (defaultRef && input.currentBranch !== defaultRef) {
+    reasons.push(
+      input.currentBranch === null
+        ? "base repo is on a detached HEAD"
+        : `base repo is on "${input.currentBranch}" instead of "${defaultRef}"`,
+    );
+  }
+  if (input.unmergedPathCount > 0) {
+    reasons.push(`base repo has ${input.unmergedPathCount} unmerged path(s) from an abandoned merge`);
+  }
+  if (input.dirtyTrackedPathCount > 0) {
+    reasons.push(`base repo has ${input.dirtyTrackedPathCount} modified tracked path(s)`);
+  }
+  if (reasons.length === 0) return { action: "ok" };
+  return {
+    action: "restore",
+    reasons,
+    snapshotTrackedChanges: input.dirtyTrackedPathCount > 0 || input.unmergedPathCount > 0,
+  };
+}
+
+async function inspectBaseRepoHygiene(repoRoot: string) {
+  const currentBranch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], repoRoot)
+    .then((value) => value || null)
+    .catch(() => null);
+  // Porcelain v1: untracked entries start with "??" and are deliberately ignored.
+  // The worktrees themselves live at <repoRoot>/.paperclip/worktrees, and that path
+  // is untracked in at least one repo on this fleet — anything that removes
+  // untracked files from the base repo would delete every agent's worktree.
+  const status = await runGit(["status", "--porcelain"], repoRoot).catch(() => null);
+  if (status === null) return null;
+  const lines = status.split("\n").filter((line) => line.trim().length > 0);
+  const unmergedPathCount = lines.filter((line) => {
+    const code = line.slice(0, 2);
+    return code === "UU" || code === "AA" || code === "DD" ||
+      code.startsWith("U") || code.endsWith("U");
+  }).length;
+  const dirtyTrackedPathCount = lines.filter((line) => !line.startsWith("??")).length - unmergedPathCount;
+  return {
+    currentBranch,
+    dirtyTrackedPathCount: Math.max(0, dirtyTrackedPathCount),
+    unmergedPathCount,
+  };
+}
+
+/**
+ * Put the base repo back on its default ref, preserving anything found there.
+ *
+ * Order matters and is chosen so every step is recoverable from a ref if the next
+ * one fails: pin HEAD first (a commit made on a detached HEAD is reachable from
+ * nothing the moment we move), then snapshot tracked modifications, only then
+ * move the working tree.
+ *
+ * Never removes untracked files. Never uses `git clean` or `stash -u`: the
+ * worktree directory lives inside the base repo and is untracked in some repos,
+ * so removing untracked content there would delete live agent workspaces.
+ */
+async function restoreBaseRepoToDefaultRef(input: {
+  repoRoot: string;
+  baseRef: string;
+  decision: Extract<BaseRepoHygieneDecision, { action: "restore" }>;
+  timestamp: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ restored: boolean; warnings: string[]; rescueRefs: string[] }> {
+  const warnings: string[] = [];
+  const rescueRefs: string[] = [];
+  const shortDefault = input.baseRef.replace(/^origin\//, "");
+  const prefix = `refs/heads/paperclip/rescue/base-repo/${input.timestamp}`;
+
+  const headSha = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
+  if (headSha) {
+    await runGit(["update-ref", `${prefix}/head`, headSha], input.repoRoot)
+      .then(() => rescueRefs.push(`${prefix}/head`))
+      .catch((err) => warnings.push(`could not pin base repo HEAD: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  if (input.decision.snapshotTrackedChanges) {
+    // `stash create` builds the commit objects without touching the working tree
+    // or index, so a failure here leaves the repo exactly as it was found.
+    const stashSha = await runGit(["stash", "create", `paperclip base repo rescue ${input.timestamp}`], input.repoRoot)
+      .then((value) => value || null)
+      .catch(() => null);
+    if (stashSha) {
+      await runGit(["update-ref", `${prefix}/worktree`, stashSha], input.repoRoot)
+        .then(() => rescueRefs.push(`${prefix}/worktree`))
+        .catch(() => undefined);
+    } else {
+      // An unmerged index defeats `stash create`. Fall back to recording the
+      // conflicted blobs so nothing is discarded unseen.
+      const unmerged = await runGit(["ls-files", "-u"], input.repoRoot).catch(() => "");
+      if (unmerged.trim().length > 0) {
+        warnings.push(
+          "base repo had unmerged index entries that could not be stashed; their blobs remain in the object store and are listed in this operation's metadata",
+        );
+      }
+    }
+  }
+
+  const checkout = await runGit(["checkout", "--force", shortDefault], input.repoRoot)
+    .then(() => true)
+    .catch(() => false);
+  let restored = checkout;
+  if (!checkout) {
+    // The default branch can be held by an agent worktree, which is its own bug
+    // but must not stop us tidying the base repo. Detaching lands the same content
+    // without contending for the branch — and without creating a second checkout
+    // of it, which is the very thing that corrupts shared branches.
+    restored = await runGit(["checkout", "--force", "--detach", input.baseRef], input.repoRoot)
+      .then(() => true)
+      .catch((err) => {
+        warnings.push(`could not restore base repo to ${input.baseRef}: ${err instanceof Error ? err.message : String(err)}`);
+        return false;
+      });
+    if (restored) {
+      warnings.push(
+        `base repo was detached at ${input.baseRef} because branch "${shortDefault}" is checked out elsewhere`,
+      );
+    }
+  }
+
+  if (input.recorder) {
+    await input.recorder.recordOperation({
+      phase: "worktree_prepare",
+      command: `git checkout --force ${shortDefault}`,
+      cwd: input.repoRoot,
+      metadata: {
+        baseRepoHygiene: true,
+        repoRoot: input.repoRoot,
+        baseRef: input.baseRef,
+        reasons: input.decision.reasons,
+        rescueRefs,
+        restored,
+      },
+      run: async () => ({
+        status: restored ? "succeeded" : "failed",
+        system: [...input.decision.reasons, ...warnings].join("\n"),
+      }),
+    }).catch(() => undefined);
+  }
+
+  return { restored, warnings, rescueRefs };
+}
+
 function buildExecutionWorkspaceCleanupEnv(input: {
   workspace: {
     cwd: string | null;
@@ -3041,6 +3216,42 @@ export async function realizeExecutionWorkspace(input: {
   ];
   const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
 
+  // SUP-11285: tidy the base repo before cutting from it. Strictly best-effort —
+  // the dispatch proceeds whatever happens here, because the issue being run did
+  // not cause the mess and must not be held hostage to it.
+  const baseRepoHygieneWarnings: string[] = [];
+  try {
+    const hygiene = await inspectBaseRepoHygiene(repoRoot);
+    if (hygiene) {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: hygiene.currentBranch,
+        defaultRef: baseRef,
+        dirtyTrackedPathCount: hygiene.dirtyTrackedPathCount,
+        unmergedPathCount: hygiene.unmergedPathCount,
+      });
+      if (decision.action === "restore") {
+        const result = await restoreBaseRepoToDefaultRef({
+          repoRoot,
+          baseRef,
+          decision,
+          timestamp: new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"),
+          recorder: input.recorder ?? null,
+        });
+        baseRepoHygieneWarnings.push(
+          `Base repository at ${repoRoot} was restored to ${baseRef}: ${decision.reasons.join("; ")}.` +
+            (result.rescueRefs.length > 0
+              ? ` Anything found there is preserved on ${result.rescueRefs.join(", ")}.`
+              : ""),
+          ...result.warnings,
+        );
+      }
+    }
+  } catch (err) {
+    baseRepoHygieneWarnings.push(
+      `Base repository hygiene check failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
   async function reuseExistingWorktree(reusablePath: string, effectiveBranchName = branchName, extraWarnings: string[] = []) {
@@ -3101,7 +3312,7 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       branchName: effectiveBranchName,
       worktreePath: reusablePath,
-      warnings: [...extraWarnings, ...baseRefreshWarnings, ...baseDrift.warnings],
+      warnings: [...extraWarnings, ...baseRepoHygieneWarnings, ...baseRefreshWarnings, ...baseDrift.warnings],
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
@@ -3247,7 +3458,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: baseRefreshWarnings,
+    warnings: [...baseRepoHygieneWarnings, ...baseRefreshWarnings],
     created: true,
     baseRefSha: currentBaseRefSha,
   };
