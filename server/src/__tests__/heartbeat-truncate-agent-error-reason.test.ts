@@ -121,4 +121,45 @@ describe("truncateAgentErrorReason", () => {
     const input = "error: [code 42] path/to/file.ts:10";
     expect(truncateAgentErrorReason(input)).toBe("error: [code 42] path/to/file.ts:10");
   });
+
+  it("truncates at sentence boundary (. ) within the 499-char limit", () => {
+    const sentence1 = "A".repeat(200) + ". ";
+    const sentence2 = "B".repeat(200) + ". ";
+    const sentence3 = "C".repeat(200);
+    const input = sentence1 + sentence2 + sentence3;
+    const result = truncateAgentErrorReason(input);
+    expect(result?.endsWith("\u2026")).toBe(true);
+    expect(result?.endsWith(".\u2026")).toBe(true);
+    expect(result?.length).toBeLessThanOrEqual(500);
+    expect(input).toContain(result!.slice(0, -1));
+  });
+
+  it("truncates at last whitespace when no .  found", () => {
+    const part1 = "A".repeat(200) + " ";
+    const part2 = "B".repeat(200) + " ";
+    const part3 = "C".repeat(200);
+    const input = part1 + part2 + part3;
+    const result = truncateAgentErrorReason(input);
+    expect(result?.endsWith("\u2026")).toBe(true);
+    expect(result?.endsWith(".\u2026")).toBe(false);
+    expect(result?.length).toBeLessThanOrEqual(500);
+  });
+
+  it("does not truncate mid-sentence when a sentence boundary exists", () => {
+    const prefix = "Error: workspace restore failed for issue SUP-12345. ";
+    const longDetail = "Root cause: permission denied at path /some/deeply/nested/directory/structure/that/goes/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/extra suffix here to ensure total exceeds five hundred characters";
+    const input = prefix + longDetail;
+    const result = truncateAgentErrorReason(input);
+    expect(result?.length).toBeLessThanOrEqual(500);
+    expect(result?.includes("workspace restore failed for issue SUP-12345.")).toBe(true);
+    expect(result?.endsWith(".\u2026")).toBe(true);
+  });
+
+  it("hard-cuts at 499 when no sentence or word boundary exists", () => {
+    const long = "x".repeat(600);
+    const result = truncateAgentErrorReason(long);
+    expect(result).toHaveLength(500);
+    expect(result?.endsWith("\u2026")).toBe(true);
+    expect(result?.slice(0, 499)).toBe("x".repeat(499));
+  });
 });
