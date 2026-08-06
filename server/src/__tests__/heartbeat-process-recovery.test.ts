@@ -5061,6 +5061,69 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  // SUP-11280: the growth guard kills a run for the command it chose, so a blind
+  // continuation re-runs that command and trips at the same place. On 2026-08-06
+  // that cost two identical 250 MB trips on one issue inside four minutes.
+  it("blocks in-progress work killed by the opencode database growth guard instead of re-dispatching it", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "opencode_db_growth_limit",
+      runError:
+        "OpenCode database grew 265.6 MB during this run (limit 256.0 MB, 412.5 MB → 678.1 MB).",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    // No continuation run was queued for the same work. The one extra run is the
+    // source-scoped recovery wake, which is scoped away from deliverable work.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const continuationRuns = runs.filter(
+      (row) =>
+        (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+        "issue_continuation_needed",
+    );
+    expect(continuationRuns).toEqual([]);
+    for (const row of runs) {
+      if (row.id === runId) continue;
+      expect(row.contextSnapshot).toMatchObject({
+        source: "issue_recovery_action",
+        allowDeliverableWork: false,
+      });
+    }
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const recoveryAction = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(recoveryAction).toMatchObject({
+      cause: "opencode_db_growth_limit",
+      status: "active",
+      recoveryIssueId: null,
+    });
+    expect(recoveryAction?.nextAction).toContain("redirect it to a file");
+
+    // The comment has to carry the remediation, or the next attempt repeats it.
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("OpenCode database grew past the per-run budget");
+    expect(comments[0]?.body).toContain("tail -100");
+  });
+
   it("does not continue seeded in-progress work that has no run linkage", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

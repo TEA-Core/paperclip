@@ -3,13 +3,17 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  describeOpenCodeDatabaseGrowthSpare,
   describeOpenCodeDatabaseGrowthTrip,
   measureOpenCodeDatabaseBytes,
+  measureOpenCodeSessionBytes,
+  readOpenCodeSessionIdFromChunk,
   resolveOpenCodeDataDir,
   resolveOpenCodeDatabaseGrowthLimitBytes,
   resolveOpenCodeDatabasePath,
   resolveOpenCodeDatabasePollIntervalMs,
   startOpenCodeDatabaseGrowthGuard,
+  type OpenCodeDatabaseGrowthSpare,
   type OpenCodeDatabaseGrowthTrip,
 } from "./db-guard.js";
 
@@ -318,9 +322,348 @@ describe("describeOpenCodeDatabaseGrowthTrip", () => {
       observedBytes: 531 * 1024 * 1024,
       growthBytes: 431 * 1024 * 1024,
       limitBytes: 256 * 1024 * 1024,
+      attribution: null,
+      sparedTrips: 0,
     });
     expect(message).toContain("431.0 MB");
     expect(message).toContain("256.0 MB");
     expect(message).toContain("opencode-agent-agent-1.db");
+  });
+
+  // An operator reading the failure has to be able to tell "this run did it"
+  // from "the guard could not tell whose writes these were".
+  it("names the owning session when the growth was attributed", () => {
+    const message = describeOpenCodeDatabaseGrowthTrip({
+      databasePath: "/paperclip/.local/share/opencode/opencode-agent-agent-1.db",
+      baselineBytes: 412 * 1024 * 1024,
+      observedBytes: 678 * 1024 * 1024,
+      growthBytes: 266 * 1024 * 1024,
+      limitBytes: 256 * 1024 * 1024,
+      attribution: {
+        sessionId: "ses_027959870ffe2fTMGMts4UU288",
+        baselineBytes: 0,
+        observedBytes: 247 * 1024 * 1024,
+        growthBytes: 247 * 1024 * 1024,
+      },
+      sparedTrips: 0,
+    });
+    expect(message).toContain("ses_027959870ffe2fTMGMts4UU288");
+    expect(message).toContain("247.0 MB");
+  });
+
+  it("says so when the growth could not be attributed", () => {
+    const message = describeOpenCodeDatabaseGrowthTrip({
+      databasePath: "/db.db",
+      baselineBytes: 0,
+      observedBytes: 300 * 1024 * 1024,
+      growthBytes: 300 * 1024 * 1024,
+      limitBytes: 256 * 1024 * 1024,
+      attribution: null,
+      sparedTrips: 0,
+    });
+    expect(message).toContain("could not be attributed");
+  });
+});
+
+// Exercises the real sqlite path, not the injected seam: the SQL has to match
+// opencode's actual schema (`event.aggregate_id`, `part.session_id`) or the
+// guard silently attributes nothing and kills innocent runs again.
+describe("measureOpenCodeSessionBytes", () => {
+  async function makeOpenCodeDatabase() {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dir = await makeTempDir();
+    const databasePath = path.join(dir, "opencode-agent-agent-1.db");
+    const db = new DatabaseSync(databasePath);
+    db.exec(`
+      CREATE TABLE event (
+        id text PRIMARY KEY, aggregate_id text NOT NULL, seq integer NOT NULL,
+        type text NOT NULL, data text NOT NULL
+      );
+      CREATE TABLE part (
+        id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL,
+        time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL
+      );
+      INSERT INTO event VALUES ('e1', 'ses_noisy', 1, 'message.part.updated.1', '${"x".repeat(1000)}');
+      INSERT INTO event VALUES ('e2', 'ses_noisy', 2, 'message.part.updated.1', '${"x".repeat(500)}');
+      INSERT INTO event VALUES ('e3', 'ses_quiet', 1, 'message.part.updated.1', '${"x".repeat(7)}');
+      INSERT INTO part VALUES ('p1', 'm1', 'ses_noisy', 0, 0, '${"x".repeat(300)}');
+      INSERT INTO part VALUES ('p2', 'm2', 'ses_quiet', 0, 0, '${"x".repeat(3)}');
+    `);
+    db.close();
+    return databasePath;
+  }
+
+  it("sums the events and parts of one session only", async () => {
+    const databasePath = await makeOpenCodeDatabase();
+    expect(await measureOpenCodeSessionBytes(databasePath, "ses_noisy")).toBe(1800);
+    expect(await measureOpenCodeSessionBytes(databasePath, "ses_quiet")).toBe(10);
+  });
+
+  it("reports zero for a session that has written nothing", async () => {
+    const databasePath = await makeOpenCodeDatabase();
+    expect(await measureOpenCodeSessionBytes(databasePath, "ses_absent")).toBe(0);
+  });
+
+  // Anything the guard cannot answer must be null, so the caller falls back to
+  // terminating rather than to a wrong number.
+  it("returns null rather than guessing when the database is unreadable", async () => {
+    const dir = await makeTempDir();
+    expect(await measureOpenCodeSessionBytes(path.join(dir, "missing.db"), "ses_x")).toBeNull();
+  });
+
+  it("returns null for an empty session id", async () => {
+    const databasePath = await makeOpenCodeDatabase();
+    expect(await measureOpenCodeSessionBytes(databasePath, "  ")).toBeNull();
+  });
+});
+
+describe("readOpenCodeSessionIdFromChunk", () => {
+  it("reads the session id opencode stamps on its JSONL events", () => {
+    expect(
+      readOpenCodeSessionIdFromChunk(
+        '{"type":"text","sessionID":"ses_027959870ffe2fTMGMts4UU288","part":{}}\n',
+      ),
+    ).toBe("ses_027959870ffe2fTMGMts4UU288");
+  });
+
+  it("returns null for output that carries no session", () => {
+    expect(readOpenCodeSessionIdFromChunk("building...\n")).toBeNull();
+  });
+});
+
+// SUP-11280: the database is per AGENT and the guard is per RUN. On 2026-08-06
+// two coder-LE runs were SIGTERMed for a sibling run's 247 MB; one of them had
+// written 203 events. Attribution is what stops that.
+describe("startOpenCodeDatabaseGrowthGuard session attribution", () => {
+  async function waitFor(predicate: () => boolean, timeoutMs = 4000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return predicate();
+  }
+
+  async function makeDatabase(initialBytes: number) {
+    const dir = await makeTempDir();
+    const databasePath = path.join(dir, "opencode-agent-agent-1.db");
+    await fs.writeFile(databasePath, Buffer.alloc(initialBytes));
+    return databasePath;
+  }
+
+  it("spares a run whose own session owns a minority of the growth", async () => {
+    const databasePath = await makeDatabase(1024);
+    const trips: OpenCodeDatabaseGrowthTrip[] = [];
+    const spares: OpenCodeDatabaseGrowthSpare[] = [];
+    let sessionBytes = 0;
+
+    const guard = startOpenCodeDatabaseGrowthGuard({
+      databasePath,
+      limitBytes: 4096,
+      pollIntervalMs: 20,
+      sessionId: "ses_innocent",
+      measureSessionBytes: async () => sessionBytes,
+      onTrip: (trip) => trips.push(trip),
+      onSpare: (spare) => spares.push(spare),
+    });
+
+    try {
+      await waitFor(() => false, 60);
+      // This run wrote 100 bytes; the 16 KB belongs to a sibling run.
+      sessionBytes = 100;
+      await fs.writeFile(`${databasePath}-wal`, Buffer.alloc(16384));
+      expect(await waitFor(() => spares.length > 0)).toBe(true);
+    } finally {
+      guard.stop();
+    }
+
+    expect(trips).toEqual([]);
+    expect(spares[0].attribution.sessionId).toBe("ses_innocent");
+    expect(spares[0].attribution.growthBytes).toBe(100);
+    expect(describeOpenCodeDatabaseGrowthSpare(spares[0])).toContain("ses_innocent");
+  });
+
+  it("terminates the run whose own session owns the growth", async () => {
+    const databasePath = await makeDatabase(1024);
+    const trips: OpenCodeDatabaseGrowthTrip[] = [];
+    const spares: OpenCodeDatabaseGrowthSpare[] = [];
+    let sessionBytes = 0;
+
+    const guard = startOpenCodeDatabaseGrowthGuard({
+      databasePath,
+      limitBytes: 4096,
+      pollIntervalMs: 20,
+      sessionId: "ses_culprit",
+      measureSessionBytes: async () => sessionBytes,
+      onTrip: (trip) => trips.push(trip),
+      onSpare: (spare) => spares.push(spare),
+    });
+
+    try {
+      await waitFor(() => false, 60);
+      sessionBytes = 16384;
+      await fs.writeFile(`${databasePath}-wal`, Buffer.alloc(16384));
+      expect(await waitFor(() => trips.length > 0)).toBe(true);
+    } finally {
+      guard.stop();
+    }
+
+    expect(spares).toEqual([]);
+    expect(trips[0].attribution?.sessionId).toBe("ses_culprit");
+  });
+
+  // A sibling that is already dead will never be killed by its own guard, so
+  // sparing cannot be unbounded or the database grows forever.
+  it("stops sparing after the bound and terminates anyway", async () => {
+    const databasePath = await makeDatabase(0);
+    const trips: OpenCodeDatabaseGrowthTrip[] = [];
+    const spares: OpenCodeDatabaseGrowthSpare[] = [];
+    let walBytes = 0;
+
+    const guard = startOpenCodeDatabaseGrowthGuard({
+      databasePath,
+      limitBytes: 4096,
+      pollIntervalMs: 20,
+      sessionId: "ses_innocent",
+      maxSparedTrips: 2,
+      measureSessionBytes: async () => 0,
+      onTrip: (trip) => trips.push(trip),
+      onSpare: (spare) => spares.push(spare),
+    });
+
+    try {
+      // Keep a foreign writer growing the file past the budget every pass.
+      const grow = setInterval(() => {
+        walBytes += 8192;
+        void fs.writeFile(`${databasePath}-wal`, Buffer.alloc(walBytes));
+      }, 25);
+      try {
+        expect(await waitFor(() => trips.length > 0)).toBe(true);
+      } finally {
+        clearInterval(grow);
+      }
+    } finally {
+      guard.stop();
+    }
+
+    expect(spares).toHaveLength(2);
+    expect(trips[0].sparedTrips).toBe(2);
+  });
+
+  // A resumed session's pre-existing rows are not this run's doing.
+  it("charges a resumed run only for what it added to its session", async () => {
+    const databasePath = await makeDatabase(1024);
+    const trips: OpenCodeDatabaseGrowthTrip[] = [];
+    const spares: OpenCodeDatabaseGrowthSpare[] = [];
+    let sessionBytes = 500_000;
+
+    const guard = startOpenCodeDatabaseGrowthGuard({
+      databasePath,
+      limitBytes: 4096,
+      pollIntervalMs: 20,
+      sessionId: "ses_resumed",
+      measureSessionBytes: async () => sessionBytes,
+      onTrip: (trip) => trips.push(trip),
+      onSpare: (spare) => spares.push(spare),
+    });
+
+    try {
+      await waitFor(() => false, 60);
+      sessionBytes = 500_100;
+      await fs.writeFile(`${databasePath}-wal`, Buffer.alloc(16384));
+      expect(await waitFor(() => spares.length > 0)).toBe(true);
+    } finally {
+      guard.stop();
+    }
+
+    expect(trips).toEqual([]);
+    expect(spares[0].attribution.growthBytes).toBe(100);
+  });
+
+  // Without a session id there is nothing to attribute to, and the guard must
+  // behave exactly as it did before attribution existed.
+  it("terminates on the file total when the session is unknown", async () => {
+    const databasePath = await makeDatabase(1024);
+    const trips: OpenCodeDatabaseGrowthTrip[] = [];
+
+    const guard = startOpenCodeDatabaseGrowthGuard({
+      databasePath,
+      limitBytes: 4096,
+      pollIntervalMs: 20,
+      measureSessionBytes: async () => 0,
+      onTrip: (trip) => trips.push(trip),
+    });
+
+    try {
+      await waitFor(() => false, 60);
+      await fs.writeFile(`${databasePath}-wal`, Buffer.alloc(16384));
+      expect(await waitFor(() => trips.length > 0)).toBe(true);
+    } finally {
+      guard.stop();
+    }
+
+    expect(trips[0].attribution).toBeNull();
+  });
+
+  // A read-only query that cannot answer must not become a licence to keep
+  // writing; the guard falls back to terminating.
+  it("terminates when the session bytes cannot be read", async () => {
+    const databasePath = await makeDatabase(1024);
+    const trips: OpenCodeDatabaseGrowthTrip[] = [];
+
+    const guard = startOpenCodeDatabaseGrowthGuard({
+      databasePath,
+      limitBytes: 4096,
+      pollIntervalMs: 20,
+      sessionId: "ses_unreadable",
+      measureSessionBytes: async () => null,
+      onTrip: (trip) => trips.push(trip),
+    });
+
+    try {
+      await waitFor(() => false, 60);
+      await fs.writeFile(`${databasePath}-wal`, Buffer.alloc(16384));
+      expect(await waitFor(() => trips.length > 0)).toBe(true);
+    } finally {
+      guard.stop();
+    }
+
+    expect(trips[0].attribution).toBeNull();
+  });
+
+  it("learns the session id from the run's stdout", async () => {
+    const databasePath = await makeDatabase(1024);
+    const trips: OpenCodeDatabaseGrowthTrip[] = [];
+    const spares: OpenCodeDatabaseGrowthSpare[] = [];
+    const asked: string[] = [];
+
+    const guard = startOpenCodeDatabaseGrowthGuard({
+      databasePath,
+      limitBytes: 4096,
+      pollIntervalMs: 20,
+      measureSessionBytes: async (_path, sessionId) => {
+        asked.push(sessionId);
+        return 100;
+      },
+      onTrip: (trip) => trips.push(trip),
+      onSpare: (spare) => spares.push(spare),
+    });
+
+    try {
+      guard.noteSessionId(
+        readOpenCodeSessionIdFromChunk('{"sessionID":"ses_fromstdout","type":"text"}'),
+      );
+      // A later, different session id must not overwrite the first.
+      guard.noteSessionId("ses_later");
+      await waitFor(() => asked.length > 0);
+      await fs.writeFile(`${databasePath}-wal`, Buffer.alloc(16384));
+      expect(await waitFor(() => spares.length > 0)).toBe(true);
+    } finally {
+      guard.stop();
+    }
+
+    expect(new Set(asked)).toEqual(new Set(["ses_fromstdout"]));
+    expect(spares[0].attribution.sessionId).toBe("ses_fromstdout");
+    expect(trips).toEqual([]);
   });
 });

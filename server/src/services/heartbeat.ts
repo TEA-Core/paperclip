@@ -368,6 +368,14 @@ const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
+// SUP-11280: the opencode adapter's database growth guard kills a run whose tool
+// output arrives faster than the database can absorb it. The kill is a property
+// of the COMMAND the run chose, not of the runtime, so re-dispatching the same
+// issue re-runs the same command and trips at the same place. On 2026-08-06 that
+// cost two identical 250 MB trips on SUP-11109 within four minutes. Recovery
+// blocks instead, with the remediation in the comment.
+const OPENCODE_DB_GROWTH_LIMIT_FAILURE_CODE = "opencode_db_growth_limit";
+const OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE = "opencode_db_growth_limit";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
@@ -1423,6 +1431,12 @@ function isWorkspaceValidationFailedRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode"> | null | undefined,
 ) {
   return run?.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE;
+}
+
+function isOpenCodeDatabaseGrowthLimitFailedRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode"> | null | undefined,
+) {
+  return run?.errorCode === OPENCODE_DB_GROWTH_LIMIT_FAILURE_CODE;
 }
 
 function readWorkspaceValidationPayloadFromRun(
@@ -14882,6 +14896,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  function buildOpenCodeDatabaseGrowthLimitRecoveryComment(input: {
+    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+  }) {
+    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    return (
+      "Paperclip terminated this run because its OpenCode database grew past the per-run budget. " +
+      "That is caused by a command whose output streams faster than the database can absorb it — " +
+      "each output chunk is written as a full snapshot — so retrying the same work would run the same " +
+      `command and fail the same way.${failureSummary ?? ""} ` +
+      "Moving it to `blocked` so the offending command can be changed before resuming: redirect long or " +
+      "chatty command output to a file and report a bounded slice of it " +
+      "(`cmd > /tmp/run.log 2>&1; tail -100 /tmp/run.log`)."
+    );
+  }
+
   function buildConfigurationIncompleteRecoveryComment(input: {
     latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
   }) {
@@ -15501,18 +15530,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         !recoveryAgent ||
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
+        isOpenCodeDatabaseGrowthLimitFailedRun(run) ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
       if (shouldBlockImmediately) {
         const workspaceValidationFailure = isWorkspaceValidationFailedRun(run);
         const configurationIncompleteFailure = isConfigurationIncompleteFailedRun(run);
+        const databaseGrowthLimitFailure = isOpenCodeDatabaseGrowthLimitFailedRun(run);
         const comment = workspaceValidationFailure
           ? buildWorkspaceValidationRecoveryComment({ latestRun: run })
           : configurationIncompleteFailure
             ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
-            : buildImmediateExecutionPathRecoveryComment({
-                status: issue.status as "todo" | "in_progress",
-                latestRun: run,
-              });
+            : databaseGrowthLimitFailure
+              ? buildOpenCodeDatabaseGrowthLimitRecoveryComment({ latestRun: run })
+              : buildImmediateExecutionPathRecoveryComment({
+                  status: issue.status as "todo" | "in_progress",
+                  latestRun: run,
+                });
         return {
           kind: "blocked" as const,
           issue,
@@ -15522,7 +15555,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
             : configurationIncompleteFailure
               ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-              : undefined,
+              : databaseGrowthLimitFailure
+                ? OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE
+                : undefined,
         };
       }
 
@@ -15635,6 +15670,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
               : promotionResult.recoveryCause === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
                 ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
+              : promotionResult.recoveryCause === OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE
+                ? OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE
               : undefined,
         recoveryOwnerAgentId: promotionResult.recoveryOwnerAgentId,
       });

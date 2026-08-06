@@ -62,12 +62,15 @@ import {
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import {
+  describeOpenCodeDatabaseGrowthSpare,
   describeOpenCodeDatabaseGrowthTrip,
   formatBytes,
+  readOpenCodeSessionIdFromChunk,
   resolveOpenCodeDatabaseGrowthLimitBytes,
   resolveOpenCodeDatabasePath,
   resolveOpenCodeDatabasePollIntervalMs,
   startOpenCodeDatabaseGrowthGuard,
+  type OpenCodeDatabaseGrowthGuard,
   type OpenCodeDatabaseGrowthTrip,
 } from "./db-guard.js";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
@@ -818,8 +821,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       let terminalBillingErrorDetected: string | null = null;
+      // Assigned just below; the log interceptor closes over it so the guard
+      // learns which opencode session this run writes to as soon as the first
+      // JSONL line lands, which is what lets it tell its own growth from a
+      // sibling run's on the same per-agent database (SUP-11280).
+      let databaseGuard: OpenCodeDatabaseGrowthGuard | null = null;
       const earlyAbortOnLog: typeof onLog = async (stream, chunk) => {
         await onLog(stream, chunk);
+        if (stream === "stdout" && databaseGuard) {
+          databaseGuard.noteSessionId(readOpenCodeSessionIdFromChunk(chunk));
+        }
         if (stream === "stderr" && terminalBillingErrorDetected === null) {
           const detected = isOpenCodeTerminalBillingError("", chunk);
           if (detected) {
@@ -836,11 +847,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       };
 
-      const databaseGuard = databaseGuardPath
+      databaseGuard = databaseGuardPath
         ? startOpenCodeDatabaseGrowthGuard({
             databasePath: databaseGuardPath,
             limitBytes: databaseGuardLimitBytes,
             pollIntervalMs: databaseGuardPollIntervalMs,
+            sessionId: resumeSessionId,
+            onSpare: (spare) => {
+              void onLog("stdout", `[paperclip] ${describeOpenCodeDatabaseGrowthSpare(spare)}\n`);
+            },
             onTrip: (trip) => {
               databaseGuardTrip = trip;
               void (async () => {
