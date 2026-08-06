@@ -1,4 +1,5 @@
-# Scope for SUP-11196 on this branch.
-# Fix: classify done-blocker roots as needs_attention with terminal sample
-server/src/services/issues.ts
-server/src/__tests__/issue-blocker-attention.test.ts
+# Scope for SUP-11270 on this branch.
+# Track heal attempts in evidence.healAttemptCount — gate isAtCeiling on that, not attemptCount
+server/src/services/recovery/service.ts
+server/src/services/issue-recovery-actions.ts
+server/src/__tests__/recovery-blocked-without-blockers-sweep.test.ts

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -660,11 +660,17 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     });
 
     const action = await db
-      .select({ id: issueRecoveryActions.id })
+      .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId))
       .then((rows) => rows[0]);
-    expect(action).toBeUndefined();
+    expect(action).toMatchObject({
+      status: "resolved",
+      outcome: "false_positive",
+      evidence: expect.objectContaining({
+        healAttemptCount: 1,
+      }),
+    });
 
     const audit = await db
       .select({ action: activityLog.action })
@@ -765,7 +771,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     await drainAgentRuns(agentId);
   });
 
-  it("flag ON + existing blocked_without_blockers action with low attemptCount — heals and resolves the action", async () => {
+  it("flag ON + existing blocked_without_blockers action with low healAttemptCount — heals and resolves the action", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     await enableBlockedWithoutBlockersAutoHeal();
 
@@ -817,7 +823,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(wakeup).toBeTruthy();
 
     const action = await db
-      .select({ status: issueRecoveryActions.status, outcome: issueRecoveryActions.outcome, attemptCount: issueRecoveryActions.attemptCount })
+      .select({ status: issueRecoveryActions.status, outcome: issueRecoveryActions.outcome, attemptCount: issueRecoveryActions.attemptCount, evidence: issueRecoveryActions.evidence })
       .from(issueRecoveryActions)
       .where(
         and(
@@ -828,12 +834,13 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       .then((rows) => rows[0]);
     expect(action?.status).toBe("resolved");
     expect(action?.outcome).toBe("false_positive");
-    expect(action?.attemptCount).toBe(2);
+    expect(action?.attemptCount).toBe(1);
+    expect(action?.evidence).toMatchObject({ healAttemptCount: 1 });
 
     await drainAgentRuns(agentId);
   });
 
-  it("flag ON + existing action at attemptCount >= 5 — does NOT heal, alreadyActionedSkipped increments", async () => {
+  it("flag ON + existing action at healAttemptCount >= 5 — does NOT heal, alreadyActionedSkipped increments", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     await enableBlockedWithoutBlockersAutoHeal();
 
@@ -857,9 +864,9 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       ownerType: "board",
       cause: "blocked_without_blockers",
       fingerprint: `bwob:${companyId}:${issueId}`,
-      attemptCount: 5,
+      attemptCount: 1,
       nextAction: "Review this blocked issue.",
-      evidence: { identifier: null },
+      evidence: { identifier: null, healAttemptCount: 5 },
     });
 
     const heartbeat = heartbeatService(db);
@@ -878,7 +885,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(row?.status).toBe("blocked");
 
     const action = await db
-      .select({ status: issueRecoveryActions.status, attemptCount: issueRecoveryActions.attemptCount })
+      .select({ status: issueRecoveryActions.status, attemptCount: issueRecoveryActions.attemptCount, evidence: issueRecoveryActions.evidence })
       .from(issueRecoveryActions)
       .where(
         and(
@@ -888,7 +895,72 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       )
       .then((rows) => rows[0]);
     expect(action?.status).toBe("active");
-    expect(action?.attemptCount).toBe(5);
+    expect(action?.attemptCount).toBe(1);
+    expect(action?.evidence).toMatchObject({ healAttemptCount: 5 });
+  });
+
+  it("flag ON: repeated heals track a persistent ceiling and stop after MAX attempts", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Repeatedly healed issue",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+
+    const heartbeat = heartbeatService(db);
+
+    // Heal to the ceiling. No active action exists on any pass because each heal
+    // resolves the action, so the count must be recovered from resolved rows.
+    for (let i = 1; i <= 5; i++) {
+      await db
+        .update(issues)
+        .set({ status: "blocked", updatedAt: oldDate() })
+        .where(eq(issues.id, issueId));
+      const result = await heartbeat.reconcileBlockedWithoutBlockers();
+      expect(result.healed).toBe(1);
+      expect(result.escalated).toBe(0);
+
+      const action = await db
+        .select({ evidence: issueRecoveryActions.evidence, status: issueRecoveryActions.status })
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+        .orderBy(desc(issueRecoveryActions.updatedAt))
+        .limit(1)
+        .then((rows) => rows[0]);
+      expect(action?.status).toBe("resolved");
+      expect(action?.evidence).toMatchObject({ healAttemptCount: i });
+
+      await drainAgentRuns(agentId);
+    }
+
+    // Sixth pass is at the ceiling: blocked_without_blockers should not heal;
+    // it falls through to the normal escalation path.
+    await db
+      .update(issues)
+      .set({ status: "blocked", updatedAt: oldDate() })
+      .where(eq(issues.id, issueId));
+    const finalResult = await heartbeat.reconcileBlockedWithoutBlockers();
+    expect(finalResult.healed).toBe(0);
+    expect(finalResult.alreadyActionedSkipped).toBe(0);
+    expect(finalResult.escalated).toBe(1);
+    expect(finalResult.issueIds).toEqual([issueId]);
+
+    const escalatedAction = await db
+      .select({ status: issueRecoveryActions.status, evidence: issueRecoveryActions.evidence })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .orderBy(desc(issueRecoveryActions.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0]);
+    expect(escalatedAction?.status).toBe("active");
+    expect(escalatedAction?.evidence).toMatchObject({ healAttemptCount: 5 });
   });
 
   it("flag OFF — escalated action carries wakePolicy board_escalation", async () => {
