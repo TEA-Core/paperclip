@@ -3570,9 +3570,9 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T extends 
     });
   }
 
-  if (reuseFailure) throw new Error(reuseFailure);
+  if (reuseFailure) throw new WorkspaceValidationFailure(reuseFailure, {});
   if (!restored) {
-    throw new Error("Expected restored execution workspace after reuse fallback handling");
+    throw new WorkspaceValidationFailure("Expected restored execution workspace after reuse fallback handling", {});
   }
 
   return {

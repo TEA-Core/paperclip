@@ -43,6 +43,7 @@ import {
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
+  WorkspaceValidationFailure,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
@@ -1623,6 +1624,42 @@ describe("effective run execution workspace config freshness", () => {
       restoreExistingWorkspace: async () => null,
       realizeWorkspace,
     })).rejects.toThrow(/could not be restored/);
+    expect(realizeWorkspace).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "restore throws", restoreOutcome: "throws" as const },
+    { name: "restore returns no workspace", restoreOutcome: "empty" as const },
+  ])("classifies reuse restore failure as a workspace validation failure when $name", async ({ restoreOutcome }) => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
+      nextMetadata: metadata,
+    });
+    const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] as string[] }));
+
+    const error = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceId: "workspace-old",
+      issueRef: { id: "issue-1", identifier: "PAP-42" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace: async () => {
+        if (restoreOutcome === "throws") throw new Error("restore command failed");
+        return null;
+      },
+      realizeWorkspace,
+    }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    // A per-issue workspace restore failure must stay workspace-scoped so the
+    // heartbeat keeps the agent idle instead of flipping the whole agent to error.
+    expect(error).toBeInstanceOf(WorkspaceValidationFailure);
+    expect((error as WorkspaceValidationFailure).code).toBe("workspace_validation_failed");
+    expect((error as WorkspaceValidationFailure).resultJson).toEqual({});
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
