@@ -3965,7 +3965,113 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.assigneeAgentId).toBe(agentId);
   });
 
-  it("retries a pending execution-review participant once before blocking with a recovery action", async () => {
+  it("keeps a deliberately abstaining review participant in review instead of blocking it", async () => {
+    // SUP-11306 / replay of SUP-11280: the reviewer ran to completion on a recovery wake and
+    // posted an abstention comment instead of deciding. That is a healthy reviewer, not a dead
+    // execution path, so the stage must stay pending with no recovery action against itself.
+    const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture({
+      wakeReason: "execution_review_participant_recovery",
+      retryReason: "execution_review_participant_recovery",
+    });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      createdByRunId: runId,
+      body: "Deferring the review decision this wake: the doctrine mount is stale, which is a self-gate.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+    expect(settledRun?.status).toBe("succeeded");
+
+    // The stage is re-armed under the same reviewer rather than escalated. The re-armed run
+    // is a terminal artifact: had the abstention blocked the issue, it would not exist.
+    const rearmedRun = await waitForValue(async () => {
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return runs.find((row) => row.retryOfRunId === runId) ?? null;
+    }, 8_000);
+    expect(rearmedRun).toMatchObject({ companyId, agentId, retryOfRunId: runId });
+    expect(rearmedRun?.contextSnapshot).toMatchObject({
+      issueId,
+      currentStageId: stageId,
+      currentStageType: "review",
+      retryReason: "execution_review_participant_recovery",
+    });
+
+    // No recovery action was opened against the abstaining run itself. (The stub adapter
+    // never records a decision, so the chain does eventually spend the deferral budget —
+    // what must not happen is an escalation attributed to this abstention.)
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    for (const action of recoveryActions) {
+      expect((action.evidence as Record<string, unknown> | null)?.latestRunId).not.toBe(runId);
+    }
+  });
+
+  it("blocks a review participant that keeps deferring past the deferral retry limit", async () => {
+    const { companyId, agentId, issueId, runId } = await seedInReviewParticipantRunFixture({
+      wakeReason: "execution_review_participant_recovery",
+      retryReason: "execution_review_participant_recovery",
+    });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      createdByRunId: runId,
+      body: "Still deferring the review decision.",
+    });
+    // Two earlier terminal deferral retries already burned the budget; this run is the third.
+    for (const index of [0, 1]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "succeeded",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "execution_review_participant_recovery",
+          retryReason: "execution_review_participant_recovery",
+        },
+        startedAt: new Date(`2026-03-18T0${index}:00:00.000Z`),
+        finishedAt: new Date(`2026-03-18T0${index}:05:00.000Z`),
+        updatedAt: new Date(`2026-03-18T0${index}:05:00.000Z`),
+      });
+    }
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const blockedIssue = await waitForValue(async () => {
+      const row = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      return row?.status === "blocked" ? row : null;
+    }, 8_000);
+    expect(blockedIssue).toBeTruthy();
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    const escalationComment = comments.find((comment) => comment.body.includes("deferral limit"));
+    expect(escalationComment).toBeTruthy();
+    // The reviewer demonstrably ran, so the escalation must not claim there was no live run.
+    expect(escalationComment?.body).not.toContain("live reviewer run");
+  });
+
+  // SUP-11306: a reviewer whose run keeps succeeding is not a dead execution path, so the
+  // stage is re-armed under it up to the deferral limit before the issue is escalated.
+  it("retries a pending execution-review participant up to the deferral limit before blocking with a recovery action", async () => {
     const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
     const heartbeat = heartbeatService(db);
 
@@ -4016,17 +4122,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       executionRunId: null,
     });
 
+    // The reviewer is re-armed until the deferral budget is spent, so the escalation is
+    // attributed to the last recovery run rather than to the first one.
+    const terminalRecoveryRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((runs) =>
+        runs.filter((row) =>
+          (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+            "execution_review_participant_recovery" &&
+          row.status === "succeeded"
+        )
+      );
+    expect(terminalRecoveryRuns).toHaveLength(3);
+    const blockingRun = terminalRecoveryRuns.reduce((latest, row) =>
+      row.createdAt > latest.createdAt ? row : latest
+    );
+
     const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
       companyId,
       agentId,
       issueId,
-      runId: reviewRecoveryRun!.id,
+      runId: blockingRun.id,
       previousStatus: "in_review",
       retryReason: "execution_review_participant_recovery",
       cause: "execution_review_participant_recovery",
     });
     expect(recoveryAction.evidence).toMatchObject({
-      latestRunId: reviewRecoveryRun?.id,
+      latestRunId: blockingRun.id,
       latestRunStatus: "succeeded",
       latestRunErrorCode: null,
       recoveryCause: "execution_review_participant_recovery",
@@ -4034,10 +4158,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     const recoveryComment = comments.find((comment) =>
-      comment.body.includes("pending execution-review participant once") &&
+      comment.body.includes("deferral limit") &&
         comment.body.includes(`Recovery action: \`${recoveryAction.id}\``),
     );
     expect(recoveryComment).toBeTruthy();
+    // Every one of those runs succeeded, so the escalation must not assert there was no
+    // live reviewer run (SUP-11306).
+    expect(recoveryComment?.body).not.toContain("live reviewer run");
 
     const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) =>
