@@ -212,6 +212,80 @@ describeEmbeddedPostgres("reuse_existing execution workspace binding", () => {
     expect(issue.executionWorkspacePreference).toBe("reuse_existing");
   });
 
+  it("declines to inherit a workspace whose owning issue has already finished", async () => {
+    // SUP-11260: a worktree outlives the issue it was cut for. Binding new issues
+    // to a finished issue's workspace is how single worktrees accumulated dozens
+    // of unrelated issues over days, and how concurrent agents ended up in one
+    // working tree destroying each other's commits.
+    const companyId = await seedCompany();
+    const { projectId, projectWorkspaceId, executionWorkspaceId } = await seedProjectWorkspace(companyId);
+    const sourceIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Carrier issue that has since finished",
+      status: "done",
+      priority: "high",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ sourceIssueId })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+
+    const issue = await svc.create(companyId, {
+      projectId,
+      title: "Follow-up after the carrier finished",
+      status: "todo",
+      priority: "high",
+      inheritExecutionWorkspaceFromIssueId: sourceIssueId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    // Declined, and the bare preference cleared with it — a refused inheritance
+    // must not surface as an unrealizable reuse_existing the caller cannot act on.
+    expect(issue.executionWorkspaceId).toBeNull();
+    expect(issue.executionWorkspacePreference).toBeNull();
+  });
+
+  it("still inherits a workspace whose owning issue is live", async () => {
+    const companyId = await seedCompany();
+    const { projectId, projectWorkspaceId, executionWorkspaceId } = await seedProjectWorkspace(companyId);
+    const sourceIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Carrier issue still running",
+      status: "in_progress",
+      priority: "high",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ sourceIssueId })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+
+    const issue = await svc.create(companyId, {
+      projectId,
+      title: "Child of a live carrier",
+      status: "todo",
+      priority: "high",
+      inheritExecutionWorkspaceFromIssueId: sourceIssueId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    expect(issue.executionWorkspaceId).toBe(executionWorkspaceId);
+    expect(issue.executionWorkspacePreference).toBe("reuse_existing");
+  });
+
   it("rejects an update that would leave reuse_existing without a workspace id", async () => {
     const companyId = await seedCompany();
     const { projectId, projectWorkspaceId } = await seedProjectWorkspace(companyId);

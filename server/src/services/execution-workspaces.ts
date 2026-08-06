@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
@@ -104,6 +104,22 @@ export type ExecutionWorkspaceGitWorktreeContention = {
     issueId: string | null;
     issueIdentifier: string | null;
   } | null;
+} | null;
+
+/**
+ * A live run that already occupies an execution workspace on behalf of a
+ * *different* issue.
+ *
+ * Distinct from {@link ExecutionWorkspaceGitWorktreeContention}, which asks
+ * whether two workspace *rows* collide on one path or branch. This asks the
+ * question that matters at dispatch: is somebody else's agent editing this
+ * working tree right now?
+ */
+export type ExecutionWorkspaceActiveRunOccupancy = {
+  runId: string;
+  runStatus: "queued" | "running";
+  issueId: string | null;
+  issueIdentifier: string | null;
 } | null;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1412,6 +1428,130 @@ export function executionWorkspaceService(db: Db) {
       }
 
       return null;
+    },
+
+    /**
+     * SUP-11260: is another issue's run live inside this execution workspace?
+     *
+     * A workspace is shared by design — children and redo issues inherit their
+     * parent's worktree so delivery stays on one branch. What was never checked
+     * is whether the previous occupant has *left*. Two agents in one worktree
+     * interleave commits, rebases and resets on a single branch; one observed
+     * `git reset` destroyed a sibling's commit 41 seconds after it was made.
+     *
+     * Two ways to be occupied, both needed. The issue binding is set before
+     * dispatch, so it catches a run still provisioning; the run's own context
+     * snapshot is written after provisioning, so it catches a run whose issue
+     * binding has since moved on. Neither alone closes the window.
+     */
+    findActiveRunOccupyingWorkspace: async (input: {
+      companyId: string;
+      executionWorkspaceId: string;
+      excludingIssueId?: string | null;
+      excludingRunId?: string | null;
+      /**
+       * The asking run's queue position, used to break ties between two runs
+       * that are both merely queued. Without it each would see the other as an
+       * occupant, both would wait out the budget, and both would end up forking
+       * a fresh workspace — safe, but neither gets the branch it wanted. With
+       * it exactly one of the pair waits.
+       */
+      contenderRunCreatedAt?: Date | null;
+    }): Promise<ExecutionWorkspaceActiveRunOccupancy> => {
+      const excludingIssueId = readNullableString(input.excludingIssueId ?? null);
+      const excludingRunId = readNullableString(input.excludingRunId ?? null);
+      const contenderCreatedAt = input.contenderRunCreatedAt ?? null;
+
+      const boundIssues = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          executionRunId: issues.executionRunId,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, input.companyId),
+          eq(issues.executionWorkspaceId, input.executionWorkspaceId),
+          isNull(issues.hiddenAt),
+          excludingIssueId ? ne(issues.id, excludingIssueId) : sql`true`,
+        ))
+        .limit(50);
+
+      const runToIssue = new Map<string, { id: string; identifier: string | null }>();
+      for (const issue of boundIssues) {
+        const summary = { id: issue.id, identifier: issue.identifier ?? null };
+        if (issue.executionRunId) runToIssue.set(issue.executionRunId, summary);
+        if (issue.checkoutRunId) runToIssue.set(issue.checkoutRunId, summary);
+      }
+      const boundRunIds = [...runToIssue.keys()];
+
+      const [row] = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          // A run that is already executing always holds the worktree. A run that
+          // is only queued holds it only if it got in line first, so that two
+          // queued siblings cannot each defer to the other.
+          contenderCreatedAt
+            ? or(
+                eq(heartbeatRuns.status, "running"),
+                and(
+                  eq(heartbeatRuns.status, "queued"),
+                  or(
+                    lt(heartbeatRuns.createdAt, contenderCreatedAt),
+                    and(
+                      eq(heartbeatRuns.createdAt, contenderCreatedAt),
+                      excludingRunId
+                        ? sql`${heartbeatRuns.id}::text < ${excludingRunId}`
+                        : sql`true`,
+                    ),
+                  ),
+                ),
+              )
+            : inArray(heartbeatRuns.status, ["queued", "running"]),
+          excludingRunId ? ne(heartbeatRuns.id, excludingRunId) : sql`true`,
+          or(
+            boundRunIds.length > 0 ? inArray(heartbeatRuns.id, boundRunIds) : sql`false`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${input.executionWorkspaceId}`,
+          ),
+          // Our own issue's other runs are not contention: the same issue's work
+          // on one branch is what the worktree is for, and serialising an issue
+          // against itself would deadlock continuation and recovery runs.
+          excludingIssueId
+            ? sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') is distinct from ${excludingIssueId}`
+            : sql`true`,
+        ))
+        .orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.createdAt))
+        .limit(1);
+
+      if (!row) return null;
+      if (row.status !== "queued" && row.status !== "running") return null;
+
+      const context = isRecord(row.contextSnapshot) ? row.contextSnapshot : null;
+      const contextIssueId = readNullableString(context?.issueId);
+      const linked = runToIssue.get(row.id) ?? null;
+      const issueId = linked?.id ?? contextIssueId;
+      let issueIdentifier = linked?.identifier ?? null;
+      if (!issueIdentifier && issueId) {
+        issueIdentifier = await db
+          .select({ identifier: issues.identifier })
+          .from(issues)
+          .where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueId)))
+          .then((rows) => rows[0]?.identifier ?? null);
+      }
+
+      return {
+        runId: row.id,
+        runStatus: row.status,
+        issueId,
+        issueIdentifier,
+      };
     },
 
     getById: async (id: string) => {

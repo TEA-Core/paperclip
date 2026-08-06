@@ -28,6 +28,8 @@ import {
   provisionExecutionWorkspaceForFreshnessDecision,
   readRuntimeStateSessionParams,
   resolveExecutionWorkspaceConfigFreshness,
+  readExecutionWorkspaceOccupancyDeferrals,
+  resolveExecutionWorkspaceOccupancyDecision,
   resolveExecutionWorkspaceReuseRequestForIssue,
   resolveExecutionWorkspaceReuseProvisioningPolicy,
   resolveNextSessionState,
@@ -2825,5 +2827,88 @@ describe("parseSessionCompactionPolicy", () => {
       maxRawInputTokens: 500_000,
       maxSessionAgeHours: 0,
     });
+  });
+});
+
+describe("execution workspace occupancy gate", () => {
+  it("proceeds when nothing else holds the workspace", () => {
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: true,
+      occupied: false,
+      priorDeferrals: 0,
+    })).toEqual({ action: "proceed" });
+  });
+
+  it("proceeds when the run was never going to reuse a workspace", () => {
+    // A run provisioning its own worktree cannot collide with anyone, so the
+    // occupancy of some other workspace must not stall it.
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: false,
+      occupied: true,
+      priorDeferrals: 0,
+    })).toEqual({ action: "proceed" });
+  });
+
+  it("defers the first time the workspace is occupied", () => {
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: true,
+      occupied: true,
+      priorDeferrals: 0,
+      maxDeferrals: 3,
+      delayMs: 1_000,
+    })).toEqual({ action: "defer", attempt: 1, maxDeferrals: 3, delayMs: 1_000 });
+  });
+
+  it("keeps deferring while wait budget remains", () => {
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: true,
+      occupied: true,
+      priorDeferrals: 2,
+      maxDeferrals: 3,
+      delayMs: 1_000,
+    })).toEqual({ action: "defer", attempt: 3, maxDeferrals: 3, delayMs: 1_000 });
+  });
+
+  it("provisions a fresh workspace once the wait budget is spent", () => {
+    // Never refuse outright: an occupant that never releases would otherwise
+    // dead-block the issue forever, which is the failure mode this gate exists
+    // to avoid repeating. Losing branch continuity is the cheap outcome.
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: true,
+      occupied: true,
+      priorDeferrals: 3,
+      maxDeferrals: 3,
+    })).toEqual({ action: "provision_fresh", deferrals: 3 });
+  });
+
+  it("provisions fresh immediately when waiting is disabled", () => {
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: true,
+      occupied: true,
+      priorDeferrals: 0,
+      maxDeferrals: 0,
+    })).toEqual({ action: "provision_fresh", deferrals: 0 });
+  });
+});
+
+describe("readExecutionWorkspaceOccupancyDeferrals", () => {
+  it("counts attempts already spent waiting for this workspace", () => {
+    expect(readExecutionWorkspaceOccupancyDeferrals({
+      scheduledRetryReason: "execution_workspace_occupied",
+      scheduledRetryAttempt: 2,
+    })).toBe(2);
+  });
+
+  it("does not charge the wait budget for retries of another kind", () => {
+    // A run that burned two transient-failure retries has spent none of its
+    // workspace-wait budget; charging it would cut the wait short.
+    expect(readExecutionWorkspaceOccupancyDeferrals({
+      scheduledRetryReason: "transient_failure",
+      scheduledRetryAttempt: 2,
+    })).toBe(0);
+  });
+
+  it("treats a run with no retry history as having waited zero times", () => {
+    expect(readExecutionWorkspaceOccupancyDeferrals({})).toBe(0);
   });
 });

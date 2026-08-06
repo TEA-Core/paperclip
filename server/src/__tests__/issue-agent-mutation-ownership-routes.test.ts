@@ -267,6 +267,15 @@ function createRunContextDb(
   contextSnapshot: Record<string, unknown> = {},
   runAgentOrRows: string | Record<string, unknown>[] = ownerAgentId,
   runId: string = ownerRunId,
+  /**
+   * Which issue owns the run's execution workspace. Run-derived inheritance only
+   * fires when the running issue owns the worktree it is sitting in (SUP-11260),
+   * so a test that expects inheritance has to say who the owner is. Defaults to
+   * the running issue, which is the ordinary case.
+   */
+  workspaceOwnerIssueId: string | null = typeof contextSnapshot.issueId === "string"
+    ? contextSnapshot.issueId
+    : null,
 ) {
   const runRows = Array.isArray(runAgentOrRows)
     ? runAgentOrRows
@@ -283,6 +292,9 @@ function createRunContextDb(
   const rowsForSelection = (selection: Record<string, unknown>) => {
     const keys = Object.keys(selection);
     if (keys.includes("entityId")) return [];
+    if (keys.includes("sourceIssueId")) {
+      return workspaceOwnerIssueId ? [{ sourceIssueId: workspaceOwnerIssueId }] : [];
+    }
     if (keys.includes("contextSnapshot")) return runRows;
     if (keys.includes("agentCompanyId")) return runRows;
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
@@ -1221,6 +1233,86 @@ describe("agent issue mutation checkout ownership", () => {
         title: "Reuse the current worktree",
         executionWorkspacePreference: "reuse_existing",
         inheritExecutionWorkspaceFromIssueId: issueId,
+      }),
+    );
+  });
+
+  it("does not hand on a workspace the running issue only borrowed", async () => {
+    // SUP-11260: the run is a guest in another issue's worktree. Passing that
+    // worktree to every issue it creates is how one workspace accumulated 31
+    // unrelated issues over eight days, and how two agents ended up editing one
+    // working tree — where an observed `git reset` destroyed a sibling's commit.
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb(
+        { issueId, executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+        ownerAgentId,
+        ownerRunId,
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      ),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Follow-up from a borrowed worktree" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.not.objectContaining({
+        inheritExecutionWorkspaceFromIssueId: expect.anything(),
+      }),
+    );
+  });
+
+  it("drops a bare reuse_existing when the borrowed workspace is withheld", async () => {
+    // Declining the inheritance must not turn into a 422. `reuse_existing` with no
+    // id is a request to continue somewhere; once that is refused there is nothing
+    // for the preference to name, and a fresh workspace is the honest answer.
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb(
+        { issueId, executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+        ownerAgentId,
+        ownerRunId,
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      ),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Reuse a worktree the run does not own",
+        executionWorkspacePreference: "reuse_existing",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [, createArgs] = mockIssueService.create.mock.calls.at(-1) ?? [];
+    expect(createArgs).toMatchObject({ title: "Reuse a worktree the run does not own" });
+    expect((createArgs as Record<string, unknown>).executionWorkspacePreference).toBeUndefined();
+    expect((createArgs as Record<string, unknown>).inheritExecutionWorkspaceFromIssueId).toBeUndefined();
+  });
+
+  it("does not hand on a run workspace whose owning workspace row is gone", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb(
+        { issueId, executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+        ownerAgentId,
+        ownerRunId,
+        null,
+      ),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Follow-up with no resolvable workspace owner" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.not.objectContaining({
+        inheritExecutionWorkspaceFromIssueId: expect.anything(),
       }),
     );
   });
