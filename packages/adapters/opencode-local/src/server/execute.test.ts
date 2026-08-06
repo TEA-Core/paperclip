@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { runAdapterExecutionTargetProcessMock } = vi.hoisted(() => ({
@@ -66,6 +69,7 @@ vi.mock("./models.js", () => ({
 }));
 
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { runningProcesses } from "@paperclipai/adapter-utils/server-utils";
 
 import {
   buildOpenCodeRunArgs,
@@ -592,4 +596,209 @@ describe("execute — per-agent opencode database", () => {
     const call = runAdapterExecutionTargetProcessMock.mock.calls.at(-1);
     expect(call?.[4].env.OPENCODE_DB).toBe("shared.db");
   });
+});
+
+// SUP-10914: per-agent databases stop a runaway run from failing OTHER agents,
+// but nothing stops it destroying its own — the fix for that (bound the message
+// row, emit deltas instead of per-delta full snapshots) is inside opencode and
+// unreachable from here. The guard watches the only thing the adapter can see:
+// the database and its WAL gaining hundreds of megabytes inside one run.
+describe("execute — opencode database growth guard", () => {
+  const TRANSIENT_STDERR = "Failed to execute statement / Unexpected server error";
+  const cleanupPaths = new Set<string>();
+
+  async function makeDataHome() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-guard-"));
+    cleanupPaths.add(root);
+    await fs.mkdir(path.join(root, "opencode"), { recursive: true });
+    return root;
+  }
+
+  function makeCtx(config: Record<string, unknown>, overrides: Partial<AdapterExecutionContext> = {}) {
+    return {
+      runId: "run-guard",
+      agent: {
+        id: "agent-guard",
+        companyId: "company-1",
+        name: "OpenCode Agent",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { model: "router/coder", cwd: process.cwd(), ...config },
+      context: {},
+      onLog: async () => {},
+      ...overrides,
+    } as AdapterExecutionContext;
+  }
+
+  function guardEnv(dataHome: string, extra: Record<string, string> = {}) {
+    return {
+      XDG_DATA_HOME: dataHome,
+      PAPERCLIP_OPENCODE_DB_GROWTH_LIMIT_MB: "1",
+      PAPERCLIP_OPENCODE_DB_GROWTH_POLL_SEC: "1",
+      ...extra,
+    };
+  }
+
+  /**
+   * Stand in for a runaway run: the process writes far past the budget and keeps
+   * running, exactly as the 431 MB message did, and only exits once the guard
+   * has had time to notice and signal it.
+   */
+  function runawayProcess(databasePath: string, stderr = "") {
+    return async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await fs.writeFile(`${databasePath}-wal`, Buffer.alloc(4 * 1024 * 1024));
+      await new Promise((resolve) => setTimeout(resolve, 1800));
+      return { exitCode: null, signal: "SIGTERM", timedOut: false, stdout: "", stderr };
+    };
+  }
+
+  beforeEach(() => {
+    runAdapterExecutionTargetProcessMock.mockReset();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await Promise.all(
+      [...cleanupPaths].map(async (filepath) => {
+        await fs.rm(filepath, { recursive: true, force: true });
+        cleanupPaths.delete(filepath);
+      }),
+    );
+  });
+
+  it("fails a runaway run under its own error code", async () => {
+    const dataHome = await makeDataHome();
+    const databasePath = path.join(dataHome, "opencode", "opencode-agent-agent-guard.db");
+    runAdapterExecutionTargetProcessMock.mockImplementation(runawayProcess(databasePath));
+
+    const logs: string[] = [];
+    const result = await execute(
+      makeCtx(
+        { env: guardEnv(dataHome) },
+        { onLog: async (_stream: "stdout" | "stderr", chunk: string) => void logs.push(chunk) },
+      ),
+    );
+
+    expect(result.errorCode).toBe("opencode_db_growth_limit");
+    // SIGTERM leaves no exit code; without synthesis this would read as a success.
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("OpenCode database grew");
+    expect(logs.some((line) => line.includes("OpenCode database grew"))).toBe(true);
+    const growth = (result.errorMeta as { databaseGrowth?: { growthBytes?: number } } | undefined)
+      ?.databaseGrowth;
+    expect(growth?.growthBytes).toBeGreaterThanOrEqual(4 * 1024 * 1024);
+  }, 20000);
+
+  // Terminating the run is the whole point: without the signal the guard just
+  // annotates a run that keeps writing.
+  it("signals the running process so the runaway actually stops writing", async () => {
+    const dataHome = await makeDataHome();
+    const databasePath = path.join(dataHome, "opencode", "opencode-agent-agent-guard.db");
+    runAdapterExecutionTargetProcessMock.mockImplementation(runawayProcess(databasePath));
+
+    const kill = vi.fn();
+    runningProcesses.set("run-guard", {
+      child: { exitCode: null, signalCode: null, kill },
+      processGroupId: 0,
+    } as unknown as NonNullable<ReturnType<typeof runningProcesses.get>>);
+
+    try {
+      await execute(makeCtx({ env: guardEnv(dataHome) }));
+    } finally {
+      runningProcesses.delete("run-guard");
+    }
+
+    expect(kill).toHaveBeenCalledWith("SIGTERM");
+  }, 20000);
+
+  // The transient-statement retry exists for lock errors — which a runaway run
+  // plausibly emits. Retrying one would replay the same message and write the
+  // same bytes again, so the guard has to win.
+  it("never retries a run it killed, even when the run also looks transient", async () => {
+    const dataHome = await makeDataHome();
+    const databasePath = path.join(dataHome, "opencode", "opencode-agent-agent-guard.db");
+    runAdapterExecutionTargetProcessMock.mockImplementation(
+      runawayProcess(databasePath, TRANSIENT_STDERR),
+    );
+
+    const result = await execute(makeCtx({ env: guardEnv(dataHome) }));
+
+    expect(result.errorCode).toBe("opencode_db_growth_limit");
+    expect(runAdapterExecutionTargetProcessMock).toHaveBeenCalledTimes(1);
+  }, 20000);
+
+  it("lets a run that stays inside its budget finish normally", async () => {
+    const dataHome = await makeDataHome();
+    const databasePath = path.join(dataHome, "opencode", "opencode-agent-agent-guard.db");
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => {
+      await fs.writeFile(databasePath, Buffer.alloc(64 * 1024));
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      return { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+    });
+
+    const result = await execute(makeCtx({ env: guardEnv(dataHome) }));
+
+    expect(result.errorCode ?? null).toBeNull();
+    expect(result.exitCode).toBe(0);
+  }, 20000);
+
+  it("records that the guard is armed in the run's command notes", async () => {
+    const dataHome = await makeDataHome();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+    }));
+
+    let commandNotes: string[] = [];
+    await execute(
+      makeCtx(
+        { env: guardEnv(dataHome) },
+        { onMeta: async (meta: { commandNotes?: string[] }) => void (commandNotes = meta.commandNotes ?? []) },
+      ),
+    );
+
+    expect(commandNotes.some((note) => note.includes("database growth guard"))).toBe(true);
+  });
+
+  // On the shared database the growth we would measure may belong to a
+  // different agent's run. Killing this run for someone else's writes would be
+  // worse than the leak, so the guard stays disarmed.
+  it("stays disarmed on a shared database", async () => {
+    const dataHome = await makeDataHome();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+    }));
+
+    let commandNotes: string[] = [];
+    await execute(
+      makeCtx(
+        { env: guardEnv(dataHome, { PAPERCLIP_OPENCODE_SHARED_DB: "1" }) },
+        { onMeta: async (meta: { commandNotes?: string[] }) => void (commandNotes = meta.commandNotes ?? []) },
+      ),
+    );
+
+    expect(commandNotes.some((note) => note.includes("database growth guard"))).toBe(false);
+  });
+
+  it("stays disarmed when an operator opts out with a zero budget", async () => {
+    const dataHome = await makeDataHome();
+    const databasePath = path.join(dataHome, "opencode", "opencode-agent-agent-guard.db");
+    runAdapterExecutionTargetProcessMock.mockImplementation(runawayProcess(databasePath));
+
+    const result = await execute(
+      makeCtx({ env: guardEnv(dataHome, { PAPERCLIP_OPENCODE_DB_GROWTH_LIMIT_MB: "0" }) }),
+    );
+
+    expect(result.errorCode).not.toBe("opencode_db_growth_limit");
+  }, 20000);
 });
