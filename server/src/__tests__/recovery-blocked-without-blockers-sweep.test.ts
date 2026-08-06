@@ -1,13 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
+  agentRuntimeState,
   agentWakeupRequests,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
+  instanceSettings,
+  issueComments,
   issueRelations,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -22,7 +26,31 @@ import {
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
 
+const mockAdapterExecute = vi.hoisted(() =>
+  vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    errorMessage: null,
+    summary: "Recovered blocked-without-blockers work.",
+    provider: "test",
+    model: "test-model",
+  })),
+);
+
+vi.mock("../adapters/index.ts", async () => {
+  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
+  return {
+    ...actual,
+    getServerAdapter: vi.fn(() => ({
+      supportsLocalAgentJwt: false,
+      execute: mockAdapterExecute,
+    })),
+  };
+});
+
 import { heartbeatService } from "../services/heartbeat.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
 import { isBlockedWithoutBlockers } from "../services/recovery/service.ts";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "../services/issue-dependency-wakeups.ts";
 
@@ -52,16 +80,38 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(issueRelations);
-    await db.delete(issueRecoveryActions);
-    await db.delete(agentWakeupRequests);
-    await db.delete(issueThreadInteractions);
-    await db.delete(issueTreeHolds);
-    await db.delete(activityLog);
-    await db.delete(issues);
-    await db.delete(heartbeatRuns);
-    await db.delete(agents);
-    await db.delete(companies);
+    vi.clearAllMocks();
+    // Cleans up the issue graph plus everything a dispatched heartbeat run may
+    // create (run events, environment leases, documents/comments, company skills).
+    // CASCADE handles FK references that are omitted from this list.
+    await db.execute(sql.raw(`
+      TRUNCATE TABLE
+        "activity_log",
+        "document_revisions",
+        "documents",
+        "environment_leases",
+        "environments",
+        "heartbeat_run_events",
+        "heartbeat_run_watchdog_decisions",
+        "heartbeat_runs",
+        "issue_comments",
+        "issue_documents",
+        "issue_relations",
+        "issue_recovery_actions",
+        "issue_thread_interactions",
+        "issue_tree_hold_members",
+        "issue_tree_holds",
+        "issue_work_products",
+        "issues",
+        "agent_wakeup_requests",
+        "agent_runtime_state",
+        "company_skill_versions",
+        "company_skills",
+        "agents",
+        "instance_settings",
+        "companies"
+      RESTART IDENTITY CASCADE
+    `));
   });
 
   afterAll(async () => {
@@ -75,6 +125,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       id: companyId,
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(agents).values({
@@ -93,6 +144,22 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
 
   function oldDate() {
     return new Date(Date.now() - GRACE_THRESHOLD_MS - 60_000);
+  }
+
+  async function enableBlockedWithoutBlockersAutoHeal() {
+    await instanceSettingsService(db).updateGeneral({ enableBlockedWithoutBlockersAutoHeal: true });
+  }
+
+  async function drainAgentRuns(agentId: string, timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const activeRuns = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, ["queued", "running"] as const)));
+      if (activeRuns.length === 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
   }
 
   it("escalates a blocked issue with zero blocker edges into a board-owned recovery action", async () => {
@@ -507,5 +574,194 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(result.pauseHoldSkipped).toBe(1);
     expect(result.escalated).toBe(0);
     expect(result.issueIds).toEqual([]);
+  });
+
+  it("setting OFF: does not heal or change status (identical to 9ed3c8a5)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked with no blockers — setting off",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.checked).toBe(1);
+    expect(result.healed).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+
+    const wakeups = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.length);
+    expect(wakeups).toBe(0);
+  });
+
+  it("setting ON: heals a candidate with an assignee — transitions to todo AND enqueues a dispatch wake", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked with no blockers — setting on",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.checked).toBe(1);
+    expect(result.healed).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("todo");
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0]);
+    expect(wakeup).toMatchObject({
+      companyId,
+      agentId,
+      source: "assignment",
+      reason: "issue_assigned",
+      payload: expect.objectContaining({
+        issueId,
+        mutation: "assigned_todo_liveness_dispatch",
+      }),
+      requestedByActorType: "system",
+    });
+
+    const action = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0]);
+    expect(action).toBeUndefined();
+
+    const audit = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows[0]);
+    expect(audit?.action).toBe("issue.blocked_without_blockers_healed");
+
+    await drainAgentRuns(agentId);
+  });
+
+  it("setting ON: candidate with assigneeAgentId: null falls through to board-owned action, not healed", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked with no blockers and no assignee",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: null,
+      updatedAt: oldDate(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.checked).toBe(1);
+    expect(result.healed).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+
+    const wakeup = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0]);
+    expect(wakeup).toBeUndefined();
+
+    const action = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0]);
+    expect(action).toMatchObject({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "blocked_without_blockers",
+      ownerType: "board",
+      previousOwnerAgentId: null,
+    });
+  });
+
+  it("healed is counted separately from escalated", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const healableId = randomUUID();
+    const unassignedId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: healableId,
+        companyId,
+        title: "Healable blocked issue",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: agentId,
+        updatedAt: oldDate(),
+      },
+      {
+        id: unassignedId,
+        companyId,
+        title: "Unassigned blocked issue",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: null,
+        updatedAt: oldDate(),
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.checked).toBe(2);
+    expect(result.healed).toBe(1);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds.sort()).toEqual([healableId, unassignedId].sort());
+
+    await drainAgentRuns(agentId);
   });
 });
