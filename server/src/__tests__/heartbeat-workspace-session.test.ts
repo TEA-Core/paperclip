@@ -1547,6 +1547,51 @@ describe("effective run execution workspace config freshness", () => {
     expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
   });
 
+  // 2026-08-06: the cleanup-reason allowlist alone stranded 14 issues overnight.
+  // A bulk archive wrote `cleanup_reason = NULL` on one row and free-text prose
+  // on the others, and those rows came from neither this server nor the reaper.
+  // No allowlist can cover reasons nobody has written yet, so an absent
+  // directory — an observable fact — has to be sufficient on its own.
+  it("treats an archived workspace whose directory is gone as unrestorable, whatever the reason says", () => {
+    for (const cleanupReason of [null, "", "worktree directory retained: HEAD unresolvable", "something nobody predicted"]) {
+      const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+        issueExecutionWorkspaceId: "workspace-old",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: "archived",
+        existingExecutionWorkspaceCleanupReason: cleanupReason,
+        existingExecutionWorkspaceDirectoryExists: false,
+      });
+      expect(reuseRequest.bindingUnrestorable).toBe(true);
+      expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+    }
+  });
+
+  // Still present on disk means possibly repairable by unarchiving, which is a
+  // human's call. Keep failing loudly rather than quietly abandoning it.
+  it("keeps failing loudly when the archived workspace's directory still exists", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "archived",
+      existingExecutionWorkspaceCleanupReason: "worktree directory retained: HEAD unresolvable",
+      existingExecutionWorkspaceDirectoryExists: true,
+    });
+    expect(reuseRequest.bindingUnrestorable).toBe(false);
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+  });
+
+  // A stat we could not complete is not evidence. Never self-heal on it.
+  it("does not self-heal when the directory could not be probed", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "archived",
+      existingExecutionWorkspaceCleanupReason: null,
+      existingExecutionWorkspaceDirectoryExists: null,
+    });
+    expect(reuseRequest.bindingUnrestorable).toBe(false);
+  });
+
   it("ignores a cleanup reason when the workspace is still active", () => {
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-old",
