@@ -402,6 +402,59 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     });
   }, 20_000);
 
+  // SUP-11207: finalize used to skip branch normalisation entirely when the run failed, so a
+  // crashed or failing run left the worktree parked on the agent's branch and the *next* dispatch
+  // dead-blocked on workspace_validation_failed. Normalise on the failed path too — best-effort,
+  // without turning the run's own failure into a workspace validation failure.
+  it("normalizes unrecorded branch drift when the adapter run throws", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const { agentId, issueId } = await seedRunTarget(db, repoRoot);
+    const publishBranch = `publish-${issueId.slice(0, 8)}`;
+    let recordedBranch: string | null = null;
+    let executionWorkspaceId: string | null = null;
+    let workspaceCwd: string | null = null;
+
+    adapterExecute.mockImplementationOnce(async (input) => {
+      const workspace = readAdapterWorkspace(input);
+      recordedBranch = workspace.branchName;
+      executionWorkspaceId = workspace.executionWorkspaceId;
+      workspaceCwd = workspace.cwd;
+      await runGit(workspace.cwd, ["checkout", "-b", publishBranch]);
+      throw new Error("adapter crashed after switching to a publish branch");
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await wakeIssue(heartbeat, agentId, issueId);
+    expect(run).not.toBeNull();
+
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    // The run still reports its own failure — not a workspace validation failure.
+    expect(finishedRun?.status).toBe("failed");
+    expect(finishedRun?.errorCode).not.toBe("workspace_validation_failed");
+    await waitForRuntimeStateLastRun(db, agentId, run!.id);
+
+    // The worktree is back on its recorded branch, so the next dispatch will not dead-block.
+    await expect(execFileAsync("git", ["branch", "--show-current"], { cwd: workspaceCwd! }))
+      .resolves.toMatchObject({ stdout: `${recordedBranch}\n` });
+
+    const finalizeOps = await listFinalizeOperations(db, run!.id);
+    expect(finalizeOps).toHaveLength(1);
+    expect(finalizeOps[0]).toMatchObject({ status: "failed", executionWorkspaceId });
+    expect(finalizeOps[0]?.metadata).toMatchObject({
+      managedGitWorktreeBranchRepair: {
+        attempted: true,
+        succeeded: true,
+        initial: expect.objectContaining({
+          valid: false,
+          reasonCode: "branch_mismatch",
+          expectedBranchName: recordedBranch,
+          actualBranchName: publishBranch,
+        }),
+      },
+    });
+  }, 20_000);
+
   it("adopts unrecorded forward branch drift for finalization without persisting it", async () => {
     const repoRoot = await createGitRepo();
     tempRoots.push(repoRoot);

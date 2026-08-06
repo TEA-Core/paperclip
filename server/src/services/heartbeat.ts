@@ -13915,7 +13915,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (adapterFinalizeOutcome) return;
         let finalizeBranchMetadata: Record<string, unknown> | null = null;
         let finalizeBranchRepairMetadata: Record<string, unknown> | null = null;
-        if (status === "succeeded") {
+        // SUP-11207: a run that failed or crashed used to skip branch normalisation entirely,
+        // leaving the worktree wherever the agent parked it. The *next* dispatch then hard-failed
+        // worktree_prepare validation and dead-blocked the issue behind
+        // workspace_validation_failed. Normalise on both outcomes, but on the failed path this is
+        // strictly best-effort: it must never throw, and must never convert an already-failed run
+        // into a workspace validation failure that masks the real reason the run failed.
+        const enforceFinalizeBranchValidity = status === "succeeded";
+        try {
           const branchInspection = await inspectFinalizeWorkspaceBranch();
           if (branchInspection) {
             let inspection = branchInspection.inspection;
@@ -13964,6 +13971,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   initial: initialManagedGitWorktreeBranch,
                   reason: repairErr instanceof Error ? repairErr.message : String(repairErr),
                 };
+                // Failed path: hand off to the outer catch, which logs and lets the ordinary
+                // finalize=failed record land carrying the repair metadata set just above. Writing
+                // a second failed operation row here would collide with that record.
+                if (!enforceFinalizeBranchValidity) throw repairErr;
                 await workspaceOperationRecorder.recordOperation({
                   phase: "workspace_finalize",
                   cwd: executionWorkspace.cwd,
@@ -14005,7 +14016,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               executionWorkspaceId: branchInspection.workspaceRecord.id,
               ...managedGitWorktreeBranch,
             };
-            if (!inspection.valid) {
+            if (!inspection.valid && enforceFinalizeBranchValidity) {
               const workspaceValidationFingerprint = fingerprintFinalizeWorkspaceBranchValidation({
                 issueId: issueRef?.id ?? null,
                 executionWorkspaceId: branchInspection.workspaceRecord.id,
@@ -14044,6 +14055,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               );
             }
           }
+        } catch (branchErr) {
+          if (enforceFinalizeBranchValidity) throw branchErr;
+          // Failed path only: whatever went wrong inspecting or normalising the branch, the run's
+          // own failure is the story worth telling. Record it and let finalize=failed land.
+          logger.warn(
+            { err: branchErr, runId: run.id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? null },
+            "best-effort workspace branch normalisation failed after a failed run; the next dispatch may still hit workspace_validation_failed",
+          );
         }
         await workspaceOperationRecorder.recordOperation({
           phase: "workspace_finalize",
