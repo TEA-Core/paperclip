@@ -14372,6 +14372,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
+      await appendRunEvent(run, seq++, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: outcome === "succeeded" ? "info" : "error",
+        message: `run ${outcome}`,
+        payload: {
+          status,
+          exitCode: adapterResult.exitCode,
+        },
+      });
+
       const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
         finishedAt: new Date(),
         error: runErrorMessage,
@@ -14411,16 +14422,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
-        await appendRunEvent(finalizedRun, seq++, {
-          eventType: "lifecycle",
-          stream: "system",
-          level: outcome === "succeeded" ? "info" : "error",
-          message: `run ${outcome}`,
-          payload: {
-            status,
-            exitCode: adapterResult.exitCode,
-          },
-        });
         try {
           await completeSkillTestRunForHeartbeatOutcome({
             run: finalizedRun,
@@ -14596,6 +14597,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
       });
 
+      await appendRunEvent(run, seq++, {
+        eventType: "error",
+        stream: "system",
+        level: "error",
+        message,
+      });
+
       const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: message,
         errorCode: failureErrorCode,
@@ -14630,12 +14638,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       if (failedRun) {
-        await appendRunEvent(failedRun, seq++, {
-          eventType: "error",
-          stream: "system",
-          level: "error",
-          message,
-        });
         const livenessRun = await classifyAndPersistRunLiveness(failedRun) ?? failedRun;
         try {
           await completeSkillTestRunForHeartbeatOutcome({
@@ -14712,6 +14714,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "setup_failed";
           logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
+          // Emit the run-log event before the status flip so the event stream is
+          // complete by the time terminal status is observable. Only do so while
+          // the run is still `running`: if another path already finalized it (a
+          // cancel, or the inner catch), setRunStatusIfRunning below is a no-op
+          // and this event would be a spurious late error on a settled run.
+          const failedRunPreFlip = await getRun(runId).catch(() => null);
+          if (failedRunPreFlip?.status === "running") {
+            await appendRunEvent(failedRunPreFlip, 1, {
+              eventType: "error",
+              stream: "system",
+              level: "error",
+              message,
+            }).catch(() => undefined);
+          }
           const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
             error: message,
             errorCode: setupFailureErrorCode,
@@ -14742,14 +14758,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           const failedRun = await getRun(runId).catch(() => null);
           if (setupFailureWrite.updated && failedRun) {
-            // Emit a run-log event so the failure is visible in the run timeline,
-            // consistent with what the inner catch block does for adapter failures.
-            await appendRunEvent(failedRun, 1, {
-              eventType: "error",
-              stream: "system",
-              level: "error",
-              message,
-            }).catch(() => undefined);
             const livenessRun = await classifyAndPersistRunLiveness(failedRun).catch(() => failedRun);
             const setupFailureIssueId = readNonEmptyString(parseObject(livenessRun.contextSnapshot).issueId);
             if (setupFailureIssueId) {
