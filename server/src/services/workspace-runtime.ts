@@ -3500,6 +3500,77 @@ async function pruneExpiredWorktreeRescueRefs(cwd: string, ttlMs = WORKTREE_RESC
   }
 }
 
+const WORKTREE_PRESERVATION_REF_PREFIX = "refs/preserved";
+
+export async function preserveUnpushedWorktreeCommits(input: {
+  workspacePath: string;
+  branchName: string;
+  issueIdentifier: string | null;
+  repoRoot: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{
+  preserved: boolean;
+  preservedRef: string | null;
+  commitSha: string | null;
+  warning: string | null;
+}> {
+  const notPreserved = { preserved: false, preservedRef: null, commitSha: null, warning: null } as const;
+  try {
+    const revList = await runGit(["rev-list", "HEAD", "--not", "--remotes"], input.workspacePath);
+    if (!revList.trim()) return notPreserved;
+
+    const commitSha = await runGit(["rev-parse", "HEAD"], input.workspacePath);
+    const safeIdentifier = (input.issueIdentifier ?? "unknown").replace(/[^a-zA-Z0-9._\-]/g, "_");
+    const safeBranchName = input.branchName.replace(/[^a-zA-Z0-9._\-]/g, "_");
+    const preservedRef = `${WORKTREE_PRESERVATION_REF_PREFIX}/${safeIdentifier}/${safeBranchName}`;
+
+    try {
+      await runGit(["push", "origin", `${commitSha}:${preservedRef}`], input.repoRoot);
+    } catch (pushErr) {
+      const pushMessage = pushErr instanceof Error ? pushErr.message : String(pushErr);
+      return {
+        preserved: false,
+        preservedRef: null,
+        commitSha,
+        warning: `Could not push unpushed commits to preservation ref ${preservedRef}: ${pushMessage}`,
+      };
+    }
+
+    if (input.recorder) {
+      await input.recorder.recordOperation({
+        phase: "worktree_cleanup",
+        command: formatCommandForDisplay("git", ["push", "origin", `${commitSha}:${preservedRef}`]),
+        cwd: input.repoRoot,
+        metadata: {
+          workspacePath: input.workspacePath,
+          branchName: input.branchName,
+          issueIdentifier: input.issueIdentifier,
+          cleanupAction: "preserve_unpushed_commits",
+          commitSha,
+          preservedRef,
+        },
+        run: async () => ({
+          status: "succeeded",
+          exitCode: 0,
+          system:
+            `Preserved unpushed commits as ${commitSha} before removing the worktree ` +
+            `(recoverable from ${preservedRef})\n`,
+        }),
+      });
+    }
+
+    return { preserved: true, preservedRef, commitSha, warning: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      preserved: false,
+      preservedRef: null,
+      commitSha: null,
+      warning: `Could not preserve unpushed commits in "${input.workspacePath}" before removal: ${message}`,
+    };
+  }
+}
+
 /**
  * Commits whatever is sitting uncommitted in a worktree before the worktree is destroyed.
  *

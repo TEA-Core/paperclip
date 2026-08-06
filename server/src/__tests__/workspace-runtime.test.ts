@@ -35,6 +35,7 @@ import {
   ensureRuntimeServicesForRun,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
+  preserveUnpushedWorktreeCommits,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
@@ -135,6 +136,15 @@ async function createTempRepo(defaultBranch = "main") {
   await runGit(repoRoot, ["commit", "-m", "Initial commit"]);
   await runGit(repoRoot, ["checkout", "-B", defaultBranch]);
   return repoRoot;
+}
+
+async function createTempRepoWithRemote(defaultBranch = "main") {
+  const remoteRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-remote-"));
+  await runGit(remoteRoot, ["init", "--bare", "--initial-branch", defaultBranch]);
+  const repoRoot = await createTempRepo(defaultBranch);
+  await runGit(repoRoot, ["remote", "add", "origin", remoteRoot]);
+  await runGit(repoRoot, ["push", "-u", "origin", defaultBranch]);
+  return { repoRoot, remoteRoot };
 }
 
 async function expectPersistedBranchMismatchRejected(input: {
@@ -7030,5 +7040,142 @@ describe("normalizeAdapterManagedRuntimeServices", () => {
       scopeId: "execution-workspace-1",
       executionWorkspaceId: "execution-workspace-1",
     });
+  });
+});
+
+describe("preserveUnpushedWorktreeCommits", () => {
+  it("returns not-preserved when remote has everything", async () => {
+    const { repoRoot } = await createTempRepoWithRemote();
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "main",
+      issueIdentifier: "SUP-11202",
+      repoRoot,
+    });
+
+    expect(result.preserved).toBe(false);
+    expect(result.preservedRef).toBeNull();
+    expect(result.commitSha).toBeNull();
+    expect(result.warning).toBeNull();
+  });
+
+  it("preserves unpushed commits when push succeeds", async () => {
+    const { repoRoot } = await createTempRepoWithRemote();
+
+    await runGit(repoRoot, ["checkout", "-b", "feature-branch"]);
+    await fs.writeFile(path.join(repoRoot, "feature.txt"), "feature\n", "utf8");
+    await runGit(repoRoot, ["add", "feature.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add feature"]);
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "feature-branch",
+      issueIdentifier: "SUP-11202",
+      repoRoot,
+    });
+
+    expect(result.preserved).toBe(true);
+    expect(result.preservedRef).toBe("refs/preserved/SUP-11202/feature-branch");
+    expect(result.commitSha).toBeTruthy();
+    expect(result.warning).toBeNull();
+
+    const remoteRoot = await readGit(repoRoot, ["remote", "get-url", "origin"]);
+    const refExists = await readGit(remoteRoot, [
+      "show-ref",
+      "--verify",
+      "--quiet",
+      "refs/preserved/SUP-11202/feature-branch",
+    ]);
+    expect(refExists).toBe("");
+  });
+
+  it("returns warning when no origin configured", async () => {
+    const repoRoot = await createTempRepo();
+
+    await runGit(repoRoot, ["checkout", "-b", "feature-branch"]);
+    await fs.writeFile(path.join(repoRoot, "feature.txt"), "feature\n", "utf8");
+    await runGit(repoRoot, ["add", "feature.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add feature"]);
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "feature-branch",
+      issueIdentifier: "SUP-11202",
+      repoRoot,
+    });
+
+    expect(result.preserved).toBe(false);
+    expect(result.preservedRef).toBeNull();
+    expect(result.commitSha).toBeTruthy();
+    expect(result.warning).toBeTruthy();
+    expect(result.warning).toContain("Could not push");
+  });
+
+  it("preserves commits when branch was never pushed to remote", async () => {
+    const { repoRoot } = await createTempRepoWithRemote();
+
+    await runGit(repoRoot, ["checkout", "-b", "new-branch"]);
+    await fs.writeFile(path.join(repoRoot, "new.txt"), "new\n", "utf8");
+    await runGit(repoRoot, ["add", "new.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add new work"]);
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "new-branch",
+      issueIdentifier: "SUP-11202",
+      repoRoot,
+    });
+
+    expect(result.preserved).toBe(true);
+    expect(result.preservedRef).toBe("refs/preserved/SUP-11202/new-branch");
+    expect(result.commitSha).toBeTruthy();
+    expect(result.warning).toBeNull();
+
+    const remoteRoot = await readGit(repoRoot, ["remote", "get-url", "origin"]);
+    const refExists = await readGit(remoteRoot, [
+      "show-ref",
+      "--verify",
+      "--quiet",
+      "refs/preserved/SUP-11202/new-branch",
+    ]);
+     expect(refExists).toBe("");
+  });
+
+  it("inspects worktree HEAD, not repo root HEAD, when workspace is a git worktree", async () => {
+    const { repoRoot, remoteRoot } = await createTempRepoWithRemote();
+
+    await fs.writeFile(path.join(repoRoot, "main.txt"), "main\n", "utf8");
+    await runGit(repoRoot, ["add", "main.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Main repo commit"]);
+    await runGit(repoRoot, ["push", "origin", "main"]);
+
+    const worktreePath = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-test-"));
+    await runGit(repoRoot, ["worktree", "add", "-b", "worktree-branch", worktreePath]);
+
+    await fs.writeFile(path.join(worktreePath, "worktree.txt"), "worktree\n", "utf8");
+    await runGit(worktreePath, ["add", "worktree.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Worktree-only commit"]);
+
+    const repoHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const worktreeHead = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    expect(repoHead).not.toBe(worktreeHead);
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: worktreePath,
+      branchName: "worktree-branch",
+      issueIdentifier: "SUP-11202",
+      repoRoot,
+    });
+
+    expect(result.preserved).toBe(true);
+    expect(result.commitSha).toBe(worktreeHead);
+    expect(result.preservedRef).toBe("refs/preserved/SUP-11202/worktree-branch");
+    expect(result.warning).toBeNull();
+
+    const preservedCommit = await readGit(remoteRoot, ["rev-parse", "refs/preserved/SUP-11202/worktree-branch"]);
+    expect(preservedCommit).toBe(worktreeHead);
+
+    await runGit(repoRoot, ["worktree", "remove", "--force", worktreePath]);
   });
 });
