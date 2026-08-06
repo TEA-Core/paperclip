@@ -5937,6 +5937,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const result = {
       checked: 0,
       escalated: 0,
+      healed: 0,
       livePathSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
@@ -5982,6 +5983,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       candidatesByCompany.set(candidate.companyId, companyCandidates);
     }
 
+    const general = await instanceSettings.getGeneral();
+
     for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
       const readinessMap = await issuesSvc.listDependencyReadiness(
         companyId,
@@ -6017,6 +6020,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         const existingAction = await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
         if (existingAction?.kind === "blocked_without_blockers") {
           result.alreadyActionedSkipped++;
+          continue;
+        }
+
+        // Auto-heal path — setting-gated, default OFF
+        if (general.enableBlockedWithoutBlockersAutoHeal && candidate.assigneeAgentId) {
+          await issuesSvc.update(candidate.id, { status: "todo" });
+          await enqueueInitialAssignedTodoDispatch(
+            { id: candidate.id, companyId: candidate.companyId, projectId: null } as typeof issues.$inferSelect,
+            candidate.assigneeAgentId,
+          );
+          result.healed++;
+          result.issueIds.push(candidate.id);
+          await logActivity(db, {
+            companyId,
+            actorType: "system",
+            actorId: "issue_graph_liveness_blocked_without_blockers",
+            runId: opts?.runId ?? null,
+            action: "issue.blocked_without_blockers_healed",
+            entityType: "issue",
+            entityId: candidate.id,
+            details: { source, fingerprint: `bwob:${companyId}:${candidate.id}` },
+          });
           continue;
         }
 
@@ -6063,8 +6088,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     if (result.escalated > 0) {
       logger.warn(
-        { escalated: result.escalated, issueIds: result.issueIds, source },
+        { escalated: result.escalated, healed: result.healed, issueIds: result.issueIds, source },
         "blocked-without-blockers escalated to board-owned recovery actions",
+      );
+    } else if (result.healed > 0) {
+      logger.info(
+        { healed: result.healed, issueIds: result.issueIds, source },
+        "blocked-without-blockers auto-healed and dispatched",
       );
     }
 
