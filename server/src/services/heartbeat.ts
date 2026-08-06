@@ -385,6 +385,17 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "opencode_local",
   "pi_local",
 ]);
+export const EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON = "execution_workspace_occupied";
+export const EXECUTION_WORKSPACE_OCCUPIED_WAKE_REASON = "execution_workspace_occupied_retry";
+export const EXECUTION_WORKSPACE_OCCUPIED_FAILURE_CODE = "execution_workspace_occupied";
+/**
+ * How many times a dispatch will wait for a shared worktree before giving up on
+ * reuse. Five waits at a minute apiece covers the ordinary case — a sibling run
+ * finishing normally — without letting one wedged run hold its siblings for an
+ * unbounded stretch.
+ */
+const EXECUTION_WORKSPACE_OCCUPIED_MAX_DEFERRALS = 5;
+const EXECUTION_WORKSPACE_OCCUPIED_DEFER_DELAY_MS = 60_000;
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -3470,6 +3481,56 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
     existingExecutionWorkspaceAvailable,
     bindingUnrestorable,
   };
+}
+
+export type ExecutionWorkspaceOccupancyDecision =
+  | { action: "proceed" }
+  | { action: "defer"; attempt: number; maxDeferrals: number; delayMs: number }
+  | { action: "provision_fresh"; deferrals: number };
+
+/**
+ * SUP-11260: decide what a dispatch does when the workspace it wants to reuse
+ * is already occupied by another issue's live run.
+ *
+ * Waiting is the right first answer — the sibling usually finishes in minutes,
+ * and waiting preserves the branch continuity that made the two issues share a
+ * worktree in the first place.
+ *
+ * Refusing outright is the wrong last answer. That is the shape that dead-blocks
+ * an issue behind a run that never releases, which is the failure this platform
+ * has already paid for once (see workspace_validation_failed / SUP-11207). So
+ * once the wait budget is spent the run provisions its own fresh workspace: it
+ * loses branch continuity, which is cheap and visible, rather than losing a
+ * sibling's commits or losing the ability to run at all.
+ */
+export function resolveExecutionWorkspaceOccupancyDecision(input: {
+  reuseRequested: boolean;
+  occupied: boolean;
+  priorDeferrals: number;
+  maxDeferrals?: number;
+  delayMs?: number;
+}): ExecutionWorkspaceOccupancyDecision {
+  const maxDeferrals = Math.max(0, Math.floor(input.maxDeferrals ?? EXECUTION_WORKSPACE_OCCUPIED_MAX_DEFERRALS));
+  const delayMs = Math.max(0, Math.floor(input.delayMs ?? EXECUTION_WORKSPACE_OCCUPIED_DEFER_DELAY_MS));
+  const priorDeferrals = Math.max(0, Math.floor(input.priorDeferrals));
+  if (!input.reuseRequested || !input.occupied) return { action: "proceed" };
+  if (priorDeferrals >= maxDeferrals) return { action: "provision_fresh", deferrals: priorDeferrals };
+  return { action: "defer", attempt: priorDeferrals + 1, maxDeferrals, delayMs };
+}
+
+/**
+ * Deferrals already spent waiting for this workspace.
+ *
+ * Read from the run's own retry reason rather than the raw attempt counter: a
+ * run that burned two transient-failure retries earlier has not spent any of
+ * its workspace-wait budget, and charging it for them would cut the wait short.
+ */
+export function readExecutionWorkspaceOccupancyDeferrals(run: {
+  scheduledRetryReason?: string | null;
+  scheduledRetryAttempt?: number | null;
+}): number {
+  if (run.scheduledRetryReason !== EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON) return 0;
+  return Math.max(0, Math.floor(run.scheduledRetryAttempt ?? 0));
 }
 
 export function resolveExecutionWorkspaceReuseProvisioningPolicy(input: {
@@ -12607,10 +12668,123 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         "Cleared a reuse_existing binding to an execution workspace whose directory was removed by platform cleanup; provisioning a fresh workspace for this run",
       );
     }
-    const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
-    const reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable
-      ? existingExecutionWorkspace
+    // SUP-11260: a shared worktree admits exactly one writer. Ask whether
+    // somebody else's agent is in there before walking in, and do it here —
+    // before provisioning, before the environment lease, before anything
+    // touches the directory — so a deferral costs nothing but the lookup.
+    const workspaceOccupancy = workspaceReuseRequest.requestedShouldReuseExisting &&
+      workspaceReuseRequest.requestedExecutionWorkspaceId
+      ? await executionWorkspacesSvc.findActiveRunOccupyingWorkspace({
+          companyId: agent.companyId,
+          executionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          excludingIssueId: issueId,
+          excludingRunId: run.id,
+          contenderRunCreatedAt: run.createdAt ?? null,
+        })
       : null;
+    const workspaceOccupancyDecision = resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: workspaceReuseRequest.requestedShouldReuseExisting,
+      occupied: workspaceOccupancy !== null,
+      priorDeferrals: readExecutionWorkspaceOccupancyDeferrals(run),
+    });
+    if (workspaceOccupancyDecision.action === "defer") {
+      const occupantText = workspaceOccupancy?.issueIdentifier
+        ? `${workspaceOccupancy.issueIdentifier} (run ${workspaceOccupancy.runId})`
+        : `run ${workspaceOccupancy?.runId ?? "unknown"}`;
+      const message =
+        `Execution workspace ${workspaceReuseRequest.requestedExecutionWorkspaceId} is already held by ${occupantText}; ` +
+        `waiting rather than editing the same worktree concurrently ` +
+        `(attempt ${workspaceOccupancyDecision.attempt}/${workspaceOccupancyDecision.maxDeferrals})`;
+      logger.info(
+        {
+          runId: run.id,
+          issueId,
+          issueIdentifier: issueRef?.identifier ?? null,
+          executionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          occupiedByRunId: workspaceOccupancy?.runId ?? null,
+          occupiedByIssueId: workspaceOccupancy?.issueId ?? null,
+          attempt: workspaceOccupancyDecision.attempt,
+          maxDeferrals: workspaceOccupancyDecision.maxDeferrals,
+        },
+        "deferring dispatch because the execution workspace is occupied by another issue's run",
+      );
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message,
+        payload: {
+          executionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          occupiedByRunId: workspaceOccupancy?.runId ?? null,
+          occupiedByIssueId: workspaceOccupancy?.issueId ?? null,
+          occupiedByIssueIdentifier: workspaceOccupancy?.issueIdentifier ?? null,
+          attempt: workspaceOccupancyDecision.attempt,
+          maxDeferrals: workspaceOccupancyDecision.maxDeferrals,
+        },
+      });
+      await setRunStatus(runId, "cancelled", {
+        error: message,
+        errorCode: EXECUTION_WORKSPACE_OCCUPIED_FAILURE_CODE,
+        finishedAt: new Date(),
+      });
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: new Date(),
+        error: message,
+      });
+      const deferredRun = await getRun(runId);
+      if (deferredRun) {
+        // The successor carries the attempt counter forward, so the wait budget
+        // is spent across runs rather than reset by each one. maxAttempts is
+        // pinned one above the current count so the scheduler never declares
+        // exhaustion on our behalf — the budget is this gate's to enforce.
+        await scheduleBoundedRetryForRun(deferredRun, agent, {
+          retryReason: EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON,
+          wakeReason: EXECUTION_WORKSPACE_OCCUPIED_WAKE_REASON,
+          maxAttempts: (deferredRun.scheduledRetryAttempt ?? 0) + 1,
+          delayMs: workspaceOccupancyDecision.delayMs,
+        });
+        await releaseIssueExecutionAndPromote(deferredRun);
+      }
+      return;
+    }
+    const requestedShouldReuseExisting =
+      workspaceOccupancyDecision.action === "provision_fresh"
+        ? false
+        : workspaceReuseRequest.requestedShouldReuseExisting;
+    if (workspaceOccupancyDecision.action === "provision_fresh") {
+      logger.warn(
+        {
+          runId: run.id,
+          issueId,
+          issueIdentifier: issueRef?.identifier ?? null,
+          executionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          occupiedByRunId: workspaceOccupancy?.runId ?? null,
+          occupiedByIssueId: workspaceOccupancy?.issueId ?? null,
+          deferrals: workspaceOccupancyDecision.deferrals,
+        },
+        "execution workspace stayed occupied for the whole wait budget; provisioning a fresh workspace instead of sharing a worktree with another issue's run",
+      );
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message:
+          `Execution workspace ${workspaceReuseRequest.requestedExecutionWorkspaceId} stayed occupied after ` +
+          `${workspaceOccupancyDecision.deferrals} waits; provisioning a fresh workspace. Branch continuity with the ` +
+          `previous workspace is lost, but no commits are: this run gets its own worktree instead of sharing one.`,
+        payload: {
+          executionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          occupiedByRunId: workspaceOccupancy?.runId ?? null,
+          occupiedByIssueId: workspaceOccupancy?.issueId ?? null,
+          occupiedByIssueIdentifier: workspaceOccupancy?.issueIdentifier ?? null,
+          deferrals: workspaceOccupancyDecision.deferrals,
+        },
+      });
+    }
+    const reusableExistingExecutionWorkspace =
+      requestedShouldReuseExisting && workspaceReuseRequest.existingExecutionWorkspaceAvailable
+        ? existingExecutionWorkspace
+        : null;
     const requestedReusableExecutionWorkspaceConfig = reusableExistingExecutionWorkspace?.config ?? null;
     const localEnvironment = await environmentsSvc.ensureLocalEnvironment(agent.companyId);
     const resolvedInstanceSettings = await instanceSettings.get();
