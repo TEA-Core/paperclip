@@ -6081,15 +6081,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         // not terminal. Bounded: if the action has already hit the sweep ceiling,
         // do NOT heal — fall through to the already-actioned guard.
         if (general.enableBlockedWithoutBlockersAutoHeal && candidate.assigneeAgentId) {
-          const isAtCeiling =
-            existingAction?.kind === "blocked_without_blockers" &&
-            existingAction.attemptCount >= MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
+          const resolvedAction = existingAction
+            ? null
+            : await recoveryActionsSvc.getLatestResolvedForIssue(companyId, candidate.id, "blocked_without_blockers");
+          const healAttemptCount =
+            (existingAction?.evidence?.healAttemptCount as number | undefined) ??
+            (resolvedAction?.evidence?.healAttemptCount as number | undefined) ??
+            0;
+          const isAtCeiling = healAttemptCount >= MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
           if (!isAtCeiling) {
+            const nextHealAttemptCount = healAttemptCount + 1;
             if (existingAction?.kind === "blocked_without_blockers") {
-              await db
-                .update(issueRecoveryActions)
-                .set({ attemptCount: existingAction.attemptCount + 1, updatedAt: now })
-                .where(eq(issueRecoveryActions.id, existingAction.id));
               await recoveryActionsSvc.resolveActiveForIssue({
                 companyId,
                 sourceIssueId: candidate.id,
@@ -6097,7 +6099,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 status: "resolved",
                 outcome: "false_positive",
                 resolutionNote: "Auto-healed by blocked_without_blockers sweep.",
+                evidence: { ...existingAction.evidence, healAttemptCount: nextHealAttemptCount },
               });
+            } else {
+              // No active action — persist the heal attempt count on a new action
+              // so the ceiling is tracked across heal cycles.
+              const resolvedHealAction = await db
+                .insert(issueRecoveryActions)
+                .values({
+                  companyId,
+                  sourceIssueId: candidate.id,
+                  kind: "blocked_without_blockers",
+                  status: "resolved",
+                  ownerType: "board",
+                  cause: "blocked_without_blockers",
+                  fingerprint: `bwob:${companyId}:${candidate.id}`,
+                  evidence: {
+                    identifier: candidate.identifier,
+                    status: "blocked",
+                    blockedAt: candidate.updatedAt,
+                    msInViolation,
+                    healAttemptCount: nextHealAttemptCount,
+                  },
+                  nextAction: "Auto-healed by blocked_without_blockers sweep.",
+                  wakePolicy: null,
+                  monitorPolicy: null,
+                  attemptCount: 0,
+                  outcome: "false_positive",
+                  resolutionNote: "Auto-healed by blocked_without_blockers sweep.",
+                  resolvedAt: now,
+                })
+                .returning();
+              if (!resolvedHealAction[0]) {
+                throw new Error("Failed to persist blocked_without_blockers heal attempt count");
+              }
             }
             await issuesSvc.update(candidate.id, { status: "todo" });
             await enqueueInitialAssignedTodoDispatch(
@@ -6125,6 +6160,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        const resolvedAction = await recoveryActionsSvc.getLatestResolvedForIssue(
+          companyId,
+          candidate.id,
+          "blocked_without_blockers",
+        );
+        const healAttemptCount =
+          (resolvedAction?.evidence?.healAttemptCount as number | undefined) ?? 0;
+
         await recoveryActionsSvc.upsertSourceScoped({
           companyId,
           sourceIssueId: candidate.id,
@@ -6138,6 +6181,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             status: "blocked",
             blockedAt: candidate.updatedAt,
             msInViolation,
+            healAttemptCount,
           },
           nextAction:
             "Review this blocked issue and either (a) add valid blocker relations, (b) unblock it to resume work, or (c) close/cancel it.",

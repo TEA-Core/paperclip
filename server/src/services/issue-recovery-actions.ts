@@ -47,6 +47,7 @@ export type ResolveIssueRecoveryActionInput = {
   status: Extract<IssueRecoveryActionStatus, "resolved" | "cancelled">;
   outcome: IssueRecoveryActionOutcome;
   resolutionNote?: string | null;
+  evidence?: Record<string, unknown>;
 };
 
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
@@ -135,6 +136,27 @@ export function issueRecoveryActionService(db: Db) {
         ),
       )
       .orderBy(desc(issueRecoveryActions.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return row ? toReadModel(row) : null;
+  }
+
+  async function getLatestResolvedForIssue(
+    companyId: string,
+    sourceIssueId: string,
+    kind?: IssueRecoveryActionKind,
+  ): Promise<IssueRecoveryAction | null> {
+    const predicates = [
+      eq(issueRecoveryActions.companyId, companyId),
+      eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+      eq(issueRecoveryActions.status, "resolved"),
+    ];
+    if (kind) predicates.push(eq(issueRecoveryActions.kind, kind));
+    const row = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(...predicates))
+      .orderBy(desc(issueRecoveryActions.resolvedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
     return row ? toReadModel(row) : null;
@@ -291,6 +313,7 @@ export function issueRecoveryActionService(db: Db) {
         resolutionNote: input.resolutionNote ?? null,
         resolvedAt: now,
         updatedAt: now,
+        ...(input.evidence ? { evidence: input.evidence } : {}),
       })
       .where(and(...predicates))
       .returning();
@@ -300,6 +323,7 @@ export function issueRecoveryActionService(db: Db) {
 
   return {
     getActiveForIssue,
+    getLatestResolvedForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
     upsertSourceScoped,
