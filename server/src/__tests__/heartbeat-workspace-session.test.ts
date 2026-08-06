@@ -1456,6 +1456,9 @@ describe("effective run execution workspace config freshness", () => {
       requestedExecutionWorkspaceId: "workspace-old",
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceAvailable: false,
+      // Repairable: a missing row or an archived one whose directory still
+      // exists can be restored by hand, so this must keep failing loudly.
+      bindingUnrestorable: false,
     });
 
     const metadata = buildWorkspaceConfigMetadata();
@@ -1479,6 +1482,82 @@ describe("effective run execution workspace config freshness", () => {
       realizeWorkspace,
     })).rejects.toThrow(/could not be restored/);
     expect(realizeWorkspace).not.toHaveBeenCalled();
+  });
+
+  // SUP-9810: the worktree reaper archives the workspace row when it deletes a
+  // worktree, and issues bound to that row kept their reuse_existing binding.
+  // Every dispatch then failed setup_failed with "could not be restored", and no
+  // retry could ever succeed because the directory is gone — a permanent trap
+  // rather than a fixable problem. 57 issues held such a binding when this was
+  // found; one was blocked behind a recovery action for exactly this.
+  it.each([
+    { name: "reaped by the worktree reaper", cleanupReason: "reaped_worktree_removed" },
+    { name: "reconciled as missing on disk", cleanupReason: "reconciled_missing_directory" },
+  ])("provisions a fresh workspace when the bound one was $name", async ({ cleanupReason }) => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "archived",
+      existingExecutionWorkspaceCleanupReason: cleanupReason,
+    });
+
+    expect(reuseRequest.bindingUnrestorable).toBe(true);
+    // No longer a reuse request: there is nothing to reuse and never will be.
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: reuseRequest.requestedShouldReuseExisting &&
+        reuseRequest.existingExecutionWorkspaceAvailable,
+      existingWorkspaceMetadata: null,
+      nextMetadata: metadata,
+    });
+    const realizeWorkspace = vi.fn(async () => ({ id: "fresh-workspace", warnings: [] }));
+    const restoreExistingWorkspace = vi.fn(async () => ({ id: "workspace-old", warnings: [] }));
+
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: reuseRequest.requestedShouldReuseExisting,
+      existingExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
+      issueRef: { id: "issue-1", identifier: "SUP-9810" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace,
+      realizeWorkspace,
+    });
+
+    expect(result.executionWorkspace).toEqual({ id: "fresh-workspace", warnings: [] });
+    expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(realizeWorkspace).toHaveBeenCalledTimes(1);
+    // Never even attempt the restore: the directory is gone.
+    expect(restoreExistingWorkspace).not.toHaveBeenCalled();
+  });
+
+  // The self-heal is deliberately narrow. An archived row whose directory still
+  // exists is repairable by unarchiving it, so refusing to run surfaces a real
+  // problem instead of stranding the issue.
+  it("still fails loudly when an archived workspace was closed without removing its directory", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "archived",
+      existingExecutionWorkspaceCleanupReason: "closed_by_operator",
+    });
+
+    expect(reuseRequest.bindingUnrestorable).toBe(false);
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+  });
+
+  it("ignores a cleanup reason when the workspace is still active", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      existingExecutionWorkspaceCleanupReason: "reaped_worktree_removed",
+    });
+
+    expect(reuseRequest.bindingUnrestorable).toBe(false);
+    expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(true);
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
   });
 
   it("fails loudly when explicit reuse restore returns no workspace", async () => {
