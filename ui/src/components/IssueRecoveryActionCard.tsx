@@ -124,6 +124,7 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
   no_live_path_unowned: "No Live Path",
   review_stage_unarmed: "Review Stage Unarmed",
   no_live_path_owner_unavailable: "Owner Unavailable",
+  blocked_without_blockers: "Blocked Without Blockers",
 };
 
 const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
@@ -144,6 +145,8 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "This task has an execution review stage configured, but no participant is actively reviewing.",
   no_live_path_owner_unavailable:
     "This task's assigned owner is not available and no live execution path exists.",
+  blocked_without_blockers:
+    "This task is marked blocked, but nothing is blocking it any more.",
 };
 
 const STATE_TONE: Record<RecoveryCardCardState, {
