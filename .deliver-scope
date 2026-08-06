@@ -1,5 +1,0 @@
-# Scope for SUP-11169 on this branch.
-# Fix: classify orphaned/unregistered worktree as worktree_metadata_missing
-packages/shared/src/types/heartbeat.ts
-server/src/__tests__/workspace-runtime.test.ts
-server/src/services/workspace-runtime.ts
