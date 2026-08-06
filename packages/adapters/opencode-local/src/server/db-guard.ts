@@ -258,8 +258,12 @@ export function describeOpenCodeDatabaseGrowthTrip(trip: OpenCodeDatabaseGrowthT
   return (
     `OpenCode database grew ${formatBytes(trip.growthBytes)} during this run ` +
     `(limit ${formatBytes(trip.limitBytes)}, ${formatBytes(trip.baselineBytes)} → ` +
-    `${formatBytes(trip.observedBytes)} at ${trip.databasePath}). This is the runaway-message ` +
-    `signature from SUP-10914; the run was terminated before it could bloat the database further.` +
+    // SUP-11268: state what was measured and on what basis, and do not assert a
+    // cause. The SUP-10914 runaway-message signature is one way to get here, not
+    // the only one, and an operator reading the failure needs to know how the
+    // growth was attributed before judging the abort.
+    `${formatBytes(trip.observedBytes)} at ${trip.databasePath}). ` +
+    `Attribution basis: per-session accounting on this agent's shared database file.` +
     describeAttribution(trip.attribution) +
     (trip.sparedTrips > 0
       ? ` The run was spared ${trip.sparedTrips} earlier trip(s) attributed to another session.`
