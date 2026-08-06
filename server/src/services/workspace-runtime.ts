@@ -1125,6 +1125,10 @@ async function buildWorktreeMetadataMissingEvidence(input: {
       actualHeadSha: null,
       sameHead: false,
       ancestryVerdict: "unknown",
+      defaultBranch: await detectDefaultBranch(input.repoRoot).catch(() => null),
+      // There is no checked-out branch to compare: the path has no worktree
+      // metadata, so nothing here can be the default branch.
+      actualBranchIsDefaultBranch: false,
       plainLanguageReason:
         "The workspace path is not a registered git worktree; its git metadata is missing or resolves to a different repository.",
     },
