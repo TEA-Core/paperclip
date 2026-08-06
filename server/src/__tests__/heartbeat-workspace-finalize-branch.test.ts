@@ -361,7 +361,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
       expect.arrayContaining([
         expect.objectContaining({
           phase: "worktree_prepare",
-          command: `git checkout ${recordedBranch}`,
+          command: `git checkout --ignore-other-worktrees ${recordedBranch}`,
           status: "succeeded",
           executionWorkspaceId,
           metadata: expect.objectContaining({

@@ -1130,17 +1130,20 @@ describe("realizeExecutionWorkspace", () => {
         expect.objectContaining({
           phase: "worktree_prepare",
           command: "git checkout --ignore-other-worktrees PAP-447-add-worktree-support",
+          // The repair is recorded by ensureGitWorktreeBranchCoherent, which is the only place
+          // allowed to normalise a reused worktree's HEAD. SUP-10665's pre-validation reset used to
+          // do it first under a branchResetOnReuse flag, bypassing the eligibility checks.
           metadata: expect.objectContaining({
-            branchResetOnReuse: true,
-            branchName: "PAP-447-add-worktree-support",
-            previousBranch: "unexpected-branch",
+            branchIncoherenceRepair: true,
+            expectedBranchName: "PAP-447-add-worktree-support",
+            actualBranchName: "unexpected-branch",
           }),
         }),
       ]),
     );
   });
 
-  it("repairs a clean linked worktree whose branch diverged from the expected issue branch with forward commits on both sides", async () => {
+  it("refuses a clean linked worktree whose branch diverged from the expected issue branch with forward commits on both sides", async () => {
     const repoRoot = await createTempRepo();
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
 
@@ -1187,38 +1190,43 @@ describe("realizeExecutionWorkspace", () => {
     const defaultBranch = await readGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
     await runGit(repoRoot, ["checkout", defaultBranch]);
 
-    const repaired = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      config: {
-        workspaceStrategy: {
-          type: "git_worktree",
-          branchTemplate: "{{issue.identifier}}-{{slug}}",
+    // scratch-branch carries "Add scratch work", which the recorded branch does not. Restoring the
+    // recorded branch here would walk away from that commit without failing the run or auditing
+    // anything, which is what workspace-branch containment exists to prevent. Fail closed instead.
+    await expect(
+      realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
         },
-      },
-      issue: {
-        id: "issue-1",
-        identifier: "PAP-447",
-        title: "Add Worktree Support",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-      recorder,
-    });
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-447",
+          title: "Add Worktree Support",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+        recorder,
+      }),
+    ).rejects.toThrow(/expected branch "PAP-447-add-worktree-support" but found "scratch-branch"/);
 
-    expect(repaired.created).toBe(false);
-    expect(repaired.cwd).toBe(initial.cwd);
-    await expect(readGit(initial.cwd, ["branch", "--show-current"])).resolves.toBe("PAP-447-add-worktree-support");
-    await expect(readGit(initial.cwd, ["rev-parse", "HEAD"])).resolves.toBe(expectedHead);
+    // The worktree is left exactly as the diverged run left it — nothing is checked out over.
+    await expect(readGit(initial.cwd, ["branch", "--show-current"])).resolves.toBe("scratch-branch");
+    await expect(readGit(initial.cwd, ["rev-parse", "HEAD"])).resolves.toBe(scratchHead);
+    expect(expectedHead).not.toBe(scratchHead);
   });
 
   it("reuses an already checked out branch from git worktree metadata even when the target path differs", async () => {
@@ -2898,43 +2906,17 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(worktreePath, ["add", "actual.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
 
-    const restored = await ensurePersistedExecutionWorkspaceAvailable({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      workspace: {
-        id: "execution-workspace-diverged",
-        mode: "isolated_workspace",
-        strategyType: "git_worktree",
-        cwd: worktreePath,
-        providerRef: worktreePath,
-        projectId: "project-1",
-        projectWorkspaceId: "workspace-1",
-        repoUrl: null,
-        baseRef: "HEAD",
-        branchName: expectedBranch,
-      },
-      issue: {
-        id: "issue-diverged",
-        identifier: "PAP-457",
-        title: "Classify diverged branch incoherence",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-      enableWorkspaceBranchReconcileForward: true,
+    // Both branches carry a commit the other does not, so neither side can be discarded.
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-diverged",
+      executionWorkspaceId: "execution-workspace-diverged",
+      expectedAncestryVerdict: "diverged",
+      expectedReason: "expected branch and current HEAD differ",
     });
-
-    expect(restored).not.toBeNull();
-    expect(restored!.branchName).toBe(expectedBranch);
-    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
   }, 15_000);
 
   it("classifies persisted git worktree branch incoherence as unknown when the recorded branch was deleted", async () => {
@@ -3175,7 +3157,7 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 15_000);
 
-  it("repairs a clean persisted git worktree branch mismatch when the checked-out branch has same-content rewritten history", async () => {
+  it("keeps forward reconciliation fail-closed for same-content rewritten history", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-content";
     const actualBranch = "PAP-459-rewritten-content";
@@ -3193,46 +3175,22 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(worktreePath, ["add", "same-content.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add content on rewritten branch"]);
 
-    const restored = await ensurePersistedExecutionWorkspaceAvailable({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      workspace: {
-        id: "execution-workspace-rewritten-history",
-        mode: "isolated_workspace",
-        strategyType: "git_worktree",
-        cwd: worktreePath,
-        providerRef: worktreePath,
-        projectId: "project-1",
-        projectWorkspaceId: "workspace-1",
-        repoUrl: null,
-        baseRef: "HEAD",
-        branchName: expectedBranch,
-      },
-      issue: {
-        id: "issue-rewritten-history",
-        identifier: "PAP-459",
-        title: "Repair diverged branch with rewritten content",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-      enableWorkspaceBranchReconcileForward: true,
+    // Same content, different sha. Git cannot prove the rewritten commit is contained in the
+    // recorded branch, and "looks equivalent" is not the same as "loses nothing", so this stays
+    // fail-closed rather than being checked out over.
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-rewritten-history",
+      executionWorkspaceId: "execution-workspace-rewritten-history",
+      expectedAncestryVerdict: "diverged",
+      expectedReason: "expected branch and current HEAD differ",
     });
-
-    expect(restored).not.toBeNull();
-    expect(restored!.branchName).toBe(expectedBranch);
-    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
   }, 15_000);
 
-  it("repairs a clean persisted git worktree branch mismatch when the checked-out branch is an unrelated task branch", async () => {
+  it("keeps forward reconciliation fail-closed for an unrelated task branch", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-task";
     const actualBranch = "PAP-999-unrelated-task";
@@ -3250,43 +3208,18 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(worktreePath, ["add", "unrelated-task.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add unrelated task work"]);
 
-    const restored = await ensurePersistedExecutionWorkspaceAvailable({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      workspace: {
-        id: "execution-workspace-unrelated-task",
-        mode: "isolated_workspace",
-        strategyType: "git_worktree",
-        cwd: worktreePath,
-        providerRef: worktreePath,
-        projectId: "project-1",
-        projectWorkspaceId: "workspace-1",
-        repoUrl: null,
-        baseRef: "HEAD",
-        branchName: expectedBranch,
-      },
-      issue: {
-        id: "issue-unrelated-task",
-        identifier: "PAP-459",
-        title: "Repair diverged branch with unrelated task",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-      enableWorkspaceBranchReconcileForward: true,
+    // The worktree is sitting on another task's branch carrying that task's commit. Restoring the
+    // recorded branch would abandon it silently.
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-unrelated-task",
+      executionWorkspaceId: "execution-workspace-unrelated-task",
+      expectedAncestryVerdict: "diverged",
+      expectedReason: "expected branch and current HEAD differ",
     });
-
-    expect(restored).not.toBeNull();
-    expect(restored!.branchName).toBe(expectedBranch);
-    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
   }, 15_000);
 
   it("repairs a clean persisted git worktree branch mismatch when the live branch is behind the recorded branch", async () => {

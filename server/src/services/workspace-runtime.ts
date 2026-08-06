@@ -968,6 +968,38 @@ async function getGitWorktreeBranchAncestryVerdict(input: {
   return "unknown";
 }
 
+/**
+ * Is the checked-out HEAD already contained in the recorded branch?
+ *
+ * `getGitWorktreeBranchAncestryVerdict` only asks the forward question (is the recorded branch an
+ * ancestor of HEAD), so its "diverged" verdict conflates two states that must be treated
+ * differently:
+ *
+ * - HEAD is *behind* the recorded branch — every commit it carries is already reachable from the
+ *   recorded branch, so restoring that branch abandons nothing. This is the leftover-branch state
+ *   SUP-10665 was filed for.
+ * - HEAD and the recorded branch have genuinely diverged — HEAD carries commits the recorded branch
+ *   does not. Restoring the recorded branch silently walks away from another run's work, which is
+ *   exactly what workspace-branch containment exists to prevent.
+ *
+ * Only the first is a safe repair. Returns false on an indeterminate git result, so an unanswerable
+ * question fails closed.
+ */
+async function isActualHeadContainedInExpectedBranch(input: {
+  repoRoot: string;
+  expectedHeadSha: string | null;
+  actualHeadSha: string | null;
+}): Promise<boolean> {
+  if (!input.expectedHeadSha || !input.actualHeadSha) return false;
+
+  const proc = await executeProcess({
+    command: "git",
+    args: ["merge-base", "--is-ancestor", input.actualHeadSha, input.expectedHeadSha],
+    cwd: input.repoRoot,
+  }).catch(() => null);
+  return proc?.code === 0;
+}
+
 function explainGitWorktreeBranchIncoherence(input: {
   expectedBranchName: string;
   actualBranchName: string | null;
@@ -1037,6 +1069,11 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     expectedHeadSha,
     actualHeadSha,
   });
+  const actualHeadContainedInExpectedBranch = await isActualHeadContainedInExpectedBranch({
+    repoRoot: input.repoRoot,
+    expectedHeadSha,
+    actualHeadSha,
+  });
   const basePlainLanguageReason = explainGitWorktreeBranchIncoherence({
     expectedBranchName: input.expectedBranchName,
     actualBranchName: input.actualBranchName,
@@ -1070,19 +1107,24 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     actualBranchExists === true &&
     registeredBranchMatchesHead &&
     actualBranchIsDefaultBranch;
-  const canCheckoutRecordedBranchOnDivergedWorktree =
+  // SUP-10665: a reused worktree left on a leftover branch by the previous run must not dead-block
+  // forever. But the repair may only run when restoring the recorded branch abandons nothing — that
+  // is, when HEAD is already contained in the recorded branch. True divergence (HEAD carries commits
+  // the recorded branch does not) stays fail-closed; see heartbeat-workspace-branch-containment.
+  const canRestoreRecordedBranchOverContainedHead =
     cleanliness === "clean" &&
     expectedBranchExists &&
     !sameHead &&
     registeredBranchMatchesHead &&
     input.actualBranchName !== null &&
-    ancestryVerdict !== "ancestor";
+    ancestryVerdict !== "ancestor" &&
+    actualHeadContainedInExpectedBranch;
   const eligible =
     canCheckoutRecordedBranch ||
     canAdoptForwardActualBranch ||
     canAttachRecordedBranchToDetachedHead ||
     canRebindDeletedBranchToDefaultBranch ||
-    canCheckoutRecordedBranchOnDivergedWorktree;
+    canRestoreRecordedBranchOverContainedHead;
   const safeRepairReason = eligible
     ? canCheckoutRecordedBranch
       ? "clean worktree and expected branch points at the current HEAD"
@@ -1092,7 +1134,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
           ? "clean detached worktree HEAD is forward of the recorded branch"
           : canRebindDeletedBranchToDefaultBranch
             ? "clean worktree with deleted recorded branch is already on the default branch"
-            : "clean worktree and expected branch can be checked out despite diverged branch history"
+            : "clean worktree HEAD is already contained in the recorded branch, so restoring it abandons no commits"
     : cleanliness !== "clean"
       ? inProgressOperation
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
@@ -2063,6 +2105,10 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   try {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
+      // --ignore-other-worktrees is required, not incidental: the recorded branch is routinely
+      // checked out in the base repo, and without this git refuses every safe repair with
+      // "already used by worktree at ...". The eligibility predicates above are what bound this
+      // checkout; see canRestoreRecordedBranchOverContainedHead.
       args: ["checkout", "--ignore-other-worktrees", expectedBranchName],
       cwd: input.worktreePath,
       metadata: {
@@ -2990,32 +3036,16 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   async function validateReusableWorktree(reusablePath: string) {
-    const currentBranch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], reusablePath).catch(() => null);
-    if (currentBranch && currentBranch !== branchName) {
-      const status = await runGit(
-        ["status", "--porcelain", "--untracked-files=all"],
-        reusablePath,
-      ).catch(() => null);
-      if (status !== null && status.trim().length === 0) {
-        const expectedBranchExists = await localBranchExists(repoRoot, branchName);
-        if (expectedBranchExists) {
-          await recordGitOperation(input.recorder, {
-            phase: "worktree_prepare",
-            args: ["checkout", "--ignore-other-worktrees", branchName],
-            cwd: reusablePath,
-            metadata: {
-              repoRoot,
-              worktreePath: reusablePath,
-              branchName,
-              previousBranch: currentBranch,
-              branchResetOnReuse: true,
-            },
-            successMessage: `Reset diverged worktree at ${reusablePath} from "${currentBranch}" to "${branchName}"\n`,
-            failureLabel: `git checkout ${branchName} in reused worktree`,
-          }).catch(() => null);
-        }
-      }
-    }
+    // SUP-10665 originally reset a clean reused worktree to its recorded branch here, before
+    // validation. That erased the very state validation exists to inspect: a diverged HEAD was
+    // checked out away before anything could detect it, so the run proceeded and another run's
+    // commits were left behind with no failure, no audit, and no contention check — the checkout
+    // even swallowed its own errors. It also preempted forward reconciliation, resetting a branch
+    // that was ahead of the record instead of adopting it.
+    //
+    // Normalisation belongs to ensureGitWorktreeBranchCoherent, which is reached through
+    // validateLinkedGitWorktree below and already encodes the safe-repair paths, the contention
+    // check, and the audit trail.
     const validation = await validateLinkedGitWorktree({
       repoRoot,
       worktreePath: reusablePath,
