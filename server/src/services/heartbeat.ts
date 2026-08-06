@@ -164,7 +164,11 @@ import {
   refreshIssueContinuationSummary,
 } from "./issue-continuation-summary.js";
 import { buildPlanReviewContext } from "./plan-review-context.js";
-import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import {
+  detachIssuesFromClosedSharedExecutionWorkspace,
+  executionWorkspaceService,
+  mergeExecutionWorkspaceConfig,
+} from "./execution-workspaces.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
@@ -3380,25 +3384,70 @@ export type ExecutionWorkspaceReuseRequestForIssue = {
   requestedExecutionWorkspaceId: string | null;
   requestedShouldReuseExisting: boolean;
   existingExecutionWorkspaceAvailable: boolean;
+  bindingUnrestorable: boolean;
 };
+
+/**
+ * Cleanup reasons that mean the workspace DIRECTORY was deleted by our own
+ * maintenance, not merely that the row was closed.
+ *
+ * The distinction decides whether a failed reuse is worth failing loudly over.
+ * An archived row whose directory still exists is repairable: a human can
+ * unarchive it and the next run reuses it, so refusing to run is the correct,
+ * loud outcome. A row archived *because we removed the directory* is not
+ * repairable by anyone — unarchiving restores nothing — so refusing to run
+ * strands the issue permanently instead of surfacing a fixable problem.
+ */
+const PLATFORM_REMOVED_EXECUTION_WORKSPACE_CLEANUP_REASONS = new Set([
+  "reaped_worktree_removed",
+  "reconciled_missing_directory",
+]);
 
 export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
   existingExecutionWorkspaceStatus?: string | null;
+  existingExecutionWorkspaceCleanupReason?: string | null;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
-  const requestedShouldReuseExisting =
+  const requestedReuse =
     input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
+
+  const existingExecutionWorkspaceAvailable =
+    requestedReuse &&
+    input.existingExecutionWorkspaceStatus !== null &&
+    input.existingExecutionWorkspaceStatus !== undefined &&
+    input.existingExecutionWorkspaceStatus !== "archived";
+
+  // SUP-9810: the worktree reaper archives the workspace row when it deletes a
+  // worktree, but issues bound to that row through `executionWorkspaceId` kept
+  // their `reuse_existing` binding. Every dispatch then failed `setup_failed`
+  // with "the workspace could not be restored", and no retry could ever
+  // succeed, because the directory is gone. One issue sat blocked behind a
+  // recovery action for exactly this; 57 issues held such a binding.
+  //
+  // The writers that create these bindings now detach at archive time, but the
+  // server must not depend on every external writer doing so — anything with
+  // direct database access can recreate it. Treating a platform-removed
+  // workspace as unrestorable makes the run recover on its own instead of
+  // looping forever on a pointer we invalidated ourselves.
+  const bindingUnrestorable =
+    requestedReuse &&
+    !existingExecutionWorkspaceAvailable &&
+    input.existingExecutionWorkspaceStatus === "archived" &&
+    PLATFORM_REMOVED_EXECUTION_WORKSPACE_CLEANUP_REASONS.has(
+      input.existingExecutionWorkspaceCleanupReason ?? "",
+    );
 
   return {
     requestedExecutionWorkspaceId,
-    requestedShouldReuseExisting,
-    existingExecutionWorkspaceAvailable:
-      requestedShouldReuseExisting &&
-      input.existingExecutionWorkspaceStatus !== null &&
-      input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+    // An unrestorable binding stops being a reuse request: there is nothing to
+    // reuse and never will be, so the run provisions fresh. Every other
+    // unavailable case still reports the request and fails loudly downstream,
+    // because those are repairable and a human should see them.
+    requestedShouldReuseExisting: requestedReuse && !bindingUnrestorable,
+    existingExecutionWorkspaceAvailable,
+    bindingUnrestorable,
   };
 }
 
@@ -12480,7 +12529,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
+      existingExecutionWorkspaceCleanupReason: existingExecutionWorkspace?.cleanupReason ?? null,
     });
+    if (workspaceReuseRequest.bindingUnrestorable && requestedExecutionWorkspaceId) {
+      // Clear the dangling pointer as well as running past it. Without this the
+      // next dispatch re-derives the same dead binding, and the issue carries an
+      // unrealizable `reuse_existing` preference that the write API refuses
+      // (SUP-10403), so a human editing anything workspace-shaped on it would
+      // 422 on state they never set. Same helper, and the same semantics, as
+      // the service's own workspace-close path.
+      await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+        companyId: agent.companyId,
+        executionWorkspaceId: requestedExecutionWorkspaceId,
+      });
+      logger.warn(
+        {
+          runId,
+          issueId: issueRef?.id ?? null,
+          issueIdentifier: issueRef?.identifier ?? null,
+          executionWorkspaceId: requestedExecutionWorkspaceId,
+          cleanupReason: existingExecutionWorkspace?.cleanupReason ?? null,
+        },
+        "Cleared a reuse_existing binding to an execution workspace whose directory was removed by platform cleanup; provisioning a fresh workspace for this run",
+      );
+    }
     const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
     const reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable
       ? existingExecutionWorkspace
