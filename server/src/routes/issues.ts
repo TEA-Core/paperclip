@@ -132,7 +132,7 @@ import {
 } from "../services/task-watchdog-scope.js";
 import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
-import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -3269,6 +3269,35 @@ export function issueRoutes(
       downloadPath: `${contentPath}?download=1`,
       originalFilename: attachment.originalFilename ?? null,
     });
+  }
+
+  function assertAgentDefaultProjectWorkspacePairValid(
+    existing: {
+      projectWorkspaceId: string | null;
+      executionWorkspacePreference: string | null;
+    },
+    body: {
+      projectWorkspaceId?: string | null;
+      executionWorkspacePreference?: string | null;
+    },
+  ) {
+    const effectiveExecutionWorkspacePreference =
+      body.executionWorkspacePreference === undefined
+        ? existing.executionWorkspacePreference
+        : body.executionWorkspacePreference;
+    const effectiveProjectWorkspaceId =
+      body.projectWorkspaceId === undefined
+        ? existing.projectWorkspaceId
+        : body.projectWorkspaceId;
+    if (
+      effectiveExecutionWorkspacePreference === "agent_default" &&
+      typeof effectiveProjectWorkspaceId === "string" &&
+      effectiveProjectWorkspaceId.trim().length > 0
+    ) {
+      throw badRequest(
+        `executionWorkspacePreference "agent_default" cannot be combined with a non-null projectWorkspaceId: agent_default resolves to the agent home directory, not a project workspace. Clear one of executionWorkspacePreference or projectWorkspaceId before retrying.`,
+      );
+    }
   }
 
   async function assertIssueEnvironmentSelection(
@@ -7824,6 +7853,7 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
+    assertAgentDefaultProjectWorkspacePairValid(existing, req.body);
     const actorAgentId = req.actor.type === "agent" ? req.actor.agentId : null;
     let mutationAccess:
       | boolean
