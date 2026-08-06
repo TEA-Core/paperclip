@@ -61,6 +61,15 @@ import {
   requireOpenCodeModelId,
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
+import {
+  describeOpenCodeDatabaseGrowthTrip,
+  formatBytes,
+  resolveOpenCodeDatabaseGrowthLimitBytes,
+  resolveOpenCodeDatabasePath,
+  resolveOpenCodeDatabasePollIntervalMs,
+  startOpenCodeDatabaseGrowthGuard,
+  type OpenCodeDatabaseGrowthTrip,
+} from "./db-guard.js";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -760,6 +769,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const printLogs = isTruthyEnvFlag(
       env.PAPERCLIP_OPENCODE_PRINT_LOGS ?? process.env.PAPERCLIP_OPENCODE_PRINT_LOGS,
     );
+    // SUP-10914: watch this agent's own database for the runaway-message
+    // signature and terminate the run before it writes hundreds of megabytes.
+    // Only armed when we set the per-agent database ourselves: on the shared
+    // database (operator-configured OPENCODE_DB, or PAPERCLIP_OPENCODE_SHARED_DB)
+    // the growth we would measure may belong to a different agent's run, and
+    // killing this run for someone else's writes would be worse than the leak.
+    // Remote targets are skipped because the file is not on this host.
+    const databaseGuardPath =
+      openCodeDatabaseFile && !executionTargetIsRemote
+        ? resolveOpenCodeDatabasePath({ databaseFile: openCodeDatabaseFile, env: runtimeEnv })
+        : null;
+    const databaseGuardLimitBytes = databaseGuardPath
+      ? resolveOpenCodeDatabaseGrowthLimitBytes({ env: runtimeEnv })
+      : 0;
+    const databaseGuardPollIntervalMs = resolveOpenCodeDatabasePollIntervalMs({ env: runtimeEnv });
+    let databaseGuardTrip: OpenCodeDatabaseGrowthTrip | null = null;
+    if (databaseGuardPath && databaseGuardLimitBytes > 0) {
+      commandNotes.push(
+        `Armed OpenCode database growth guard on ${databaseGuardPath} (limit ${formatBytes(databaseGuardLimitBytes)} per run).`,
+      );
+    }
+
     const buildArgs = (resumeSessionId: string | null) =>
       buildOpenCodeRunArgs({
         dir: effectiveExecutionCwd,
@@ -805,22 +836,47 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       };
 
-      const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-        cwd,
-        env: preparedRuntimeConfig.env,
-        stdin: prompt,
-        timeoutSec,
-        graceSec,
-        onSpawn,
-        onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog: earlyAbortOnLog,
-        runLogTail: paperclipBridge?.runLogTail,
-      });
-      return {
-        proc,
-        rawStderr: proc.stderr,
-        parsed: parseOpenCodeJsonl(proc.stdout),
-      };
+      const databaseGuard = databaseGuardPath
+        ? startOpenCodeDatabaseGrowthGuard({
+            databasePath: databaseGuardPath,
+            limitBytes: databaseGuardLimitBytes,
+            pollIntervalMs: databaseGuardPollIntervalMs,
+            onTrip: (trip) => {
+              databaseGuardTrip = trip;
+              void (async () => {
+                await onLog(
+                  "stdout",
+                  `[paperclip] ${describeOpenCodeDatabaseGrowthTrip(trip)}\n`,
+                );
+                const running = runningProcesses.get(runId);
+                if (running) {
+                  signalRunningProcess(running, "SIGTERM");
+                }
+              })();
+            },
+          })
+        : null;
+
+      try {
+        const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+          cwd,
+          env: preparedRuntimeConfig.env,
+          stdin: prompt,
+          timeoutSec,
+          graceSec,
+          onSpawn,
+          onRuntimeProgress: ctx.onRuntimeProgress,
+          onLog: earlyAbortOnLog,
+          runLogTail: paperclipBridge?.runLogTail,
+        });
+        return {
+          proc,
+          rawStderr: proc.stderr,
+          parsed: parseOpenCodeJsonl(proc.stdout),
+        };
+      } finally {
+        databaseGuard?.stop();
+      }
     };
 
     const toResult = (
@@ -831,6 +887,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
       clearSessionOnMissingSession = false,
       errorCode: string | null = null,
+      // Set when the adapter itself ended the run for a reason the process's own
+      // exit status cannot express (currently: the database growth guard).
+      errorMessageOverride: string | null = null,
     ): AdapterExecutionResult => {
       if (attempt.proc.timedOut) {
         return {
@@ -907,7 +966,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const effectiveParsedError = parsedError || incompleteStreamError;
       const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
       const rawExitCode = attempt.proc.exitCode;
-      const synthesizedExitCode = effectiveParsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+      // We terminate a guard-tripped run with SIGTERM, which leaves exitCode
+      // null; without this it would be reported as a success or an opaque
+      // signal death rather than the failure the adapter deliberately caused.
+      const failedForOverride = Boolean(errorMessageOverride) && (rawExitCode ?? 0) === 0;
+      const synthesizedExitCode =
+        failedForOverride || (effectiveParsedError && (rawExitCode ?? 0) === 0) ? 1 : rawExitCode;
       const fallbackErrorMessage =
         effectiveParsedError ||
         (stderrLine
@@ -925,13 +989,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: attempt.proc.stderr,
         toolErrors: attempt.parsed.toolErrors,
       });
+      if (databaseGuardTrip) {
+        errorMeta.databaseGrowth = {
+          databasePath: databaseGuardTrip.databasePath,
+          baselineBytes: databaseGuardTrip.baselineBytes,
+          observedBytes: databaseGuardTrip.observedBytes,
+          growthBytes: databaseGuardTrip.growthBytes,
+          limitBytes: databaseGuardTrip.limitBytes,
+        };
+      }
 
       return {
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
         finishReason: attempt.parsed.finalStepReason,
-        errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : stripAnsi(fallbackErrorMessage),
+        errorMessage:
+          errorMessageOverride ??
+          ((synthesizedExitCode ?? 0) === 0 ? null : stripAnsi(fallbackErrorMessage)),
         errorCode: errorCode ?? classifiedErrorCode,
         errorMeta: Object.keys(errorMeta).length > 0 ? errorMeta : undefined,
         usage: {
@@ -960,8 +1035,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     };
 
+    // A guard-tripped attempt must never be retried: the retry would replay the
+    // same runaway message and write the same bytes again. This short-circuits
+    // both the unknown-session retry and the transient-statement retry loop —
+    // and a runaway run plausibly emits lock errors of its own, which is exactly
+    // what the latter retries on.
+    const databaseGuardResult = (
+      attempt: Awaited<ReturnType<typeof runAttempt>>,
+    ): AdapterExecutionResult | null => {
+      if (!databaseGuardTrip) return null;
+      return toResult(
+        attempt,
+        false,
+        "opencode_db_growth_limit",
+        describeOpenCodeDatabaseGrowthTrip(databaseGuardTrip),
+      );
+    };
+
     try {
       const initial = await runAttempt(sessionId);
+      const initialGuardResult = databaseGuardResult(initial);
+      if (initialGuardResult) return initialGuardResult;
       const initialFailed =
         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
       if (
@@ -974,7 +1068,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `[paperclip] OpenCode session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
         const retry = await runAttempt(null);
-        return toResult(retry, true);
+        return databaseGuardResult(retry) ?? toResult(retry, true);
       }
 
       if (
@@ -994,6 +1088,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             `[paperclip] transient opencode statement error, retry ${attemptIndex + 1}/2 after ${delay}ms: ${firstNonEmptyLine(attempt.rawStderr)}\n`,
           );
           const retry = await runAttempt(sessionId);
+          const retryGuardResult = databaseGuardResult(retry);
+          if (retryGuardResult) return retryGuardResult;
           const retryFailed =
             !retry.proc.timedOut &&
             ((retry.proc.exitCode ?? 0) !== 0 || Boolean(retry.parsed.errorMessage));
