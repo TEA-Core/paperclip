@@ -2407,7 +2407,6 @@ async function listIssueBlockerAttentionMap(
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.relatedIssueId, chunk),
             eq(issues.companyId, companyId),
-            ne(issues.status, "done"),
           ),
         );
       const childRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
@@ -2459,7 +2458,9 @@ async function listIssueBlockerAttentionMap(
           assigneeAgentId: row.assigneeAgentId,
           assigneeUserId: row.assigneeUserId,
         });
-        nextFrontier.add(row.blockerIssueId);
+        if (row.status !== "done") {
+          nextFrontier.add(row.blockerIssueId);
+        }
       }
     }
 
@@ -2707,7 +2708,16 @@ async function listIssueBlockerAttentionMap(
   for (const root of roots) {
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
     if (topLevelEdges.length === 0) {
-      if (zeroEdgeWaitingIssueIds.has(root.id)) {
+      const allEdges = edgesByIssueId.get(root.id) ?? [];
+      if (allEdges.length > 0) {
+        const terminalSampleNode = nodesById.get(allEdges[0].blockerIssueId);
+        attentionMap.set(root.id, createIssueBlockerAttention({
+          state: "needs_attention",
+          reason: "attention_required",
+          computed: true,
+          sampleBlockerIdentifier: blockerSampleIdentifier(terminalSampleNode),
+        }));
+      } else if (zeroEdgeWaitingIssueIds.has(root.id)) {
         attentionMap.set(root.id, createIssueBlockerAttention({
           state: "covered",
           reason: "active_dependency",

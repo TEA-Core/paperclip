@@ -1,6 +1,4 @@
-# Scope for SUP-11168 on this branch.
-# Files owned by this branch's PR: the report-only stillborn assigned-backlog sweep and tests.
-server/src/services/recovery/service.ts
-server/src/services/heartbeat.ts
-server/src/index.ts
-server/src/__tests__/recovery-stillborn-assigned-backlog-sweep.test.ts
+# Scope for SUP-11196 on this branch.
+# Fix: classify done-blocker roots as needs_attention with terminal sample
+server/src/services/issues.ts
+server/src/__tests__/issue-blocker-attention.test.ts
