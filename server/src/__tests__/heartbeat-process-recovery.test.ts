@@ -2600,11 +2600,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "failed",
       errorCode: "workspace_validation_failed",
     });
-    expect(failedRun?.error).toContain("linked to a project workspace but has no project id");
+    expect(failedRun?.error).toContain("no project cwd was resolved");
     expect(failedRun?.resultJson).toMatchObject({
       workspaceValidation: {
-        reason: "missing_project_id",
-        adapterType: "codex_local",
+        // SUP-11115 (#89) refuses the unrealizable project_primary fabrication earlier than the
+        // missing_project_id check, so this issue is now rejected at the fabrication guard. The
+        // property under test is unchanged: the run is failed before the adapter is launched.
+        reason: "project_primary_base_agent_home",
         issueId,
         issueProjectId: null,
         issueProjectWorkspaceId: projectWorkspaceId,
@@ -5746,7 +5748,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.dispatchRequeued).toBe(0);
     expect(result.continuationRequeued).toBe(0);
     expect(result.escalated).toBe(0);
-    expect(result.skipped).toBe(1);
+    // SUP-11085 (#83) widened the candidate filter to admit unassigned todo/in_progress issues, so
+    // this fixture now contributes a second candidate. It is skipped inside the grace window, which
+    // is why the assertions that carry the actual guarantee — escalated, issueIds, and the issue's
+    // own status — are unchanged.
+    expect(result.skipped).toBe(2);
     expect(result.issueIds).toEqual([]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
