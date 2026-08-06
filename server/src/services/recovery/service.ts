@@ -106,6 +106,9 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participa
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 const BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT = 100;
 const BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS = 15 * 60 * 1000;
+const STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT = 100;
+const STILLBORN_ASSIGNED_BACKLOG_RELOG_INTERVAL_MS = 5 * 60_000;
+let lastStillbornAssignedBacklogLogAt: Date | null = null;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -6701,6 +6704,79 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  async function reconcileStillbornAssignedBacklog(opts?: { issueCreatedAtGte?: Date | null }) {
+    const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
+
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "backlog"),
+          sql`${issues.assigneeAgentId} is not null`,
+          visibleIssueCondition(),
+          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+        ),
+      )
+      .orderBy(asc(issues.id))
+      .limit(STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT);
+
+    for (const candidate of candidates) {
+      if (await hasActiveExecutionPath(candidate.companyId, candidate.id, candidate.assigneeAgentId)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasPendingWakeInteraction(candidate.companyId, candidate.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      result.reported += 1;
+      result.issueIds.push(candidate.id);
+
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.stillborn_assigned_backlog_detected",
+        entityType: "issue",
+        entityId: candidate.id,
+        details: {
+          source: "recovery.reconcile_stillborn_assigned_backlog",
+          identifier: candidate.identifier,
+          assigneeAgentId: candidate.assigneeAgentId,
+        },
+      });
+    }
+
+    const shouldLog =
+      result.reported > 0 &&
+      (!lastStillbornAssignedBacklogLogAt ||
+        Date.now() - lastStillbornAssignedBacklogLogAt.getTime() >= STILLBORN_ASSIGNED_BACKLOG_RELOG_INTERVAL_MS);
+    if (shouldLog) {
+      logger.warn(
+        { reported: result.reported, skipped: result.skipped, issueIds: result.issueIds },
+        "stillborn assigned backlog sweep reported issues",
+      );
+      lastStillbornAssignedBacklogLogAt = new Date();
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -6718,5 +6794,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileResolvedDependencyWakeBackstop,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
+    reconcileStillbornAssignedBacklog,
   };
 }

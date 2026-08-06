@@ -11936,6 +11936,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  async function reconcileStillbornAssignedBacklog() {
+    return recovery.reconcileStillbornAssignedBacklog({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+  }
+
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
   }
@@ -17483,6 +17487,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
     reconcileIssueGraphLiveness,
+
+    reconcileStillbornAssignedBacklog,
 
     scanSilentActiveRuns,
     scanTerminableSilentActiveRuns,

@@ -1,5 +1,6 @@
-# Scope for SUP-11052 on this branch.
-# Files owned by this branch's PR: the OpenAPI registration of the author
-# withdraw interaction route and its spec test.
-server/src/routes/openapi.ts
-server/src/__tests__/openapi-routes.test.ts
+# Scope for SUP-11168 on this branch.
+# Files owned by this branch's PR: the report-only stillborn assigned-backlog sweep and tests.
+server/src/services/recovery/service.ts
+server/src/services/heartbeat.ts
+server/src/index.ts
+server/src/__tests__/recovery-stillborn-assigned-backlog-sweep.test.ts

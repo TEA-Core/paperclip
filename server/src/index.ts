@@ -936,6 +936,14 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        const stillbornAssignedBacklog = await heartbeat.reconcileStillbornAssignedBacklog();
+        if (stillbornAssignedBacklog.reported > 0) {
+          logger.warn(
+            { ...stillbornAssignedBacklog },
+            "startup stillborn-assigned-backlog sweep reported issues",
+          );
+        }
+
         const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
         if (taskWatchdogsReconciled.triggered > 0) {
           logger.warn(
@@ -1091,6 +1099,15 @@ export async function startServer(): Promise<StartedServer> {
               const reconciled = await heartbeat.reconcileIssueGraphLiveness();
               if (reconciled.escalationsCreated > 0 || reconciled.dependencyWakesHealed > 0) {
                 logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
+              }
+            })
+            .then(async () => {
+              const stillbornAssignedBacklog = await heartbeat.reconcileStillbornAssignedBacklog();
+              if (stillbornAssignedBacklog.reported > 0) {
+                logger.warn(
+                  { ...stillbornAssignedBacklog },
+                  "periodic stillborn-assigned-backlog sweep reported issues",
+                );
               }
             })
             .then(async () => {
