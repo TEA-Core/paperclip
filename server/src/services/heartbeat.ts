@@ -389,13 +389,21 @@ export const EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON = "execution_workspace_oc
 export const EXECUTION_WORKSPACE_OCCUPIED_WAKE_REASON = "execution_workspace_occupied_retry";
 export const EXECUTION_WORKSPACE_OCCUPIED_FAILURE_CODE = "execution_workspace_occupied";
 /**
- * How many times a dispatch will wait for a shared worktree before giving up on
- * reuse. Five waits at a minute apiece covers the ordinary case — a sibling run
- * finishing normally — without letting one wedged run hold its siblings for an
- * unbounded stretch.
+ * How long a dispatch will wait for a shared worktree before giving up on reuse.
+ *
+ * Sized against how long runs in shared workspaces actually take: p50 is ~5.6
+ * minutes and p90 ~37, with 54% exceeding five minutes. A short budget would not
+ * be a wait at all — it would spend latency and then fork anyway in the majority
+ * of cases, which is the worst of both. Forking is the anti-dead-block backstop,
+ * not the common path, so the budget has to outlast an ordinary sibling run.
+ *
+ * Forking is not free for the run that gets forked: a fresh workspace is cut
+ * from the base ref, so a child that needed its parent's branch state starts
+ * clean and either redoes the work or conflicts. That is still far cheaper than
+ * two agents in one worktree, but it is a reason to wait properly first.
  */
-const EXECUTION_WORKSPACE_OCCUPIED_MAX_DEFERRALS = 5;
-const EXECUTION_WORKSPACE_OCCUPIED_DEFER_DELAY_MS = 60_000;
+const EXECUTION_WORKSPACE_OCCUPIED_MAX_DEFERRALS = 8;
+const EXECUTION_WORKSPACE_OCCUPIED_DEFER_DELAY_MS = 5 * 60_000;
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;

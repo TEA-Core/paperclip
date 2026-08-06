@@ -2783,11 +2783,34 @@ export function issueRoutes(
     const context = run.contextSnapshot && typeof run.contextSnapshot === "object"
       ? run.contextSnapshot as Record<string, unknown>
       : null;
-    if (!context || !readNonEmptyString(context.executionWorkspaceId)) return null;
+    const runExecutionWorkspaceId = readNonEmptyString(context?.executionWorkspaceId);
+    if (!context || !runExecutionWorkspaceId) return null;
     const paperclipIssue = context.paperclipIssue && typeof context.paperclipIssue === "object"
       ? context.paperclipIssue as Record<string, unknown>
       : null;
-    return readNonEmptyString(context.issueId) ?? readNonEmptyString(paperclipIssue?.id);
+    const runIssueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(paperclipIssue?.id);
+    if (!runIssueId) return null;
+
+    // SUP-11260: hand on the run's worktree only if the run actually owns it.
+    //
+    // A run that is itself a guest in someone else's workspace used to pass that
+    // workspace to every issue it created, and those issues passed it on again.
+    // That is how one worktree ended up shared by 31 unrelated issues over eight
+    // days: not by anyone choosing to share it, but by a binding that propagated
+    // through runs that had merely borrowed it.
+    //
+    // Creating a follow-up in a worktree you own stays supported — that is the
+    // point of SUP-10403 — but the chain stops at the first borrower.
+    const workspaceOwner = await db
+      .select({ sourceIssueId: executionWorkspaces.sourceIssueId })
+      .from(executionWorkspaces)
+      .where(and(
+        eq(executionWorkspaces.id, runExecutionWorkspaceId),
+        eq(executionWorkspaces.companyId, companyId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!workspaceOwner || workspaceOwner.sourceIssueId !== runIssueId) return null;
+    return runIssueId;
   }
 
   async function resolveAgentTrustForIssue(
@@ -7206,9 +7229,18 @@ export function issueRoutes(
       rawCreateBody.assigneeAgentId as string | null | undefined,
     );
     const actor = getActorInfo(req);
-    const runWorkspaceInheritanceSourceIssueId = hasExplicitIssueWorkspaceCreateSelection(rawCreateBody)
-      ? null
-      : await resolveRunIssueWorkspaceInheritanceSource(companyId, actor);
+    const requestsWorkspaceInheritanceFromRun = !hasExplicitIssueWorkspaceCreateSelection(rawCreateBody);
+    const runWorkspaceInheritanceSourceIssueId = requestsWorkspaceInheritanceFromRun
+      ? await resolveRunIssueWorkspaceInheritanceSource(companyId, actor)
+      : null;
+    // A bare `reuse_existing` asks to continue in the run's worktree. When that
+    // request is declined the preference has nothing left to name, and leaving it
+    // in place would fail the create with an unrealizable pair (SUP-10403) rather
+    // than doing the sensible thing and cutting a fresh workspace.
+    const declinedRunWorkspaceInheritance =
+      requestsWorkspaceInheritanceFromRun &&
+      !runWorkspaceInheritanceSourceIssueId &&
+      rawCreateBody.executionWorkspacePreference === "reuse_existing";
     const createBody = {
       ...rawCreateBody,
       parentId: effectiveParentId,
@@ -7216,6 +7248,7 @@ export function issueRoutes(
       ...(runWorkspaceInheritanceSourceIssueId
         ? { inheritExecutionWorkspaceFromIssueId: runWorkspaceInheritanceSourceIssueId }
         : {}),
+      ...(declinedRunWorkspaceInheritance ? { executionWorkspacePreference: undefined } : {}),
       ...(watchdogProductBugFollowUp
         ? {
           description: appendWatchdogDiscoveryContext({

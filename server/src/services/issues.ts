@@ -6578,6 +6578,7 @@ export function issueService(db: Db) {
           issueData.executionWorkspacePreference === "reuse_existing" &&
           issueData.executionWorkspaceId === undefined &&
           issueData.executionWorkspaceSettings === undefined;
+        let declinedWorkspaceInheritance = false;
         const hasExplicitExecutionWorkspaceOverride =
           !requestsUnboundWorkspaceReuse &&
           (issueData.executionWorkspaceId !== undefined ||
@@ -6600,11 +6601,29 @@ export function issueService(db: Db) {
               .select({
                 id: executionWorkspaces.id,
                 mode: executionWorkspaces.mode,
+                sourceIssueId: executionWorkspaces.sourceIssueId,
               })
               .from(executionWorkspaces)
               .where(eq(executionWorkspaces.id, workspaceSource.executionWorkspaceId))
               .then((rows) => rows[0] ?? null);
-            if (sourceWorkspace) {
+            // SUP-11260: a workspace outlives the issue it was cut for. Once that
+            // issue is done the worktree is nobody's, and binding new issues to it
+            // is what let single worktrees accumulate dozens of unrelated issues
+            // over days. Inherit a live issue's workspace; let a finished one go.
+            const sourceWorkspaceOwnerStatus = sourceWorkspace?.sourceIssueId
+              ? await tx
+                  .select({ status: issues.status })
+                  .from(issues)
+                  .where(and(
+                    eq(issues.companyId, companyId),
+                    eq(issues.id, sourceWorkspace.sourceIssueId),
+                  ))
+                  .then((rows) => rows[0]?.status ?? null)
+              : null;
+            const sourceWorkspaceOwnerIsTerminal =
+              sourceWorkspaceOwnerStatus === "done" || sourceWorkspaceOwnerStatus === "cancelled";
+            if (sourceWorkspace && sourceWorkspaceOwnerIsTerminal) declinedWorkspaceInheritance = true;
+            if (sourceWorkspace && !sourceWorkspaceOwnerIsTerminal) {
               executionWorkspaceId = sourceWorkspace.id;
               executionWorkspacePreference = "reuse_existing";
               executionWorkspaceSettings = {
@@ -6613,6 +6632,18 @@ export function issueService(db: Db) {
               };
             }
           }
+        }
+        // A bare `reuse_existing` is a request to inherit, so a declined
+        // inheritance must not land as a 422 the caller cannot act on: it asked to
+        // continue somewhere and we said no, which leaves a fresh workspace as the
+        // honest answer. Only a decline clears it — an unrealizable pair the caller
+        // actually meant still fails loudly (SUP-10403).
+        if (declinedWorkspaceInheritance && requestsUnboundWorkspaceReuse && !executionWorkspaceId) {
+          executionWorkspacePreference = null;
+          // The insert spreads `issueData` and then only *adds* the local when it
+          // is truthy, so clearing the local alone would let the original request
+          // survive into the row.
+          delete issueData.executionWorkspacePreference;
         }
         if (issueData.projectId == null && projectWorkspaceId) {
           const workspace = await assertValidProjectWorkspace(companyId, null, projectWorkspaceId, tx);
