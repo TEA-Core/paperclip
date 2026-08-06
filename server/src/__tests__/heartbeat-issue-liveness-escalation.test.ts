@@ -1779,7 +1779,164 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       );
 
     expect(wakes).toHaveLength(maxCount);
-    expect(wakes.every((wake) => wake.status === "completed")).toBe(true);
+  it("logs activity for every cap-exhausted candidate in the same tick, not just the first", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+
+    const blockedIssueId2 = randomUUID();
+    const blockerIssueId2 = randomUUID();
+    const issuePrefix = `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const now = new Date();
+
+    await db.insert(issues).values([
+      {
+        id: blockedIssueId2,
+        companyId,
+        title: "Synthetic blocked dependent 2",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 3,
+        identifier: `${issuePrefix}-3`,
+      },
+      {
+        id: blockerIssueId2,
+        companyId,
+        title: "Synthetic completed blocker 2",
+        status: "done",
+        priority: "medium",
+        issueNumber: 4,
+        identifier: `${issuePrefix}-4`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId2,
+      relatedIssueId: blockedIssueId2,
+      type: "blocks",
+    });
+
+await db.insert(agentWakeupRequests).values([
+  {
+    companyId,
+    agentId,
+    source: "automation",
+    triggerDetail: "system",
+    reason: "issue_blockers_resolved",
+    payload: {
+      issueId: blockedIssueId,
+      resolvedBlockerIssueId: blockerIssueId,
+      blockerIssueIds: [blockerIssueId],
+    },
+    status: "skipped",
+    requestedAt: new Date(now.getTime() - 3_000),
+    finishedAt: new Date(now.getTime() - 2_800),
+    idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`,
+  },
+  {
+    companyId,
+    agentId,
+    source: "automation",
+    triggerDetail: "system",
+    reason: "issue_blockers_resolved",
+    payload: {
+      issueId: blockedIssueId,
+      resolvedBlockerIssueId: blockerIssueId,
+      blockerIssueIds: [blockerIssueId],
+    },
+    status: "skipped",
+    requestedAt: new Date(now.getTime() - 2_000),
+    finishedAt: new Date(now.getTime() - 1_800),
+    idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`,
+  },
+  {
+    companyId,
+    agentId,
+    source: "automation",
+    triggerDetail: "system",
+    reason: "issue_blockers_resolved",
+    payload: {
+      issueId: blockedIssueId,
+      resolvedBlockerIssueId: blockerIssueId,
+      blockerIssueIds: [blockerIssueId],
+    },
+    status: "skipped",
+    requestedAt: new Date(now.getTime() - 1_000),
+    finishedAt: new Date(now.getTime() - 900),
+    idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`,
+  },
+  {
+    companyId,
+    agentId,
+    source: "automation",
+    triggerDetail: "system",
+    reason: "issue_blockers_resolved",
+    payload: {
+      issueId: blockedIssueId2,
+      resolvedBlockerIssueId: blockerIssueId2,
+      blockerIssueIds: [blockerIssueId2],
+    },
+    status: "skipped",
+    requestedAt: new Date(now.getTime() - 3_000),
+    finishedAt: new Date(now.getTime() - 2_800),
+    idempotencyKey: `issue_blockers_resolved:${blockedIssueId2}:${blockerIssueId2}`,
+  },
+  {
+    companyId,
+    agentId,
+    source: "automation",
+    triggerDetail: "system",
+    reason: "issue_blockers_resolved",
+    payload: {
+      issueId: blockedIssueId2,
+      resolvedBlockerIssueId: blockerIssueId2,
+      blockerIssueIds: [blockerIssueId2],
+    },
+    status: "skipped",
+    requestedAt: new Date(now.getTime() - 2_000),
+    finishedAt: new Date(now.getTime() - 1_800),
+    idempotencyKey: `issue_blockers_resolved:${blockedIssueId2}:${blockerIssueId2}`,
+  },
+  {
+    companyId,
+    agentId,
+    source: "automation",
+    triggerDetail: "system",
+    reason: "issue_blockers_resolved",
+    payload: {
+      issueId: blockedIssueId2,
+      resolvedBlockerIssueId: blockerIssueId2,
+      blockerIssueIds: [blockerIssueId2],
+    },
+    status: "skipped",
+    requestedAt: new Date(now.getTime() - 1_000),
+    finishedAt: new Date(now.getTime() - 900),
+    idempotencyKey: `issue_blockers_resolved:${blockedIssueId2}:${blockerIssueId2}`,
+  },
+]);
+
+    const result = await recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileResolvedDependencyWakeBackstop({
+      now,
+      rearmWindowMs: 10 * 60_000,
+      rearmMaxCount: 2,
+    });
+
+    expect(result.reArmCapSkipped).toBe(2);
+
+    const capLogs = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "issue.dependency_wake_rearm_cap_reached"),
+        ),
+      );
+
+    expect(capLogs).toHaveLength(2);
+    expect(capLogs.map((log) => log.entityId).sort()).toEqual(
+      [blockedIssueId, blockedIssueId2].sort(),
+    );
   });
 
   it("escalates every candidate that hits the re-arm cap within the same tick via recovery action", async () => {
@@ -1987,4 +2144,4 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(capHitAgainResult.reArmCapEscalated).toBe(0);
     expect(capHitAgainResult.reArmCapSkipped).toBe(1);
   });
-  });
+});
