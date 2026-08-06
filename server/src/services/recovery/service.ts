@@ -184,6 +184,10 @@ type StrandedRecoveryCause =
   | "workspace_validation_failed"
   | "configuration_incomplete"
   | "execution_review_participant_recovery"
+  // SUP-11280: a run killed by the opencode database growth guard. Distinct from
+  // a plain stranded issue because the fix is to the command the run chose, not
+  // to the runtime or the assignment.
+  | "opencode_db_growth_limit"
   | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
@@ -217,6 +221,9 @@ function resolveStrandedRecoveryCause(
   if (latestRun?.errorCode === "process_lost") return "process_lost";
   if (latestRun?.errorCode === "codex_output_inactivity_monitor") {
     return "codex_output_inactivity_monitor";
+  }
+  if (latestRun?.errorCode === "opencode_db_growth_limit") {
+    return "opencode_db_growth_limit";
   }
   return "stranded_assigned_issue";
 }
@@ -311,6 +318,8 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "timeout",
 ]);
 
+const OPENCODE_DB_GROWTH_LIMIT_ERROR_CODE = "opencode_db_growth_limit";
+
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",
   "agent_not_found",
@@ -318,6 +327,12 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "budget_exhausted",
   "issue_paused",
   "issue_dependencies_blocked",
+  // SUP-11280: the opencode growth guard kills a run for the command it chose,
+  // not for anything about the runtime. Continuing the same work re-runs the same
+  // command and trips at the same place -- on 2026-08-06 two identical 250 MB
+  // trips on one issue inside four minutes. Nothing retries its way out of this;
+  // the command has to change first.
+  OPENCODE_DB_GROWTH_LIMIT_ERROR_CODE,
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
@@ -3105,6 +3120,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ? "Bind the missing secret(s) named in the run failure to the agent/project/routine env before resuming adapter execution."
         : recoveryCause === "execution_review_participant_recovery"
           ? "Repair the failed review participant path, restore the source issue to in_review with a live reviewer, or record an intentional manual resolution."
+        : recoveryCause === "opencode_db_growth_limit"
+          ? "Change the command whose output streamed unbounded — redirect it to a file and report a bounded tail — before resuming the same work."
         : "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
       wakePolicy: recoveryCause === "provider_quota" && !ownerAgentId
         ? {
@@ -3454,6 +3471,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ? "recovery.reconcile_configuration_incomplete"
       : input.recoveryCause === "execution_review_participant_recovery"
         ? "recovery.reconcile_execution_review_participant"
+      : input.recoveryCause === "opencode_db_growth_limit"
+        ? "recovery.reconcile_opencode_db_growth_limit"
       : "recovery.reconcile_stranded_assigned_issue";
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
@@ -4451,14 +4470,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         if (classification.kind === "non_retryable") {
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+          const databaseGrowthLimit =
+            classification.errorCode === OPENCODE_DB_GROWTH_LIMIT_ERROR_CODE;
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_progress",
             latestRun,
-            comment:
-              "Paperclip detected a non-retryable failure on this issue's continuation run " +
-              `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
-              `so it is visible for intervention.${failureSummary ?? ""}`,
+            ...(databaseGrowthLimit ? { recoveryCause: "opencode_db_growth_limit" as const } : {}),
+            // The growth-limit case gets the remediation spelled out: without it
+            // the next owner reads "non-retryable" and re-runs the same command.
+            comment: databaseGrowthLimit
+              ? "Paperclip terminated this issue's run because its OpenCode database grew past the " +
+                "per-run budget. That is caused by a command whose output streams faster than the " +
+                "database can absorb it — each output chunk is written as a full snapshot — so " +
+                "retrying the same work would run the same command and fail the same way." +
+                `${failureSummary ?? ""} Moving it to \`blocked\` so the offending command can be ` +
+                "changed before resuming: redirect long or chatty command output to a file and " +
+                "report a bounded slice of it (`cmd > /tmp/run.log 2>&1; tail -100 /tmp/run.log`)."
+              : "Paperclip detected a non-retryable failure on this issue's continuation run " +
+                `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
+                `so it is visible for intervention.${failureSummary ?? ""}`,
           });
           if (updated) {
             result.escalated += 1;
