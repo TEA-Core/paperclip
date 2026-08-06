@@ -40,6 +40,7 @@ import {
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
+  resolveBaseRepoHygieneDecision,
   resetRuntimeServicesForTests,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
@@ -1011,6 +1012,158 @@ describe("realizeExecutionWorkspace", () => {
 
     expect(await readGit(repoRoot, ["symbolic-ref", "--short", "HEAD"])).toBe("master");
     expect(existsSync(untracked)).toBe(true);
+  });
+
+  describe("base repo hygiene decision", () => {
+    it("returns ok when the base repo is cleanly detached at the base ref", () => {
+      expect(
+        resolveBaseRepoHygieneDecision({
+          currentBranch: null,
+          defaultRef: "main",
+          dirtyTrackedPathCount: 0,
+          unmergedPathCount: 0,
+          headSha: "abc123",
+          baseRefSha: "abc123",
+        }),
+      ).toEqual({ action: "ok" });
+    });
+
+    it("still restores a base repo detached at a different commit", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: null,
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(expect.arrayContaining([expect.stringContaining("detached HEAD")]));
+      }
+    });
+
+    it("still restores a base repo on a named non-default branch", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "feature-branch",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(
+          expect.arrayContaining([expect.stringContaining('"feature-branch" instead of "main"')]),
+        );
+      }
+    });
+
+    it("still restores a base repo with unmerged paths", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 2,
+        headSha: "abc123",
+        baseRefSha: "abc123",
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(
+          expect.arrayContaining([expect.stringContaining("2 unmerged path(s)")]),
+        );
+        expect(decision.snapshotTrackedChanges).toBe(true);
+      }
+    });
+
+    it("still restores a base repo detached at baseRef but with dirty tracked paths", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: null,
+        defaultRef: "main",
+        dirtyTrackedPathCount: 3,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "abc123",
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(
+          expect.arrayContaining([expect.stringContaining("3 modified tracked path(s)")]),
+        );
+        expect(decision.snapshotTrackedChanges).toBe(true);
+      }
+    });
+
+    it("falls back to branch-name behaviour when SHAs are unknown", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: null,
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: null,
+        baseRefSha: null,
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(
+          expect.arrayContaining([expect.stringContaining("detached HEAD")]),
+        );
+      }
+    });
+  });
+
+  it("does not restore a base repo already at the base ref on a second dispatch (detached HEAD case)", async () => {
+    // F1: when the default branch is held by an agent worktree, the first dispatch
+    // detaches at the base ref. The second dispatch must see HEAD === baseRefSha and
+    // skip the restore entirely — no "was restored to" warning, no new rescue ref.
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const stealer = path.join(repoRoot, "..", "master-stealer");
+    await runGit(repoRoot, ["checkout", "-b", "parked-elsewhere"]);
+    await fs.writeFile(path.join(repoRoot, "extra.txt"), "extra\n", "utf8");
+    await runGit(repoRoot, ["add", "extra.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "extra commit"]);
+    await runGit(repoRoot, ["worktree", "add", stealer, "master"]);
+
+    const first = await realizeWorktreeForTest(repoRoot, "master");
+    expect(first.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+    const firstRescueRefs = (await readGit(repoRoot, [
+      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+    ])).split("\n").filter(Boolean);
+    const firstCount = firstRescueRefs.length;
+    expect(firstCount).toBeGreaterThan(0);
+
+    const second = await realizeWorktreeForTest(repoRoot, "master");
+    expect(second.warnings).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+    const secondRescueRefs = (await readGit(repoRoot, [
+      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+    ])).split("\n").filter(Boolean);
+    expect(secondRescueRefs.length).toBe(firstCount);
+  });
+
+  it("produces distinct rescue-ref prefixes for two dirty base repo restores in the same second", async () => {
+    // F2: the rescue prefix must include a per-run discriminator so concurrent
+    // restores within the same second do not silently overwrite each other.
+    const { repoRoot } = await createClonedRepoWithRemote();
+
+    await runGit(repoRoot, ["checkout", "-b", "dirty-one"]);
+    await fs.writeFile(path.join(repoRoot, "README.md"), "modification one\n", "utf8");
+    await realizeWorktreeForTest(repoRoot, "master");
+
+    await runGit(repoRoot, ["checkout", "-b", "dirty-two"]);
+    await fs.writeFile(path.join(repoRoot, "README.md"), "modification two\n", "utf8");
+    await realizeWorktreeForTest(repoRoot, "master");
+
+    const rescueRefs = (await readGit(repoRoot, [
+      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+    ])).split("\n").filter(Boolean);
+    const prefixes = new Set(rescueRefs.map((ref) => ref.replace(/\/(head|worktree)$/, "")));
+    expect(prefixes.size).toBe(2);
   });
 
   it("still provisions when the base repo cannot be restored", async () => {
