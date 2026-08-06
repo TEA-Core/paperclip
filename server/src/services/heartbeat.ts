@@ -14700,8 +14700,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "setup_failed";
           logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
+          // Emit the run-log event before the status flip so the event stream is
+          // complete by the time terminal status is observable. Only do so while
+          // the run is still `running`: if another path already finalized it (a
+          // cancel, or the inner catch), setRunStatusIfRunning below is a no-op
+          // and this event would be a spurious late error on a settled run.
           const failedRunPreFlip = await getRun(runId).catch(() => null);
-          if (failedRunPreFlip) {
+          if (failedRunPreFlip?.status === "running") {
             await appendRunEvent(failedRunPreFlip, 1, {
               eventType: "error",
               stream: "system",

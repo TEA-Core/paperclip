@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -57,62 +57,21 @@ async function waitForRun(db: ReturnType<typeof createDb>, runId: string) {
   return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
 }
 
-async function cleanupSafely(db: ReturnType<typeof createDb>) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    let hadError = false;
-    for (const fn of [
-      () => db.delete(activityLog),
-      () => db.delete(issueComments),
-      () => db.delete(heartbeatRunEvents),
-      () => db.delete(heartbeatRuns),
-      () => db.delete(agentWakeupRequests),
-      () => db.delete(agentRuntimeState),
-    ]) {
-      try { await fn(); } catch { hadError = true; }
-    }
-    try { await db.delete(issues); } catch (e) { hadError = true; }
-    try { await db.delete(agents); } catch (e) { hadError = true; }
-    try { await db.delete(companySkills); } catch { hadError = true; }
-    try { await db.delete(companyMemberships); } catch { hadError = true; }
-    try { await db.delete(companies); } catch { hadError = true; }
-    if (!hadError) return;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-}
-
-async function waitForSettledState(
-  db: ReturnType<typeof createDb>,
-  timeoutMs: number,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  let settled = 0;
-  let lastMaxUpdated: string | null = null;
-  while (Date.now() < deadline) {
-    const active = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(inArray(heartbeatRuns.status, ["queued", "running"]))
-      .then((rows) => rows.length);
-    if (active > 0) {
-      settled = 0;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      continue;
-    }
-    const maxUpdated = await db
-      .select({ max: sql<string>`greatest(max(${heartbeatRuns.updatedAt}), max(${heartbeatRunEvents.createdAt}))` })
-      .from(heartbeatRuns)
-      .leftJoin(heartbeatRunEvents, eq(heartbeatRuns.id, heartbeatRunEvents.runId))
-      .then((rows) => rows[0]?.max ?? null);
-    if (maxUpdated !== lastMaxUpdated) {
-      lastMaxUpdated = maxUpdated;
-      settled = 0;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      continue;
-    }
-    settled += 1;
-    if (settled >= 6) return;
-    await new Promise((resolve) => setTimeout(resolve, 30));
-  }
+// Child-before-parent, with no retries and no swallowed errors. The ordering fix
+// in executeRun means a settled run has no writes still outstanding, so any error
+// raised here is a real defect and must surface instead of being retried away.
+async function deleteAllFixtureRows(db: ReturnType<typeof createDb>) {
+  await db.delete(activityLog);
+  await db.delete(issueComments);
+  await db.delete(heartbeatRunEvents);
+  await db.delete(heartbeatRuns);
+  await db.delete(agentWakeupRequests);
+  await db.delete(agentRuntimeState);
+  await db.delete(issues);
+  await db.delete(agents);
+  await db.delete(companySkills);
+  await db.delete(companyMemberships);
+  await db.delete(companies);
 }
 
 describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
@@ -129,8 +88,11 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
   afterEach(async () => {
     mockAdapterExecute.mockClear();
     runningProcesses.clear();
-    await waitForSettledState(db, 8_000);
-    await cleanupSafely(db);
+    // Terminal run status is NOT a "this run is finished writing" signal: the
+    // executeRun finally block still appends scratch-cleanup events afterwards.
+    // Await the service's explicit drain instead of polling run status.
+    await heartbeat.drainActiveRunExecutions();
+    await deleteAllFixtureRows(db);
   });
 
   afterAll(async () => {
