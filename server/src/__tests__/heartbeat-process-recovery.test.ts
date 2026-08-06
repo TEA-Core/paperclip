@@ -4052,19 +4052,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     await heartbeat.resumeQueuedRuns();
-    const blockedIssue = await waitForValue(async () => {
-      const row = await db
-        .select()
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      return row?.status === "blocked" ? row : null;
+    // Wait on the escalation comment, not on `status === "blocked"`. Other recovery sweeps
+    // also block a stranded issue, and one of them can win the race — polling the status
+    // lets the test read the comments before this path has written its own.
+    const escalationComment = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.find((comment) => comment.body.includes("deferral limit")) ?? null;
     }, 8_000);
-    expect(blockedIssue).toBeTruthy();
-
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    const escalationComment = comments.find((comment) => comment.body.includes("deferral limit"));
     expect(escalationComment).toBeTruthy();
+
+    const blockedIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(blockedIssue?.status).toBe("blocked");
     // The reviewer demonstrably ran, so the escalation must not claim there was no live run.
     expect(escalationComment?.body).not.toContain("live reviewer run");
   });
