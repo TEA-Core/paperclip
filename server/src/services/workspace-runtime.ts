@@ -1109,6 +1109,16 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     expectedHeadSha,
     actualHeadSha,
   });
+  // Contention is consulted by the eligibility predicates below, so it must be resolved before
+  // them: restoring the recorded branch is only safe while no *other* workspace is actively
+  // running on the branch this worktree is parked on.
+  const contention = await findGitWorktreeBranchContention({
+    db: input.db ?? null,
+    sourceIssue: input.sourceIssue,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    worktreePath: input.worktreePath,
+    actualBranchName: input.actualBranchName,
+  });
   const basePlainLanguageReason = explainGitWorktreeBranchIncoherence({
     expectedBranchName: input.expectedBranchName,
     actualBranchName: input.actualBranchName,
@@ -1144,8 +1154,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     actualBranchIsDefaultBranch;
   // SUP-10665: a reused worktree left on a leftover branch by the previous run must not dead-block
   // forever. But the repair may only run when restoring the recorded branch abandons nothing — that
-  // is, when HEAD is already contained in the recorded branch. True divergence (HEAD carries commits
-  // the recorded branch does not) stays fail-closed; see heartbeat-workspace-branch-containment.
+  // is, when HEAD is already contained in the recorded branch. Divergence that would strand commits
+  // stays fail-closed; see heartbeat-workspace-branch-containment. (Divergence on a *live named
+  // branch* strands nothing and is handled by canRestoreRecordedBranchOverLiveNamedBranch below.)
   const canRestoreRecordedBranchOverContainedHead =
     cleanliness === "clean" &&
     expectedBranchExists &&
@@ -1154,12 +1165,30 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     input.actualBranchName !== null &&
     ancestryVerdict !== "ancestor" &&
     actualHeadContainedInExpectedBranch;
+  // SUP-11207: the containment proof above is only *needed* when the commits on HEAD would
+  // otherwise become unreachable — a detached HEAD, or a branch ref that no longer exists. When
+  // HEAD is on a live named branch that git still resolves, checking out the recorded branch
+  // abandons nothing: every commit stays reachable from that branch's own ref, under a name the
+  // operator can see in `git branch`. Requiring containment here left every agent that ran
+  // `git checkout -b` inside its worktree permanently dead-blocked behind
+  // workspace_validation_failed. Still fail-closed on contention, because yanking the worktree
+  // back would pull the rug out from under another workspace's live run.
+  const canRestoreRecordedBranchOverLiveNamedBranch =
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    !sameHead &&
+    registeredBranchMatchesHead &&
+    input.actualBranchName !== null &&
+    actualBranchExists === true &&
+    ancestryVerdict !== "ancestor" &&
+    !contention;
   const eligible =
     canCheckoutRecordedBranch ||
     canAdoptForwardActualBranch ||
     canAttachRecordedBranchToDetachedHead ||
     canRebindDeletedBranchToDefaultBranch ||
-    canRestoreRecordedBranchOverContainedHead;
+    canRestoreRecordedBranchOverContainedHead ||
+    canRestoreRecordedBranchOverLiveNamedBranch;
   const safeRepairReason = eligible
     ? canCheckoutRecordedBranch
       ? "clean worktree and expected branch points at the current HEAD"
@@ -1169,7 +1198,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
           ? "clean detached worktree HEAD is forward of the recorded branch"
           : canRebindDeletedBranchToDefaultBranch
             ? "clean worktree with deleted recorded branch is already on the default branch"
-            : "clean worktree HEAD is already contained in the recorded branch, so restoring it abandons no commits"
+            : canRestoreRecordedBranchOverContainedHead
+              ? "clean worktree HEAD is already contained in the recorded branch, so restoring it abandons no commits"
+              : `clean worktree HEAD is on live branch "${input.actualBranchName}", which keeps its commits reachable after the recorded branch is restored`
     : cleanliness !== "clean"
       ? inProgressOperation
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
@@ -1178,6 +1209,8 @@ async function inspectGitWorktreeBranchIncoherence(input: {
         ? "worktree path is not registered"
       : !registeredBranchMatchesHead
         ? "registered worktree branch does not match HEAD"
+      : contention
+        ? formatBranchContentionRefusal("recorded branch restore", contention)
       : !expectedBranchExists
         ? actualBranchIsDefaultBranch
           ? "recorded branch is deleted but worktree is clean and already on the default branch"
@@ -1194,13 +1227,6 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     cleanliness,
     expectedHeadSha,
     actualHeadSha,
-  });
-  const contention = await findGitWorktreeBranchContention({
-    db: input.db ?? null,
-    sourceIssue: input.sourceIssue,
-    executionWorkspaceId: input.executionWorkspaceId ?? null,
-    worktreePath: input.worktreePath,
-    actualBranchName: input.actualBranchName,
   });
 
   return {
@@ -1252,11 +1278,15 @@ function branchIncoherenceValidationFailure(evidence: GitWorktreeBranchIncoheren
   );
 }
 
-function formatDirtyQuarantineContentionRefusal(contention: GitWorktreeBranchContention) {
+function formatBranchContentionRefusal(repairLabel: string, contention: GitWorktreeBranchContention) {
   const activeRunText = contention.activeRun
     ? ` with active run ${contention.activeRun.id}`
     : " with no active run";
-  return `dirty quarantine repair refused because workspace ${contention.claimedByWorkspaceId} already claims the live branch${activeRunText}`;
+  return `${repairLabel} refused because workspace ${contention.claimedByWorkspaceId} already claims the live branch${activeRunText}`;
+}
+
+function formatDirtyQuarantineContentionRefusal(contention: GitWorktreeBranchContention) {
+  return formatBranchContentionRefusal("dirty quarantine repair", contention);
 }
 
 function formatDirtyQuarantineFailure(error: unknown) {
@@ -2175,11 +2205,18 @@ export async function ensureGitWorktreeBranchCoherent(input: {
 
   evidence.safeRepair.succeeded = true;
   evidence.safeRepair.reason = "clean worktree checked out the recorded branch";
+  // Name the branch the worktree was parked on. Its commits survive there, but nothing else in the
+  // run surfaces them, so an agent resuming on the recorded branch would otherwise just see its
+  // previous work vanish and redo it.
+  const abandonedBranchNote =
+    currentBranch && !evidence.provenance.sameHead && evidence.provenance.actualBranchExists === true
+      ? ` The worktree was parked on "${currentBranch}"; any commits made there are still reachable from that branch and were not discarded.`
+      : "";
   return {
     branchName: expectedBranchName,
     reconciledForward: false,
     warnings: [
-      `Execution workspace branch metadata was self-healed by checking out recorded branch "${expectedBranchName}" at ${input.worktreePath}.`,
+      `Execution workspace branch metadata was self-healed by checking out recorded branch "${expectedBranchName}" at ${input.worktreePath}.${abandonedBranchNote}`,
     ],
   };
 }
