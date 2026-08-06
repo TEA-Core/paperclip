@@ -964,6 +964,74 @@ describe("realizeExecutionWorkspace", () => {
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(originHead);
   });
 
+  it("restores a base repo left on a task branch before cutting a worktree from it", async () => {
+    // SUP-11285: the primary clone is an ancestor of every agent worktree and the
+    // only checkout holding the default branch, so agents use it as scratch and
+    // leave it parked. Tidy it on the way past — without blocking the dispatch.
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await runGit(repoRoot, ["checkout", "-b", "someone-elses-task-branch"]);
+    await fs.writeFile(path.join(repoRoot, "README.md"), "left dirty by an agent\n", "utf8");
+    expect(await readGit(repoRoot, ["status", "--porcelain"])).not.toBe("");
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+
+    // The dispatch still got its worktree...
+    expect(workspace.cwd).toBeTruthy();
+    // ...and the base repo is back on its default ref with no tracked modifications.
+    // Untracked entries are expected to survive: by this point `.paperclip/worktrees`
+    // exists and is untracked in this repo, and removing it would delete the very
+    // worktree this dispatch just created.
+    expect(await readGit(repoRoot, ["symbolic-ref", "--short", "HEAD"])).toBe("master");
+    const trackedDirt = (await readGit(repoRoot, ["status", "--porcelain"]))
+      .split("\n")
+      .filter((line) => line.trim().length > 0 && !line.startsWith("??"));
+    expect(trackedDirt).toEqual([]);
+    expect(workspace.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+
+    // Nothing was discarded: the modification is recoverable from a rescue ref.
+    const rescueRefs = (await readGit(repoRoot, [
+      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+    ])).split("\n").filter(Boolean);
+    expect(rescueRefs.some((ref) => ref.endsWith("/worktree"))).toBe(true);
+    expect(rescueRefs.some((ref) => ref.endsWith("/head"))).toBe(true);
+  });
+
+  it("leaves untracked files in the base repo alone while restoring it", async () => {
+    // The worktrees live at <repoRoot>/.paperclip/worktrees and are untracked in
+    // some repos on this fleet, so anything that removes untracked content from
+    // the base repo would delete live agent workspaces. Never do that.
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await runGit(repoRoot, ["checkout", "-b", "parked"]);
+    const untracked = path.join(repoRoot, "untracked-keepme.txt");
+    await fs.writeFile(untracked, "not ours to delete\n", "utf8");
+
+    await realizeWorktreeForTest(repoRoot, "master");
+
+    expect(await readGit(repoRoot, ["symbolic-ref", "--short", "HEAD"])).toBe("master");
+    expect(existsSync(untracked)).toBe(true);
+  });
+
+  it("still provisions when the base repo cannot be restored", async () => {
+    // Hygiene is never a gate. A base repo whose default branch is checked out in
+    // another worktree cannot be returned to it, and the dispatch must not care.
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const stealer = path.join(repoRoot, "..", "master-stealer");
+    await runGit(repoRoot, ["checkout", "-b", "parked-elsewhere"]);
+    await runGit(repoRoot, ["worktree", "add", stealer, "master"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+
+    expect(workspace.cwd).toBeTruthy();
+    // Detached at the base ref rather than contending for a branch another
+    // checkout already holds.
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"]))
+      .toBe(await readGit(repoRoot, ["rev-parse", "origin/master"]));
+    expect(await readGit(repoRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => "DETACHED"))
+      .toBe("DETACHED");
+  });
+
   it("maps a configured local branch base ref to origin/<branch> for fresh worktrees", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
     const originHead = await readGit(repoRoot, ["rev-parse", "origin/master"]);
