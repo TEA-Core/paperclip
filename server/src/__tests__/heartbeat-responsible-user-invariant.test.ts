@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -57,23 +57,61 @@ async function waitForRun(db: ReturnType<typeof createDb>, runId: string) {
   return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
 }
 
-async function deleteHeartbeatRunsAfterEvents(db: ReturnType<typeof createDb>) {
+async function cleanupSafely(db: ReturnType<typeof createDb>) {
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    await db.delete(heartbeatRunEvents);
-    try {
-      await db.delete(heartbeatRuns);
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (
-        attempt < 4 &&
-        message.includes("heartbeat_run_events_run_id_heartbeat_runs_id_fk")
-      ) {
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        continue;
-      }
-      throw error;
+    let hadError = false;
+    for (const fn of [
+      () => db.delete(activityLog),
+      () => db.delete(issueComments),
+      () => db.delete(heartbeatRunEvents),
+      () => db.delete(heartbeatRuns),
+      () => db.delete(agentWakeupRequests),
+      () => db.delete(agentRuntimeState),
+    ]) {
+      try { await fn(); } catch { hadError = true; }
     }
+    try { await db.delete(issues); } catch (e) { hadError = true; }
+    try { await db.delete(agents); } catch (e) { hadError = true; }
+    try { await db.delete(companySkills); } catch { hadError = true; }
+    try { await db.delete(companyMemberships); } catch { hadError = true; }
+    try { await db.delete(companies); } catch { hadError = true; }
+    if (!hadError) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function waitForSettledState(
+  db: ReturnType<typeof createDb>,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let settled = 0;
+  let lastMaxUpdated: string | null = null;
+  while (Date.now() < deadline) {
+    const active = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.status, ["queued", "running"]))
+      .then((rows) => rows.length);
+    if (active > 0) {
+      settled = 0;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      continue;
+    }
+    const maxUpdated = await db
+      .select({ max: sql<string>`greatest(max(${heartbeatRuns.updatedAt}), max(${heartbeatRunEvents.createdAt}))` })
+      .from(heartbeatRuns)
+      .leftJoin(heartbeatRunEvents, eq(heartbeatRuns.id, heartbeatRunEvents.runId))
+      .then((rows) => rows[0]?.max ?? null);
+    if (maxUpdated !== lastMaxUpdated) {
+      lastMaxUpdated = maxUpdated;
+      settled = 0;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      continue;
+    }
+    settled += 1;
+    if (settled >= 6) return;
+    await new Promise((resolve) => setTimeout(resolve, 30));
   }
 }
 
@@ -91,25 +129,8 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
   afterEach(async () => {
     mockAdapterExecute.mockClear();
     runningProcesses.clear();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const activeRuns = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(inArray(heartbeatRuns.status, ["queued", "running"]));
-      if (activeRuns.length === 0) break;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await db.delete(issueComments);
-    await db.delete(activityLog);
-    await deleteHeartbeatRunsAfterEvents(db);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companySkills);
-    await db.delete(companyMemberships);
-    await db.delete(companies);
+    await waitForSettledState(db, 8_000);
+    await cleanupSafely(db);
   });
 
   afterAll(async () => {
