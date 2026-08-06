@@ -5619,7 +5619,18 @@ export function truncateAgentErrorReason(reason: string | null | undefined): str
     .replace(/\x1b(?:[@-Z\\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
   const trimmed = plain.trim();
   if (!trimmed) return null;
-  return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
+  if (trimmed.length <= 500) return trimmed;
+  const limit = 499;
+  const search = trimmed.slice(0, limit);
+  const sentenceEnd = search.lastIndexOf(". ");
+  if (sentenceEnd >= 0) {
+    return `${search.slice(0, sentenceEnd + 1)}…`;
+  }
+  const ws = search.lastIndexOf(" ");
+  if (ws >= 0) {
+    return `${search.slice(0, ws)}…`;
+  }
+  return `${search}…`;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
