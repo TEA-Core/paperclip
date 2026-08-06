@@ -156,6 +156,44 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     return runId;
   }
 
+  async function createProject(companyId: string) {
+    const projectId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Test Project" });
+    return projectId;
+  }
+
+  async function createExecutionWorkspace(companyId: string, projectId: string) {
+    const workspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Test Workspace",
+    });
+    return workspaceId;
+  }
+
+  async function insertWorkspaceOp(input: {
+    companyId: string;
+    executionWorkspaceId: string;
+    issueId: string;
+    phase: string;
+    status: string;
+  }) {
+    const opId = randomUUID();
+    await db.insert(workspaceOperations).values({
+      id: opId,
+      companyId: input.companyId,
+      executionWorkspaceId: input.executionWorkspaceId,
+      issueId: input.issueId,
+      phase: input.phase,
+      status: input.status,
+    });
+    return opId;
+  }
+
   it("classifies a blocked parent as covered when its child has a running execution path", async () => {
     const { companyId, agentId } = await createCompany("PBC");
     const parentId = await insertIssue({ companyId, identifier: "PBC-1", title: "Parent", status: "blocked" });
@@ -1115,48 +1153,114 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(diagnostics.readiness.allBlockersDone).toBe(false);
   });
 
-  // ---------------------------------------------------------------------------
-  // Permanently unfinalizable blocker sweep tests
-  // ---------------------------------------------------------------------------
-
-  async function createProject(companyId: string) {
-    const projectId = randomUUID();
-    await db.insert(projects).values({
-      id: projectId,
+  it("classifies a blocked root whose every blocker is done as needs_attention with terminal sample", async () => {
+    const { companyId } = await createCompany("PBDONE");
+    const parentId = await insertIssue({ companyId, identifier: "PBDONE-1", title: "Blocked parent", status: "blocked" });
+    const doneBlockerId = await insertIssue({
       companyId,
-      name: "Test Project",
+      identifier: "PBDONE-2",
+      title: "Done blocker",
+      status: "done",
     });
-    return projectId;
-  }
+    await block({ companyId, blockerIssueId: doneBlockerId, blockedIssueId: parentId });
 
-  async function createExecutionWorkspace(companyId: string, projectId: string) {
-    const executionWorkspaceId = randomUUID();
-    await db.insert(executionWorkspaces).values({
-      id: executionWorkspaceId,
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 0,
+      coveredBlockerCount: 0,
+      sampleBlockerIdentifier: "PBDONE-2",
+    });
+  });
+
+  it("classifies a blocked root with multiple done blockers as needs_attention with terminal sample", async () => {
+    const { companyId } = await createCompany("PBMULTI");
+    const parentId = await insertIssue({ companyId, identifier: "PBMULTI-1", title: "Blocked parent", status: "blocked" });
+    const doneBlockerA = await insertIssue({
       companyId,
-      projectId,
-      mode: "isolated_workspace",
-      strategyType: "git_worktree",
-      name: "test-workspace",
+      identifier: "PBMULTI-2",
+      title: "Done blocker A",
+      status: "done",
     });
-    return executionWorkspaceId;
-  }
+    const doneBlockerB = await insertIssue({
+      companyId,
+      identifier: "PBMULTI-3",
+      title: "Done blocker B",
+      status: "done",
+    });
+    await block({ companyId, blockerIssueId: doneBlockerA, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: doneBlockerB, blockedIssueId: parentId });
 
-  async function insertWorkspaceOp(input: {
-    companyId: string;
-    executionWorkspaceId: string;
-    issueId?: string | null;
-    phase: string;
-    status: string;
-  }) {
-    await db.insert(workspaceOperations).values({
-      companyId: input.companyId,
-      executionWorkspaceId: input.executionWorkspaceId,
-      issueId: input.issueId ?? null,
-      phase: input.phase,
-      status: input.status,
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 0,
+      coveredBlockerCount: 0,
     });
-  }
+    expect(parent?.blockerAttention?.sampleBlockerIdentifier).toBeTruthy();
+  });
+
+  it("classifies blocked root with zero blocker edges as needs_attention (no regression)", async () => {
+    const { companyId } = await createCompany("PBEMPTY");
+    const parentId = await insertIssue({ companyId, identifier: "PBEMPTY-1", title: "Blocked parent", status: "blocked" });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 0,
+      coveredBlockerCount: 0,
+      sampleBlockerIdentifier: null,
+    });
+  });
+
+  it("classifies root with one non-terminal blocker as covered (no false positive)", async () => {
+    const { companyId, agentId } = await createCompany("PBLIVE");
+    const parentId = await insertIssue({ companyId, identifier: "PBLIVE-1", title: "Blocked parent", status: "blocked" });
+    const liveBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBLIVE-2",
+      title: "Live blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: liveBlockerId, blockedIssueId: parentId });
+    await activeRun({ companyId, agentId, issueId: liveBlockerId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+    });
+  });
+
+  it("does not change cancelled blocker behaviour", async () => {
+    const { companyId, agentId } = await createCompany("PBCANC");
+    const parentId = await insertIssue({ companyId, identifier: "PBCANC-1", title: "Blocked parent", status: "blocked" });
+    const cancelledBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBCANC-2",
+      title: "Cancelled blocker",
+      status: "cancelled",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: cancelledBlockerId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      attentionBlockerCount: 1,
+    });
+    expect(parent?.blockerAttention?.sampleBlockerIdentifier).toBe("PBCANC-2");
+  });
 
   it("detects permanently unfinalizable blockers and logs activity", async () => {
     const { companyId, agentId } = await createCompany("PUF");
@@ -1301,5 +1405,4 @@ describeEmbeddedPostgres("issue blocker attention", () => {
 
     expect(result.reported).toBe(0);
   });
-
 });
