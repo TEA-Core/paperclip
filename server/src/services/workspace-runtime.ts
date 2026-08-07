@@ -1279,13 +1279,30 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     actualBranchExists === true &&
     ancestryVerdict !== "ancestor" &&
     !contention;
+  // a detached HEAD that diverged from the recorded branch is refused by every
+  // predicate above, because reattachment is only provably lossless when the recorded branch
+  // already contains HEAD. But the hazard is narrower than the refusal: the detached commits are
+  // reachable from no ref, so checking the recorded branch out would strand them. Naming them on
+  // a rescue branch first — the same move the dirty-quarantine path already makes — removes that
+  // hazard, and the restore becomes as safe as canRestoreRecordedBranchOverLiveNamedBranch.
+  // Fail-closed on contention, as everywhere else here.
+  const canRescueDivergedDetachedHead =
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    !sameHead &&
+    registeredBranchMatchesHead &&
+    input.actualBranchName === null &&
+    Boolean(actualHeadSha) &&
+    ancestryVerdict !== "ancestor" &&
+    !contention;
   const eligible =
     canCheckoutRecordedBranch ||
     canAdoptForwardActualBranch ||
     canAttachRecordedBranchToDetachedHead ||
     canRebindDeletedBranchToDefaultBranch ||
     canRestoreRecordedBranchOverContainedHead ||
-    canRestoreRecordedBranchOverLiveNamedBranch;
+    canRestoreRecordedBranchOverLiveNamedBranch ||
+    canRescueDivergedDetachedHead;
   const safeRepairReason = eligible
     ? canCheckoutRecordedBranch
       ? "clean worktree and expected branch points at the current HEAD"
@@ -1297,7 +1314,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
             ? "clean worktree with deleted recorded branch is already on the default branch"
             : canRestoreRecordedBranchOverContainedHead
               ? "clean worktree HEAD is already contained in the recorded branch, so restoring it abandons no commits"
-              : `clean worktree HEAD is on live branch "${input.actualBranchName}", which keeps its commits reachable after the recorded branch is restored`
+              : canRescueDivergedDetachedHead
+                ? "clean detached worktree HEAD diverged from the recorded branch, so its commits are named on a rescue branch before the recorded branch is restored"
+                : `clean worktree HEAD is on live branch "${input.actualBranchName}", which keeps its commits reachable after the recorded branch is restored`
     : cleanliness !== "clean"
       ? inProgressOperation
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
@@ -2271,6 +2290,49 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     };
   }
 
+  // the shared checkout below strands anything reachable only from a detached HEAD, so
+  // when HEAD is detached and diverged, give its commits a name first. This must happen before the
+  // checkout, not after: once HEAD moves, the sha is only recoverable from the reflog.
+  let divergedDetachedRescueBranch: string | null = null;
+  const divergedDetachedHeadSha = evidence.provenance.actualHeadSha;
+  if (
+    currentBranch === null &&
+    divergedDetachedHeadSha &&
+    !evidence.provenance.sameHead &&
+    evidence.provenance.ancestryVerdict !== "ancestor"
+  ) {
+    const rescueBranch = buildDirtyQuarantineRescueBranch(input.sourceIssue);
+    try {
+      await recordGitOperation(input.recorder, {
+        phase: input.reconcileOperationPhase ?? "worktree_prepare",
+        args: ["branch", rescueBranch, divergedDetachedHeadSha],
+        cwd: input.worktreePath,
+        metadata: {
+          repoRoot: input.repoRoot,
+          worktreePath: input.worktreePath,
+          expectedBranchName,
+          actualBranchName: currentBranch,
+          branchIncoherenceRepair: true,
+          divergedDetachedHeadRescue: true,
+          rescueBranch,
+          rescueCommitSha: divergedDetachedHeadSha,
+          fingerprint: evidence.fingerprint,
+          sourceIssueId: evidence.sourceIssueId,
+          executionWorkspaceId: evidence.executionWorkspaceId,
+        },
+        successMessage:
+          `Named diverged detached HEAD ${formatShortSha(divergedDetachedHeadSha)} on rescue branch ${rescueBranch} at ${input.worktreePath}\n`,
+        failureLabel: `git branch ${rescueBranch} ${formatShortSha(divergedDetachedHeadSha)}`,
+      });
+    } catch (error) {
+      evidence.safeRepair.succeeded = false;
+      evidence.safeRepair.reason =
+        `detached HEAD rescue branch creation failed: ${error instanceof Error ? error.message : String(error)}`;
+      throw branchIncoherenceValidationFailure(evidence);
+    }
+    divergedDetachedRescueBranch = rescueBranch;
+  }
+
   try {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
@@ -2308,12 +2370,15 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   }
 
   evidence.safeRepair.succeeded = true;
-  evidence.safeRepair.reason = "clean worktree checked out the recorded branch";
+  evidence.safeRepair.reason = divergedDetachedRescueBranch
+    ? `clean detached worktree HEAD was preserved on rescue branch ${divergedDetachedRescueBranch} before the recorded branch was checked out`
+    : "clean worktree checked out the recorded branch";
   // Name the branch the worktree was parked on. Its commits survive there, but nothing else in the
   // run surfaces them, so an agent resuming on the recorded branch would otherwise just see its
   // previous work vanish and redo it.
-  const abandonedBranchNote =
-    currentBranch && !evidence.provenance.sameHead && evidence.provenance.actualBranchExists === true
+  const abandonedBranchNote = divergedDetachedRescueBranch
+    ? ` The worktree was on a detached HEAD that diverged from the recorded branch; its commits were preserved on rescue branch "${divergedDetachedRescueBranch}" (${formatShortSha(divergedDetachedHeadSha)}) and were not discarded.`
+    : currentBranch && !evidence.provenance.sameHead && evidence.provenance.actualBranchExists === true
       ? ` The worktree was parked on "${currentBranch}"; any commits made there are still reachable from that branch and were not discarded.`
       : "";
   return {

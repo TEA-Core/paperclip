@@ -3038,6 +3038,81 @@ describe("realizeExecutionWorkspace", () => {
     await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(detachedHead);
   }, 15_000);
 
+  // a detached HEAD that diverged from the recorded branch used to dead-block, because
+  // reattachment is only provably lossless when the recorded branch is an ancestor. But the reason
+  // divergence is unsafe is that the detached commits are reachable from no ref — and that is
+  // repairable: name them on a rescue branch first, exactly as the dirty-quarantine path does, and
+  // restoring the recorded branch abandons nothing.
+  it("quarantines a diverged clean detached HEAD on a rescue branch before restoring the recorded branch", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-465-diverged-detached-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", branchName]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+
+    const forkPoint = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    await fs.writeFile(path.join(worktreePath, "recorded.txt"), "recorded work\n", "utf8");
+    await runGit(worktreePath, ["add", "recorded.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add recorded branch work"]);
+    const recordedHead = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+
+    await runGit(worktreePath, ["checkout", "--detach", forkPoint]);
+    await fs.writeFile(path.join(worktreePath, "detached.txt"), "detached work\n", "utf8");
+    await runGit(worktreePath, ["add", "detached.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add diverged detached work"]);
+    const detachedHead = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    expect(detachedHead).not.toBe(recordedHead);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-diverged-detached",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName,
+      },
+      issue: {
+        id: "issue-diverged-detached",
+        identifier: "PAP-465",
+        title: "Rescue diverged detached HEAD",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(restored?.branchName).toBe(branchName);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(branchName);
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(recordedHead);
+
+    // The abandoned commit must survive under a name an operator can see in `git branch`.
+    const rescueBranches = (await readGit(repoRoot, ["branch", "--list", "paperclip/rescue/PAP-465/*"]))
+      .split("\n")
+      .map((line) => line.replace(/^[*+]?\s*/, "").trim())
+      .filter((line) => line.length > 0);
+    expect(rescueBranches).toHaveLength(1);
+    await expect(readGit(repoRoot, ["rev-parse", rescueBranches[0]])).resolves.toBe(detachedHead);
+    expect(restored?.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining(rescueBranches[0]),
+    ]));
+  }, 15_000);
+
   it("rejects dirty persisted git worktree branch incoherence with bounded recovery evidence", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-455-reject-dirty-branch-mismatch";
@@ -3583,7 +3658,11 @@ describe("realizeExecutionWorkspace", () => {
       .resolves.toBe(strandedSha);
   }, 15_000);
 
-  it("keeps the recorded-branch restore fail-closed for a detached HEAD carrying unreachable commits", async () => {
+  // The invariant here is that a restore must never make a commit unreachable — not that it must
+  // refuse. Refusal used to be the only way to honour that (SUP-11207), at the cost of
+  // dead-blocking the issue forever; this change honours it by naming the commit first instead. The
+  // assertions below are on reachability, which is the property that actually matters.
+  it("never strands a detached HEAD's commits when restoring the recorded branch", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-460-recorded-detached";
     const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
@@ -3592,6 +3671,7 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(repoRoot, "recorded-task.txt"), "recorded task work\n", "utf8");
     await runGit(repoRoot, ["add", "recorded-task.txt"]);
     await runGit(repoRoot, ["commit", "-m", "Add recorded task work"]);
+    const recordedSha = await readGit(repoRoot, ["rev-parse", "HEAD"]);
     await runGit(repoRoot, ["checkout", "main"]);
 
     await fs.mkdir(path.dirname(worktreePath), { recursive: true });
@@ -3599,18 +3679,27 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(worktreePath, "detached-task.txt"), "detached work\n", "utf8");
     await runGit(worktreePath, ["add", "detached-task.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add detached work"]);
+    const strandedSha = await readGit(worktreePath, ["rev-parse", "HEAD"]);
 
-    // No branch ref holds this commit. Restoring the recorded branch would make it unreachable, so
-    // the relaxation for live named branches must not apply here.
-    await expectPersistedBranchMismatchRejected({
+    const restored = await expectPersistedBranchMismatchRepaired({
       repoRoot,
       worktreePath,
       expectedBranch,
-      actualBranch: null,
       issueId: "issue-detached-unreachable",
       executionWorkspaceId: "execution-workspace-detached-unreachable",
-      expectedAncestryVerdict: "diverged",
     });
+
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(recordedSha);
+
+    // The commit that was reachable only from the detached HEAD must now be reachable from a
+    // branch ref an operator can see, and the warning must name that ref.
+    const rescueBranches = (await readGit(repoRoot, ["branch", "--contains", strandedSha, "--format=%(refname:short)"]))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    expect(rescueBranches).toHaveLength(1);
+    expect(rescueBranches[0]).toMatch(/^paperclip\/rescue\//);
+    expect(restored.warnings.join("\n")).toContain(rescueBranches[0]);
   }, 15_000);
 
   it("repairs a clean persisted git worktree branch mismatch when the live branch is behind the recorded branch", async () => {
