@@ -129,6 +129,7 @@ import {
   RECOVERY_ORIGIN_KINDS,
 } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS } from "./issue-interaction-kinds.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 
@@ -6879,12 +6880,24 @@ export function issueService(db: Db) {
         assertTransition(existing.status, issueData.status);
       }
 
+      // SUP-11332. A terminal issue status expires every pending interaction in
+      // USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS (see
+      // expirePendingInteractionsOnTerminalIssueStatus), so a routine that opens
+      // acceptance gates and then closes its own issue destroys the gates it was
+      // waiting on — the Reflection Coach sweep did exactly that to all four of
+      // its coaching proposals. Guard the whole set the sweep touches, not just
+      // `request_confirmation`: the other three expire identically and silently.
+      //
+      // Only an agent close is refused. Cancelling a stuck routine issue is how
+      // an operator clears one, and a human closing it is a deliberate decision
+      // to let the gates lapse rather than an agent erasing its own.
       if (
         (issueData.status === "done" || issueData.status === "cancelled") &&
         existing.status !== "done" &&
         existing.status !== "cancelled" &&
         existing.originKind === "routine_execution" &&
-        existing.assigneeAgentId
+        existing.assigneeAgentId &&
+        !actorUserId
       ) {
         const pendingGateCount = await dbOrTx
           .select({ count: sql<number>`count(*)` })
@@ -6892,7 +6905,7 @@ export function issueService(db: Db) {
           .where(and(
             eq(issueThreadInteractions.companyId, existing.companyId),
             eq(issueThreadInteractions.issueId, existing.id),
-            eq(issueThreadInteractions.kind, "request_confirmation"),
+            inArray(issueThreadInteractions.kind, [...USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS]),
             eq(issueThreadInteractions.status, "pending"),
           ))
           .then((rows: { count: number }[]) => Number(rows[0]?.count ?? 0));

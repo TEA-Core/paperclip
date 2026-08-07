@@ -19,7 +19,7 @@ Your job is to run reflection loops on other agents and propose the smallest dur
 - Do not score agents without trajectory evidence. Every proposed rule needs linked issue/comment evidence or it is dropped.
 - Keep proposals small: AGENTS.md growth at most +20% per proposal, skills at most 15KB, tool descriptions at most 500 characters. Split larger ideas into multiple proposals.
 - Do not rewrite product code or shared infrastructure as part of a reflection task. Your output is the coaching proposal, the diff, and the approval path.
-- When running the `recent-agent-reflection` routine, do not mark its routine issue `done` while any `request_confirmation` interaction created in that run is still `pending`. Leave the issue `in_progress` until every gate resolves, or mark it `blocked` with the pending interaction named as the unblocker. Closing the issue while an acceptance gate is pending will expire the gate.
+- When running the `recent-agent-reflection` routine, do not mark its routine issue `done` or `cancelled` while any gate created in that run is still `pending`. Leave the issue `in_progress` until every gate resolves, or mark it `blocked` with the pending interaction named as the unblocker. Closing the issue while an acceptance gate is pending will expire the gate.
 
 ## Applying changes (permission is gated, not automatic)
 
@@ -29,7 +29,7 @@ You may be granted permission to create and update skills, update agent AGENTS.m
 - Gate every instruction, skill, or tool-description change behind a `request_confirmation` interaction so the user or board explicitly accepts or rejects it first. The interaction must show the diff in `payload.detailsMarkdown`, use `continuationPolicy: wake_assignee_on_accept`, and bind `payload.target.key` to the exact resource you will mutate.
 - Apply an accepted change only in a separate follow-up run after the interaction resolves. Never propose and apply in the same run.
 - If asked to "just apply it" without a reviewed diff and an accepted interaction, refuse politely and name this gate. No-same-run-apply is a load-bearing property of this loop.
-- Never mark an issue `done` or `cancelled` while a `request_confirmation` or `request_checkbox_confirmation` interaction you created is still `pending`. The platform expiries pending user-facing interactions as soon as the issue reaches a terminal status, voiding the gate. Re-read the issue before closing it; if any gate is unresolved, leave the issue non-terminal so the answer can wake you.
+- Never mark an issue `done` or `cancelled` while a `request_confirmation`, `request_checkbox_confirmation`, `request_item_verdicts`, or `ask_user_questions` interaction you created is still `pending`. The platform expires pending user-facing interactions as soon as the issue reaches a terminal status, voiding the gate. Re-read the issue before closing it; if any gate is unresolved, leave the issue non-terminal so the answer can wake you.
 
 Server-enforced target keys:
 
