@@ -289,41 +289,31 @@ describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents
   });
 
   it("limit counts distinct issues, not blocker edges — second dependent reported even with 3 cancelled blockers each", async () => {
-    const originalLimit = process.env.CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT;
-    process.env.CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = "2";
-    try {
-      const { companyId, agentId } = await seed();
+    const { companyId, agentId } = await seed();
 
-      const blocked1Id = await createBlockedIssue(companyId, agentId, "Blocked dependent 1");
-      const blocker1aId = await createBlocker(companyId, "cancelled", "Cancelled blocker 1a");
-      const blocker1bId = await createBlocker(companyId, "cancelled", "Cancelled blocker 1b");
-      const blocker1cId = await createBlocker(companyId, "cancelled", "Cancelled blocker 1c");
-      await addBlockerRelation(companyId, blocker1aId, blocked1Id);
-      await addBlockerRelation(companyId, blocker1bId, blocked1Id);
-      await addBlockerRelation(companyId, blocker1cId, blocked1Id);
+    const blocked1Id = await createBlockedIssue(companyId, agentId, "Blocked dependent 1");
+    const blocker1aId = await createBlocker(companyId, "cancelled", "Cancelled blocker 1a");
+    const blocker1bId = await createBlocker(companyId, "cancelled", "Cancelled blocker 1b");
+    const blocker1cId = await createBlocker(companyId, "cancelled", "Cancelled blocker 1c");
+    await addBlockerRelation(companyId, blocker1aId, blocked1Id);
+    await addBlockerRelation(companyId, blocker1bId, blocked1Id);
+    await addBlockerRelation(companyId, blocker1cId, blocked1Id);
 
-      const blocked2Id = await createBlockedIssue(companyId, agentId, "Blocked dependent 2");
-      const blocker2aId = await createBlocker(companyId, "cancelled", "Cancelled blocker 2a");
-      const blocker2bId = await createBlocker(companyId, "cancelled", "Cancelled blocker 2b");
-      const blocker2cId = await createBlocker(companyId, "cancelled", "Cancelled blocker 2c");
-      await addBlockerRelation(companyId, blocker2aId, blocked2Id);
-      await addBlockerRelation(companyId, blocker2bId, blocked2Id);
-      await addBlockerRelation(companyId, blocker2cId, blocked2Id);
+    const blocked2Id = await createBlockedIssue(companyId, agentId, "Blocked dependent 2");
+    const blocker2aId = await createBlocker(companyId, "cancelled", "Cancelled blocker 2a");
+    const blocker2bId = await createBlocker(companyId, "cancelled", "Cancelled blocker 2b");
+    const blocker2cId = await createBlocker(companyId, "cancelled", "Cancelled blocker 2c");
+    await addBlockerRelation(companyId, blocker2aId, blocked2Id);
+    await addBlockerRelation(companyId, blocker2bId, blocked2Id);
+    await addBlockerRelation(companyId, blocker2cId, blocked2Id);
 
-      const heartbeat = heartbeatService(db);
-      const result = await heartbeat.reconcileCancelledOnlyBlockerDependents();
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileCancelledOnlyBlockerDependents({ limit: 2 });
 
-      expect(result.reported).toBe(2);
-      expect(result.issueIds).toHaveLength(2);
-      expect(result.issueIds).toContain(blocked1Id);
-      expect(result.issueIds).toContain(blocked2Id);
-    } finally {
-      if (originalLimit === undefined) {
-        delete process.env.CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT;
-      } else {
-        process.env.CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = originalLimit;
-      }
-    }
+    expect(result.reported).toBe(2);
+    expect(result.issueIds).toHaveLength(2);
+    expect(result.issueIds).toContain(blocked1Id);
+    expect(result.issueIds).toContain(blocked2Id);
   });
 
   it("does NOT report a blocked dependent whose harnessKind is set (harness issues excluded)", async () => {

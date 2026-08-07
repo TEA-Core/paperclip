@@ -109,7 +109,7 @@ const BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT = 100;
 const BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS = 15 * 60 * 1000;
 const STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT = 100;
 const STILLBORN_ASSIGNED_BACKLOG_RELOG_INTERVAL_MS = 5 * 60_000;
-const CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = Number(process.env.CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT) || 250;
+const CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = 250;
 const CANCELLED_ONLY_BLOCKER_DEPENDENT_RELOG_INTERVAL_MS = 5 * 60_000;
 let lastStillbornAssignedBacklogLogAt: Date | null = null;
 let lastCancelledOnlyBlockerDependentLogAt: Date | null = null;
@@ -6847,7 +6847,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
-  async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null }) {
+  async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null; limit?: number }) {
     const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
     const seen = new Set<string>();
 
@@ -6873,7 +6873,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ),
       )
       .orderBy(asc(issues.id))
-      .limit(CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT);
+      .limit(opts?.limit ?? CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT);
 
     for (const candidate of candidates) {
       if (seen.has(candidate.id)) continue;
