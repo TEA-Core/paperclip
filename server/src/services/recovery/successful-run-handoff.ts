@@ -2,6 +2,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
+import { isExternalPullAgent } from "../agent-work-delivery.js";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
@@ -47,7 +48,7 @@ type IssueRow = Pick<
   typeof issues.$inferSelect,
   "id" | "companyId" | "identifier" | "title" | "status" | "assigneeAgentId" | "assigneeUserId" | "executionState"
 >;
-type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
+type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status" | "runtimeConfig">;
 type NoticeIssue = Pick<typeof issues.$inferSelect, "id" | "identifier" | "title" | "status">;
 type NoticeRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "status">;
 type NoticeAgent = Pick<typeof agents.$inferSelect, "id" | "name">;
@@ -88,9 +89,13 @@ export type SuccessfulRunHandoffDecision =
       reason: string;
     };
 
+export const EXTERNAL_PULL_DELIVERY_SKIP_REASON =
+  "agent receives work out of band and cannot be judged by its run process";
+
 const SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS = new Set([
   "issue has execution policy state",
   "active routine continuation owns the next action",
+  EXTERNAL_PULL_DELIVERY_SKIP_REASON,
   "issue already has an active execution path",
   "issue already has a queued or deferred wake",
   "pending interaction or approval owns the next action",
@@ -419,6 +424,17 @@ export function decideSuccessfulRunHandoff(input: {
   if (issue.executionState) return { kind: "skip", reason: "issue has execution policy state" };
   if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };
+  }
+  // SUP-9859. An external pull agent's run is a doorbell, not the work: the
+  // real agent is a desktop runtime Paperclip never started, and it records its
+  // disposition through the MCP tools whenever it next picks the issue up. A
+  // no-op wake process therefore succeeds having done nothing, which every
+  // productivity signal below reads as "progress without a next step" — the
+  // handoff fires, its corrective wake is another no-op, and the stranded sweep
+  // escalates the exhausted handoff into a `missing_disposition` action. Ask
+  // the agent record instead of asking the run.
+  if (isExternalPullAgent(agent)) {
+    return { kind: "skip", reason: EXTERNAL_PULL_DELIVERY_SKIP_REASON };
   }
   if (input.hasActiveRoutineContinuation) {
     return { kind: "skip", reason: "active routine continuation owns the next action" };

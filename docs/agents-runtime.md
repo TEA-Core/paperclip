@@ -81,6 +81,29 @@ Templates support variables like `{{agent.id}}`, `{{agent.name}}`, and run conte
 
 > **Note:** `bootstrapPromptTemplate` is deprecated and should not be used for new agents. Existing configs that use it will continue to work but should be migrated to the managed instructions bundle system.
 
+## 3.5 Agents whose work arrives out of band
+
+Some agents are not started by Paperclip at all. A desktop runtime — Claude Code Desktop, Cowork Desktop — runs on its own schedule, pulls its work through the Paperclip MCP tools, and records the outcome there. Paperclip only needs to be able to say "there is something for you".
+
+Two supported shapes, in order of preference:
+
+1. **A gateway adapter.** If the external runtime can expose an HTTP endpoint, use `openclaw_gateway` or `hermes_gateway`. Paperclip calls the running runtime, the runtime does real work in-band, and the run records a normal disposition. Nothing below applies.
+2. **A pull agent.** If the runtime is not reachable over HTTP, configure a wake-only adapter *and* declare the delivery mode:
+
+   ```json
+   { "workDelivery": "external_pull" }
+   ```
+
+   in the agent's **runtime config**.
+
+`workDelivery` is what tells Paperclip that a run is a doorbell rather than the work. Without it, a wake-only command (the `/bin/echo` no-op operators reach for) produces a run that succeeded having done nothing, and Paperclip reads that as "made progress but chose no next step": it queues a corrective missing-disposition wake, that wake is another no-op, and the stranded-issue sweep eventually escalates the issue with a `missing_disposition` recovery action. With `workDelivery: "external_pull"` set, the missing-disposition handoff is skipped for that agent and any handoff already pending against it is resolved on its next successful run.
+
+Notes:
+
+- The declaration is read from the agent record only. Paperclip never infers it from the adapter command, because a no-op command and a genuinely misconfigured `process` agent look identical — and the misconfigured one still needs its recovery path.
+- It is not a substitute for `status: paused` or `heartbeat.wakeOnDemand: false`. Both of those also stop the noise, but by removing the agent from scheduling entirely; a pull agent should stay wakeable so assignment still reaches it.
+- Every other agent is `invoked` by default, and nothing about its recovery behaviour changes.
+
 ## 4. Session resume behavior
 
 Paperclip stores session IDs for resumable adapters.
