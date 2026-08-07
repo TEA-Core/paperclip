@@ -6,8 +6,11 @@ import {
   agents,
   companies,
   createDb,
+  executionWorkspaces,
   issueRelations,
   issues,
+  projects,
+  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -45,6 +48,9 @@ describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents
         "activity_log",
         "issue_relations",
         "issues",
+        "workspace_operations",
+        "execution_workspaces",
+        "projects",
         "heartbeat_runs",
         "agents",
         "companies"
@@ -59,6 +65,7 @@ describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents
   async function seed() {
     const companyId = randomUUID();
     const agentId = randomUUID();
+    const projectId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -77,8 +84,14 @@ describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents
       runtimeConfig: {},
       permissions: {},
     });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      status: "active",
+    });
 
-    return { companyId, agentId };
+    return { companyId, agentId, projectId };
   }
 
   async function createBlockedIssue(companyId: string, agentId: string, title: string) {
@@ -272,6 +285,105 @@ describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents
 
     expect(result.reported).toBe(0);
     expect(result.skipped).toBe(0);
+    expect(result.issueIds).toEqual([]);
+  });
+
+  it("limit counts distinct issues, not blocker edges — second dependent reported even with 3 cancelled blockers each", async () => {
+    const originalLimit = process.env.CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT;
+    process.env.CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = "2";
+    try {
+      const { companyId, agentId } = await seed();
+
+      const blocked1Id = await createBlockedIssue(companyId, agentId, "Blocked dependent 1");
+      const blocker1aId = await createBlocker(companyId, "cancelled", "Cancelled blocker 1a");
+      const blocker1bId = await createBlocker(companyId, "cancelled", "Cancelled blocker 1b");
+      const blocker1cId = await createBlocker(companyId, "cancelled", "Cancelled blocker 1c");
+      await addBlockerRelation(companyId, blocker1aId, blocked1Id);
+      await addBlockerRelation(companyId, blocker1bId, blocked1Id);
+      await addBlockerRelation(companyId, blocker1cId, blocked1Id);
+
+      const blocked2Id = await createBlockedIssue(companyId, agentId, "Blocked dependent 2");
+      const blocker2aId = await createBlocker(companyId, "cancelled", "Cancelled blocker 2a");
+      const blocker2bId = await createBlocker(companyId, "cancelled", "Cancelled blocker 2b");
+      const blocker2cId = await createBlocker(companyId, "cancelled", "Cancelled blocker 2c");
+      await addBlockerRelation(companyId, blocker2aId, blocked2Id);
+      await addBlockerRelation(companyId, blocker2bId, blocked2Id);
+      await addBlockerRelation(companyId, blocker2cId, blocked2Id);
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reconcileCancelledOnlyBlockerDependents();
+
+      expect(result.reported).toBe(2);
+      expect(result.issueIds).toHaveLength(2);
+      expect(result.issueIds).toContain(blocked1Id);
+      expect(result.issueIds).toContain(blocked2Id);
+    } finally {
+      if (originalLimit === undefined) {
+        delete process.env.CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT;
+      } else {
+        process.env.CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = originalLimit;
+      }
+    }
+  });
+
+  it("does NOT report a blocked dependent whose harnessKind is set (harness issues excluded)", async () => {
+    const { companyId, agentId } = await seed();
+    const blockedId = randomUUID();
+    await db.insert(issues).values({
+      id: blockedId,
+      companyId,
+      title: "Harness dependent",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      harnessKind: "test",
+    });
+    const blockerId = await createBlocker(companyId, "cancelled", "Cancelled blocker");
+    await addBlockerRelation(companyId, blockerId, blockedId);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileCancelledOnlyBlockerDependents();
+
+    expect(result.reported).toBe(0);
+    expect(result.skipped).toBe(0);
+    expect(result.issueIds).toEqual([]);
+  });
+
+  it("does NOT report a blocked dependent with a cancelled blocker and a done blocker pending workspace finalize", async () => {
+    const { companyId, agentId, projectId } = await seed();
+    const blockedId = await createBlockedIssue(companyId, agentId, "Blocked dependent");
+    const cancelledBlockerId = await createBlocker(companyId, "cancelled", "Cancelled blocker");
+    const doneBlockerId = await createBlocker(companyId, "done", "Done blocker pending finalize");
+    await addBlockerRelation(companyId, cancelledBlockerId, blockedId);
+    await addBlockerRelation(companyId, doneBlockerId, blockedId);
+
+    const executionWorkspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "test-ws",
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId })
+      .where(eq(issues.id, doneBlockerId));
+
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: doneBlockerId,
+      phase: "workspace_setup",
+      status: "succeeded",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileCancelledOnlyBlockerDependents();
+
+    expect(result.reported).toBe(0);
+    expect(result.skipped).toBe(1);
     expect(result.issueIds).toEqual([]);
   });
 });
