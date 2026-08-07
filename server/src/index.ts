@@ -1207,7 +1207,27 @@ export async function startServer(): Promise<StartedServer> {
       });
     }, backupIntervalMs);
   }
-  
+
+  // SUP-10914. Nothing inside opencode ever deletes a row or truncates its WAL,
+  // so without this the per-agent databases grow until a host operator notices.
+  // The sweep is a no-op on deployments that do not run opencode_local.
+  if (config.opencodeJanitorEnabled) {
+    const { startOpenCodeDatabaseJanitor } = await import("./services/opencode-db-janitor.js");
+    logger.info(
+      {
+        intervalMinutes: config.opencodeJanitorIntervalMinutes,
+        retentionDays: config.opencodeJanitorRetentionDays,
+        vacuum: config.opencodeJanitorVacuum,
+      },
+      "OpenCode database janitor enabled",
+    );
+    startOpenCodeDatabaseJanitor({
+      intervalMs: config.opencodeJanitorIntervalMinutes * 60 * 1000,
+      retentionDays: config.opencodeJanitorRetentionDays,
+      vacuum: config.opencodeJanitorVacuum,
+    });
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
