@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -36,6 +37,8 @@ import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig, type ExecutionWorkspaceBranchReconcileMode } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+
+const execFileAsync = promisify(execFile);
 
 export function resolveShell(): string {
   const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
@@ -2565,6 +2568,33 @@ export function normalizeDefaultBranchForComparison(branch: string | null | unde
   return branch.replace(/^origin\//, "");
 }
 
+async function detectRemoteDefaultBranch(repoRoot: string): Promise<string | null> {
+  try {
+    const remoteHead = (await execFileAsync(
+      "git",
+      ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+      { cwd: repoRoot },
+    )).stdout.trim();
+    if (remoteHead) {
+      const stripped = remoteHead.startsWith("origin/") ? remoteHead.slice("origin/".length) : remoteHead;
+      if (stripped.length > 0) return stripped;
+    }
+  } catch {
+    // origin/HEAD not set — fall through to heuristic
+  }
+
+  for (const candidate of ["origin/master", "origin/main"]) {
+    try {
+      await execFileAsync("git", ["rev-parse", "--verify", `${candidate}^{commit}`], { cwd: repoRoot });
+      return candidate.slice("origin/".length);
+    } catch {
+      // Not found — try next
+    }
+  }
+
+  return null;
+}
+
 async function directoryExists(value: string) {
   return fs.stat(value).then((stats) => stats.isDirectory()).catch(() => false);
 }
@@ -3316,6 +3346,14 @@ export async function realizeExecutionWorkspace(input: {
     repoRef: input.base.repoRef,
   });
   let branchName = sanitizeBranchName(renderedBranch);
+  const remoteDefaultBranch = await detectRemoteDefaultBranch(repoRoot);
+  if (remoteDefaultBranch && branchName === remoteDefaultBranch) {
+    throw new Error(
+      `Execution workspace branch name "${branchName}" matches the repo's default branch. ` +
+      `Creating a worktree on the default branch would permanently strand the primary clone. ` +
+      `Use a branch template that produces a unique name (e.g., "{{issue.identifier}}-{{slug}}").`,
+    );
+  }
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir
     ? resolveConfiguredPath(configuredParentDir, repoRoot)
