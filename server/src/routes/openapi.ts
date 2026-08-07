@@ -201,6 +201,7 @@ import {
   toolPolicyTestRequestSchema,
   createToolMcpGatewaySchema,
 } from "@paperclipai/shared";
+import { dispatchQuiesceRequestSchema } from "./dispatch-quiesce.js";
 
 type JsonSchema = Record<string, unknown>;
 type OpenApiResponse = Record<string, unknown>;
@@ -3293,6 +3294,33 @@ registry.registerPath({
   summary: "Update experimental instance settings",
   request: { body: jsonBody(patchInstanceExperimentalSettingsSchema) },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+// ─── Dispatch quiesce (deploy window) ─────────────────────────────────────────
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/dispatch-quiesce",
+  tags: ["instance"],
+  summary: "Get dispatch quiesce state and the current in-flight run count",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/instance/dispatch-quiesce",
+  tags: ["instance"],
+  summary: "Quiesce dispatch for a deploy window without cancelling in-flight runs",
+  request: { body: jsonBody(dispatchQuiesceRequestSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/instance/dispatch-quiesce",
+  tags: ["instance"],
+  summary: "Release the dispatch quiesce",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 // ─── Board chat (Conference Room Chat, experimental) ──────────────────────────
