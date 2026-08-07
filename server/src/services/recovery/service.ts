@@ -46,6 +46,7 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   issueService,
   listPermanentlyUnfinalizableBlockers as listPermanentlyUnfinalizableBlockersFromIssues,
+  listUnresolvedBlockerIssueIds,
 } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
@@ -108,7 +109,10 @@ const BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT = 100;
 const BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS = 15 * 60 * 1000;
 const STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT = 100;
 const STILLBORN_ASSIGNED_BACKLOG_RELOG_INTERVAL_MS = 5 * 60_000;
+const CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = 250;
+const CANCELLED_ONLY_BLOCKER_DEPENDENT_RELOG_INTERVAL_MS = 5 * 60_000;
 let lastStillbornAssignedBacklogLogAt: Date | null = null;
+let lastCancelledOnlyBlockerDependentLogAt: Date | null = null;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -6843,6 +6847,122 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null }) {
+    const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
+    const seen = new Set<string>();
+
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issueRelations)
+      .innerJoin(issues, and(eq(issueRelations.relatedIssueId, issues.id), eq(issueRelations.type, "blocks")))
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          isNull(issues.hiddenAt),
+          ...(opts?.issueCreatedAtGte ? [gte(issues.createdAt, opts.issueCreatedAtGte)] : []),
+        ),
+      )
+      .orderBy(asc(issues.id))
+      .limit(CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT);
+
+    for (const candidate of candidates) {
+      if (seen.has(candidate.id)) continue;
+      seen.add(candidate.id);
+      const blockerIds = await db
+        .select({ blockerId: issueRelations.issueId })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, candidate.companyId),
+            eq(issueRelations.relatedIssueId, candidate.id),
+            eq(issueRelations.type, "blocks"),
+          ),
+        )
+        .then((rows) => rows.map((r) => r.blockerId));
+
+      if (blockerIds.length === 0) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const unresolvedIds = await listUnresolvedBlockerIssueIds(db, candidate.companyId, blockerIds);
+
+      if (unresolvedIds.length === 0) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const unresolvedStatuses = await db
+        .select({ id: issues.id, status: issues.status })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, candidate.companyId),
+            inArray(issues.id, unresolvedIds),
+          ),
+        )
+        .then((rows) => rows.map((r) => r.status));
+
+      const allCancelled = unresolvedStatuses.length > 0 && unresolvedStatuses.every((s) => s === "cancelled");
+      if (!allCancelled) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasActiveExecutionPath(candidate.companyId, candidate.id, candidate.assigneeAgentId)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasPendingWakeInteraction(candidate.companyId, candidate.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      result.reported += 1;
+      result.issueIds.push(candidate.id);
+
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.cancelled_blocker_dependent_detected",
+        entityType: "issue",
+        entityId: candidate.id,
+        details: {
+          identifier: candidate.identifier,
+          source: "recovery.reconcile_cancelled_only_blocker_dependents",
+        },
+      });
+    }
+
+    const shouldLog =
+      result.reported > 0 &&
+      (!lastCancelledOnlyBlockerDependentLogAt ||
+        Date.now() - lastCancelledOnlyBlockerDependentLogAt.getTime() >= CANCELLED_ONLY_BLOCKER_DEPENDENT_RELOG_INTERVAL_MS);
+    if (shouldLog) {
+      logger.warn(
+        { reported: result.reported, skipped: result.skipped, issueIds: result.issueIds },
+        "reconcileCancelledOnlyBlockerDependents: detected blocked issues with only cancelled blockers",
+      );
+      lastCancelledOnlyBlockerDependentLogAt = new Date();
+    }
+
+    return result;
+  }
+
   async function reconcileStillbornAssignedBacklog(opts?: { issueCreatedAtGte?: Date | null }) {
     const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
 
@@ -6934,5 +7054,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
     reconcileStillbornAssignedBacklog,
+    reconcileCancelledOnlyBlockerDependents,
   };
 }
