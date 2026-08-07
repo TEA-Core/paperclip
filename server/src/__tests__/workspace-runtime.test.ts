@@ -4449,6 +4449,109 @@ describe("realizeExecutionWorkspace", () => {
       cleanupAction: "branch_delete",
     });
   });
+
+  describe("default branch guard", () => {
+    it("rejects a new worktree when the computed branch name equals the repo default", async () => {
+      const { repoRoot } = await createClonedRepoWithRemote();
+
+      await expect(
+        realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-1",
+            workspaceId: "workspace-1",
+            repoUrl: null,
+            repoRef: null,
+          },
+          config: {
+            workspaceStrategy: {
+              type: "git_worktree",
+              branchTemplate: "master",
+            },
+          },
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-447",
+            title: "Add Worktree Support",
+          },
+          agent: {
+            id: "agent-1",
+            name: "Codex Coder",
+            companyId: "company-1",
+          },
+        }),
+      ).rejects.toThrow(/matches the repo's default branch/);
+    });
+
+    it("allows a new worktree when the computed branch differs from the default", async () => {
+      const { repoRoot } = await createClonedRepoWithRemote();
+
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: null,
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-447",
+          title: "Add Worktree Support",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+
+      expect(workspace.created).toBe(true);
+      expect(workspace.branchName).toBe("PAP-447-add-worktree-support");
+    });
+
+    it("allows creation when remote default branch detection fails (no remote)", async () => {
+      const repoRoot = await createTempRepo("main");
+
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: null,
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-447",
+          title: "Add Worktree Support",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+
+      expect(workspace.created).toBe(true);
+      expect(workspace.branchName).toBe("PAP-447-add-worktree-support");
+    });
+  });
 });
 
 describe("ensureRuntimeServicesForRun", () => {
