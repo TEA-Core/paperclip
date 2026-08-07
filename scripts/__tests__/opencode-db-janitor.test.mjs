@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -8,8 +8,11 @@ import test from "node:test";
 import {
   detectTimeUnit,
   isDatabaseIdle,
+  isJanitorLockStale,
+  janitorLockPath,
   janitorRunDatabase,
   listOpenCodeDatabases,
+  main,
   parseJanitorArgs,
   resolveCutoff,
   resolveOpenCodeDataDir,
@@ -109,6 +112,10 @@ function bloatThenFree(databasePath) {
   const pages = db.prepare("PRAGMA page_count").get().page_count;
   db.close();
   if (free / pages < 0.25) throw new Error(`fixture did not free enough pages: ${free}/${pages}`);
+}
+
+function writeLockFile(dataDir, holder) {
+  writeFileSync(janitorLockPath(dataDir), `${JSON.stringify(holder)}\n`);
 }
 
 function counts(databasePath) {
@@ -499,4 +506,206 @@ test("a corrupt database fails that database without throwing out of the run", (
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Unattended operation. Everything below exists because this script is meant to
+// be SCHEDULED, and a scheduled janitor fails differently from one a human runs
+// and reads the output of.
+// ---------------------------------------------------------------------------
+
+// `-shm` exists exactly while some connection has the database open in WAL
+// mode; SQLite removes it when the last one closes. mtime alone cannot see a
+// run that is open but idle — an agent waiting on a slow model writes nothing
+// for far longer than the idle window, and VACUUMing under it takes an
+// exclusive lock against a live fleet. That is the outage this issue is about.
+test("a database with a live WAL connection is never idle, however old its mtimes", () => {
+  const { dir, databasePath } = makeDatabase({ sessions: [1] });
+  const live = new DatabaseSync(databasePath);
+  try {
+    live.exec("PRAGMA journal_mode = WAL");
+    live.prepare("SELECT COUNT(*) AS c FROM session").get();
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try {
+        utimesSync(`${databasePath}${suffix}`, old, old);
+      } catch {
+        // Sidecar may not exist.
+      }
+    }
+    assert.equal(statSync(`${databasePath}-shm`).isFile(), true);
+    assert.equal(isDatabaseIdle({ databasePath, nowMs: Date.now(), idleMinutes: 10 }), false);
+  } finally {
+    live.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A cron entry that reports success while every database failed is the same
+// blindness that let the old host pruner run for two weeks against a dead file.
+test("main exits non-zero when a database fails", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "opencode-db-janitor-test-"));
+  try {
+    writeFileSync(path.join(dir, "opencode-agent-broken.db"), "this is not a database");
+    const lines = [];
+    const code = await main(["--apply", "--data-dir", dir], {
+      log: (line) => lines.push(line),
+      nowMs: NOW_MS,
+      DatabaseSync,
+    });
+    assert.equal(code, 1);
+    assert.ok(lines.some((line) => line.includes("FAILED")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("main exits zero when every database is healthy", async () => {
+  const { dir } = makeDatabase({ sessions: [30] });
+  try {
+    const code = await main(["--apply", "--data-dir", dir], {
+      log: () => {},
+      nowMs: NOW_MS,
+      DatabaseSync,
+    });
+    assert.equal(code, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The bash pruner this replaces grew `flock` after a write-lock-starvation
+// incident. Two overlapping sweeps both take write locks — and a VACUUM that
+// overlaps a prune is the starvation this whole issue exists to prevent.
+test("--apply refuses to start while another sweep holds the lock", async () => {
+  const { dir } = makeDatabase({ sessions: [30] });
+  try {
+    writeLockFile(dir, {
+      pid: process.pid,
+      startedAt: new Date(NOW_MS).toISOString(),
+    });
+    const lines = [];
+    const code = await main(["--apply", "--data-dir", dir], {
+      log: (line) => lines.push(line),
+      nowMs: NOW_MS,
+      DatabaseSync,
+    });
+    assert.equal(code, 0);
+    assert.ok(lines.some((line) => line.toLowerCase().includes("already running")));
+    // Nothing was pruned: the sweep never started.
+    assert.equal(counts(path.join(dir, "opencode-agent-agent-1.db")).session, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--apply releases the lock so the next scheduled sweep can run", async () => {
+  const { dir } = makeDatabase({ sessions: [30, 29] });
+  try {
+    const first = await main(["--apply", "--data-dir", dir], {
+      log: () => {},
+      nowMs: NOW_MS,
+      DatabaseSync,
+    });
+    assert.equal(first, 0);
+    assert.equal(existsSync(janitorLockPath(dir)), false);
+    const second = await main(["--apply", "--data-dir", dir], {
+      log: () => {},
+      nowMs: NOW_MS,
+      DatabaseSync,
+    });
+    assert.equal(second, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A machine that reboots mid-sweep leaves the lock behind. Refusing forever
+// would silently stop retention, which is exactly the failure mode the lock is
+// supposed to protect against.
+test("a lock left by a dead process is taken over rather than obeyed forever", async () => {
+  const { dir } = makeDatabase({ sessions: [30] });
+  try {
+    writeLockFile(dir, {
+      pid: 4242,
+      startedAt: new Date(NOW_MS - 60_000).toISOString(),
+    });
+    const lines = [];
+    const code = await main(["--apply", "--data-dir", dir], {
+      log: (line) => lines.push(line),
+      nowMs: NOW_MS,
+      DatabaseSync,
+      isProcessAlive: () => false,
+    });
+    assert.equal(code, 0);
+    assert.ok(lines.some((line) => line.toLowerCase().includes("stale")));
+    assert.equal(counts(path.join(dir, "opencode-agent-agent-1.db")).session, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A dry run takes no write locks, so making it wait on a live sweep would only
+// stop an operator diagnosing one.
+test("a dry run is not blocked by a held lock", async () => {
+  const { dir } = makeDatabase({ sessions: [30] });
+  try {
+    writeLockFile(dir, {
+      pid: process.pid,
+      startedAt: new Date(NOW_MS).toISOString(),
+    });
+    const lines = [];
+    const code = await main(["--data-dir", dir], {
+      log: (line) => lines.push(line),
+      nowMs: NOW_MS,
+      DatabaseSync,
+    });
+    assert.equal(code, 0);
+    assert.ok(lines.some((line) => line.includes("Dry run")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a lock is only judged stale on evidence, never on a nonsense pid", () => {
+  const nowMs = NOW_MS;
+  // A live holder is honoured no matter how long it has been running: a sweep
+  // over a large backlog is legitimately slow.
+  assert.equal(
+    isJanitorLockStale({
+      holder: { pid: 4242 },
+      mtimeMs: nowMs - 30 * 24 * 60 * 60 * 1000,
+      nowMs,
+      isProcessAlive: () => true,
+    }),
+    false,
+  );
+  // `process.kill(0, sig)` addresses the whole process group, so a zero pid
+  // must never reach the liveness probe.
+  let probed = false;
+  assert.equal(
+    isJanitorLockStale({
+      holder: { pid: 0 },
+      mtimeMs: nowMs,
+      nowMs,
+      isProcessAlive: () => {
+        probed = true;
+        return true;
+      },
+    }),
+    false,
+  );
+  assert.equal(probed, false);
+  // A holder we cannot attribute — no pid, or a pid from another namespace —
+  // is honoured, but not forever; a lock nobody ever clears would stop
+  // retention altogether.
+  assert.equal(isJanitorLockStale({ holder: null, mtimeMs: nowMs - 60_000, nowMs }), false);
+  assert.equal(
+    isJanitorLockStale({
+      holder: null,
+      mtimeMs: nowMs - 13 * 60 * 60 * 1000,
+      nowMs,
+    }),
+    true,
+  );
 });

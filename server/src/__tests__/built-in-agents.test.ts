@@ -1427,6 +1427,129 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(updated).toMatchObject({ id: routineIssueId, status: "cancelled" });
   });
 
+  /**
+   * Minimal fixture for the SUP-11332 close guard: a routine execution issue
+   * owned by the Reflection Coach with exactly one pending gate of `kind`.
+   */
+  async function seedRoutineIssueWithPendingGate(kind: string) {
+    const companyId = await seedCompany();
+    const created = await builtInAgentService(db).ensure(companyId, "reflection-coach");
+    const coach = created.agent!;
+    const routine = await db
+      .select()
+      .from(routines)
+      .where(eq(routines.companyId, companyId))
+      .then((rows) => rows[0]!);
+
+    const routineIssueId = randomUUID();
+    const routineRunId = randomUUID();
+    const heartbeatRunId = randomUUID();
+    await db.insert(routineRuns).values({
+      id: routineRunId,
+      companyId,
+      routineId: routine.id,
+      source: "schedule",
+      status: "succeeded",
+      triggeredAt: new Date(),
+      completedAt: new Date(),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: heartbeatRunId,
+      companyId,
+      agentId: coach.id,
+      status: "succeeded",
+      triggeredAt: new Date(),
+      completedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: routineIssueId,
+      companyId,
+      title: "Review recent agent trajectories for coaching proposals",
+      status: "in_progress",
+      priority: "medium",
+      identifier: `${issuePrefix(companyId)}-77`,
+      issueNumber: 77,
+      assigneeAgentId: coach.id,
+      createdByAgentId: coach.id,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: routineRunId,
+    });
+
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId: routineIssueId,
+      kind,
+      status: "pending",
+      continuationPolicy: "wake_assignee_on_accept",
+      title: "Review proposed coaching change",
+      summary: "Accept or reject the proposed update.",
+      createdByAgentId: coach.id,
+      sourceRunId: heartbeatRunId,
+      payload: {
+        version: 1,
+        prompt: "Apply this Reflection Coach instruction diff?",
+        detailsMarkdown: "```diff\n+Add a verification step.\n```",
+        acceptLabel: "Accept",
+        rejectLabel: "Reject",
+        target: { type: "custom", key: `agent:${coach.id}:instructions`, revisionId: "proposal-v1" },
+      },
+    });
+
+    return { companyId, coach, routineIssueId, interactionId };
+  }
+
+  // The guard was written against `request_confirmation` alone, but the platform
+  // sweep it exists to defeat expires every kind in
+  // USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS. A routine that opens any of the
+  // others and then closes destroys them exactly the same way, silently.
+  it.each(["request_checkbox_confirmation", "request_item_verdicts", "ask_user_questions"])(
+    "blocks closing a routine issue while a pending %s gate would be expired by the close",
+    async (kind) => {
+      const { routineIssueId, coach } = await seedRoutineIssueWithPendingGate(kind);
+      const issuesSvc = issueService(db);
+
+      await expect(
+        issuesSvc.update(routineIssueId, { status: "done", actorAgentId: coach.id }),
+      ).rejects.toMatchObject({
+        status: 422,
+        details: {
+          code: "routine_close_pending_confirmation_gates",
+          pendingCount: 1,
+        },
+      });
+    },
+  );
+
+  // The guard refuses an agent erasing its own gates. It must not also trap an
+  // operator: cancelling a stuck routine issue is how a human clears one, and
+  // extending the guard to `cancelled` took that away. The expiry is then a
+  // deliberate operator decision, which is what the sweep is for.
+  it("lets a human operator cancel a routine issue whose gates are still pending", async () => {
+    const { routineIssueId } = await seedRoutineIssueWithPendingGate("request_confirmation");
+    const issuesSvc = issueService(db);
+
+    const cancelled = await issuesSvc.update(routineIssueId, {
+      status: "cancelled",
+      actorUserId: "board-user",
+    });
+    expect(cancelled).toMatchObject({ id: routineIssueId, status: "cancelled" });
+  });
+
+  it("still refuses the assignee agent's own close on the same fixture", async () => {
+    const { routineIssueId, coach } = await seedRoutineIssueWithPendingGate("request_confirmation");
+    const issuesSvc = issueService(db);
+
+    await expect(
+      issuesSvc.update(routineIssueId, { status: "done", actorAgentId: coach.id }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "routine_close_pending_confirmation_gates" },
+    });
+  });
+
   it("gates Reflection Coach proposal mutations until an accepted follow-up apply step", async () => {
     const companyId = await seedCompany();
     const agentsSvc = agentService(db);

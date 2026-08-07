@@ -284,6 +284,7 @@ import {
   type HotRestartReportRun,
 } from "./hot-restart.js";
 import { normalizeMaxConcurrentRuns, parseHeartbeatPolicy } from "./heartbeat-policy.js";
+import { dispatchQuiesce } from "./dispatch-quiesce.js";
 import {
   assertLowTrustRuntimeServicesAllowed,
   assertLowTrustWorkspaceIsolation,
@@ -5676,10 +5677,20 @@ function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
 }
 
+export type HeartbeatSchedulingSuppressionReason =
+  | "worktree_instance"
+  | "database_restore_in_progress"
+  | "dispatch_quiesced";
+
+export type HeartbeatSchedulingSuppression = {
+  suppressed: boolean;
+  reason: HeartbeatSchedulingSuppressionReason | null;
+};
+
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
-  overrides: { allowWorktreeRunExecution?: boolean } = {},
-): { suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | null } {
+  overrides: { allowWorktreeRunExecution?: boolean; dispatchQuiesced?: boolean } = {},
+): HeartbeatSchedulingSuppression {
   if (isTruthyRuntimeEnvValue(env.PAPERCLIP_IN_WORKTREE) && !overrides.allowWorktreeRunExecution) {
     return { suppressed: true, reason: "worktree_instance" };
   }
@@ -5688,6 +5699,12 @@ export function resolveHeartbeatSchedulingSuppression(
     isTruthyRuntimeEnvValue(env.PAPERCLIP_RESTORE_IN_PROGRESS)
   ) {
     return { suppressed: true, reason: "database_restore_in_progress" };
+  }
+  // SUP-9857. Runtime quiesce for deploys: gates new dispatch exactly the way
+  // the two env reasons above do, and like them never cancels anything that is
+  // already running.
+  if (overrides.dispatchQuiesced) {
+    return { suppressed: true, reason: "dispatch_quiesced" };
   }
   return { suppressed: false, reason: null };
 }
@@ -5759,6 +5776,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const override = await resolveWorktreeRunExecutionOverride();
     return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
+      // Module singleton, not closure state: `heartbeatService(db)` is
+      // constructed once per route module, so a per-instance flag would leave
+      // most dispatch paths unquiesced.
+      dispatchQuiesced: dispatchQuiesce.isQuiesced(),
     });
   };
   const getWorktreeExecutionCutoff = async () => {
@@ -10908,6 +10929,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return issuesSvc.listDependencyReadiness(companyId, issueIds);
   }
 
+  /**
+   * SUP-9857. Instance-wide picture of what a deploy would destroy if it swapped
+   * the container now. `running` is what a drain has to wait on; `queued` cannot
+   * start while dispatch is quiesced but still tells an operator there is a
+   * backlog piling up behind the window.
+   *
+   * Deliberately DB-backed rather than counting `runningProcesses`: a run whose
+   * child this server never owned (adopted after a hot restart, or executing on
+   * a workspace runtime) is still in flight.
+   */
+  async function summarizeInFlightRuns() {
+    const rows = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.status, ["running", "queued"]));
+    const runIds = rows.filter((row) => row.status === "running").map((row) => row.id);
+    return {
+      running: runIds.length,
+      queued: rows.length - runIds.length,
+      runIds,
+    };
+  }
+
   async function countRunningRunsForAgent(agentId: string) {
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
@@ -13244,6 +13288,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             name: agent.name,
             companyId: agent.companyId,
           },
+          // SUP-11520: realization can reuse a worktree the issue's existing workspace row
+          // already points at. That row is the asker, not a competing claimant — pass it so
+          // the branch-contention check can exclude it instead of self-locking on it.
+          existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
           heartbeatRunId: run.id,
           enableWorkspaceBranchReconcileForward:
             resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
@@ -17746,6 +17794,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
+    summarizeInFlightRuns,
     drainRunningRunsForShutdown,
     drainActiveRunExecutions,
 

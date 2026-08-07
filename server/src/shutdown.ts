@@ -2,16 +2,140 @@ type HotRestartShutdownPreparation = {
   skipDrain: boolean;
 };
 
+/**
+ * SUP-10309. Docker's default stop timeout is 10s; anything the shutdown
+ * handler has not finished by then is cut off by SIGKILL to PID 1. Run
+ * children are spawned detached in their own process group, so they never see
+ * that signal and survive the restart as orphans holding the old container's
+ * mounts open. The whole handler therefore gets a budget comfortably under
+ * 10s, and whatever is still alive when it runs out is killed rather than
+ * awaited.
+ */
+export const DEFAULT_SHUTDOWN_DEADLINE_MS = 8_000;
+
+export function resolveShutdownDeadlineMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.PAPERCLIP_SHUTDOWN_DEADLINE_MS;
+  if (typeof raw !== "string" || raw.trim() === "") return DEFAULT_SHUTDOWN_DEADLINE_MS;
+  const parsed = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_SHUTDOWN_DEADLINE_MS;
+  return parsed;
+}
+
+export type ShutdownDeadline = {
+  totalMs: number;
+  remainingMs: () => number;
+  expired: () => boolean;
+};
+
+export function createShutdownDeadline(
+  totalMs: number,
+  now: () => number = Date.now,
+): ShutdownDeadline {
+  const startedAt = now();
+  const remainingMs = () => Math.max(0, totalMs - (now() - startedAt));
+  return {
+    totalMs,
+    remainingMs,
+    expired: () => remainingMs() <= 0,
+  };
+}
+
+/**
+ * Run one shutdown stage against the shared budget. A stage that outruns the
+ * budget is abandoned, not cancelled -- there is no way to cancel an in-flight
+ * drain -- but the handler stops waiting on it and moves on to the kill sweep.
+ * Rejections are still real failures and propagate.
+ */
+export async function withShutdownDeadline<T>(
+  work: Promise<T>,
+  deadline: ShutdownDeadline,
+): Promise<{ completed: true; value: T } | { completed: false }> {
+  const remaining = deadline.remainingMs();
+  if (remaining <= 0) return { completed: false };
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<{ completed: false }>((resolveExpiry) => {
+    timer = setTimeout(() => resolveExpiry({ completed: false }), remaining);
+    // Never let the deadline timer be the reason the process stays up.
+    timer.unref?.();
+  });
+
+  try {
+    return await Promise.race([
+      work.then((value) => ({ completed: true as const, value })),
+      expiry,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+type SweepableRunProcess = {
+  child: { pid?: number | null } | null | undefined;
+  processGroupId: number | null | undefined;
+};
+
+/**
+ * Last resort before `process.exit`: SIGKILL the process group of every run
+ * child still registered in memory. The graceful drain already tried SIGTERM
+ * and a per-run grace period; anything left here either outlived that grace or
+ * belongs to a run whose row is no longer `running`, which the drain does not
+ * look at. Killing the group rather than the pid is what actually reaches the
+ * detached `opencode run` subtree.
+ *
+ * Never call this on the hot-restart path -- those children are deliberately
+ * left alive for the incoming server to adopt.
+ */
+export function sweepDetachedRunProcesses(input: {
+  entries: Iterable<[string, SweepableRunProcess]>;
+  kill?: (pid: number, signal: NodeJS.Signals) => void;
+  signal?: NodeJS.Signals;
+}): { signalled: string[]; skipped: string[]; failed: string[] } {
+  const kill = input.kill ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
+  const signal = input.signal ?? "SIGKILL";
+  const signalled: string[] = [];
+  const skipped: string[] = [];
+  const failed: string[] = [];
+
+  for (const [runId, entry] of input.entries) {
+    const groupId = entry?.processGroupId;
+    const childPid = entry?.child?.pid;
+    const targetGroup =
+      process.platform !== "win32" && typeof groupId === "number" && Number.isInteger(groupId) && groupId > 0;
+    const target = targetGroup
+      ? -(groupId as number)
+      : typeof childPid === "number" && Number.isInteger(childPid) && childPid > 0
+        ? childPid
+        : null;
+    if (target === null) {
+      skipped.push(runId);
+      continue;
+    }
+    try {
+      kill(target, signal);
+      signalled.push(runId);
+    } catch {
+      // ESRCH just means the drain already got it. Never let one dead entry
+      // strand the entries behind it.
+      failed.push(runId);
+    }
+  }
+
+  return { signalled, skipped, failed };
+}
+
 export async function coordinateHeartbeatSchedulerShutdown<
   TPreparation extends HotRestartShutdownPreparation,
 >(input: {
   signal: "SIGINT" | "SIGTERM";
   prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<TPreparation>) | null;
   waitForHeartbeatSchedulerIdle: () => Promise<void>;
+  deadline?: ShutdownDeadline;
 }): Promise<{
   hotRestart: TPreparation | null;
   preparationError: unknown;
   waitedForSchedulerIdle: boolean;
+  schedulerIdleTimedOut: boolean;
 }> {
   let hotRestart: TPreparation | null = null;
   let preparationError: unknown = null;
@@ -29,6 +153,20 @@ export async function coordinateHeartbeatSchedulerShutdown<
       hotRestart,
       preparationError,
       waitedForSchedulerIdle: false,
+      schedulerIdleTimedOut: false,
+    };
+  }
+
+  // The idle wait blocks on in-flight scheduler work, which includes whole
+  // agent runs. Without a bound it can outlast the container's stop timeout on
+  // its own, before the drain has had a chance to signal anything.
+  if (input.deadline) {
+    const idle = await withShutdownDeadline(input.waitForHeartbeatSchedulerIdle(), input.deadline);
+    return {
+      hotRestart,
+      preparationError,
+      waitedForSchedulerIdle: idle.completed,
+      schedulerIdleTimedOut: !idle.completed,
     };
   }
 
@@ -37,5 +175,6 @@ export async function coordinateHeartbeatSchedulerShutdown<
     hotRestart,
     preparationError,
     waitedForSchedulerIdle: true,
+    schedulerIdleTimedOut: false,
   };
 }

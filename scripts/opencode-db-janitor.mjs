@@ -179,9 +179,28 @@ export function shouldVacuum({ freelistCount, pageCount, pageSize, minFreeMb, mi
 /**
  * A database whose files were touched inside the idle window is assumed to be
  * held by a live run.
+ *
+ * `-shm` is checked for EXISTENCE, not just mtime. SQLite creates it when a
+ * connection opens the database in WAL mode and removes it when the last one
+ * closes, so its presence means somebody is connected right now. mtime alone
+ * cannot see a run that is open but quiet, and opencode runs are quiet for long
+ * stretches: an agent waiting on a slow model writes nothing for far longer
+ * than any idle window worth using. VACUUM under such a run takes an exclusive
+ * lock against a live fleet — the outage this script exists to prevent.
+ *
+ * A process that died without closing leaves the file behind, so this can
+ * refuse a database that is genuinely idle. That is the direction to fail in: a
+ * skipped reclaim costs disk, a VACUUM against a live fleet costs the fleet.
  */
-export function isDatabaseIdle({ databasePath, nowMs, idleMinutes, stat = fs.statSync }) {
+export function isDatabaseIdle({
+  databasePath,
+  nowMs,
+  idleMinutes,
+  stat = fs.statSync,
+  exists = fs.existsSync,
+}) {
   if (idleMinutes <= 0) return true;
+  if (exists(`${databasePath}-shm`)) return false;
   const thresholdMs = nowMs - idleMinutes * 60 * 1000;
   for (const suffix of ["", "-wal", "-shm"]) {
     try {
@@ -197,6 +216,137 @@ export function isDatabaseIdle({ databasePath, nowMs, idleMinutes, stat = fs.sta
 export function formatBytes(bytes) {
   if (bytes < BYTES_PER_MB) return `${bytes} B`;
   return `${(bytes / BYTES_PER_MB).toFixed(1)} MB`;
+}
+
+/**
+ * Single-instance lock, kept beside the databases it protects.
+ *
+ * The bash pruner this replaces grew `flock` after a write-lock-starvation
+ * incident, and that guard did not survive the rewrite. Once this runs on a
+ * schedule, overlap is not hypothetical: a sweep over a multi-GB backlog can
+ * outlast its own interval, and a VACUUM that overlaps another sweep's prune
+ * reproduces exactly the starvation this issue is about.
+ */
+export function janitorLockPath(dataDir) {
+  return path.join(dataDir, ".opencode-db-janitor.lock");
+}
+
+/** How long a lock we cannot attribute to a live process is honoured before it
+ * is treated as debris. Generous, because stealing a live holder's lock is the
+ * failure this is guarding against. */
+const STALE_LOCK_MS = 12 * 60 * 60 * 1000;
+
+function readLockHolder(lockPath) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    // Missing, truncated, or half-written by a holder that is still starting.
+    return null;
+  }
+}
+
+/**
+ * Whether a lock file is debris rather than a live holder.
+ *
+ * A pid check is the sharp signal, but it only means anything when the holder
+ * shares this pid namespace — a container restart, or a sweep launched from the
+ * host against a container's data dir, both break that assumption. So mtime is
+ * the backstop: an unattributable lock is honoured, but not forever, because a
+ * lock nobody ever clears would silently stop retention altogether.
+ */
+export function isJanitorLockStale({
+  holder,
+  mtimeMs,
+  nowMs,
+  isProcessAlive = defaultIsProcessAlive,
+}) {
+  const pid = Number(holder?.pid);
+  // A non-positive pid is not a process. `process.kill(0, ...)` addresses the
+  // whole process group, so it must never reach the liveness probe.
+  if (Number.isInteger(pid) && pid > 0) {
+    if (isProcessAlive(pid)) return false;
+    return true;
+  }
+  return nowMs - mtimeMs > STALE_LOCK_MS;
+}
+
+function defaultIsProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means it exists and belongs to somebody else.
+    return err?.code === "EPERM";
+  }
+}
+
+/**
+ * Take the lock, or report why not. Returns a release function on success.
+ * Only `--apply` takes it: a dry run holds no write locks, so making it wait on
+ * a live sweep would only get in the way of diagnosing one.
+ */
+export function acquireJanitorLock({
+  dataDir,
+  nowMs,
+  log,
+  isProcessAlive = defaultIsProcessAlive,
+}) {
+  const lockPath = janitorLockPath(dataDir);
+  const write = () => {
+    const handle = fs.openSync(lockPath, "wx");
+    try {
+      fs.writeFileSync(
+        handle,
+        `${JSON.stringify({ pid: process.pid, startedAt: new Date(nowMs).toISOString() })}\n`,
+      );
+    } finally {
+      fs.closeSync(handle);
+    }
+    return () => {
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        // Already gone; nothing to release.
+      }
+    };
+  };
+
+  try {
+    return write();
+  } catch (err) {
+    if (err?.code !== "EEXIST") throw err;
+  }
+
+  const holder = readLockHolder(lockPath);
+  let mtimeMs = 0;
+  try {
+    mtimeMs = fs.statSync(lockPath).mtimeMs;
+  } catch {
+    // Released between the failed create and this stat; fall through and retry.
+  }
+  if (!isJanitorLockStale({ holder, mtimeMs, nowMs, isProcessAlive })) {
+    log(
+      `Another janitor sweep is already running (lock ${lockPath}${holder?.pid ? `, pid ${holder.pid}` : ""}${holder?.startedAt ? `, started ${holder.startedAt}` : ""}). Skipping this run.`,
+    );
+    return null;
+  }
+
+  log(
+    `Clearing a stale janitor lock at ${lockPath}${holder?.pid ? ` (pid ${holder.pid} is gone)` : ""}.`,
+  );
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    // Someone else cleared it first; the create below decides the race.
+  }
+  try {
+    return write();
+  } catch (err) {
+    if (err?.code !== "EEXIST") throw err;
+    log("Another janitor sweep took the lock first. Skipping this run.");
+    return null;
+  }
 }
 
 /** Synchronous sleep. `DatabaseSync` is synchronous, so yielding the lock
@@ -357,51 +507,82 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     return 0;
   }
 
+  // Dry runs take no write locks, so they neither take the lock nor wait on it.
+  const releaseLock = args.apply
+    ? acquireJanitorLock({
+        dataDir,
+        nowMs,
+        log,
+        isProcessAlive: deps.isProcessAlive,
+      })
+    : () => {};
+  if (!releaseLock) return 0;
+
   log(
     `${args.apply ? "Pruning" : "Dry run over"} ${databases.length} database(s) in ${dataDir} ` +
       `(sessions older than ${args.olderThanDays}d)`,
   );
 
   let reclaimed = 0;
-  for (const databasePath of databases) {
-    // NOT a skip. A fleet that never goes idle would otherwise never be pruned
-    // or checkpointed at all — which is how a 51 GB database and a 954 MB WAL
-    // happen. Only VACUUM waits for quiet.
-    const idle = isDatabaseIdle({ databasePath, nowMs, idleMinutes: args.idleMinutes });
-    try {
-      const report = janitorRunDatabase({
+  let failures = 0;
+  try {
+    for (const databasePath of databases) {
+      // NOT a skip. A fleet that never goes idle would otherwise never be pruned
+      // or checkpointed at all — which is how a 51 GB database and a 954 MB WAL
+      // happen. Only VACUUM waits for quiet.
+      const idle = isDatabaseIdle({
         databasePath,
-        DatabaseSync,
-        apply: args.apply,
-        olderThanDays: args.olderThanDays,
         nowMs,
-        vacuumMinFreeMb: args.vacuumMinFreeMb,
-        deleteBatchSize: args.deleteBatchSize,
-        idle,
-        allowVacuum: !args.noVacuum,
+        idleMinutes: args.idleMinutes,
       });
-      reclaimed += Math.max(0, report.bytesBefore - report.bytesAfter);
-      log(
-        `  ${path.basename(databasePath)}: ${report.sessionsPruned} session(s)` +
-          `${report.eventSequencesPruned ? `, ${report.eventSequencesPruned} event stream(s)` : ""}` +
-          `${report.vacuumed === true ? ", vacuumed" : report.vacuumed ? ", vacuum pending" : ""}` +
-          `${report.vacuumSkipped ? `, vacuum deferred (${report.vacuumSkipped})` : ""}` +
-          ` — ${formatBytes(report.bytesBefore)} → ${formatBytes(report.bytesAfter)}` +
-          `${report.skipped ? ` (${report.skipped})` : ""}`,
-      );
-      if (args.verbose) {
-        log(`    cascades: ${SESSION_CASCADE_TABLES.join(", ")}`);
+      try {
+        const report = janitorRunDatabase({
+          databasePath,
+          DatabaseSync,
+          apply: args.apply,
+          olderThanDays: args.olderThanDays,
+          nowMs,
+          vacuumMinFreeMb: args.vacuumMinFreeMb,
+          deleteBatchSize: args.deleteBatchSize,
+          idle,
+          allowVacuum: !args.noVacuum,
+        });
+        reclaimed += Math.max(0, report.bytesBefore - report.bytesAfter);
+        log(
+          `  ${path.basename(databasePath)}: ${report.sessionsPruned} session(s)` +
+            `${report.eventSequencesPruned ? `, ${report.eventSequencesPruned} event stream(s)` : ""}` +
+            `${report.vacuumed === true ? ", vacuumed" : report.vacuumed ? ", vacuum pending" : ""}` +
+            `${report.vacuumSkipped ? `, vacuum deferred (${report.vacuumSkipped})` : ""}` +
+            ` — ${formatBytes(report.bytesBefore)} → ${formatBytes(report.bytesAfter)}` +
+            `${report.skipped ? ` (${report.skipped})` : ""}`,
+        );
+        if (args.verbose) {
+          log(`    cascades: ${SESSION_CASCADE_TABLES.join(", ")}`);
+        }
+      } catch (err) {
+        // One unhealthy or locked database must not stop the sweep.
+        failures += 1;
+        log(
+          `  ${path.basename(databasePath)}: FAILED — ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
-    } catch (err) {
-      // One unhealthy or locked database must not stop the sweep.
-      log(`  ${path.basename(databasePath)}: FAILED — ${err instanceof Error ? err.message : String(err)}`);
     }
+  } finally {
+    releaseLock();
   }
 
   if (!args.apply) {
     log("Dry run: nothing was deleted. Re-run with --apply.");
   } else {
     log(`Reclaimed ${formatBytes(reclaimed)}.`);
+  }
+  // Scheduled from a cron or a supervisor, this exit code is the only thing
+  // anyone reads. Exiting 0 over a sweep where every database failed is the
+  // same blindness that let the old host pruner run green for two weeks against
+  // a database that had stopped being the live one.
+  if (failures > 0) {
+    log(`${failures} database(s) failed this sweep.`);
+    return 1;
   }
   return 0;
 }

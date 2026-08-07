@@ -70,6 +70,9 @@ jobs:
       - name: Test opencode database janitor
         run: node --test ./scripts/__tests__/opencode-db-janitor.test.mjs
 
+      - name: Test bundled plugin image build coverage
+        run: node --test ./scripts/__tests__/build-bundled-plugins.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 

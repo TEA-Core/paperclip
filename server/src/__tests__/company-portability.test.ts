@@ -2908,6 +2908,119 @@ describe("company portability", () => {
     });
   });
 
+  /**
+   * `heartbeat.wakeOnDemand` parses back as `true` when absent, so dropping a
+   * `false` here does not preserve behaviour — it inverts it. An operator who
+   * declared "the platform must never start a run for this agent" gets an
+   * on-demand-wakeable agent back, which is how coder-Claude-code acquired a
+   * `missing_disposition` recovery loop after the 2026-07-24 rebuild.
+   */
+  function pullAgentFixture(heartbeat: Record<string, unknown>) {
+    return [
+      {
+        id: "agent-1",
+        name: "ClaudeCoder",
+        status: "idle",
+        role: "engineer",
+        title: "Software Engineer",
+        icon: "code",
+        reportsTo: null,
+        capabilities: "Writes code",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat },
+        budgetMonthlyCents: 0,
+        permissions: {},
+        metadata: null,
+      },
+    ];
+  }
+
+  async function roundTripHeartbeat(
+    heartbeat: Record<string, unknown>,
+    adapterConfig: Record<string, unknown> = {},
+  ) {
+    const portability = companyPortabilityService({} as any);
+    agentSvc.list.mockResolvedValue(
+      pullAgentFixture(heartbeat).map((agent) => ({ ...agent, adapterConfig })),
+    );
+    companySvc.create.mockResolvedValue({ id: "company-imported", name: "Imported Paperclip" });
+    agentSvc.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
+      id: `agent-${String(input.name).toLowerCase()}`,
+      name: input.name,
+      adapterConfig: input.adapterConfig,
+      runtimeConfig: input.runtimeConfig,
+    }));
+
+    const include = { company: true, agents: true, projects: false, issues: false };
+    const exported = await portability.exportBundle("company-1", { include });
+
+    agentSvc.list.mockResolvedValue([]);
+    const imported = await portability.importBundle({
+      source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+      include,
+      target: { mode: "new_company", newCompanyName: "Imported Paperclip" },
+      agents: "all",
+      collisionStrategy: "rename",
+    }, "user-1");
+
+    const created = agentSvc.create.mock.calls.find(([, input]) => input.name === "ClaudeCoder");
+    return {
+      exportWarnings: exported.warnings,
+      importWarnings: imported.warnings,
+      manifestYaml: asTextFile(exported.files[".paperclip.yaml"]),
+      importedAdapterConfig: created?.[1]?.adapterConfig as Record<string, unknown> | undefined,
+      importedHeartbeat: (created?.[1]?.runtimeConfig as { heartbeat?: Record<string, unknown> } | undefined)?.heartbeat,
+    };
+  }
+
+  it("preserves an explicit heartbeat.wakeOnDemand: false across an export/import round trip", async () => {
+    const { manifestYaml, importedHeartbeat } = await roundTripHeartbeat({
+      enabled: false,
+      maxConcurrentRuns: 20,
+      wakeOnDemand: false,
+    });
+
+    expect(manifestYaml).toContain("wakeOnDemand: false");
+    expect(importedHeartbeat).toMatchObject({ enabled: false, wakeOnDemand: false });
+  });
+
+  it("still prunes heartbeat booleans whose absence parses back to the same value", async () => {
+    // `wakeOnDemand: true` is the parse default, so omitting it is lossless and
+    // the export should stay small. `skipTimerWhenNoActionableWork` defaults to
+    // `false`, so dropping a `false` there is lossless too — the fix must not
+    // widen into keeping every false boolean.
+    const { manifestYaml, importedHeartbeat } = await roundTripHeartbeat({
+      enabled: false,
+      maxConcurrentRuns: 20,
+      wakeOnDemand: true,
+      skipTimerWhenNoActionableWork: false,
+    });
+
+    expect(manifestYaml).not.toContain("wakeOnDemand:");
+    expect(manifestYaml).not.toContain("skipTimerWhenNoActionableWork");
+    expect(importedHeartbeat).not.toHaveProperty("wakeOnDemand");
+    expect(importedHeartbeat).not.toHaveProperty("skipTimerWhenNoActionableWork");
+  });
+
+  it("warns at import time when a process agent arrives without its stripped command", async () => {
+    // The export drops absolute commands as system-dependent — deliberately, and
+    // it warns. But that warning reaches whoever ran the export; the person who
+    // has to supply the replacement is the one importing on the new host.
+    const { exportWarnings, importWarnings, importedAdapterConfig } = await roundTripHeartbeat(
+      { enabled: false, maxConcurrentRuns: 20, wakeOnDemand: false },
+      { command: "/bin/echo", args: ["external-pull-agent no-op wake"] },
+    );
+
+    expect(exportWarnings).toContain(
+      "Agent claudecoder command /bin/echo was omitted from export because it is system-dependent.",
+    );
+    expect(importedAdapterConfig).not.toHaveProperty("command");
+    expect(importWarnings).toContain(
+      "Agent claudecoder was imported without a process command; set adapterConfig.command before it can run.",
+    );
+  });
+
   it("imports only selected files and leaves unchecked company metadata alone", async () => {
     const portability = companyPortabilityService({} as any);
 
