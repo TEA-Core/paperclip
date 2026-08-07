@@ -58,7 +58,7 @@ import {
   buildIssueZeroBlockerHealWakeIdempotencyKey,
   findExistingIssueBlockersResolvedWakeForAnyKey,
 } from "../issue-dependency-wakeups.js";
-import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
+import { evaluateAgentInvokabilityFromDb, type AgentInvokability } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -803,8 +803,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
   }
 
+  async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined): Promise<AgentInvokability> {
+    return evaluateAgentInvokabilityFromDb(db, agent);
+  }
+
   async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
-    return (await evaluateAgentInvokabilityFromDb(db, agent)).invokable;
+    return (await getAgentInvokability(agent)).invokable;
   }
 
   async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
@@ -3038,6 +3042,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: StrandedPreviousStatus;
     recoveryCause: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    agentInvokability?: AgentInvokability | null;
   }) {
     const context = parseObject(input.latestRun?.contextSnapshot);
     const workspaceValidation = input.recoveryCause === "workspace_validation_failed"
@@ -3058,6 +3063,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       missingDisposition: input.successfulRunHandoffEvidence?.missingDisposition ?? null,
       handoffAttempt: input.successfulRunHandoffEvidence?.handoffAttempt ?? null,
       maxHandoffAttempts: input.successfulRunHandoffEvidence?.maxHandoffAttempts ?? null,
+      agentInvokable: input.agentInvokability?.invokable ?? null,
+      agentInvokabilityReason: input.agentInvokability && !input.agentInvokability.invokable
+        ? input.agentInvokability.reason
+        : null,
+      agentInvokabilityMessage: input.agentInvokability && !input.agentInvokability.invokable
+        ? input.agentInvokability.message
+        : null,
       ...(workspaceValidation ? { workspaceValidation } : {}),
     };
   }
@@ -3069,6 +3081,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    agentInvokability?: AgentInvokability | null;
   }) {
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
     const routing = await resolveStrandedRecoveryRouting({
@@ -3100,6 +3113,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           previousStatus: input.previousStatus,
           recoveryCause,
           successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+          agentInvokability: input.agentInvokability,
         }),
         failureSummary: summarizeRunFailureForIssueComment(input.latestRun)?.trim() ?? null,
         routingFallbackReason: routing.routingFallbackReason,
@@ -3453,6 +3467,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    agentInvokability?: AgentInvokability | null;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -3481,6 +3496,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryCause,
       recoveryOwnerAgentId: input.recoveryOwnerAgentId,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+      agentInvokability: input.agentInvokability,
     });
     const isProviderQuotaWait = recoveryCause === "provider_quota" &&
       !recoveryAction.ownerAgentId &&
@@ -3758,15 +3774,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return participant?.type === "agent" ? participant.agentId : null;
   }
 
-  function hasPendingProviderQuotaRecoveryMonitor(
+  function hasPendingRecoveryMonitor(
     issue: typeof issues.$inferSelect,
-    latestRun: LatestIssueRun,
+    latestRun: LatestIssueRun | null,
     now: Date,
   ) {
     if (!latestRun || !issue.monitorNextCheckAt || issue.monitorNextCheckAt.getTime() <= now.getTime()) return false;
     const monitor = parseObject(parseObject(issue.executionPolicy).monitor);
-    return readNonEmptyString(monitor.serviceName) === PROVIDER_QUOTA_MONITOR_SERVICE_NAME &&
-      readNonEmptyString(monitor.externalRef) === latestRun.id;
+    if (!monitor) return false;
+    return true;
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
@@ -3874,9 +3890,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       const agent = await getAgent(agentId);
-      const agentInvokable = agent && agent.companyId === issue.companyId
-        ? await isAgentInvokable(agent)
-        : false;
+      const agentInvokability: AgentInvokability = agent && agent.companyId === issue.companyId
+        ? await getAgentInvokability(agent)
+        : {
+          invokable: false,
+          reason: "missing",
+          message: "Agent is not assigned to this company",
+          details: {},
+          invalidOrgChain: false,
+        };
+      const agentInvokable = agentInvokability.invokable;
+
+      let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      const recoveryNow = new Date();
+      const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId
+        ? await getLatestIssueRunForAgent(issue.companyId, issue.id, participantAgentId)
+        : null;
+      const monitorRun = issue.status === "in_review"
+        ? participantLatestRunForRecovery
+        : latestRun;
+      if (hasPendingRecoveryMonitor(issue, monitorRun, recoveryNow)) {
+        result.skipped += 1;
+        continue;
+      }
+
       if (issue.status !== "in_review" && !agentInvokable) {
         const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
         if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
@@ -3901,6 +3938,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             status: issue.status,
             agentId,
             msSinceUpdate,
+            agentInvokable: agentInvokable,
+            agentInvokabilityReason: agentInvokability.reason,
+            agentInvokabilityMessage: agentInvokability.message,
           },
           nextAction: "Restore a live execution path, reactivate or replace the assignee, or record an intentional manual resolution.",
           wakePolicy: null,
@@ -3944,19 +3984,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
       if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
-        result.skipped += 1;
-        continue;
-      }
-      const recoveryNow = new Date();
-      const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId
-        ? await getLatestIssueRunForAgent(issue.companyId, issue.id, participantAgentId)
-        : null;
-      const providerQuotaMonitorRun = issue.status === "in_review"
-        ? participantLatestRunForRecovery
-        : latestRun;
-      if (hasPendingProviderQuotaRecoveryMonitor(issue, providerQuotaMonitorRun, recoveryNow)) {
         result.skipped += 1;
         continue;
       }
@@ -4008,6 +4036,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             comment:
               "Paperclip classified the latest adapter failure as `configuration_incomplete`. " +
               "Moving the issue to `blocked` with the configuration fix recorded instead of creating a recovery takeover.",
+            agentInvokability: agentInvokability,
           });
           if (updated) {
             latestRun = await persistAdapterFailureRecoveryClassification(latestRun, adapterFailureClassification);
@@ -4078,6 +4107,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 `Paperclip stopped requeueing accepted interaction \`${acceptedContinuationInteraction.id}\` after ` +
                 `${consecutive} consecutive continuation wakes were cancelled while waiting on review. ` +
                 "Moving the issue to `blocked` so the missing execution path is visible for intervention.",
+              agentInvokability: agentInvokability,
             });
             if (updated) {
               result.escalated += 1;
@@ -4172,6 +4202,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun),
               recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
               recoveryOwnerAgentId: participantAgentId,
+              agentInvokability: agentInvokability,
             });
             if (updated) {
               result.escalated += 1;
@@ -4217,6 +4248,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               "Paperclip classified the active review participant's latest adapter failure as " +
               "`configuration_incomplete`. Moving the issue to `blocked` with the configuration fix " +
               "recorded instead of repeatedly requeueing the reviewer.",
+            agentInvokability: agentInvokability,
           });
           if (updated) {
             latestRun = await persistAdapterFailureRecoveryClassification(
@@ -4239,6 +4271,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
             recoveryOwnerAgentId: participantAgentId,
+            agentInvokability: agentInvokability,
           });
           if (updated) {
             result.escalated += 1;
@@ -4257,6 +4290,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             comment: buildExecutionReviewParticipantRecoveryComment(participantLatestRun),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
             recoveryOwnerAgentId: participantAgentId,
+            agentInvokability: agentInvokability,
           });
           if (updated) {
             result.escalated += 1;
@@ -4337,6 +4371,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
               `but it still has no live execution path.${failureSummary ?? ""} ` +
               "Moving it to `blocked` so it is visible for intervention.",
+            agentInvokability: agentInvokability,
           });
           if (updated) {
             result.escalated += 1;
@@ -4386,6 +4421,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           latestRun,
           recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
           successfulRunHandoffEvidence: handoffEvidence,
+          agentInvokability: agentInvokability,
         });
         if (updated) {
           result.successfulRunHandoffEscalated += 1;
@@ -4423,6 +4459,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               comment:
                 "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
                 "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+              agentInvokability: agentInvokability,
             });
             if (updated) {
               result.escalated += 1;
@@ -4490,6 +4527,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               : "Paperclip detected a non-retryable failure on this issue's continuation run " +
                 `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
                 `so it is visible for intervention.${failureSummary ?? ""}`,
+            agentInvokability: agentInvokability,
           });
           if (updated) {
             result.escalated += 1;
@@ -4521,6 +4559,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
                 `execution disappeared, but it still has no live execution path${attemptCopy}.${causeCopy}${failureSummary ?? ""} ` +
                 "Moving it to `blocked` so it is visible for intervention.",
+              agentInvokability: agentInvokability,
             });
             if (updated) {
               result.escalated += 1;

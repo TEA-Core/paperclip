@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import express from "express";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -7,6 +9,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issueComments,
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
@@ -15,10 +18,21 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres no-live-path strand tests on this host: ${
+      embeddedPostgresSupport.reason ?? "unsupported environment"
+    }`,
+  );
+}
 
 const GRACE_WINDOW_MS = 15 * 60 * 1000;
 
@@ -32,6 +46,7 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(issueComments);
     await db.delete(issueThreadInteractions);
     await db.delete(issueRecoveryActions);
     await db.delete(activityLog);
@@ -82,6 +97,38 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       },
     ]);
     return { companyId, managerId, coderId, prefix };
+  }
+
+  async function seedCompanyWithIssue() {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const sourceIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Implement backend recovery",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    return { companyId, managerId, coderId, prefix, sourceIssueId, sourceIssue };
+  }
+
+  function createApp(
+    actor: any = { type: "board", source: "local_implicit" },
+    opts: Parameters<typeof issueRoutes>[2] = {},
+  ) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).actor = actor;
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as any, opts));
+    app.use(errorHandler);
+    return app;
   }
 
   async function seedPausedAgent(companyId: string, managerId: string) {
@@ -154,6 +201,8 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
   function withinGraceDate(): Date {
     return new Date(Date.now() - 5 * 60_000);
   }
+
+  // -- Base tests --
 
   it("branch 1: unassigned todo issue past grace window creates no_live_path_unowned recovery action", async () => {
     const { companyId, managerId, prefix } = await seedCompany();
@@ -743,5 +792,171 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
     expect(actions).toHaveLength(0);
+  });
+
+  // -- SUP-11327 tests (Defects A, B, C) --
+
+  it("retires a no_live_path_owner_unavailable action on read projection when the source issue is in_progress with an agent owner", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompanyWithIssue();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+       kind: "no_live_path_owner_unavailable",
+       ownerType: "board",
+       ownerAgentId: null,
+       cause: "no_live_path_owner_unavailable",
+       fingerprint: "no-live-path:retire-on-read",
+      evidence: { status: "in_progress", agentId: coderId, identifier: `${companyId.slice(0, 8)}-1` },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "board_escalation", reason: "no_invokable_recovery_owner" },
+    });
+
+    const app = createApp();
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+
+    expect(detail.body).toMatchObject({
+      id: sourceIssueId,
+      status: "in_progress",
+      assigneeAgentId: coderId,
+      activeRecoveryAction: null,
+    });
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+    expect(actionRow?.resolvedAt).toBeTruthy();
+  });
+
+  it("does not open a no_live_path_owner_unavailable action when the issue has a future monitorNextCheckAt and a parseable executionPolicy.monitor", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompanyWithIssue();
+    const now = new Date("2026-08-07T00:00:00.000Z");
+    const monitorNextCheckAt = new Date("2026-08-07T09:00:00.000Z");
+
+    await db
+      .update(issues)
+      .set({
+        status: "in_progress",
+        assigneeAgentId: coderId,
+        monitorNextCheckAt,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          monitor: {
+            kind: "external_service",
+            serviceName: "deployment health",
+            nextCheckAt: monitorNextCheckAt.toISOString(),
+            scheduledBy: "assignee",
+            recoveryPolicy: "wake_owner",
+            maxAttempts: 3,
+            notes: "Wait for deployment health monitor.",
+          },
+        },
+      })
+      .where(eq(issues.id, sourceIssueId));
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: now,
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.skipped).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("carries the invokability block reason in a newly opened no_live_path_owner_unavailable action evidence", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompanyWithIssue();
+
+    await db
+      .update(agents)
+      .set({ status: "paused" })
+      .where(eq(agents.id, coderId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { issueId: sourceIssue.id, retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+      agentInvokability: {
+        invokable: false,
+        reason: "paused",
+        message: "Agent is not invokable in its current state",
+        details: { agentId: coderId, agentStatus: "paused" },
+        invalidOrgChain: false,
+      },
+    });
+
+    expect(updated).toMatchObject({ status: "blocked" });
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      status: "active",
+    });
+    expect(action?.evidence).toMatchObject({
+      agentInvokable: false,
+      agentInvokabilityReason: "paused",
+    });
+    expect(action?.evidence?.agentInvokabilityMessage).toBeTruthy();
+  });
+
+  it("carries the invokability block reason in a sweep-created no_live_path_owner_unavailable action evidence", async () => {
+    const { companyId, managerId, prefix } = await seedCompany();
+    const pausedAgentId = await seedPausedAgent(companyId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", pausedAgentId, {
+      updatedAt: pastGraceDate(),
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.noLivePathOwnerUnavailable).toBe(1);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action).toMatchObject({
+      kind: "no_live_path_owner_unavailable",
+      cause: "no_live_path_owner_unavailable",
+      status: "active",
+    });
+    expect(action?.evidence).toMatchObject({
+      agentInvokable: false,
+      agentInvokabilityReason: "paused",
+    });
+    expect(action?.evidence?.agentInvokabilityMessage).toBeTruthy();
   });
 });
