@@ -13,6 +13,7 @@ import {
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
   readPaperclipToolCallCount,
+  selectSuccessfulRunProgressSummary,
 } from "./successful-run-handoff.js";
 import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
 
@@ -48,6 +49,10 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
     agent,
     livenessState: "advanced",
     detectedProgressSummary: "Run produced concrete action evidence: 1 issue comment(s)",
+    // Unless a case says otherwise, evidence tracks the displayed summary — the
+    // two were the same field before they were split.
+    hasProgressEvidence: overrides.hasProgressEvidence
+      ?? Boolean("detectedProgressSummary" in overrides ? overrides.detectedProgressSummary : true),
     paperclipToolCallCount: null,
     taskKey: "issue-1",
     hasActiveExecutionPath: false,
@@ -186,6 +191,52 @@ describe("successful run handoff decision", () => {
       kind: "skip",
       reason: "active routine continuation owns the next action",
     });
+  });
+
+  it("does not treat the classifier's own verdict on a run as evidence the run made progress", () => {
+    // `empty_response` is deliberately absent from PRODUCTIVE_SUCCESS_LIVENESS_STATES,
+    // and its liveness reason literally says the run produced nothing. Reading
+    // that sentence back as a progress signal defeats the exclusion.
+    expect(decide({
+      livenessState: "empty_response",
+      detectedProgressSummary: "Run succeeded without useful output or concrete action evidence",
+      hasProgressEvidence: false,
+      paperclipToolCallCount: null,
+    })).toEqual({
+      kind: "skip",
+      reason: "successful run did not produce handoff-relevant progress",
+    });
+    // Bounded liveness continuation owns this state; the handoff must not
+    // claim it as well.
+    expect(decide({
+      livenessState: "empty_response",
+      detectedProgressSummary: "Run succeeded without useful output",
+      hasProgressEvidence: false,
+      paperclipToolCallCount: 3,
+    })).toEqual({
+      kind: "skip",
+      reason: "successful run did not produce handoff-relevant progress",
+    });
+  });
+
+  it("still hands off on evidence the run itself produced", () => {
+    expect(decide({
+      livenessState: null,
+      detectedProgressSummary: "Next action noted: wire the detector into the sweep",
+      hasProgressEvidence: true,
+      paperclipToolCallCount: null,
+    }).kind).toBe("enqueue");
+  });
+
+  it("keeps the zero-tool-call rule ahead of the evidence test", () => {
+    // SUP-9779's Mode A rule is what covers the `opencode_local` population.
+    // It has to survive an empty run with no evidence of any kind.
+    expect(decide({
+      livenessState: "empty_response",
+      detectedProgressSummary: "Run succeeded without useful output",
+      hasProgressEvidence: false,
+      paperclipToolCallCount: 0,
+    }).kind).toBe("enqueue");
   });
 
   it("queues a corrective wake when a successful run made zero Paperclip tool calls", () => {
@@ -455,5 +506,83 @@ describe("readPaperclipToolCallCount", () => {
     expect(readPaperclipToolCallCount({ paperclipToolCallCount: "0" })).toBeNull();
     expect(readPaperclipToolCallCount({ paperclipToolCallCount: Number.NaN })).toBeNull();
     expect(readPaperclipToolCallCount({ paperclipToolCallCount: -1 })).toBeNull();
+  });
+});
+
+describe("selectSuccessfulRunProgressSummary", () => {
+  it("keeps the classifier reason ahead of adapter result fields for display", () => {
+    // Display ordering is unchanged by the evidence split: `livenessReason`
+    // still wins over resultJson fields when it is offered.
+    expect(selectSuccessfulRunProgressSummary({
+      unmanagedBackgroundTask: false,
+      nextAction: null,
+      resultJson: { summary: "Adapter summary" },
+      classifierReason: "Run produced concrete action evidence: 1 issue comment(s)",
+    })).toBe("Run produced concrete action evidence: 1 issue comment(s)");
+
+    expect(selectSuccessfulRunProgressSummary({
+      unmanagedBackgroundTask: false,
+      nextAction: "wire the detector into the sweep",
+      resultJson: null,
+      classifierReason: "Run described runnable future work without concrete action evidence",
+    })).toBe("Next action noted: wire the detector into the sweep");
+  });
+
+  it("omits the classifier reason when asked what the run itself produced", () => {
+    // This is the whole point: "Run succeeded without useful output or concrete
+    // action evidence" is Paperclip describing the run, not the run reporting
+    // progress, so it must not survive into the evidence answer.
+    expect(selectSuccessfulRunProgressSummary({
+      unmanagedBackgroundTask: false,
+      nextAction: null,
+      resultJson: null,
+    })).toBeNull();
+
+    expect(selectSuccessfulRunProgressSummary({
+      unmanagedBackgroundTask: false,
+      nextAction: null,
+      resultJson: { stdout: "", stderr: "" },
+    })).toBeNull();
+  });
+
+  it("counts everything the run actually produced", () => {
+    expect(selectSuccessfulRunProgressSummary({
+      unmanagedBackgroundTask: true,
+      nextAction: null,
+      resultJson: null,
+    })).toBe(UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON);
+
+    expect(selectSuccessfulRunProgressSummary({
+      unmanagedBackgroundTask: false,
+      nextAction: "wire the detector into the sweep",
+      resultJson: null,
+    })).toBe("Next action noted: wire the detector into the sweep");
+
+    expect(selectSuccessfulRunProgressSummary({
+      unmanagedBackgroundTask: false,
+      nextAction: null,
+      resultJson: { summary: "Adapter summary" },
+    })).toBe("Adapter summary");
+
+    expect(selectSuccessfulRunProgressSummary({
+      unmanagedBackgroundTask: false,
+      nextAction: null,
+      resultJson: { result: "Adapter result" },
+    })).toBe("Adapter result");
+
+    expect(selectSuccessfulRunProgressSummary({
+      unmanagedBackgroundTask: false,
+      nextAction: null,
+      resultJson: { message: "Adapter message" },
+    })).toBe("Adapter message");
+  });
+
+  it("ignores blank and non-string candidates", () => {
+    expect(selectSuccessfulRunProgressSummary({
+      unmanagedBackgroundTask: false,
+      nextAction: "   ",
+      resultJson: { summary: "", result: 42 },
+      classifierReason: "  ",
+    })).toBeNull();
   });
 });

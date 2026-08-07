@@ -2,6 +2,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
+import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
@@ -337,9 +338,44 @@ export function readPaperclipToolCallCount(resultJson: unknown): number | null {
   return value;
 }
 
+/**
+ * Picks the one line that best describes what a successful run did.
+ *
+ * The candidates are in the order the board notice prefers them, and all but
+ * one are things the *run* produced. `classifierReason` — the run's
+ * `livenessReason` — is the exception: it is Paperclip's own verdict on the
+ * run, written by `classifyRunLiveness`, and it is never empty. An
+ * `empty_response` run carries "Run succeeded without useful output or
+ * concrete action evidence", which reads as progress to anything that only
+ * checks whether a summary exists.
+ *
+ * So it is a separate argument rather than another entry in the list. Pass it
+ * when building text for a human; leave it out when asking whether the run
+ * produced anything. See `hasProgressEvidence` on the handoff decision.
+ */
+export function selectSuccessfulRunProgressSummary(input: {
+  unmanagedBackgroundTask: boolean;
+  nextAction: string | null;
+  resultJson: Record<string, unknown> | null;
+  classifierReason?: string | null;
+}): string | null {
+  const resultJson = input.resultJson && typeof input.resultJson === "object" && !Array.isArray(input.resultJson)
+    ? input.resultJson
+    : {};
+  const nextAction = readString(input.nextAction);
+  return [
+    input.unmanagedBackgroundTask ? UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON : null,
+    nextAction ? `Next action noted: ${nextAction}` : null,
+    readString(input.classifierReason),
+    readString(resultJson.summary),
+    readString(resultJson.result),
+    readString(resultJson.message),
+  ].find((candidate): candidate is string => Boolean(candidate)) ?? null;
+}
+
 function isProductiveSuccessfulRun(input: {
   livenessState: RunLivenessState | null;
-  detectedProgressSummary: string | null;
+  hasProgressEvidence: boolean;
   paperclipToolCallCount: number | null;
 }) {
   // A run that never touched a Paperclip tool cannot have recorded a
@@ -347,7 +383,13 @@ function isProductiveSuccessfulRun(input: {
   // (Mode A, 2026-07-27)
   if (input.paperclipToolCallCount === 0) return true;
   if (input.livenessState && PRODUCTIVE_SUCCESS_LIVENESS_STATES.has(input.livenessState)) return true;
-  return Boolean(input.detectedProgressSummary);
+  // Deliberately not `detectedProgressSummary`: that string carries the
+  // classifier's own reason as a fallback, so it is non-empty for every
+  // classified run and would make this whole function — and the two checks
+  // above it — decide nothing. `plan_only` and `empty_response` are the states
+  // this test is here to exclude, and bounded liveness continuation already
+  // owns them (`ACTIONABLE_LIVENESS_STATES`).
+  return input.hasProgressEvidence;
 }
 
 export function buildSuccessfulRunHandoffInstruction(input: {
@@ -384,6 +426,7 @@ export function decideSuccessfulRunHandoff(input: {
   agent: AgentRow | null;
   livenessState: RunLivenessState | null;
   detectedProgressSummary: string | null;
+  hasProgressEvidence: boolean;
   paperclipToolCallCount: number | null;
   taskKey: string | null;
   hasActiveExecutionPath: boolean;
