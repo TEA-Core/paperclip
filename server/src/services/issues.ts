@@ -6880,8 +6880,9 @@ export function issueService(db: Db) {
       }
 
       if (
-        issueData.status === "done" &&
+        (issueData.status === "done" || issueData.status === "cancelled") &&
         existing.status !== "done" &&
+        existing.status !== "cancelled" &&
         existing.originKind === "routine_execution" &&
         existing.assigneeAgentId
       ) {
@@ -6897,7 +6898,7 @@ export function issueService(db: Db) {
           .then((rows) => Number(rows[0]?.count ?? 0));
         if (pendingGateCount > 0) {
           throw unprocessable(
-            "Routine issue cannot be marked done while pending request_confirmation interactions exist",
+            "Routine issue cannot be closed while pending request_confirmation interactions exist",
             {
               code: "routine_close_pending_confirmation_gates",
               issueId: existing.id,
