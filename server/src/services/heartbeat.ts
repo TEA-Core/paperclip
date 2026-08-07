@@ -204,6 +204,7 @@ import {
   RECOVERY_ORIGIN_KINDS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
+  selectSuccessfulRunProgressSummary,
   RUN_LIVENESS_CONTINUATION_REASON,
   buildRunLivenessContinuationIdempotencyKey,
   buildFinishSuccessfulRunHandoffIdempotencyKey,
@@ -8191,17 +8192,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function buildDetectedSuccessfulRunProgressSummary(run: typeof heartbeatRuns.$inferSelect) {
+  function readSuccessfulRunProgressInputs(run: typeof heartbeatRuns.$inferSelect) {
     const resultJson = parseObject(run.resultJson);
-    const candidates = [
-      hasUnmanagedBackgroundTaskEvidence(resultJson) ? UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON : null,
-      readNonEmptyString(run.nextAction) ? `Next action noted: ${readNonEmptyString(run.nextAction)}` : null,
-      readNonEmptyString(run.livenessReason),
-      readNonEmptyString(resultJson.summary),
-      readNonEmptyString(resultJson.result),
-      readNonEmptyString(resultJson.message),
-    ].filter((value): value is string => Boolean(value));
-    const summary = candidates[0];
+    return {
+      unmanagedBackgroundTask: hasUnmanagedBackgroundTaskEvidence(resultJson),
+      nextAction: run.nextAction ?? null,
+      resultJson,
+    };
+  }
+
+  /**
+   * Whether the run itself reported anything, ignoring Paperclip's own verdict
+   * on it. `livenessReason` is set for every classified run — including
+   * "Run succeeded without useful output or concrete action evidence" — so it
+   * is excluded here even though the board notice below still shows it.
+   */
+  function hasSuccessfulRunProgressEvidence(run: typeof heartbeatRuns.$inferSelect) {
+    return Boolean(selectSuccessfulRunProgressSummary(readSuccessfulRunProgressInputs(run)));
+  }
+
+  async function buildDetectedSuccessfulRunProgressSummary(run: typeof heartbeatRuns.$inferSelect) {
+    const summary = selectSuccessfulRunProgressSummary({
+      ...readSuccessfulRunProgressInputs(run),
+      classifierReason: run.livenessReason,
+    });
     if (!summary) return null;
     return redactDetectedSuccessfulRunProgressSummaryForBoard(
       summary,
@@ -8431,6 +8445,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       livenessState: run.livenessState as RunLivenessState | null,
       detectedProgressSummary,
+      hasProgressEvidence: hasSuccessfulRunProgressEvidence(run),
       paperclipToolCallCount: readPaperclipToolCallCount(run.resultJson),
       taskKey,
       hasActiveExecutionPath: Boolean(activeExecutionPath),

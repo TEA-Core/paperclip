@@ -59,6 +59,7 @@ export {
   isSuccessfulRunHandoffValidPathSkip,
   isSuccessfulRunHandoffRequiredNoticeBody,
   readPaperclipToolCallCount,
+  selectSuccessfulRunProgressSummary,
 } from "./successful-run-handoff.js";
 export type {
   SuccessfulRunHandoffNotice,
