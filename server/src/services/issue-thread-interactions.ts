@@ -51,6 +51,11 @@ import {
 } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
+import {
+  REQUEST_CONFIRMATION_INTERACTION_KINDS,
+  TARGET_BOUND_INTERACTION_KINDS,
+  USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS,
+} from "./issue-interaction-kinds.js";
 import { issueService, runWorkspaceIsFinalized } from "./issues.js";
 
 type InteractionActor = {
@@ -85,28 +90,16 @@ type IssueResolutionContext = {
   assigneeUserId: string | null;
 };
 
-const REQUEST_CONFIRMATION_INTERACTION_KINDS = [
-  "request_confirmation",
-  "request_checkbox_confirmation",
-] as const;
 type RequestConfirmationLikeKind = (typeof REQUEST_CONFIRMATION_INTERACTION_KINDS)[number];
 type RequestConfirmationLikeInteraction =
   | RequestConfirmationInteraction
   | RequestCheckboxConfirmationInteraction;
 
-const TARGET_BOUND_INTERACTION_KINDS = [
-  ...REQUEST_CONFIRMATION_INTERACTION_KINDS,
-  "request_item_verdicts",
-] as const;
 type TargetBoundInteractionKind = (typeof TARGET_BOUND_INTERACTION_KINDS)[number];
 type TargetBoundInteraction =
   | RequestConfirmationLikeInteraction
   | RequestItemVerdictsInteraction;
 
-const USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS = [
-  ...TARGET_BOUND_INTERACTION_KINDS,
-  "ask_user_questions",
-] as const;
 type UserCommentSupersedableKind = (typeof USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS)[number];
 type UserCommentSupersedableInteraction =
   | TargetBoundInteraction
