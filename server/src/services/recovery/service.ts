@@ -1,3 +1,5 @@
+import { constants as fsConstants } from "node:fs";
+import { access } from "node:fs/promises";
 import { and, asc, desc, eq, gte, gt, inArray, isNotNull, isNull, lt, ne, notInArray, or, sql, count } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -16,6 +18,7 @@ import {
   approvals,
   activityLog,
   companies,
+  executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
@@ -5884,6 +5887,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       dependencyWakeReArmCapEscalated: 0,
       dependencyWakeReArmCapEscalatedIssueIds: [] as string[],
       dependencyWakeIssueIds: [] as string[],
+      blockedWithoutBlockersChecked: 0,
+      blockedWithoutBlockersHealed: 0,
+      blockedWithoutBlockersEscalated: 0,
+      blockedWithoutBlockersLivePathSkipped: 0,
+      blockedWithoutBlockersInteractionSkipped: 0,
+      blockedWithoutBlockersPauseHoldSkipped: 0,
+      blockedWithoutBlockersGraceThresholdSkipped: 0,
+      blockedWithoutBlockersAlreadyActionedSkipped: 0,
+      blockedWithoutBlockersCandidateLimitSkipped: 0,
+      blockedWithoutBlockersDeadWorkspaceBindingSkipped: 0,
+      blockedWithoutBlockersRearmCapExhaustedSkipped: 0,
+      blockedWithoutBlockersDeadBindingsCleared: 0,
+      blockedWithoutBlockersIssueIds: [] as string[],
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
       retiredRecoveryIssueIds: obsoleteRecoveryCleanup.retiredIssueIds,
@@ -5908,6 +5924,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.dependencyWakeReArmCapEscalated = dependencyWakeBackstop.reArmCapEscalated;
     result.dependencyWakeReArmCapEscalatedIssueIds = dependencyWakeBackstop.reArmCapEscalatedIssueIds;
     result.dependencyWakeIssueIds = dependencyWakeBackstop.issueIds;
+
+    const blockedWithoutBlockers = await reconcileBlockedWithoutBlockers({
+      runId: opts?.runId ?? null,
+    });
+    result.blockedWithoutBlockersChecked = blockedWithoutBlockers.checked;
+    result.blockedWithoutBlockersHealed = blockedWithoutBlockers.healed;
+    result.blockedWithoutBlockersEscalated = blockedWithoutBlockers.escalated;
+    result.blockedWithoutBlockersLivePathSkipped = blockedWithoutBlockers.livePathSkipped;
+    result.blockedWithoutBlockersInteractionSkipped = blockedWithoutBlockers.interactionSkipped;
+    result.blockedWithoutBlockersPauseHoldSkipped = blockedWithoutBlockers.pauseHoldSkipped;
+    result.blockedWithoutBlockersGraceThresholdSkipped = blockedWithoutBlockers.graceThresholdSkipped;
+    result.blockedWithoutBlockersAlreadyActionedSkipped = blockedWithoutBlockers.alreadyActionedSkipped;
+    result.blockedWithoutBlockersCandidateLimitSkipped = blockedWithoutBlockers.candidateLimitSkipped;
+    result.blockedWithoutBlockersDeadWorkspaceBindingSkipped = blockedWithoutBlockers.deadWorkspaceBindingSkipped;
+    result.blockedWithoutBlockersRearmCapExhaustedSkipped = blockedWithoutBlockers.rearmCapExhaustedSkipped;
+    result.blockedWithoutBlockersDeadBindingsCleared = blockedWithoutBlockers.deadBindingsCleared;
+    result.blockedWithoutBlockersIssueIds = blockedWithoutBlockers.issueIds;
 
     if (!autoRecoveryEnabled) {
       result.skippedAutoRecoveryDisabled = findings.length;
@@ -6075,6 +6108,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       graceThresholdSkipped: 0,
       alreadyActionedSkipped: 0,
       candidateLimitSkipped: 0,
+      deadWorkspaceBindingSkipped: 0,
+      rearmCapExhaustedSkipped: 0,
+      deadBindingsCleared: 0,
       issueIds: [] as string[],
     };
 
@@ -6095,6 +6131,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         identifier: issues.identifier,
         assigneeAgentId: issues.assigneeAgentId,
         updatedAt: issues.updatedAt,
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
         totalCount: sql<number>`count(*) over()::int`,
       })
       .from(issues)
@@ -6150,11 +6188,83 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         const existingAction = await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
 
+        // Guard 2 — rearm-cap-exhausted: a candidate holding an active
+        // `blocked_without_blockers` recovery action whose cause is
+        // `dependency_wake_rearm_cap_exhausted` must not be healed. That action
+        // represents a legitimately-empty blocker set that has already been
+        // escalated; healing it would contend for the same shared workspace,
+        // fail, and burn another attempt against reArmMax. The escalation/
+        // report-only path is unchanged — only the heal-and-dispatch branch
+        // skips these.
+        if (
+          general.enableBlockedWithoutBlockersAutoHeal &&
+          candidate.assigneeAgentId &&
+          existingAction?.kind === "blocked_without_blockers" &&
+          existingAction?.cause === "dependency_wake_rearm_cap_exhausted"
+        ) {
+          result.rearmCapExhaustedSkipped++;
+          continue;
+        }
+
         // Auto-heal path — setting-gated, default OFF.
         // Evaluated BEFORE the already-actioned guard so an existing action is
         // not terminal. Bounded: if the action has already hit the sweep ceiling,
         // do NOT heal — fall through to the already-actioned guard.
         if (general.enableBlockedWithoutBlockersAutoHeal && candidate.assigneeAgentId) {
+          // Guard 1 — dead workspace binding: before healing a candidate that
+          // has `executionWorkspacePreference = "reuse_existing"` with a non-null
+          // `executionWorkspaceId`, probe the workspace's `cwd` on disk. If the
+          // path is gone (ENOENT), clear the binding before healing so the
+          // dispatch does not reuse a dead worktree. If the probe cannot be
+          // completed (any error other than ENOENT, or no recorded cwd), skip
+          // the candidate — the "never self-heal on a stat we could not complete"
+          // rule is the overriding invariant.
+          if (
+            candidate.executionWorkspacePreference === "reuse_existing" &&
+            candidate.executionWorkspaceId
+          ) {
+            const workspaceRow = await db
+              .select({ cwd: executionWorkspaces.cwd })
+              .from(executionWorkspaces)
+              .where(eq(executionWorkspaces.id, candidate.executionWorkspaceId))
+              .then((rows) => rows[0] ?? null);
+
+            if (workspaceRow?.cwd) {
+              try {
+                await access(workspaceRow.cwd, fsConstants.F_OK);
+              } catch (err: unknown) {
+                const isEnoent =
+                  err instanceof Error &&
+                  (err as NodeJS.ErrnoException).code === "ENOENT";
+                if (isEnoent) {
+                  await db
+                    .update(issues)
+                    .set({
+                      executionWorkspaceId: null,
+                      executionWorkspacePreference: null,
+                      updatedAt: new Date(),
+                    })
+                    .where(eq(issues.id, candidate.id));
+                  result.deadBindingsCleared++;
+                  logger.info(
+                    {
+                      issueId: candidate.id,
+                      identifier: candidate.identifier,
+                      clearedExecutionWorkspaceId: candidate.executionWorkspaceId,
+                      cwd: workspaceRow.cwd,
+                    },
+                    "cleared dead workspace binding before blocked_without_blockers heal",
+                  );
+                } else {
+                  result.deadWorkspaceBindingSkipped++;
+                  continue;
+                }
+              }
+            } else {
+              result.deadWorkspaceBindingSkipped++;
+              continue;
+            }
+          }
           const resolvedAction = existingAction
             ? null
             : await recoveryActionsSvc.getLatestResolvedForIssue(companyId, candidate.id, "blocked_without_blockers");

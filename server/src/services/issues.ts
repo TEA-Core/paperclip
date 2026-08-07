@@ -6895,7 +6895,7 @@ export function issueService(db: Db) {
             eq(issueThreadInteractions.kind, "request_confirmation"),
             eq(issueThreadInteractions.status, "pending"),
           ))
-          .then((rows) => Number(rows[0]?.count ?? 0));
+          .then((rows: { count: number }[]) => Number(rows[0]?.count ?? 0));
         if (pendingGateCount > 0) {
           throw unprocessable(
             "Routine issue cannot be closed while pending request_confirmation interactions exist",

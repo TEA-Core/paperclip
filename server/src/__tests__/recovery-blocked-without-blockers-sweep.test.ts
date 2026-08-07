@@ -8,6 +8,7 @@ import {
   agentWakeupRequests,
   companies,
   createDb,
+  executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
@@ -17,6 +18,8 @@ import {
   issueThreadInteractions,
   issueTreeHolds,
   issues,
+  projectWorkspaces,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -91,6 +94,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
         "documents",
         "environment_leases",
         "environments",
+        "execution_workspaces",
         "heartbeat_run_events",
         "heartbeat_run_watchdog_decisions",
         "heartbeat_runs",
@@ -109,7 +113,9 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
         "company_skills",
         "agents",
         "instance_settings",
-        "companies"
+        "companies",
+        "project_workspaces",
+        "projects"
       RESTART IDENTITY CASCADE
     `));
   });
@@ -963,35 +969,266 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(escalatedAction?.evidence).toMatchObject({ healAttemptCount: 5 });
   });
 
-  it("flag OFF — escalated action carries wakePolicy board_escalation", async () => {
+  async function seedCompanyAgentAndProject() {
     const { companyId, agentId } = await seedCompanyAndAgent();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Test Project",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "primary",
+      isPrimary: true,
+    });
+    return { companyId, agentId, projectId, projectWorkspaceId };
+  }
+
+  async function seedIssueWithDeadWorkspaceBinding(opts: {
+    cwd: string;
+    companyId: string;
+    agentId: string;
+    projectId: string;
+    projectWorkspaceId: string;
+  }) {
     const issueId = randomUUID();
+    const workspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId: opts.companyId,
+      projectId: opts.projectId,
+      projectWorkspaceId: opts.projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: `workspace-${workspaceId}`,
+      status: "active",
+      cwd: opts.cwd,
+    });
     await db.insert(issues).values({
       id: issueId,
-      companyId,
-      title: "Blocked with no blockers — wakePolicy check",
+      companyId: opts.companyId,
+      title: "Blocked with dead reuse binding",
       status: "blocked",
       priority: "high",
-      assigneeAgentId: agentId,
+      assigneeAgentId: opts.agentId,
       updatedAt: oldDate(),
+      executionWorkspaceId: workspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+    return { issueId, workspaceId };
+  }
+
+  it("flag ON + dead workspace binding (ENOENT) clears binding and heals", async () => {
+    const { companyId, agentId, projectId, projectWorkspaceId } = await seedCompanyAgentAndProject();
+    await enableBlockedWithoutBlockersAutoHeal();
+    const missingCwd = "/tmp/not-a-real-worktree-path-blocked-without-blockers-test";
+    const { issueId, workspaceId } = await seedIssueWithDeadWorkspaceBinding({
+      cwd: missingCwd,
+      companyId,
+      agentId,
+      projectId,
+      projectWorkspaceId,
     });
 
     const heartbeat = heartbeatService(db);
     const result = await heartbeat.reconcileBlockedWithoutBlockers();
 
-    expect(result.escalated).toBe(1);
-    expect(result.issueIds).toEqual([issueId]);
+    expect(result.checked).toBe(1);
+    expect(result.deadBindingsCleared).toBe(1);
+    expect(result.deadWorkspaceBindingSkipped).toBe(0);
+    expect(result.healed).toBe(1);
 
-    const action = await db
-      .select({ wakePolicy: issueRecoveryActions.wakePolicy })
-      .from(issueRecoveryActions)
-      .where(
-        and(
-          eq(issueRecoveryActions.companyId, companyId),
-          eq(issueRecoveryActions.sourceIssueId, issueId),
-        ),
-      )
+    const issue = await db
+      .select({
+        status: issues.status,
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
-    expect(action?.wakePolicy).toMatchObject({ type: "board_escalation" });
+    expect(issue?.status).toBe("todo");
+    expect(issue?.executionWorkspaceId).toBeNull();
+    expect(issue?.executionWorkspacePreference).toBeNull();
+
+    const audit = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows[0]);
+    expect(audit?.action).toBe("issue.blocked_without_blockers_healed");
+
+    await drainAgentRuns(agentId);
+  });
+
+  it("flag ON + missing cwd on workspace row skips and counts deadWorkspaceBindingSkipped", async () => {
+    const { companyId, agentId, projectId, projectWorkspaceId } = await seedCompanyAgentAndProject();
+    await enableBlockedWithoutBlockersAutoHeal();
+    const { issueId } = await seedIssueWithDeadWorkspaceBinding({
+      cwd: "/nonexistent",
+      companyId,
+      agentId,
+      projectId,
+      projectWorkspaceId,
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ cwd: null })
+      .where(eq(executionWorkspaces.companyId, companyId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.deadWorkspaceBindingSkipped).toBe(1);
+    expect(result.deadBindingsCleared).toBe(0);
+    expect(result.healed).toBe(0);
+
+    const issue = await db
+      .select({ status: issues.status, executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.status).toBe("blocked");
+    expect(issue?.executionWorkspaceId).not.toBeNull();
+  });
+
+  it("flag ON + active dependency_wake_rearm_cap_exhausted action skips and counts", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked with rearm cap exhausted action",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId: issueId,
+      kind: "blocked_without_blockers",
+      status: "active",
+      ownerType: "board",
+      previousOwnerAgentId: agentId,
+      cause: "dependency_wake_rearm_cap_exhausted",
+      fingerprint: `drearm:${companyId}:${issueId}`,
+      attemptCount: 1,
+      nextAction: "Review dependency wake rearm cap exhausted issue.",
+      evidence: { identifier: null, reArmCount: 5, reArmMax: 5 },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.rearmCapExhaustedSkipped).toBe(1);
+    expect(result.healed).toBe(0);
+    expect(result.escalated).toBe(0);
+
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.status).toBe("blocked");
+
+    const activeAction = await db
+      .select({ status: issueRecoveryActions.status })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0]);
+    expect(activeAction?.status).toBe("active");
+  });
+
+  it("flag ON + live workspace binding (directory exists) heals normally", async () => {
+    const { companyId, agentId, projectId, projectWorkspaceId } = await seedCompanyAgentAndProject();
+    await enableBlockedWithoutBlockersAutoHeal();
+    const { issueId, workspaceId } = await seedIssueWithDeadWorkspaceBinding({
+      cwd: process.cwd(),
+      companyId,
+      agentId,
+      projectId,
+      projectWorkspaceId,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.deadWorkspaceBindingSkipped).toBe(0);
+    expect(result.deadBindingsCleared).toBe(0);
+    expect(result.healed).toBe(1);
+
+    const issue = await db
+      .select({ status: issues.status, executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.status).toBe("todo");
+    expect(issue?.executionWorkspaceId).toBe(workspaceId);
+
+    await drainAgentRuns(agentId);
+  });
+
+  it("flag OFF - dead workspace binding does not clear or heal; candidate escalates", async () => {
+    const { companyId, agentId, projectId, projectWorkspaceId } = await seedCompanyAgentAndProject();
+    // auto-heal is OFF by default
+    const missingCwd = "/tmp/not-a-real-worktree-path-blocked-without-blockers-test";
+    const { issueId, workspaceId } = await seedIssueWithDeadWorkspaceBinding({
+      cwd: missingCwd,
+      companyId,
+      agentId,
+      projectId,
+      projectWorkspaceId,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.deadBindingsCleared).toBe(0);
+    expect(result.healed).toBe(0);
+    expect(result.escalated).toBe(1);
+
+    const issue = await db
+      .select({ status: issues.status, executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.status).toBe("blocked");
+    expect(issue?.executionWorkspaceId).toBe(workspaceId);
+  });
+
+  it("idempotence: second pass does not re-clear dead bindings or double-count", async () => {
+    const { companyId, agentId, projectId, projectWorkspaceId } = await seedCompanyAgentAndProject();
+    await enableBlockedWithoutBlockersAutoHeal();
+    const missingCwd = "/tmp/not-a-real-worktree-path-blocked-without-blockers-test-2";
+    await seedIssueWithDeadWorkspaceBinding({
+      cwd: missingCwd,
+      companyId,
+      agentId,
+      projectId,
+      projectWorkspaceId,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const first = await heartbeat.reconcileBlockedWithoutBlockers();
+    expect(first.deadBindingsCleared).toBe(1);
+    expect(first.healed).toBe(1);
+
+    await drainAgentRuns(agentId);
+
+    // The first heal transitions the issue to todo; the second pass finds zero
+    // blocked candidates and takes no further action.
+    const second = await heartbeat.reconcileBlockedWithoutBlockers();
+    expect(second.checked).toBe(0);
+    expect(second.deadBindingsCleared).toBe(0);
+    expect(second.deadWorkspaceBindingSkipped).toBe(0);
+    expect(second.healed).toBe(0);
   });
 });
