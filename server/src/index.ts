@@ -944,6 +944,14 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        const cancelledOnlyBlockerDependents = await heartbeat.reconcileCancelledOnlyBlockerDependents();
+        if (cancelledOnlyBlockerDependents.reported > 0) {
+          logger.warn(
+            { ...cancelledOnlyBlockerDependents },
+            "startup cancelled-only-blocker-dependent sweep reported issues",
+          );
+        }
+
         const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
         if (taskWatchdogsReconciled.triggered > 0) {
           logger.warn(
@@ -1107,6 +1115,15 @@ export async function startServer(): Promise<StartedServer> {
                 logger.warn(
                   { ...stillbornAssignedBacklog },
                   "periodic stillborn-assigned-backlog sweep reported issues",
+                );
+              }
+            })
+            .then(async () => {
+              const cancelledOnlyBlockerDependents = await heartbeat.reconcileCancelledOnlyBlockerDependents();
+              if (cancelledOnlyBlockerDependents.reported > 0) {
+                logger.warn(
+                  { ...cancelledOnlyBlockerDependents },
+                  "periodic cancelled-only-blocker-dependent sweep reported issues",
                 );
               }
             })
