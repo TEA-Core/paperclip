@@ -1779,6 +1779,9 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       );
 
     expect(wakes).toHaveLength(maxCount);
+    expect(wakes.every((wake) => wake.status === "completed")).toBe(true);
+  });
+
   it("logs activity for every cap-exhausted candidate in the same tick, not just the first", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
