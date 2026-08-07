@@ -1152,6 +1152,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   actualBranchName: string | null;
   sourceIssue: ExecutionWorkspaceIssueRef | null;
   executionWorkspaceId?: string | null;
+  contentionExcludeExecutionWorkspaceId?: string | null;
 }): Promise<GitWorktreeBranchIncoherenceEvidence> {
   const resolvedTopLevel = await runGit(["rev-parse", "--show-toplevel"], input.worktreePath)
     .then((output) => resolvePathForWorktreeComparison(output))
@@ -1215,7 +1216,8 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const contention = await findGitWorktreeBranchContention({
     db: input.db ?? null,
     sourceIssue: input.sourceIssue,
-    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    executionWorkspaceId:
+      input.contentionExcludeExecutionWorkspaceId ?? input.executionWorkspaceId ?? null,
     worktreePath: input.worktreePath,
     actualBranchName: input.actualBranchName,
   });
@@ -1989,6 +1991,12 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   expectedBranchName: string | null;
   sourceIssue: ExecutionWorkspaceIssueRef | null;
   executionWorkspaceId?: string | null;
+  /**
+   * SUP-11520: the workspace row that is *asking* for this repair, for callers that can name it
+   * but do not own it. Defaults to `executionWorkspaceId`. It is used for one thing only —
+   * excluding the asker from the branch-contention search — and never grants record writes.
+   */
+  contentionExcludeExecutionWorkspaceId?: string | null;
   actualBranchName?: string | null;
   heartbeatRunId?: string | null;
   enableWorkspaceBranchReconcileForward?: boolean;
@@ -2015,6 +2023,8 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     actualBranchName: currentBranch,
     sourceIssue: input.sourceIssue,
     executionWorkspaceId: input.executionWorkspaceId ?? null,
+    contentionExcludeExecutionWorkspaceId:
+      input.contentionExcludeExecutionWorkspaceId ?? input.executionWorkspaceId ?? null,
   });
 
   if (evidence.reason === WORKTREE_METADATA_MISSING_REASON) {
@@ -3418,6 +3428,20 @@ export async function realizeExecutionWorkspace(input: {
   config: Record<string, unknown>;
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
+  /**
+   * SUP-11520: the execution workspace row this issue is already bound to, when one exists.
+   *
+   * Realization is a fresh *realization*, not necessarily a fresh *row*: an issue whose workspace
+   * config went stale is re-realized while its existing row still points at the same worktree
+   * path. The branch-contention check has to know which row belongs to the asker, or it matches
+   * that row on path and reports the asking run as its own competing claimant — a refusal whose
+   * precondition is created by the act of asking, so it can never clear.
+   *
+   * Identification only. Realization does not own this row (the dispatch persists workspace
+   * records after realization returns), so this must not be passed as `executionWorkspaceId`,
+   * which is what grants mid-repair write access to the record.
+   */
+  existingExecutionWorkspaceId?: string | null;
   heartbeatRunId?: string | null;
   enableWorkspaceBranchReconcileForward?: boolean;
   enableWorkspaceDirtyQuarantineRepair?: boolean;
@@ -3606,6 +3630,7 @@ export async function realizeExecutionWorkspace(input: {
         actualBranchName: validation.actualBranchName ?? null,
         sourceIssue: input.issue,
         executionWorkspaceId: null,
+        contentionExcludeExecutionWorkspaceId: input.existingExecutionWorkspaceId ?? null,
         heartbeatRunId: input.heartbeatRunId ?? null,
         enableWorkspaceBranchReconcileForward: input.enableWorkspaceBranchReconcileForward === true,
         enableWorkspaceDirtyQuarantineRepair: input.enableWorkspaceDirtyQuarantineRepair === true,

@@ -13285,6 +13285,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             name: agent.name,
             companyId: agent.companyId,
           },
+          // SUP-11520: realization can reuse a worktree the issue's existing workspace row
+          // already points at. That row is the asker, not a competing claimant — pass it so
+          // the branch-contention check can exclude it instead of self-locking on it.
+          existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
           heartbeatRunId: run.id,
           enableWorkspaceBranchReconcileForward:
             resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,

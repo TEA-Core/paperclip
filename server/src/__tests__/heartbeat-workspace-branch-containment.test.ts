@@ -1054,6 +1054,40 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
     });
   });
 
+  // SUP-11520: the asking workspace is not a competing claimant. Realization reuses a worktree
+  // the issue's own execution-workspace row already points at, so a contention check that does
+  // not know the asker's id matches that row on path and reports the asking run as the claimant.
+  // The refusal then regenerates on every wake — 46 consecutive workspace_validation_failed runs
+  // in the live incident, with no state the agent could reach to repair itself.
+  it("does not report the asking workspace's own run as a competing branch claimant", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    // No claimLiveBranchFromOtherWorkspace: the only open workspace on this worktree path is the
+    // asking one, and the only queued/running run linked to it is this run.
+    const seeded = await seedBranchContainmentRun(db, repoRoot, "fresh_realize");
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    const finishedRun = await waitForRunToFinish(heartbeat, seeded.runId, 20_000);
+
+    const workspaceValidation = asRecord(asRecord(finishedRun?.resultJson).workspaceValidation);
+    const safeRepair = asRecord(workspaceValidation.safeRepair);
+    expect(String(safeRepair.reason ?? "")).not.toContain("already claims the live branch");
+    expect(workspaceValidation.contention ?? null).toBeNull();
+    expect(finishedRun?.errorCode ?? null).not.toBe("workspace_validation_failed");
+
+    // The repair the self-lock refused: restore the recorded branch over a live named branch,
+    // which strands nothing because the agent's own branch keeps its commits reachable.
+    expect(await readGit(seeded.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]))
+      .toBe(seeded.expectedBranch);
+    expect(await readGit(repoRoot, ["rev-parse", "--verify", seeded.actualBranch]))
+      .toEqual(expect.stringMatching(/^[a-f0-9]{40}$/));
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+
+    const actionRows = await readContainmentActionRows(db, seeded.companyId, [seeded.sourceIssueId]);
+    expect(actionRows).toHaveLength(0);
+  }, 30_000);
+
   it.each([
     ["workspace-runtime fresh worktree reuse", "fresh_realize" as const, null],
     ["workspace-runtime persisted restore", "persisted_restore" as const, "source-workspace"],
