@@ -283,6 +283,7 @@ import {
   type HotRestartIntentRun,
   type HotRestartReportRun,
 } from "./hot-restart.js";
+import { normalizeMaxConcurrentRuns, parseHeartbeatPolicy } from "./heartbeat-policy.js";
 import { dispatchQuiesce } from "./dispatch-quiesce.js";
 import {
   assertLowTrustRuntimeServicesAllowed,
@@ -315,9 +316,6 @@ export function redactDetectedSuccessfulRunProgressSummaryForBoard(
 
 const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
 const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -2148,12 +2146,6 @@ export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_C
   const omittedChars = Math.max(0, normalized.length - headChars - tailChars);
   const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
   return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
-}
-
-function normalizeMaxConcurrentRuns(value: unknown) {
-  const parsed = Math.floor(asNumber(value, HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT));
-  if (!Number.isFinite(parsed)) return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
-  return Math.max(HEARTBEAT_MAX_CONCURRENT_RUNS_MIN, Math.min(HEARTBEAT_MAX_CONCURRENT_RUNS_MAX, parsed));
 }
 
 interface WakeupOptions {
@@ -10752,39 +10744,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message: "Scheduled retry was already promoted",
       scheduledRetry,
     };
-  }
-
-  function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
-    const runtimeConfig = parseObject(agent.runtimeConfig);
-    const heartbeat = parseObject(runtimeConfig.heartbeat);
-
-    return {
-      enabled: asBoolean(heartbeat.enabled, false),
-      intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
-      wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
-      maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
-      skipTimerWhenNoActionableWork: asBoolean(
-        heartbeat.skipTimerWhenNoActionableWork ??
-          heartbeat.requireActionableTimerWork ??
-          heartbeat.issueOnlyTimer,
-        false,
-      ),
-      maxDailyRuns: normalizeOptionalNonNegativeInteger(
-        heartbeat.maxDailyRuns ?? heartbeat.dailyRunLimit ?? heartbeat.dailyRunCap ?? heartbeat.maxRunsPerDay,
-      ),
-      maxDailyCostCents: normalizeOptionalNonNegativeInteger(
-        heartbeat.maxDailyCostCents ??
-          heartbeat.dailyCostCentsLimit ??
-          heartbeat.dailySpendCentsLimit ??
-          heartbeat.dailyBudgetCents,
-      ),
-    };
-  }
-
-  function normalizeOptionalNonNegativeInteger(value: unknown) {
-    if (value === null || value === undefined || value === "") return null;
-    const normalized = Math.floor(asNumber(value, 0));
-    return normalized >= 0 ? normalized : null;
   }
 
   function currentUtcDayWindow(now = new Date()) {
