@@ -802,11 +802,11 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     const action = await recoveryActionSvc.upsertSourceScoped({
       companyId,
       sourceIssueId,
-      kind: "stranded_assigned_issue",
-      ownerType: "board",
-      ownerAgentId: null,
-      cause: "stranded_assigned_issue",
-      fingerprint: "no-live-path:retire-on-read",
+       kind: "no_live_path_owner_unavailable",
+       ownerType: "board",
+       ownerAgentId: null,
+       cause: "no_live_path_owner_unavailable",
+       fingerprint: "no-live-path:retire-on-read",
       evidence: { status: "in_progress", agentId: coderId, identifier: `${companyId.slice(0, 8)}-1` },
       nextAction: "Restore a live execution path.",
       wakePolicy: { type: "board_escalation", reason: "no_invokable_recovery_owner" },
@@ -923,6 +923,34 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     expect(action).toMatchObject({
       kind: "stranded_assigned_issue",
       cause: "stranded_assigned_issue",
+      status: "active",
+    });
+    expect(action?.evidence).toMatchObject({
+      agentInvokable: false,
+      agentInvokabilityReason: "paused",
+    });
+    expect(action?.evidence?.agentInvokabilityMessage).toBeTruthy();
+  });
+
+  it("carries the invokability block reason in a sweep-created no_live_path_owner_unavailable action evidence", async () => {
+    const { companyId, managerId, prefix } = await seedCompany();
+    const pausedAgentId = await seedPausedAgent(companyId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", pausedAgentId, {
+      updatedAt: pastGraceDate(),
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.noLivePathOwnerUnavailable).toBe(1);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action).toMatchObject({
+      kind: "no_live_path_owner_unavailable",
+      cause: "no_live_path_owner_unavailable",
       status: "active",
     });
     expect(action?.evidence).toMatchObject({

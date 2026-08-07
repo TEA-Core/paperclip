@@ -3045,7 +3045,8 @@ export function issueRoutes(
     }
 
     const isReadProjectionForStrandedAction = input.trigger === "read_projection" &&
-      input.activeRecoveryAction?.kind === "stranded_assigned_issue";
+      (input.activeRecoveryAction?.kind === "stranded_assigned_issue" ||
+        input.activeRecoveryAction?.kind === "no_live_path_owner_unavailable");
     if (input.trigger !== "read_projection" || !isReadProjectionForStrandedAction) {
       const durableSourceChange =
         input.statusChanged === true ||
