@@ -310,15 +310,107 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
-  it("respects explicit opt-out", async () => {
-    const configHome = await makeConfigHome();
+  it("respects explicit opt-out of the headless permission grant", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" }, theme: "system" });
     const prepared = await prepareOpenCodeRuntimeConfig({
       env: { XDG_CONFIG_HOME: configHome },
       config: { dangerouslySkipPermissions: false },
     });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
 
-    expect(prepared.env).toEqual({ XDG_CONFIG_HOME: configHome });
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as Record<string, unknown>;
+    // The operator's own permission block is passed through untouched.
+    expect(runtimeConfig.permission).toEqual({ read: "allow" });
+    expect(runtimeConfig.theme).toBe("system");
+    expect(prepared.notes.some((n) => n.includes("external_directory"))).toBe(false);
+    await prepared.cleanup();
+  });
+
+  // SUP-11164: the snapshot disable sat behind the permission opt-out's early
+  // return, so an agent configured with dangerouslySkipPermissions: false got no
+  // runtime config at all — and therefore kept leaking a full `tmp_pack_*` per
+  // run. The opt-out is about the permission grant; the disk-leak guard is not
+  // part of what it opts out of.
+  it("still disables snapshot tracking when dangerouslySkipPermissions is false", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: { dangerouslySkipPermissions: false },
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(runtimeConfig.snapshot).toBe(false);
+    expect("snapshots" in runtimeConfig).toBe(false);
+    await prepared.cleanup();
+  });
+
+  it("keeps the snapshot overrides authoritative when dangerouslySkipPermissions is false", async () => {
+    const explicit = await makeConfigHome({ snapshot: true });
+    const preparedExplicit = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: explicit },
+      config: { dangerouslySkipPermissions: false },
+    });
+    cleanupPaths.add(preparedExplicit.env.XDG_CONFIG_HOME);
+    const explicitConfig = JSON.parse(
+      await fs.readFile(
+        path.join(preparedExplicit.env.XDG_CONFIG_HOME, "opencode", "opencode.json"),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    expect(explicitConfig.snapshot).toBe(true);
+    await preparedExplicit.cleanup();
+
+    const optedIn = await makeConfigHome();
+    const preparedOptedIn = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: optedIn, PAPERCLIP_OPENCODE_SNAPSHOTS: "1" },
+      config: { dangerouslySkipPermissions: false },
+    });
+    cleanupPaths.add(preparedOptedIn.env.XDG_CONFIG_HOME);
+    const optedInConfig = JSON.parse(
+      await fs.readFile(
+        path.join(preparedOptedIn.env.XDG_CONFIG_HOME, "opencode", "opencode.json"),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    expect(optedInConfig.snapshot).toBeUndefined();
+    expect(optedInConfig.snapshots).toBeUndefined();
+    await preparedOptedIn.cleanup();
+  });
+
+  // Callers used to infer "a runtime config home was materialised" from
+  // `notes.length > 0`. That inference decides whether a remote run repoints
+  // XDG_CONFIG_HOME at the uploaded copy or leaves it on a host-only path, and
+  // it stops holding as soon as a config is written on a path that emits no
+  // notes. Report the directory instead of making callers guess at it.
+  it("reports the runtime config home even when it emits no notes", async () => {
+    const configHome = await makeConfigHome({ snapshot: true });
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: { dangerouslySkipPermissions: false },
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
     expect(prepared.notes).toEqual([]);
+    expect(prepared.runtimeConfigHome).toBe(prepared.env.XDG_CONFIG_HOME);
+    expect(prepared.runtimeConfigHome).not.toBe(configHome);
+    await prepared.cleanup();
+  });
+
+  it("reports the runtime config home on the default path", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    expect(prepared.runtimeConfigHome).toBe(prepared.env.XDG_CONFIG_HOME);
     await prepared.cleanup();
   });
 });
