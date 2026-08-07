@@ -18,6 +18,7 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_INSTANCE_ID` | `default` | Instance identifier (for multiple local instances) |
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
+| `PAPERCLIP_SHUTDOWN_DEADLINE_MS` | `8000` | Total budget for graceful shutdown on SIGINT/SIGTERM. Anything still running at the deadline is abandoned, run process groups are SIGKILLed, and the process exits. Keep this below the container stop timeout (Docker's default is 10s) so detached run children cannot outlive a restart. |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
 
 ## Secrets
