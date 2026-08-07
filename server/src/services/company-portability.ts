@@ -1840,6 +1840,22 @@ function isPathDefault(pathSegments: string[], value: unknown, rules: Array<{ pa
   return rules.some((rule) => jsonEqual(rule.path, pathSegments) && jsonEqual(rule.value, value));
 }
 
+/**
+ * `dropFalseBooleans` treats `false` as equivalent to absent, which only holds
+ * where the consumer's default is also `false`. `heartbeat.wakeOnDemand` and its
+ * aliases default to `true` (`heartbeat.ts` `parseHeartbeatPolicy`), so dropping
+ * their `false` does not preserve behaviour on import — it inverts it, and an
+ * agent the operator declared un-wakeable comes back wakeable.
+ *
+ * The default rules already state each path's default, so they are also the
+ * authority on which `false` values are meaningful: a path whose default is not
+ * `false` must keep an explicit `false`. This stays correct as rules are added.
+ */
+function isMeaningfulFalse(pathSegments: string[], rules: Array<{ path: string[]; value: unknown }> | undefined) {
+  if (!rules) return false;
+  return rules.some((rule) => jsonEqual(rule.path, pathSegments) && rule.value !== false);
+}
+
 function pruneDefaultLikeValue(
   value: unknown,
   opts: {
@@ -1868,7 +1884,9 @@ function pruneDefaultLikeValue(
     return out;
   }
   if (value === undefined) return undefined;
-  if (opts.dropFalseBooleans && value === false) return undefined;
+  if (opts.dropFalseBooleans && value === false && !isMeaningfulFalse(pathSegments, opts.defaultRules)) {
+    return undefined;
+  }
   return value;
 }
 
@@ -4686,6 +4704,18 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             desiredSkills,
             mode,
           );
+          // The export strips absolute commands as system-dependent and warns
+          // whoever ran it — often on another machine, days earlier. The person
+          // who has to supply the replacement is the one importing, so say it
+          // here too rather than creating a process agent that cannot run.
+          if (
+            normalizedAdapter.adapterType === "process" &&
+            !asString((normalizedAdapter.adapterConfig as Record<string, unknown>).command)
+          ) {
+            warnings.push(
+              `Agent ${planAgent.slug} was imported without a process command; set adapterConfig.command before it can run.`,
+            );
+          }
           const patch = {
             name: planAgent.plannedName,
             role: manifestAgent.role,
