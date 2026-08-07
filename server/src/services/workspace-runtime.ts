@@ -1615,6 +1615,9 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
   evidence: GitWorktreeBranchIncoherenceEvidence;
   phase?: "worktree_prepare" | "workspace_finalize";
   recorder?: WorkspaceOperationRecorder | null;
+  // Set only when the recorded branch no longer exists: the sha to recreate it at, which is the
+  // worktree's HEAD from before the rescue commit moved it.
+  recreateRecordedBranchAtSha?: string | null;
 }): Promise<DirtyQuarantineRepairResult> {
   const companyId = await readIssueCompanyId(input.db, input.evidence.sourceIssueId);
   if (!companyId) {
@@ -1696,16 +1699,28 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
       failureLabel: "git commit dirty workspace rescue",
     });
     const rescueCommitSha = await runGit(["rev-parse", "HEAD"], input.worktreePath);
+    const recreateAtSha = input.recreateRecordedBranchAtSha ?? null;
+    // `checkout -B <branch> <sha>` rather than a plain checkout when the recorded branch is gone:
+    // the rescue commit already moved HEAD, so the branch has to be pinned back to the sha the
+    // worktree was on before the rescue, not to wherever HEAD sits now.
+    const restoreArgs = recreateAtSha
+      ? ["checkout", "--ignore-other-worktrees", "-B", input.expectedBranchName, recreateAtSha]
+      : ["checkout", input.expectedBranchName];
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
-      args: ["checkout", input.expectedBranchName],
+      args: restoreArgs,
       cwd: input.worktreePath,
       metadata: {
         ...baseMetadata,
         rescueCommitSha,
+        ...(recreateAtSha ? { recreatedRecordedBranchAtSha: recreateAtSha } : {}),
       },
-      successMessage: `Restored recorded branch ${input.expectedBranchName} after dirty workspace rescue ${rescueBranch}\n`,
-      failureLabel: `git checkout ${input.expectedBranchName}`,
+      successMessage: recreateAtSha
+        ? `Recreated deleted recorded branch ${input.expectedBranchName} at ${formatShortSha(recreateAtSha)} after dirty workspace rescue ${rescueBranch}\n`
+        : `Restored recorded branch ${input.expectedBranchName} after dirty workspace rescue ${rescueBranch}\n`,
+      failureLabel: recreateAtSha
+        ? `git checkout -B ${input.expectedBranchName} ${formatShortSha(recreateAtSha)}`
+        : `git checkout ${input.expectedBranchName}`,
     });
     expectedBranchRestored = true;
 
@@ -1796,7 +1811,14 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     };
   } catch (error) {
     if (rescueBranchCreated && !expectedBranchRestored) {
-      await runGit(["checkout", input.expectedBranchName], input.worktreePath).catch(() => null);
+      // When the recorded branch was deleted there is nothing to go back to under that name, so
+      // fall back to the branch the worktree was actually on. Otherwise a failed rescue leaves the
+      // worktree parked on the rescue branch, and the next dispatch would fold the quarantined
+      // dirty commit into the recorded branch it recreates.
+      const rollbackTarget = input.recreateRecordedBranchAtSha && input.evidence.actualBranch
+        ? input.evidence.actualBranch
+        : input.expectedBranchName;
+      await runGit(["checkout", rollbackTarget], input.worktreePath).catch(() => null);
     }
     if (error instanceof WorkspaceRuntimeValidationFailure) throw error;
     input.evidence.safeRepair.succeeded = false;
@@ -2008,8 +2030,18 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       evidence.safeRepair.reason = "dirty quarantine repair requires a registered git worktree path";
       throw branchIncoherenceValidationFailure(evidence);
     }
-    if (!evidence.provenance.expectedBranchExists) {
-      evidence.safeRepair.reason = "dirty quarantine repair requires the recorded branch to exist";
+    // A deleted recorded branch used to be an unconditional refusal, which dead-blocked every later
+    // dispatch for an issue whose agent had merely renamed its branch. The refusal is not what keeps
+    // commits safe here: the deletion already happened, and recreating the branch at the worktree's
+    // current HEAD makes nothing unreachable that was still reachable a moment ago. What it cannot
+    // do is recover whatever the branch pointed at before it was deleted, so the repair is only
+    // allowed when there is a HEAD to recreate from, and it always says so in the warning.
+    const recordedBranchRecreateSha = evidence.provenance.expectedBranchExists
+      ? null
+      : evidence.provenance.actualHeadSha;
+    if (!evidence.provenance.expectedBranchExists && !recordedBranchRecreateSha) {
+      evidence.safeRepair.reason =
+        "dirty quarantine repair requires the recorded branch to exist, or a resolvable worktree HEAD to recreate it from";
       throw branchIncoherenceValidationFailure(evidence);
     }
     if (evidence.contention) {
@@ -2036,17 +2068,21 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       evidence,
       phase: input.reconcileOperationPhase,
       recorder: input.recorder ?? null,
+      recreateRecordedBranchAtSha: recordedBranchRecreateSha,
     });
     evidence.safeRepair.succeeded = true;
+    const recreatedNote = recordedBranchRecreateSha
+      ? `; recorded branch had been deleted and was recreated at ${formatShortSha(recordedBranchRecreateSha)}`
+      : "";
     evidence.safeRepair.reason = result.clearedInProgressOperation
-      ? `dirty worktree quarantined on ${result.rescueBranch} at ${formatShortSha(result.rescueCommitSha)}; interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} state cleared`
-      : `dirty worktree quarantined on ${result.rescueBranch} at ${formatShortSha(result.rescueCommitSha)}`;
+      ? `dirty worktree quarantined on ${result.rescueBranch} at ${formatShortSha(result.rescueCommitSha)}; interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} state cleared${recreatedNote}`
+      : `dirty worktree quarantined on ${result.rescueBranch} at ${formatShortSha(result.rescueCommitSha)}${recreatedNote}`;
     return {
       branchName: expectedBranchName,
       reconciledForward: false,
       dirtyQuarantineRepair: result,
       warnings: [
-        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}`,
+        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}${recordedBranchRecreateSha ? ` Recorded branch "${expectedBranchName}" had been deleted from the repository and was recreated at ${formatShortSha(recordedBranchRecreateSha)}, the commit this worktree was on; any history it pointed at before the deletion is not recoverable from the worktree and may need to be restored from a reflog or a remote.` : ""}`,
       ],
     };
   }
