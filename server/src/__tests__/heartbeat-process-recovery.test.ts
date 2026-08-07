@@ -4073,7 +4073,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   // SUP-11306: a reviewer whose run keeps succeeding is not a dead execution path, so the
   // stage is re-armed under it up to the deferral limit before the issue is escalated.
-  it("retries a pending execution-review participant up to the deferral limit before blocking with a recovery action", async () => {
+  it("retries a pending execution-review participant up to the deferral limit before blocking with a recovery action", { timeout: 10_000 }, async () => {
     const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
     const heartbeat = heartbeatService(db);
 
@@ -4110,14 +4110,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(reviewRecoveryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
 
-    const sourceIssue = await waitForValue(async () => {
-      const row = await db
-        .select()
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      return row?.status === "blocked" ? row : null;
+    // Wait on the escalation comment, not on `status === "blocked"`. Other recovery sweeps
+    // also block a stranded issue, and one of them can win the race — polling the status
+    // lets the test read the comments before this path has written its own.
+    const escalationComment = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.find((comment) => comment.body.includes("deferral limit")) ?? null;
     }, 8_000);
+    expect(escalationComment).toBeTruthy();
+
+    const sourceIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
     expect(sourceIssue).toMatchObject({
       status: "blocked",
       assigneeAgentId: agentId,
@@ -4125,18 +4131,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     // The reviewer is re-armed until the deferral budget is spent, so the escalation is
-    // attributed to the last recovery run rather than to the first one.
-    const terminalRecoveryRuns = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.agentId, agentId))
-      .then((runs) =>
-        runs.filter((row) =>
-          (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
-            "execution_review_participant_recovery" &&
-          row.status === "succeeded"
-        )
+    // attributed to the last recovery run rather than to the first one. Poll for exactly
+    // three succeeded recovery runs — on a cold run the re-arming chain may still be in
+    // flight, so a one-shot read can race and see fewer than three.
+    const terminalRecoveryRuns = await waitForValue(async () => {
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      const succeeded = runs.filter((row) =>
+        (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+          "execution_review_participant_recovery" &&
+        row.status === "succeeded"
       );
+      return succeeded.length === 3 ? succeeded : null;
+    }, 8_000);
     expect(terminalRecoveryRuns).toHaveLength(3);
     const blockingRun = terminalRecoveryRuns.reduce((latest, row) =>
       row.createdAt > latest.createdAt ? row : latest
