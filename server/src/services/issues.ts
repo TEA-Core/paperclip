@@ -6879,6 +6879,34 @@ export function issueService(db: Db) {
         assertTransition(existing.status, issueData.status);
       }
 
+      if (
+        issueData.status === "done" &&
+        existing.status !== "done" &&
+        existing.originKind === "routine_execution" &&
+        existing.assigneeAgentId
+      ) {
+        const pendingGateCount = await dbOrTx
+          .select({ count: sql<number>`count(*)` })
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.companyId, existing.companyId),
+            eq(issueThreadInteractions.issueId, existing.id),
+            eq(issueThreadInteractions.kind, "request_confirmation"),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .then((rows) => Number(rows[0]?.count ?? 0));
+        if (pendingGateCount > 0) {
+          throw unprocessable(
+            "Routine issue cannot be marked done while pending request_confirmation interactions exist",
+            {
+              code: "routine_close_pending_confirmation_gates",
+              issueId: existing.id,
+              pendingCount: pendingGateCount,
+            },
+          );
+        }
+      }
+
       const patch: Partial<typeof issues.$inferInsert> = {
         ...issueData,
         updatedAt: new Date(),

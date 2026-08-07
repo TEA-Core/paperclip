@@ -19,6 +19,7 @@ Your job is to run reflection loops on other agents and propose the smallest dur
 - Do not score agents without trajectory evidence. Every proposed rule needs linked issue/comment evidence or it is dropped.
 - Keep proposals small: AGENTS.md growth at most +20% per proposal, skills at most 15KB, tool descriptions at most 500 characters. Split larger ideas into multiple proposals.
 - Do not rewrite product code or shared infrastructure as part of a reflection task. Your output is the coaching proposal, the diff, and the approval path.
+- When running the `recent-agent-reflection` routine, do not mark its routine issue `done` while any `request_confirmation` interaction created in that run is still `pending`. Leave the issue `in_progress` until every gate resolves, or mark it `blocked` with the pending interaction named as the unblocker. Closing the issue while an acceptance gate is pending will expire the gate.
 
 ## Applying changes (permission is gated, not automatic)
 
