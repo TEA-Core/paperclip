@@ -2818,6 +2818,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
   });
 
+  it("does not queue a finish-handoff wake for an agent whose work arrives out of band", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    // Same run shape as the test above, which proves the handoff fires here.
+    // The only difference is the declaration on the agent record.
+    await db
+      .update(agents)
+      .set({
+        runtimeConfig: {
+          heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+          workDelivery: "external_pull",
+        },
+      })
+      .where(eq(agents.id, agentId));
+    // A handoff this agent was asked for before it was declared external-pull.
+    // Resolving it is what this run must do instead of asking again, and it is
+    // the barrier that proves the decision actually ran before we assert.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId,
+      action: "issue.successful_run_handoff_required",
+      entityType: "issue",
+      entityId: issueId,
+      details: { sourceRunId: randomUUID() },
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Implemented the backend detector, but did not choose a final issue state.",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Implemented the backend detector, but did not choose a final issue state.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    const resolved = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId));
+      return rows.find((event) => event.action === "issue.successful_run_handoff_resolved") ?? null;
+    }, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    expect(resolved?.details).toMatchObject({
+      resolvedByRunId: runId,
+      resolvedBySkipReason: "agent receives work out of band and cannot be judged by its run process",
+    });
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups.filter((wakeup) => wakeup.reason === "finish_successful_run_handoff")).toEqual([]);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY)).toBe(false);
+  });
+
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const idempotencyKey = `finish_successful_run_handoff:${issueId}:${runId}:1`;

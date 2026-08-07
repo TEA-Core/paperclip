@@ -57,6 +57,31 @@ describe("heartbeat scheduling suppression", () => {
     });
   });
 
+  // SUP-9857. A deploy needs to stop new dispatch without cancelling in-flight
+  // runs. The suppression path already has exactly those semantics; it was only
+  // readable from the environment, which a deploy script cannot change on an
+  // already-running server.
+  it("suppresses heartbeat scheduling while dispatch is quiesced at runtime", () => {
+    expect(
+      resolveHeartbeatSchedulingSuppression({}, { dispatchQuiesced: true }),
+    ).toEqual({
+      suppressed: true,
+      reason: "dispatch_quiesced",
+    });
+  });
+
+  it("reports the more fundamental reason when a restore overlaps a quiesce", () => {
+    expect(
+      resolveHeartbeatSchedulingSuppression(
+        { PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS: "1" },
+        { dispatchQuiesced: true },
+      ),
+    ).toEqual({
+      suppressed: true,
+      reason: "database_restore_in_progress",
+    });
+  });
+
   it("maps unsuccessful heartbeat outcomes to terminal skill test run outcomes", () => {
     expect(resolveSkillTestRunCompletionForHeartbeatOutcome("succeeded", null)).toBeNull();
     expect(resolveSkillTestRunCompletionForHeartbeatOutcome("cancelled", null)).toEqual({

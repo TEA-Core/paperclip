@@ -284,6 +284,8 @@ import {
   type HotRestartIntentRun,
   type HotRestartReportRun,
 } from "./hot-restart.js";
+import { normalizeMaxConcurrentRuns, parseHeartbeatPolicy } from "./heartbeat-policy.js";
+import { dispatchQuiesce } from "./dispatch-quiesce.js";
 import {
   assertLowTrustRuntimeServicesAllowed,
   assertLowTrustWorkspaceIsolation,
@@ -315,9 +317,6 @@ export function redactDetectedSuccessfulRunProgressSummaryForBoard(
 
 const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
 const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -2148,12 +2147,6 @@ export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_C
   const omittedChars = Math.max(0, normalized.length - headChars - tailChars);
   const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
   return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
-}
-
-function normalizeMaxConcurrentRuns(value: unknown) {
-  const parsed = Math.floor(asNumber(value, HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT));
-  if (!Number.isFinite(parsed)) return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
-  return Math.max(HEARTBEAT_MAX_CONCURRENT_RUNS_MIN, Math.min(HEARTBEAT_MAX_CONCURRENT_RUNS_MAX, parsed));
 }
 
 interface WakeupOptions {
@@ -5685,10 +5678,20 @@ function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
 }
 
+export type HeartbeatSchedulingSuppressionReason =
+  | "worktree_instance"
+  | "database_restore_in_progress"
+  | "dispatch_quiesced";
+
+export type HeartbeatSchedulingSuppression = {
+  suppressed: boolean;
+  reason: HeartbeatSchedulingSuppressionReason | null;
+};
+
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
-  overrides: { allowWorktreeRunExecution?: boolean } = {},
-): { suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | null } {
+  overrides: { allowWorktreeRunExecution?: boolean; dispatchQuiesced?: boolean } = {},
+): HeartbeatSchedulingSuppression {
   if (isTruthyRuntimeEnvValue(env.PAPERCLIP_IN_WORKTREE) && !overrides.allowWorktreeRunExecution) {
     return { suppressed: true, reason: "worktree_instance" };
   }
@@ -5697,6 +5700,12 @@ export function resolveHeartbeatSchedulingSuppression(
     isTruthyRuntimeEnvValue(env.PAPERCLIP_RESTORE_IN_PROGRESS)
   ) {
     return { suppressed: true, reason: "database_restore_in_progress" };
+  }
+  // SUP-9857. Runtime quiesce for deploys: gates new dispatch exactly the way
+  // the two env reasons above do, and like them never cancels anything that is
+  // already running.
+  if (overrides.dispatchQuiesced) {
+    return { suppressed: true, reason: "dispatch_quiesced" };
   }
   return { suppressed: false, reason: null };
 }
@@ -5768,6 +5777,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const override = await resolveWorktreeRunExecutionOverride();
     return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
+      // Module singleton, not closure state: `heartbeatService(db)` is
+      // constructed once per route module, so a per-instance flag would leave
+      // most dispatch paths unquiesced.
+      dispatchQuiesced: dispatchQuiesce.isQuiesced(),
     });
   };
   const getWorktreeExecutionCutoff = async () => {
@@ -10748,39 +10761,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
-    const runtimeConfig = parseObject(agent.runtimeConfig);
-    const heartbeat = parseObject(runtimeConfig.heartbeat);
-
-    return {
-      enabled: asBoolean(heartbeat.enabled, false),
-      intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
-      wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
-      maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
-      skipTimerWhenNoActionableWork: asBoolean(
-        heartbeat.skipTimerWhenNoActionableWork ??
-          heartbeat.requireActionableTimerWork ??
-          heartbeat.issueOnlyTimer,
-        false,
-      ),
-      maxDailyRuns: normalizeOptionalNonNegativeInteger(
-        heartbeat.maxDailyRuns ?? heartbeat.dailyRunLimit ?? heartbeat.dailyRunCap ?? heartbeat.maxRunsPerDay,
-      ),
-      maxDailyCostCents: normalizeOptionalNonNegativeInteger(
-        heartbeat.maxDailyCostCents ??
-          heartbeat.dailyCostCentsLimit ??
-          heartbeat.dailySpendCentsLimit ??
-          heartbeat.dailyBudgetCents,
-      ),
-    };
-  }
-
-  function normalizeOptionalNonNegativeInteger(value: unknown) {
-    if (value === null || value === undefined || value === "") return null;
-    const normalized = Math.floor(asNumber(value, 0));
-    return normalized >= 0 ? normalized : null;
-  }
-
   function currentUtcDayWindow(now = new Date()) {
     const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
     const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0));
@@ -10962,6 +10942,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return new Map<string, Awaited<ReturnType<typeof issuesSvc.getDependencyReadiness>>>();
     }
     return issuesSvc.listDependencyReadiness(companyId, issueIds);
+  }
+
+  /**
+   * SUP-9857. Instance-wide picture of what a deploy would destroy if it swapped
+   * the container now. `running` is what a drain has to wait on; `queued` cannot
+   * start while dispatch is quiesced but still tells an operator there is a
+   * backlog piling up behind the window.
+   *
+   * Deliberately DB-backed rather than counting `runningProcesses`: a run whose
+   * child this server never owned (adopted after a hot restart, or executing on
+   * a workspace runtime) is still in flight.
+   */
+  async function summarizeInFlightRuns() {
+    const rows = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.status, ["running", "queued"]));
+    const runIds = rows.filter((row) => row.status === "running").map((row) => row.id);
+    return {
+      running: runIds.length,
+      queued: rows.length - runIds.length,
+      runIds,
+    };
   }
 
   async function countRunningRunsForAgent(agentId: string) {
@@ -13300,6 +13303,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             name: agent.name,
             companyId: agent.companyId,
           },
+          // SUP-11520: realization can reuse a worktree the issue's existing workspace row
+          // already points at. That row is the asker, not a competing claimant — pass it so
+          // the branch-contention check can exclude it instead of self-locking on it.
+          existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
           heartbeatRunId: run.id,
           enableWorkspaceBranchReconcileForward:
             resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
@@ -17802,6 +17809,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
+    summarizeInFlightRuns,
     drainRunningRunsForShutdown,
     drainActiveRunExecutions,
 

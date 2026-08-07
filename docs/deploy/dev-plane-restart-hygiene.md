@@ -15,8 +15,37 @@ Every control-plane restart hard-kills any heartbeat run in flight at that momen
    SELECT count(*) FROM heartbeat_runs WHERE status = 'running';
    ```
 
-3. **Drain before restart (upcoming).** Graceful SIGTERM drain — stop accepting new runs, let in-flight runs finish or checkpoint, then exit — is being added in PAP-12930. Once it lands, send SIGTERM and wait for drain instead of hard-restarting. Until then, rule 2 is your drain.
+3. **Quiesce dispatch, then drain, then restart.** See [Quiescing dispatch for a deploy](#quiescing-dispatch-for-a-deploy) below. Quiescing stops the scheduler from starting new work while in-flight runs finish on their own; the SIGTERM handler then drains what is left within a bounded budget.
 4. **After any restart, glance at the damage.** See the detection queries below; confirm lost runs either retried successfully or get manual follow-up.
+
+## Quiescing dispatch for a deploy
+
+**Do not pause agents to quiesce a deploy.** `POST /agents/:id/pause` calls `cancelActiveForAgent`, which cancels every `queued`/`running`/`scheduled_retry` run for that agent and signals its process group. A deploy that pauses the fleet and then waits for a drain is waiting on a queue its own pause step already emptied — that is SUP-9857, where 14 live runs (ages 20s to 62 minutes) were cancelled as `agent_paused` and the drain reported success after 0s.
+
+Use the instance-level dispatch quiesce instead. It reuses the scheduler suppression path that already backs `PAPERCLIP_IN_WORKTREE` and `PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS`: it gates *new* dispatch and never cancels anything.
+
+```bash
+curl -sS -X POST "$API/api/instance/dispatch-quiesce" \
+  -H "Authorization: Bearer $BOARD_KEY" -H 'content-type: application/json' \
+  -d '{"reason":"deploy v2026.722.1","ttlSeconds":5400}'
+```
+
+The response carries the live picture the drain loop should wait on:
+
+```json
+{ "quiesced": true, "reason": "deploy v2026.722.1", "engagedAt": "...", "expiresAt": "...",
+  "inFlightRuns": 14, "queuedRuns": 3, "runIds": ["..."] }
+```
+
+Poll `GET /api/instance/dispatch-quiesce` until `inFlightRuns` reaches 0, then swap the container. Release with `DELETE /api/instance/dispatch-quiesce` — and release it on *every* exit path, including failure.
+
+Three properties worth knowing:
+
+- **The state is in-memory and does not survive a restart.** That is deliberate: a replaced container must come up dispatching. It also means the quiesce must be engaged against the server you are about to stop, not re-applied afterwards.
+- **Every engagement expires.** `ttlSeconds` defaults to 90 minutes and is clamped to 6 hours, so a deploy that dies between engage and release cannot park the fleet indefinitely. Re-engaging extends the window and keeps the original `engagedAt`.
+- **Queued work is not lost, only deferred.** Runs already `queued` stay queued and are started by `resumeQueuedRuns` once the quiesce lifts. Wake requests raised during the window are recorded as `heartbeat.scheduling_suppressed` with `reason: "dispatch_quiesced"` rather than silently dropped.
+
+Requires board access with instance-admin (`GET` needs board access only).
 
 ## How to spot a restart burst
 

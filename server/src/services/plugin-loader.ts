@@ -1299,13 +1299,49 @@ export function pluginLoader(
     return loadManifestFromPath(manifestPath);
   }
 
+  /**
+   * SUP-11330: `loadManifestFromPackageRoot` returns `null` for three unrelated faults
+   * — an unreadable package.json, a package that declares no manifest entrypoint, and a
+   * package that declares one which was never built. Collapsing all three into "no
+   * longer exposes a Paperclip manifest" pointed operators at the package contract when
+   * the actual fault was a missing build output, and asserted a change ("no longer") in
+   * a package that had not changed at all.
+   *
+   * This re-derives which branch was taken rather than widening the loader's return
+   * type. The phrase survives only for the case it is true of.
+   */
+  async function describeUnloadablePackageManifest(
+    plugin: PluginRecord,
+    packageRoot: string,
+  ): Promise<string> {
+    const pkgJson = await readPackageJson(packageRoot);
+    if (!pkgJson) {
+      return `Plugin package ${plugin.packageName} has no readable package.json at ${packageRoot}`;
+    }
+
+    const manifestPath = resolveManifestPath(packageRoot, pkgJson);
+    if (!manifestPath) {
+      return `Plugin package ${plugin.packageName} no longer exposes a Paperclip manifest`;
+    }
+
+    if (existsSync(manifestPath)) {
+      // The file appeared between the load attempt and this diagnosis. Say so rather
+      // than reporting a missing build output that is no longer missing.
+      return `Plugin package ${plugin.packageName} manifest at ${manifestPath} could not be loaded`;
+    }
+
+    const manualBuildHint = formatLocalPluginManualBuildHint(packageRoot, pkgJson);
+    return `Plugin package ${plugin.packageName} declares its Paperclip manifest at ${manifestPath}, `
+      + `but that file does not exist — the package is not built.${manualBuildHint}`;
+  }
+
   async function refreshPluginManifestFromPackage(
     plugin: PluginRecord,
     packageRoot: string,
   ): Promise<PluginRecord> {
     const manifest = await loadManifestFromPackageRoot(packageRoot);
     if (!manifest) {
-      throw new Error(`Plugin package ${plugin.packageName} no longer exposes a Paperclip manifest`);
+      throw new Error(await describeUnloadablePackageManifest(plugin, packageRoot));
     }
     if (manifest.id !== plugin.pluginKey) {
       throw new Error(
@@ -2116,6 +2152,18 @@ export function pluginLoader(
       // 1. Resolve worker entrypoint
       // ------------------------------------------------------------------
       const packageRoot = resolvePluginPackageRoot(activePlugin, localPluginDir);
+      // SUP-11330: a repo-bundled plugin's declared entrypoints are build outputs under
+      // a gitignored dist/. Where that dist/ came from install-time auto-build, it lived
+      // in the container's writable layer and died with the container — so the next
+      // image rebuild resurrected the package with its entrypoints absent and activation
+      // failed on a package that had not changed. The install path has run this guard
+      // since it shipped; the activation path never called it. It no-ops for npm-installed
+      // packages, no-ops when no declared entrypoint is missing, and honours
+      // PAPERCLIP_DISABLE_PLUGIN_AUTOBUILD=1.
+      const packageJson = await readPackageJson(packageRoot);
+      if (packageJson) {
+        await ensureLocalPluginBuilt(packageRoot, packageJson);
+      }
       activePlugin = await refreshPluginManifestFromPackage(activePlugin, packageRoot);
       manifest = activePlugin.manifestJson;
       const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, localPluginDir);

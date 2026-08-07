@@ -7,6 +7,17 @@ import { isTruthyEnvFlag } from "./models.js";
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
   notes: string[];
+  /**
+   * Absolute path of the temporary XDG_CONFIG_HOME this call materialised.
+   *
+   * Callers that ship the config to a remote execution target key off this: it
+   * is the directory to upload, and its presence is the precondition for
+   * repointing XDG_CONFIG_HOME at the uploaded copy. They previously inferred
+   * the same thing from `notes.length > 0`, which silently stops holding once a
+   * config is written on a path that emits no notes — and getting that wrong on
+   * a remote target means leaving a host-only path in the remote env.
+   */
+  runtimeConfigHome: string;
   cleanup: () => Promise<void>;
 };
 
@@ -95,32 +106,26 @@ async function readJsonObject(filepath: string): Promise<Record<string, unknown>
   }
 }
 
+// Always materialises a runtime config, on every execution target.
+//
+// `dangerouslySkipPermissions` opts out of the headless permission grant, not
+// out of having a runtime config at all. It used to return early here, which
+// took the SUP-10914 snapshot disable with it, so an agent configured with
+// `dangerouslySkipPermissions: false` kept leaking a full `tmp_pack_*` per run
+// on both local and remote targets (SUP-11164).
+//
+// Remote targets are handled by building the config on the host and uploading
+// it as the `xdgConfig` runtime asset, after which the caller repoints
+// XDG_CONFIG_HOME at the uploaded copy — see `prepareAdapterExecutionTargetRuntime`
+// in execute.ts. The host path is never what the remote process sees, so this
+// function does not need to know whether the target is remote. An earlier
+// `targetIsRemote` short-circuit predates that upload path and is gone; callers
+// stopped passing it when the upload landed.
 export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
-  targetIsRemote?: boolean;
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
-  if (!skipPermissions) {
-    return {
-      env: input.env,
-      notes: [],
-      cleanup: async () => {},
-    };
-  }
-
-  // For remote execution targets the host XDG_CONFIG_HOME path is meaningless
-  // (and actively harmful — it leaks a macOS-only path into the remote Linux
-  // env). Callers that need to ship a runtime opencode config to the remote
-  // box do that via prepareAdapterExecutionTargetRuntime in execute.ts; this
-  // host-fs helper is local-only.
-  if (input.targetIsRemote) {
-    return {
-      env: input.env,
-      notes: [],
-      cleanup: async () => {},
-    };
-  }
 
   const sourceConfigDir = path.join(resolveXdgConfigHome(input.env), "opencode");
   const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-config-"));
@@ -145,9 +150,12 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   const existingPermission = isPlainObject(existingConfig.permission)
     ? existingConfig.permission
     : {};
-  const notes = [
-    "Injected runtime OpenCode config with permission.external_directory=allow to avoid headless approval prompts.",
-  ];
+  const notes: string[] = [];
+  if (skipPermissions) {
+    notes.push(
+      "Injected runtime OpenCode config with permission.external_directory=allow to avoid headless approval prompts.",
+    );
+  }
 
   // Merge gateway/custom provider definitions supplied via PAPERCLIP_OPENCODE_PROVIDERS
   // (a JSON object in OpenCode's `provider` shape). OpenCode resolves a `--model
@@ -172,13 +180,13 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     );
   }
 
-  const nextConfig: Record<string, unknown> = {
-    ...existingConfig,
-    permission: {
+  const nextConfig: Record<string, unknown> = { ...existingConfig };
+  if (skipPermissions) {
+    nextConfig.permission = {
       ...existingPermission,
       external_directory: "allow",
-    },
-  };
+    };
+  }
   if (Object.keys(nextProvider).length > 0) {
     nextConfig.provider = nextProvider;
   }
@@ -232,6 +240,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
       XDG_CONFIG_HOME: runtimeConfigHome,
     },
     notes,
+    runtimeConfigHome,
     cleanup: async () => {
       await fs.rm(runtimeConfigHome, { recursive: true, force: true });
     },

@@ -126,4 +126,58 @@ describe("opencode remote environment diagnostics", () => {
       "/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/xdgConfig",
     );
   });
+
+  // SUP-11164 asked whether remote targets miss the SUP-10914 snapshot disable.
+  // They do not: the runtime config is built on the host and uploaded as the
+  // `xdgConfig` asset, then XDG_CONFIG_HOME is repointed at the uploaded copy.
+  // What did skip it is an agent with dangerouslySkipPermissions: false, which
+  // produced no config to upload at all — so the remote gap was really the
+  // permission gap reaching a remote target.
+  it("stages remote runtime config assets even when dangerouslySkipPermissions is false", async () => {
+    const remoteTarget: AdapterExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "cloudflare",
+      remoteCwd: "/remote/workspace",
+      runner: {
+        execute: async () => ({
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "",
+          stderr: "",
+          pid: null,
+          startedAt: new Date().toISOString(),
+        }),
+      },
+    };
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "opencode_local",
+      config: {
+        command: "opencode",
+        model: "anthropic/claude-sonnet-4-5",
+        dangerouslySkipPermissions: false,
+      },
+      executionTarget: remoteTarget,
+      environmentName: "QA Cloudflare",
+    });
+
+    expect(result.status).toBe("pass");
+    const runtimeCalls = prepareAdapterExecutionTargetRuntime.mock.calls as unknown as Array<
+      [{ assets?: Array<{ key: string; localDir: string }> }]
+    >;
+    expect(runtimeCalls[0]?.[0]?.assets).toEqual([
+      expect.objectContaining({ key: "xdgConfig" }),
+    ]);
+
+    const probeCall = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as
+      | [string, AdapterExecutionTarget, string, string[], { cwd: string; env: Record<string, string> }]
+      | undefined;
+    // Still the remote path, never the host temp dir the config was built in.
+    expect(probeCall?.[4].env.XDG_CONFIG_HOME).toBe(
+      "/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/xdgConfig",
+    );
+  });
 });

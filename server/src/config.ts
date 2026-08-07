@@ -69,6 +69,10 @@ export interface Config {
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  opencodeJanitorEnabled: boolean;
+  opencodeJanitorIntervalMinutes: number;
+  opencodeJanitorRetentionDays: number;
+  opencodeJanitorVacuum: boolean;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -268,6 +272,25 @@ export function loadConfig(): Config {
       fileDatabaseBackup?.dir ??
       resolveDefaultBackupDir(),
   );
+  // SUP-10914. opencode deletes no rows and never truncates its WAL, so its
+  // databases grow until something outside opencode reclaims them. On by
+  // default: an unswept deployment is how a 51 GB database and a 954 MB WAL
+  // happened, and the sweep is a no-op where opencode is not used.
+  const opencodeJanitorEnabled =
+    process.env.PAPERCLIP_OPENCODE_JANITOR_ENABLED !== undefined
+      ? process.env.PAPERCLIP_OPENCODE_JANITOR_ENABLED === "true"
+      : true;
+  const opencodeJanitorIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_OPENCODE_JANITOR_INTERVAL_MINUTES) || 24 * 60,
+  );
+  const opencodeJanitorRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_OPENCODE_JANITOR_RETENTION_DAYS) || 7,
+  );
+  // Opt-in, unlike the rest of the sweep: VACUUM holds an exclusive lock for the
+  // length of a full-file rewrite, and getting that wrong starves the fleet.
+  const opencodeJanitorVacuum = process.env.PAPERCLIP_OPENCODE_JANITOR_VACUUM === "true";
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -306,6 +329,10 @@ export function loadConfig(): Config {
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),
     embeddedPostgresPort: fileConfig?.database.embeddedPostgresPort ?? 54329,
+    opencodeJanitorEnabled,
+    opencodeJanitorIntervalMinutes,
+    opencodeJanitorRetentionDays,
+    opencodeJanitorVacuum,
     databaseBackupEnabled,
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,

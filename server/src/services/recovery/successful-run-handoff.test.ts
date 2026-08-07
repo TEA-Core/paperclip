@@ -239,6 +239,43 @@ describe("successful run handoff decision", () => {
     }).kind).toBe("enqueue");
   });
 
+  it("does not queue for an agent whose work arrives out of band", () => {
+    const pullAgent = { ...agent, runtimeConfig: { workDelivery: "external_pull" } } as any;
+
+    expect(decide({ agent: pullAgent })).toEqual({
+      kind: "skip",
+      reason: "agent receives work out of band and cannot be judged by its run process",
+    });
+    // The guard has to win over every productivity signal a no-op wake can fake,
+    // including the zero-tool-call rule that otherwise always hands off.
+    expect(decide({
+      agent: pullAgent,
+      livenessState: null,
+      detectedProgressSummary: null,
+      paperclipToolCallCount: 0,
+    })).toEqual({
+      kind: "skip",
+      reason: "agent receives work out of band and cannot be judged by its run process",
+    });
+    expect(isSuccessfulRunHandoffValidPathSkip(decide({ agent: pullAgent }))).toBe(true);
+  });
+
+  it("keeps handing off for agents Paperclip actually invokes", () => {
+    expect(decide({ agent: { ...agent, runtimeConfig: {} } as any }).kind).toBe("enqueue");
+    expect(decide({ agent: { ...agent, runtimeConfig: { heartbeat: { enabled: true } } } as any }).kind)
+      .toBe("enqueue");
+    expect(decide({
+      agent: {
+        ...agent,
+        adapterType: "opencode_local",
+        runtimeConfig: { model: "sonnet" },
+      } as any,
+      livenessState: null,
+      detectedProgressSummary: null,
+      paperclipToolCallCount: 0,
+    }).kind).toBe("enqueue");
+  });
+
   it("queues a corrective wake when a successful run made zero Paperclip tool calls", () => {
     const decision = decide({
       livenessState: null,
