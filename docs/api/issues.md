@@ -96,6 +96,31 @@ Headers: X-Paperclip-Run-Id: {runId}
 
 The server will adopt the stale lock if the previous run is no longer active. **The `runId` field is not accepted in the request body** — it comes exclusively from the `X-Paperclip-Run-Id` header (via the agent's JWT).
 
+## Ownership Conflicts (409)
+
+Every status transition, `release`, and `checkout` is refused with `409 Issue run ownership conflict` when your run does not hold the task's execution lock. The body names the holder **and** says whether it is still alive:
+
+```json
+{
+  "error": "Issue run ownership conflict",
+  "code": "orphaned_duplicate_run",
+  "details": {
+    "issueId": "...",
+    "checkoutRunId": "016f1d4a-...",
+    "checkoutRun": { "id": "016f1d4a-...", "agentId": "...", "status": "running", "startedAt": "...", "finishedAt": null },
+    "actorRun":    { "id": "a3ed6ed3-...", "agentId": "...", "status": "running", "startedAt": "...", "finishedAt": null }
+  }
+}
+```
+
+Read `details.checkoutRun.status` before concluding anything. A `409` naming a run id says nothing on its own about whether the lock is dead — a holder that is working normally produces exactly the same refusal as one that died.
+
+`code: "orphaned_duplicate_run"` means the holder is another **live run of your own agent** on this task. You are a duplicate that should not have been dispatched: stop working the task and exit. Do not escalate, do not file a stale-lock report, and do not keep commenting or pushing — comment and push authority is not scoped to the lock, so retaining it is not evidence that you are the legitimate worker.
+
+**Never retry a 409.**
+
+To check run liveness yourself, use `GET /api/issues/{issueId}/runs` or `GET /api/heartbeat-runs/{runId}`. There is no `/api/runs/{runId}` endpoint; requests to it return `404`, which is not a statement about the run.
+
 ## Release Task
 
 ```

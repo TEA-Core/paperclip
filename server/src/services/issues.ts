@@ -759,6 +759,13 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+/**
+ * Returned on an ownership 409 when the caller is a second live run of the same
+ * agent on the same issue — a duplicate that should not have been dispatched
+ * (SUP-9864), not a survivor of a dead lock. The correct response to it is to
+ * stop working the issue, not to escalate.
+ */
+export const ORPHANED_DUPLICATE_RUN_CONFLICT_CODE = "orphaned_duplicate_run";
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -4751,6 +4758,26 @@ export function issueService(db: Db) {
   }
 
   /**
+   * The liveness facts a refused caller needs to tell "the lock is dead" from
+   * "the lock is held by a run that is working". `GET /api/heartbeat-runs/{id}`
+   * returns the same fields; this just saves the caller a round trip it has
+   * historically not made.
+   */
+  async function loadRunOwnershipLiveness(runId: string, dbOrTx: DbReader = db) {
+    return dbOrTx
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /**
    * True when a run cannot be executing any more: it is terminal, gone, or stillborn — a row that
    * says `running` but never produced a process, output, usage or liveness.
    *
@@ -7562,6 +7589,46 @@ export function issueService(db: Db) {
         return { ownership: null, latest: null };
       };
 
+      // SUP-9864. Name the holder *and* say whether it is still alive. A body
+      // that carries only `checkoutRunId` reads identically whether the lock is
+      // dead or is held by a run that is working normally, and the caller has
+      // no way to tell which — so a duplicate run of the same agent infers a
+      // dead lock and escalates. Ship the holder's liveness in the refusal.
+      const withOwnershipConflictLiveness = async (details: {
+        issueId: string;
+        status: string;
+        assigneeAgentId: string | null;
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+      }) => {
+        const holderRunId = details.checkoutRunId ?? details.executionRunId;
+        const [checkoutRun, actorRun] = await Promise.all([
+          holderRunId ? loadRunOwnershipLiveness(holderRunId) : Promise.resolve(null),
+          actorRunId ? loadRunOwnershipLiveness(actorRunId) : Promise.resolve(null),
+        ]);
+        // Two live runs of one agent on one issue: the caller is not a stale
+        // straggler racing a finished run, it is a duplicate that should never
+        // have been dispatched. A distinct code lets it stand down quietly
+        // instead of opening a stale-lock investigation.
+        const orphanedDuplicateRun = Boolean(
+          checkoutRun
+          && actorRun
+          && checkoutRun.id !== actorRun.id
+          && checkoutRun.agentId === actorAgentId
+          && actorRun.agentId === actorAgentId
+          && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(checkoutRun.status)
+          && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status),
+        );
+        return {
+          ...(orphanedDuplicateRun ? { code: ORPHANED_DUPLICATE_RUN_CONFLICT_CODE } : {}),
+          ...details,
+          actorAgentId,
+          actorRunId,
+          checkoutRun,
+          actorRun,
+        };
+      };
+
       const resolved = await resolveOwnership(current);
       if (resolved.ownership) return resolved.ownership;
 
@@ -7570,26 +7637,22 @@ export function issueService(db: Db) {
       const resolvedLatest = await resolveOwnership(latest);
       if (resolvedLatest.ownership) return resolvedLatest.ownership;
       if (resolvedLatest.latest) {
-        throw conflict("Issue run ownership conflict", {
+        throw conflict("Issue run ownership conflict", await withOwnershipConflictLiveness({
           issueId: resolvedLatest.latest.id,
           status: resolvedLatest.latest.status,
           assigneeAgentId: resolvedLatest.latest.assigneeAgentId,
           checkoutRunId: resolvedLatest.latest.checkoutRunId,
           executionRunId: resolvedLatest.latest.executionRunId,
-          actorAgentId,
-          actorRunId,
-        });
+        }));
       }
 
-      throw conflict("Issue run ownership conflict", {
+      throw conflict("Issue run ownership conflict", await withOwnershipConflictLiveness({
         issueId: latest.id,
         status: latest.status,
         assigneeAgentId: latest.assigneeAgentId,
         checkoutRunId: latest.checkoutRunId,
         executionRunId: latest.executionRunId,
-        actorAgentId,
-        actorRunId,
-      });
+      }));
     },
 
     release: async (id: string, actorAgentId?: string, actorRunId?: string | null) =>
