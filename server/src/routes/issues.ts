@@ -3015,6 +3015,7 @@ export function issueRoutes(
   async function classifySourceRecoveryRevalidation(input: {
     issue: IssueRouteSnapshot;
     trigger: RecoveryRevalidationTrigger;
+    activeRecoveryAction?: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>> | null;
     statusChanged?: boolean;
     assigneeChanged?: boolean;
     blockersChanged?: boolean;
@@ -3034,7 +3035,6 @@ export function issueRoutes(
       return "Recovery action became stale because the source issue was manually moved from blocked to todo.";
     }
 
-    if (input.trigger === "read_projection") return null;
     if (
       input.trigger === "comment" &&
       input.resumeRequested !== true &&
@@ -3044,17 +3044,21 @@ export function issueRoutes(
       return null;
     }
 
-    const durableSourceChange =
-      input.statusChanged === true ||
-      input.assigneeChanged === true ||
-      input.blockersChanged === true ||
-      input.executionPolicyChanged === true ||
-      input.monitorChanged === true ||
-      input.documentChanged === true ||
-      input.workProductChanged === true ||
-      input.resumeRequested === true ||
-      input.reopened === true;
-    if (!durableSourceChange) return null;
+    const isReadProjectionForStrandedAction = input.trigger === "read_projection" &&
+      input.activeRecoveryAction?.kind === "stranded_assigned_issue";
+    if (input.trigger !== "read_projection" || !isReadProjectionForStrandedAction) {
+      const durableSourceChange =
+        input.statusChanged === true ||
+        input.assigneeChanged === true ||
+        input.blockersChanged === true ||
+        input.executionPolicyChanged === true ||
+        input.monitorChanged === true ||
+        input.documentChanged === true ||
+        input.workProductChanged === true ||
+        input.resumeRequested === true ||
+        input.reopened === true;
+      if (!durableSourceChange) return null;
+    }
 
     if (issue.status === "blocked") {
       const readiness = await svc.getDependencyReadiness(issue.id);
@@ -3123,7 +3127,10 @@ export function issueRoutes(
         : input.activeRecoveryAction;
     if (!activeRecoveryAction) return null;
 
-    const resolutionNote = await classifySourceRecoveryRevalidation(input);
+    const resolutionNote = await classifySourceRecoveryRevalidation({
+      ...input,
+      activeRecoveryAction,
+    });
     if (!resolutionNote) return activeRecoveryAction;
 
     const resolved = await recoveryActionsSvc.resolveActiveForIssue({
