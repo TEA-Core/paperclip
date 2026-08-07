@@ -64,7 +64,14 @@ import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
-import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
+import {
+  coordinateHeartbeatSchedulerShutdown,
+  createShutdownDeadline,
+  resolveShutdownDeadlineMs,
+  sweepDetachedRunProcesses,
+  withShutdownDeadline,
+} from "./shutdown.js";
+import { runningProcesses } from "./adapters/index.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -1295,12 +1302,59 @@ export async function startServer(): Promise<StartedServer> {
         heartbeatSchedulerInterval = null;
       }
 
+      // SUP-10309. Run children are detached, so they never receive the
+      // container's signals -- only this handler can reach them, and only
+      // before Docker's stop timeout SIGKILLs us. Every stage below runs
+      // against one shared budget, and a backstop timer guarantees the exit
+      // even if a stage wedges somewhere this handler cannot bound.
+      const shutdownDeadline = createShutdownDeadline(resolveShutdownDeadlineMs());
+      let killSweepArmed = false;
+      let killSweepDone = false;
+      const killSurvivingRunChildren = (reason: string) => {
+        if (!killSweepArmed || killSweepDone) return;
+        killSweepDone = true;
+        const entries = [...runningProcesses.entries()];
+        if (entries.length === 0) return;
+        const swept = sweepDetachedRunProcesses({ entries });
+        runningProcesses.clear();
+        logger.warn(
+          {
+            signal,
+            reason,
+            killed: swept.signalled.length,
+            alreadyGone: swept.failed.length,
+            untargetable: swept.skipped.length,
+            runIds: swept.signalled,
+          },
+          "SIGKILLed detached run process groups that outlived the graceful drain",
+        );
+      };
+      const forcedExitTimer = setTimeout(() => {
+        killSurvivingRunChildren("shutdown_deadline_exceeded");
+        logger.error(
+          { signal, deadlineMs: shutdownDeadline.totalMs },
+          "shutdown deadline exceeded; forcing exit",
+        );
+        process.exit(0);
+      }, shutdownDeadline.totalMs);
+
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
         signal,
         prepareHotRestartShutdown,
         waitForHeartbeatSchedulerIdle,
+        deadline: shutdownDeadline,
       });
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+      // A hot restart deliberately leaves run children alive for the incoming
+      // server to adopt. Arming the sweep on that path would kill exactly what
+      // the restart is trying to preserve.
+      killSweepArmed = !skipHeartbeatDrain;
+      if (heartbeatShutdown.schedulerIdleTimedOut) {
+        logger.warn(
+          { signal, deadlineMs: shutdownDeadline.totalMs },
+          "heartbeat scheduler did not go idle within the shutdown deadline; continuing without it",
+        );
+      }
       if (skipHeartbeatDrain) {
         logger.info(
           { signal, hotRestart: heartbeatShutdown.hotRestart },
@@ -1321,12 +1375,28 @@ export async function startServer(): Promise<StartedServer> {
 
       if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
         try {
-          const drain = await drainHeartbeatRunsForShutdown(signal);
-          logger.info({ signal, drain }, "graceful heartbeat run drain complete");
+          // The drain waits `graceSec` per run, sequentially, so on a busy
+          // server it alone can outlast the container's stop timeout. Give it
+          // whatever is left of the budget and no more; the kill sweep below
+          // is what guarantees nothing detached survives either way.
+          const drain = await withShutdownDeadline(
+            drainHeartbeatRunsForShutdown(signal),
+            shutdownDeadline,
+          );
+          if (drain.completed) {
+            logger.info({ signal, drain: drain.value }, "graceful heartbeat run drain complete");
+          } else {
+            logger.warn(
+              { signal, deadlineMs: shutdownDeadline.totalMs },
+              "graceful heartbeat run drain exceeded the shutdown deadline; killing survivors",
+            );
+          }
         } catch (err) {
           logger.error({ err, signal }, "graceful heartbeat run drain failed");
         }
       }
+
+      killSurvivingRunChildren("post_drain_sweep");
 
       const appShutdown = (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown;
       appShutdown?.();
@@ -1344,6 +1414,7 @@ export async function startServer(): Promise<StartedServer> {
       // await the exporter's final batch is dropped on exit.
       await shutdownInstrumentation();
 
+      clearTimeout(forcedExitTimer);
       process.exit(0);
     };
 
