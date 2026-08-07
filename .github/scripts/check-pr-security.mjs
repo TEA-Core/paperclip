@@ -41,6 +41,7 @@ export function scanSecrets(files) {
 const CI_BUILD_SCRIPTS = [
   'scripts/release.sh',
   'scripts/check-docker-deps-stage.mjs',
+  'scripts/build-bundled-plugins.mjs',
   'scripts/check-release-package-bootstrap.mjs',
   'scripts/release-package-map.mjs',
   'scripts/docker-onboard-smoke.sh',

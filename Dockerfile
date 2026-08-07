@@ -69,6 +69,12 @@ RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
+# Bundled plugins declare their entrypoints as build outputs under a gitignored dist/.
+# Without this, every image ships them unbuilt and activation fails on a package that
+# never changed. The script builds each one and verifies every declared entrypoint,
+# failing the image build rather than the running instance. It runs after the SDK build
+# above because each plugin's prebuild depends on the SDK's output.
+RUN node scripts/build-bundled-plugins.mjs
 
 FROM base AS production
 ARG USER_UID=1000
