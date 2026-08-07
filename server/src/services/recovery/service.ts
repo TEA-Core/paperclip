@@ -63,6 +63,7 @@ import {
   findExistingIssueBlockersResolvedWakeForAnyKey,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb, type AgentInvokability } from "../agent-invokability.js";
+import { parseHeartbeatPolicy } from "../heartbeat-policy.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -1152,6 +1153,43 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Boolean(comment || attachment);
   }
 
+  /**
+   * SUP-9858. `enqueueWakeup` refuses a wake on two conditions that are pure
+   * functions of state the sweeps already hold: the assignee's `wakeOnDemand`
+   * policy, and whether the issue still has unresolved blockers. Neither
+   * refusal is free — each writes a `skipped` row into `agent_wakeup_requests`
+   * — and the sweeps re-nominate the same candidate every pass with no
+   * backoff, so a single structurally-unwakeable agent produced ~6,500 rows a
+   * day and buried genuine skips in noise. Ask here instead of asking the
+   * wake path to say no forever.
+   *
+   * The dependency arm mirrors the gate's own precondition: it only refuses
+   * when there is no active execution run, which every caller below has
+   * already established via `hasActiveExecutionPath`.
+   */
+  async function staticWakeRefusalReason(issueId: string, agentId: string) {
+    const agent = await getAgent(agentId);
+    if (!agent) return "agent_unavailable" as const;
+    if (!parseHeartbeatPolicy(agent).wakeOnDemand) return "wake_on_demand_disabled" as const;
+
+    const readiness = await issuesSvc
+      .listDependencyReadiness(agent.companyId, [issueId])
+      .then((rows) => rows.get(issueId) ?? null);
+    if (readiness && !readiness.isDependencyReady) return "issue_dependencies_blocked" as const;
+
+    return null;
+  }
+
+  async function isWakeStaticallyRefused(issueId: string, agentId: string) {
+    const reason = await staticWakeRefusalReason(issueId, agentId);
+    if (!reason) return false;
+    logger.debug(
+      { issueId, agentId, reason },
+      "recovery sweep skipped a wake its own gate would refuse",
+    );
+    return true;
+  }
+
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
@@ -1161,6 +1199,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
   }) {
+    if (await isWakeStaticallyRefused(input.issueId, input.agentId)) return null;
+
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -1199,6 +1239,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function enqueueInitialAssignedTodoDispatch(issue: typeof issues.$inferSelect, agentId: string) {
+    if (await isWakeStaticallyRefused(issue.id, agentId)) return null;
+
     return deps.enqueueWakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
