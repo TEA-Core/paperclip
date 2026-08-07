@@ -45,8 +45,8 @@ import {
   IssueDependencyReadiness,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   issueService,
+  listIssueDependencyReadinessMap,
   listPermanentlyUnfinalizableBlockers as listPermanentlyUnfinalizableBlockersFromIssues,
-  listUnresolvedBlockerIssueIds,
 } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
@@ -6847,7 +6847,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
-  async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null }) {
+  async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null; limit?: number }) {
     const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
     const seen = new Set<string>();
 
@@ -6858,17 +6858,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         identifier: issues.identifier,
         assigneeAgentId: issues.assigneeAgentId,
       })
-      .from(issueRelations)
-      .innerJoin(issues, and(eq(issueRelations.relatedIssueId, issues.id), eq(issueRelations.type, "blocks")))
+      .from(issues)
       .where(
         and(
           eq(issues.status, "blocked"),
-          isNull(issues.hiddenAt),
+          visibleIssueCondition(),
           ...(opts?.issueCreatedAtGte ? [gte(issues.createdAt, opts.issueCreatedAtGte)] : []),
+          sql`exists (
+            select 1 from ${issueRelations}
+            where ${issueRelations.companyId} = ${issues.companyId}
+              and ${issueRelations.relatedIssueId} = ${issues.id}
+              and ${issueRelations.type} = 'blocks'
+          )`,
         ),
       )
       .orderBy(asc(issues.id))
-      .limit(CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT);
+      .limit(opts?.limit ?? CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT);
 
     for (const candidate of candidates) {
       if (seen.has(candidate.id)) continue;
@@ -6890,9 +6895,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      const unresolvedIds = await listUnresolvedBlockerIssueIds(db, candidate.companyId, blockerIds);
+      const readiness = (await listIssueDependencyReadinessMap(db, candidate.companyId, [candidate.id])).get(
+        candidate.id,
+      );
+      if (!readiness) {
+        result.skipped += 1;
+        continue;
+      }
 
-      if (unresolvedIds.length === 0) {
+      if (readiness.unresolvedBlockerCount === 0) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (readiness.pendingFinalizeBlockerIssueIds.length > 0) {
         result.skipped += 1;
         continue;
       }
@@ -6903,12 +6919,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .where(
           and(
             eq(issues.companyId, candidate.companyId),
-            inArray(issues.id, unresolvedIds),
+            inArray(issues.id, readiness.unresolvedBlockerIssueIds),
           ),
         )
-        .then((rows) => rows.map((r) => r.status));
+        .then((rows) => new Map(rows.map((r) => [r.id, r.status])));
 
-      const allCancelled = unresolvedStatuses.length > 0 && unresolvedStatuses.every((s) => s === "cancelled");
+      const allCancelled =
+        readiness.unresolvedBlockerIssueIds.length > 0 &&
+        readiness.unresolvedBlockerIssueIds.every((blockerId) => unresolvedStatuses.get(blockerId) === "cancelled");
       if (!allCancelled) {
         result.skipped += 1;
         continue;

@@ -12039,8 +12039,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStillbornAssignedBacklog({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
-  async function reconcileCancelledOnlyBlockerDependents() {
-    return recovery.reconcileCancelledOnlyBlockerDependents({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+  async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null; limit?: number }) {
+    return recovery.reconcileCancelledOnlyBlockerDependents({ issueCreatedAtGte: await getWorktreeExecutionCutoff(), ...(opts ?? {}) });
   }
 
   async function sweepStaleIssueLocks() {

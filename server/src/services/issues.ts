@@ -1330,7 +1330,7 @@ export async function runWorkspaceIsFinalized(
   return latest.phase === "workspace_finalize" && latest.status === "succeeded";
 }
 
-async function listIssueDependencyReadinessMap(
+export async function listIssueDependencyReadinessMap(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
   issueIds: string[],
