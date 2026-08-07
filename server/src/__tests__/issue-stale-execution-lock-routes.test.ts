@@ -434,6 +434,91 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  // SUP-9864: the refusal has to say whether the named holder is alive. Without
+  // that, a duplicate run of the same agent reads "409 + a run id" as evidence
+  // of a dead lock and escalates.
+  it("names the holder's liveness on an ownership conflict", async () => {
+    const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+    const liveOwnerRunId = randomUUID();
+    const issueId = randomUUID();
+    const ownerStartedAt = new Date();
+    await db.insert(heartbeatRuns).values({
+      id: liveOwnerRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: ownerStartedAt,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live checkout lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: liveOwnerRunId,
+      executionRunId: liveOwnerRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, failedRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body?.details?.checkoutRun).toMatchObject({
+      id: liveOwnerRunId,
+      agentId,
+      status: "running",
+      startedAt: ownerStartedAt.toISOString(),
+      finishedAt: null,
+    });
+    // The caller here is a *terminal* run losing a race with a live holder, not
+    // a concurrently-dispatched duplicate. It still needs the liveness facts,
+    // but the duplicate code would be wrong.
+    expect(res.body?.code).toBeUndefined();
+  });
+
+  it("codes an ownership conflict between two live runs of one agent as an orphaned duplicate", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const holderRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: holderRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "assignment",
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Duplicate dispatch",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: holderRunId,
+      executionRunId: holderRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body?.code).toBe("orphaned_duplicate_run");
+    expect(res.body?.details?.checkoutRun?.status).toBe("running");
+    expect(res.body?.details?.actorRun).toMatchObject({
+      id: currentRunId,
+      status: "running",
+    });
+  });
+
   it("still returns 409 when a different live checkout owner is active", async () => {
     const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
     const liveOwnerRunId = randomUUID();
