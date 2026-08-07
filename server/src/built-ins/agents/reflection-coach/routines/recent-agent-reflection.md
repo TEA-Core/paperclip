@@ -65,7 +65,10 @@ This routine is **paused by default** and spends no tokens until an operator ena
 
 ## Hard limits for this routine
 
+> **CRITICAL — pending confirmation gate rule**: The server enforces this. If this routine issue has any `request_confirmation` interaction in `pending` status, the issue **cannot** be marked `done`. The server will reject the status transition with code `routine_close_pending_confirmation_gates`. Before marking this issue `done`, either resolve every pending gate (accept or reject) or mark the issue `blocked` with the pending interaction named as the unblocker. Closing the issue while an acceptance gate is pending will expire the gate.
+
 - Proposal-only. This routine must not edit any agent's live AGENTS.md, skill assignments, or tool descriptions directly.
+- Do not mark this routine issue `done` while any `request_confirmation` interaction created in this run is still `pending`. Leave the issue `in_progress` until every gate resolves, or mark it `blocked` with the pending interaction named as the unblocker. Closing the issue while an acceptance gate is pending will expire the gate.
 - Any actual instruction/skill/tool-description change requires a displayed diff and an **accepted** `request_confirmation` task interaction, applied only in a separate follow-up run.
 - Mutation confirmations must bind the exact resource key they will apply, using `agent:<agentId>:instructions`, `agent:<agentId>:profile`, `skill:<skillId>`, `skill-slug:<slug>`, `skill-import:<source>`, or `skills:scan-projects`.
 - Keep every read company-scoped. Do not cross company boundaries.
@@ -74,4 +77,4 @@ This routine is **paused by default** and spends no tokens until an operator ena
 
 ## Output
 
-A single bounded routine issue that links one proposal document (or follow-up proposal issue) per reviewed target agent, plus a summary comment listing: agents reviewed, window, clusters found, surfaces proposed, and the next-step owner for each accepted-or-pending change.
+A single bounded routine issue that links one proposal document (or follow-up proposal issue) per reviewed target agent, plus a summary comment listing: agents reviewed, window, clusters found, surfaces proposed, and the next-step owner for each accepted-or-pending change. Keep this routine issue open (`in_progress` or `blocked`) while pending `request_confirmation` interactions exist; only mark it `done` once every gate has resolved accepted or rejected.
