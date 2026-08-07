@@ -1221,7 +1221,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     });
   });
 
-  it("blocks marking a routine issue done while a request_confirmation gate is pending", async () => {
+  it("blocks closing a routine issue while a request_confirmation gate is pending", async () => {
     const companyId = await seedCompany();
     const agentsSvc = agentService(db);
     await agentsSvc.create(companyId, {
@@ -1320,6 +1320,97 @@ describeEmbeddedPostgres("built-in agents", () => {
 
     const updated = await issuesSvc.update(routineIssueId, { status: "done" });
     expect(updated).toMatchObject({ id: routineIssueId, status: "done" });
+  });
+
+  it("also blocks cancelling a routine issue while a request_confirmation gate is pending", async () => {
+    const companyId = await seedCompany();
+    const created = await builtInAgentService(db).ensure(companyId, "reflection-coach");
+    const coach = created.agent!;
+    const routine = await db
+      .select()
+      .from(routines)
+      .where(eq(routines.companyId, companyId))
+      .then((rows) => rows[0]!);
+
+    const routineIssueId = randomUUID();
+    const routineRunId = randomUUID();
+    const heartbeatRunId = randomUUID();
+    await db.insert(routineRuns).values({
+      id: routineRunId,
+      companyId,
+      routineId: routine.id,
+      source: "schedule",
+      status: "succeeded",
+      triggeredAt: new Date(),
+      completedAt: new Date(),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: heartbeatRunId,
+      companyId,
+      agentId: coach.id,
+      status: "succeeded",
+      triggeredAt: new Date(),
+      completedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: routineIssueId,
+      companyId,
+      title: "Review recent agent trajectories for coaching proposals",
+      status: "in_progress",
+      priority: "medium",
+      identifier: `${issuePrefix(companyId)}-43`,
+      issueNumber: 43,
+      assigneeAgentId: coach.id,
+      createdByAgentId: coach.id,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: routineRunId,
+    });
+
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId: routineIssueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee_on_accept",
+      title: "Review proposed coaching change",
+      summary: "Accept or reject the proposed update.",
+      createdByAgentId: coach.id,
+      sourceRunId: heartbeatRunId,
+      payload: {
+        version: 1,
+        prompt: "Apply this Reflection Coach instruction diff?",
+        detailsMarkdown: "```diff\n+Add a verification step.\n```",
+        acceptLabel: "Accept",
+        rejectLabel: "Reject",
+        target: { type: "custom", key: `agent:${coach.id}:instructions`, revisionId: "proposal-v1" },
+      },
+    });
+
+    const issuesSvc = issueService(db);
+
+    await expect(issuesSvc.update(routineIssueId, { status: "cancelled" })).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "routine_close_pending_confirmation_gates",
+        pendingCount: 1,
+      },
+    });
+
+    await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "rejected",
+        result: { version: 1, outcome: "rejected", reason: "Not the right rule." },
+        resolvedByUserId: "board-user",
+        resolvedAt: new Date(),
+      })
+      .where(eq(issueThreadInteractions.id, interactionId));
+
+    const updated = await issuesSvc.update(routineIssueId, { status: "cancelled" });
+    expect(updated).toMatchObject({ id: routineIssueId, status: "cancelled" });
   });
 
   it("gates Reflection Coach proposal mutations until an accepted follow-up apply step", async () => {
