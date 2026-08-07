@@ -252,7 +252,7 @@ function buildClearedMonitorState(input: {
 }
 
 function issueAllowsMonitor(status: string, assigneeAgentId: string | null, assigneeUserId: string | null) {
-  return Boolean(assigneeAgentId) && !assigneeUserId && (status === "in_progress" || status === "in_review");
+  return Boolean(assigneeAgentId) && !assigneeUserId && (status === "in_progress" || status === "in_review" || status === "blocked");
 }
 
 function monitorClearReasonForIssue(
@@ -314,7 +314,6 @@ function nextAssigneeIds(input: {
 export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | null): IssueExecutionPolicy | null {
   if (!policy) return null;
   if (!policy.monitor) return policy;
-  if (policy.stages.length === 0) return null;
   return {
     mode: policy.mode,
     commentRequired: policy.commentRequired,
@@ -1037,7 +1036,7 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
 
   if (input.policy?.monitor) {
     if (invalidReason) {
-      if (input.monitorExplicitlyUpdated) {
+      if (invalidReason !== "done" && invalidReason !== "cancelled") {
         throw unprocessable(MONITOR_INVALID_MESSAGE);
       }
       patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
@@ -1055,28 +1054,18 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
         now: new Date(),
       });
       if (exhaustedReason) {
-        if (input.monitorExplicitlyUpdated) {
-          throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
-        }
-        patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
-        patch.monitorNextCheckAt = null;
-        patch.monitorWakeRequestedAt = null;
-        targetMonitorState = buildClearedMonitorState({
-          previous: currentMonitorState,
-          clearReason: exhaustedReason,
-          clearedAt: new Date(),
-        });
-      } else {
-        patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
-        patch.monitorWakeRequestedAt = null;
-        patch.monitorNotes = input.policy.monitor.notes ?? null;
-        patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
-        targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor);
+        throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
       }
+      patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
+      patch.monitorWakeRequestedAt = null;
+      patch.monitorNotes = input.policy.monitor.notes ?? null;
+      patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
+      targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor);
     }
   } else if (previousPolicy?.monitor) {
     patch.monitorNextCheckAt = null;
     patch.monitorWakeRequestedAt = null;
+    patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy ?? previousPolicy);
     targetMonitorState = buildClearedMonitorState({
       previous: currentMonitorState,
       clearReason:
