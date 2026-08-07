@@ -688,6 +688,41 @@ DB backups are not full instance filesystem backups. For full local disaster
 recovery, also back up local storage files and the local encrypted secrets key if
 those providers are enabled.
 
+## OpenCode Database Janitor
+
+The `opencode_local` adapter runs each agent against its own SQLite database
+under `XDG_DATA_HOME/opencode`. opencode never deletes a row and never truncates
+its WAL, so those files grow for as long as the agent exists — one shared
+database reached 51 GB with a 954 MB WAL before anyone looked, and the write-lock
+starvation that followed failed every concurrent run (SUP-10914).
+
+The server therefore sweeps them on a schedule: prune sessions past the retention
+window, then `wal_checkpoint(TRUNCATE)`. It runs `scripts/opencode-db-janitor.mjs`
+as a child process, because the sweep is synchronous SQLite and yields the write
+lock between delete batches. A deployment that does not use `opencode_local` has
+no databases to find, and the sweep is a no-op.
+
+- `PAPERCLIP_OPENCODE_JANITOR_ENABLED=true|false` (default `true`)
+- `PAPERCLIP_OPENCODE_JANITOR_INTERVAL_MINUTES=<minutes>` (default `1440`)
+- `PAPERCLIP_OPENCODE_JANITOR_RETENTION_DAYS=<days>` (default `7`)
+- `PAPERCLIP_OPENCODE_JANITOR_VACUUM=true` (default off)
+
+`VACUUM` is opt-in and off by default. Pruning returns pages to the freelist but
+`auto_vacuum` is `0`, so the file keeps its high-water mark until something
+rewrites it — and that rewrite holds an exclusive lock for its whole duration,
+which against a live fleet is the outage rather than the fix. Where the reclaim
+matters, prefer running it against a drained stack (a one-shot at container
+start) over enabling it here.
+
+The script can also be run by hand, and defaults to a dry run:
+
+```bash
+node scripts/opencode-db-janitor.mjs --data-dir /paperclip/.local/share/opencode
+```
+
+`--apply` takes a single-instance lock in the data directory, so a manual sweep
+and the scheduled one cannot overlap, and exits non-zero if any database failed.
+
 ## Secrets in Dev
 
 Agent env vars now support secret references. By default, secret values are stored with local encryption and only secret refs are persisted in agent config.
