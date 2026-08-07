@@ -71,6 +71,7 @@ This routine is **paused by default** and spends no tokens until an operator ena
 - Keep every read company-scoped. Do not cross company boundaries.
 - Every proposed rule needs linked issue/comment evidence or it is dropped. No scoring without trajectories.
 - Respect the size caps: AGENTS.md +20% max per proposal, skills 15KB max, tool descriptions 500 chars max.
+- **Do not close this issue while any `request_confirmation` gate is still `pending`.** A terminal status (`done`/`cancelled`) on this issue immediately expires every pending user-facing interaction, silently voiding the acceptance gates this routine just created. Before setting the issue to `done` or `cancelled`, re-read the issue and confirm every `request_confirmation` interaction created by this run has resolved. If any are still pending, leave the issue non-terminal (e.g. `in_progress`) so the interaction's `continuationPolicy` can wake this agent when the user/board responds.
 
 ## Output
 
