@@ -6116,6 +6116,68 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     ]));
   }, 20_000);
 
+  // An agent that renames its branch (`git branch -m`) leaves the recorded branch gone and the
+  // worktree dirty on a live branch. Quarantine used to refuse outright because the recorded branch
+  // had to already exist, which dead-blocked the issue on every later dispatch. Recreating it at the
+  // pre-quarantine HEAD strands nothing: the dirty state goes to the rescue branch and the live
+  // branch keeps its own ref.
+  it("recreates a deleted recorded branch after quarantining dirty work", async () => {
+    const expectedBranch = "PAP-466-recorded-deleted";
+    const actualBranch = "PAP-466-live";
+    const repoRoot = await createTempRepo();
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, expectedBranch]);
+
+    // Advance the live branch so it is not merely the recorded branch under another name.
+    await fs.writeFile(path.join(worktreePath, "live.txt"), "live work\n", "utf8");
+    await runGit(worktreePath, ["add", "live.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add live branch work"]);
+    const actualBranchHead = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+    await fs.appendFile(path.join(worktreePath, "README.md"), "dirty tracked work\n", "utf8");
+    await fs.writeFile(path.join(worktreePath, "untracked.txt"), "dirty untracked work\n", "utf8");
+
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-466",
+      claimant: "none",
+    });
+
+    const restored = await restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    });
+
+    expect(restored?.branchName).toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
+
+    // The recorded branch is back, at the commit the worktree was on before the rescue.
+    await expect(readGit(repoRoot, ["rev-parse", expectedBranch])).resolves.toBe(actualBranchHead);
+    // The live branch is untouched, so nothing it held became unreachable.
+    await expect(readGit(repoRoot, ["rev-parse", actualBranch])).resolves.toBe(actualBranchHead);
+
+    // The dirty state still lands on a rescue branch.
+    const warning = restored?.warnings.find((entry) => entry.includes("dirty worktree state was quarantined"));
+    expect(warning).toBeTruthy();
+    const rescueBranch = warning?.match(/"([^"]+)"/)?.[1] ?? "";
+    expect(rescueBranch).toMatch(/^paperclip\/rescue\/PAP-466\/\d{8}T\d{6}Z$/);
+    await expect(readGit(repoRoot, ["show", `${rescueBranch}:untracked.txt`])).resolves.toBe("dirty untracked work");
+
+    // Recreating a branch that someone deleted must never be silent: whatever history the recorded
+    // branch held before the deletion is not recoverable from here, so the operator has to be told.
+    expect(restored?.warnings.join("\n")).toContain("had been deleted");
+  }, 20_000);
+
   it("quarantines a worktree wedged mid-rebase and clears the interrupted rebase state", async () => {
     const expectedBranch = "PAP-456-recorded";
     const repoRoot = await createTempRepo("master");
