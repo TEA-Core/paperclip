@@ -936,6 +936,22 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        const stillbornAssignedBacklog = await heartbeat.reconcileStillbornAssignedBacklog();
+        if (stillbornAssignedBacklog.reported > 0) {
+          logger.warn(
+            { ...stillbornAssignedBacklog },
+            "startup stillborn-assigned-backlog sweep reported issues",
+          );
+        }
+
+        const cancelledOnlyBlockerDependents = await heartbeat.reconcileCancelledOnlyBlockerDependents();
+        if (cancelledOnlyBlockerDependents.reported > 0) {
+          logger.warn(
+            { ...cancelledOnlyBlockerDependents },
+            "startup cancelled-only-blocker-dependent sweep reported issues",
+          );
+        }
+
         const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
         if (taskWatchdogsReconciled.triggered > 0) {
           logger.warn(
@@ -957,6 +973,26 @@ export async function startServer(): Promise<StartedServer> {
         const swept = await heartbeat.sweepStaleIssueLocks();
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
+        }
+
+        const blockedWithoutBlockers = await heartbeat.reconcileBlockedWithoutBlockers();
+        if (blockedWithoutBlockers.escalated > 0) {
+          logger.warn({ ...blockedWithoutBlockers }, "startup blocked-without-blockers sweep escalated issues");
+        }
+
+        const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
+        if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {
+          logger.warn({ ...staleWakes }, "startup stale recovery action wake sweep re-fired wakes");
+        }
+
+        const permanentlyUnfinalizable = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
+        if (permanentlyUnfinalizable.reported > 0) {
+          logger.warn({ ...permanentlyUnfinalizable }, "startup permanently-unfinalizable-blocker sweep reported issues");
+        }
+
+        const staleInReview = await heartbeat.ingestStaleInReviewChildIssues();
+        if (staleInReview.archived > 0) {
+          logger.warn({ ...staleInReview }, "startup stale in_review child archive sweep archived issues");
         }
 
         const reviewed = await heartbeat.reconcileProductivityReviews();
@@ -1074,6 +1110,24 @@ export async function startServer(): Promise<StartedServer> {
               }
             })
             .then(async () => {
+              const stillbornAssignedBacklog = await heartbeat.reconcileStillbornAssignedBacklog();
+              if (stillbornAssignedBacklog.reported > 0) {
+                logger.warn(
+                  { ...stillbornAssignedBacklog },
+                  "periodic stillborn-assigned-backlog sweep reported issues",
+                );
+              }
+            })
+            .then(async () => {
+              const cancelledOnlyBlockerDependents = await heartbeat.reconcileCancelledOnlyBlockerDependents();
+              if (cancelledOnlyBlockerDependents.reported > 0) {
+                logger.warn(
+                  { ...cancelledOnlyBlockerDependents },
+                  "periodic cancelled-only-blocker-dependent sweep reported issues",
+                );
+              }
+            })
+            .then(async () => {
               const reconciled = await heartbeat.reconcileTaskWatchdogs();
               if (reconciled.triggered > 0) {
                 logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
@@ -1098,6 +1152,28 @@ export async function startServer(): Promise<StartedServer> {
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .then(async () => {
+              const blockedWithoutBlockers = await heartbeat.reconcileBlockedWithoutBlockers();
+              if (blockedWithoutBlockers.escalated > 0) {
+                logger.warn({ ...blockedWithoutBlockers }, "periodic blocked-without-blockers sweep escalated issues");
+              }
+              const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
+              if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {
+                logger.warn({ ...staleWakes }, "periodic stale recovery action wake sweep re-fired wakes");
+              }
+            })
+            .then(async () => {
+              const permanentlyUnfinalizable = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
+              if (permanentlyUnfinalizable.reported > 0) {
+                logger.warn({ ...permanentlyUnfinalizable }, "periodic permanently-unfinalizable-blocker sweep reported issues");
+              }
+            })
+            .then(async () => {
+              const staleInReview = await heartbeat.ingestStaleInReviewChildIssues();
+              if (staleInReview.archived > 0) {
+                logger.warn({ ...staleInReview }, "periodic stale in_review child archive sweep archived issues");
               }
             })
             .then(async () => {

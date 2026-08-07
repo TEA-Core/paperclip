@@ -29,6 +29,7 @@ import type {
   SuggestTasksInteraction,
   SuggestTasksResultCreatedTask,
   SubmitIssueThreadInteractionVerdicts,
+  WithdrawIssueThreadInteraction,
 } from "@paperclipai/shared";
 import {
   acceptIssueThreadInteractionSchema,
@@ -46,8 +47,9 @@ import {
   suggestTasksPayloadSchema,
   suggestTasksResultSchema,
   submitIssueThreadInteractionVerdictsSchema,
+  withdrawIssueThreadInteractionSchema,
 } from "@paperclipai/shared";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { issueService, runWorkspaceIsFinalized } from "./issues.js";
 
@@ -315,6 +317,66 @@ function buildStaleTargetResult(
     version: 1,
     outcome: "stale_target",
     staleTarget,
+  } as const;
+}
+
+function buildWithdrawnByAuthorResult(
+  row: IssueThreadInteractionRow,
+  reason: string | null,
+) {
+  if (row.kind === "ask_user_questions") {
+    return {
+      version: 1,
+      answers: [],
+      expirationReason: "withdrawn_by_author",
+      reason,
+      commentId: null,
+      summaryMarkdown: null,
+    } as const;
+  }
+
+  if (row.kind === "request_item_verdicts") {
+    const interaction = hydrateInteraction(row) as RequestItemVerdictsInteraction;
+    return {
+      version: 1,
+      outcome: "withdrawn_by_author",
+      complete: false,
+      items: interaction.result?.items ?? [],
+      reason,
+    } satisfies RequestItemVerdictsResult;
+  }
+
+  return {
+    version: 1,
+    outcome: "withdrawn_by_author",
+    reason,
+  } as const;
+}
+
+function buildExpiredByTerminalStatusResult(row: IssueThreadInteractionRow) {
+  if (row.kind === "ask_user_questions") {
+    return {
+      version: 1,
+      answers: [],
+      expirationReason: "expired_issue_terminal",
+      commentId: null,
+      summaryMarkdown: null,
+    } as const;
+  }
+
+  if (row.kind === "request_item_verdicts") {
+    const interaction = hydrateInteraction(row) as RequestItemVerdictsInteraction;
+    return {
+      version: 1,
+      outcome: "expired_issue_terminal",
+      complete: false,
+      items: interaction.result?.items ?? [],
+    } satisfies RequestItemVerdictsResult;
+  }
+
+  return {
+    version: 1,
+    outcome: "expired_issue_terminal",
   } as const;
 }
 
@@ -1960,6 +2022,96 @@ export function issueThreadInteractionService(db: Db) {
       const cancelled = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, cancelled);
       return cancelled;
+    },
+
+    withdrawInteraction: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      input: WithdrawIssueThreadInteraction,
+      actor: InteractionActor,
+    ) => {
+      const data = withdrawIssueThreadInteractionSchema.parse(input);
+      const current = await getPendingInteractionForResolution({ issue, interactionId });
+      if (!isUserCommentSupersedableKind(current.kind)) {
+        throw unprocessable(`Interactions of kind ${current.kind} cannot be withdrawn by the author`);
+      }
+
+      if (!actor.agentId || actor.agentId !== current.createdByAgentId) {
+        throw forbidden("Only the author of this interaction can withdraw it");
+      }
+
+      const reason = data.reason ?? null;
+      const [updated] = await db
+        .update(issueThreadInteractions)
+        .set({
+          status: "expired",
+          result: buildWithdrawnByAuthorResult(current, reason),
+          resolvedByAgentId: actor.agentId ?? null,
+          resolvedByUserId: actor.userId ?? null,
+          resolvedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(issueThreadInteractions.id, interactionId),
+          eq(issueThreadInteractions.status, "pending"),
+        ))
+        .returning();
+
+      if (!updated) {
+        throw conflict("Interaction has already been resolved");
+      }
+
+      await touchIssue(db, issue.id);
+      const withdrawn = hydrateInteraction(updated);
+      await emitInteractionResolvedTelemetry(db, withdrawn);
+      return withdrawn;
+    },
+
+    expirePendingInteractionsOnTerminalIssueStatus: async (
+      issue: { id: string; companyId: string },
+      status: string,
+      actor: InteractionActor,
+    ) => {
+      if (!isTerminalIssueStatus(status)) return [];
+
+      const rows = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.companyId, issue.companyId),
+          eq(issueThreadInteractions.issueId, issue.id),
+          inArray(issueThreadInteractions.kind, [...USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS]),
+          eq(issueThreadInteractions.status, "pending"),
+        ));
+
+      if (rows.length === 0) return [];
+
+      const now = new Date();
+      const expired: IssueThreadInteraction[] = [];
+      for (const row of rows) {
+        const [updated] = await db
+          .update(issueThreadInteractions)
+          .set({
+            status: "expired",
+            result: buildExpiredByTerminalStatusResult(row),
+            resolvedByAgentId: actor.agentId ?? null,
+            resolvedByUserId: actor.userId ?? null,
+            resolvedAt: now,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issueThreadInteractions.id, row.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .returning();
+        if (updated) expired.push(hydrateInteraction(updated));
+      }
+
+      if (expired.length > 0) {
+        await touchIssue(db, issue.id);
+        await emitResolvedInteractionsTelemetry(db, expired);
+      }
+      return expired;
     },
   };
 }

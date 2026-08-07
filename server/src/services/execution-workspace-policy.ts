@@ -15,6 +15,12 @@ export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION =
 export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE =
   `This task is set to run in an isolated git worktree, but it has no project and no reusable execution workspace to create the worktree from. ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION}`;
 
+export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_CODE = "workspace_reuse_requires_execution_workspace";
+export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION =
+  "Pass executionWorkspaceId with the workspace to reuse, pass inheritExecutionWorkspaceFromIssueId (or parentId) to inherit one, or drop executionWorkspacePreference: \"reuse_existing\".";
+export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE =
+  `executionWorkspacePreference: "reuse_existing" requires executionWorkspaceId, and none was supplied or inherited. ${WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION}`;
+
 type WorkspaceStrategyType = ExecutionWorkspaceStrategy["type"];
 
 export type UnrunnableWorktreeIssueRef = {

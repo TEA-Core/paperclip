@@ -419,7 +419,24 @@ const createIssueBaseSchema = z.object({
     agentId: z.string().uuid(),
     instructions: multilineTextSchema.optional().nullable(),
   }).strict().optional().nullable(),
+  parkDeliberately: z.boolean().optional().default(false),
 }).strict();
+
+export function isAssignedBacklogBlockingCreate(input: {
+  status?: unknown;
+  assigneeAgentId?: unknown;
+  parentId?: unknown;
+  blockedByIssueIds?: unknown;
+  parkDeliberately?: unknown;
+}): boolean {
+  if (input.parkDeliberately === true) return false;
+  if (typeof input.status !== "string" || input.status !== "backlog") return false;
+  const hasAssignee = typeof input.assigneeAgentId === "string" && input.assigneeAgentId.length > 0;
+  if (!hasAssignee) return false;
+  const hasParent = typeof input.parentId === "string" && input.parentId.length > 0;
+  const hasBlockers = Array.isArray(input.blockedByIssueIds) && input.blockedByIssueIds.length > 0;
+  return hasParent || hasBlockers;
+}
 
 const createIssueDuplicateGuardSchema = {
   idempotencyKey: z.string().trim().min(1).max(255).optional().nullable(),
@@ -472,10 +489,40 @@ export const createIssueLabelSchema = z.object({
 
 export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 
-export const updateIssueSchema = createIssueBaseSchema.omit({
-  createdByUserId: true,
-  responsibleUserId: true,
+/**
+ * Attribution is create-only, but "create-only" is not the same failure class as a misspelled key.
+ * `blockedBy` for `blockedByIssueIds` is a caller bug with no correct reading, so it must 400 (see
+ * `createIssueBaseSchema`). `createdByUserId` on an update is a *known* server-owned field that a
+ * caller round-tripping a full issue object — GET, edit one field, PATCH — legitimately carries,
+ * and the only sensible reading is "ignore it". Rejecting that breaks every such client, so these
+ * keys are accepted for shape and then dropped from the parsed output.
+ */
+export const ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS = ["createdByUserId", "responsibleUserId"] as const;
+
+/**
+ * Drops the create-only attribution keys from an update payload after validation.
+ *
+ * Dropping rather than merely undefining is load-bearing: the PATCH handler rest-spreads the
+ * parsed body into the column update (`...updateFields` in `server/src/routes/issues.ts`), so a
+ * key left present — zod keeps a key whose validator yields `undefined` when the key was supplied —
+ * would reach the write path. Deleting it keeps attribution unmutable exactly as `.omit()` did.
+ */
+export function stripCreateOnlyIssueAttribution<Schema extends z.ZodObject<z.ZodRawShape>>(schema: Schema) {
+  return schema.transform((value) => {
+    const next: Record<string, unknown> = { ...value };
+    for (const key of ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS) delete next[key];
+    return next as Omit<z.infer<Schema>, (typeof ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS)[number]>;
+  });
+}
+
+/**
+ * ZodObject form of the update payload, for consumers that need `.extend()` / `.merge()` /
+ * `.partial()` — those methods do not exist on the transformed schema. Anything that parses a real
+ * update payload must wrap this with `stripCreateOnlyIssueAttribution`.
+ */
+export const updateIssueObjectSchema = createIssueBaseSchema.omit({
   watchdog: true,
+  parkDeliberately: true,
 }).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
@@ -486,6 +533,8 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
 });
+
+export const updateIssueSchema = stripCreateOnlyIssueAttribution(updateIssueObjectSchema);
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
 export type IssueExecutionWorkspaceSettings = z.infer<typeof issueExecutionWorkspaceSettingsSchema>;
@@ -725,7 +774,8 @@ export const askUserQuestionsResultSchema = z.object({
   answers: z.array(askUserQuestionsAnswerSchema).max(20),
   cancelled: z.literal(true).optional(),
   cancellationReason: z.string().trim().max(4000).nullable().optional(),
-  expirationReason: z.literal("superseded_by_comment").optional(),
+  expirationReason: z.literal("superseded_by_comment").or(z.literal("expired_issue_terminal")).or(z.literal("withdrawn_by_author")).optional(),
+  reason: z.string().trim().max(500).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   summaryMarkdown: z.string().max(20000).nullable().optional(),
 });
@@ -919,7 +969,7 @@ export const requestConfirmationToolActionResultSchema = z.object({
 
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target"]),
+  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target", "withdrawn_by_author", "expired_issue_terminal"]),
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
@@ -1041,10 +1091,11 @@ export const requestItemVerdictsResultItemSchema = z.object({
 
 export const requestItemVerdictsResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["resolved", "superseded_by_comment", "stale_target", "cancelled"]),
+  outcome: z.enum(["resolved", "superseded_by_comment", "stale_target", "cancelled", "withdrawn_by_author", "expired_issue_terminal"]),
   complete: z.boolean(),
   items: z.array(requestItemVerdictsResultItemSchema)
     .max(REQUEST_ITEM_VERDICTS_ITEM_LIMIT),
+  reason: z.string().trim().max(500).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
 }).superRefine((value, ctx) => {
@@ -1159,6 +1210,11 @@ export const cancelIssueThreadInteractionSchema = z.object({
   reason: z.string().trim().max(4000).optional(),
 });
 export type CancelIssueThreadInteraction = z.infer<typeof cancelIssueThreadInteractionSchema>;
+
+export const withdrawIssueThreadInteractionSchema = z.object({
+  reason: z.string().trim().max(500).optional().transform((value) => (value && value.length > 0 ? value : null)),
+});
+export type WithdrawIssueThreadInteraction = z.infer<typeof withdrawIssueThreadInteractionSchema>;
 
 export const respondIssueThreadInteractionSchema = z.object({
   answers: z.array(askUserQuestionsAnswerSchema).max(20),

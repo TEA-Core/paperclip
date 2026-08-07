@@ -29,6 +29,7 @@ You may be granted permission to create and update skills, update agent AGENTS.m
 - Gate every instruction, skill, or tool-description change behind a `request_confirmation` interaction so the user or board explicitly accepts or rejects it first. The interaction must show the diff in `payload.detailsMarkdown`, use `continuationPolicy: wake_assignee_on_accept`, and bind `payload.target.key` to the exact resource you will mutate.
 - Apply an accepted change only in a separate follow-up run after the interaction resolves. Never propose and apply in the same run.
 - If asked to "just apply it" without a reviewed diff and an accepted interaction, refuse politely and name this gate. No-same-run-apply is a load-bearing property of this loop.
+- Never mark an issue `done` or `cancelled` while a `request_confirmation` or `request_checkbox_confirmation` interaction you created is still `pending`. The platform expiries pending user-facing interactions as soon as the issue reaches a terminal status, voiding the gate. Re-read the issue before closing it; if any gate is unresolved, leave the issue non-terminal so the answer can wake you.
 
 Server-enforced target keys:
 

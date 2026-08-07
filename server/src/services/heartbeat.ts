@@ -164,7 +164,11 @@ import {
   refreshIssueContinuationSummary,
 } from "./issue-continuation-summary.js";
 import { buildPlanReviewContext } from "./plan-review-context.js";
-import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import {
+  detachIssuesFromClosedSharedExecutionWorkspace,
+  executionWorkspaceService,
+  mergeExecutionWorkspaceConfig,
+} from "./execution-workspaces.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
@@ -331,6 +335,11 @@ const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+const STALE_RUN_HANDOFF_HOPS_KEY = "staleRunHandoffHops";
+// A handoff wake that is itself cancelled as stale means issue ownership is still
+// contradictory (e.g. assignee and review participant disagree). Stop after one hop
+// so two agents cannot ping-pong queued runs at each other forever.
+const STALE_RUN_HANDOFF_MAX_HOPS = 1;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
@@ -359,9 +368,22 @@ const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
+// SUP-11280: the opencode adapter's database growth guard kills a run whose tool
+// output arrives faster than the database can absorb it. The kill is a property
+// of the COMMAND the run chose, not of the runtime, so re-dispatching the same
+// issue re-runs the same command and trips at the same place. On 2026-08-06 that
+// cost two identical 250 MB trips on SUP-11109 within four minutes. Recovery
+// blocks instead, with the remediation in the comment.
+const OPENCODE_DB_GROWTH_LIMIT_FAILURE_CODE = "opencode_db_growth_limit";
+const OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE = "opencode_db_growth_limit";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
+// A reviewer that runs to completion and comments without deciding is deliberately
+// deferring, not dead, so its stage keeps getting re-armed instead of escalating.
+// Bound the re-arming anyway: a reviewer that defers forever is its own kind of
+// stall, and the recovery owner should hear about it rather than the stage looping.
+const EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT = 3;
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
 const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
@@ -376,6 +398,25 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "opencode_local",
   "pi_local",
 ]);
+export const EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON = "execution_workspace_occupied";
+export const EXECUTION_WORKSPACE_OCCUPIED_WAKE_REASON = "execution_workspace_occupied_retry";
+export const EXECUTION_WORKSPACE_OCCUPIED_FAILURE_CODE = "execution_workspace_occupied";
+/**
+ * How long a dispatch will wait for a shared worktree before giving up on reuse.
+ *
+ * Sized against how long runs in shared workspaces actually take: p50 is ~5.6
+ * minutes and p90 ~37, with 54% exceeding five minutes. A short budget would not
+ * be a wait at all — it would spend latency and then fork anyway in the majority
+ * of cases, which is the worst of both. Forking is the anti-dead-block backstop,
+ * not the common path, so the budget has to outlast an ordinary sibling run.
+ *
+ * Forking is not free for the run that gets forked: a fresh workspace is cut
+ * from the base ref, so a child that needed its parent's branch state starts
+ * clean and either redoes the work or conflicts. That is still far cheaper than
+ * two agents in one worktree, but it is a reason to wait properly first.
+ */
+const EXECUTION_WORKSPACE_OCCUPIED_MAX_DEFERRALS = 8;
+const EXECUTION_WORKSPACE_OCCUPIED_DEFER_DELAY_MS = 5 * 60_000;
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -1416,6 +1457,12 @@ function isWorkspaceValidationFailedRun(
   return run?.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE;
 }
 
+function isOpenCodeDatabaseGrowthLimitFailedRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode"> | null | undefined,
+) {
+  return run?.errorCode === OPENCODE_DB_GROWTH_LIMIT_FAILURE_CODE;
+}
+
 function readWorkspaceValidationPayloadFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson"> | null | undefined,
 ) {
@@ -1572,6 +1619,63 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
       `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but base workspace "${input.base.baseCwd}" is not a git checkout. ${remediation}`,
     );
   }
+}
+
+export async function assertProjectPrimaryBaseWorkspaceReady(input: {
+  requestedExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
+  config: Record<string, unknown>;
+  agentId: string;
+  issue: {
+    id: string;
+    identifier: string | null;
+    projectId: string | null;
+    projectWorkspaceId: string | null;
+    executionWorkspaceId?: string | null;
+    executionWorkspacePreference?: string | null;
+  } | null;
+  base: ExecutionWorkspaceInput;
+}) {
+  if (!input.issue) return;
+
+  const strategyType = resolveEffectiveWorkspaceStrategyType(
+    input.requestedExecutionWorkspaceMode,
+    input.config,
+  );
+  if (strategyType === "git_worktree") return;
+
+  const workspaceExpectation =
+    Boolean(input.issue.projectWorkspaceId) ||
+    Boolean(input.base.workspaceId);
+  if (!workspaceExpectation) return;
+
+  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
+  const resolvedToAgentFallbackCwd =
+    input.base.source === "agent_home" ||
+    (Boolean(input.base.baseCwd) && sameResolvedPath(input.base.baseCwd, agentFallbackCwd));
+  if (!resolvedToAgentFallbackCwd) return;
+
+  const issueLabel = input.issue.identifier ?? input.issue.id;
+  const remediation = "This task needs a project / project workspace or a reusable execution workspace before it can run.";
+  throw new WorkspaceValidationFailure(
+    `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with project_primary, but no project cwd was resolved; refusing to create a project_primary execution workspace from agent fallback cwd "${input.base.baseCwd}". ${remediation}`,
+    {
+      workspaceValidation: {
+        reason: "project_primary_base_agent_home",
+        issueId: input.issue.id,
+        issueIdentifier: input.issue.identifier,
+        issueProjectId: input.issue.projectId,
+        issueProjectWorkspaceId: input.issue.projectWorkspaceId,
+        issueExecutionWorkspaceId: input.issue.executionWorkspaceId ?? null,
+        issueExecutionWorkspacePreference: input.issue.executionWorkspacePreference ?? null,
+        requestedExecutionWorkspaceMode: input.requestedExecutionWorkspaceMode,
+        workspaceStrategyType: strategyType,
+        resolvedWorkspaceSource: input.base.source,
+        resolvedProjectId: input.base.projectId,
+        resolvedProjectWorkspaceId: input.base.workspaceId,
+        resolvedWorkspaceCwd: input.base.baseCwd,
+      },
+    },
+  );
 }
 
 export async function assertPushCapabilityCheckoutValid(input: {
@@ -2105,6 +2209,7 @@ export type ResolvedWorkspaceForRun = {
     cwd: string | null;
     repoUrl: string | null;
     repoRef: string | null;
+    defaultRef: string | null;
   }>;
   warnings: string[];
 };
@@ -3317,26 +3422,142 @@ export type ExecutionWorkspaceReuseRequestForIssue = {
   requestedExecutionWorkspaceId: string | null;
   requestedShouldReuseExisting: boolean;
   existingExecutionWorkspaceAvailable: boolean;
+  bindingUnrestorable: boolean;
 };
+
+/**
+ * Cleanup reasons that mean the workspace DIRECTORY was deleted by our own
+ * maintenance, not merely that the row was closed.
+ *
+ * The distinction decides whether a failed reuse is worth failing loudly over.
+ * An archived row whose directory still exists is repairable: a human can
+ * unarchive it and the next run reuses it, so refusing to run is the correct,
+ * loud outcome. A row archived *because we removed the directory* is not
+ * repairable by anyone — unarchiving restores nothing — so refusing to run
+ * strands the issue permanently instead of surfacing a fixable problem.
+ */
+const PLATFORM_REMOVED_EXECUTION_WORKSPACE_CLEANUP_REASONS = new Set([
+  "reaped_worktree_removed",
+  "reconciled_missing_directory",
+]);
 
 export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
   existingExecutionWorkspaceStatus?: string | null;
+  existingExecutionWorkspaceCleanupReason?: string | null;
+  /**
+   * Whether the workspace's directory is still on disk. `null` when it was not
+   * probed (nothing to probe, or no recorded cwd), which is treated as "cannot
+   * prove it is gone" and therefore fails loudly rather than self-healing.
+   */
+  existingExecutionWorkspaceDirectoryExists?: boolean | null;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
-  const requestedShouldReuseExisting =
+  const requestedReuse =
     input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
+
+  const existingExecutionWorkspaceAvailable =
+    requestedReuse &&
+    input.existingExecutionWorkspaceStatus !== null &&
+    input.existingExecutionWorkspaceStatus !== undefined &&
+    input.existingExecutionWorkspaceStatus !== "archived";
+
+  // SUP-9810: the worktree reaper archives the workspace row when it deletes a
+  // worktree, but issues bound to that row through `executionWorkspaceId` kept
+  // their `reuse_existing` binding. Every dispatch then failed `setup_failed`
+  // with "the workspace could not be restored", and no retry could ever
+  // succeed, because the directory is gone. One issue sat blocked behind a
+  // recovery action for exactly this; 57 issues held such a binding.
+  //
+  // The writers that create these bindings now detach at archive time, but the
+  // server must not depend on every external writer doing so — anything with
+  // direct database access can recreate it. Treating a platform-removed
+  // workspace as unrestorable makes the run recover on its own instead of
+  // looping forever on a pointer we invalidated ourselves.
+  // Two ways to know a binding is beyond repair. The cleanup reason is a fast
+  // path for the writers we control; the directory probe is the general one.
+  //
+  // 2026-08-06: the allowlist alone was not enough. 14 issues were stranded
+  // overnight by a bulk archive that wrote `cleanup_reason = NULL` and a
+  // free-text reason no allowlist could have anticipated — the rows did not come
+  // from this server or from the reaper at all. Keying on an observable fact
+  // rather than on a vocabulary means it does not matter who archived the row or
+  // what prose they wrote in it.
+  //
+  // A directory that is GONE is unrestorable by anyone. A directory that is
+  // still present stays on the loud-failure path: it may be repairable by
+  // unarchiving, and that is a human's call, not ours.
+  const archived =
+    requestedReuse && !existingExecutionWorkspaceAvailable &&
+    input.existingExecutionWorkspaceStatus === "archived";
+  const bindingUnrestorable =
+    archived &&
+    (PLATFORM_REMOVED_EXECUTION_WORKSPACE_CLEANUP_REASONS.has(
+      input.existingExecutionWorkspaceCleanupReason ?? "",
+    ) ||
+      input.existingExecutionWorkspaceDirectoryExists === false);
 
   return {
     requestedExecutionWorkspaceId,
-    requestedShouldReuseExisting,
-    existingExecutionWorkspaceAvailable:
-      requestedShouldReuseExisting &&
-      input.existingExecutionWorkspaceStatus !== null &&
-      input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+    // An unrestorable binding stops being a reuse request: there is nothing to
+    // reuse and never will be, so the run provisions fresh. Every other
+    // unavailable case still reports the request and fails loudly downstream,
+    // because those are repairable and a human should see them.
+    requestedShouldReuseExisting: requestedReuse && !bindingUnrestorable,
+    existingExecutionWorkspaceAvailable,
+    bindingUnrestorable,
   };
+}
+
+export type ExecutionWorkspaceOccupancyDecision =
+  | { action: "proceed" }
+  | { action: "defer"; attempt: number; maxDeferrals: number; delayMs: number }
+  | { action: "provision_fresh"; deferrals: number };
+
+/**
+ * SUP-11260: decide what a dispatch does when the workspace it wants to reuse
+ * is already occupied by another issue's live run.
+ *
+ * Waiting is the right first answer — the sibling usually finishes in minutes,
+ * and waiting preserves the branch continuity that made the two issues share a
+ * worktree in the first place.
+ *
+ * Refusing outright is the wrong last answer. That is the shape that dead-blocks
+ * an issue behind a run that never releases, which is the failure this platform
+ * has already paid for once (see workspace_validation_failed / SUP-11207). So
+ * once the wait budget is spent the run provisions its own fresh workspace: it
+ * loses branch continuity, which is cheap and visible, rather than losing a
+ * sibling's commits or losing the ability to run at all.
+ */
+export function resolveExecutionWorkspaceOccupancyDecision(input: {
+  reuseRequested: boolean;
+  occupied: boolean;
+  priorDeferrals: number;
+  maxDeferrals?: number;
+  delayMs?: number;
+}): ExecutionWorkspaceOccupancyDecision {
+  const maxDeferrals = Math.max(0, Math.floor(input.maxDeferrals ?? EXECUTION_WORKSPACE_OCCUPIED_MAX_DEFERRALS));
+  const delayMs = Math.max(0, Math.floor(input.delayMs ?? EXECUTION_WORKSPACE_OCCUPIED_DEFER_DELAY_MS));
+  const priorDeferrals = Math.max(0, Math.floor(input.priorDeferrals));
+  if (!input.reuseRequested || !input.occupied) return { action: "proceed" };
+  if (priorDeferrals >= maxDeferrals) return { action: "provision_fresh", deferrals: priorDeferrals };
+  return { action: "defer", attempt: priorDeferrals + 1, maxDeferrals, delayMs };
+}
+
+/**
+ * Deferrals already spent waiting for this workspace.
+ *
+ * Read from the run's own retry reason rather than the raw attempt counter: a
+ * run that burned two transient-failure retries earlier has not spent any of
+ * its workspace-wait budget, and charging it for them would cut the wait short.
+ */
+export function readExecutionWorkspaceOccupancyDeferrals(run: {
+  scheduledRetryReason?: string | null;
+  scheduledRetryAttempt?: number | null;
+}): number {
+  if (run.scheduledRetryReason !== EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON) return 0;
+  return Math.max(0, Math.floor(run.scheduledRetryAttempt ?? 0));
 }
 
 export function resolveExecutionWorkspaceReuseProvisioningPolicy(input: {
@@ -3437,9 +3658,9 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T extends 
     });
   }
 
-  if (reuseFailure) throw new Error(reuseFailure);
+  if (reuseFailure) throw new WorkspaceValidationFailure(reuseFailure, {});
   if (!restored) {
-    throw new Error("Expected restored execution workspace after reuse fallback handling");
+    throw new WorkspaceValidationFailure("Expected restored execution workspace after reuse fallback handling", {});
   }
 
   return {
@@ -5479,6 +5700,27 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export function truncateAgentErrorReason(reason: string | null | undefined): string | null {
+  if (!reason) return null;
+  const plain = reason
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b(?:[@-Z\\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
+  const trimmed = plain.trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= 500) return trimmed;
+  const limit = 499;
+  const search = trimmed.slice(0, limit);
+  const sentenceEnd = search.lastIndexOf(". ");
+  if (sentenceEnd >= 0) {
+    return `${search.slice(0, sentenceEnd + 1)}…`;
+  }
+  const ws = search.lastIndexOf(" ");
+  if (ws >= 0) {
+    return `${search.slice(0, ws)}…`;
+  }
+  return `${search}…`;
+}
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
@@ -6915,8 +7157,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!issue.assigneeAgentId || issue.assigneeUserId) {
       throw conflict("Issue monitor requires an agent assignee");
     }
-    if (!["in_progress", "in_review"].includes(issue.status)) {
-      throw conflict("Issue monitor can only run while the issue is in progress or in review");
+    if (!["in_progress", "in_review", "blocked"].includes(issue.status)) {
+      throw conflict("Issue monitor can only run while the issue is in progress, in review, or blocked");
     }
 
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
@@ -6933,7 +7175,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             sql`${issues.monitorNextCheckAt} is not null`,
             isNull(issues.assigneeUserId),
             sql`${issues.assigneeAgentId} is not null`,
-            inArray(issues.status, ["in_progress", "in_review"]),
+            inArray(issues.status, ["in_progress", "in_review", "blocked"]),
             or(
               isNull(issues.monitorWakeRequestedAt),
               lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -6975,7 +7217,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           lte(issues.monitorNextCheckAt, now),
           isNull(issues.assigneeUserId),
           sql`${issues.assigneeAgentId} is not null`,
-          inArray(issues.status, ["in_progress", "in_review"]),
+          inArray(issues.status, ["in_progress", "in_review", "blocked"]),
           or(
             isNull(issues.monitorWakeRequestedAt),
             lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -7003,7 +7245,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               lte(issues.monitorNextCheckAt, now),
               isNull(issues.assigneeUserId),
               sql`${issues.assigneeAgentId} is not null`,
-              inArray(issues.status, ["in_progress", "in_review"]),
+              inArray(issues.status, ["in_progress", "in_review", "blocked"]),
               or(
                 isNull(issues.monitorWakeRequestedAt),
                 lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -7372,7 +7614,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceId: workspace.id,
       cwd: readNonEmptyString(workspace.cwd),
       repoUrl: readNonEmptyString(workspace.repoUrl),
-      repoRef: readNonEmptyString(workspace.repoRef),
+      repoRef: readNonEmptyString(workspace.defaultRef) ?? readNonEmptyString(workspace.repoRef),
+      defaultRef: readNonEmptyString(workspace.defaultRef),
     }));
 
     if (projectWorkspaceRows.length > 0) {
@@ -7417,7 +7660,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             projectId: resolvedProjectId,
             workspaceId: workspace.id,
             repoUrl: workspace.repoUrl,
-            repoRef: workspace.repoRef,
+            repoRef: readNonEmptyString(workspace.defaultRef) ?? readNonEmptyString(workspace.repoRef),
             workspaceHints,
             warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
               (value): value is string => Boolean(value),
@@ -7456,7 +7699,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         projectId: resolvedProjectId,
         workspaceId: projectWorkspaceRows[0]?.id ?? null,
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
-        repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
+        repoRef:
+          readNonEmptyString(projectWorkspaceRows[0]?.defaultRef) ??
+          readNonEmptyString(projectWorkspaceRows[0]?.repoRef),
         workspaceHints,
         warnings,
       };
@@ -10792,11 +11037,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
       if (staleness.stale) {
-        await cancelQueuedRunForStaleIssue(run, issueId, staleness);
+        const cancelledRun = await cancelQueuedRunForStaleIssue(run, issueId, staleness);
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
         );
+        if (cancelledRun) {
+          // Runs after the cancellation so the issue execution lock is already
+          // released and enqueueWakeup can queue the replacement immediately.
+          await enqueueStaleRunHandoffWake({
+            cancelledRun,
+            previousContext: context,
+            issueId,
+            staleness,
+          });
+        }
         return null;
       }
     }
@@ -10942,6 +11197,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_review_participant_changed"
           | "issue_continuation_waiting_on_review";
         details: Record<string, unknown>;
+        // Agent that owns the issue now and must be woken in the cancelled run's
+        // place. null means this is a deliberate no-enqueue case (the issue is
+        // gone, terminal, parked, or has no agent owner) — the reason string must
+        // then not promise a wake.
+        handoffAgentId: string | null;
       };
 
   async function evaluateQueuedRunStaleness(
@@ -10967,6 +11227,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         errorCode: "issue_not_found",
         reason: "Cancelled because the target issue no longer exists",
         details: { issueId },
+        handoffAgentId: null,
       };
     }
 
@@ -11004,6 +11265,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             retryReason,
             nextAction: continuationSummaryBody,
           },
+          handoffAgentId: null,
         };
       }
     }
@@ -11016,16 +11278,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reviewParticipant.agentId === run.agentId;
 
     if (issue.assigneeAgentId !== run.agentId && !isInteractionWake && !isCurrentReviewParticipant) {
+      // Prefer the in-review participant when one is set: on an in_review issue
+      // that agent is the owner the staleness gate below will actually accept,
+      // so waking it converges in one hop instead of bouncing via the assignee.
+      const nextOwnerAgentId =
+        (reviewParticipant?.type === "agent" ? reviewParticipant.agentId : null) ??
+        issue.assigneeAgentId;
+      const handoffAgentId = nextOwnerAgentId && nextOwnerAgentId !== run.agentId
+        ? nextOwnerAgentId
+        : null;
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
-        reason:
-          "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead",
+        reason: handoffAgentId
+          ? "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead"
+          : "Cancelled because issue assignee changed before the queued run could start; the issue has no agent owner, so no replacement run was queued",
         details: {
           issueId,
           previousAssigneeAgentId: run.agentId,
           currentAssigneeAgentId: issue.assigneeAgentId,
         },
+        handoffAgentId,
       };
     }
 
@@ -11036,6 +11309,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           errorCode: "issue_terminal_status",
           reason: `Cancelled because issue reached terminal status (${issue.status}) before the queued run could start`,
           details: { issueId, currentStatus: issue.status },
+          handoffAgentId: null,
         };
       }
     }
@@ -11046,6 +11320,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         errorCode: "issue_not_in_progress",
         reason: `Cancelled because max-turn continuation issue is no longer in_progress (current status: ${issue.status}) before the queued run could start`,
         details: { issueId, currentStatus: issue.status, requiredStatus: "in_progress" },
+        handoffAgentId: null,
       };
     }
 
@@ -11060,6 +11335,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           expectedExecutionRunId: run.id,
           currentExecutionRunId: issue.executionRunId,
         },
+        handoffAgentId: null,
       };
     }
 
@@ -11069,16 +11345,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const participantMatches =
           currentParticipant.type === "agent" && currentParticipant.agentId === run.agentId;
         if (!participantMatches && !wakeCommentId) {
+          const participantAgentId =
+            currentParticipant.type === "agent" ? currentParticipant.agentId ?? null : null;
+          const handoffAgentId = participantAgentId && participantAgentId !== run.agentId
+            ? participantAgentId
+            : null;
           return {
             stale: true,
             errorCode: "issue_review_participant_changed",
-            reason:
-              "Cancelled because the in-review participant changed before the queued run could start; the current participant will be woken instead",
+            reason: handoffAgentId
+              ? "Cancelled because the in-review participant changed before the queued run could start; the current participant will be woken instead"
+              : "Cancelled because the in-review participant changed before the queued run could start; the current participant is not an agent, so no replacement run was queued",
             details: {
               issueId,
               currentStageType: reviewExecutionState?.currentStageType ?? null,
               currentParticipant,
             },
+            handoffAgentId,
           };
         }
       }
@@ -11140,18 +11423,103 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
-  function truncateAgentErrorReason(reason: string | null | undefined): string | null {
-    if (!reason) return null;
-    const trimmed = reason.trim();
-    if (!trimmed) return null;
-    return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
+  async function enqueueStaleRunHandoffWake(input: {
+    cancelledRun: typeof heartbeatRuns.$inferSelect;
+    previousContext: Record<string, unknown>;
+    issueId: string;
+    staleness: Extract<QueuedRunStaleness, { stale: true }>;
+  }) {
+    const { cancelledRun, previousContext, issueId, staleness } = input;
+    const handoffAgentId = staleness.handoffAgentId;
+    if (!handoffAgentId || handoffAgentId === cancelledRun.agentId) return null;
+
+    const previousHopsRaw = Number(previousContext[STALE_RUN_HANDOFF_HOPS_KEY] ?? 0);
+    const previousHops =
+      Number.isFinite(previousHopsRaw) && previousHopsRaw > 0 ? Math.floor(previousHopsRaw) : 0;
+    const hops = previousHops + 1;
+
+    const recordOutcome = async (level: "info" | "warn", message: string, extra: Record<string, unknown>) => {
+      await appendRunEvent(cancelledRun, await nextRunEventSeq(cancelledRun.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level,
+        message,
+        payload: { issueId, handoffAgentId, errorCode: staleness.errorCode, hops, ...extra },
+      });
+    };
+
+    if (hops > STALE_RUN_HANDOFF_MAX_HOPS) {
+      logger.warn(
+        { runId: cancelledRun.id, issueId, handoffAgentId, hops },
+        "claimQueuedRun: stale-run handoff hop limit reached; not re-enqueueing",
+      );
+      await recordOutcome(
+        "warn",
+        "Stale-run handoff stopped at the hop limit; issue ownership is still contradictory",
+        {},
+      );
+      return null;
+    }
+
+    try {
+      const handoffRun = await enqueueWakeup(handoffAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId, staleRunHandoffFromRunId: cancelledRun.id },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+          source: "heartbeat.stale_run_handoff",
+          staleRunHandoffFromRunId: cancelledRun.id,
+          staleRunHandoffFromAgentId: cancelledRun.agentId,
+          staleRunHandoffErrorCode: staleness.errorCode,
+          [STALE_RUN_HANDOFF_HOPS_KEY]: hops,
+        },
+        idempotencyKey: `stale-run-handoff:${cancelledRun.id}:${handoffAgentId}`,
+        requestedByActorType: "system",
+        requestedByActorId: "heartbeat",
+      });
+
+      if (handoffRun) {
+        logger.info(
+          { runId: cancelledRun.id, issueId, handoffAgentId, handoffRunId: handoffRun.id },
+          "claimQueuedRun: queued stale-run handoff wake for the issue's current owner",
+        );
+        await recordOutcome("info", "Queued a replacement run for the issue's current owner", {
+          handoffRunId: handoffRun.id,
+        });
+      } else {
+        logger.warn(
+          { runId: cancelledRun.id, issueId, handoffAgentId },
+          "claimQueuedRun: stale-run handoff wake was deferred or skipped",
+        );
+        await recordOutcome(
+          "warn",
+          "Stale-run handoff wake was deferred or skipped; no replacement run is queued yet",
+          { handoffRunId: null },
+        );
+      }
+      return handoffRun;
+    } catch (err) {
+      logger.error(
+        { err, runId: cancelledRun.id, issueId, handoffAgentId },
+        "claimQueuedRun: stale-run handoff wake failed",
+      );
+      await recordOutcome("warn", "Stale-run handoff wake failed; no replacement run is queued", {
+        handoffRunId: null,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
   }
 
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
     failureReason?: string | null,
-    options?: { keepIdleOnFailure?: boolean },
+    options?: { keepIdleOnFailure?: boolean; errorCode?: string | null },
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -11177,7 +11545,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Persist a human-readable reason on the agent record when it enters
         // error so operators see it on the agent page without digging into run
         // events; clear it whenever the agent leaves error.
-        errorReason: nextStatus === "error" ? truncateAgentErrorReason(failureReason) : null,
+        errorReason: nextStatus === "error" ? truncateAgentErrorReason(options?.errorCode ? `[${options.errorCode}] ${failureReason ?? ""}` : failureReason) : null,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -11631,7 +11999,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "failed", baseMessage);
+      await finalizeAgentStatus(run.agentId, "failed", baseMessage, { errorCode: "process_lost" });
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
@@ -11667,8 +12035,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  async function reconcileStillbornAssignedBacklog() {
+    return recovery.reconcileStillbornAssignedBacklog({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+  }
+
+  async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null; limit?: number }) {
+    return recovery.reconcileCancelledOnlyBlockerDependents({ issueCreatedAtGte: await getWorktreeExecutionCutoff(), ...(opts ?? {}) });
+  }
+
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
+  }
+
+  async function reconcileBlockedWithoutBlockers() {
+    return recovery.reconcileBlockedWithoutBlockers();
+  }
+
+  async function reconcileResolvedDependencyWakeBackstop(opts?: {
+    rearmWindowMs?: number;
+    rearmMaxCount?: number;
+    now?: Date;
+    runId?: string | null;
+    companyId?: string | null;
+    blockerIssueId?: string | null;
+    source?: "issue_graph_liveness.backstop" | "workspace.finalize";
+  }) {
+    return recovery.reconcileResolvedDependencyWakeBackstop(opts);
+  }
+
+  async function reconcileStaleRecoveryActionWakes(opts?: { intervalMs?: number }) {
+    return recovery.reconcileStaleRecoveryActionWakes(opts);
+  }
+
+  async function reconcileUnfinalizableWorkspaceBarriers() {
+    return recovery.reconcileUnfinalizableWorkspaceBarriers({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+  }
+
+  async function ingestStaleInReviewChildIssues() {
+    return recovery.ingestStaleInReviewChildIssues();
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -12249,15 +12653,169 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const requestedExecutionWorkspaceId = readNonEmptyString(issueRef?.executionWorkspaceId);
     const existingExecutionWorkspace =
       requestedExecutionWorkspaceId ? await executionWorkspacesSvc.getById(requestedExecutionWorkspaceId) : null;
+    // Probe the directory only for an archived workspace we would otherwise
+    // refuse to run against: an absent directory is proof the binding can never
+    // be honoured, whoever archived the row and whatever reason they recorded.
+    // Any probe failure leaves this null, which keeps the loud-failure path —
+    // never self-heal on a stat we could not complete.
+    const existingExecutionWorkspaceDirectoryExists = await (async () => {
+      if (existingExecutionWorkspace?.status !== "archived") return null;
+      const workspaceCwd = readNonEmptyString(existingExecutionWorkspace?.cwd);
+      if (!workspaceCwd) return null;
+      try {
+        const stat = await fs.stat(workspaceCwd);
+        return stat.isDirectory();
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return false;
+        return null;
+      }
+    })();
     const workspaceReuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
+      existingExecutionWorkspaceCleanupReason: existingExecutionWorkspace?.cleanupReason ?? null,
+      existingExecutionWorkspaceDirectoryExists,
     });
-    const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
-    const reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable
-      ? existingExecutionWorkspace
+    if (workspaceReuseRequest.bindingUnrestorable && requestedExecutionWorkspaceId) {
+      // Clear the dangling pointer as well as running past it. Without this the
+      // next dispatch re-derives the same dead binding, and the issue carries an
+      // unrealizable `reuse_existing` preference that the write API refuses
+      // (SUP-10403), so a human editing anything workspace-shaped on it would
+      // 422 on state they never set. Same helper, and the same semantics, as
+      // the service's own workspace-close path.
+      await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+        companyId: agent.companyId,
+        executionWorkspaceId: requestedExecutionWorkspaceId,
+      });
+      logger.warn(
+        {
+          runId,
+          issueId: issueRef?.id ?? null,
+          issueIdentifier: issueRef?.identifier ?? null,
+          executionWorkspaceId: requestedExecutionWorkspaceId,
+          cleanupReason: existingExecutionWorkspace?.cleanupReason ?? null,
+        },
+        "Cleared a reuse_existing binding to an execution workspace whose directory was removed by platform cleanup; provisioning a fresh workspace for this run",
+      );
+    }
+    // SUP-11260: a shared worktree admits exactly one writer. Ask whether
+    // somebody else's agent is in there before walking in, and do it here —
+    // before provisioning, before the environment lease, before anything
+    // touches the directory — so a deferral costs nothing but the lookup.
+    const workspaceOccupancy = workspaceReuseRequest.requestedShouldReuseExisting &&
+      workspaceReuseRequest.requestedExecutionWorkspaceId
+      ? await executionWorkspacesSvc.findActiveRunOccupyingWorkspace({
+          companyId: agent.companyId,
+          executionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          excludingIssueId: issueId,
+          excludingRunId: run.id,
+          contenderRunCreatedAt: run.createdAt ?? null,
+        })
       : null;
+    const workspaceOccupancyDecision = resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: workspaceReuseRequest.requestedShouldReuseExisting,
+      occupied: workspaceOccupancy !== null,
+      priorDeferrals: readExecutionWorkspaceOccupancyDeferrals(run),
+    });
+    if (workspaceOccupancyDecision.action === "defer") {
+      const occupantText = workspaceOccupancy?.issueIdentifier
+        ? `${workspaceOccupancy.issueIdentifier} (run ${workspaceOccupancy.runId})`
+        : `run ${workspaceOccupancy?.runId ?? "unknown"}`;
+      const message =
+        `Execution workspace ${workspaceReuseRequest.requestedExecutionWorkspaceId} is already held by ${occupantText}; ` +
+        `waiting rather than editing the same worktree concurrently ` +
+        `(attempt ${workspaceOccupancyDecision.attempt}/${workspaceOccupancyDecision.maxDeferrals})`;
+      logger.info(
+        {
+          runId: run.id,
+          issueId,
+          issueIdentifier: issueRef?.identifier ?? null,
+          executionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          occupiedByRunId: workspaceOccupancy?.runId ?? null,
+          occupiedByIssueId: workspaceOccupancy?.issueId ?? null,
+          attempt: workspaceOccupancyDecision.attempt,
+          maxDeferrals: workspaceOccupancyDecision.maxDeferrals,
+        },
+        "deferring dispatch because the execution workspace is occupied by another issue's run",
+      );
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message,
+        payload: {
+          executionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          occupiedByRunId: workspaceOccupancy?.runId ?? null,
+          occupiedByIssueId: workspaceOccupancy?.issueId ?? null,
+          occupiedByIssueIdentifier: workspaceOccupancy?.issueIdentifier ?? null,
+          attempt: workspaceOccupancyDecision.attempt,
+          maxDeferrals: workspaceOccupancyDecision.maxDeferrals,
+        },
+      });
+      await setRunStatus(runId, "cancelled", {
+        error: message,
+        errorCode: EXECUTION_WORKSPACE_OCCUPIED_FAILURE_CODE,
+        finishedAt: new Date(),
+      });
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: new Date(),
+        error: message,
+      });
+      const deferredRun = await getRun(runId);
+      if (deferredRun) {
+        // The successor carries the attempt counter forward, so the wait budget
+        // is spent across runs rather than reset by each one. maxAttempts is
+        // pinned one above the current count so the scheduler never declares
+        // exhaustion on our behalf — the budget is this gate's to enforce.
+        await scheduleBoundedRetryForRun(deferredRun, agent, {
+          retryReason: EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON,
+          wakeReason: EXECUTION_WORKSPACE_OCCUPIED_WAKE_REASON,
+          maxAttempts: (deferredRun.scheduledRetryAttempt ?? 0) + 1,
+          delayMs: workspaceOccupancyDecision.delayMs,
+        });
+        await releaseIssueExecutionAndPromote(deferredRun);
+      }
+      return;
+    }
+    const requestedShouldReuseExisting =
+      workspaceOccupancyDecision.action === "provision_fresh"
+        ? false
+        : workspaceReuseRequest.requestedShouldReuseExisting;
+    if (workspaceOccupancyDecision.action === "provision_fresh") {
+      logger.warn(
+        {
+          runId: run.id,
+          issueId,
+          issueIdentifier: issueRef?.identifier ?? null,
+          executionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          occupiedByRunId: workspaceOccupancy?.runId ?? null,
+          occupiedByIssueId: workspaceOccupancy?.issueId ?? null,
+          deferrals: workspaceOccupancyDecision.deferrals,
+        },
+        "execution workspace stayed occupied for the whole wait budget; provisioning a fresh workspace instead of sharing a worktree with another issue's run",
+      );
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message:
+          `Execution workspace ${workspaceReuseRequest.requestedExecutionWorkspaceId} stayed occupied after ` +
+          `${workspaceOccupancyDecision.deferrals} waits; provisioning a fresh workspace. Branch continuity with the ` +
+          `previous workspace is lost, but no commits are: this run gets its own worktree instead of sharing one.`,
+        payload: {
+          executionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+          occupiedByRunId: workspaceOccupancy?.runId ?? null,
+          occupiedByIssueId: workspaceOccupancy?.issueId ?? null,
+          occupiedByIssueIdentifier: workspaceOccupancy?.issueIdentifier ?? null,
+          deferrals: workspaceOccupancyDecision.deferrals,
+        },
+      });
+    }
+    const reusableExistingExecutionWorkspace =
+      requestedShouldReuseExisting && workspaceReuseRequest.existingExecutionWorkspaceAvailable
+        ? existingExecutionWorkspace
+        : null;
     const requestedReusableExecutionWorkspaceConfig = reusableExistingExecutionWorkspace?.config ?? null;
     const localEnvironment = await environmentsSvc.ensureLocalEnvironment(agent.companyId);
     const resolvedInstanceSettings = await instanceSettings.get();
@@ -12580,6 +13138,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await assertGitWorktreeBaseWorkspaceReady({
       requestedExecutionWorkspaceMode,
       config: hostExecutionWorkspaceConfig,
+      issue: issueRef,
+      base: executionWorkspaceBase,
+    });
+    await assertProjectPrimaryBaseWorkspaceReady({
+      requestedExecutionWorkspaceMode,
+      config: hostExecutionWorkspaceConfig,
+      agentId: agent.id,
       issue: issueRef,
       base: executionWorkspaceBase,
     });
@@ -13240,7 +13805,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Atomic conditional UPDATE is the sole gate (no read-then-write); 0 rows => abort.
       const runningAgent = await db
         .update(agents)
-        .set({ status: "running", updatedAt: new Date() })
+        .set({ status: "running", errorReason: null, updatedAt: new Date() })
         .where(and(eq(agents.id, agent.id), notInArray(agents.status, [...DIRECT_NON_INVOKABLE_STATUSES])))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -13555,7 +14120,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (adapterFinalizeOutcome) return;
         let finalizeBranchMetadata: Record<string, unknown> | null = null;
         let finalizeBranchRepairMetadata: Record<string, unknown> | null = null;
-        if (status === "succeeded") {
+        // SUP-11207: a run that failed or crashed used to skip branch normalisation entirely,
+        // leaving the worktree wherever the agent parked it. The *next* dispatch then hard-failed
+        // worktree_prepare validation and dead-blocked the issue behind
+        // workspace_validation_failed. Normalise on both outcomes, but on the failed path this is
+        // strictly best-effort: it must never throw, and must never convert an already-failed run
+        // into a workspace validation failure that masks the real reason the run failed.
+        const enforceFinalizeBranchValidity = status === "succeeded";
+        try {
           const branchInspection = await inspectFinalizeWorkspaceBranch();
           if (branchInspection) {
             let inspection = branchInspection.inspection;
@@ -13604,6 +14176,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   initial: initialManagedGitWorktreeBranch,
                   reason: repairErr instanceof Error ? repairErr.message : String(repairErr),
                 };
+                // Failed path: hand off to the outer catch, which logs and lets the ordinary
+                // finalize=failed record land carrying the repair metadata set just above. Writing
+                // a second failed operation row here would collide with that record.
+                if (!enforceFinalizeBranchValidity) throw repairErr;
                 await workspaceOperationRecorder.recordOperation({
                   phase: "workspace_finalize",
                   cwd: executionWorkspace.cwd,
@@ -13645,7 +14221,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               executionWorkspaceId: branchInspection.workspaceRecord.id,
               ...managedGitWorktreeBranch,
             };
-            if (!inspection.valid) {
+            if (!inspection.valid && enforceFinalizeBranchValidity) {
               const workspaceValidationFingerprint = fingerprintFinalizeWorkspaceBranchValidation({
                 issueId: issueRef?.id ?? null,
                 executionWorkspaceId: branchInspection.workspaceRecord.id,
@@ -13684,6 +14260,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               );
             }
           }
+        } catch (branchErr) {
+          if (enforceFinalizeBranchValidity) throw branchErr;
+          // Failed path only: whatever went wrong inspecting or normalising the branch, the run's
+          // own failure is the story worth telling. Record it and let finalize=failed land.
+          logger.warn(
+            { err: branchErr, runId: run.id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? null },
+            "best-effort workspace branch normalisation failed after a failed run; the next dispatch may still hit workspace_validation_failed",
+          );
         }
         await workspaceOperationRecorder.recordOperation({
           phase: "workspace_finalize",
@@ -13979,6 +14563,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
+      await appendRunEvent(run, seq++, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: outcome === "succeeded" ? "info" : "error",
+        message: `run ${outcome}`,
+        payload: {
+          status,
+          exitCode: adapterResult.exitCode,
+        },
+      });
+
       const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
         finishedAt: new Date(),
         error: runErrorMessage,
@@ -14018,16 +14613,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
-        await appendRunEvent(finalizedRun, seq++, {
-          eventType: "lifecycle",
-          stream: "system",
-          level: outcome === "succeeded" ? "info" : "error",
-          message: `run ${outcome}`,
-          payload: {
-            status,
-            exitCode: adapterResult.exitCode,
-          },
-        });
         try {
           await completeSkillTestRunForHeartbeatOutcome({
             run: finalizedRun,
@@ -14168,6 +14753,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           keepIdleOnFailure:
             outcome === "failed" &&
             (finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota"),
+          errorCode: outcome === "succeeded" ? null : runErrorCode,
         },
       );
     } catch (err) {
@@ -14200,6 +14786,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       await flushOutputProgress({ force: true }).catch((flushErr) => {
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
+      });
+
+      await appendRunEvent(run, seq++, {
+        eventType: "error",
+        stream: "system",
+        level: "error",
+        message,
       });
 
       const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
@@ -14236,12 +14829,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       if (failedRun) {
-        await appendRunEvent(failedRun, seq++, {
-          eventType: "error",
-          stream: "system",
-          level: "error",
-          message,
-        });
         const livenessRun = await classifyAndPersistRunLiveness(failedRun) ?? failedRun;
         try {
           await completeSkillTestRunForHeartbeatOutcome({
@@ -14292,7 +14879,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      await finalizeAgentStatus(agent.id, "failed", message);
+      await finalizeAgentStatus(agent.id, "failed", message, {
+        keepIdleOnFailure: workspaceValidationFailure != null,
+        errorCode: failureErrorCode,
+      });
     }
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
@@ -14315,6 +14905,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "setup_failed";
           logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
+          // Emit the run-log event before the status flip so the event stream is
+          // complete by the time terminal status is observable. Only do so while
+          // the run is still `running`: if another path already finalized it (a
+          // cancel, or the inner catch), setRunStatusIfRunning below is a no-op
+          // and this event would be a spurious late error on a settled run.
+          const failedRunPreFlip = await getRun(runId).catch(() => null);
+          if (failedRunPreFlip?.status === "running") {
+            await appendRunEvent(failedRunPreFlip, 1, {
+              eventType: "error",
+              stream: "system",
+              level: "error",
+              message,
+            }).catch(() => undefined);
+          }
           const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
             error: message,
             errorCode: setupFailureErrorCode,
@@ -14345,14 +14949,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           const failedRun = await getRun(runId).catch(() => null);
           if (setupFailureWrite.updated && failedRun) {
-            // Emit a run-log event so the failure is visible in the run timeline,
-            // consistent with what the inner catch block does for adapter failures.
-            await appendRunEvent(failedRun, 1, {
-              eventType: "error",
-              stream: "system",
-              level: "error",
-              message,
-            }).catch(() => undefined);
             const livenessRun = await classifyAndPersistRunLiveness(failedRun).catch(() => failedRun);
             const setupFailureIssueId = readNonEmptyString(parseObject(livenessRun.contextSnapshot).issueId);
             if (setupFailureIssueId) {
@@ -14392,7 +14988,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // path owned the terminal transition. If another path already finalized
           // the run, keep that terminal outcome authoritative.
           if (setupFailureWrite.updated) {
-            await finalizeAgentStatus(run.agentId, "failed", message).catch(() => undefined);
+            await finalizeAgentStatus(run.agentId, "failed", message, {
+              // A workspace that cannot be realized (e.g. truncated git index)
+              // is permanent corruption, not a transient agent fault. Keeping the
+              // agent idle — instead of error — stops one broken worktree from
+              // crash-looping the whole agent while operators repair the index.
+              keepIdleOnFailure: workspaceValidationSetupFailure != null,
+              errorCode: setupFailureErrorCode,
+            }).catch(() => undefined);
           }
         } finally {
           const latestRun = await getRun(run.id).catch(() => null);
@@ -14492,6 +15095,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  function buildOpenCodeDatabaseGrowthLimitRecoveryComment(input: {
+    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+  }) {
+    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    return (
+      "Paperclip terminated this run because its OpenCode database grew past the per-run budget. " +
+      "That is caused by a command whose output streams faster than the database can absorb it — " +
+      "each output chunk is written as a full snapshot — so retrying the same work would run the same " +
+      `command and fail the same way.${failureSummary ?? ""} ` +
+      "Moving it to `blocked` so the offending command can be changed before resuming: redirect long or " +
+      "chatty command output to a file and report a bounded slice of it " +
+      "(`cmd > /tmp/run.log 2>&1; tail -100 /tmp/run.log`)."
+    );
+  }
+
   function buildConfigurationIncompleteRecoveryComment(input: {
     latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
   }) {
@@ -14504,9 +15122,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   function buildExecutionReviewParticipantRecoveryComment(input: {
-    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "status"> | null | undefined;
+    deferralRetriesExhausted?: boolean;
   }) {
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    if (input.deferralRetriesExhausted) {
+      return (
+        "Paperclip re-armed the pending execution-review participant up to the deferral limit " +
+        `(${EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT} attempts). The reviewer ran to completion and ` +
+        `commented each time but never recorded a decision, so the review stage is still pending.${failureSummary ?? ""} ` +
+        "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can record the decision, " +
+        "restore the review stage, or record an intentional manual resolution."
+      );
+    }
+    if (input.latestRun?.status === "succeeded") {
+      return (
+        "Paperclip retried the pending execution-review participant once, but the retry run completed without " +
+        `recording a decision and without leaving any trace on the issue.${failureSummary ?? ""} ` +
+        "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can repair the reviewer runtime, " +
+        "restore the review stage, or record an intentional manual resolution."
+      );
+    }
     return (
       "Paperclip retried the pending execution-review participant once, but the review stage still has no completed decision " +
       `or live reviewer run.${failureSummary ?? ""} ` +
@@ -14952,6 +15588,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
           .limit(1)
           .then((rows) => rows[0] ?? null);
+      // Proof that the reviewer was alive during this run: it left a comment on the issue.
+      // Keyed on createdByRunId so an older comment from a previous wake cannot pass.
+      const findReviewParticipantProofOfLifeComment = () =>
+        tx
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.companyId, issue.companyId),
+              eq(issueComments.issueId, issue.id),
+              eq(issueComments.createdByRunId, run.id),
+              isNull(issueComments.deletedAt),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+      // Issue-scoped rather than stage-scoped on purpose: recovery runs from an earlier
+      // review round still count, so a repeatedly-deferring reviewer escalates sooner
+      // rather than later. Erring toward escalation keeps the dead-reviewer case intact.
+      const countTerminalReviewParticipantRecoveryRuns = () =>
+        tx
+          .select({ count: sql<number>`count(*)::int` })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, issue.companyId),
+              eq(heartbeatRuns.agentId, run.agentId),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON}`,
+            ),
+          )
+          .then((rows) => rows[0]?.count ?? 0);
       const executionState = parseIssueExecutionState(issue.executionState);
       const currentParticipant = executionState?.status === "pending"
         ? executionState.currentParticipant
@@ -14985,16 +15654,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
 
+        // A participant run that finished cleanly AND left a comment on the issue is proof
+        // of life: the reviewer evaluated the stage and deliberately withheld a decision
+        // this wake (e.g. a doctrine staleness self-gate). That is a healthy reviewer, not
+        // a dead execution path, so re-arm the stage instead of blocking the issue and
+        // opening a recovery action naming the reviewer as its own recovery owner.
+        // A reviewer that never ran, was not invokable, crashed, or produced nothing still
+        // escalates: no clean terminal status or no comment means no proof of life.
+        const reviewRecoveryAlreadyAttempted = isExecutionReviewParticipantRecoveryRun(run);
+        const reviewParticipantDeferred =
+          reviewRecoveryAlreadyAttempted &&
+          Boolean(recoveryAgent) &&
+          Boolean(recoveryAgentInvokable) &&
+          run.status === "succeeded" &&
+          !readNonEmptyString(run.errorCode) &&
+          Boolean(await findReviewParticipantProofOfLifeComment());
+        const reviewDeferralRetriesExhausted =
+          reviewParticipantDeferred &&
+          (await countTerminalReviewParticipantRecoveryRuns()) >=
+            EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT;
+
         const shouldBlockReviewRecovery =
           !recoveryAgentInvokable ||
           !recoveryAgent ||
-          isExecutionReviewParticipantRecoveryRun(run);
+          (reviewRecoveryAlreadyAttempted &&
+            !(reviewParticipantDeferred && !reviewDeferralRetriesExhausted));
         if (shouldBlockReviewRecovery) {
           return {
             kind: "blocked" as const,
             issue,
             previousStatus: issue.status,
-            comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
+            comment: buildExecutionReviewParticipantRecoveryComment({
+              latestRun: run,
+              deferralRetriesExhausted: reviewDeferralRetriesExhausted,
+            }),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
             recoveryOwnerAgentId: currentParticipant.agentId,
           };
@@ -15111,18 +15804,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         !recoveryAgent ||
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
+        isOpenCodeDatabaseGrowthLimitFailedRun(run) ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
       if (shouldBlockImmediately) {
         const workspaceValidationFailure = isWorkspaceValidationFailedRun(run);
         const configurationIncompleteFailure = isConfigurationIncompleteFailedRun(run);
+        const databaseGrowthLimitFailure = isOpenCodeDatabaseGrowthLimitFailedRun(run);
         const comment = workspaceValidationFailure
           ? buildWorkspaceValidationRecoveryComment({ latestRun: run })
           : configurationIncompleteFailure
             ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
-            : buildImmediateExecutionPathRecoveryComment({
-                status: issue.status as "todo" | "in_progress",
-                latestRun: run,
-              });
+            : databaseGrowthLimitFailure
+              ? buildOpenCodeDatabaseGrowthLimitRecoveryComment({ latestRun: run })
+              : buildImmediateExecutionPathRecoveryComment({
+                  status: issue.status as "todo" | "in_progress",
+                  latestRun: run,
+                });
         return {
           kind: "blocked" as const,
           issue,
@@ -15132,7 +15829,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
             : configurationIncompleteFailure
               ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-              : undefined,
+              : databaseGrowthLimitFailure
+                ? OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE
+                : undefined,
         };
       }
 
@@ -15245,6 +15944,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
               : promotionResult.recoveryCause === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
                 ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
+              : promotionResult.recoveryCause === OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE
+                ? OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE
               : undefined,
         recoveryOwnerAgentId: promotionResult.recoveryOwnerAgentId,
       });
@@ -17116,9 +17817,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     sweepStaleIssueLocks,
 
+    reconcileBlockedWithoutBlockers,
+    reconcileResolvedDependencyWakeBackstop,
+    reconcileStaleRecoveryActionWakes,
+
+    reconcileUnfinalizableWorkspaceBarriers,
+
+    ingestStaleInReviewChildIssues,
+
     buildIssueGraphLivenessAutoRecoveryPreview,
 
     reconcileIssueGraphLiveness,
+
+    reconcileStillbornAssignedBacklog,
+
+    reconcileCancelledOnlyBlockerDependents,
 
     scanSilentActiveRuns,
     scanTerminableSilentActiveRuns,

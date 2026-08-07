@@ -21,6 +21,9 @@ vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClien
 
 import { heartbeatService } from "../services/heartbeat.ts";
 
+// loadConfig() in recovery/service.ts validates bind mode eagerly.
+process.env.PAPERCLIP_BIND = "loopback";
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 

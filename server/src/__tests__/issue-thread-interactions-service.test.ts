@@ -98,6 +98,22 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     return { companyId, goalId, issueId };
   }
 
+  async function seedAgent(companyId: string) {
+    const id = randomUUID();
+    await db.insert(agents).values({
+      id,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return id;
+  }
+
   it("accepts suggested tasks by creating a rooted issue tree under the current issue", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();
@@ -2522,5 +2538,488 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         status: "accepted",
       });
     });
+  });
+
+  it("author withdraws a pending interaction with an agent token", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Author withdrawal");
+    const authorAgentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    const withdrawn = await interactionsSvc.withdrawInteraction(
+      { id: issueId, companyId },
+      created.id,
+      { reason: "No longer needed" },
+      { agentId: authorAgentId },
+    );
+
+    expect(withdrawn.status).toBe("expired");
+    expect(withdrawn.result).toMatchObject({
+      version: 1,
+      outcome: "withdrawn_by_author",
+      reason: "No longer needed",
+    });
+
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("expired");
+  });
+
+  it("non-author agent withdrawal returns 403 and leaves the row pending", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Non-author withdrawal");
+    const authorAgentId = await seedAgent(companyId);
+    const otherAgentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    await expect(
+      interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        created.id,
+        {},
+        { agentId: otherAgentId },
+      ),
+    ).rejects.toThrow("Only the author of this interaction can withdraw it");
+
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("pending");
+  });
+
+  it("board actors cannot withdraw interactions (agent-only authz)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Board actor withdrawal");
+    const authorAgentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    await expect(
+      interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        created.id,
+        {},
+        { userId: "local-board" },
+      ),
+    ).rejects.toThrow("Only the author of this interaction can withdraw it");
+
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("pending");
+  });
+
+  it("withdrawal without a reason persists null reason", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Withdrawal without reason");
+    const authorAgentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    const withdrawn = await interactionsSvc.withdrawInteraction(
+      { id: issueId, companyId },
+      created.id,
+      {},
+      { agentId: authorAgentId },
+    );
+
+    expect(withdrawn.result).toMatchObject({
+      version: 1,
+      outcome: "withdrawn_by_author",
+      reason: null,
+    });
+  });
+
+  it("withdrawal with an empty reason persists null reason", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Withdrawal with empty reason");
+    const authorAgentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    const withdrawn = await interactionsSvc.withdrawInteraction(
+      { id: issueId, companyId },
+      created.id,
+      { reason: "   " },
+      { agentId: authorAgentId },
+    );
+
+    expect(withdrawn.result).toMatchObject({
+      version: 1,
+      outcome: "withdrawn_by_author",
+      reason: null,
+    });
+  });
+
+  it("withdrawal reason is capped at 500 characters", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Withdrawal reason cap");
+    const authorAgentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    const longReason = "x".repeat(501);
+    await expect(
+      interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        created.id,
+        { reason: longReason },
+        { agentId: authorAgentId },
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("withdrawal of an already-resolved interaction returns 409", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Withdrawn twice");
+    const authorAgentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    await interactionsSvc.withdrawInteraction(
+      { id: issueId, companyId },
+      created.id,
+      {},
+      { agentId: authorAgentId },
+    );
+
+    await expect(
+      interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        created.id,
+        {},
+        { agentId: authorAgentId },
+      ),
+    ).rejects.toThrow("Interaction has already been resolved");
+
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("expired");
+  });
+
+  it("accepting a withdrawn interaction returns 409 and leaves the row unchanged", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Accept after withdraw");
+    const authorAgentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    await interactionsSvc.withdrawInteraction(
+      { id: issueId, companyId },
+      created.id,
+      {},
+      { agentId: authorAgentId },
+    );
+
+    await expect(
+      interactionsSvc.acceptInteraction(
+        { id: issueId, companyId, goalId: null, projectId: null },
+        created.id,
+        {},
+        { agentId: authorAgentId },
+      ),
+    ).rejects.toThrow("Interaction has already been resolved");
+
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("expired");
+  });
+
+  it("withdrawal of an unknown interaction returns 404", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Unknown interaction withdraw");
+    const authorAgentId = await seedAgent(companyId);
+
+    await expect(
+      interactionsSvc.withdrawInteraction(
+        { id: issueId, companyId },
+        randomUUID(),
+        {},
+        { agentId: authorAgentId },
+      ),
+    ).rejects.toThrow("Interaction not found");
+  });
+
+  it("withdrawal of a cross-issue interaction returns 404", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Cross-issue withdraw");
+    const otherIssueId = randomUUID();
+    const authorAgentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    await expect(
+      interactionsSvc.withdrawInteraction(
+        { id: otherIssueId, companyId },
+        created.id,
+        {},
+        { agentId: authorAgentId },
+      ),
+    ).rejects.toThrow("Interaction not found");
+  });
+
+  it("withdrawal applies to all user-comment-supersedable interaction kinds", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Multi-kind withdrawal");
+    const authorAgentId = await seedAgent(companyId);
+
+    const checkbox = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_checkbox_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Check?",
+        options: [{ id: "a", label: "A" }],
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    const withdrawn = await interactionsSvc.withdrawInteraction(
+      { id: issueId, companyId },
+      checkbox.id,
+      { reason: "Done" },
+      { agentId: authorAgentId },
+    );
+
+    expect(withdrawn.status).toBe("expired");
+    expect(withdrawn.result).toMatchObject({
+      version: 1,
+      outcome: "withdrawn_by_author",
+      reason: "Done",
+    });
+  });
+
+  it("expiring pending interactions on terminal status (done) with expired_issue_terminal outcome", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Terminal expiry done");
+    const authorAgentId = await seedAgent(companyId);
+
+    await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    const expired = await interactionsSvc.expirePendingInteractionsOnTerminalIssueStatus(
+      { id: issueId, companyId },
+      "done",
+      { agentId: authorAgentId },
+    );
+
+    expect(expired).toHaveLength(1);
+    expect(expired[0]?.status).toBe("expired");
+    expect(expired[0]?.result).toMatchObject({
+      version: 1,
+      outcome: "expired_issue_terminal",
+    });
+  });
+
+  it("expiring pending interactions on terminal status (cancelled) with expired_issue_terminal outcome", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Terminal expiry cancelled");
+    const authorAgentId = await seedAgent(companyId);
+
+    await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    const expired = await interactionsSvc.expirePendingInteractionsOnTerminalIssueStatus(
+      { id: issueId, companyId },
+      "cancelled",
+      { agentId: authorAgentId },
+    );
+
+    expect(expired).toHaveLength(1);
+    expect(expired[0]?.status).toBe("expired");
+    expect(expired[0]?.result).toMatchObject({
+      version: 1,
+      outcome: "expired_issue_terminal",
+    });
+  });
+
+  it("terminal status expiry does not expire already-resolved interactions", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Terminal expiry skips resolved");
+    const authorAgentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    await interactionsSvc.withdrawInteraction(
+      { id: issueId, companyId },
+      created.id,
+      {},
+      { agentId: authorAgentId },
+    );
+
+    const expired = await interactionsSvc.expirePendingInteractionsOnTerminalIssueStatus(
+      { id: issueId, companyId },
+      "done",
+      { agentId: authorAgentId },
+    );
+
+    expect(expired).toHaveLength(0);
+
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("expired");
+  });
+
+  it("terminal status expiry is a no-op for non-terminal statuses", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Non-terminal expiry no-op");
+    const authorAgentId = await seedAgent(companyId);
+
+    await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Confirm?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+
+    const expired = await interactionsSvc.expirePendingInteractionsOnTerminalIssueStatus(
+      { id: issueId, companyId },
+      "in_progress",
+      { agentId: authorAgentId },
+    );
+
+    expect(expired).toHaveLength(0);
+
+    const rows = await db.select().from(issueThreadInteractions);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("pending");
   });
 });

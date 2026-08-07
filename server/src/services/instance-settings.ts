@@ -188,6 +188,7 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       backupRetention: parsed.data.backupRetention ?? DEFAULT_BACKUP_RETENTION,
       // Absent => unrestricted; only carry through an explicit policy.
       ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
+      enableBlockedWithoutBlockersAutoHeal: parsed.data.enableBlockedWithoutBlockersAutoHeal ?? false,
     };
   }
   return {
@@ -195,6 +196,7 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
     keyboardShortcuts: false,
     feedbackDataSharingPreference: DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
     backupRetention: DEFAULT_BACKUP_RETENTION,
+    enableBlockedWithoutBlockersAutoHeal: false,
   };
 }
 

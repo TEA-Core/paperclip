@@ -105,6 +105,20 @@ describe("built-in agent asset loading", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("reflection-coach bundle forbids terminal status while pending acceptance gates exist (SUP-11332)", () => {
+    const definitions = listBuiltInAgentDefinitions();
+    const reflectionCoach = definitions.find((definition) => definition.key === "reflection-coach");
+    expect(reflectionCoach).toBeDefined();
+
+    const routineDescription = reflectionCoach?.bundle?.routine?.description ?? "";
+    expect(routineDescription).toContain("Do not close this issue while any `request_confirmation` gate is still `pending`");
+    expect(routineDescription).toContain("terminal status");
+    expect(routineDescription).toContain("expires every pending user-facing interaction");
+
+    const instructions = reflectionCoach?.defaultInstructions ?? "";
+    expect(instructions).toContain("Never mark an issue `done` or `cancelled` while a `request_confirmation`");
+  });
 });
 
 describeEmbeddedPostgres("built-in agents", () => {

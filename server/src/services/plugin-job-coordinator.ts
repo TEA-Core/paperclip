@@ -126,11 +126,15 @@ export function createPluginJobCoordinator(
       const jobDeclarations = manifest.jobs ?? [];
 
       if (jobDeclarations.length > 0) {
+        // One row per (company, job) — see syncJobDeclarations. Resolve the
+        // enabled-company set here so a job dispatched later carries a scope.
+        const companyIds = await registry.listEnabledCompanyIds(pluginId);
+
         log.info(
-          { pluginId, pluginKey, jobCount: jobDeclarations.length },
+          { pluginId, pluginKey, jobCount: jobDeclarations.length, companyCount: companyIds.length },
           "syncing job declarations from manifest",
         );
-        await jobStore.syncJobDeclarations(pluginId, jobDeclarations);
+        await jobStore.syncJobDeclarations(pluginId, jobDeclarations, companyIds);
       }
 
       // Register with the scheduler (computes nextRunAt for active jobs)

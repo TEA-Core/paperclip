@@ -2600,11 +2600,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "failed",
       errorCode: "workspace_validation_failed",
     });
-    expect(failedRun?.error).toContain("linked to a project workspace but has no project id");
+    expect(failedRun?.error).toContain("no project cwd was resolved");
     expect(failedRun?.resultJson).toMatchObject({
       workspaceValidation: {
-        reason: "missing_project_id",
-        adapterType: "codex_local",
+        // SUP-11115 (#89) refuses the unrealizable project_primary fabrication earlier than the
+        // missing_project_id check, so this issue is now rejected at the fabrication guard. The
+        // property under test is unchanged: the run is failed before the adapter is launched.
+        reason: "project_primary_base_agent_home",
         issueId,
         issueProjectId: null,
         issueProjectWorkspaceId: projectWorkspaceId,
@@ -3963,7 +3965,115 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.assigneeAgentId).toBe(agentId);
   });
 
-  it("retries a pending execution-review participant once before blocking with a recovery action", async () => {
+  it("keeps a deliberately abstaining review participant in review instead of blocking it", async () => {
+    // SUP-11306 / replay of SUP-11280: the reviewer ran to completion on a recovery wake and
+    // posted an abstention comment instead of deciding. That is a healthy reviewer, not a dead
+    // execution path, so the stage must stay pending with no recovery action against itself.
+    const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture({
+      wakeReason: "execution_review_participant_recovery",
+      retryReason: "execution_review_participant_recovery",
+    });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      createdByRunId: runId,
+      body: "Deferring the review decision this wake: the doctrine mount is stale, which is a self-gate.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+    expect(settledRun?.status).toBe("succeeded");
+
+    // The stage is re-armed under the same reviewer rather than escalated. The re-armed run
+    // is a terminal artifact: had the abstention blocked the issue, it would not exist.
+    const rearmedRun = await waitForValue(async () => {
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return runs.find((row) => row.retryOfRunId === runId) ?? null;
+    }, 8_000);
+    expect(rearmedRun).toMatchObject({ companyId, agentId, retryOfRunId: runId });
+    expect(rearmedRun?.contextSnapshot).toMatchObject({
+      issueId,
+      currentStageId: stageId,
+      currentStageType: "review",
+      retryReason: "execution_review_participant_recovery",
+    });
+
+    // No recovery action was opened against the abstaining run itself. (The stub adapter
+    // never records a decision, so the chain does eventually spend the deferral budget —
+    // what must not happen is an escalation attributed to this abstention.)
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    for (const action of recoveryActions) {
+      expect((action.evidence as Record<string, unknown> | null)?.latestRunId).not.toBe(runId);
+    }
+  });
+
+  it("blocks a review participant that keeps deferring past the deferral retry limit", async () => {
+    const { companyId, agentId, issueId, runId } = await seedInReviewParticipantRunFixture({
+      wakeReason: "execution_review_participant_recovery",
+      retryReason: "execution_review_participant_recovery",
+    });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      createdByRunId: runId,
+      body: "Still deferring the review decision.",
+    });
+    // Two earlier terminal deferral retries already burned the budget; this run is the third.
+    for (const index of [0, 1]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "succeeded",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "execution_review_participant_recovery",
+          retryReason: "execution_review_participant_recovery",
+        },
+        startedAt: new Date(`2026-03-18T0${index}:00:00.000Z`),
+        finishedAt: new Date(`2026-03-18T0${index}:05:00.000Z`),
+        updatedAt: new Date(`2026-03-18T0${index}:05:00.000Z`),
+      });
+    }
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    // Wait on the escalation comment, not on `status === "blocked"`. Other recovery sweeps
+    // also block a stranded issue, and one of them can win the race — polling the status
+    // lets the test read the comments before this path has written its own.
+    const escalationComment = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.find((comment) => comment.body.includes("deferral limit")) ?? null;
+    }, 8_000);
+    expect(escalationComment).toBeTruthy();
+
+    const blockedIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(blockedIssue?.status).toBe("blocked");
+    // The reviewer demonstrably ran, so the escalation must not claim there was no live run.
+    expect(escalationComment?.body).not.toContain("live reviewer run");
+  });
+
+  // SUP-11306: a reviewer whose run keeps succeeding is not a dead execution path, so the
+  // stage is re-armed under it up to the deferral limit before the issue is escalated.
+  it("retries a pending execution-review participant up to the deferral limit before blocking with a recovery action", { timeout: 10_000 }, async () => {
     const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
     const heartbeat = heartbeatService(db);
 
@@ -4000,31 +4110,58 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(reviewRecoveryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
 
-    const sourceIssue = await waitForValue(async () => {
-      const row = await db
-        .select()
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      return row?.status === "blocked" ? row : null;
+    // Wait on the escalation comment, not on `status === "blocked"`. Other recovery sweeps
+    // also block a stranded issue, and one of them can win the race — polling the status
+    // lets the test read the comments before this path has written its own.
+    const escalationComment = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.find((comment) => comment.body.includes("deferral limit")) ?? null;
     }, 8_000);
+    expect(escalationComment).toBeTruthy();
+
+    const sourceIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
     expect(sourceIssue).toMatchObject({
       status: "blocked",
       assigneeAgentId: agentId,
       executionRunId: null,
     });
 
+    // The reviewer is re-armed until the deferral budget is spent, so the escalation is
+    // attributed to the last recovery run rather than to the first one. Poll for exactly
+    // three succeeded recovery runs — on a cold run the re-arming chain may still be in
+    // flight, so a one-shot read can race and see fewer than three.
+    const terminalRecoveryRuns = await waitForValue(async () => {
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      const succeeded = runs.filter((row) =>
+        (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+          "execution_review_participant_recovery" &&
+        row.status === "succeeded"
+      );
+      return succeeded.length === 3 ? succeeded : null;
+    }, 8_000);
+    expect(terminalRecoveryRuns).toHaveLength(3);
+    const blockingRun = terminalRecoveryRuns.reduce((latest, row) =>
+      row.createdAt > latest.createdAt ? row : latest
+    );
+
     const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
       companyId,
       agentId,
       issueId,
-      runId: reviewRecoveryRun!.id,
+      runId: blockingRun.id,
       previousStatus: "in_review",
       retryReason: "execution_review_participant_recovery",
       cause: "execution_review_participant_recovery",
     });
     expect(recoveryAction.evidence).toMatchObject({
-      latestRunId: reviewRecoveryRun?.id,
+      latestRunId: blockingRun.id,
       latestRunStatus: "succeeded",
       latestRunErrorCode: null,
       recoveryCause: "execution_review_participant_recovery",
@@ -4032,10 +4169,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     const recoveryComment = comments.find((comment) =>
-      comment.body.includes("pending execution-review participant once") &&
+      comment.body.includes("deferral limit") &&
         comment.body.includes(`Recovery action: \`${recoveryAction.id}\``),
     );
     expect(recoveryComment).toBeTruthy();
+    // Every one of those runs succeeded, so the escalation must not assert there was no
+    // live reviewer run (SUP-11306).
+    expect(recoveryComment?.body).not.toContain("live reviewer run");
 
     const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) =>
@@ -5059,6 +5199,69 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  // SUP-11280: the growth guard kills a run for the command it chose, so a blind
+  // continuation re-runs that command and trips at the same place. On 2026-08-06
+  // that cost two identical 250 MB trips on one issue inside four minutes.
+  it("blocks in-progress work killed by the opencode database growth guard instead of re-dispatching it", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "opencode_db_growth_limit",
+      runError:
+        "OpenCode database grew 265.6 MB during this run (limit 256.0 MB, 412.5 MB → 678.1 MB).",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    // No continuation run was queued for the same work. The one extra run is the
+    // source-scoped recovery wake, which is scoped away from deliverable work.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const continuationRuns = runs.filter(
+      (row) =>
+        (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+        "issue_continuation_needed",
+    );
+    expect(continuationRuns).toEqual([]);
+    for (const row of runs) {
+      if (row.id === runId) continue;
+      expect(row.contextSnapshot).toMatchObject({
+        source: "issue_recovery_action",
+        allowDeliverableWork: false,
+      });
+    }
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const recoveryAction = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(recoveryAction).toMatchObject({
+      cause: "opencode_db_growth_limit",
+      status: "active",
+      recoveryIssueId: null,
+    });
+    expect(recoveryAction?.nextAction).toContain("redirect it to a file");
+
+    // The comment has to carry the remediation, or the next attempt repeats it.
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("OpenCode database grew past the per-run budget");
+    expect(comments[0]?.body).toContain("tail -100");
+  });
+
   it("does not continue seeded in-progress work that has no run linkage", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -5746,7 +5949,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.dispatchRequeued).toBe(0);
     expect(result.continuationRequeued).toBe(0);
     expect(result.escalated).toBe(0);
-    expect(result.skipped).toBe(1);
+    // SUP-11085 (#83) widened the candidate filter to admit unassigned todo/in_progress issues, so
+    // this fixture now contributes a second candidate. It is skipped inside the grace window, which
+    // is why the assertions that carry the actual guarantee — escalated, issueIds, and the issue's
+    // own status — are unchanged.
+    expect(result.skipped).toBe(2);
     expect(result.issueIds).toEqual([]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);

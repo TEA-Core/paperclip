@@ -66,3 +66,7 @@ tests/storybook-visual/playwright-report/
 .superpowers/
 .claude/worktrees/
 .herenow
+
+# Per-branch deliver.sh scope declaration — must never be committed:
+# a committed copy mis-scopes every later branch (SUP-11169 leaked one in #103).
+.deliver-scope

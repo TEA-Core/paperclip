@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -33,9 +34,11 @@ import {
   writeLocalServiceRegistryRecord,
 } from "./local-service-supervisor.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
-import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { executionWorkspaceService, readExecutionWorkspaceConfig, type ExecutionWorkspaceBranchReconcileMode } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+
+const execFileAsync = promisify(execFile);
 
 export function resolveShell(): string {
   const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
@@ -679,6 +682,7 @@ async function remoteExists(repoRoot: string, remote: string): Promise<boolean> 
 }
 
 const GIT_WORKTREE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
+const WORKTREE_METADATA_MISSING_REASON = "worktree_metadata_missing";
 
 type GitWorktreeCleanliness = SharedGitWorktreeBranchIncoherenceEvidence["cleanliness"];
 
@@ -894,6 +898,70 @@ async function assertGitIndexIsUnlocked(worktreePath: string) {
   }
 }
 
+// Detect a truncated (zero-byte) git index before any git read/write that would
+// fatal on it. A zero-byte index is unrecoverable worktree corruption, not a
+// transient lock — surfacing it as a workspace validation failure keeps the
+// dispatch loop from crash-looping the agent into `error` and leaves the run
+// with an errorCode operators can search on.
+export async function assertGitIndexIntegrity(worktreePath: string): Promise<void> {
+  const indexFile = await runGit(["rev-parse", "--git-path", "index"], worktreePath).catch(() => null);
+  if (!indexFile) return;
+  try {
+    const stats = await fs.stat(indexFile);
+    if (stats.size === 0) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Git index at "${indexFile}" is 0 bytes (truncated). The worktree git index is corrupted and must be repaired before the worktree can be used.`,
+        {
+          workspaceValidation: {
+            reason: "git_index_truncated",
+            worktreePath,
+            indexFile,
+            size: 0,
+          },
+        },
+      );
+    }
+  } catch (error) {
+    if (error instanceof WorkspaceRuntimeValidationFailure) throw error;
+    // Index file absent (fresh repo) or unstat-able — nothing to guard.
+  }
+}
+
+/**
+ * Refuse a worktree whose HEAD does not resolve to a commit.
+ *
+ * SUP-10008 and SUP-10933 both reached provisioning with HEAD pointing at a branch ref that no
+ * longer existed. `git worktree list` shows such a worktree as `000000000` and every rev-parse
+ * fails, so an agent dispatched there cannot commit, branch, or diff — whatever it does strands.
+ *
+ * The reuse preflight never caught it because the branch-coherence check asks
+ * `git symbolic-ref --short HEAD`, which reports the symref's *target name* whether or not that ref
+ * exists. The name matched the recorded branch, so the check returned early and validation moved
+ * on. The run then failed later and elsewhere — SUP-10008 surfaced as a pnpm lockfile error — which
+ * pointed the operator at the wrong thing entirely.
+ *
+ * Deliberately narrow: this asserts only that HEAD resolves. A dirty tree, deleted tracked files, a
+ * detached HEAD and an interrupted rebase all resolve fine and are none of this guard's business.
+ */
+export async function assertGitHeadResolvable(worktreePath: string): Promise<void> {
+  const head = await runGit(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], worktreePath).catch(() => null);
+  if (head) return;
+
+  const symbolicTarget = await runGit(["symbolic-ref", "--quiet", "HEAD"], worktreePath).catch(() => null);
+  throw new WorkspaceRuntimeValidationFailure(
+    symbolicTarget
+      ? `Git HEAD at "${worktreePath}" does not resolve to a commit: it points at "${symbolicTarget}", which no longer exists. The worktree's branch ref was deleted or was never created, so git cannot commit, branch or diff here. Recreate the branch at the intended commit, or clear the issue's reuse_existing workspace binding so a fresh workspace is provisioned.`
+      : `Git HEAD at "${worktreePath}" does not resolve to a commit. The worktree git metadata is corrupted and must be repaired before the worktree can be used.`,
+    {
+      workspaceValidation: {
+        reason: "git_head_unresolvable",
+        worktreePath,
+        symbolicTarget: symbolicTarget ?? null,
+      },
+    },
+  );
+}
+
 function fingerprintWorkspaceBranchIncoherence(input: {
   sourceIssueId: string | null;
   executionWorkspaceId: string | null;
@@ -921,6 +989,25 @@ function fingerprintWorkspaceBranchIncoherence(input: {
   return `workspace_incoherence:v1:sha256:${digest}`;
 }
 
+function fingerprintWorktreeMetadataMissing(input: {
+  sourceIssueId: string | null;
+  executionWorkspaceId: string | null;
+  worktreePath: string;
+  expectedBranch: string;
+}) {
+  const digest = createHash("sha256")
+    .update(stableStringify({
+      version: 1,
+      reason: WORKTREE_METADATA_MISSING_REASON,
+      sourceIssueId: input.sourceIssueId,
+      executionWorkspaceId: input.executionWorkspaceId,
+      worktreePath: path.resolve(input.worktreePath),
+      expectedBranch: input.expectedBranch,
+    }))
+    .digest("hex");
+  return `workspace_metadata_missing:v1:sha256:${digest}`;
+}
+
 async function getGitWorktreeBranchAncestryVerdict(input: {
   repoRoot: string;
   expectedHeadSha: string | null;
@@ -937,6 +1024,38 @@ async function getGitWorktreeBranchAncestryVerdict(input: {
   if (proc.code === 0) return "ancestor";
   if (proc.code === 1) return "diverged";
   return "unknown";
+}
+
+/**
+ * Is the checked-out HEAD already contained in the recorded branch?
+ *
+ * `getGitWorktreeBranchAncestryVerdict` only asks the forward question (is the recorded branch an
+ * ancestor of HEAD), so its "diverged" verdict conflates two states that must be treated
+ * differently:
+ *
+ * - HEAD is *behind* the recorded branch — every commit it carries is already reachable from the
+ *   recorded branch, so restoring that branch abandons nothing. This is the leftover-branch state
+ *   SUP-10665 was filed for.
+ * - HEAD and the recorded branch have genuinely diverged — HEAD carries commits the recorded branch
+ *   does not. Restoring the recorded branch silently walks away from another run's work, which is
+ *   exactly what workspace-branch containment exists to prevent.
+ *
+ * Only the first is a safe repair. Returns false on an indeterminate git result, so an unanswerable
+ * question fails closed.
+ */
+async function isActualHeadContainedInExpectedBranch(input: {
+  repoRoot: string;
+  expectedHeadSha: string | null;
+  actualHeadSha: string | null;
+}): Promise<boolean> {
+  if (!input.expectedHeadSha || !input.actualHeadSha) return false;
+
+  const proc = await executeProcess({
+    command: "git",
+    args: ["merge-base", "--is-ancestor", input.actualHeadSha, input.expectedHeadSha],
+    cwd: input.repoRoot,
+  }).catch(() => null);
+  return proc?.code === 0;
 }
 
 function explainGitWorktreeBranchIncoherence(input: {
@@ -963,6 +1082,68 @@ function explainGitWorktreeBranchIncoherence(input: {
   return `Paperclip could not determine whether the checked-out branch "${actualBranch}" is forward of the recorded branch "${input.expectedBranchName}".`;
 }
 
+async function buildWorktreeMetadataMissingEvidence(input: {
+  db?: Db | null;
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranchName: string;
+  sourceIssue: ExecutionWorkspaceIssueRef | null;
+  executionWorkspaceId?: string | null;
+}): Promise<GitWorktreeBranchIncoherenceEvidence> {
+  const expectedHeadSha = await runGit(
+    ["rev-parse", "--verify", `refs/heads/${input.expectedBranchName}^{commit}`],
+    input.repoRoot,
+  ).catch(() => null);
+  const expectedBranchExists = Boolean(expectedHeadSha);
+
+  return {
+    reason: WORKTREE_METADATA_MISSING_REASON,
+    fingerprint: fingerprintWorktreeMetadataMissing({
+      sourceIssueId: input.sourceIssue?.id ?? null,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+      worktreePath: input.worktreePath,
+      expectedBranch: input.expectedBranchName,
+    }),
+    sourceIssueId: input.sourceIssue?.id ?? null,
+    sourceIdentifier: input.sourceIssue?.identifier ?? null,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    worktreePath: path.resolve(input.worktreePath),
+    repoRoot: path.resolve(input.repoRoot),
+    expectedBranch: input.expectedBranchName,
+    actualBranch: null,
+    cleanliness: "unknown",
+    inProgressOperation: null,
+    statusEntryCount: null,
+    dirtyPathSample: [],
+    contention: null,
+    provenance: {
+      expectedBranchRef: `refs/heads/${input.expectedBranchName}`,
+      actualBranchRef: null,
+      registeredBranchRef: null,
+      registeredPathFound: false,
+      registeredBranchMatchesHead: false,
+      expectedBranchExists,
+      actualBranchExists: null,
+      expectedHeadSha,
+      actualHeadSha: null,
+      sameHead: false,
+      ancestryVerdict: "unknown",
+      defaultBranch: await detectDefaultBranch(input.repoRoot).catch(() => null),
+      // There is no checked-out branch to compare: the path has no worktree
+      // metadata, so nothing here can be the default branch.
+      actualBranchIsDefaultBranch: false,
+      plainLanguageReason:
+        "The workspace path is not a registered git worktree; its git metadata is missing or resolves to a different repository.",
+    },
+    safeRepair: {
+      eligible: true,
+      attempted: false,
+      succeeded: false,
+      reason: "worktree metadata is missing; relinking or re-provisioning may repair it",
+    },
+  };
+}
+
 async function inspectGitWorktreeBranchIncoherence(input: {
   db?: Db | null;
   repoRoot: string;
@@ -972,6 +1153,22 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   sourceIssue: ExecutionWorkspaceIssueRef | null;
   executionWorkspaceId?: string | null;
 }): Promise<GitWorktreeBranchIncoherenceEvidence> {
+  const resolvedTopLevel = await runGit(["rev-parse", "--show-toplevel"], input.worktreePath)
+    .then((output) => resolvePathForWorktreeComparison(output))
+    .catch(() => null);
+  const expectedPath = await resolvePathForWorktreeComparison(input.worktreePath);
+  const registered = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  if (!resolvedTopLevel || resolvedTopLevel !== expectedPath || !registered) {
+    return buildWorktreeMetadataMissingEvidence({
+      db: input.db ?? null,
+      repoRoot: input.repoRoot,
+      worktreePath: input.worktreePath,
+      expectedBranchName: input.expectedBranchName,
+      sourceIssue: input.sourceIssue,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+    });
+  }
+
   const status = await runGit(
     ["status", "--porcelain", "--untracked-files=all"],
     input.worktreePath,
@@ -991,16 +1188,36 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const actualBranchExists = input.actualBranchName
     ? await localBranchExists(input.repoRoot, input.actualBranchName)
     : null;
-  const registered = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
   const actualBranchRef = input.actualBranchName ? `refs/heads/${input.actualBranchName}` : null;
   const registeredBranchRef = registered?.branch ?? null;
   const registeredBranchMatchesHead = Boolean(registered && registeredBranchRef === actualBranchRef);
   const sameHead = Boolean(expectedHeadSha && actualHeadSha && expectedHeadSha === actualHeadSha);
   const expectedBranchExists = Boolean(expectedHeadSha);
+  const defaultBranch = input.repoRoot ? await detectDefaultBranch(input.repoRoot) : null;
+  const actualBranchIsDefaultBranch =
+    Boolean(input.actualBranchName) &&
+    Boolean(defaultBranch) &&
+    normalizeDefaultBranchForComparison(input.actualBranchName) ===
+      normalizeDefaultBranchForComparison(defaultBranch);
   const ancestryVerdict = await getGitWorktreeBranchAncestryVerdict({
     repoRoot: input.repoRoot,
     expectedHeadSha,
     actualHeadSha,
+  });
+  const actualHeadContainedInExpectedBranch = await isActualHeadContainedInExpectedBranch({
+    repoRoot: input.repoRoot,
+    expectedHeadSha,
+    actualHeadSha,
+  });
+  // Contention is consulted by the eligibility predicates below, so it must be resolved before
+  // them: restoring the recorded branch is only safe while no *other* workspace is actively
+  // running on the branch this worktree is parked on.
+  const contention = await findGitWorktreeBranchContention({
+    db: input.db ?? null,
+    sourceIssue: input.sourceIssue,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    worktreePath: input.worktreePath,
+    actualBranchName: input.actualBranchName,
   });
   const basePlainLanguageReason = explainGitWorktreeBranchIncoherence({
     expectedBranchName: input.expectedBranchName,
@@ -1029,14 +1246,80 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     ancestryVerdict === "ancestor" &&
     !sameHead &&
     registeredBranchMatchesHead;
+  const canRebindDeletedBranchToDefaultBranch =
+    cleanliness === "clean" &&
+    !expectedBranchExists &&
+    actualBranchExists === true &&
+    registeredBranchMatchesHead &&
+    actualBranchIsDefaultBranch;
+  // SUP-10665: a reused worktree left on a leftover branch by the previous run must not dead-block
+  // forever. But the repair may only run when restoring the recorded branch abandons nothing — that
+  // is, when HEAD is already contained in the recorded branch. Divergence that would strand commits
+  // stays fail-closed; see heartbeat-workspace-branch-containment. (Divergence on a *live named
+  // branch* strands nothing and is handled by canRestoreRecordedBranchOverLiveNamedBranch below.)
+  const canRestoreRecordedBranchOverContainedHead =
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    !sameHead &&
+    registeredBranchMatchesHead &&
+    input.actualBranchName !== null &&
+    ancestryVerdict !== "ancestor" &&
+    actualHeadContainedInExpectedBranch;
+  // SUP-11207: the containment proof above is only *needed* when the commits on HEAD would
+  // otherwise become unreachable — a detached HEAD, or a branch ref that no longer exists. When
+  // HEAD is on a live named branch that git still resolves, checking out the recorded branch
+  // abandons nothing: every commit stays reachable from that branch's own ref, under a name the
+  // operator can see in `git branch`. Requiring containment here left every agent that ran
+  // `git checkout -b` inside its worktree permanently dead-blocked behind
+  // workspace_validation_failed. Still fail-closed on contention, because yanking the worktree
+  // back would pull the rug out from under another workspace's live run.
+  const canRestoreRecordedBranchOverLiveNamedBranch =
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    !sameHead &&
+    registeredBranchMatchesHead &&
+    input.actualBranchName !== null &&
+    actualBranchExists === true &&
+    ancestryVerdict !== "ancestor" &&
+    !contention;
+  // a detached HEAD that diverged from the recorded branch is refused by every
+  // predicate above, because reattachment is only provably lossless when the recorded branch
+  // already contains HEAD. But the hazard is narrower than the refusal: the detached commits are
+  // reachable from no ref, so checking the recorded branch out would strand them. Naming them on
+  // a rescue branch first — the same move the dirty-quarantine path already makes — removes that
+  // hazard, and the restore becomes as safe as canRestoreRecordedBranchOverLiveNamedBranch.
+  // Fail-closed on contention, as everywhere else here.
+  const canRescueDivergedDetachedHead =
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    !sameHead &&
+    registeredBranchMatchesHead &&
+    input.actualBranchName === null &&
+    Boolean(actualHeadSha) &&
+    ancestryVerdict !== "ancestor" &&
+    !contention;
   const eligible =
-    canCheckoutRecordedBranch || canAdoptForwardActualBranch || canAttachRecordedBranchToDetachedHead;
+    canCheckoutRecordedBranch ||
+    canAdoptForwardActualBranch ||
+    canAttachRecordedBranchToDetachedHead ||
+    canRebindDeletedBranchToDefaultBranch ||
+    canRestoreRecordedBranchOverContainedHead ||
+    canRestoreRecordedBranchOverLiveNamedBranch ||
+    canRescueDivergedDetachedHead;
   const safeRepairReason = eligible
     ? canCheckoutRecordedBranch
       ? "clean worktree and expected branch points at the current HEAD"
       : canAdoptForwardActualBranch
         ? "clean worktree and checked-out branch is forward of the recorded branch"
-        : "clean detached worktree HEAD is forward of the recorded branch"
+        : canAttachRecordedBranchToDetachedHead
+          ? "clean detached worktree HEAD is forward of the recorded branch"
+          : canRebindDeletedBranchToDefaultBranch
+            ? "clean worktree with deleted recorded branch is already on the default branch"
+            : canRestoreRecordedBranchOverContainedHead
+              ? "clean worktree HEAD is already contained in the recorded branch, so restoring it abandons no commits"
+              : canRescueDivergedDetachedHead
+                ? "clean detached worktree HEAD diverged from the recorded branch, so its commits are named on a rescue branch before the recorded branch is restored"
+                : `clean worktree HEAD is on live branch "${input.actualBranchName}", which keeps its commits reachable after the recorded branch is restored`
     : cleanliness !== "clean"
       ? inProgressOperation
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
@@ -1045,8 +1328,12 @@ async function inspectGitWorktreeBranchIncoherence(input: {
         ? "worktree path is not registered"
       : !registeredBranchMatchesHead
         ? "registered worktree branch does not match HEAD"
+      : contention
+        ? formatBranchContentionRefusal("recorded branch restore", contention)
       : !expectedBranchExists
-        ? "expected branch does not exist"
+        ? actualBranchIsDefaultBranch
+          ? "recorded branch is deleted but worktree is clean and already on the default branch"
+          : "expected branch does not exist"
         : !sameHead
           ? "expected branch and current HEAD differ"
           : "safe repair could not be proven";
@@ -1059,13 +1346,6 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     cleanliness,
     expectedHeadSha,
     actualHeadSha,
-  });
-  const contention = await findGitWorktreeBranchContention({
-    db: input.db ?? null,
-    sourceIssue: input.sourceIssue,
-    executionWorkspaceId: input.executionWorkspaceId ?? null,
-    worktreePath: input.worktreePath,
-    actualBranchName: input.actualBranchName,
   });
 
   return {
@@ -1095,6 +1375,8 @@ async function inspectGitWorktreeBranchIncoherence(input: {
       actualHeadSha,
       sameHead,
       ancestryVerdict,
+      defaultBranch,
+      actualBranchIsDefaultBranch,
       plainLanguageReason,
     },
     safeRepair: {
@@ -1107,19 +1389,26 @@ async function inspectGitWorktreeBranchIncoherence(input: {
 }
 
 function branchIncoherenceValidationFailure(evidence: GitWorktreeBranchIncoherenceEvidence) {
+  const message = evidence.reason === WORKTREE_METADATA_MISSING_REASON
+    ? `Execution workspace at "${evidence.worktreePath}" is missing its git worktree metadata. Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`
+    : `Execution workspace git worktree expected branch "${evidence.expectedBranch}" but found "${formatBranchForMessage(evidence.actualBranch)}" at "${evidence.worktreePath}". Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`;
   return new WorkspaceRuntimeValidationFailure(
-    `Execution workspace git worktree expected branch "${evidence.expectedBranch}" but found "${formatBranchForMessage(evidence.actualBranch)}" at "${evidence.worktreePath}". Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`,
+    message,
     {
       workspaceValidation: evidence,
     },
   );
 }
 
-function formatDirtyQuarantineContentionRefusal(contention: GitWorktreeBranchContention) {
+function formatBranchContentionRefusal(repairLabel: string, contention: GitWorktreeBranchContention) {
   const activeRunText = contention.activeRun
     ? ` with active run ${contention.activeRun.id}`
     : " with no active run";
-  return `dirty quarantine repair refused because workspace ${contention.claimedByWorkspaceId} already claims the live branch${activeRunText}`;
+  return `${repairLabel} refused because workspace ${contention.claimedByWorkspaceId} already claims the live branch${activeRunText}`;
+}
+
+function formatDirtyQuarantineContentionRefusal(contention: GitWorktreeBranchContention) {
+  return formatBranchContentionRefusal("dirty quarantine repair", contention);
 }
 
 function formatDirtyQuarantineFailure(error: unknown) {
@@ -1326,6 +1615,9 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
   evidence: GitWorktreeBranchIncoherenceEvidence;
   phase?: "worktree_prepare" | "workspace_finalize";
   recorder?: WorkspaceOperationRecorder | null;
+  // Set only when the recorded branch no longer exists: the sha to recreate it at, which is the
+  // worktree's HEAD from before the rescue commit moved it.
+  recreateRecordedBranchAtSha?: string | null;
 }): Promise<DirtyQuarantineRepairResult> {
   const companyId = await readIssueCompanyId(input.db, input.evidence.sourceIssueId);
   if (!companyId) {
@@ -1407,16 +1699,28 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
       failureLabel: "git commit dirty workspace rescue",
     });
     const rescueCommitSha = await runGit(["rev-parse", "HEAD"], input.worktreePath);
+    const recreateAtSha = input.recreateRecordedBranchAtSha ?? null;
+    // `checkout -B <branch> <sha>` rather than a plain checkout when the recorded branch is gone:
+    // the rescue commit already moved HEAD, so the branch has to be pinned back to the sha the
+    // worktree was on before the rescue, not to wherever HEAD sits now.
+    const restoreArgs = recreateAtSha
+      ? ["checkout", "--ignore-other-worktrees", "-B", input.expectedBranchName, recreateAtSha]
+      : ["checkout", input.expectedBranchName];
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
-      args: ["checkout", input.expectedBranchName],
+      args: restoreArgs,
       cwd: input.worktreePath,
       metadata: {
         ...baseMetadata,
         rescueCommitSha,
+        ...(recreateAtSha ? { recreatedRecordedBranchAtSha: recreateAtSha } : {}),
       },
-      successMessage: `Restored recorded branch ${input.expectedBranchName} after dirty workspace rescue ${rescueBranch}\n`,
-      failureLabel: `git checkout ${input.expectedBranchName}`,
+      successMessage: recreateAtSha
+        ? `Recreated deleted recorded branch ${input.expectedBranchName} at ${formatShortSha(recreateAtSha)} after dirty workspace rescue ${rescueBranch}\n`
+        : `Restored recorded branch ${input.expectedBranchName} after dirty workspace rescue ${rescueBranch}\n`,
+      failureLabel: recreateAtSha
+        ? `git checkout -B ${input.expectedBranchName} ${formatShortSha(recreateAtSha)}`
+        : `git checkout ${input.expectedBranchName}`,
     });
     expectedBranchRestored = true;
 
@@ -1507,7 +1811,14 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     };
   } catch (error) {
     if (rescueBranchCreated && !expectedBranchRestored) {
-      await runGit(["checkout", input.expectedBranchName], input.worktreePath).catch(() => null);
+      // When the recorded branch was deleted there is nothing to go back to under that name, so
+      // fall back to the branch the worktree was actually on. Otherwise a failed rescue leaves the
+      // worktree parked on the rescue branch, and the next dispatch would fold the quarantined
+      // dirty commit into the recorded branch it recreates.
+      const rollbackTarget = input.recreateRecordedBranchAtSha && input.evidence.actualBranch
+        ? input.evidence.actualBranch
+        : input.expectedBranchName;
+      await runGit(["checkout", rollbackTarget], input.worktreePath).catch(() => null);
     }
     if (error instanceof WorkspaceRuntimeValidationFailure) throw error;
     input.evidence.safeRepair.succeeded = false;
@@ -1571,7 +1882,7 @@ async function logForwardBranchReconcileActivity(input: {
   executionWorkspaceId: string;
   sourceIssueId: string | null;
   runId: string | null;
-  mode: "forward";
+  mode: ExecutionWorkspaceBranchReconcileMode;
   reason: string | null;
   fromBranch: string;
   toBranch: string;
@@ -1706,6 +2017,10 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     executionWorkspaceId: input.executionWorkspaceId ?? null,
   });
 
+  if (evidence.reason === WORKTREE_METADATA_MISSING_REASON) {
+    throw branchIncoherenceValidationFailure(evidence);
+  }
+
   if (evidence.cleanliness === "dirty" && input.enableWorkspaceDirtyQuarantineRepair === true) {
     if (!input.db) {
       evidence.safeRepair.reason = "dirty quarantine repair requires database access for claimant checks and audit";
@@ -1715,8 +2030,18 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       evidence.safeRepair.reason = "dirty quarantine repair requires a registered git worktree path";
       throw branchIncoherenceValidationFailure(evidence);
     }
-    if (!evidence.provenance.expectedBranchExists) {
-      evidence.safeRepair.reason = "dirty quarantine repair requires the recorded branch to exist";
+    // A deleted recorded branch used to be an unconditional refusal, which dead-blocked every later
+    // dispatch for an issue whose agent had merely renamed its branch. The refusal is not what keeps
+    // commits safe here: the deletion already happened, and recreating the branch at the worktree's
+    // current HEAD makes nothing unreachable that was still reachable a moment ago. What it cannot
+    // do is recover whatever the branch pointed at before it was deleted, so the repair is only
+    // allowed when there is a HEAD to recreate from, and it always says so in the warning.
+    const recordedBranchRecreateSha = evidence.provenance.expectedBranchExists
+      ? null
+      : evidence.provenance.actualHeadSha;
+    if (!evidence.provenance.expectedBranchExists && !recordedBranchRecreateSha) {
+      evidence.safeRepair.reason =
+        "dirty quarantine repair requires the recorded branch to exist, or a resolvable worktree HEAD to recreate it from";
       throw branchIncoherenceValidationFailure(evidence);
     }
     if (evidence.contention) {
@@ -1743,17 +2068,21 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       evidence,
       phase: input.reconcileOperationPhase,
       recorder: input.recorder ?? null,
+      recreateRecordedBranchAtSha: recordedBranchRecreateSha,
     });
     evidence.safeRepair.succeeded = true;
+    const recreatedNote = recordedBranchRecreateSha
+      ? `; recorded branch had been deleted and was recreated at ${formatShortSha(recordedBranchRecreateSha)}`
+      : "";
     evidence.safeRepair.reason = result.clearedInProgressOperation
-      ? `dirty worktree quarantined on ${result.rescueBranch} at ${formatShortSha(result.rescueCommitSha)}; interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} state cleared`
-      : `dirty worktree quarantined on ${result.rescueBranch} at ${formatShortSha(result.rescueCommitSha)}`;
+      ? `dirty worktree quarantined on ${result.rescueBranch} at ${formatShortSha(result.rescueCommitSha)}; interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} state cleared${recreatedNote}`
+      : `dirty worktree quarantined on ${result.rescueBranch} at ${formatShortSha(result.rescueCommitSha)}${recreatedNote}`;
     return {
       branchName: expectedBranchName,
       reconciledForward: false,
       dirtyQuarantineRepair: result,
       warnings: [
-        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}`,
+        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}${recordedBranchRecreateSha ? ` Recorded branch "${expectedBranchName}" had been deleted from the repository and was recreated at ${formatShortSha(recordedBranchRecreateSha)}, the commit this worktree was on; any history it pointed at before the deletion is not recoverable from the worktree and may need to be restored from a reflog or a remote.` : ""}`,
       ],
     };
   }
@@ -1919,10 +2248,138 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     };
   }
 
+  if (
+    !evidence.provenance.expectedBranchExists &&
+    currentBranch &&
+    evidence.provenance.actualBranchExists === true &&
+    evidence.provenance.actualBranchIsDefaultBranch &&
+    evidence.provenance.registeredBranchMatchesHead
+  ) {
+    if (input.db && input.executionWorkspaceId) {
+      const reason = `Automatic default-branch rebind: recorded branch "${expectedBranchName}" was deleted; clean worktree is on the default branch "${currentBranch}".`;
+      try {
+        const result = await executionWorkspaceService(input.db).reconcileExecutionWorkspaceBranch(
+          input.executionWorkspaceId,
+          {
+            mode: "default_branch_rebind",
+            reason,
+            alternateRecoveryFingerprints: [evidence.fingerprint],
+            actor: { actorType: "system", actorId: "workspace_runtime", agentId: null, runId: input.heartbeatRunId ?? null },
+          },
+        );
+        await logForwardBranchReconcileActivity({
+          db: input.db,
+          companyId: result.workspace.companyId,
+          executionWorkspaceId: result.workspace.id,
+          sourceIssueId: result.workspace.sourceIssueId ?? evidence.sourceIssueId ?? null,
+          runId: input.heartbeatRunId ?? null,
+          mode: "default_branch_rebind",
+          reason,
+          fromBranch: result.inspection.fromBranch,
+          toBranch: result.inspection.toBranch,
+          fromSha: result.inspection.fromSha,
+          toSha: result.inspection.toSha,
+          ancestryVerdict: result.inspection.ancestryVerdict,
+          fingerprint: result.inspection.fingerprint,
+          auditCommentId: result.auditCommentId,
+          recoveryActionId: result.recoveryAction?.id ?? null,
+        });
+        await recordForwardBranchReconcileOperation({
+          recorder: input.recorder,
+          phase: input.reconcileOperationPhase,
+          cwd: input.worktreePath,
+          repoRoot: result.inspection.repoRoot,
+          worktreePath: result.inspection.worktreePath,
+          expectedBranchName: result.inspection.fromBranch,
+          actualBranchName: result.inspection.toBranch,
+          executionWorkspaceId: result.workspace.id,
+          sourceIssueId: result.workspace.sourceIssueId ?? evidence.sourceIssueId ?? null,
+          fingerprint: result.inspection.fingerprint,
+          expectedHeadSha: result.inspection.fromSha,
+          actualHeadSha: result.inspection.toSha,
+          ancestryVerdict: result.inspection.ancestryVerdict,
+          mode: "record_updated",
+          auditCommentId: result.auditCommentId,
+          recoveryActionId: result.recoveryAction?.id ?? null,
+        });
+        evidence.safeRepair.succeeded = true;
+        evidence.safeRepair.reason = "clean worktree with deleted recorded branch rebound to the default branch and persisted";
+        return {
+          branchName: result.inspection.toBranch,
+          reconciledForward: false,
+          warnings: [
+            `${warningPrefix} The recorded branch "${expectedBranchName}" was deleted from the repository, but the worktree is clean and already on the default branch "${currentBranch}". Paperclip adopted the default branch as the workspace branch.`,
+          ],
+        };
+      } catch (error) {
+        evidence.safeRepair.succeeded = false;
+        evidence.safeRepair.reason = `default branch rebind persistence failed: ${error instanceof Error ? error.message : String(error)}`;
+        throw branchIncoherenceValidationFailure(evidence);
+      }
+    }
+
+    evidence.safeRepair.succeeded = true;
+    evidence.safeRepair.reason = "clean worktree with deleted recorded branch is already on the default branch";
+    return {
+      branchName: currentBranch,
+      reconciledForward: false,
+      warnings: [
+        `${warningPrefix} The recorded branch "${expectedBranchName}" was deleted from the repository, but the worktree is clean and already on the default branch "${currentBranch}". Paperclip adopted the default branch as the workspace branch.`,
+      ],
+    };
+  }
+
+  // the shared checkout below strands anything reachable only from a detached HEAD, so
+  // when HEAD is detached and diverged, give its commits a name first. This must happen before the
+  // checkout, not after: once HEAD moves, the sha is only recoverable from the reflog.
+  let divergedDetachedRescueBranch: string | null = null;
+  const divergedDetachedHeadSha = evidence.provenance.actualHeadSha;
+  if (
+    currentBranch === null &&
+    divergedDetachedHeadSha &&
+    !evidence.provenance.sameHead &&
+    evidence.provenance.ancestryVerdict !== "ancestor"
+  ) {
+    const rescueBranch = buildDirtyQuarantineRescueBranch(input.sourceIssue);
+    try {
+      await recordGitOperation(input.recorder, {
+        phase: input.reconcileOperationPhase ?? "worktree_prepare",
+        args: ["branch", rescueBranch, divergedDetachedHeadSha],
+        cwd: input.worktreePath,
+        metadata: {
+          repoRoot: input.repoRoot,
+          worktreePath: input.worktreePath,
+          expectedBranchName,
+          actualBranchName: currentBranch,
+          branchIncoherenceRepair: true,
+          divergedDetachedHeadRescue: true,
+          rescueBranch,
+          rescueCommitSha: divergedDetachedHeadSha,
+          fingerprint: evidence.fingerprint,
+          sourceIssueId: evidence.sourceIssueId,
+          executionWorkspaceId: evidence.executionWorkspaceId,
+        },
+        successMessage:
+          `Named diverged detached HEAD ${formatShortSha(divergedDetachedHeadSha)} on rescue branch ${rescueBranch} at ${input.worktreePath}\n`,
+        failureLabel: `git branch ${rescueBranch} ${formatShortSha(divergedDetachedHeadSha)}`,
+      });
+    } catch (error) {
+      evidence.safeRepair.succeeded = false;
+      evidence.safeRepair.reason =
+        `detached HEAD rescue branch creation failed: ${error instanceof Error ? error.message : String(error)}`;
+      throw branchIncoherenceValidationFailure(evidence);
+    }
+    divergedDetachedRescueBranch = rescueBranch;
+  }
+
   try {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
-      args: ["checkout", expectedBranchName],
+      // --ignore-other-worktrees is required, not incidental: the recorded branch is routinely
+      // checked out in the base repo, and without this git refuses every safe repair with
+      // "already used by worktree at ...". The eligibility predicates above are what bound this
+      // checkout; see canRestoreRecordedBranchOverContainedHead.
+      args: ["checkout", "--ignore-other-worktrees", expectedBranchName],
       cwd: input.worktreePath,
       metadata: {
         repoRoot: input.repoRoot,
@@ -1952,12 +2409,22 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   }
 
   evidence.safeRepair.succeeded = true;
-  evidence.safeRepair.reason = "clean worktree checked out the recorded branch";
+  evidence.safeRepair.reason = divergedDetachedRescueBranch
+    ? `clean detached worktree HEAD was preserved on rescue branch ${divergedDetachedRescueBranch} before the recorded branch was checked out`
+    : "clean worktree checked out the recorded branch";
+  // Name the branch the worktree was parked on. Its commits survive there, but nothing else in the
+  // run surfaces them, so an agent resuming on the recorded branch would otherwise just see its
+  // previous work vanish and redo it.
+  const abandonedBranchNote = divergedDetachedRescueBranch
+    ? ` The worktree was on a detached HEAD that diverged from the recorded branch; its commits were preserved on rescue branch "${divergedDetachedRescueBranch}" (${formatShortSha(divergedDetachedHeadSha)}) and were not discarded.`
+    : currentBranch && !evidence.provenance.sameHead && evidence.provenance.actualBranchExists === true
+      ? ` The worktree was parked on "${currentBranch}"; any commits made there are still reachable from that branch and were not discarded.`
+      : "";
   return {
     branchName: expectedBranchName,
     reconciledForward: false,
     warnings: [
-      `Execution workspace branch metadata was self-healed by checking out recorded branch "${expectedBranchName}" at ${input.worktreePath}.`,
+      `Execution workspace branch metadata was self-healed by checking out recorded branch "${expectedBranchName}" at ${input.worktreePath}.${abandonedBranchNote}`,
     ],
   };
 }
@@ -1976,7 +2443,11 @@ async function resolveAuthoritativeBaseRef(
 
   const configured = configuredBaseRef?.trim();
   if (!configured || configured === "HEAD") {
-    return { baseRef: await detectOrHead(), warnings, refreshed: false };
+    const detected = await detectOrHead();
+    warnings.push(
+      `No baseRef configured on the workspace strategy, project workspace repoRef, or defaultRef; falling back to detected default branch "${detected}". Set project executionWorkspacePolicy.workspaceStrategy.baseRef or the workspace defaultRef to pin the base.`,
+    );
+    return { baseRef: detected, warnings, refreshed: false };
   }
 
   if (parseRemoteTrackingRef(configured)) {
@@ -2158,7 +2629,7 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
 }
 
-async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
+export async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
   const originMasterRef = "origin/master";
   await refreshRemoteTrackingBaseRef(repoRoot, originMasterRef);
   if (await resolveBaseRefSha(repoRoot, originMasterRef)) {
@@ -2185,6 +2656,38 @@ async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
       await refreshRemoteTrackingBaseRef(repoRoot, candidate);
       await runGit(["rev-parse", "--verify", `${candidate}^{commit}`], repoRoot);
       return candidate;
+    } catch {
+      // Not found — try next
+    }
+  }
+
+  return null;
+}
+
+export function normalizeDefaultBranchForComparison(branch: string | null | undefined): string | null {
+  if (!branch) return null;
+  return branch.replace(/^origin\//, "");
+}
+
+async function detectRemoteDefaultBranch(repoRoot: string): Promise<string | null> {
+  try {
+    const remoteHead = (await execFileAsync(
+      "git",
+      ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+      { cwd: repoRoot },
+    )).stdout.trim();
+    if (remoteHead) {
+      const stripped = remoteHead.startsWith("origin/") ? remoteHead.slice("origin/".length) : remoteHead;
+      if (stripped.length > 0) return stripped;
+    }
+  } catch {
+    // origin/HEAD not set — fall through to heuristic
+  }
+
+  for (const candidate of ["origin/master", "origin/main"]) {
+    try {
+      await execFileAsync("git", ["rev-parse", "--verify", `${candidate}^{commit}`], { cwd: repoRoot });
+      return candidate.slice("origin/".length);
     } catch {
       // Not found — try next
     }
@@ -2315,14 +2818,17 @@ async function validateLinkedGitWorktree(input: {
     worktreePath: input.worktreePath,
     expectedBranchName: input.expectedBranchName,
   });
-  return inspection.valid
-    ? { valid: true }
-    : {
-        valid: false,
-        reason: inspection.reason ?? "unknown git worktree mismatch",
-        reasonCode: inspection.reasonCode ?? "not_a_git_checkout",
-        actualBranchName: inspection.actualBranchName,
-      };
+  if (!inspection.valid) {
+    return {
+      valid: false,
+      reason: inspection.reason ?? "unknown git worktree mismatch",
+      reasonCode: inspection.reasonCode ?? "not_a_git_checkout",
+      actualBranchName: inspection.actualBranchName,
+    };
+  }
+  await assertGitIndexIntegrity(input.worktreePath);
+  await assertGitHeadResolvable(input.worktreePath);
+  return { valid: true };
 }
 
 export function formatManagedGitWorktreeBranchInspection(input: ManagedGitWorktreeBranchInspection) {
@@ -2562,6 +3068,68 @@ async function recordWorkspaceCommandOperation(
   );
 }
 
+export async function assertWorktreeWritableByProcessUser(worktreePath: string): Promise<void> {
+  await assertGitIndexIntegrity(worktreePath);
+  let trackedPaths: string[];
+  try {
+    const proc = await executeProcess({
+      command: "git",
+      args: ["-C", worktreePath, "ls-files", "-z"],
+      cwd: worktreePath,
+    });
+    if (proc.code !== 0) {
+      throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ls-files failed in ${worktreePath}`);
+    }
+    trackedPaths = proc.stdout.split("\0").filter((p) => p.length > 0);
+  } catch (error) {
+    throw new Error(
+      `Execution worktree at ${worktreePath} is not a valid git repository or is missing: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const uid = process.getuid != null ? process.getuid() : null;
+  const gid = process.getgid != null ? process.getgid() : null;
+  const failures: string[] = [];
+  let totalFailures = 0;
+  const MAX_FAILURES = 10;
+
+  if (await fs.access(worktreePath, fs.constants.W_OK).then(() => true, () => false)) {
+    // writable
+  } else {
+    failures.push(worktreePath);
+    totalFailures++;
+  }
+
+  for (const relPath of trackedPaths) {
+    const fullPath = path.join(worktreePath, relPath);
+    const writable = await fs.access(fullPath, fs.constants.W_OK).then(
+      () => true,
+      (err: NodeJS.ErrnoException) =>
+        // A tracked file that is absent is an uncommitted deletion — ordinary
+        // work in progress — and says nothing about whether we can write here.
+        // Treating ENOENT as a permission failure blocked provisioning for any
+        // issue whose agent had deleted a file, and told the operator to run a
+        // `chown` that could not have fixed it. Only real permission failures
+        // count; everything else this check exists for still reports.
+        err?.code === "ENOENT",
+    );
+    if (!writable) {
+      totalFailures++;
+      if (failures.length < MAX_FAILURES) {
+        failures.push(fullPath);
+      }
+    }
+  }
+
+  if (totalFailures > 0) {
+    const uidPart = uid != null ? `uid ${uid}` : "current user";
+    const gidPart = gid != null ? `:${gid}` : "";
+    throw new Error(
+      `Execution worktree at ${worktreePath} contains ${totalFailures} files not writable by the server user (${uidPart}${gidPart}) (showing first ${failures.length}): ${failures.join(", ")}. A host-side process likely wrote them as another user (e.g. root). Repair on the host with: chown -R ${uid != null ? uid : ""}${gidPart} ${worktreePath} — then retry provisioning.`,
+    );
+  }
+}
+
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -2573,6 +3141,7 @@ async function provisionExecutionWorktree(input: {
   created: boolean;
   recorder?: WorkspaceOperationRecorder | null;
 }) {
+  await assertWorktreeWritableByProcessUser(input.worktreePath);
   const provisionCommand = asString(input.strategy.provisionCommand, "").trim();
   if (!provisionCommand) return;
   const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
@@ -2601,6 +3170,197 @@ async function provisionExecutionWorktree(input: {
     },
     successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
   });
+}
+
+export type BaseRepoHygieneDecision =
+  | { action: "ok" }
+  | { action: "restore"; reasons: string[]; snapshotTrackedChanges: boolean };
+
+/**
+ * SUP-11285: should the base repo be put back before we cut a worktree from it?
+ *
+ * The primary clone is nobody's workspace, but it is an ancestor directory of
+ * every agent worktree (`<repoRoot>/.paperclip/worktrees/<branch>`), its path is
+ * handed out as PAPERCLIP_WORKSPACE_BASE_CWD, and it is the only checkout holding
+ * the default branch — so any main-branch errand an agent runs has exactly one
+ * home. Observed consequences: primaries parked on task branches or detached,
+ * commits for a dozen issues landing in one shared checkout, a TypeScript source
+ * file left carrying conflict markers for over a day, and orphaned commits
+ * reachable from no ref at all.
+ *
+ * Restoring is hygiene, not a gate. It never blocks the dispatch: refusing to run
+ * because the base repo is untidy would dead-block issues over a condition the
+ * issue did not cause, which is the SUP-11207 mistake.
+ */
+export function resolveBaseRepoHygieneDecision(input: {
+  /** Branch the base repo has checked out; null when detached. */
+  currentBranch: string | null;
+  /** The ref the base repo is expected to sit on, e.g. "main". */
+  defaultRef: string | null;
+  /** Tracked paths with modifications. Untracked paths are deliberately excluded. */
+  dirtyTrackedPathCount: number;
+  /** Unmerged index entries — a half-finished merge nobody is going to finish. */
+  unmergedPathCount: number;
+  /** Resolved SHA of the base repo's HEAD, or null when unresolvable. */
+  headSha: string | null;
+  /** Resolved SHA of the base ref, or null when unresolvable. */
+  baseRefSha: string | null;
+}): BaseRepoHygieneDecision {
+  const reasons: string[] = [];
+  const defaultRef = input.defaultRef?.replace(/^origin\//, "") ?? null;
+  const contentMatches = Boolean(input.headSha && input.baseRefSha && input.headSha === input.baseRefSha);
+  if (defaultRef && input.currentBranch !== defaultRef) {
+    if (input.currentBranch === null) {
+      // Detached HEAD is only a problem when the content is not already the base ref.
+      if (!contentMatches) {
+        reasons.push("base repo is on a detached HEAD");
+      }
+    } else {
+      reasons.push(`base repo is on "${input.currentBranch}" instead of "${defaultRef}"`);
+    }
+  }
+  if (input.unmergedPathCount > 0) {
+    reasons.push(`base repo has ${input.unmergedPathCount} unmerged path(s) from an abandoned merge`);
+  }
+  if (input.dirtyTrackedPathCount > 0) {
+    reasons.push(`base repo has ${input.dirtyTrackedPathCount} modified tracked path(s)`);
+  }
+  if (reasons.length === 0) return { action: "ok" };
+  return {
+    action: "restore",
+    reasons,
+    snapshotTrackedChanges: input.dirtyTrackedPathCount > 0 || input.unmergedPathCount > 0,
+  };
+}
+
+async function inspectBaseRepoHygiene(repoRoot: string) {
+  const currentBranch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], repoRoot)
+    .then((value) => value || null)
+    .catch(() => null);
+  // Porcelain v1: untracked entries start with "??" and are deliberately ignored.
+  // The worktrees themselves live at <repoRoot>/.paperclip/worktrees, and that path
+  // is untracked in at least one repo on this fleet — anything that removes
+  // untracked files from the base repo would delete every agent's worktree.
+  const status = await runGit(["status", "--porcelain"], repoRoot).catch(() => null);
+  if (status === null) return null;
+  const lines = status.split("\n").filter((line) => line.trim().length > 0);
+  const unmergedPathCount = lines.filter((line) => {
+    const code = line.slice(0, 2);
+    return code === "UU" || code === "AA" || code === "DD" ||
+      code.startsWith("U") || code.endsWith("U");
+  }).length;
+  const dirtyTrackedPathCount = lines.filter((line) => !line.startsWith("??")).length - unmergedPathCount;
+  return {
+    currentBranch,
+    dirtyTrackedPathCount: Math.max(0, dirtyTrackedPathCount),
+    unmergedPathCount,
+  };
+}
+
+/**
+ * Put the base repo back on its default ref, preserving anything found there.
+ *
+ * Order matters and is chosen so every step is recoverable from a ref if the next
+ * one fails: pin HEAD first (a commit made on a detached HEAD is reachable from
+ * nothing the moment we move), then snapshot tracked modifications, only then
+ * move the working tree.
+ *
+ * Never removes untracked files that the base ref does not itself contain. Never uses `git clean` or `stash -u`: the
+ * worktree directory lives inside the base repo and is untracked in some repos,
+ * so removing untracked content there would delete live agent workspaces.
+ */
+async function restoreBaseRepoToDefaultRef(input: {
+  repoRoot: string;
+  baseRef: string;
+  decision: Extract<BaseRepoHygieneDecision, { action: "restore" }>;
+  timestamp: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ restored: boolean; warnings: string[]; rescueRefs: string[] }> {
+  const warnings: string[] = [];
+  const rescueRefs: string[] = [];
+  const shortDefault = input.baseRef.replace(/^origin\//, "");
+  const prefix = `refs/heads/paperclip/rescue/base-repo/${input.timestamp}-${randomUUID().slice(0, 8)}`;
+
+  const headSha = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
+  if (headSha) {
+    await runGit(["update-ref", `${prefix}/head`, headSha], input.repoRoot)
+      .then(() => rescueRefs.push(`${prefix}/head`))
+      .catch((err) => warnings.push(`could not pin base repo HEAD: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  if (input.decision.snapshotTrackedChanges) {
+    // `stash create` builds the commit objects without touching the working tree
+    // or index, so a failure here leaves the repo exactly as it was found.
+    const stashSha = await runGit(["stash", "create", `paperclip base repo rescue ${input.timestamp}`], input.repoRoot)
+      .then((value) => value || null)
+      .catch((err) => {
+        warnings.push(`base repo stash create failed: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      });
+    if (stashSha) {
+      await runGit(["update-ref", `${prefix}/worktree`, stashSha], input.repoRoot)
+        .then(() => rescueRefs.push(`${prefix}/worktree`))
+        .catch((err) => warnings.push(`could not pin base repo stashed worktree: ${err instanceof Error ? err.message : String(err)}`));
+    } else {
+      // An unmerged index defeats `stash create`. Fall back to recording the
+      // conflicted blobs so nothing is discarded unseen.
+      const unmerged = await runGit(["ls-files", "-u"], input.repoRoot).catch(() => "");
+      if (unmerged.trim().length > 0) {
+        warnings.push(
+          "base repo had unmerged index entries that could not be stashed; their blobs remain in the object store and are listed in this operation's metadata",
+        );
+      }
+    }
+  }
+
+  if (input.decision.snapshotTrackedChanges && !rescueRefs.some((ref) => ref.endsWith("/worktree"))) {
+    warnings.push("base repo has tracked modifications that could not be snapshotted; skipping restore to avoid data loss");
+    return { restored: false, warnings, rescueRefs };
+  }
+
+  const checkout = await runGit(["checkout", "--force", shortDefault], input.repoRoot)
+    .then(() => true)
+    .catch(() => false);
+  let restored = checkout;
+  if (!checkout) {
+    // The default branch can be held by an agent worktree, which is its own bug
+    // but must not stop us tidying the base repo. Detaching lands the same content
+    // without contending for the branch — and without creating a second checkout
+    // of it, which is the very thing that corrupts shared branches.
+    restored = await runGit(["checkout", "--force", "--detach", input.baseRef], input.repoRoot)
+      .then(() => true)
+      .catch((err) => {
+        warnings.push(`could not restore base repo to ${input.baseRef}: ${err instanceof Error ? err.message : String(err)}`);
+        return false;
+      });
+    if (restored) {
+      warnings.push(
+        `base repo was detached at ${input.baseRef} because branch "${shortDefault}" is checked out elsewhere`,
+      );
+    }
+  }
+
+  if (input.recorder) {
+    await input.recorder.recordOperation({
+      phase: "worktree_prepare",
+      command: `git checkout --force ${shortDefault}`,
+      cwd: input.repoRoot,
+      metadata: {
+        baseRepoHygiene: true,
+        repoRoot: input.repoRoot,
+        baseRef: input.baseRef,
+        reasons: input.decision.reasons,
+        rescueRefs,
+        restored,
+      },
+      run: async () => ({
+        status: restored ? "succeeded" : "failed",
+        system: [...input.decision.reasons, ...warnings].join("\n"),
+      }),
+    }).catch(() => undefined);
+  }
+
+  return { restored, warnings, rescueRefs };
 }
 
 function buildExecutionWorkspaceCleanupEnv(input: {
@@ -2687,6 +3447,14 @@ export async function realizeExecutionWorkspace(input: {
     repoRef: input.base.repoRef,
   });
   let branchName = sanitizeBranchName(renderedBranch);
+  const remoteDefaultBranch = await detectRemoteDefaultBranch(repoRoot);
+  if (remoteDefaultBranch && branchName === remoteDefaultBranch) {
+    throw new Error(
+      `Execution workspace branch name "${branchName}" matches the repo's default branch. ` +
+      `Creating a worktree on the default branch would permanently strand the primary clone. ` +
+      `Use a branch template that produces a unique name (e.g., "{{issue.identifier}}-{{slug}}").`,
+    );
+  }
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir
     ? resolveConfiguredPath(configuredParentDir, repoRoot)
@@ -2706,6 +3474,45 @@ export async function realizeExecutionWorkspace(input: {
     ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(repoRoot, baseRef)),
   ];
   const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
+
+  // SUP-11285: tidy the base repo before cutting from it. Strictly best-effort —
+  // the dispatch proceeds whatever happens here, because the issue being run did
+  // not cause the mess and must not be held hostage to it.
+  const baseRepoHygieneWarnings: string[] = [];
+  try {
+    const hygiene = await inspectBaseRepoHygiene(repoRoot);
+    if (hygiene) {
+      const headSha = await runGit(["rev-parse", "HEAD"], repoRoot).catch(() => null);
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: hygiene.currentBranch,
+        defaultRef: baseRef,
+        dirtyTrackedPathCount: hygiene.dirtyTrackedPathCount,
+        unmergedPathCount: hygiene.unmergedPathCount,
+        headSha,
+        baseRefSha: currentBaseRefSha,
+      });
+      if (decision.action === "restore") {
+        const result = await restoreBaseRepoToDefaultRef({
+          repoRoot,
+          baseRef,
+          decision,
+          timestamp: new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"),
+          recorder: input.recorder ?? null,
+        });
+        baseRepoHygieneWarnings.push(
+          `Base repository at ${repoRoot} was restored to ${baseRef}: ${decision.reasons.join("; ")}.` +
+            (result.rescueRefs.length > 0
+              ? ` Anything found there is preserved on ${result.rescueRefs.join(", ")}.`
+              : ""),
+          ...result.warnings,
+        );
+      }
+    }
+  } catch (err) {
+    baseRepoHygieneWarnings.push(
+      `Base repository hygiene check failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
@@ -2767,7 +3574,7 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       branchName: effectiveBranchName,
       worktreePath: reusablePath,
-      warnings: [...extraWarnings, ...baseRefreshWarnings, ...baseDrift.warnings],
+      warnings: [...extraWarnings, ...baseRepoHygieneWarnings, ...baseRefreshWarnings, ...baseDrift.warnings],
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
@@ -2775,6 +3582,16 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   async function validateReusableWorktree(reusablePath: string) {
+    // SUP-10665 originally reset a clean reused worktree to its recorded branch here, before
+    // validation. That erased the very state validation exists to inspect: a diverged HEAD was
+    // checked out away before anything could detect it, so the run proceeded and another run's
+    // commits were left behind with no failure, no audit, and no contention check — the checkout
+    // even swallowed its own errors. It also preempted forward reconciliation, resetting a branch
+    // that was ahead of the record instead of adopting it.
+    //
+    // Normalisation belongs to ensureGitWorktreeBranchCoherent, which is reached through
+    // validateLinkedGitWorktree below and already encodes the safe-repair paths, the contention
+    // check, and the audit trail.
     const validation = await validateLinkedGitWorktree({
       repoRoot,
       worktreePath: reusablePath,
@@ -2903,7 +3720,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: baseRefreshWarnings,
+    warnings: [...baseRepoHygieneWarnings, ...baseRefreshWarnings],
     created: true,
     baseRefSha: currentBaseRefSha,
   };
@@ -3190,6 +4007,77 @@ async function pruneExpiredWorktreeRescueRefs(cwd: string, ttlMs = WORKTREE_RESC
     }
   } catch {
     // Pruning is housekeeping; a failure here must not surface as a preservation failure.
+  }
+}
+
+const WORKTREE_PRESERVATION_REF_PREFIX = "refs/preserved";
+
+export async function preserveUnpushedWorktreeCommits(input: {
+  workspacePath: string;
+  branchName: string;
+  issueIdentifier: string | null;
+  repoRoot: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{
+  preserved: boolean;
+  preservedRef: string | null;
+  commitSha: string | null;
+  warning: string | null;
+}> {
+  const notPreserved = { preserved: false, preservedRef: null, commitSha: null, warning: null } as const;
+  try {
+    const revList = await runGit(["rev-list", "HEAD", "--not", "--remotes"], input.workspacePath);
+    if (!revList.trim()) return notPreserved;
+
+    const commitSha = await runGit(["rev-parse", "HEAD"], input.workspacePath);
+    const safeIdentifier = (input.issueIdentifier ?? "unknown").replace(/[^a-zA-Z0-9._\-]/g, "_");
+    const safeBranchName = input.branchName.replace(/[^a-zA-Z0-9._\-]/g, "_");
+    const preservedRef = `${WORKTREE_PRESERVATION_REF_PREFIX}/${safeIdentifier}/${safeBranchName}`;
+
+    try {
+      await runGit(["push", "origin", `${commitSha}:${preservedRef}`], input.repoRoot);
+    } catch (pushErr) {
+      const pushMessage = pushErr instanceof Error ? pushErr.message : String(pushErr);
+      return {
+        preserved: false,
+        preservedRef: null,
+        commitSha,
+        warning: `Could not push unpushed commits to preservation ref ${preservedRef}: ${pushMessage}`,
+      };
+    }
+
+    if (input.recorder) {
+      await input.recorder.recordOperation({
+        phase: "worktree_cleanup",
+        command: formatCommandForDisplay("git", ["push", "origin", `${commitSha}:${preservedRef}`]),
+        cwd: input.repoRoot,
+        metadata: {
+          workspacePath: input.workspacePath,
+          branchName: input.branchName,
+          issueIdentifier: input.issueIdentifier,
+          cleanupAction: "preserve_unpushed_commits",
+          commitSha,
+          preservedRef,
+        },
+        run: async () => ({
+          status: "succeeded",
+          exitCode: 0,
+          system:
+            `Preserved unpushed commits as ${commitSha} before removing the worktree ` +
+            `(recoverable from ${preservedRef})\n`,
+        }),
+      });
+    }
+
+    return { preserved: true, preservedRef, commitSha, warning: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      preserved: false,
+      preservedRef: null,
+      commitSha: null,
+      warning: `Could not preserve unpushed commits in "${input.workspacePath}" before removal: ${message}`,
+    };
   }
 }
 

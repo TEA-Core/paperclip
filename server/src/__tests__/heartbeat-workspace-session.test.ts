@@ -28,6 +28,8 @@ import {
   provisionExecutionWorkspaceForFreshnessDecision,
   readRuntimeStateSessionParams,
   resolveExecutionWorkspaceConfigFreshness,
+  readExecutionWorkspaceOccupancyDeferrals,
+  resolveExecutionWorkspaceOccupancyDecision,
   resolveExecutionWorkspaceReuseRequestForIssue,
   resolveExecutionWorkspaceReuseProvisioningPolicy,
   resolveNextSessionState,
@@ -43,6 +45,7 @@ import {
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
+  WorkspaceValidationFailure,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
@@ -1456,6 +1459,9 @@ describe("effective run execution workspace config freshness", () => {
       requestedExecutionWorkspaceId: "workspace-old",
       requestedShouldReuseExisting: true,
       existingExecutionWorkspaceAvailable: false,
+      // Repairable: a missing row or an archived one whose directory still
+      // exists can be restored by hand, so this must keep failing loudly.
+      bindingUnrestorable: false,
     });
 
     const metadata = buildWorkspaceConfigMetadata();
@@ -1481,6 +1487,127 @@ describe("effective run execution workspace config freshness", () => {
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
+  // SUP-9810: the worktree reaper archives the workspace row when it deletes a
+  // worktree, and issues bound to that row kept their reuse_existing binding.
+  // Every dispatch then failed setup_failed with "could not be restored", and no
+  // retry could ever succeed because the directory is gone — a permanent trap
+  // rather than a fixable problem. 57 issues held such a binding when this was
+  // found; one was blocked behind a recovery action for exactly this.
+  it.each([
+    { name: "reaped by the worktree reaper", cleanupReason: "reaped_worktree_removed" },
+    { name: "reconciled as missing on disk", cleanupReason: "reconciled_missing_directory" },
+  ])("provisions a fresh workspace when the bound one was $name", async ({ cleanupReason }) => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "archived",
+      existingExecutionWorkspaceCleanupReason: cleanupReason,
+    });
+
+    expect(reuseRequest.bindingUnrestorable).toBe(true);
+    // No longer a reuse request: there is nothing to reuse and never will be.
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: reuseRequest.requestedShouldReuseExisting &&
+        reuseRequest.existingExecutionWorkspaceAvailable,
+      existingWorkspaceMetadata: null,
+      nextMetadata: metadata,
+    });
+    const realizeWorkspace = vi.fn(async () => ({ id: "fresh-workspace", warnings: [] }));
+    const restoreExistingWorkspace = vi.fn(async () => ({ id: "workspace-old", warnings: [] }));
+
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: reuseRequest.requestedShouldReuseExisting,
+      existingExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
+      issueRef: { id: "issue-1", identifier: "SUP-9810" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace,
+      realizeWorkspace,
+    });
+
+    expect(result.executionWorkspace).toEqual({ id: "fresh-workspace", warnings: [] });
+    expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(realizeWorkspace).toHaveBeenCalledTimes(1);
+    // Never even attempt the restore: the directory is gone.
+    expect(restoreExistingWorkspace).not.toHaveBeenCalled();
+  });
+
+  // The self-heal is deliberately narrow. An archived row whose directory still
+  // exists is repairable by unarchiving it, so refusing to run surfaces a real
+  // problem instead of stranding the issue.
+  it("still fails loudly when an archived workspace was closed without removing its directory", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "archived",
+      existingExecutionWorkspaceCleanupReason: "closed_by_operator",
+    });
+
+    expect(reuseRequest.bindingUnrestorable).toBe(false);
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+  });
+
+  // 2026-08-06: the cleanup-reason allowlist alone stranded 14 issues overnight.
+  // A bulk archive wrote `cleanup_reason = NULL` on one row and free-text prose
+  // on the others, and those rows came from neither this server nor the reaper.
+  // No allowlist can cover reasons nobody has written yet, so an absent
+  // directory — an observable fact — has to be sufficient on its own.
+  it("treats an archived workspace whose directory is gone as unrestorable, whatever the reason says", () => {
+    for (const cleanupReason of [null, "", "worktree directory retained: HEAD unresolvable", "something nobody predicted"]) {
+      const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+        issueExecutionWorkspaceId: "workspace-old",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: "archived",
+        existingExecutionWorkspaceCleanupReason: cleanupReason,
+        existingExecutionWorkspaceDirectoryExists: false,
+      });
+      expect(reuseRequest.bindingUnrestorable).toBe(true);
+      expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+    }
+  });
+
+  // Still present on disk means possibly repairable by unarchiving, which is a
+  // human's call. Keep failing loudly rather than quietly abandoning it.
+  it("keeps failing loudly when the archived workspace's directory still exists", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "archived",
+      existingExecutionWorkspaceCleanupReason: "worktree directory retained: HEAD unresolvable",
+      existingExecutionWorkspaceDirectoryExists: true,
+    });
+    expect(reuseRequest.bindingUnrestorable).toBe(false);
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+  });
+
+  // A stat we could not complete is not evidence. Never self-heal on it.
+  it("does not self-heal when the directory could not be probed", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "archived",
+      existingExecutionWorkspaceCleanupReason: null,
+      existingExecutionWorkspaceDirectoryExists: null,
+    });
+    expect(reuseRequest.bindingUnrestorable).toBe(false);
+  });
+
+  it("ignores a cleanup reason when the workspace is still active", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      existingExecutionWorkspaceCleanupReason: "reaped_worktree_removed",
+    });
+
+    expect(reuseRequest.bindingUnrestorable).toBe(false);
+    expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(true);
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+  });
+
   it("fails loudly when explicit reuse restore returns no workspace", async () => {
     const metadata = buildWorkspaceConfigMetadata();
     const decision = resolveExecutionWorkspaceConfigFreshness({
@@ -1499,6 +1626,42 @@ describe("effective run execution workspace config freshness", () => {
       restoreExistingWorkspace: async () => null,
       realizeWorkspace,
     })).rejects.toThrow(/could not be restored/);
+    expect(realizeWorkspace).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "restore throws", restoreOutcome: "throws" as const },
+    { name: "restore returns no workspace", restoreOutcome: "empty" as const },
+  ])("classifies reuse restore failure as a workspace validation failure when $name", async ({ restoreOutcome }) => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
+      nextMetadata: metadata,
+    });
+    const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] as string[] }));
+
+    const error = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceId: "workspace-old",
+      issueRef: { id: "issue-1", identifier: "PAP-42" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace: async () => {
+        if (restoreOutcome === "throws") throw new Error("restore command failed");
+        return null;
+      },
+      realizeWorkspace,
+    }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    // A per-issue workspace restore failure must stay workspace-scoped so the
+    // heartbeat keeps the agent idle instead of flipping the whole agent to error.
+    expect(error).toBeInstanceOf(WorkspaceValidationFailure);
+    expect((error as WorkspaceValidationFailure).code).toBe("workspace_validation_failed");
+    expect((error as WorkspaceValidationFailure).resultJson).toEqual({});
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
@@ -2664,5 +2827,88 @@ describe("parseSessionCompactionPolicy", () => {
       maxRawInputTokens: 500_000,
       maxSessionAgeHours: 0,
     });
+  });
+});
+
+describe("execution workspace occupancy gate", () => {
+  it("proceeds when nothing else holds the workspace", () => {
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: true,
+      occupied: false,
+      priorDeferrals: 0,
+    })).toEqual({ action: "proceed" });
+  });
+
+  it("proceeds when the run was never going to reuse a workspace", () => {
+    // A run provisioning its own worktree cannot collide with anyone, so the
+    // occupancy of some other workspace must not stall it.
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: false,
+      occupied: true,
+      priorDeferrals: 0,
+    })).toEqual({ action: "proceed" });
+  });
+
+  it("defers the first time the workspace is occupied", () => {
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: true,
+      occupied: true,
+      priorDeferrals: 0,
+      maxDeferrals: 3,
+      delayMs: 1_000,
+    })).toEqual({ action: "defer", attempt: 1, maxDeferrals: 3, delayMs: 1_000 });
+  });
+
+  it("keeps deferring while wait budget remains", () => {
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: true,
+      occupied: true,
+      priorDeferrals: 2,
+      maxDeferrals: 3,
+      delayMs: 1_000,
+    })).toEqual({ action: "defer", attempt: 3, maxDeferrals: 3, delayMs: 1_000 });
+  });
+
+  it("provisions a fresh workspace once the wait budget is spent", () => {
+    // Never refuse outright: an occupant that never releases would otherwise
+    // dead-block the issue forever, which is the failure mode this gate exists
+    // to avoid repeating. Losing branch continuity is the cheap outcome.
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: true,
+      occupied: true,
+      priorDeferrals: 3,
+      maxDeferrals: 3,
+    })).toEqual({ action: "provision_fresh", deferrals: 3 });
+  });
+
+  it("provisions fresh immediately when waiting is disabled", () => {
+    expect(resolveExecutionWorkspaceOccupancyDecision({
+      reuseRequested: true,
+      occupied: true,
+      priorDeferrals: 0,
+      maxDeferrals: 0,
+    })).toEqual({ action: "provision_fresh", deferrals: 0 });
+  });
+});
+
+describe("readExecutionWorkspaceOccupancyDeferrals", () => {
+  it("counts attempts already spent waiting for this workspace", () => {
+    expect(readExecutionWorkspaceOccupancyDeferrals({
+      scheduledRetryReason: "execution_workspace_occupied",
+      scheduledRetryAttempt: 2,
+    })).toBe(2);
+  });
+
+  it("does not charge the wait budget for retries of another kind", () => {
+    // A run that burned two transient-failure retries has spent none of its
+    // workspace-wait budget; charging it would cut the wait short.
+    expect(readExecutionWorkspaceOccupancyDeferrals({
+      scheduledRetryReason: "transient_failure",
+      scheduledRetryAttempt: 2,
+    })).toBe(0);
+  });
+
+  it("treats a run with no retry history as having waited zero times", () => {
+    expect(readExecutionWorkspaceOccupancyDeferrals({})).toBe(0);
   });
 });

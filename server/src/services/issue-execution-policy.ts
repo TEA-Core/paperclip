@@ -252,7 +252,7 @@ function buildClearedMonitorState(input: {
 }
 
 function issueAllowsMonitor(status: string, assigneeAgentId: string | null, assigneeUserId: string | null) {
-  return Boolean(assigneeAgentId) && !assigneeUserId && (status === "in_progress" || status === "in_review");
+  return Boolean(assigneeAgentId) && !assigneeUserId && (status === "in_progress" || status === "in_review" || status === "blocked");
 }
 
 function monitorClearReasonForIssue(
@@ -314,7 +314,6 @@ function nextAssigneeIds(input: {
 export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | null): IssueExecutionPolicy | null {
   if (!policy) return null;
   if (!policy.monitor) return policy;
-  if (policy.stages.length === 0) return null;
   return {
     mode: policy.mode,
     commentRequired: policy.commentRequired,
@@ -422,6 +421,24 @@ export function normalizeIssueExecutionPolicy(
   };
 }
 
+/**
+ * Normalizes a project-level default execution policy for issue creation.
+ *
+ * Unlike `normalizeIssueExecutionPolicy`, a malformed stored default returns
+ * null instead of throwing: the default is injected on behalf of the project,
+ * not supplied by the caller, so a bad project row must not make every issue
+ * create in that project fail with 422. Issues then keep the pre-existing
+ * null-policy behavior rather than being rejected outright.
+ */
+export function resolveProjectDefaultIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
+  if (input == null) return null;
+  try {
+    return normalizeIssueExecutionPolicy(input);
+  } catch {
+    return null;
+  }
+}
+
 export function parseIssueExecutionState(input: unknown): IssueExecutionState | null {
   if (input == null) return null;
   const parsed = issueExecutionStateSchema.safeParse(input);
@@ -476,15 +493,25 @@ function selectStageParticipant(
   opts?: {
     preferred?: IssueExecutionStagePrincipal | null;
     exclude?: IssueExecutionStagePrincipal | null;
+    allowSelfAsFallback?: boolean;
   },
 ): IssueExecutionStagePrincipal | null {
-  const participants = stage.participants.filter((participant) => !principalsEqual(participant, opts?.exclude ?? null));
-  if (participants.length === 0) return null;
+  const exclude = opts?.exclude ?? null;
+  const participants = stage.participants.filter((participant) => !principalsEqual(participant, exclude));
+  // When the exclude would leave zero participants (e.g. a sole participant who
+  // is also the return assignee), fall back to the full participant list so the
+  // stage remains reachable instead of deadlocking. This is skipped when
+  // allowSelfAsFallback is false, which is used by the auto-skip path to
+  // correctly detect self-review-only stages.
+  const eligible = participants.length > 0 || opts?.allowSelfAsFallback === false
+    ? participants
+    : stage.participants;
+  if (eligible.length === 0) return null;
   if (opts?.preferred) {
-    const preferred = participants.find((participant) => principalsEqual(participant, opts.preferred ?? null));
+    const preferred = eligible.find((participant) => principalsEqual(participant, opts.preferred ?? null));
     if (preferred) return preferred;
   }
-  const first = participants[0];
+  const first = eligible[0];
   return first ? { type: first.type, agentId: first.agentId ?? null, userId: first.userId ?? null } : null;
 }
 
@@ -708,7 +735,9 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         }),
       });
     if (!currentParticipant) {
-      throw unprocessable(`No eligible ${activeStage.type} participant is configured for this issue`);
+      throw unprocessable(
+        `No eligible ${activeStage.type} participant is configured for this issue (stage ${activeStage.id}); the return assignee is excluded from participant selection`,
+      );
     }
 
     if (!stageHasParticipant(activeStage, currentParticipant)) {
@@ -788,7 +817,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           }),
         });
         if (!participant) {
-          throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
+          throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue (stage ${nextStage.id}); the return assignee is excluded from participant selection`);
         }
 
         buildPendingStagePatch({
@@ -911,6 +940,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         ? explicitAssignee ?? existingState.currentParticipant ?? null
         : explicitAssignee,
     exclude: returnAssignee,
+    allowSelfAsFallback: false,
   });
   while (!participant && canAutoSkipPendingStage({ stage: pendingStage, returnAssignee, requestedStatus })) {
     skippedStageIds.push(pendingStage.id);
@@ -936,10 +966,22 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           ? explicitAssignee ?? existingState.currentParticipant ?? null
           : explicitAssignee,
       exclude: returnAssignee,
+      allowSelfAsFallback: false,
     });
   }
   if (!participant) {
-    throw unprocessable(`No eligible ${pendingStage.type} participant is configured for this issue`);
+    participant = selectStageParticipant(pendingStage, {
+      preferred:
+        existingState?.status === CHANGES_REQUESTED_STATUS
+          ? explicitAssignee ?? existingState.currentParticipant ?? null
+          : explicitAssignee,
+      exclude: returnAssignee,
+    });
+    if (!participant) {
+      throw unprocessable(
+        `No eligible ${pendingStage.type} participant is configured for this issue (stage ${pendingStage.id}); the return assignee is excluded from participant selection`,
+      );
+    }
   }
 
   buildPendingStagePatch({
@@ -994,7 +1036,7 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
 
   if (input.policy?.monitor) {
     if (invalidReason) {
-      if (input.monitorExplicitlyUpdated) {
+      if (invalidReason !== "done" && invalidReason !== "cancelled") {
         throw unprocessable(MONITOR_INVALID_MESSAGE);
       }
       patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
@@ -1012,28 +1054,18 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
         now: new Date(),
       });
       if (exhaustedReason) {
-        if (input.monitorExplicitlyUpdated) {
-          throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
-        }
-        patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
-        patch.monitorNextCheckAt = null;
-        patch.monitorWakeRequestedAt = null;
-        targetMonitorState = buildClearedMonitorState({
-          previous: currentMonitorState,
-          clearReason: exhaustedReason,
-          clearedAt: new Date(),
-        });
-      } else {
-        patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
-        patch.monitorWakeRequestedAt = null;
-        patch.monitorNotes = input.policy.monitor.notes ?? null;
-        patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
-        targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor);
+        throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
       }
+      patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
+      patch.monitorWakeRequestedAt = null;
+      patch.monitorNotes = input.policy.monitor.notes ?? null;
+      patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
+      targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor);
     }
   } else if (previousPolicy?.monitor) {
     patch.monitorNextCheckAt = null;
     patch.monitorWakeRequestedAt = null;
+    patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy ?? previousPolicy);
     targetMonitorState = buildClearedMonitorState({
       previous: currentMonitorState,
       clearReason:

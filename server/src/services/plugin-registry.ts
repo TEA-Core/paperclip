@@ -1,6 +1,7 @@
 import { asc, eq, isNull, ne, sql, and } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  companies,
   plugins,
   pluginConfig,
   pluginCompanySettings,
@@ -404,6 +405,33 @@ export function pluginRegistryService(db: Db) {
         ))
         .then((rows) => rows[0] ?? null) as Promise<PluginCompanySettings | null>,
 
+    /**
+     * List the ids of every company this plugin is enabled for.
+     *
+     * A plugin is enabled for a company **by default** — absence of a
+     * `plugin_company_settings` row means enabled, not disabled (see the
+     * schema comment on that table). So this is "every active company minus
+     * the ones explicitly switched off", which is why it is a left join and
+     * not an inner one. Getting that backwards would silently disable every
+     * scheduled job on a fresh instance.
+     */
+    listEnabledCompanyIds: async (pluginId: string): Promise<string[]> => {
+      const rows = await db
+        .select({ id: companies.id, enabled: pluginCompanySettings.enabled })
+        .from(companies)
+        .leftJoin(
+          pluginCompanySettings,
+          and(
+            eq(pluginCompanySettings.companyId, companies.id),
+            eq(pluginCompanySettings.pluginId, pluginId),
+          ),
+        )
+        .where(eq(companies.status, "active"))
+        .orderBy(asc(companies.id));
+
+      return rows.filter((row) => row.enabled !== false).map((row) => row.id);
+    },
+
     /** Create or replace company-scoped plugin settings. */
     upsertCompanySettings: async (
       pluginId: string,
@@ -600,17 +628,29 @@ export function pluginRegistryService(db: Db) {
         .orderBy(asc(pluginJobs.jobKey)),
 
     /**
-     * Look up a plugin job by its unique job key.
+     * Look up a plugin job by its job key within one company.
+     *
+     * `(pluginId, jobKey)` stopped identifying a single row when jobs gained a
+     * company scope — a manifest declaration fans out to one row per enabled
+     * company. `companyId` is required so this cannot quietly return an
+     * arbitrary company's row.
      *
      * @param pluginId - The UUID of the plugin.
+     * @param companyId - The company whose copy of the job to fetch.
      * @param jobKey - The key defined in the plugin manifest.
      * @returns The matching `PluginJobRecord` or null.
      */
-    getJobByKey: (pluginId: string, jobKey: string) =>
+    getJobByKey: (pluginId: string, companyId: string, jobKey: string) =>
       db
         .select()
         .from(pluginJobs)
-        .where(and(eq(pluginJobs.pluginId, pluginId), eq(pluginJobs.jobKey, jobKey)))
+        .where(
+          and(
+            eq(pluginJobs.pluginId, pluginId),
+            eq(pluginJobs.companyId, companyId),
+            eq(pluginJobs.jobKey, jobKey),
+          ),
+        )
         .then((rows) => rows[0] ?? null),
 
     /**

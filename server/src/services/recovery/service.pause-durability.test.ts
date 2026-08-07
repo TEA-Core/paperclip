@@ -35,4 +35,13 @@ describe("pause durability: continuation retry classification", () => {
     expect(classifyContinuationFailure(run(null)).kind).toBe("default");
     expect(classifyContinuationFailure(run("some_adapter_error")).kind).toBe("default");
   });
+
+  // SUP-11280: the opencode growth guard kills a run for the command it chose.
+  // A retry runs the same command and trips at the same place, so there is no
+  // attempt count that helps -- the command has to change first.
+  it("opencode_db_growth_limit is non-retryable with no attempts left", () => {
+    const c = classifyContinuationFailure(run("opencode_db_growth_limit"));
+    expect(c.kind).toBe("non_retryable");
+    expect(c.maxAttempts).toBe(0);
+  });
 });

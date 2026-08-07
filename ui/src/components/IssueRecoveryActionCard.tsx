@@ -121,6 +121,10 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
   configuration_validation: "Configuration Validation",
   active_run_watchdog: "Active Watchdog",
   issue_graph_liveness: "Graph Liveness",
+  no_live_path_unowned: "No Live Path",
+  review_stage_unarmed: "Review Stage Unarmed",
+  no_live_path_owner_unavailable: "Owner Unavailable",
+  blocked_without_blockers: "Blocked Without Blockers",
 };
 
 const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
@@ -135,6 +139,14 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "The active run has been silent. Recovery is observing without interrupting it.",
   issue_graph_liveness:
     "Paperclip detected this task lost a live action path. A recovery owner needs to act.",
+  no_live_path_unowned:
+    "This task has no assigned owner and no live execution path.",
+  review_stage_unarmed:
+    "This task has an execution review stage configured, but no participant is actively reviewing.",
+  no_live_path_owner_unavailable:
+    "This task's assigned owner is not available and no live execution path exists.",
+  blocked_without_blockers:
+    "This task is marked blocked, but nothing is blocking it any more.",
 };
 
 const STATE_TONE: Record<RecoveryCardCardState, {

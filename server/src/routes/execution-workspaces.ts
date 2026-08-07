@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
-import { issues, projects, projectWorkspaces } from "@paperclipai/db";
+import { issueComments, issues, projects, projectWorkspaces } from "@paperclipai/db";
 import {
   findWorkspaceCommandDefinition,
   matchWorkspaceRuntimeServiceToCommand,
@@ -13,7 +13,11 @@ import {
 import type { WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { accessService, executionWorkspaceService, heartbeatService, logActivity, workspaceOperationService } from "../services/index.js";
-import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
+import {
+  detachIssuesFromClosedSharedExecutionWorkspace,
+  mergeExecutionWorkspaceConfig,
+  readExecutionWorkspaceConfig,
+} from "../services/execution-workspaces.js";
 import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
 import {
@@ -21,6 +25,7 @@ import {
   cleanupExecutionWorkspaceArtifacts,
   ensurePersistedExecutionWorkspaceAvailable,
   listConfiguredRuntimeServiceEntries,
+  preserveUnpushedWorktreeCommits,
   runWorkspaceJobForControl,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
@@ -624,6 +629,82 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         return;
       }
 
+      if (
+        existing.providerType === "git_worktree" &&
+        typeof readiness.git?.aheadCount === "number" &&
+        readiness.git.aheadCount > 0 &&
+        readiness.git.repoRoot &&
+        existing.branchName
+      ) {
+        const issueIdentifier = existing.sourceIssueId
+          ? await db
+              .select({ identifier: issues.identifier })
+              .from(issues)
+              .where(eq(issues.id, existing.sourceIssueId))
+              .then((rows) => rows[0]?.identifier ?? null)
+          : null;
+
+        const preservation = await preserveUnpushedWorktreeCommits({
+          workspacePath: readiness.git.workspacePath ?? existing.providerRef ?? existing.cwd ?? "",
+          branchName: existing.branchName,
+          issueIdentifier,
+          repoRoot: readiness.git.repoRoot,
+        });
+
+        if (!preservation.preserved) {
+          if (existing.sourceIssueId) {
+            await db
+              .insert(issueComments)
+              .values({
+                companyId: existing.companyId,
+                issueId: existing.sourceIssueId,
+                authorAgentId: null,
+                authorUserId: null,
+                authorType: "system",
+                body:
+                  `Archiving execution workspace \`${existing.name}\` was refused: ` +
+                  `unpushed commits could not be preserved.\n\n` +
+                  `${preservation.warning ?? "Unknown preservation failure."}\n`,
+              })
+              .catch(() => null);
+            await db
+              .update(issues)
+              .set({ updatedAt: new Date() })
+              .where(eq(issues.id, existing.sourceIssueId))
+              .catch(() => null);
+          }
+
+          res.status(409).json({
+            error: "Execution workspace has unpushed commits that could not be preserved; archive refused",
+            closeReadiness: readiness,
+            preservation,
+          });
+          return;
+        }
+
+        if (existing.sourceIssueId) {
+          await db
+            .insert(issueComments)
+            .values({
+              companyId: existing.companyId,
+              issueId: existing.sourceIssueId,
+              authorAgentId: null,
+              authorUserId: null,
+              authorType: "system",
+              body:
+                `Preserved unpushed commits from execution workspace \`${existing.name}\` before archiving.\n\n` +
+                `Commit: \`${preservation.commitSha}\`\n` +
+                `Preservation ref: \`${preservation.preservedRef}\`\n`,
+            })
+            .catch(() => null);
+          await db
+            .update(issues)
+            .set({ updatedAt: new Date() })
+            .where(eq(issues.id, existing.sourceIssueId))
+            .catch(() => null);
+        }
+      }
+
       const closedAt = new Date();
       const archivedWorkspace = await svc.update(id, {
         ...patch,
@@ -644,18 +725,10 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       });
 
       if (existing.mode === "shared_workspace") {
-        await db
-          .update(issues)
-          .set({
-            executionWorkspaceId: null,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(issues.companyId, existing.companyId),
-              eq(issues.executionWorkspaceId, existing.id),
-            ),
-          );
+        await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+          companyId: existing.companyId,
+          executionWorkspaceId: existing.id,
+        });
       }
 
       try {

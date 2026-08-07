@@ -313,7 +313,13 @@ async function seedBranchContainmentRun(
   db: Db,
   repoRoot: string,
   callSite: BranchContainmentCallSite,
-  opts: { enableWorkspaceBranchReconcileForward?: boolean } = {},
+  opts: {
+    enableWorkspaceBranchReconcileForward?: boolean;
+    // Park a second, still-open execution workspace on the live branch. SUP-11207 lets a clean
+    // worktree be restored onto its recorded branch when the live branch is a real ref, so
+    // contention is what keeps the containment cascade fail-closed for a *claimed* live branch.
+    claimLiveBranchFromOtherWorkspace?: boolean;
+  } = {},
 ) {
   const companyId = randomUUID();
   const projectId = randomUUID();
@@ -439,7 +445,7 @@ async function seedBranchContainmentRun(
       cwd: path.join(repoRoot, ".paperclip", "worktrees", "other-workspace"),
       repoUrl: null,
       baseRef: "HEAD",
-      branchName: "other-workspace",
+      branchName: opts.claimLiveBranchFromOtherWorkspace === true ? actualBranch : "other-workspace",
       providerType: "git_worktree",
       providerRef: path.join(repoRoot, ".paperclip", "worktrees", "other-workspace"),
       lastUsedAt: now,
@@ -601,6 +607,7 @@ async function expectContainedWorkspaceBranchFailure(input: {
   sourceExecutionWorkspaceId?: string | null;
   expectedBranch: string;
   actualBranch: string;
+  expectedSafeRepairReason?: string | RegExp;
 }) {
   const finishedRun = await waitForRunToFinish(input.heartbeat, input.runId, 10_000);
   expect(finishedRun).toMatchObject({
@@ -620,7 +627,9 @@ async function expectContainedWorkspaceBranchFailure(input: {
       eligible: false,
       attempted: false,
       succeeded: false,
-      reason: "expected branch and current HEAD differ",
+      reason: input.expectedSafeRepairReason instanceof RegExp
+        ? expect.stringMatching(input.expectedSafeRepairReason)
+        : input.expectedSafeRepairReason ?? "expected branch and current HEAD differ",
     }),
   });
   if (input.sourceExecutionWorkspaceId !== undefined) {
@@ -1051,7 +1060,9 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
   ])("contains mid-change branch divergence at %s", async (_name, callSite, expectedWorkspaceId) => {
     const repoRoot = await createGitRepo();
     tempRoots.push(repoRoot);
-    const seeded = await seedBranchContainmentRun(db, repoRoot, callSite);
+    const seeded = await seedBranchContainmentRun(db, repoRoot, callSite, {
+      claimLiveBranchFromOtherWorkspace: true,
+    });
 
     if (callSite === "finalize") {
       adapterExecute.mockImplementationOnce(async (adapterInput) => {
@@ -1100,6 +1111,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
             : null,
       expectedBranch: seeded.expectedBranch,
       actualBranch: seeded.actualBranch,
+      expectedSafeRepairReason: /^recorded branch restore refused because workspace .* already claims the live branch/,
     });
     expect(adapterExecute).toHaveBeenCalledTimes(callSite === "finalize" ? 1 : 0);
   }, 30_000);

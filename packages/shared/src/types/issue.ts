@@ -395,7 +395,14 @@ export type IssueBlockerAttentionReason =
 export interface IssueBlockerAttention {
   state: IssueBlockerAttentionState;
   reason: IssueBlockerAttentionReason;
+  /** Whether the blocker-attention fields were computed for this issue. `false` for non-`blocked` issues where attention is a placeholder. */
+  computed: boolean;
+  /** Total count of unresolved top-level blockers (explicit + child). Kept for backward compat; prefer the split counts. */
   unresolvedBlockerCount: number;
+  /** Count of unresolved explicit "blocks" relation edges at the top level. */
+  explicitBlockerCount: number;
+  /** Count of unresolved child/parent edges at the top level. */
+  childBlockerCount: number;
   coveredBlockerCount: number;
   stalledBlockerCount: number;
   attentionBlockerCount: number;
@@ -1026,7 +1033,8 @@ export interface AskUserQuestionsResult {
   answers: AskUserQuestionsAnswer[];
   cancelled?: true;
   cancellationReason?: string | null;
-  expirationReason?: "superseded_by_comment";
+  expirationReason?: "superseded_by_comment" | "expired_issue_terminal" | "withdrawn_by_author";
+  reason?: string | null;
   commentId?: string | null;
   summaryMarkdown?: string | null;
 }
@@ -1157,7 +1165,7 @@ export interface RequestItemVerdictsPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target";
+  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "withdrawn_by_author" | "expired_issue_terminal";
   reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
@@ -1189,9 +1197,10 @@ export interface RequestItemVerdictsResultItem {
 
 export interface RequestItemVerdictsResult {
   version: 1;
-  outcome: "resolved" | "superseded_by_comment" | "stale_target" | "cancelled";
+  outcome: "resolved" | "superseded_by_comment" | "stale_target" | "cancelled" | "withdrawn_by_author" | "expired_issue_terminal";
   complete: boolean;
   items: RequestItemVerdictsResultItem[];
+  reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
 }

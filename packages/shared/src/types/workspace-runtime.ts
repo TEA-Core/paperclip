@@ -129,6 +129,9 @@ export interface ExecutionWorkspaceCloseGitReadiness {
   behindCount: number | null;
   isMergedIntoBase: boolean | null;
   createdByRuntime: boolean;
+  recordedBranchExists: boolean | null;
+  recordedBranchDeleted: boolean;
+  safeRebindToDefaultBranch: boolean;
 }
 
 export interface ExecutionWorkspaceCloseReadiness {

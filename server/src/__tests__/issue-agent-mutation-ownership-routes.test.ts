@@ -36,6 +36,7 @@ const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
   decide: vi.fn(),
   hasPermission: vi.fn(),
+  isManagerOf: vi.fn(),
 }));
 
 const mockAgentService = vi.hoisted(() => ({
@@ -71,6 +72,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
+  expirePendingInteractionsOnTerminalIssueStatus: vi.fn(async () => []),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
   link: vi.fn(),
@@ -265,6 +267,15 @@ function createRunContextDb(
   contextSnapshot: Record<string, unknown> = {},
   runAgentOrRows: string | Record<string, unknown>[] = ownerAgentId,
   runId: string = ownerRunId,
+  /**
+   * Which issue owns the run's execution workspace. Run-derived inheritance only
+   * fires when the running issue owns the worktree it is sitting in (SUP-11260),
+   * so a test that expects inheritance has to say who the owner is. Defaults to
+   * the running issue, which is the ordinary case.
+   */
+  workspaceOwnerIssueId: string | null = typeof contextSnapshot.issueId === "string"
+    ? contextSnapshot.issueId
+    : null,
 ) {
   const runRows = Array.isArray(runAgentOrRows)
     ? runAgentOrRows
@@ -281,6 +292,9 @@ function createRunContextDb(
   const rowsForSelection = (selection: Record<string, unknown>) => {
     const keys = Object.keys(selection);
     if (keys.includes("entityId")) return [];
+    if (keys.includes("sourceIssueId")) {
+      return workspaceOwnerIssueId ? [{ sourceIssueId: workspaceOwnerIssueId }] : [];
+    }
     if (keys.includes("contextSnapshot")) return runRows;
     if (keys.includes("agentCompanyId")) return runRows;
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
@@ -1196,6 +1210,113 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  it("still inherits the run workspace when reuse_existing names no workspace id", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        issueId,
+        executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      }),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Reuse the current worktree",
+        executionWorkspacePreference: "reuse_existing",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({
+        title: "Reuse the current worktree",
+        executionWorkspacePreference: "reuse_existing",
+        inheritExecutionWorkspaceFromIssueId: issueId,
+      }),
+    );
+  });
+
+  it("does not hand on a workspace the running issue only borrowed", async () => {
+    // SUP-11260: the run is a guest in another issue's worktree. Passing that
+    // worktree to every issue it creates is how one workspace accumulated 31
+    // unrelated issues over eight days, and how two agents ended up editing one
+    // working tree — where an observed `git reset` destroyed a sibling's commit.
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb(
+        { issueId, executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+        ownerAgentId,
+        ownerRunId,
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      ),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Follow-up from a borrowed worktree" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.not.objectContaining({
+        inheritExecutionWorkspaceFromIssueId: expect.anything(),
+      }),
+    );
+  });
+
+  it("drops a bare reuse_existing when the borrowed workspace is withheld", async () => {
+    // Declining the inheritance must not turn into a 422. `reuse_existing` with no
+    // id is a request to continue somewhere; once that is refused there is nothing
+    // for the preference to name, and a fresh workspace is the honest answer.
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb(
+        { issueId, executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+        ownerAgentId,
+        ownerRunId,
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      ),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Reuse a worktree the run does not own",
+        executionWorkspacePreference: "reuse_existing",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [, createArgs] = mockIssueService.create.mock.calls.at(-1) ?? [];
+    expect(createArgs).toMatchObject({ title: "Reuse a worktree the run does not own" });
+    expect((createArgs as Record<string, unknown>).executionWorkspacePreference).toBeUndefined();
+    expect((createArgs as Record<string, unknown>).inheritExecutionWorkspaceFromIssueId).toBeUndefined();
+  });
+
+  it("does not hand on a run workspace whose owning workspace row is gone", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb(
+        { issueId, executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+        ownerAgentId,
+        ownerRunId,
+        null,
+      ),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Follow-up with no resolvable workspace owner" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.not.objectContaining({
+        inheritExecutionWorkspaceFromIssueId: expect.anything(),
+      }),
+    );
+  });
+
   it("preserves explicit workspace choices on agent-created root issues", async () => {
     const app = await createApp(
       ownerActor(),
@@ -1493,6 +1614,159 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  describe("ancestor escape hatch field restrictions", () => {
+    function ancestorActor() {
+      return {
+        type: "agent",
+        agentId: peerAgentId,
+        companyId,
+        source: "agent_key",
+        runId: "66666666-6666-4666-8666-666666666666",
+      };
+    }
+
+    beforeEach(() => {
+      // The base authorization boundary denies issue:mutate for the ancestor
+      // (they are not the assignee), but isManagerOf returns true, so the
+      // inline ancestor escape hatch in the PATCH handler applies.
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed:
+          input.action === "tasks:assign" ||
+          input.action === "issue:comment" ||
+          input.action === "issue:read" ||
+          input.action === "company_scope:read",
+        action: input.action,
+        reason:
+          input.action === "tasks:assign" ||
+            input.action === "issue:comment" ||
+            input.action === "issue:read" ||
+            input.action === "company_scope:read"
+            ? "allow_explicit_grant"
+            : "deny_missing_grant",
+        explanation: "Ancestor test boundary default.",
+      }));
+      mockAccessService.isManagerOf.mockResolvedValue(true);
+      mockAgentService.getById.mockImplementation(async (id: string) => ({
+        id,
+        companyId,
+        name: `Agent ${id}`,
+      }));
+      mockAgentService.resolveByReference.mockImplementation(async (_companyId: string, raw: string) => ({
+        agent: { id: raw, companyId, name: `Agent ${raw}`, status: "active" },
+        ambiguous: false,
+      }));
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }),
+      );
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }),
+        ...patch,
+      }));
+    });
+
+    it.each([
+      ["assigneeAgentId", { assigneeAgentId: peerAgentId }],
+      ["status", { status: "blocked" }],
+      ["blockedByIssueIds", { blockedByIssueIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"] }],
+    ])("allows ancestor escape hatch to set %s", async (_field, patch) => {
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send(patch);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining(patch),
+      );
+    });
+
+    it("records escape_hatch_manager_chain in the issue.updated activity when the ancestor escape hatch applies", async () => {
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "blocked" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.updated",
+          entityType: "issue",
+          details: expect.objectContaining({
+            authorizationPath: "escape_hatch_manager_chain",
+          }),
+        }),
+      );
+    });
+
+    it.each([
+      ["title", { title: "Spoofed title" }],
+      ["description", { description: "Spoofed description" }],
+      ["reviewRequest", { reviewRequest: { instructions: "Approve this" } }],
+      ["reopen", { reopen: true }],
+      ["resume", { resume: true }],
+      ["comment", { comment: "Ancestor comment" }],
+      ["assigneeAdapterOverrides", { assigneeAdapterOverrides: { modelProfile: "cheap" } }],
+    ])("rejects ancestor escape hatch from setting %s", async (_field, patch) => {
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send(patch);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe(
+        "Ancestor escape hatch only permits assigneeAgentId, status, and blockedByIssueIds changes",
+      );
+      expect(res.body.details.forbiddenFields).toContain(_field);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects ancestor escape hatch from approving a stage via reviewRequest", async () => {
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ reviewRequest: { instructions: "Please approve" } });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe(
+        "Ancestor escape hatch only permits assigneeAgentId, status, and blockedByIssueIds changes",
+      );
+      expect(res.body.details.forbiddenFields).toContain("reviewRequest");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
+  it("records escape_hatch_creator in the issue.comment_added activity when the creating agent comments via the escape hatch", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:comment" || input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:comment" ? "allow_creator" : "allow_explicit_grant",
+      explanation: "Creator escape hatch boundary.",
+    }));
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ assigneeAgentId: ownerAgentId, createdByAgentId: peerAgentId }),
+    );
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Creator follow-up comment." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Creator follow-up comment.",
+      expect.any(Object),
+      expect.any(Object),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_added",
+        entityType: "issue",
+        details: expect.objectContaining({
+          authorizationPath: "escape_hatch_creator",
+        }),
+      }),
+    );
+  });
+
   it("allows same-company agent mutations on unassigned in-progress issues", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: null }));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
@@ -1547,6 +1821,56 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("Agent cannot resolve another owner's recovery action");
     expect(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
+  });
+
+  it("allows any same-company agent to mutate an unassigned issue when the active recovery action has no owner", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "blocked", assigneeAgentId: null }),
+    );
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "blocked", assigneeAgentId: null }),
+      ...patch,
+    }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId: null,
+    });
+    mockAgentService.resolveByReference.mockResolvedValue({
+      ambiguous: false,
+      agent: makeAgent(peerAgentId),
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: peerAgentId, status: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("allows any same-company agent to resolve a recovery action when the action has no owner and the issue is unassigned", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "blocked", assigneeAgentId: null }),
+    );
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "blocked", assigneeAgentId: null }),
+      ...patch,
+    }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId: null,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+      .send({
+        actionId: recoveryActionId,
+        outcome: "restored",
+        sourceIssueStatus: "done",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueRecoveryActionService.resolveActiveForIssue).toHaveBeenCalled();
   });
 
   it("allows the named recovery owner to resolve a board-owned source issue", async () => {

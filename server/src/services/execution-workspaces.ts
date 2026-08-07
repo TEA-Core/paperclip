@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
@@ -38,6 +38,7 @@ import {
   listCurrentRuntimeServicesForExecutionWorkspaces,
   listCurrentRuntimeServicesForProjectWorkspaces,
 } from "./workspace-runtime-read-model.js";
+import { detectDefaultBranch, normalizeDefaultBranchForComparison } from "./workspace-runtime.js";
 
 type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
@@ -47,7 +48,7 @@ const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 
-export type ExecutionWorkspaceBranchReconcileMode = "forward" | "override" | "quarantine_restore";
+export type ExecutionWorkspaceBranchReconcileMode = "forward" | "override" | "quarantine_restore" | "default_branch_rebind";
 
 export type ExecutionWorkspaceBranchReconcileActor = {
   actorType: "agent" | "user" | "system";
@@ -68,6 +69,8 @@ export type ExecutionWorkspaceBranchReconcileInspection = {
   cleanliness: "clean" | "dirty" | "unknown";
   statusEntryCount: number | null;
   plainLanguageReason: string;
+  defaultBranch: string | null;
+  actualBranchIsDefaultBranch: boolean;
 };
 
 export type ExecutionWorkspaceBranchReconcileResult = {
@@ -101,6 +104,22 @@ export type ExecutionWorkspaceGitWorktreeContention = {
     issueId: string | null;
     issueIdentifier: string | null;
   } | null;
+} | null;
+
+/**
+ * A live run that already occupies an execution workspace on behalf of a
+ * *different* issue.
+ *
+ * Distinct from {@link ExecutionWorkspaceGitWorktreeContention}, which asks
+ * whether two workspace *rows* collide on one path or branch. This asks the
+ * question that matters at dispatch: is somebody else's agent editing this
+ * working tree right now?
+ */
+export type ExecutionWorkspaceActiveRunOccupancy = {
+  runId: string;
+  runStatus: "queued" | "running";
+  issueId: string | null;
+  issueIdentifier: string | null;
 } | null;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -305,6 +324,13 @@ async function inspectExecutionWorkspaceBranchForReconcile(
     actualHeadSha: toSha,
   });
 
+  const defaultBranch = repoRoot ? await detectDefaultBranch(repoRoot) : null;
+  const actualBranchIsDefaultBranch =
+    Boolean(toBranch) &&
+    Boolean(defaultBranch) &&
+    normalizeDefaultBranchForComparison(toBranch) ===
+      normalizeDefaultBranchForComparison(defaultBranch);
+
   return {
     fingerprint: fingerprintWorkspaceBranchIncoherence({
       sourceIssueId: workspace.sourceIssueId ?? null,
@@ -325,6 +351,8 @@ async function inspectExecutionWorkspaceBranchForReconcile(
     ancestryVerdict,
     cleanliness,
     statusEntryCount: statusLines?.length ?? null,
+    defaultBranch,
+    actualBranchIsDefaultBranch,
     plainLanguageReason: explainGitWorktreeBranchReconcileInspection({
       fromBranch,
       toBranch,
@@ -518,6 +546,12 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
   }
 }
 
+async function localBranchExists(repoRoot: string, branch: string): Promise<boolean> {
+  return runGit(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot)
+    .then(() => true)
+    .catch(() => false);
+}
+
 async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<{
   git: ExecutionWorkspaceCloseGitReadiness | null;
   warnings: string[];
@@ -554,6 +588,9 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
         behindCount: null,
         isMergedIntoBase: null,
         createdByRuntime,
+        recordedBranchExists: null,
+        recordedBranchDeleted: false,
+        safeRebindToDefaultBranch: false,
       },
       warnings,
     };
@@ -628,6 +665,44 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
     }
   }
 
+  let recordedBranchExists: boolean | null = null;
+  let recordedBranchDeleted = false;
+  let safeRebindToDefaultBranch = false;
+
+  if (repoRoot && workspace.branchName) {
+    recordedBranchExists = await localBranchExists(repoRoot, workspace.branchName);
+    if (!recordedBranchExists) {
+      recordedBranchDeleted = true;
+      const isClean = dirtyEntryCount === 0 && untrackedEntryCount === 0;
+      if (isClean) {
+        const currentBranch = await readGitStdout(
+          ["symbolic-ref", "--quiet", "--short", "HEAD"],
+          workspacePath,
+        ).catch(() => null);
+        const defaultBranch = await detectDefaultBranch(repoRoot);
+        const isOnDefaultBranch =
+          Boolean(currentBranch) &&
+          Boolean(defaultBranch) &&
+          normalizeDefaultBranchForComparison(currentBranch) ===
+            normalizeDefaultBranchForComparison(defaultBranch);
+        if (isOnDefaultBranch) {
+          safeRebindToDefaultBranch = true;
+          warnings.push(
+            `The recorded branch "${workspace.branchName}" no longer exists in the repository. Since the worktree is clean and HEAD is on the default branch "${currentBranch}", Paperclip can safely rebind this workspace to the default branch without destroying any work.`,
+          );
+        } else {
+          warnings.push(
+            `The recorded branch "${workspace.branchName}" no longer exists in the repository, and the worktree is clean, but HEAD is not on the default branch. Paperclip cannot safely rebind to the default branch until the worktree is moved to the default branch.`,
+          );
+        }
+      } else {
+        warnings.push(
+          `The recorded branch "${workspace.branchName}" no longer exists in the repository, but the worktree is dirty. Paperclip cannot safely rebind to the default branch until the dirty state is resolved.`,
+        );
+      }
+    }
+  }
+
   return {
     git: {
       repoRoot,
@@ -642,6 +717,9 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
       behindCount,
       isMergedIntoBase,
       createdByRuntime,
+      recordedBranchExists,
+      recordedBranchDeleted,
+      safeRebindToDefaultBranch,
     },
     warnings,
   };
@@ -668,6 +746,37 @@ export function readExecutionWorkspaceConfig(metadata: Record<string, unknown> |
   });
 
   return hasConfig ? config : null;
+}
+
+/**
+ * Detach every issue pointing at a closed shared execution workspace.
+ *
+ * Clearing the id alone would strand `executionWorkspacePreference:
+ * "reuse_existing"` with a null id — the unrealizable pair that
+ * `assertReusableExecutionWorkspaceBound` refuses at write time. This write
+ * bypasses issueService, so it clears the paired preference itself (as the
+ * heartbeat detach path does); otherwise the next PATCH touching workspace
+ * fields would 422 on state the close wrote. Other preferences are left alone:
+ * they are mode intents that stay meaningful without an id, and nulling them
+ * would silently move where the next run lands.
+ */
+export async function detachIssuesFromClosedSharedExecutionWorkspace(
+  db: Db,
+  input: { companyId: string; executionWorkspaceId: string },
+) {
+  return db
+    .update(issues)
+    .set({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: sql`case when ${issues.executionWorkspacePreference} = 'reuse_existing' then null else ${issues.executionWorkspacePreference} end`,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(issues.companyId, input.companyId),
+        eq(issues.executionWorkspaceId, input.executionWorkspaceId),
+      ),
+    );
 }
 
 export function mergeExecutionWorkspaceConfig(
@@ -1321,6 +1430,130 @@ export function executionWorkspaceService(db: Db) {
       return null;
     },
 
+    /**
+     * SUP-11260: is another issue's run live inside this execution workspace?
+     *
+     * A workspace is shared by design — children and redo issues inherit their
+     * parent's worktree so delivery stays on one branch. What was never checked
+     * is whether the previous occupant has *left*. Two agents in one worktree
+     * interleave commits, rebases and resets on a single branch; one observed
+     * `git reset` destroyed a sibling's commit 41 seconds after it was made.
+     *
+     * Two ways to be occupied, both needed. The issue binding is set before
+     * dispatch, so it catches a run still provisioning; the run's own context
+     * snapshot is written after provisioning, so it catches a run whose issue
+     * binding has since moved on. Neither alone closes the window.
+     */
+    findActiveRunOccupyingWorkspace: async (input: {
+      companyId: string;
+      executionWorkspaceId: string;
+      excludingIssueId?: string | null;
+      excludingRunId?: string | null;
+      /**
+       * The asking run's queue position, used to break ties between two runs
+       * that are both merely queued. Without it each would see the other as an
+       * occupant, both would wait out the budget, and both would end up forking
+       * a fresh workspace — safe, but neither gets the branch it wanted. With
+       * it exactly one of the pair waits.
+       */
+      contenderRunCreatedAt?: Date | null;
+    }): Promise<ExecutionWorkspaceActiveRunOccupancy> => {
+      const excludingIssueId = readNullableString(input.excludingIssueId ?? null);
+      const excludingRunId = readNullableString(input.excludingRunId ?? null);
+      const contenderCreatedAt = input.contenderRunCreatedAt ?? null;
+
+      const boundIssues = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          executionRunId: issues.executionRunId,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, input.companyId),
+          eq(issues.executionWorkspaceId, input.executionWorkspaceId),
+          isNull(issues.hiddenAt),
+          excludingIssueId ? ne(issues.id, excludingIssueId) : sql`true`,
+        ))
+        .limit(50);
+
+      const runToIssue = new Map<string, { id: string; identifier: string | null }>();
+      for (const issue of boundIssues) {
+        const summary = { id: issue.id, identifier: issue.identifier ?? null };
+        if (issue.executionRunId) runToIssue.set(issue.executionRunId, summary);
+        if (issue.checkoutRunId) runToIssue.set(issue.checkoutRunId, summary);
+      }
+      const boundRunIds = [...runToIssue.keys()];
+
+      const [row] = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          // A run that is already executing always holds the worktree. A run that
+          // is only queued holds it only if it got in line first, so that two
+          // queued siblings cannot each defer to the other.
+          contenderCreatedAt
+            ? or(
+                eq(heartbeatRuns.status, "running"),
+                and(
+                  eq(heartbeatRuns.status, "queued"),
+                  or(
+                    lt(heartbeatRuns.createdAt, contenderCreatedAt),
+                    and(
+                      eq(heartbeatRuns.createdAt, contenderCreatedAt),
+                      excludingRunId
+                        ? sql`${heartbeatRuns.id}::text < ${excludingRunId}`
+                        : sql`true`,
+                    ),
+                  ),
+                ),
+              )
+            : inArray(heartbeatRuns.status, ["queued", "running"]),
+          excludingRunId ? ne(heartbeatRuns.id, excludingRunId) : sql`true`,
+          or(
+            boundRunIds.length > 0 ? inArray(heartbeatRuns.id, boundRunIds) : sql`false`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${input.executionWorkspaceId}`,
+          ),
+          // Our own issue's other runs are not contention: the same issue's work
+          // on one branch is what the worktree is for, and serialising an issue
+          // against itself would deadlock continuation and recovery runs.
+          excludingIssueId
+            ? sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') is distinct from ${excludingIssueId}`
+            : sql`true`,
+        ))
+        .orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.createdAt))
+        .limit(1);
+
+      if (!row) return null;
+      if (row.status !== "queued" && row.status !== "running") return null;
+
+      const context = isRecord(row.contextSnapshot) ? row.contextSnapshot : null;
+      const contextIssueId = readNullableString(context?.issueId);
+      const linked = runToIssue.get(row.id) ?? null;
+      const issueId = linked?.id ?? contextIssueId;
+      let issueIdentifier = linked?.identifier ?? null;
+      if (!issueIdentifier && issueId) {
+        issueIdentifier = await db
+          .select({ identifier: issues.identifier })
+          .from(issues)
+          .where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueId)))
+          .then((rows) => rows[0]?.identifier ?? null);
+      }
+
+      return {
+        runId: row.id,
+        runStatus: row.status,
+        issueId,
+        issueIdentifier,
+      };
+    },
+
     getById: async (id: string) => {
       const row = await db
         .select()
@@ -1534,7 +1767,7 @@ export function executionWorkspaceService(db: Db) {
         });
       }
 
-      if (git?.createdByRuntime && executionWorkspace.branchName) {
+      if (git?.createdByRuntime && executionWorkspace.branchName && !git?.recordedBranchDeleted) {
         plannedActions.push({
           kind: "git_branch_delete",
           label: "Delete runtime-created branch",
@@ -1634,6 +1867,27 @@ export function executionWorkspaceService(db: Db) {
         );
       }
 
+      if (input.mode === "default_branch_rebind") {
+        if (inspection.fromSha !== null) {
+          throw unprocessable(
+            "Default branch rebind requires the recorded branch to be deleted from the repository",
+            { inspection },
+          );
+        }
+        if (inspection.cleanliness !== "clean") {
+          throw unprocessable(
+            "Default branch rebind requires a clean worktree",
+            { inspection },
+          );
+        }
+        if (!inspection.actualBranchIsDefaultBranch) {
+          throw unprocessable(
+            "Default branch rebind requires the worktree to be on the default branch",
+            { inspection },
+          );
+        }
+      }
+
       const reason = readNullableString(input.reason);
       const rescueRef = input.mode === "quarantine_restore"
         ? await (async () => {
@@ -1660,7 +1914,7 @@ export function executionWorkspaceService(db: Db) {
         : null;
       const now = new Date();
       const allowActiveWorkspace =
-        input.mode === "forward" &&
+        (input.mode === "forward" || input.mode === "default_branch_rebind") &&
         input.actor.actorType === "system" &&
         input.actor.actorId === "workspace_runtime" &&
         Boolean(input.actor.runId);

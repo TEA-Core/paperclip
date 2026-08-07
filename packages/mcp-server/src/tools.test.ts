@@ -52,6 +52,55 @@ describe("paperclip MCP tools", () => {
     );
   });
 
+  it("preserves returnAssigneeAgentId through create and update tool requests", async () => {
+    const returnAssigneeAgentId = "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e";
+    const reviewerAgentId = "d1982606-4c66-475f-af56-63c4b9d92f24";
+    const executionPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      returnAssigneeAgentId,
+      stages: [
+        {
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "PAP-1135", status: "backlog", executionPolicy }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const createTool = getTool("paperclipCreateIssue");
+    await createTool.execute({
+      title: "Exercise return assignee",
+      executionPolicy,
+    });
+
+    const [createUrl, createInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(createUrl)).toBe(
+      "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/issues",
+    );
+    expect(createInit.method).toBe("POST");
+    expect(JSON.parse(String(createInit.body)).executionPolicy.returnAssigneeAgentId).toBe(
+      returnAssigneeAgentId,
+    );
+
+    const updateTool = getTool("paperclipUpdateIssue");
+    await updateTool.execute({
+      issueId: "PAP-1135",
+      executionPolicy: { returnAssigneeAgentId },
+    });
+
+    const [updateUrl, updateInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(String(updateUrl)).toBe("http://localhost:3100/api/issues/PAP-1135");
+    expect(updateInit.method).toBe("PATCH");
+    expect(JSON.parse(String(updateInit.body)).executionPolicy.returnAssigneeAgentId).toBe(
+      returnAssigneeAgentId,
+    );
+  });
+
   it("uses default company id for company-scoped list tools", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse([{ id: "issue-1" }]),
@@ -110,6 +159,7 @@ describe("paperclip MCP tools", () => {
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
+      allowDuplicate: false,
     });
   });
 

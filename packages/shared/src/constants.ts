@@ -308,6 +308,10 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
   "configuration_validation",
   "active_run_watchdog",
   "issue_graph_liveness",
+  "blocked_without_blockers",
+  "no_live_path_unowned",
+  "review_stage_unarmed",
+  "no_live_path_owner_unavailable",
 ] as const;
 export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[number];
 
@@ -1584,6 +1588,7 @@ export const PLUGIN_EVENT_TYPES = [
   "issue.checked_out",
   "issue.released",
   "issue.assignment_wakeup_requested",
+  "issue.dependency_wake_rearm_cap_reached",
   "agent.created",
   "agent.updated",
   "agent.status_changed",

@@ -21,7 +21,10 @@ function makeBlockerAttention(
   return {
     state: "none",
     reason: null,
+    computed: false,
     unresolvedBlockerCount: 0,
+    explicitBlockerCount: 0,
+    childBlockerCount: 0,
     coveredBlockerCount: 0,
     stalledBlockerCount: 0,
     attentionBlockerCount: 0,

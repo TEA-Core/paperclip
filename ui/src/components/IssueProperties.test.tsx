@@ -355,6 +355,7 @@ function createProject(overrides: Partial<Project> = {}): Project {
     pauseReason: null,
     pausedAt: null,
     executionWorkspacePolicy: null,
+    defaultExecutionPolicy: null,
     codebase: {
       workspaceId: "workspace-main",
       repoUrl: null,
@@ -777,6 +778,9 @@ describe("IssueProperties", () => {
           state: "covered",
           reason: "active_child",
           unresolvedBlockerCount: 1,
+          explicitBlockerCount: 1,
+          childBlockerCount: 0,
+          computed: true,
           coveredBlockerCount: 1,
           stalledBlockerCount: 0,
           attentionBlockerCount: 0,

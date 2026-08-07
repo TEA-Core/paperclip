@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -57,24 +57,21 @@ async function waitForRun(db: ReturnType<typeof createDb>, runId: string) {
   return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
 }
 
-async function deleteHeartbeatRunsAfterEvents(db: ReturnType<typeof createDb>) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    await db.delete(heartbeatRunEvents);
-    try {
-      await db.delete(heartbeatRuns);
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (
-        attempt < 4 &&
-        message.includes("heartbeat_run_events_run_id_heartbeat_runs_id_fk")
-      ) {
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        continue;
-      }
-      throw error;
-    }
-  }
+// Child-before-parent, with no retries and no swallowed errors. The ordering fix
+// in executeRun means a settled run has no writes still outstanding, so any error
+// raised here is a real defect and must surface instead of being retried away.
+async function deleteAllFixtureRows(db: ReturnType<typeof createDb>) {
+  await db.delete(activityLog);
+  await db.delete(issueComments);
+  await db.delete(heartbeatRunEvents);
+  await db.delete(heartbeatRuns);
+  await db.delete(agentWakeupRequests);
+  await db.delete(agentRuntimeState);
+  await db.delete(issues);
+  await db.delete(agents);
+  await db.delete(companySkills);
+  await db.delete(companyMemberships);
+  await db.delete(companies);
 }
 
 describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
@@ -91,25 +88,11 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
   afterEach(async () => {
     mockAdapterExecute.mockClear();
     runningProcesses.clear();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const activeRuns = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(inArray(heartbeatRuns.status, ["queued", "running"]));
-      if (activeRuns.length === 0) break;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await db.delete(issueComments);
-    await db.delete(activityLog);
-    await deleteHeartbeatRunsAfterEvents(db);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companySkills);
-    await db.delete(companyMemberships);
-    await db.delete(companies);
+    // Terminal run status is NOT a "this run is finished writing" signal: the
+    // executeRun finally block still appends scratch-cleanup events afterwards.
+    // Await the service's explicit drain instead of polling run status.
+    await heartbeat.drainActiveRunExecutions();
+    await deleteAllFixtureRows(db);
   });
 
   afterAll(async () => {

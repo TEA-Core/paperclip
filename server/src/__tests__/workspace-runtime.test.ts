@@ -25,16 +25,22 @@ import {
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
+  assertGitHeadResolvable,
+  assertGitIndexIntegrity,
+  assertWorktreeWritableByProcessUser,
   buildWorkspaceRuntimeDesiredStatePatch,
   cleanupExecutionWorkspaceArtifacts,
+  ensureGitWorktreeBranchCoherent,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
+  preserveUnpushedWorktreeCommits,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
+  resolveBaseRepoHygieneDecision,
   resetRuntimeServicesForTests,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
@@ -134,11 +140,67 @@ async function createTempRepo(defaultBranch = "main") {
   return repoRoot;
 }
 
+async function createTempRepoWithRemote(defaultBranch = "main") {
+  const remoteRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-remote-"));
+  await runGit(remoteRoot, ["init", "--bare", "--initial-branch", defaultBranch]);
+  const repoRoot = await createTempRepo(defaultBranch);
+  await runGit(repoRoot, ["remote", "add", "origin", remoteRoot]);
+  await runGit(repoRoot, ["push", "-u", "origin", defaultBranch]);
+  return { repoRoot, remoteRoot };
+}
+
+async function expectPersistedBranchMismatchRepaired(input: {
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranch: string;
+  issueId: string;
+  executionWorkspaceId: string;
+}) {
+  const restored = await ensurePersistedExecutionWorkspaceAvailable({
+    base: {
+      baseCwd: input.repoRoot,
+      source: "project_primary",
+      projectId: "project-1",
+      workspaceId: "workspace-1",
+      repoUrl: null,
+      repoRef: "HEAD",
+    },
+    workspace: {
+      id: input.executionWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      cwd: input.worktreePath,
+      providerRef: input.worktreePath,
+      projectId: "project-1",
+      projectWorkspaceId: "workspace-1",
+      repoUrl: null,
+      baseRef: "HEAD",
+      branchName: input.expectedBranch,
+    },
+    issue: {
+      id: input.issueId,
+      identifier: "PAP-459",
+      title: "Restore the recorded branch over a live named branch",
+    },
+    agent: {
+      id: "agent-1",
+      name: "Codex Coder",
+      companyId: "company-1",
+    },
+    enableWorkspaceBranchReconcileForward: true,
+  });
+
+  expect(restored).not.toBeNull();
+  expect(restored!.branchName).toBe(input.expectedBranch);
+  await expect(readGit(input.worktreePath, ["branch", "--show-current"])).resolves.toBe(input.expectedBranch);
+  return restored!;
+}
+
 async function expectPersistedBranchMismatchRejected(input: {
   repoRoot: string;
   worktreePath: string;
   expectedBranch: string;
-  actualBranch: string;
+  actualBranch: string | null;
   issueId: string;
   executionWorkspaceId: string;
   expectedAncestryVerdict: "diverged" | "unknown";
@@ -350,6 +412,221 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
   await resetRuntimeServicesForTests();
+});
+
+describe("assertWorktreeWritableByProcessUser", () => {
+  it("resolves when the worktree and all tracked files are writable", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10633-writable-guard";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    await expect(assertWorktreeWritableByProcessUser(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("throws when the worktree directory itself is not writable", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10633-dir-not-writable";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await fs.chmod(worktreePath, 0o555);
+
+    try {
+      await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(/not writable/);
+    } finally {
+      await fs.chmod(worktreePath, 0o755);
+    }
+  });
+
+  it("throws when a tracked file is not writable", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10633-file-not-writable";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await fs.writeFile(path.join(worktreePath, "README.md"), "hello\n", "utf8");
+    await fs.chmod(path.join(worktreePath, "README.md"), 0o444);
+
+    try {
+      await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(/not writable/);
+    } finally {
+      await fs.chmod(path.join(worktreePath, "README.md"), 0o644);
+    }
+  });
+
+  // An agent deleting a tracked file is ordinary uncommitted work. `fs.access`
+  // reports ENOENT for it, which is not a permission problem — counting it as one
+  // blocked provisioning for any issue mid-change and told the operator to run a
+  // `chown` that could not possibly help. Observed on the live instance: two
+  // worktrees reported "3 files not writable" and "110 files not writable" whose
+  // failing counts exactly matched `git ls-files --deleted`, with every remaining
+  // file owned correctly.
+  it("resolves when a tracked file has been deleted from the worktree", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10633-tracked-file-deleted";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    const tracked = path.join(worktreePath, "delete-me.md");
+    await fs.writeFile(tracked, "hello\n", "utf8");
+    await execFileAsync("git", ["add", "delete-me.md"], { cwd: worktreePath });
+    await execFileAsync("git", ["commit", "-m", "add tracked file"], { cwd: worktreePath });
+    await fs.rm(tracked);
+
+    // Still tracked in the index, absent on disk — the exact live condition.
+    const { stdout } = await execFileAsync("git", ["ls-files", "--deleted"], { cwd: worktreePath });
+    expect(stdout).toContain("delete-me.md");
+
+    await expect(assertWorktreeWritableByProcessUser(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("still throws for a genuinely unreadable file alongside a deleted one", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10633-deleted-plus-unwritable";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    await fs.writeFile(path.join(worktreePath, "gone.md"), "gone\n", "utf8");
+    await fs.writeFile(path.join(worktreePath, "locked.md"), "locked\n", "utf8");
+    await execFileAsync("git", ["add", "gone.md", "locked.md"], { cwd: worktreePath });
+    await execFileAsync("git", ["commit", "-m", "add two tracked files"], { cwd: worktreePath });
+    await fs.rm(path.join(worktreePath, "gone.md"));
+    await fs.chmod(path.join(worktreePath, "locked.md"), 0o444);
+
+    try {
+      // The deletion is ignored; the real permission failure is still reported.
+      await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(
+        /1 files not writable/,
+      );
+    } finally {
+      await fs.chmod(path.join(worktreePath, "locked.md"), 0o644);
+    }
+  });
+
+  it("throws when the path is not a valid git repository", async () => {
+    const nonRepoPath = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-non-repo-"));
+
+    await expect(assertWorktreeWritableByProcessUser(nonRepoPath)).rejects.toThrow(
+      /not a valid git repository or is missing/,
+    );
+  });
+
+  it("throws a workspace validation failure when the worktree git index is truncated to zero bytes", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-10995-truncated-index";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    const indexFile = path.join(repoRoot, ".git", "worktrees", branchName, "index");
+    await fs.writeFile(indexFile, Buffer.alloc(0));
+
+    await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(
+      /git index.*0 bytes \(truncated\)|truncated.*git index/i,
+    );
+  });
+});
+
+describe("assertGitIndexIntegrity", () => {
+  it("resolves when the git index is healthy (non-zero)", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11017-healthy-index";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    await expect(assertGitIndexIntegrity(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("throws a workspace validation failure when the worktree git index is truncated to zero bytes", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11017-truncated-index";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    const indexFile = path.join(repoRoot, ".git", "worktrees", branchName, "index");
+    await fs.writeFile(indexFile, Buffer.alloc(0));
+
+    await expect(assertGitIndexIntegrity(worktreePath)).rejects.toThrow(
+      /git index.*0 bytes \(truncated\)|truncated.*git index/i,
+    );
+  });
+});
+
+describe("assertGitHeadResolvable", () => {
+  // SUP-10008 / SUP-10933: a reused worktree whose HEAD is a symref to a branch that no longer
+  // exists. git reports it as "000000000" in `git worktree list` and every rev-parse fails, so an
+  // agent dispatched there cannot commit, branch, or diff — its work strands. The reuse preflight
+  // never noticed, because `git symbolic-ref --short HEAD` still returns the expected branch name
+  // whether or not the ref it points at exists, so the branch-coherence check matched and returned.
+  it("throws a workspace validation failure when HEAD is a symref to a branch that no longer exists", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11121-dangling-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    // Delete the branch ref out from under the worktree, leaving HEAD dangling.
+    await fs.rm(path.join(repoRoot, ".git", "refs", "heads", branchName), { force: true });
+    await fs.rm(path.join(repoRoot, ".git", "packed-refs"), { force: true });
+
+    await expect(assertGitHeadResolvable(worktreePath)).rejects.toThrow(/HEAD.*does not resolve/i);
+  });
+
+  // False-positive guards. A refuse-to-proceed check earns its place only by staying silent on the
+  // ordinary states it must not reject — the SUP-10633 lesson, where a writability guard counted
+  // ENOENT from deleted tracked files as a permission failure and blocked every agent that had
+  // removed a file.
+  it("resolves for a healthy worktree", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11121-healthy-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    await expect(assertGitHeadResolvable(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("resolves for a worktree with uncommitted work, including deleted tracked files", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11121-dirty-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    await fs.writeFile(path.join(worktreePath, "untracked.txt"), "new work\n", "utf8");
+    await fs.writeFile(path.join(worktreePath, "README.md"), "modified\n", "utf8");
+    await fs.rm(path.join(worktreePath, "package.json"), { force: true });
+
+    await expect(assertGitHeadResolvable(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("resolves for a detached HEAD", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11121-detached-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await runGit(worktreePath, ["checkout", "--detach"]);
+
+    await expect(assertGitHeadResolvable(worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("resolves for a worktree with an interrupted rebase, which is a separate condition", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-11121-rebase-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await fs.mkdir(path.join(repoRoot, ".git", "worktrees", branchName, "rebase-merge"), { recursive: true });
+
+    await expect(assertGitHeadResolvable(worktreePath)).resolves.toBeUndefined();
+  });
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {
@@ -688,6 +965,226 @@ describe("realizeExecutionWorkspace", () => {
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(originHead);
   });
 
+  it("restores a base repo left on a task branch before cutting a worktree from it", async () => {
+    // SUP-11285: the primary clone is an ancestor of every agent worktree and the
+    // only checkout holding the default branch, so agents use it as scratch and
+    // leave it parked. Tidy it on the way past — without blocking the dispatch.
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await runGit(repoRoot, ["checkout", "-b", "someone-elses-task-branch"]);
+    await fs.writeFile(path.join(repoRoot, "README.md"), "left dirty by an agent\n", "utf8");
+    expect(await readGit(repoRoot, ["status", "--porcelain"])).not.toBe("");
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+
+    // The dispatch still got its worktree...
+    expect(workspace.cwd).toBeTruthy();
+    // ...and the base repo is back on its default ref with no tracked modifications.
+    // Untracked entries are expected to survive: by this point `.paperclip/worktrees`
+    // exists and is untracked in this repo, and removing it would delete the very
+    // worktree this dispatch just created.
+    expect(await readGit(repoRoot, ["symbolic-ref", "--short", "HEAD"])).toBe("master");
+    const trackedDirt = (await readGit(repoRoot, ["status", "--porcelain"]))
+      .split("\n")
+      .filter((line) => line.trim().length > 0 && !line.startsWith("??"));
+    expect(trackedDirt).toEqual([]);
+    expect(workspace.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+
+    // Nothing was discarded: the modification is recoverable from a rescue ref.
+    const rescueRefs = (await readGit(repoRoot, [
+      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+    ])).split("\n").filter(Boolean);
+    expect(rescueRefs.some((ref) => ref.endsWith("/worktree"))).toBe(true);
+    expect(rescueRefs.some((ref) => ref.endsWith("/head"))).toBe(true);
+  });
+
+  it("leaves untracked files in the base repo alone while restoring it", async () => {
+    // The worktrees live at <repoRoot>/.paperclip/worktrees and are untracked in
+    // some repos on this fleet, so anything that removes untracked content from
+    // the base repo would delete live agent workspaces. Never do that.
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await runGit(repoRoot, ["checkout", "-b", "parked"]);
+    const untracked = path.join(repoRoot, "untracked-keepme.txt");
+    await fs.writeFile(untracked, "not ours to delete\n", "utf8");
+
+    await realizeWorktreeForTest(repoRoot, "master");
+
+    expect(await readGit(repoRoot, ["symbolic-ref", "--short", "HEAD"])).toBe("master");
+    expect(existsSync(untracked)).toBe(true);
+  });
+
+  describe("base repo hygiene decision", () => {
+    it("returns ok when the base repo is cleanly detached at the base ref", () => {
+      expect(
+        resolveBaseRepoHygieneDecision({
+          currentBranch: null,
+          defaultRef: "main",
+          dirtyTrackedPathCount: 0,
+          unmergedPathCount: 0,
+          headSha: "abc123",
+          baseRefSha: "abc123",
+        }),
+      ).toEqual({ action: "ok" });
+    });
+
+    it("still restores a base repo detached at a different commit", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: null,
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(expect.arrayContaining([expect.stringContaining("detached HEAD")]));
+      }
+    });
+
+    it("still restores a base repo on a named non-default branch", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "feature-branch",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(
+          expect.arrayContaining([expect.stringContaining('"feature-branch" instead of "main"')]),
+        );
+      }
+    });
+
+    it("still restores a base repo with unmerged paths", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 2,
+        headSha: "abc123",
+        baseRefSha: "abc123",
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(
+          expect.arrayContaining([expect.stringContaining("2 unmerged path(s)")]),
+        );
+        expect(decision.snapshotTrackedChanges).toBe(true);
+      }
+    });
+
+    it("still restores a base repo detached at baseRef but with dirty tracked paths", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: null,
+        defaultRef: "main",
+        dirtyTrackedPathCount: 3,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "abc123",
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(
+          expect.arrayContaining([expect.stringContaining("3 modified tracked path(s)")]),
+        );
+        expect(decision.snapshotTrackedChanges).toBe(true);
+      }
+    });
+
+    it("falls back to branch-name behaviour when SHAs are unknown", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: null,
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: null,
+        baseRefSha: null,
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(
+          expect.arrayContaining([expect.stringContaining("detached HEAD")]),
+        );
+      }
+    });
+  });
+
+  it("does not restore a base repo already at the base ref on a second dispatch (detached HEAD case)", async () => {
+    // F1: when the default branch is held by an agent worktree, the first dispatch
+    // detaches at the base ref. The second dispatch must see HEAD === baseRefSha and
+    // skip the restore entirely — no "was restored to" warning, no new rescue ref.
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const stealer = path.join(repoRoot, "..", "master-stealer");
+    await runGit(repoRoot, ["checkout", "-b", "parked-elsewhere"]);
+    await fs.writeFile(path.join(repoRoot, "extra.txt"), "extra\n", "utf8");
+    await runGit(repoRoot, ["add", "extra.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "extra commit"]);
+    await runGit(repoRoot, ["worktree", "add", stealer, "master"]);
+
+    const first = await realizeWorktreeForTest(repoRoot, "master");
+    expect(first.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+    const firstRescueRefs = (await readGit(repoRoot, [
+      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+    ])).split("\n").filter(Boolean);
+    const firstCount = firstRescueRefs.length;
+    expect(firstCount).toBeGreaterThan(0);
+
+    const second = await realizeWorktreeForTest(repoRoot, "master");
+    expect(second.warnings).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+    const secondRescueRefs = (await readGit(repoRoot, [
+      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+    ])).split("\n").filter(Boolean);
+    expect(secondRescueRefs.length).toBe(firstCount);
+  });
+
+  it("produces distinct rescue-ref prefixes for two dirty base repo restores in the same second", async () => {
+    // F2: the rescue prefix must include a per-run discriminator so concurrent
+    // restores within the same second do not silently overwrite each other.
+    const { repoRoot } = await createClonedRepoWithRemote();
+
+    await runGit(repoRoot, ["checkout", "-b", "dirty-one"]);
+    await fs.writeFile(path.join(repoRoot, "README.md"), "modification one\n", "utf8");
+    await realizeWorktreeForTest(repoRoot, "master");
+
+    await runGit(repoRoot, ["checkout", "-b", "dirty-two"]);
+    await fs.writeFile(path.join(repoRoot, "README.md"), "modification two\n", "utf8");
+    await realizeWorktreeForTest(repoRoot, "master");
+
+    const rescueRefs = (await readGit(repoRoot, [
+      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+    ])).split("\n").filter(Boolean);
+    const prefixes = new Set(rescueRefs.map((ref) => ref.replace(/\/(head|worktree)$/, "")));
+    expect(prefixes.size).toBe(2);
+  });
+
+  it("still provisions when the base repo cannot be restored", async () => {
+    // Hygiene is never a gate. A base repo whose default branch is checked out in
+    // another worktree cannot be returned to it, and the dispatch must not care.
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const stealer = path.join(repoRoot, "..", "master-stealer");
+    await runGit(repoRoot, ["checkout", "-b", "parked-elsewhere"]);
+    await runGit(repoRoot, ["worktree", "add", stealer, "master"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+
+    expect(workspace.cwd).toBeTruthy();
+    // Detached at the base ref rather than contending for a branch another
+    // checkout already holds.
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"]))
+      .toBe(await readGit(repoRoot, ["rev-parse", "origin/master"]));
+    expect(await readGit(repoRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => "DETACHED"))
+      .toBe("DETACHED");
+  });
+
   it("maps a configured local branch base ref to origin/<branch> for fresh worktrees", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
     const originHead = await readGit(repoRoot, ["rev-parse", "origin/master"]);
@@ -720,7 +1217,9 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.cwd).toBe(initial.cwd);
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(advancedHead);
     expect(reused.baseRefSha).toBe(advancedHead);
-    expect(reused.warnings).toEqual([]);
+    expect(reused.warnings).toEqual([
+      expect.stringContaining("No baseRef configured"),
+    ]);
   });
 
   it("does not reset a reused worktree that already has task commits", async () => {
@@ -739,6 +1238,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.created).toBe(false);
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(taskHead);
     expect(reused.warnings).toEqual([
+      expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
   });
@@ -760,6 +1260,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
+      expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
   });
@@ -785,6 +1286,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
+      expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
   });
@@ -822,7 +1324,51 @@ describe("realizeExecutionWorkspace", () => {
           companyId: "company-1",
         },
       }),
-    ).rejects.toThrow(/not a reusable git worktree \(path is not registered in `git worktree list`\)\./);
+     ).rejects.toThrow(/not a reusable git worktree \(path is not registered in `git worktree list`\)\./);
+  });
+
+  it("rejects provisioning a worktree that is not writable", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-999-non-writable";
+
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await fs.chmod(worktreePath, 0o555);
+
+    try {
+      await expect(
+        realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-1",
+            workspaceId: "workspace-1",
+            repoUrl: null,
+            repoRef: "HEAD",
+          },
+          config: {
+            workspaceStrategy: {
+              type: "git_worktree",
+              branchTemplate: branchName,
+              provisionCommand: "bash ./scripts/provision.sh",
+            },
+          },
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-999",
+            title: "Non-writable worktree",
+          },
+          agent: {
+            id: "agent-1",
+            name: "Codex Coder",
+            companyId: "company-1",
+          },
+        }),
+      ).rejects.toThrow(/not writable/);
+    } finally {
+      await fs.chmod(worktreePath, 0o755);
+    }
   });
 
   it("reuses the current linked worktree instead of nesting another worktree inside it", async () => {
@@ -934,17 +1480,106 @@ describe("realizeExecutionWorkspace", () => {
       expect.arrayContaining([
         expect.objectContaining({
           phase: "worktree_prepare",
-          command: "git checkout PAP-447-add-worktree-support",
+          command: "git checkout --ignore-other-worktrees PAP-447-add-worktree-support",
+          // The repair is recorded by ensureGitWorktreeBranchCoherent, which is the only place
+          // allowed to normalise a reused worktree's HEAD. SUP-10665's pre-validation reset used to
+          // do it first under a branchResetOnReuse flag, bypassing the eligibility checks.
           metadata: expect.objectContaining({
             branchIncoherenceRepair: true,
             expectedBranchName: "PAP-447-add-worktree-support",
             actualBranchName: "unexpected-branch",
-            sourceIssueId: "issue-1",
-            fingerprint: expect.stringMatching(/^workspace_incoherence:v1:sha256:/),
           }),
         }),
       ]),
     );
+  });
+
+  it("restores the recorded branch on a clean linked worktree left on a scratch branch with commits on both sides", async () => {
+    const repoRoot = await createTempRepo();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    const initial = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    await runGit(initial.cwd, ["checkout", "-b", "scratch-branch"]);
+    await fs.writeFile(path.join(initial.cwd, "scratch.txt"), "scratch work\n", "utf8");
+    await runGit(initial.cwd, ["add", "scratch.txt"]);
+    await runGit(initial.cwd, ["commit", "-m", "Add scratch work"]);
+    const scratchHead = await readGit(initial.cwd, ["rev-parse", "HEAD"]);
+
+    await runGit(repoRoot, ["checkout", "PAP-447-add-worktree-support"]);
+    await fs.writeFile(path.join(repoRoot, "expected.txt"), "expected work\n", "utf8");
+    await runGit(repoRoot, ["add", "expected.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add expected work"]);
+    const expectedHead = await readGit(repoRoot, ["rev-parse", "PAP-447-add-worktree-support"]);
+    expect(expectedHead).not.toBe(scratchHead);
+
+    const defaultBranch = await readGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    await runGit(repoRoot, ["checkout", defaultBranch]);
+
+    // scratch-branch carries "Add scratch work", which the recorded branch does not. SUP-11207:
+    // that commit is not at risk — scratch-branch is a real ref that still holds it — so the
+    // recorded branch is restored instead of dead-blocking the workspace on every future dispatch.
+    const repaired = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      recorder,
+    });
+
+    expect(repaired.branchName).toBe("PAP-447-add-worktree-support");
+    await expect(readGit(initial.cwd, ["branch", "--show-current"]))
+      .resolves.toBe("PAP-447-add-worktree-support");
+    // The scratch commit was not destroyed, and the operator is told where it went.
+    await expect(readGit(repoRoot, ["rev-parse", "refs/heads/scratch-branch"])).resolves.toBe(scratchHead);
+    expect(repaired.warnings.join("\n")).toContain('parked on "scratch-branch"');
+    expect(expectedHead).not.toBe(scratchHead);
+    expect(operations.some((op) => op.metadata?.branchIncoherenceRepair === true)).toBe(true);
   });
 
   it("reuses an already checked out branch from git worktree metadata even when the target path differs", async () => {
@@ -2335,7 +2970,7 @@ describe("realizeExecutionWorkspace", () => {
       expect.arrayContaining([
         expect.objectContaining({
           phase: "worktree_prepare",
-          command: "git checkout PAP-454-repair-clean-branch-mismatch",
+          command: "git checkout --ignore-other-worktrees PAP-454-repair-clean-branch-mismatch",
           metadata: expect.objectContaining({
             branchIncoherenceRepair: true,
             expectedBranchName: expectedBranch,
@@ -2401,6 +3036,81 @@ describe("realizeExecutionWorkspace", () => {
     ]));
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(branchName);
     await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(detachedHead);
+  }, 15_000);
+
+  // a detached HEAD that diverged from the recorded branch used to dead-block, because
+  // reattachment is only provably lossless when the recorded branch is an ancestor. But the reason
+  // divergence is unsafe is that the detached commits are reachable from no ref — and that is
+  // repairable: name them on a rescue branch first, exactly as the dirty-quarantine path does, and
+  // restoring the recorded branch abandons nothing.
+  it("quarantines a diverged clean detached HEAD on a rescue branch before restoring the recorded branch", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-465-diverged-detached-head";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", branchName]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+
+    const forkPoint = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    await fs.writeFile(path.join(worktreePath, "recorded.txt"), "recorded work\n", "utf8");
+    await runGit(worktreePath, ["add", "recorded.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add recorded branch work"]);
+    const recordedHead = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+
+    await runGit(worktreePath, ["checkout", "--detach", forkPoint]);
+    await fs.writeFile(path.join(worktreePath, "detached.txt"), "detached work\n", "utf8");
+    await runGit(worktreePath, ["add", "detached.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add diverged detached work"]);
+    const detachedHead = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    expect(detachedHead).not.toBe(recordedHead);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-diverged-detached",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName,
+      },
+      issue: {
+        id: "issue-diverged-detached",
+        identifier: "PAP-465",
+        title: "Rescue diverged detached HEAD",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(restored?.branchName).toBe(branchName);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(branchName);
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(recordedHead);
+
+    // The abandoned commit must survive under a name an operator can see in `git branch`.
+    const rescueBranches = (await readGit(repoRoot, ["branch", "--list", "paperclip/rescue/PAP-465/*"]))
+      .split("\n")
+      .map((line) => line.replace(/^[*+]?\s*/, "").trim())
+      .filter((line) => line.length > 0);
+    expect(rescueBranches).toHaveLength(1);
+    await expect(readGit(repoRoot, ["rev-parse", rescueBranches[0]])).resolves.toBe(detachedHead);
+    expect(restored?.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining(rescueBranches[0]),
+    ]));
   }, 15_000);
 
   it("rejects dirty persisted git worktree branch incoherence with bounded recovery evidence", async () => {
@@ -2624,66 +3334,18 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(worktreePath, ["add", "actual.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
 
-    let error: unknown = null;
-    try {
-      await ensurePersistedExecutionWorkspaceAvailable({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-1",
-          workspaceId: "workspace-1",
-          repoUrl: null,
-          repoRef: "HEAD",
-        },
-        workspace: {
-          id: "execution-workspace-diverged",
-          mode: "isolated_workspace",
-          strategyType: "git_worktree",
-          cwd: worktreePath,
-          providerRef: worktreePath,
-          projectId: "project-1",
-          projectWorkspaceId: "workspace-1",
-          repoUrl: null,
-          baseRef: "HEAD",
-          branchName: expectedBranch,
-        },
-        issue: {
-          id: "issue-diverged",
-          identifier: "PAP-457",
-          title: "Classify diverged branch incoherence",
-        },
-        agent: {
-          id: "agent-1",
-          name: "Codex Coder",
-          companyId: "company-1",
-        },
-        enableWorkspaceBranchReconcileForward: true,
-      });
-    } catch (err) {
-      error = err;
-    }
-
-    expect(error).toMatchObject({
-      code: "workspace_validation_failed",
-      resultJson: {
-        workspaceValidation: expect.objectContaining({
-          reason: "git_worktree_branch_incoherence",
-          sourceIssueId: "issue-diverged",
-          sourceIdentifier: "PAP-457",
-          executionWorkspaceId: "execution-workspace-diverged",
-          expectedBranch,
-          actualBranch,
-          cleanliness: "clean",
-          provenance: expect.objectContaining({
-            expectedBranchExists: true,
-            actualBranchExists: true,
-            sameHead: false,
-            ancestryVerdict: "diverged",
-            plainLanguageReason: expect.stringContaining("cannot prove a forward-only reconciliation"),
-          }),
-        }),
-      },
+    // Both branches carry a commit the other does not, so neither side can be discarded — and
+    // neither is. Restoring the recorded branch leaves the sibling commit on its own ref.
+    const restored = await expectPersistedBranchMismatchRepaired({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      issueId: "issue-diverged",
+      executionWorkspaceId: "execution-workspace-diverged",
     });
+    expect(restored.warnings.join("\n")).toContain(`parked on "${actualBranch}"`);
+    await expect(readGit(repoRoot, ["log", "-1", "--format=%s", `refs/heads/${actualBranch}`]))
+      .resolves.toBe("Add actual branch work");
   }, 15_000);
 
   it("classifies persisted git worktree branch incoherence as unknown when the recorded branch was deleted", async () => {
@@ -2766,6 +3428,164 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 15_000);
 
+  it("rebinds deleted recorded branch to default branch when worktree is clean and on default", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-460-deleted-recorded-branch";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, expectedBranch]);
+    await runGit(repoRoot, ["worktree", "remove", worktreePath]);
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath]);
+    await runGit(worktreePath, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await runGit(worktreePath, ["reset", "--hard", "HEAD"]);
+
+    const result = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-deleted-branch-default",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: expectedBranch,
+      },
+      issue: {
+        id: "issue-deleted-branch-default",
+        identifier: "PAP-460",
+        title: "Rebind deleted branch to default",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      enableWorkspaceBranchReconcileForward: true,
+    });
+
+    expect(result.branchName).toBe("main");
+    expect(result.pendingForwardBranchReconcile).toBeUndefined();
+  }, 15_000);
+
+  it("does NOT rebind a dirty worktree with deleted recorded branch to the default branch", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-463-dirty-deleted";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, expectedBranch]);
+    await runGit(repoRoot, ["worktree", "remove", worktreePath]);
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath]);
+    await runGit(worktreePath, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await runGit(worktreePath, ["reset", "--hard", "HEAD"]);
+    await fs.writeFile(path.join(worktreePath, "dirty.txt"), "dirty work\n", "utf8");
+
+    let error: unknown = null;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          id: "execution-workspace-dirty-deleted",
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: worktreePath,
+          providerRef: worktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-1",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName: expectedBranch,
+        },
+        issue: {
+          id: "issue-dirty-deleted",
+          identifier: "PAP-463",
+          title: "Dirty deleted branch non-rebind",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+        enableWorkspaceBranchReconcileForward: true,
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "git_worktree_branch_incoherence",
+          cleanliness: "dirty",
+          provenance: expect.objectContaining({
+            expectedBranchExists: false,
+            actualBranchIsDefaultBranch: true,
+          }),
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+            reason: "worktree is not clean",
+          }),
+        }),
+      },
+    });
+  }, 15_000);
+
+  it("does NOT rebind a deleted recorded branch when the worktree is on an unrelated registered task branch", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-464-deleted-unrelated";
+    const actualBranch = "PAP-999-unrelated-task";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await runGit(repoRoot, ["checkout", "-b", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded-task.txt"), "recorded task work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded-task.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded task work"]);
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "main"]);
+    await fs.writeFile(path.join(worktreePath, "unrelated-task.txt"), "unrelated task work\n", "utf8");
+    await runGit(worktreePath, ["add", "unrelated-task.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add unrelated task work"]);
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-unrelated-deleted",
+      executionWorkspaceId: "execution-workspace-unrelated-deleted",
+      expectedAncestryVerdict: "unknown",
+      expectedReason: "expected branch does not exist",
+    });
+  }, 15_000);
+
   it("keeps forward reconciliation fail-closed for same-content rewritten history", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-content";
@@ -2784,19 +3604,27 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(worktreePath, ["add", "same-content.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add content on rewritten branch"]);
 
-    await expectPersistedBranchMismatchRejected({
+    // Same content, different sha. Git cannot prove the rewritten commit is contained in the
+    // recorded branch — but the rewritten commit lives on a live named branch, so restoring the
+    // recorded branch strands nothing. SUP-11207: this used to dead-block the workspace forever.
+    const restored = await expectPersistedBranchMismatchRepaired({
       repoRoot,
       worktreePath,
       expectedBranch,
-      actualBranch,
       issueId: "issue-rewritten-history",
       executionWorkspaceId: "execution-workspace-rewritten-history",
-      expectedAncestryVerdict: "diverged",
-      expectedReason: "expected branch and current HEAD differ",
     });
+    expect(restored.warnings.join("\n")).toContain(`parked on "${actualBranch}"`);
+    // The rewritten commit is still reachable from the branch it was made on.
+    await expect(readGit(repoRoot, ["rev-parse", "--verify", `refs/heads/${actualBranch}`]))
+      .resolves.toMatch(/^[0-9a-f]{40}$/);
   }, 15_000);
 
-  it("keeps forward reconciliation fail-closed for an unrelated task branch", async () => {
+  // SUP-11207: an agent that runs `git checkout -b` inside its own execution worktree and never
+  // switches back used to leave the workspace permanently dead-blocked behind
+  // workspace_validation_failed on every subsequent dispatch. The commits it made are not at risk:
+  // they are reachable from the branch it created, under a name `git branch` shows.
+  it("restores the recorded branch when a clean worktree was left on another live named branch", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-task";
     const actualBranch = "PAP-999-unrelated-task";
@@ -2813,20 +3641,68 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(worktreePath, "unrelated-task.txt"), "unrelated task work\n", "utf8");
     await runGit(worktreePath, ["add", "unrelated-task.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add unrelated task work"]);
+    const strandedSha = await readGit(worktreePath, ["rev-parse", "HEAD"]);
 
-    await expectPersistedBranchMismatchRejected({
+    const restored = await expectPersistedBranchMismatchRepaired({
       repoRoot,
       worktreePath,
       expectedBranch,
-      actualBranch,
       issueId: "issue-unrelated-task",
       executionWorkspaceId: "execution-workspace-unrelated-task",
-      expectedAncestryVerdict: "diverged",
-      expectedReason: "expected branch and current HEAD differ",
     });
+
+    // The warning must name the branch the work was left on, or an agent resuming on the recorded
+    // branch just sees its previous commits vanish and redoes them.
+    expect(restored.warnings.join("\n")).toContain(`parked on "${actualBranch}"`);
+    await expect(readGit(repoRoot, ["rev-parse", "--verify", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(strandedSha);
   }, 15_000);
 
-  it("keeps forward reconciliation fail-closed when the live branch is behind the recorded branch", async () => {
+  // The invariant here is that a restore must never make a commit unreachable — not that it must
+  // refuse. Refusal used to be the only way to honour that (SUP-11207), at the cost of
+  // dead-blocking the issue forever; this change honours it by naming the commit first instead. The
+  // assertions below are on reachability, which is the property that actually matters.
+  it("never strands a detached HEAD's commits when restoring the recorded branch", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-460-recorded-detached";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await runGit(repoRoot, ["checkout", "-b", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded-task.txt"), "recorded task work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded-task.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded task work"]);
+    const recordedSha = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath, "main"]);
+    await fs.writeFile(path.join(worktreePath, "detached-task.txt"), "detached work\n", "utf8");
+    await runGit(worktreePath, ["add", "detached-task.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add detached work"]);
+    const strandedSha = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+
+    const restored = await expectPersistedBranchMismatchRepaired({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      issueId: "issue-detached-unreachable",
+      executionWorkspaceId: "execution-workspace-detached-unreachable",
+    });
+
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(recordedSha);
+
+    // The commit that was reachable only from the detached HEAD must now be reachable from a
+    // branch ref an operator can see, and the warning must name that ref.
+    const rescueBranches = (await readGit(repoRoot, ["branch", "--contains", strandedSha, "--format=%(refname:short)"]))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    expect(rescueBranches).toHaveLength(1);
+    expect(rescueBranches[0]).toMatch(/^paperclip\/rescue\//);
+    expect(restored.warnings.join("\n")).toContain(rescueBranches[0]);
+  }, 15_000);
+
+  it("repairs a clean persisted git worktree branch mismatch when the live branch is behind the recorded branch", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-ahead";
     const actualBranch = "PAP-459-live-behind";
@@ -2841,15 +3717,139 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(repoRoot, ["add", "recorded-ahead.txt"]);
     await runGit(repoRoot, ["commit", "-m", "Move recorded branch ahead"]);
 
-    await expectPersistedBranchMismatchRejected({
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-live-behind",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: expectedBranch,
+      },
+      issue: {
+        id: "issue-live-behind",
+        identifier: "PAP-459",
+        title: "Repair diverged branch with live branch behind",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      enableWorkspaceBranchReconcileForward: true,
+    });
+
+    expect(restored).not.toBeNull();
+    expect(restored!.branchName).toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+  }, 15_000);
+
+  it("classifies an orphaned nested worktree directory as worktree_metadata_missing", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "SUP-11169-orphaned-worktree";
+
+    // Create a recorded branch in the parent repository.
+    await runGit(repoRoot, ["checkout", "-b", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    // Create an orphaned, populated directory nested inside the parent repository
+    // without any .git metadata. Git commands run inside it resolve upward to the
+    // parent repository, which previously produced a misleading `diverged` verdict
+    // sourced from the parent repo's working tree.
+    const orphanedPath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await fs.mkdir(path.join(orphanedPath, "src"), { recursive: true });
+    await fs.writeFile(path.join(orphanedPath, "src", "file.ts"), "export const x = 1;\n", "utf8");
+
+    await expect(ensureGitWorktreeBranchCoherent({
+      repoRoot,
+      worktreePath: orphanedPath,
+      expectedBranchName: expectedBranch,
+      sourceIssue: {
+        id: "issue-orphaned",
+        identifier: "PAP-11169",
+        title: "Orphaned nested worktree",
+      },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "worktree_metadata_missing",
+          fingerprint: expect.stringMatching(/^workspace_metadata_missing:v1:sha256:/),
+          sourceIssueId: "issue-orphaned",
+          sourceIdentifier: "PAP-11169",
+          expectedBranch: expectedBranch,
+          actualBranch: null,
+          cleanliness: "unknown",
+          dirtyPathSample: [],
+          provenance: expect.objectContaining({
+            expectedBranchExists: true,
+            actualBranchRef: null,
+            actualHeadSha: null,
+            registeredPathFound: false,
+            ancestryVerdict: "unknown",
+          }),
+          safeRepair: expect.objectContaining({
+            eligible: true,
+            attempted: false,
+            succeeded: false,
+            reason: expect.stringContaining("worktree metadata is missing"),
+          }),
+        }),
+      },
+    });
+  }, 15_000);
+
+  it("classifies a registered worktree whose .git file was lost as worktree_metadata_missing", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "SUP-11169-lost-git-file";
+    const actualBranch = "SUP-11169-lost-git-file-live";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+
+    await fs.writeFile(path.join(worktreePath, "actual.txt"), "live work\n", "utf8");
+    await runGit(worktreePath, ["add", "actual.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add live work"]);
+
+    await fs.unlink(path.join(worktreePath, ".git"));
+
+    await expect(ensureGitWorktreeBranchCoherent({
       repoRoot,
       worktreePath,
-      expectedBranch,
-      actualBranch,
-      issueId: "issue-live-behind",
-      executionWorkspaceId: "execution-workspace-live-behind",
-      expectedAncestryVerdict: "diverged",
-      expectedReason: "expected branch and current HEAD differ",
+      expectedBranchName: expectedBranch,
+      sourceIssue: {
+        id: "issue-lost-git",
+        identifier: "PAP-11169",
+        title: "Lost git file worktree",
+      },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "worktree_metadata_missing",
+          provenance: expect.objectContaining({
+            registeredPathFound: false,
+            ancestryVerdict: "unknown",
+            actualHeadSha: null,
+          }),
+        }),
+      },
     });
   }, 15_000);
 
@@ -3077,6 +4077,137 @@ describe("realizeExecutionWorkspace", () => {
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
     expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
+  }, 10_000);
+
+  it("emits a warning when no baseRef, repoRef, or defaultRef is configured and falls back to the detected default branch", async () => {
+    const repoRoot = await createTempRepo("master");
+    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-bare-"));
+    await runGit(bareRemote, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
+    await runGit(repoRoot, ["push", "-u", "origin", "master"]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: null,
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-462",
+        title: "Warn on unconfigured base",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(workspace.warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("No baseRef configured"),
+      ]),
+    );
+  }, 10_000);
+
+  it("uses the repoRef from base input when no strategy baseRef is set", async () => {
+    const repoRoot = await createTempRepo("main");
+    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-bare-"));
+    await runGit(bareRemote, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
+    await runGit(repoRoot, ["push", "-u", "origin", "main"]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/main",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-463",
+        title: "Use repoRef from base",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      recorder,
+    });
+
+    expect(workspace.strategy).toBe("git_worktree");
+    expect(workspace.created).toBe(true);
+    const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
+    expect(worktreeOp).toBeDefined();
+    expect(worktreeOp!.metadata!.baseRef).toBe("origin/main");
+  }, 10_000);
+
+  it("uses the strategy baseRef over the base input repoRef", async () => {
+    const repoRoot = await createTempRepo("main");
+    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-bare-"));
+    await runGit(bareRemote, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
+    await runGit(repoRoot, ["push", "-u", "origin", "main"]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/some-other-branch",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          baseRef: "origin/main",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-464",
+        title: "Strategy baseRef wins",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      recorder,
+    });
+
+    expect(workspace.strategy).toBe("git_worktree");
+    expect(workspace.created).toBe(true);
+    const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
+    expect(worktreeOp).toBeDefined();
+    // strategy baseRef "origin/main" should beat the base input repoRef "origin/some-other-branch"
+    expect(worktreeOp!.metadata!.baseRef).toBe("origin/main");
   }, 10_000);
 
   it("removes a created git worktree and branch during cleanup", async () => {
@@ -3405,6 +4536,109 @@ describe("realizeExecutionWorkspace", () => {
     });
     expect(operations[2]?.metadata).toMatchObject({
       cleanupAction: "branch_delete",
+    });
+  });
+
+  describe("default branch guard", () => {
+    it("rejects a new worktree when the computed branch name equals the repo default", async () => {
+      const { repoRoot } = await createClonedRepoWithRemote();
+
+      await expect(
+        realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-1",
+            workspaceId: "workspace-1",
+            repoUrl: null,
+            repoRef: null,
+          },
+          config: {
+            workspaceStrategy: {
+              type: "git_worktree",
+              branchTemplate: "master",
+            },
+          },
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-447",
+            title: "Add Worktree Support",
+          },
+          agent: {
+            id: "agent-1",
+            name: "Codex Coder",
+            companyId: "company-1",
+          },
+        }),
+      ).rejects.toThrow(/matches the repo's default branch/);
+    });
+
+    it("allows a new worktree when the computed branch differs from the default", async () => {
+      const { repoRoot } = await createClonedRepoWithRemote();
+
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: null,
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-447",
+          title: "Add Worktree Support",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+
+      expect(workspace.created).toBe(true);
+      expect(workspace.branchName).toBe("PAP-447-add-worktree-support");
+    });
+
+    it("allows creation when remote default branch detection fails (no remote)", async () => {
+      const repoRoot = await createTempRepo("main");
+
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: null,
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-447",
+          title: "Add Worktree Support",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+
+      expect(workspace.created).toBe(true);
+      expect(workspace.branchName).toBe("PAP-447-add-worktree-support");
     });
   });
 });
@@ -4880,6 +6114,68 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
         }),
       }),
     ]));
+  }, 20_000);
+
+  // An agent that renames its branch (`git branch -m`) leaves the recorded branch gone and the
+  // worktree dirty on a live branch. Quarantine used to refuse outright because the recorded branch
+  // had to already exist, which dead-blocked the issue on every later dispatch. Recreating it at the
+  // pre-quarantine HEAD strands nothing: the dirty state goes to the rescue branch and the live
+  // branch keeps its own ref.
+  it("recreates a deleted recorded branch after quarantining dirty work", async () => {
+    const expectedBranch = "PAP-466-recorded-deleted";
+    const actualBranch = "PAP-466-live";
+    const repoRoot = await createTempRepo();
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, expectedBranch]);
+
+    // Advance the live branch so it is not merely the recorded branch under another name.
+    await fs.writeFile(path.join(worktreePath, "live.txt"), "live work\n", "utf8");
+    await runGit(worktreePath, ["add", "live.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add live branch work"]);
+    const actualBranchHead = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+    await fs.appendFile(path.join(worktreePath, "README.md"), "dirty tracked work\n", "utf8");
+    await fs.writeFile(path.join(worktreePath, "untracked.txt"), "dirty untracked work\n", "utf8");
+
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-466",
+      claimant: "none",
+    });
+
+    const restored = await restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    });
+
+    expect(restored?.branchName).toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
+
+    // The recorded branch is back, at the commit the worktree was on before the rescue.
+    await expect(readGit(repoRoot, ["rev-parse", expectedBranch])).resolves.toBe(actualBranchHead);
+    // The live branch is untouched, so nothing it held became unreachable.
+    await expect(readGit(repoRoot, ["rev-parse", actualBranch])).resolves.toBe(actualBranchHead);
+
+    // The dirty state still lands on a rescue branch.
+    const warning = restored?.warnings.find((entry) => entry.includes("dirty worktree state was quarantined"));
+    expect(warning).toBeTruthy();
+    const rescueBranch = warning?.match(/"([^"]+)"/)?.[1] ?? "";
+    expect(rescueBranch).toMatch(/^paperclip\/rescue\/PAP-466\/\d{8}T\d{6}Z$/);
+    await expect(readGit(repoRoot, ["show", `${rescueBranch}:untracked.txt`])).resolves.toBe("dirty untracked work");
+
+    // Recreating a branch that someone deleted must never be silent: whatever history the recorded
+    // branch held before the deletion is not recoverable from here, so the operator has to be told.
+    expect(restored?.warnings.join("\n")).toContain("had been deleted");
   }, 20_000);
 
   it("quarantines a worktree wedged mid-rebase and clears the interrupted rebase state", async () => {
@@ -6404,5 +7700,142 @@ describe("normalizeAdapterManagedRuntimeServices", () => {
       scopeId: "execution-workspace-1",
       executionWorkspaceId: "execution-workspace-1",
     });
+  });
+});
+
+describe("preserveUnpushedWorktreeCommits", () => {
+  it("returns not-preserved when remote has everything", async () => {
+    const { repoRoot } = await createTempRepoWithRemote();
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "main",
+      issueIdentifier: "SUP-11202",
+      repoRoot,
+    });
+
+    expect(result.preserved).toBe(false);
+    expect(result.preservedRef).toBeNull();
+    expect(result.commitSha).toBeNull();
+    expect(result.warning).toBeNull();
+  });
+
+  it("preserves unpushed commits when push succeeds", async () => {
+    const { repoRoot } = await createTempRepoWithRemote();
+
+    await runGit(repoRoot, ["checkout", "-b", "feature-branch"]);
+    await fs.writeFile(path.join(repoRoot, "feature.txt"), "feature\n", "utf8");
+    await runGit(repoRoot, ["add", "feature.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add feature"]);
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "feature-branch",
+      issueIdentifier: "SUP-11202",
+      repoRoot,
+    });
+
+    expect(result.preserved).toBe(true);
+    expect(result.preservedRef).toBe("refs/preserved/SUP-11202/feature-branch");
+    expect(result.commitSha).toBeTruthy();
+    expect(result.warning).toBeNull();
+
+    const remoteRoot = await readGit(repoRoot, ["remote", "get-url", "origin"]);
+    const refExists = await readGit(remoteRoot, [
+      "show-ref",
+      "--verify",
+      "--quiet",
+      "refs/preserved/SUP-11202/feature-branch",
+    ]);
+    expect(refExists).toBe("");
+  });
+
+  it("returns warning when no origin configured", async () => {
+    const repoRoot = await createTempRepo();
+
+    await runGit(repoRoot, ["checkout", "-b", "feature-branch"]);
+    await fs.writeFile(path.join(repoRoot, "feature.txt"), "feature\n", "utf8");
+    await runGit(repoRoot, ["add", "feature.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add feature"]);
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "feature-branch",
+      issueIdentifier: "SUP-11202",
+      repoRoot,
+    });
+
+    expect(result.preserved).toBe(false);
+    expect(result.preservedRef).toBeNull();
+    expect(result.commitSha).toBeTruthy();
+    expect(result.warning).toBeTruthy();
+    expect(result.warning).toContain("Could not push");
+  });
+
+  it("preserves commits when branch was never pushed to remote", async () => {
+    const { repoRoot } = await createTempRepoWithRemote();
+
+    await runGit(repoRoot, ["checkout", "-b", "new-branch"]);
+    await fs.writeFile(path.join(repoRoot, "new.txt"), "new\n", "utf8");
+    await runGit(repoRoot, ["add", "new.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add new work"]);
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "new-branch",
+      issueIdentifier: "SUP-11202",
+      repoRoot,
+    });
+
+    expect(result.preserved).toBe(true);
+    expect(result.preservedRef).toBe("refs/preserved/SUP-11202/new-branch");
+    expect(result.commitSha).toBeTruthy();
+    expect(result.warning).toBeNull();
+
+    const remoteRoot = await readGit(repoRoot, ["remote", "get-url", "origin"]);
+    const refExists = await readGit(remoteRoot, [
+      "show-ref",
+      "--verify",
+      "--quiet",
+      "refs/preserved/SUP-11202/new-branch",
+    ]);
+     expect(refExists).toBe("");
+  });
+
+  it("inspects worktree HEAD, not repo root HEAD, when workspace is a git worktree", async () => {
+    const { repoRoot, remoteRoot } = await createTempRepoWithRemote();
+
+    await fs.writeFile(path.join(repoRoot, "main.txt"), "main\n", "utf8");
+    await runGit(repoRoot, ["add", "main.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Main repo commit"]);
+    await runGit(repoRoot, ["push", "origin", "main"]);
+
+    const worktreePath = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-test-"));
+    await runGit(repoRoot, ["worktree", "add", "-b", "worktree-branch", worktreePath]);
+
+    await fs.writeFile(path.join(worktreePath, "worktree.txt"), "worktree\n", "utf8");
+    await runGit(worktreePath, ["add", "worktree.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Worktree-only commit"]);
+
+    const repoHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const worktreeHead = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    expect(repoHead).not.toBe(worktreeHead);
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: worktreePath,
+      branchName: "worktree-branch",
+      issueIdentifier: "SUP-11202",
+      repoRoot,
+    });
+
+    expect(result.preserved).toBe(true);
+    expect(result.commitSha).toBe(worktreeHead);
+    expect(result.preservedRef).toBe("refs/preserved/SUP-11202/worktree-branch");
+    expect(result.warning).toBeNull();
+
+    const preservedCommit = await readGit(remoteRoot, ["rev-parse", "refs/preserved/SUP-11202/worktree-branch"]);
+    expect(preservedCommit).toBe(worktreeHead);
+
+    await runGit(repoRoot, ["worktree", "remove", "--force", worktreePath]);
   });
 });

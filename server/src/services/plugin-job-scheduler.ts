@@ -316,6 +316,18 @@ export function createPluginJobScheduler(
           continue;
         }
 
+        // A row with no company predates the fan-out and cannot be dispatched:
+        // the run would have no invocation scope, so every company-scoped host
+        // call from the handler would fail closed. The next job sync pauses
+        // these; skip them until then rather than dispatching a doomed run.
+        if (!job.companyId) {
+          log.warn(
+            { jobId: job.id, jobKey: job.jobKey, pluginId: job.pluginId },
+            "skipping job — no company scope (legacy row, awaiting job sync)",
+          );
+          continue;
+        }
+
         dispatches.push(dispatchJob(job));
       }
 
@@ -343,8 +355,8 @@ export function createPluginJobScheduler(
   async function dispatchJob(
     job: typeof pluginJobs.$inferSelect,
   ): Promise<void> {
-    const { id: jobId, pluginId, jobKey, schedule } = job;
-    const jobLog = log.child({ jobId, pluginId, jobKey });
+    const { id: jobId, pluginId, jobKey, schedule, companyId } = job;
+    const jobLog = log.child({ jobId, pluginId, jobKey, companyId });
 
     // Mark as active (overlap prevention)
     activeJobs.add(jobId);
@@ -357,6 +369,7 @@ export function createPluginJobScheduler(
       const run = await jobStore.createRun({
         jobId,
         pluginId,
+        companyId,
         trigger: "schedule",
       });
       runId = run.id;
@@ -366,16 +379,25 @@ export function createPluginJobScheduler(
       // 2. Mark run as running
       await jobStore.markRunning(runId);
 
-      // 3. Call worker via RPC
+      // 3. Call worker via RPC.
+      //
+      // `companyId` sits at the top level of the params, not inside `job`,
+      // because that is where the worker manager's `deriveInvocationScope`
+      // looks first. Passing it here is what registers an invocation scope for
+      // the run, which is what lets the handler call `ctx.config.get()` and
+      // `ctx.issues.list()` (SUP-10856). It is repeated inside `job` so the
+      // handler can read its own company without inferring it.
       await workerManager.call(
         pluginId,
         "runJob",
         {
+          companyId,
           job: {
             jobKey,
             runId,
             trigger: "schedule" as const,
             scheduledAt: (job.nextRunAt ?? new Date()).toISOString(),
+            companyId,
           },
         },
         jobTimeoutMs,
@@ -482,10 +504,20 @@ export function createPluginJobScheduler(
       );
     }
 
+    // Refuse to hand-trigger a row that predates the company fan-out: the run
+    // would have no invocation scope and every scoped host call would fail
+    // closed. Fail loudly here rather than producing a confusing failed run.
+    if (!job.companyId) {
+      throw new Error(
+        `Job "${job.jobKey}" has no company scope — restart the plugin to re-sync its jobs before triggering`,
+      );
+    }
+
     // Create the run and dispatch (non-blocking)
     const run = await jobStore.createRun({
       jobId,
       pluginId: job.pluginId,
+      companyId: job.companyId,
       trigger,
     });
 
@@ -503,8 +535,8 @@ export function createPluginJobScheduler(
     runId: string,
     trigger: "manual" | "retry",
   ): Promise<void> {
-    const { id: jobId, pluginId, jobKey } = job;
-    const jobLog = log.child({ jobId, pluginId, jobKey, runId, trigger });
+    const { id: jobId, pluginId, jobKey, companyId } = job;
+    const jobLog = log.child({ jobId, pluginId, jobKey, companyId, runId, trigger });
 
     activeJobs.add(jobId);
     const startedAt = Date.now();
@@ -512,15 +544,18 @@ export function createPluginJobScheduler(
     try {
       await jobStore.markRunning(runId);
 
+      // See `dispatchJob` for why `companyId` is passed at the top level.
       await workerManager.call(
         pluginId,
         "runJob",
         {
+          companyId,
           job: {
             jobKey,
             runId,
             trigger,
             scheduledAt: new Date().toISOString(),
+            companyId,
           },
         },
         jobTimeoutMs,

@@ -41,8 +41,9 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../services/execution-workspace-policy.ts";
-import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH, type IssueWorkMode } from "@paperclipai/shared";
+import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH, type IssueExecutionPolicy, type IssueWorkMode } from "@paperclipai/shared";
 
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -3696,6 +3697,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(issueInboxArchives);
     await db.delete(activityLog);
     await db.delete(issues);
+    await db.delete(heartbeatRuns);
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
@@ -4301,6 +4303,84 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       allBlockersDone: true,
       isDependencyReady: true,
     });
+  });
+
+  // A cancelled blocker is deliberately NOT self-resolving: cancellation means the
+  // blocking work was abandoned, which may invalidate the dependent's premise, so the
+  // edge is held until an operator removes or replaces it. The dependent is not
+  // stranded — issue-graph liveness raises `blocked_by_cancelled_issue` ("Replace
+  // blocker") against it. Do not "fix" this by treating cancelled as terminal here:
+  // that silently drops the repair signal and lets dependents proceed on a dead
+  // premise. See the cancelled-blocker cases in issue-liveness.test.ts.
+  it("keeps a cancelled blocker unresolved and refuses dependent execution", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const blockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "todo", priority: "medium" },
+      { id: blockedId, companyId, title: "Blocked", status: "todo", priority: "medium", assigneeAgentId },
+    ]);
+    await svc.update(blockedId, { blockedByIssueIds: [blockerId] });
+
+    await svc.update(blockerId, { status: "cancelled" });
+
+    // Read model still reports the cancelled blocker as unresolved...
+    await expect(svc.getDependencyReadiness(blockedId)).resolves.toMatchObject({
+      issueId: blockedId,
+      blockerIssueIds: [blockerId],
+      unresolvedBlockerIssueIds: [blockerId],
+      unresolvedBlockerCount: 1,
+      allBlockersDone: false,
+      isDependencyReady: false,
+    });
+
+    // ...and the relation stays visible rather than being silently dropped.
+    await expect(svc.getRelationSummaries(blockedId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: blockerId, status: "cancelled" })],
+    });
+
+    // ...so both execution gates agree with that read model. This is the pairing
+    // SUP-10347 was filed against: they must never disagree.
+    await expect(
+      svc.update(blockedId, { status: "in_progress" }),
+    ).rejects.toMatchObject({ status: 422 });
+
+    await expect(
+      svc.checkout(blockedId, assigneeAgentId, ["todo", "blocked"], null),
+    ).rejects.toMatchObject({ status: 422 });
+
+    // Cancelling a blocker must not fire issue_blockers_resolved for the dependent.
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
+
+    // Removing the stale edge is the sanctioned repair, and it does unblock.
+    await svc.update(blockedId, { blockedByIssueIds: [] });
+    await expect(svc.getDependencyReadiness(blockedId)).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      isDependencyReady: true,
+    });
+    await expect(
+      svc.checkout(blockedId, assigneeAgentId, ["todo", "blocked"], null),
+    ).resolves.toMatchObject({ id: blockedId });
   });
 
   it("unblocks a source issue when a liveness escalation recovery issue is marked done", async () => {
@@ -6617,5 +6697,151 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
     const comment = await svc.addComment(issueId, "hello from a live run", { runId });
 
     expect(await createdByRunIdFor(comment.id)).toBe(runId);
+  });
+});
+
+describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-create-default-policy-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  const defaultPolicyAgentId = randomUUID();
+  const explicitReviewerAgentId = randomUUID();
+
+  const defaultPolicy: IssueExecutionPolicy = {
+    mode: "normal",
+    commentRequired: true,
+    stages: [
+      {
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId: defaultPolicyAgentId, userId: null }],
+      },
+    ],
+  };
+
+  it("inherits the project defaultExecutionPolicy when the issue is created without one", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Policy project",
+      status: "in_progress",
+      defaultExecutionPolicy: defaultPolicy as unknown as Record<string, unknown>,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId,
+      title: "Issue without explicit policy",
+    });
+
+    expect(issue.executionPolicy).toMatchObject({
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        {
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [expect.objectContaining({ type: "agent", agentId: defaultPolicyAgentId })],
+        },
+      ],
+    });
+  });
+
+  it("leaves executionPolicy null when the project has no default", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "No-policy project",
+      status: "in_progress",
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId,
+      title: "Issue without explicit policy and no project default",
+    });
+
+    expect(issue.executionPolicy).toBeNull();
+  });
+
+  it("does not override an explicitly provided executionPolicy with the project default", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const explicitPolicy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: explicitReviewerAgentId }] }],
+    })!;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Policy project",
+      status: "in_progress",
+      defaultExecutionPolicy: defaultPolicy as unknown as Record<string, unknown>,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId,
+      title: "Issue with explicit policy",
+      executionPolicy: explicitPolicy,
+    });
+
+    expect(issue.executionPolicy).toMatchObject({
+      stages: [
+        expect.objectContaining({
+          participants: [expect.objectContaining({ agentId: explicitReviewerAgentId })],
+        }),
+      ],
+    });
   });
 });

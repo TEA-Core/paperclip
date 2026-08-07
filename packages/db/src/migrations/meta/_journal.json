@@ -1275,6 +1275,27 @@
       "when": 1784653200000,
       "tag": "0183_connection_user_authorization_state",
       "breakpoints": true
+    },
+    {
+      "idx": 184,
+      "version": "7",
+      "when": 1784739600000,
+      "tag": "0184_project_default_execution_policy",
+      "breakpoints": true
+    },
+    {
+      "idx": 185,
+      "version": "7",
+      "when": 1785100000000,
+      "tag": "0185_plugin_jobs_company_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 186,
+      "version": "7",
+      "when": 1785930044829,
+      "tag": "0186_un_wakeable_archives",
+      "breakpoints": true
     }
   ]
 }

@@ -44,9 +44,13 @@ import {
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
+  signalRunningProcess,
+  runningProcesses,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   describeIncompleteOpenCodeStream,
+  isOpenCodeTerminalBillingError,
+  isOpenCodeTransientStatementError,
   isOpenCodeUnknownSessionError,
   parseOpenCodeJsonl,
 } from "./parse.js";
@@ -57,6 +61,18 @@ import {
   requireOpenCodeModelId,
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
+import {
+  describeOpenCodeDatabaseGrowthSpare,
+  describeOpenCodeDatabaseGrowthTrip,
+  formatBytes,
+  readOpenCodeSessionIdFromChunk,
+  resolveOpenCodeDatabaseGrowthLimitBytes,
+  resolveOpenCodeDatabasePath,
+  resolveOpenCodeDatabasePollIntervalMs,
+  startOpenCodeDatabaseGrowthGuard,
+  type OpenCodeDatabaseGrowthGuard,
+  type OpenCodeDatabaseGrowthTrip,
+} from "./db-guard.js";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -69,6 +85,109 @@ function firstNonEmptyLine(text: string): string {
       .map((line) => line.trim())
       .find(Boolean) ?? ""
   );
+}
+
+const ANSI_ESCAPE_PATTERN = /\x1b\[[0-9;]*[a-zA-Z]/g;
+
+function stripAnsi(text: string): string {
+  return text.replace(ANSI_ESCAPE_PATTERN, "").trim();
+}
+
+function stderrTail(text: string, maxLines = 10): string {
+  const stripped = stripAnsi(text);
+  const lines = stripped.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return "";
+  return lines.slice(-maxLines).join("\n");
+}
+
+/**
+ * Classify the underlying cause of a non-timeout adapter failure into a
+ * structured errorCode + errorMeta, so the heartbeat layer and downstream
+ * consumers get a machine-readable reason instead of a bare ANSI string.
+ *
+ * Priority order:
+ *   1. non-zero exit code → opencode_exit_<N>
+ *   2. signal termination → opencode_signal_<SIGNAL>
+ *   3. parsed JSONL error → opencode_tool_error
+ *   4. stderr content → opencode_stderr_error
+ *   5. otherwise → null (success)
+ */
+export function classifyOpenCodeFailure(input: {
+  exitCode: number | null;
+  signal: string | null;
+  parsedError: string;
+  stderrLine: string;
+  adapterSessionId: string | null;
+  stderr: string;
+  toolErrors: string[];
+}): { errorCode: string | null; errorMeta: Record<string, unknown> } {
+  const { exitCode, signal, parsedError, stderrLine, adapterSessionId, stderr, toolErrors } = input;
+  const errorMeta: Record<string, unknown> = {
+    adapterSessionId,
+    stderrTail: stderrTail(stderr),
+  };
+  let errorCode: string | null = null;
+  if (exitCode !== null && exitCode !== 0) {
+    errorCode = `opencode_exit_${exitCode}`;
+  } else if (signal) {
+    errorCode = `opencode_signal_${signal}`;
+  } else if (parsedError) {
+    errorCode = "opencode_tool_error";
+  } else if (stderrLine) {
+    errorCode = "opencode_stderr_error";
+  }
+  if (parsedError) {
+    errorMeta.parsedError = parsedError;
+  }
+  if (toolErrors.length > 0) {
+    errorMeta.toolErrors = toolErrors;
+  }
+  return { errorCode, errorMeta };
+}
+
+// SUP-10914: opencode resolves its SQLite database as
+// `OPENCODE_DB` (joined to its data dir when relative) and otherwise defaults to
+// `<data dir>/opencode.db`. Every Paperclip run shares one HOME, so every agent
+// shared that one database — and opencode opens it with `busy_timeout = 5000`.
+// On 2026-08-04 a single 431 MB assistant message, rewritten in full on every
+// stream delta, held the only write lock long enough that every other agent's
+// write blew that timeout ("Failed to execute statement / database is locked"),
+// producing 63 `adapter_failed` in one hour across 7 agents.
+//
+// Giving each agent its own database file keeps a runaway run's blast radius
+// inside that agent. The name stays RELATIVE so opencode still resolves it
+// inside its own data dir, which keeps `auth.json` and the rest of the data dir
+// shared — only the database is partitioned.
+//
+// SUP-11268 asked for a per-RUN file so a runaway run could not be confused with
+// its siblings. That is not viable: opencode keeps its sessions in this database,
+// and a fresh file per run would make every cross-run `--session` resume fail as
+// an unknown session (see resolveOpenCodeSessionResume and the unknown-session
+// fallback below), silently losing conversation continuity on every run. The
+// misattribution it targeted is instead handled per SESSION inside the growth
+// guard (SUP-11280), which is why the file stays per agent.
+const OPENCODE_DB_AGENT_PREFIX = "opencode-agent-";
+
+export function resolveOpenCodeDatabaseFile(input: {
+  agentId: string;
+  env: Record<string, string>;
+  processEnv?: NodeJS.ProcessEnv;
+}): string | null {
+  const processEnv = input.processEnv ?? process.env;
+  // Escape hatch: fall back to the single shared database.
+  if (
+    isTruthyEnvFlag(
+      input.env.PAPERCLIP_OPENCODE_SHARED_DB ?? processEnv.PAPERCLIP_OPENCODE_SHARED_DB,
+    )
+  ) {
+    return null;
+  }
+  // An explicitly configured database (adapterConfig.env or the host env) wins.
+  const configured = (input.env.OPENCODE_DB ?? processEnv.OPENCODE_DB ?? "").trim();
+  if (configured.length > 0) return null;
+  const agentId = input.agentId.trim();
+  if (agentId.length === 0) return null;
+  return `${OPENCODE_DB_AGENT_PREFIX}${agentId.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`;
 }
 
 function parseModelProvider(model: string | null): string | null {
@@ -374,6 +493,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // selection is already handled via the --model CLI flag.  Set after the
   // envConfig loop so user overrides cannot disable this guard.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
+  // Partition the shared opencode SQLite database per agent (SUP-10914). Set
+  // after the envConfig merge so an operator-configured OPENCODE_DB still wins.
+  const openCodeDatabaseFile = resolveOpenCodeDatabaseFile({ agentId: agent.id, env });
+  if (openCodeDatabaseFile) {
+    env.OPENCODE_DB = openCodeDatabaseFile;
+  }
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
@@ -655,6 +780,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const printLogs = isTruthyEnvFlag(
       env.PAPERCLIP_OPENCODE_PRINT_LOGS ?? process.env.PAPERCLIP_OPENCODE_PRINT_LOGS,
     );
+    // SUP-10914: watch this agent's own database for the runaway-message
+    // signature and terminate the run before it writes hundreds of megabytes.
+    // Only armed when we set the per-agent database ourselves: on the shared
+    // database (operator-configured OPENCODE_DB, or PAPERCLIP_OPENCODE_SHARED_DB)
+    // the growth we would measure may belong to a different agent's run, and
+    // killing this run for someone else's writes would be worse than the leak.
+    // Remote targets are skipped because the file is not on this host.
+    const databaseGuardPath =
+      openCodeDatabaseFile && !executionTargetIsRemote
+        ? resolveOpenCodeDatabasePath({ databaseFile: openCodeDatabaseFile, env: runtimeEnv })
+        : null;
+    const databaseGuardLimitBytes = databaseGuardPath
+      ? resolveOpenCodeDatabaseGrowthLimitBytes({ env: runtimeEnv })
+      : 0;
+    const databaseGuardPollIntervalMs = resolveOpenCodeDatabasePollIntervalMs({ env: runtimeEnv });
+    let databaseGuardTrip: OpenCodeDatabaseGrowthTrip | null = null;
+    if (databaseGuardPath && databaseGuardLimitBytes > 0) {
+      commandNotes.push(
+        `Armed OpenCode database growth guard on ${databaseGuardPath} (limit ${formatBytes(databaseGuardLimitBytes)} per run). ` +
+          `Attribution basis: per-session accounting. Growth is attributed to this run's own ` +
+          `opencode session before the run is terminated, so a sibling run's writes on this ` +
+          `agent's shared database do not kill this run.`,
+      );
+    }
+
     const buildArgs = (resumeSessionId: string | null) =>
       buildOpenCodeRunArgs({
         dir: effectiveExecutionCwd,
@@ -681,22 +831,78 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       }
 
-      const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-        cwd,
-        env: preparedRuntimeConfig.env,
-        stdin: prompt,
-        timeoutSec,
-        graceSec,
-        onSpawn,
-        onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog,
-        runLogTail: paperclipBridge?.runLogTail,
-      });
-      return {
-        proc,
-        rawStderr: proc.stderr,
-        parsed: parseOpenCodeJsonl(proc.stdout),
+      let terminalBillingErrorDetected: string | null = null;
+      // Assigned just below; the log interceptor closes over it so the guard
+      // learns which opencode session this run writes to as soon as the first
+      // JSONL line lands, which is what lets it tell its own growth from a
+      // sibling run's on the same per-agent database (SUP-11280).
+      let databaseGuard: OpenCodeDatabaseGrowthGuard | null = null;
+      const earlyAbortOnLog: typeof onLog = async (stream, chunk) => {
+        await onLog(stream, chunk);
+        if (stream === "stdout" && databaseGuard) {
+          databaseGuard.noteSessionId(readOpenCodeSessionIdFromChunk(chunk));
+        }
+        if (stream === "stderr" && terminalBillingErrorDetected === null) {
+          const detected = isOpenCodeTerminalBillingError("", chunk);
+          if (detected) {
+            terminalBillingErrorDetected = detected;
+            await onLog(
+              "stdout",
+              `[paperclip] Terminal provider billing/usage error detected in stderr; aborting run early: ${detected}\n`,
+            );
+            const running = runningProcesses.get(runId);
+            if (running) {
+              signalRunningProcess(running, "SIGTERM");
+            }
+          }
+        }
       };
+
+      databaseGuard = databaseGuardPath
+        ? startOpenCodeDatabaseGrowthGuard({
+            databasePath: databaseGuardPath,
+            limitBytes: databaseGuardLimitBytes,
+            pollIntervalMs: databaseGuardPollIntervalMs,
+            sessionId: resumeSessionId,
+            onSpare: (spare) => {
+              void onLog("stdout", `[paperclip] ${describeOpenCodeDatabaseGrowthSpare(spare)}\n`);
+            },
+            onTrip: (trip) => {
+              databaseGuardTrip = trip;
+              void (async () => {
+                await onLog(
+                  "stdout",
+                  `[paperclip] ${describeOpenCodeDatabaseGrowthTrip(trip)}\n`,
+                );
+                const running = runningProcesses.get(runId);
+                if (running) {
+                  signalRunningProcess(running, "SIGTERM");
+                }
+              })();
+            },
+          })
+        : null;
+
+      try {
+        const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+          cwd,
+          env: preparedRuntimeConfig.env,
+          stdin: prompt,
+          timeoutSec,
+          graceSec,
+          onSpawn,
+          onRuntimeProgress: ctx.onRuntimeProgress,
+          onLog: earlyAbortOnLog,
+          runLogTail: paperclipBridge?.runLogTail,
+        });
+        return {
+          proc,
+          rawStderr: proc.stderr,
+          parsed: parseOpenCodeJsonl(proc.stdout),
+        };
+      } finally {
+        databaseGuard?.stop();
+      }
     };
 
     const toResult = (
@@ -706,6 +912,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsed: ReturnType<typeof parseOpenCodeJsonl>;
       },
       clearSessionOnMissingSession = false,
+      errorCode: string | null = null,
+      // Set when the adapter itself ended the run for a reason the process's own
+      // exit status cannot express (currently: the database growth guard).
+      errorMessageOverride: string | null = null,
     ): AdapterExecutionResult => {
       if (attempt.proc.timedOut) {
         return {
@@ -713,7 +923,47 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           signal: attempt.proc.signal,
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
+          errorCode: "timeout",
+          errorMeta: {
+            stderrTail: stderrTail(attempt.proc.stderr),
+            adapterSessionId: runtimeSessionId ?? runtime.sessionId ?? null,
+          },
           clearSession: clearSessionOnMissingSession,
+        };
+      }
+
+      const terminalBillingError = isOpenCodeTerminalBillingError(
+        "",
+        attempt.proc.stderr,
+      );
+      if (terminalBillingError) {
+        const billingModelId = model || null;
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          finishReason: attempt.parsed.finalStepReason,
+          errorMessage: `Terminal provider billing/usage error: ${terminalBillingError}`,
+          usage: {
+            inputTokens: attempt.parsed.usage.inputTokens,
+            outputTokens: attempt.parsed.usage.outputTokens,
+            cachedInputTokens: attempt.parsed.usage.cachedInputTokens,
+          },
+          sessionId: attempt.parsed.sessionId ?? runtimeSessionId ?? runtime.sessionId ?? null,
+          sessionParams: null,
+          sessionDisplayId: attempt.parsed.sessionId ?? runtimeSessionId ?? runtime.sessionId ?? null,
+          provider: parseModelProvider(billingModelId),
+          biller: resolveOpenCodeBiller(runtimeEnv, parseModelProvider(billingModelId)),
+          model: billingModelId,
+          billingType: "unknown",
+          costUsd: attempt.parsed.costUsd,
+          resultJson: {
+            stdout: attempt.proc.stdout,
+            stderr: attempt.proc.stderr,
+            paperclipToolCallCount: attempt.parsed.paperclipToolCallCount,
+          },
+          summary: attempt.parsed.summary,
+          clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
         };
       }
 
@@ -742,19 +992,49 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const effectiveParsedError = parsedError || incompleteStreamError;
       const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
       const rawExitCode = attempt.proc.exitCode;
-      const synthesizedExitCode = effectiveParsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+      // We terminate a guard-tripped run with SIGTERM, which leaves exitCode
+      // null; without this it would be reported as a success or an opaque
+      // signal death rather than the failure the adapter deliberately caused.
+      const failedForOverride = Boolean(errorMessageOverride) && (rawExitCode ?? 0) === 0;
+      const synthesizedExitCode =
+        failedForOverride || (effectiveParsedError && (rawExitCode ?? 0) === 0) ? 1 : rawExitCode;
       const fallbackErrorMessage =
         effectiveParsedError ||
-        stderrLine ||
-        `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+        (stderrLine
+          ? `OpenCode exited with code ${synthesizedExitCode ?? -1}: ${stderrLine}`
+          : `OpenCode exited with code ${synthesizedExitCode ?? -1}`);
       const modelId = model || null;
+
+      const adapterSessionId = runtimeSessionId ?? runtime.sessionId ?? null;
+      const { errorCode: classifiedErrorCode, errorMeta } = classifyOpenCodeFailure({
+        exitCode: synthesizedExitCode,
+        signal: attempt.proc.signal,
+        parsedError: effectiveParsedError,
+        stderrLine,
+        adapterSessionId,
+        stderr: attempt.proc.stderr,
+        toolErrors: attempt.parsed.toolErrors,
+      });
+      if (databaseGuardTrip) {
+        errorMeta.databaseGrowth = {
+          databasePath: databaseGuardTrip.databasePath,
+          baselineBytes: databaseGuardTrip.baselineBytes,
+          observedBytes: databaseGuardTrip.observedBytes,
+          growthBytes: databaseGuardTrip.growthBytes,
+          limitBytes: databaseGuardTrip.limitBytes,
+        };
+      }
 
       return {
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
         finishReason: attempt.parsed.finalStepReason,
-        errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+        errorMessage:
+          errorMessageOverride ??
+          ((synthesizedExitCode ?? 0) === 0 ? null : stripAnsi(fallbackErrorMessage)),
+        errorCode: errorCode ?? classifiedErrorCode,
+        errorMeta: Object.keys(errorMeta).length > 0 ? errorMeta : undefined,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
           outputTokens: attempt.parsed.usage.outputTokens,
@@ -772,14 +1052,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
           paperclipToolCallCount: attempt.parsed.paperclipToolCallCount,
+          exitCode: synthesizedExitCode,
+          errorCode: errorCode ?? classifiedErrorCode,
+          ...(Object.keys(errorMeta).length > 0 ? { errorMeta } : {}),
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
       };
     };
 
+    // A guard-tripped attempt must never be retried: the retry would replay the
+    // same runaway message and write the same bytes again. This short-circuits
+    // both the unknown-session retry and the transient-statement retry loop —
+    // and a runaway run plausibly emits lock errors of its own, which is exactly
+    // what the latter retries on.
+    const databaseGuardResult = (
+      attempt: Awaited<ReturnType<typeof runAttempt>>,
+    ): AdapterExecutionResult | null => {
+      if (!databaseGuardTrip) return null;
+      return toResult(
+        attempt,
+        false,
+        "opencode_db_growth_limit",
+        describeOpenCodeDatabaseGrowthTrip(databaseGuardTrip),
+      );
+    };
+
     try {
       const initial = await runAttempt(sessionId);
+      const initialGuardResult = databaseGuardResult(initial);
+      if (initialGuardResult) return initialGuardResult;
       const initialFailed =
         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
       if (
@@ -792,7 +1094,45 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `[paperclip] OpenCode session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
         const retry = await runAttempt(null);
-        return toResult(retry, true);
+        return databaseGuardResult(retry) ?? toResult(retry, true);
+      }
+
+      if (
+        initialFailed &&
+        !initial.proc.timedOut &&
+        isOpenCodeTransientStatementError(initial.rawStderr) &&
+        initial.parsed.paperclipToolCallCount === 0 &&
+        initial.parsed.summary.trim() === ""
+      ) {
+        const backoffs = [500, 1500];
+        let attempt = initial;
+        for (let attemptIndex = 0; attemptIndex < backoffs.length; attemptIndex++) {
+          const delay = backoffs[attemptIndex];
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          await onLog(
+            "stdout",
+            `[paperclip] transient opencode statement error, retry ${attemptIndex + 1}/2 after ${delay}ms: ${firstNonEmptyLine(attempt.rawStderr)}\n`,
+          );
+          const retry = await runAttempt(sessionId);
+          const retryGuardResult = databaseGuardResult(retry);
+          if (retryGuardResult) return retryGuardResult;
+          const retryFailed =
+            !retry.proc.timedOut &&
+            ((retry.proc.exitCode ?? 0) !== 0 || Boolean(retry.parsed.errorMessage));
+          if (!retryFailed) {
+            return toResult(retry);
+          }
+          const retryTransient =
+            !retry.proc.timedOut &&
+            isOpenCodeTransientStatementError(retry.rawStderr) &&
+            retry.parsed.paperclipToolCallCount === 0 &&
+            retry.parsed.summary.trim() === "";
+          if (!retryTransient) {
+            return toResult(retry);
+          }
+          attempt = retry;
+        }
+        return toResult(attempt, false, "opencode_statement_failed");
       }
 
       return toResult(initial);

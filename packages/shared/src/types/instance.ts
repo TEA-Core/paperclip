@@ -42,6 +42,16 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /**
+   * When true, `reconcileBlockedWithoutBlockers` transitions a qualifying
+   * candidate (blocked, zero blockers, past grace, no active path, no pending
+   * interaction, no pause hold, no prior action) back to `todo` and enqueues an
+   * `issue_assigned` dispatch wake — but only when the candidate has an
+   * `assigneeAgentId`. Candidates with no assignee fall through to the existing
+   * board-owned recovery action. Default OFF — behaviour is byte-identical to
+   * the detection-only path when unset.
+   */
+  enableBlockedWithoutBlockersAutoHeal: boolean;
 }
 
 export interface InstanceExperimentalSettings {

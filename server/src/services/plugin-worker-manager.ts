@@ -154,6 +154,55 @@ export function formatWorkerFailureMessage(message: string, stderrExcerpt: strin
   return `${message}\n\nWorker stderr:\n${excerpt}`;
 }
 
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Work out which company an outbound RPC call is acting on behalf of.
+ *
+ * The returned scope is registered for the lifetime of the call and is what
+ * permits company-scoped host services (`config.get`, `issues.list`, …) to
+ * answer. A `null` result means the call gets no scope, and every such host
+ * call from the worker fails closed.
+ *
+ * A top-level `companyId` wins over the per-method shapes below, so any caller
+ * can scope a call simply by including one — that is how scheduled `runJob`
+ * dispatch carries its company (SUP-10856).
+ *
+ * Exported for tests; the module keeps the sole runtime caller.
+ */
+export function deriveInvocationScope(
+  method: HostToWorkerMethodName | string,
+  params: unknown,
+): PluginInvocationScope | null {
+  if (!isRecord(params)) return null;
+
+  const directCompanyId = readNonEmptyString(params.companyId);
+  if (directCompanyId) return { companyId: directCompanyId };
+
+  if (method === "performAction" && isRecord(params.actorContext)) {
+    const companyId = readNonEmptyString(params.actorContext.companyId);
+    return companyId ? { companyId } : null;
+  }
+
+  if (method === "executeTool" && isRecord(params.runContext)) {
+    const companyId = readNonEmptyString(params.runContext.companyId);
+    return companyId ? { companyId } : null;
+  }
+
+  if (method === "onEvent" && isRecord(params.event)) {
+    const companyId = readNonEmptyString(params.event.companyId);
+    return companyId ? { companyId } : null;
+  }
+
+  return null;
+}
+
 /**
  * Options for starting a worker process.
  */
@@ -494,41 +543,6 @@ export function createPluginWorkerHandle(
     clearTimeout(pending.timer);
     pendingRequests.delete(id);
     pending.resolve(response);
-  }
-
-  function readNonEmptyString(value: unknown): string | null {
-    return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
-  }
-
-  function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
-  }
-
-  function deriveInvocationScope(
-    method: HostToWorkerMethodName | string,
-    params: unknown,
-  ): PluginInvocationScope | null {
-    if (!isRecord(params)) return null;
-
-    const directCompanyId = readNonEmptyString(params.companyId);
-    if (directCompanyId) return { companyId: directCompanyId };
-
-    if (method === "performAction" && isRecord(params.actorContext)) {
-      const companyId = readNonEmptyString(params.actorContext.companyId);
-      return companyId ? { companyId } : null;
-    }
-
-    if (method === "executeTool" && isRecord(params.runContext)) {
-      const companyId = readNonEmptyString(params.runContext.companyId);
-      return companyId ? { companyId } : null;
-    }
-
-    if (method === "onEvent" && isRecord(params.event)) {
-      const companyId = readNonEmptyString(params.event.companyId);
-      return companyId ? { companyId } : null;
-    }
-
-    return null;
   }
 
   function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {

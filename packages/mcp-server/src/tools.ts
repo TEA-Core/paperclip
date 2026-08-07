@@ -9,7 +9,7 @@ import {
   requestCheckboxConfirmationPayloadSchema,
   requestConfirmationPayloadSchema,
   suggestTasksPayloadSchema,
-  updateIssueSchema,
+  updateIssueObjectSchema,
   upsertIssueDocumentSchema,
   linkIssueApprovalSchema,
 } from "@paperclipai/shared";
@@ -99,9 +99,14 @@ const createIssueToolSchema = z.object({
   companyId: companyIdOptional,
 }).merge(createIssueInputSchema);
 
+// Attribution stays off the advertised tool surface — it is create-only, so offering it would
+// invite callers to attempt a mutation the server discards.
 const updateIssueToolSchema = z.object({
   issueId: issueIdSchema,
-}).merge(updateIssueSchema);
+}).merge(updateIssueObjectSchema.omit({
+  createdByUserId: true,
+  responsibleUserId: true,
+}));
 
 const checkoutIssueToolSchema = z.object({
   issueId: issueIdSchema,

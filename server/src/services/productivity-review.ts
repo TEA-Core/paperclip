@@ -599,16 +599,40 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     candidateIds.push(...roleCandidates.map((agent) => agent.id));
 
     const seen = new Set<string>();
+    const pass1Filtered = new Set<string>();
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
       seen.add(agentId);
       const candidate = await getAgent(agentId);
-      if (!candidate || candidate.companyId !== sourceIssue.companyId || !isAgentInvokable(candidate)) continue;
+      if (!candidate || candidate.companyId !== sourceIssue.companyId || !isAgentInvokable(candidate)) {
+        pass1Filtered.add(agentId);
+        continue;
+      }
       const budgetBlock = await budgets.getInvocationBlock(sourceIssue.companyId, candidate.id, {
         issueId: sourceIssue.id,
         projectId: sourceIssue.projectId ?? null,
       });
       if (!budgetBlock) return candidate.id;
+    }
+
+    const pass2Candidates = await db
+      .select({ id: agents.id, status: agents.status })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.companyId, sourceIssue.companyId),
+          inArray(agents.role, ["cto", "ceo"]),
+          sql`${agents.id} <> ${sourceAgent.id}`,
+        ),
+      )
+      .orderBy(sql`case when ${agents.role} = 'cto' then 0 else 1 end`, asc(agents.createdAt), asc(agents.id));
+    for (const candidate of pass2Candidates) {
+      if (seen.has(candidate.id) && !pass1Filtered.has(candidate.id)) continue;
+      seen.add(candidate.id);
+      const fullCandidate = await getAgent(candidate.id);
+      if (!fullCandidate || fullCandidate.companyId !== sourceIssue.companyId) continue;
+      if (fullCandidate.status === "terminated") continue;
+      return candidate.id;
     }
     return null;
   }
@@ -745,6 +769,26 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     }
 
     const ownerAgentId = await resolveReviewOwnerAgentId(evidence.sourceIssue, evidence.sourceAgent);
+    if (!ownerAgentId) {
+      await logActivity(db, {
+        companyId: evidence.sourceIssue.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.productivity_review_owner_unresolved",
+        entityType: "issue",
+        entityId: evidence.sourceIssue.id,
+        agentId: evidence.sourceAgent.id,
+        details: {
+          source: "productivity_review.reconcile",
+          sourceIssueId: evidence.sourceIssue.id,
+          trigger: evidence.trigger,
+          noCommentStreak: evidence.noCommentStreak,
+          runCountLastHour: evidence.runCountLastHour,
+          commentCountLastHour: evidence.commentCountLastHour,
+        },
+      });
+      return { kind: "no_owner" as const, reviewIssueId: null };
+    }
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {
@@ -857,6 +901,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       snoozed: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
+      noOwner: 0,
       skipped: 0,
       failed: 0,
       reviewIssueIds: [] as string[],
@@ -898,6 +943,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "creation_capped") result.creationCapped += 1;
         else if (outcome.kind === "no_action_suppressed") result.noActionSuppressed += 1;
+        else if (outcome.kind === "no_owner") result.noOwner += 1;
         else result.existing += 1;
         if (outcome.reviewIssueId) result.reviewIssueIds.push(outcome.reviewIssueId);
       } catch (err) {

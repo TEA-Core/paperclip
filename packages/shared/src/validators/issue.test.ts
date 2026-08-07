@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
   addIssueCommentSchema,
@@ -7,6 +8,8 @@ import {
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,
+  stripCreateOnlyIssueAttribution,
+  updateIssueObjectSchema,
   updateIssueSchema,
   upsertIssueDocumentSchema,
 } from "./issue.js";
@@ -64,6 +67,36 @@ describe("issue validators", () => {
     expect(created.responsibleUserId).toBe("spoofed-responsible");
     expect(updated).not.toHaveProperty("createdByUserId");
     expect(updated).not.toHaveProperty("responsibleUserId");
+    // The rest of the payload must still parse — stripping attribution is not a silent no-op.
+    expect(updated.title).toBe("Do not update attribution");
+  });
+
+  it("still rejects unrecognized update keys while stripping attribution", () => {
+    // Accepting a known-but-create-only field must not weaken the typo guard that makes
+    // `blockedBy` (for `blockedByIssueIds`) a 400 instead of a silently dropped dependency edge.
+    expect(updateIssueSchema.safeParse({ title: "t", blockedBy: ["x"] }).success).toBe(false);
+  });
+
+  it("strips attribution through the route's extend composition", () => {
+    // Mirrors `updateIssueRouteSchema` in server/src/routes/issues.ts, whose PATCH handler
+    // rest-spreads the parsed body into the column update. A surviving key would reach the write.
+    const routeSchema = stripCreateOnlyIssueAttribution(updateIssueObjectSchema.extend({
+      interrupt: z.boolean().optional(),
+      force: z.boolean().optional(),
+    }));
+    const parsed = routeSchema.parse({
+      title: "Echo back a full issue object",
+      createdByUserId: "spoofed-creator",
+      responsibleUserId: "spoofed-responsible",
+      force: true,
+    });
+
+    expect(parsed).not.toHaveProperty("createdByUserId");
+    expect(parsed).not.toHaveProperty("responsibleUserId");
+    expect(Object.keys(parsed)).not.toContain("createdByUserId");
+    expect(parsed.title).toBe("Echo back a full issue object");
+    expect(parsed.force).toBe(true);
+    expect(routeSchema.safeParse({ title: "t", blockedBy: ["x"] }).success).toBe(false);
   });
 
   it("allows false-positive recovery resolutions to atomically restore the source issue status", () => {
@@ -416,5 +449,37 @@ describe("issue validators", () => {
     });
 
     expect(parsed.success).toBe(false);
+  });
+
+  it("preserves returnAssigneeAgentId in a create execution policy", () => {
+    const agentId = "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e";
+    const parsed = createIssueSchema.parse({
+      title: "Persist return assignee",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "agent", agentId }],
+          },
+        ],
+        returnAssigneeAgentId: agentId,
+      },
+    });
+
+    expect(parsed.executionPolicy?.returnAssigneeAgentId).toBe(agentId);
+  });
+
+  it("preserves returnAssigneeAgentId in an update execution policy", () => {
+    const agentId = "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e";
+    const parsed = updateIssueSchema.parse({
+      executionPolicy: {
+        returnAssigneeAgentId: agentId,
+      },
+    });
+
+    expect(parsed.executionPolicy?.returnAssigneeAgentId).toBe(agentId);
   });
 });

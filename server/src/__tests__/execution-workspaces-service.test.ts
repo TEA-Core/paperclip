@@ -26,6 +26,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  detachIssuesFromClosedSharedExecutionWorkspace,
   executionWorkspaceService,
   mergeExecutionWorkspaceConfig,
   readExecutionWorkspaceConfig,
@@ -2117,6 +2118,352 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(comments).toHaveLength(0);
   }, 20_000);
 
+  it("persists a default_branch_rebind, resolves the original recovery fingerprint, and rejects non-rebindable states", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-rebind-${randomUUID()}`);
+    tempDirs.add(worktreePath);
+
+    const recordedBranch = "PAP-460-deleted-recorded";
+    await runGit(repoRoot, ["branch", recordedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath]);
+    await runGit(worktreePath, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await runGit(worktreePath, ["reset", "--hard", "HEAD"]);
+    await runGit(repoRoot, ["branch", "-D", recordedBranch]);
+
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const issueId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Branch reconcile",
+      status: "in_progress",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Source task",
+      identifier: "PAP-460",
+      status: "blocked",
+      priority: "medium",
+    });
+
+    const actualBranch = await readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    const originalFingerprint = await fingerprintWorkspaceBranchIncoherenceForTest({
+      repoRoot,
+      worktreePath,
+      sourceIssueId: issueId,
+      executionWorkspaceId,
+      expectedBranch: recordedBranch,
+      actualBranch,
+    });
+    const alternateFingerprint = `workspace_incoherence:v1:sha256:alternate-${randomUUID()}`;
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: recordedBranch,
+      status: "idle",
+      providerType: "git_worktree",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      branchName: recordedBranch,
+      baseRef: "main",
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "workspace_validation",
+      status: "active",
+      ownerType: "board",
+      cause: "workspace_validation_failed",
+      fingerprint: originalFingerprint,
+      evidence: { workspaceValidation: { fingerprint: originalFingerprint } },
+      nextAction: "Repair the source issue workspace link.",
+    });
+
+    const result = await svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
+      mode: "default_branch_rebind",
+      reason: "Automatic default-branch rebind: recorded branch was deleted; clean worktree is on the default branch.",
+      alternateRecoveryFingerprints: [alternateFingerprint],
+      actor: {
+        actorType: "system",
+        actorId: "workspace_runtime",
+        agentId: null,
+        runId: null,
+      },
+    });
+
+    expect(result.workspace.branchName).toBe("main");
+    expect(result.workspace.name).toBe("main");
+    expect(result.inspection.fromBranch).toBe(recordedBranch);
+    expect(result.inspection.toBranch).toBe("main");
+    expect(result.inspection.fromSha).toBeNull();
+    expect(result.inspection.actualBranchIsDefaultBranch).toBe(true);
+    expect(result.recoveryAction).toMatchObject({
+      kind: "workspace_validation",
+      status: "resolved",
+      outcome: "restored",
+      fingerprint: originalFingerprint,
+    });
+
+    const [persistedRow] = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    expect(persistedRow?.branchName).toBe("main");
+
+    const [persistedRecoveryAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(persistedRecoveryAction).toMatchObject({
+      status: "resolved",
+      outcome: "restored",
+      fingerprint: originalFingerprint,
+    });
+
+    const [comment] = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comment?.body).toContain("Execution workspace branch reconciled.");
+    expect(comment?.body).toContain("- Mode: `default_branch_rebind`");
+
+    const dirtyWorktreePath = path.join(path.dirname(repoRoot), `paperclip-rebind-dirty-${randomUUID()}`);
+    tempDirs.add(dirtyWorktreePath);
+    await runGit(repoRoot, ["worktree", "add", "--detach", dirtyWorktreePath]);
+    await runGit(dirtyWorktreePath, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await runGit(dirtyWorktreePath, ["reset", "--hard", "HEAD"]);
+    await fs.writeFile(path.join(dirtyWorktreePath, "dirty.txt"), "dirty work\n", "utf8");
+
+    const dirtyWorkspaceId = randomUUID();
+    const dirtyIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: dirtyIssueId,
+      companyId,
+      projectId,
+      title: "Dirty task",
+      identifier: "PAP-461",
+      status: "blocked",
+      priority: "medium",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: dirtyWorkspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: dirtyIssueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: recordedBranch,
+      status: "idle",
+      providerType: "git_worktree",
+      cwd: dirtyWorktreePath,
+      providerRef: dirtyWorktreePath,
+      branchName: recordedBranch,
+      baseRef: "main",
+    });
+
+    await expect(svc.reconcileExecutionWorkspaceBranch(dirtyWorkspaceId, {
+      mode: "default_branch_rebind",
+      reason: null,
+      actor: {
+        actorType: "system",
+        actorId: "workspace_runtime",
+        agentId: null,
+        runId: null,
+      },
+    })).rejects.toMatchObject({ status: 422 });
+
+    const [dirtyPersisted] = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, dirtyWorkspaceId));
+    expect(dirtyPersisted?.branchName).toBe(recordedBranch);
+
+    const unrelatedWorktreePath = path.join(path.dirname(repoRoot), `paperclip-rebind-unrelated-${randomUUID()}`);
+    tempDirs.add(unrelatedWorktreePath);
+    await runGit(repoRoot, ["branch", "feature/unrelated"]);
+    await runGit(repoRoot, ["worktree", "add", unrelatedWorktreePath, "feature/unrelated"]);
+    await fs.writeFile(path.join(unrelatedWorktreePath, "unrelated.txt"), "unrelated\n", "utf8");
+    await runGit(unrelatedWorktreePath, ["add", "unrelated.txt"]);
+    await runGit(unrelatedWorktreePath, ["commit", "-m", "Unrelated task work"]);
+
+    const unrelatedWorkspaceId = randomUUID();
+    const unrelatedIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: unrelatedIssueId,
+      companyId,
+      projectId,
+      title: "Unrelated task",
+      identifier: "PAP-462",
+      status: "blocked",
+      priority: "medium",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: unrelatedWorkspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: unrelatedIssueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: recordedBranch,
+      status: "idle",
+      providerType: "git_worktree",
+      cwd: unrelatedWorktreePath,
+      providerRef: unrelatedWorktreePath,
+      branchName: recordedBranch,
+      baseRef: "main",
+    });
+
+    await expect(svc.reconcileExecutionWorkspaceBranch(unrelatedWorkspaceId, {
+      mode: "default_branch_rebind",
+      reason: null,
+      actor: {
+        actorType: "system",
+        actorId: "workspace_runtime",
+        agentId: null,
+        runId: null,
+      },
+    })).rejects.toMatchObject({ status: 422 });
+
+    const [unrelatedPersisted] = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, unrelatedWorkspaceId));
+    expect(unrelatedPersisted?.branchName).toBe(recordedBranch);
+  }, 30_000);
+
+  it("persists a default_branch_rebind, resolves the alternate recovery fingerprint when the original is absent", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-rebind-alt-${randomUUID()}`);
+    tempDirs.add(worktreePath);
+
+    const recordedBranch = "PAP-463-deleted-recorded";
+    await runGit(repoRoot, ["branch", recordedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath]);
+    await runGit(worktreePath, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await runGit(worktreePath, ["reset", "--hard", "HEAD"]);
+    await runGit(repoRoot, ["branch", "-D", recordedBranch]);
+
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const issueId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Branch reconcile",
+      status: "in_progress",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Source task",
+      identifier: "PAP-463",
+      status: "blocked",
+      priority: "medium",
+    });
+
+    const actualBranch = await readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    const inspectionFingerprint = await fingerprintWorkspaceBranchIncoherenceForTest({
+      repoRoot,
+      worktreePath,
+      sourceIssueId: issueId,
+      executionWorkspaceId,
+      expectedBranch: recordedBranch,
+      actualBranch,
+    });
+    const alternateFingerprint = `workspace_incoherence:v1:sha256:alternate-${randomUUID()}`;
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: recordedBranch,
+      status: "idle",
+      providerType: "git_worktree",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      branchName: recordedBranch,
+      baseRef: "main",
+    });
+
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "workspace_validation",
+      status: "active",
+      ownerType: "board",
+      cause: "workspace_validation_failed",
+      fingerprint: alternateFingerprint,
+      evidence: { workspaceValidation: { fingerprint: alternateFingerprint } },
+      nextAction: "Repair the source issue workspace link.",
+    });
+
+    const result = await svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
+      mode: "default_branch_rebind",
+      reason: "Automatic default-branch rebind: recorded branch was deleted; clean worktree is on the default branch.",
+      alternateRecoveryFingerprints: [alternateFingerprint],
+      actor: {
+        actorType: "system",
+        actorId: "workspace_runtime",
+        agentId: null,
+        runId: null,
+      },
+    });
+
+    expect(result.workspace.branchName).toBe("main");
+    expect(result.recoveryAction).toMatchObject({
+      kind: "workspace_validation",
+      status: "resolved",
+      outcome: "restored",
+      fingerprint: alternateFingerprint,
+    });
+
+    const [persistedRow] = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    expect(persistedRow?.branchName).toBe("main");
+
+    const [persistedRecoveryAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(persistedRecoveryAction).toMatchObject({
+      status: "resolved",
+      outcome: "restored",
+      fingerprint: alternateFingerprint,
+    });
+  }, 30_000);
+
   it("returns a bounded company-scoped workspace overview with service and linked issue summaries", async () => {
     const companyId = randomUUID();
     const otherCompanyId = randomUUID();
@@ -2526,4 +2873,407 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       "git_branch_delete",
     ]));
   }, 20_000);
+
+  it("reports deleted recorded branch with detached HEAD as unsafe to rebind", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-deleted-branch-${randomUUID()}`);
+    tempDirs.add(worktreePath);
+
+    await runGit(repoRoot, ["branch", "feature/squashed"]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "feature/squashed"]);
+    await fs.writeFile(path.join(worktreePath, "feature.txt"), "work\n", "utf8");
+    await runGit(worktreePath, ["add", "feature.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Feature commit"]);
+    await runGit(repoRoot, ["checkout", "main"]);
+    await runGit(repoRoot, ["worktree", "remove", worktreePath]);
+    await runGit(repoRoot, ["branch", "-D", "feature/squashed"]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath]);
+
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspaces",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+        workspaceStrategy: {
+          type: "git_worktree",
+        },
+      },
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      sourceType: "git_repo",
+      isPrimary: true,
+      cwd: repoRoot,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "feature/squashed",
+      status: "active",
+      providerType: "git_worktree",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      branchName: "feature/squashed",
+      baseRef: "main",
+      metadata: {
+        createdByRuntime: true,
+      },
+    });
+
+    const readiness = await svc.getCloseReadiness(executionWorkspaceId);
+
+    expect(readiness).toMatchObject({
+      workspaceId: executionWorkspaceId,
+      git: {
+        recordedBranchExists: false,
+        recordedBranchDeleted: true,
+        safeRebindToDefaultBranch: false,
+      },
+    });
+    expect(readiness?.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("The recorded branch \"feature/squashed\" no longer exists"),
+      expect.stringContaining("HEAD is not on the default branch"),
+    ]));
+  }, 20_000);
+
+  it("reports deleted recorded branch on default branch as safe to rebind", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-deleted-branch-default-${randomUUID()}`);
+    tempDirs.add(worktreePath);
+
+    await runGit(repoRoot, ["branch", "feature/squashed"]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "feature/squashed"]);
+    await fs.writeFile(path.join(worktreePath, "feature.txt"), "work\n", "utf8");
+    await runGit(worktreePath, ["add", "feature.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Feature commit"]);
+    await runGit(repoRoot, ["checkout", "main"]);
+    await runGit(repoRoot, ["worktree", "remove", worktreePath]);
+    await runGit(repoRoot, ["branch", "-D", "feature/squashed"]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath]);
+    await runGit(worktreePath, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await runGit(worktreePath, ["reset", "--hard", "HEAD"]);
+
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspaces",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+        workspaceStrategy: {
+          type: "git_worktree",
+        },
+      },
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      sourceType: "git_repo",
+      isPrimary: true,
+      cwd: repoRoot,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "feature/squashed",
+      status: "active",
+      providerType: "git_worktree",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      branchName: "feature/squashed",
+      baseRef: "main",
+      metadata: {
+        createdByRuntime: true,
+      },
+    });
+
+    const readiness = await svc.getCloseReadiness(executionWorkspaceId);
+
+    expect(readiness).toMatchObject({
+      workspaceId: executionWorkspaceId,
+      state: "ready_with_warnings",
+      isSharedWorkspace: false,
+      isProjectPrimaryWorkspace: false,
+      isDestructiveCloseAllowed: true,
+      git: {
+        workspacePath: worktreePath,
+        baseRef: "main",
+        recordedBranchExists: false,
+        recordedBranchDeleted: true,
+        safeRebindToDefaultBranch: true,
+      },
+    });
+    expect(readiness?.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("The recorded branch \"feature/squashed\" no longer exists"),
+      expect.stringContaining("Paperclip can safely rebind"),
+    ]));
+    expect(readiness?.plannedActions.map((action) => action.kind)).toEqual(expect.arrayContaining([
+      "archive_record",
+      "git_worktree_remove",
+    ]));
+  }, 20_000);
+
+  it("reports deleted recorded branch with dirty worktree as unsafe to rebind", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-deleted-dirty-${randomUUID()}`);
+    tempDirs.add(worktreePath);
+
+    await runGit(repoRoot, ["branch", "feature/squashed"]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "feature/squashed"]);
+    await fs.writeFile(path.join(worktreePath, "feature.txt"), "work\n", "utf8");
+    await runGit(worktreePath, ["add", "feature.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Feature commit"]);
+    await runGit(repoRoot, ["checkout", "main"]);
+    await runGit(repoRoot, ["worktree", "remove", worktreePath]);
+    await runGit(repoRoot, ["branch", "-D", "feature/squashed"]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath]);
+    await fs.writeFile(path.join(worktreePath, "dirty.txt"), "not safe\n", "utf8");
+
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspaces",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "feature/squashed",
+      status: "active",
+      providerType: "git_worktree",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      branchName: "feature/squashed",
+      baseRef: "main",
+      metadata: {
+        createdByRuntime: true,
+      },
+    });
+
+    const readiness = await svc.getCloseReadiness(executionWorkspaceId);
+
+    expect(readiness).toMatchObject({
+      workspaceId: executionWorkspaceId,
+      git: {
+        recordedBranchExists: false,
+        recordedBranchDeleted: true,
+        safeRebindToDefaultBranch: false,
+      },
+    });
+    expect(readiness?.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("The recorded branch \"feature/squashed\" no longer exists"),
+      expect.stringContaining("the worktree is dirty"),
+    ]));
+  }, 20_000);
+});
+
+describeEmbeddedPostgres("detachIssuesFromClosedSharedExecutionWorkspace", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-shared-workspace-detach-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seed() {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const sharedWorkspaceId = randomUUID();
+    const otherWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      isPrimary: true,
+    });
+    for (const [id, name] of [[sharedWorkspaceId, "Shared workspace"], [otherWorkspaceId, "Other workspace"]] as const) {
+      await db.insert(executionWorkspaces).values({
+        id,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name,
+        status: "active",
+        providerType: "project_primary",
+      });
+    }
+
+    return { companyId, projectId, projectWorkspaceId, sharedWorkspaceId, otherWorkspaceId };
+  }
+
+  async function seedIssue(
+    seeded: Awaited<ReturnType<typeof seed>>,
+    input: {
+      issueNumber: number;
+      executionWorkspaceId: string;
+      executionWorkspacePreference: string | null;
+    },
+  ) {
+    const id = randomUUID();
+    await db.insert(issues).values({
+      id,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      projectWorkspaceId: seeded.projectWorkspaceId,
+      title: `Issue ${input.issueNumber}`,
+      status: "todo",
+      priority: "medium",
+      issueNumber: input.issueNumber,
+      identifier: `T-${input.issueNumber}`,
+      executionWorkspaceId: input.executionWorkspaceId,
+      executionWorkspacePreference: input.executionWorkspacePreference,
+    });
+    return id;
+  }
+
+  async function readIssue(id: string) {
+    const [row] = await db
+      .select({
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+      })
+      .from(issues)
+      .where(eq(issues.id, id));
+    return row;
+  }
+
+  it("clears the reuse preference alongside the id so no unrealizable pair is left behind", async () => {
+    const seeded = await seed();
+    const issueId = await seedIssue(seeded, {
+      issueNumber: 1,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+      companyId: seeded.companyId,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+    });
+
+    expect(await readIssue(issueId)).toEqual({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+    });
+  });
+
+  it("preserves mode preferences that stay meaningful without a workspace id", async () => {
+    const seeded = await seed();
+    const issueId = await seedIssue(seeded, {
+      issueNumber: 2,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+      executionWorkspacePreference: "isolated_workspace",
+    });
+
+    await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+      companyId: seeded.companyId,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+    });
+
+    expect(await readIssue(issueId)).toEqual({
+      executionWorkspaceId: null,
+      executionWorkspacePreference: "isolated_workspace",
+    });
+  });
+
+  it("leaves issues bound to other execution workspaces untouched", async () => {
+    const seeded = await seed();
+    const issueId = await seedIssue(seeded, {
+      issueNumber: 3,
+      executionWorkspaceId: seeded.otherWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+
+    await detachIssuesFromClosedSharedExecutionWorkspace(db, {
+      companyId: seeded.companyId,
+      executionWorkspaceId: seeded.sharedWorkspaceId,
+    });
+
+    expect(await readIssue(issueId)).toEqual({
+      executionWorkspaceId: seeded.otherWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    });
+  });
 });
