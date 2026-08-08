@@ -197,6 +197,7 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import { DIRECT_NON_INVOKABLE_STATUSES } from "../services/agent-invokability.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 // Strip must be re-applied after `.extend()`: the handler below rest-spreads the parsed body into
@@ -3074,6 +3075,13 @@ export function issueRoutes(
     }
 
     if ((issue.status === "todo" || issue.status === "in_progress") && issue.assigneeAgentId) {
+      const [assignee] = await db
+        .select({ status: agents.status })
+        .from(agents)
+        .where(eq(agents.id, issue.assigneeAgentId));
+      if (assignee && DIRECT_NON_INVOKABLE_STATUSES.has(assignee.status)) {
+        return null;
+      }
       return `Recovery action became stale because the source issue is ${issue.status} with an agent owner.`;
     }
 
