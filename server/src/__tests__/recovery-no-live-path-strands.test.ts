@@ -833,6 +833,78 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     expect(actionRow?.resolvedAt).toBeTruthy();
   });
 
+  it("does not cancel a no_live_path_owner_unavailable action on read projection when the source issue is todo with a non-invokable (paused) agent owner", async () => {
+    const { companyId, managerId, prefix } = await seedCompany();
+    const pausedAgentId = await seedPausedAgent(companyId, managerId);
+    const issueId = await createIssue(companyId, prefix, "todo", pausedAgentId, {
+      updatedAt: pastGraceDate(),
+    });
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "no_live_path_owner_unavailable",
+      ownerType: "board",
+      ownerAgentId: null,
+      cause: "no_live_path_owner_unavailable",
+      fingerprint: `no-live-path:paused-todo-read:${issueId}`,
+      evidence: { status: "todo", agentId: pausedAgentId, identifier: `${prefix}-1` },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "board_escalation", reason: "no_invokable_recovery_owner" },
+    });
+
+    const app = createApp();
+    await request(app).get(`/api/issues/${issueId}`).expect(200);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "active",
+    });
+    expect(actionRow?.resolvedAt).toBeNull();
+  });
+
+  it("converges rather than oscillating on repeated reads of a no_live_path_owner_unavailable action for a todo issue with a non-invokable agent", async () => {
+    const { companyId, managerId, prefix } = await seedCompany();
+    const pausedAgentId = await seedPausedAgent(companyId, managerId);
+    const issueId = await createIssue(companyId, prefix, "todo", pausedAgentId, {
+      updatedAt: pastGraceDate(),
+    });
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "no_live_path_owner_unavailable",
+      ownerType: "board",
+      ownerAgentId: null,
+      cause: "no_live_path_owner_unavailable",
+      fingerprint: `no-live-path:oscillation-test:${issueId}`,
+      evidence: { status: "todo", agentId: pausedAgentId, identifier: `${prefix}-1` },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "board_escalation", reason: "no_invokable_recovery_owner" },
+    });
+
+    const app = createApp();
+    for (let i = 0; i < 5; i++) {
+      await request(app).get(`/api/issues/${issueId}`).expect(200);
+    }
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      status: "active",
+      kind: "no_live_path_owner_unavailable",
+    });
+    expect(actions[0]?.resolvedAt).toBeNull();
+  });
+
   it("does not open a no_live_path_owner_unavailable action when the issue has a future monitorNextCheckAt and a parseable executionPolicy.monitor", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompanyWithIssue();
     const now = new Date("2026-08-07T00:00:00.000Z");
