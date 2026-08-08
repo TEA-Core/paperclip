@@ -25,6 +25,9 @@ export const SUCCESSFUL_RUN_HANDOFF_OPTIONS = [
   "delegate_or_continue_from_checkpoint",
 ] as const;
 
+export type DeliveryEvidence = "absent" | "present" | "inconclusive";
+export const DEFAULT_DELIVERY_EVIDENCE: DeliveryEvidence = "inconclusive";
+
 const PRODUCTIVE_SUCCESS_LIVENESS_STATES = new Set<RunLivenessState>([
   "advanced",
   "completed",
@@ -400,13 +403,44 @@ function isProductiveSuccessfulRun(input: {
 export function buildSuccessfulRunHandoffInstruction(input: {
   issueIdentifier: string | null;
   sourceRunId: string;
+  deliveryEvidence?: DeliveryEvidence;
 }) {
   const issueLabel = input.issueIdentifier ?? "this issue";
-  return [
+  const evidence = input.deliveryEvidence ?? DEFAULT_DELIVERY_EVIDENCE;
+
+  const isDeliveryAbsent = evidence === "absent";
+
+  const common = [
     `Your previous run on ${issueLabel} succeeded, but the issue is still in \`in_progress\` and Paperclip cannot identify a valid issue disposition.`,
     "",
     "This is a status-only retry to the original agent. Record a disposition; do not start new work.",
     "",
+  ];
+
+  if (isDeliveryAbsent) {
+    return [
+      ...common,
+      "No delivery evidence was detected — zero commits beyond the integration base and no remote branch exist for this issue's execution workspace. The work has not been delivered and cannot move to review.",
+      "",
+      "If the work was completed locally but not committed or pushed, run `deliver.sh` to commit, push, and open a PR before recording a disposition. An undelivered tree cannot be sent to review.",
+      "",
+      "Resolve the missing disposition before creating or revising any new artifacts. Choose **exactly one** outcome and perform the matching Paperclip action:",
+      "",
+      "**Is the issue finished?**",
+      "1. Mark it `done` (scope complete) or `cancelled` (intentionally stopped).",
+      "",
+      "**Can it not continue right now?**",
+      "2. Mark it `blocked` with first-class blockers (`blockedByIssueIds`) or a clearly named unblock owner/action.",
+      "",
+      "**Is there more work to do?**",
+      `3. Either delegate follow-up work (create/link a follow-up issue and block this one on it, or close this issue if its scope is independently complete) or record an explicit continuation path with \`resumeIntent: true\`, \`resumeFromRunId: ${input.sourceRunId}\`, and a concrete next action — which MUST include running \`deliver.sh\` as its first step. Do not perform the remaining source work in this recovery run; the follow-up/resume wake must use the normal model lane.`,
+      "",
+      "Comments, document revisions, work-product writes, and continuation summaries are supporting evidence only — they do not satisfy this handoff unless the issue state/path also records one valid disposition. If this wake is status-only recovery, document or plan updates are not allowed.",
+    ].join("\n");
+  }
+
+  return [
+    ...common,
     "Resolve the missing disposition before creating or revising any new artifacts. Choose **exactly one** outcome and perform the matching Paperclip action:",
     "",
     "**Is the issue finished?**",
@@ -444,6 +478,7 @@ export function decideSuccessfulRunHandoff(input: {
   hasActiveRoutineContinuation: boolean;
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
+  deliveryEvidence?: DeliveryEvidence;
 }): SuccessfulRunHandoffDecision {
   const { run, issue, agent } = input;
 
@@ -502,6 +537,7 @@ export function decideSuccessfulRunHandoff(input: {
   const instruction = buildSuccessfulRunHandoffInstruction({
     issueIdentifier: issue.identifier,
     sourceRunId: run.id,
+    deliveryEvidence: input.deliveryEvidence ?? DEFAULT_DELIVERY_EVIDENCE,
   });
   const payload = withRecoveryModelProfileHint({
     issueId: issue.id,

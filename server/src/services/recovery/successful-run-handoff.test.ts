@@ -6,8 +6,10 @@ import {
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildFinishSuccessfulRunHandoffIdempotencyKey,
   buildSuccessfulRunHandoffExhaustedNotice,
+  buildSuccessfulRunHandoffInstruction,
   buildSuccessfulRunHandoffRequiredNotice,
   decideSuccessfulRunHandoff,
+  DEFAULT_DELIVERY_EVIDENCE,
   isIdempotentFinishSuccessfulRunHandoffWakeStatus,
   isSuccessfulRunHandoffValidPathSkip,
   isSuccessfulRunHandoffRequiredNoticeBody,
@@ -522,6 +524,91 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## Successful run missing issue disposition\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## This issue still needs a next step\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("Unrelated comment")).toBe(false);
+  });
+});
+
+describe("buildSuccessfulRunHandoffInstruction with delivery evidence", () => {
+  it("generates today's instruction byte-identically when delivery evidence is present", () => {
+    const instruction = buildSuccessfulRunHandoffInstruction({
+      issueIdentifier: "PAP-1",
+      sourceRunId: "run-1",
+      deliveryEvidence: "present",
+    });
+    expect(instruction).toContain(
+      "This is a status-only retry to the original agent. Record a disposition; do not start new work.",
+    );
+    expect(instruction).toContain("**Does someone else need to look at it?**");
+    expect(instruction).toContain("2. Move it to `in_review`");
+    expect(instruction).toContain("4. Either delegate follow-up work");
+    expect(instruction).not.toContain("deliver.sh");
+  });
+
+  it("generates today's instruction byte-identically when delivery evidence is inconclusive", () => {
+    const instruction = buildSuccessfulRunHandoffInstruction({
+      issueIdentifier: "PAP-1",
+      sourceRunId: "run-1",
+      deliveryEvidence: "inconclusive",
+    });
+    expect(instruction).toContain("**Does someone else need to look at it?**");
+    expect(instruction).toContain("2. Move it to `in_review`");
+    expect(instruction).not.toContain("deliver.sh");
+  });
+
+  it("generates today's instruction when deliveryEvidence is omitted entirely", () => {
+    const instruction = buildSuccessfulRunHandoffInstruction({
+      issueIdentifier: "PAP-1",
+      sourceRunId: "run-1",
+    });
+    expect(instruction).toContain("**Does someone else need to look at it?**");
+    expect(instruction).toContain("2. Move it to `in_review`");
+    expect(instruction).not.toContain("deliver.sh");
+  });
+
+  it("omits the in_review option and names deliver.sh when delivery evidence is absent", () => {
+    const instruction = buildSuccessfulRunHandoffInstruction({
+      issueIdentifier: "PAP-1",
+      sourceRunId: "run-1",
+      deliveryEvidence: "absent",
+    });
+
+    expect(instruction).toContain(
+      "No delivery evidence was detected",
+    );
+    expect(instruction).toContain("deliver.sh");
+    expect(instruction).not.toContain("**Does someone else need to look at it?**");
+    expect(instruction).not.toContain("Move it to `in_review`");
+
+    expect(instruction).toContain("**Is the issue finished?**");
+    expect(instruction).toContain("1. Mark it `done`");
+    expect(instruction).toContain("**Can it not continue right now?**");
+    expect(instruction).toContain("2. Mark it `blocked`");
+    expect(instruction).toContain("3. Either delegate follow-up work");
+    expect(instruction).toContain("`deliver.sh` as its first step");
+  });
+
+  it("defaults to inconclusive when deliveryEvidence is undefined", () => {
+    expect(DEFAULT_DELIVERY_EVIDENCE).toBe("inconclusive");
+  });
+
+  it("decideSuccessfulRunHandoff without deliveryEvidence produces the unchanged instruction", () => {
+    const decision = decide({
+      deliveryEvidence: undefined,
+    });
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.instruction).toContain("2. Move it to `in_review`");
+    expect(decision.instruction).not.toContain("deliver.sh");
+  });
+
+  it("decideSuccessfulRunHandoff with absent deliveryEvidence produces the strict instruction", () => {
+    const decision = decide({
+      deliveryEvidence: "absent",
+    });
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.instruction).toContain("No delivery evidence was detected");
+    expect(decision.instruction).toContain("deliver.sh");
+    expect(decision.instruction).not.toContain("Move it to `in_review`");
   });
 });
 
