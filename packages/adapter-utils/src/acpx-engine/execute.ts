@@ -1435,10 +1435,12 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
       instructionsPrefix =
         `${instructionsContents}\n\n` +
         `The above agent instructions were loaded from ${instructionsFilePath}. ` +
-        `Resolve any relative file references from ${instructionsDir}.\n\n`;
+        `Resolve any relative file references from ${instructionsDir}.\n\n` +
+        `Your execution workspace path is: ${env.PAPERCLIP_WORKSPACE_CWD ?? ""} (also available as the environment variable $PAPERCLIP_WORKSPACE_CWD).\n\n`;
       commandNotes.push(
         `Loaded agent instructions from ${instructionsFilePath}`,
         `Prepended instructions + path directive to the ACPX prompt (relative references from ${instructionsDir}).`,
+        `Injected literal workspace path ${env.PAPERCLIP_WORKSPACE_CWD ?? ""} into prompt.`,
       );
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
