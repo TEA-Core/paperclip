@@ -88,3 +88,21 @@ export function buildStillbornRunMessage(run: { id: string }, ttlMs: number): st
     "issue's execution lock."
   );
 }
+
+export const DEFAULT_SELF_DECLARED_RUN_TTL_MS = 15 * 60 * 1000;
+
+export interface SelfDeclaredRunCandidate {
+  invocationSource: string | null;
+  updatedAt: Date | string | null;
+}
+
+export function isSelfDeclaredRunExpired(
+  run: SelfDeclaredRunCandidate,
+  now: Date,
+  ttlMs: number = DEFAULT_SELF_DECLARED_RUN_TTL_MS,
+): boolean {
+  if (run.invocationSource !== "self_declared") return false;
+  const refMs = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+  if (refMs === 0) return false;
+  return now.getTime() - refMs >= ttlMs;
+}

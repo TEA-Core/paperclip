@@ -468,6 +468,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runErrorCode?: string | null;
     runError?: string | null;
     contextSnapshot?: Record<string, unknown>;
+    invocationSource?: string;
+    updatedAt?: Date;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -514,7 +516,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       id: runId,
       companyId,
       agentId,
-      invocationSource: "assignment",
+      invocationSource: input?.invocationSource ?? "assignment",
       triggerDetail: "system",
       status: input?.runStatus ?? "running",
       wakeupRequestId,
@@ -527,7 +529,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
       startedAt: now,
-      updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+      updatedAt: input?.updatedAt ?? new Date("2026-03-19T00:00:00.000Z"),
     });
 
     if (input?.includeIssue !== false) {
@@ -6458,5 +6460,74 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
+  });
+
+  it("does not reap a fresh self-declared run during the periodic sweep (staleThresholdMs > 0)", async () => {
+    const { runId } = await seedRunFixture({
+      invocationSource: "self_declared",
+      updatedAt: new Date(),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(result.reaped).toBe(0);
+    expect(result.runIds).toEqual([]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+  });
+
+  it("does not reap a fresh self-declared run at startup (staleThresholdMs = 0)", async () => {
+    const { runId } = await seedRunFixture({
+      invocationSource: "self_declared",
+      updatedAt: new Date(),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(0);
+    expect(result.runIds).toEqual([]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+  });
+
+  it("reaps a self-declared run that has outlived its TTL during the periodic sweep", async () => {
+    const expiredAt = new Date(Date.now() - 20 * 60 * 1000);
+    const { runId } = await seedRunFixture({
+      invocationSource: "self_declared",
+      updatedAt: expiredAt,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({
+      staleThresholdMs: 5 * 60 * 1000,
+      selfDeclaredRunTtlMs: 15 * 60 * 1000,
+    });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("reaps a self-declared run that has outlived its TTL at startup (staleThresholdMs = 0)", async () => {
+    const expiredAt = new Date(Date.now() - 20 * 60 * 1000);
+    const { runId } = await seedRunFixture({
+      invocationSource: "self_declared",
+      updatedAt: expiredAt,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ selfDeclaredRunTtlMs: 15 * 60 * 1000 });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
   });
 });
