@@ -124,6 +124,8 @@ import {
   buildStillbornRunMessage,
   canDetectStillbornRun,
   isStillbornRun,
+  isSelfDeclaredRunExpired,
+  DEFAULT_SELF_DECLARED_RUN_TTL_MS,
   DEFAULT_STILLBORN_RUN_TTL_MS,
 } from "./run-stillborn.js";
 import { logActivity, logActivityInTransaction, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
@@ -11791,9 +11793,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; stillbornTtlMs?: number }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; stillbornTtlMs?: number; selfDeclaredRunTtlMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const stillbornTtlMs = opts?.stillbornTtlMs ?? DEFAULT_STILLBORN_RUN_TTL_MS;
+    const selfDeclaredRunTtlMs = opts?.selfDeclaredRunTtlMs ?? DEFAULT_SELF_DECLARED_RUN_TTL_MS;
     const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
@@ -11845,6 +11848,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const stillborn = canDetectStillbornRun(adapterType) && isStillbornRun(run, now, stillbornTtlMs);
 
       if (!stillborn && (runningProcesses.has(run.id) || activeRunExecutions.has(run.id))) continue;
+
+      // Self-declared runs are driven by an external session that does not register
+      // in runningProcesses or activeRunExecutions, so the in-memory guard above
+      // would never protect them. They are reaped only once their TTL has elapsed;
+      // a live external session keeps refreshing updatedAt, so the TTL check below
+      // is the liveness signal. This must come before the staleness-threshold check
+      // so that a fresh self-declared run is never force-failed at startup (where
+      // staleThresholdMs=0) or during the periodic sweep.
+      //
+      // The stillborn predicate is also suppressed for self-declared runs: a
+      // self-declared run legitimately has no pid, no output and no process start
+      // (the external session drives it), so the stillborn signature would match
+      // every live self-declared run. The TTL is the only liveness signal.
+      if (run.invocationSource === "self_declared" && !isSelfDeclaredRunExpired(run, now, selfDeclaredRunTtlMs)) {
+        continue;
+      }
 
       // Apply staleness threshold to avoid false positives
       if (!stillborn && staleThresholdMs > 0) {
