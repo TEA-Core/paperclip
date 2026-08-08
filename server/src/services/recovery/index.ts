@@ -55,6 +55,7 @@ export {
   buildSuccessfulRunHandoffInstruction,
   buildSuccessfulRunHandoffRequiredNotice,
   decideSuccessfulRunHandoff,
+  DEFAULT_DELIVERY_EVIDENCE,
   findExistingFinishSuccessfulRunHandoffWake,
   isSuccessfulRunHandoffValidPathSkip,
   isSuccessfulRunHandoffRequiredNoticeBody,
@@ -62,6 +63,7 @@ export {
   selectSuccessfulRunProgressSummary,
 } from "./successful-run-handoff.js";
 export type {
+  DeliveryEvidence,
   SuccessfulRunHandoffNotice,
   SuccessfulRunHandoffDecision,
 } from "./successful-run-handoff.js";

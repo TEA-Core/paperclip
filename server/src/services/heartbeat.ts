@@ -218,6 +218,7 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
 } from "./recovery/index.js";
+import type { DeliveryEvidence } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
   recoveryAssigneeAdapterOverrides,
@@ -8272,6 +8273,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
         executionState: issues.executionState,
+        executionWorkspaceId: issues.executionWorkspaceId,
         monitorNextCheckAt: issues.monitorNextCheckAt,
         projectId: issues.projectId,
       })
@@ -8286,6 +8288,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : null;
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
     const detectedProgressSummary = await buildDetectedSuccessfulRunProgressSummary(run);
+
+    async function probeDeliveryEvidence(executionWorkspaceId: string | null): Promise<DeliveryEvidence> {
+      if (!executionWorkspaceId) return "inconclusive";
+      try {
+        const ws = await executionWorkspacesSvc.getById(executionWorkspaceId);
+        if (!ws?.cwd) return "inconclusive";
+        const baseRef = ws.baseRef?.trim();
+        if (!baseRef) return "inconclusive";
+
+        const aheadResult = await execFile("git", ["rev-list", "--count", `${baseRef}..HEAD`], { cwd: ws.cwd });
+        const aheadCount = Number.parseInt(aheadResult.stdout.trim(), 10);
+        if (Number.isFinite(aheadCount) && aheadCount > 0) return "present";
+
+        try {
+          await execFile("git", ["rev-parse", "--abbrev-ref", "HEAD@{upstream}"], { cwd: ws.cwd });
+          return "present";
+        } catch {
+          // no upstream configured
+        }
+
+        return "absent";
+      } catch {
+        return "inconclusive";
+      }
+    }
+
+    const deliveryEvidence = await probeDeliveryEvidence(issue?.executionWorkspaceId ?? null);
 
     const [
       activeExecutionPath,
@@ -8458,6 +8487,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       hasActiveRoutineContinuation: Boolean(activeRoutineContinuation),
       budgetBlocked: Boolean(budgetBlock),
       idempotentWakeExists: Boolean(existingWake),
+      deliveryEvidence,
     });
 
     if (isSuccessfulRunHandoffValidPathSkip(decision) && issue) {
