@@ -375,6 +375,15 @@ export async function execute(
     model,
   });
 
+  // ── Resolve working directory ──────────────────────────────────────────
+  const cwd =
+    cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
+  try {
+    await ensureAbsoluteDirectory(cwd);
+  } catch {
+    // Non-fatal
+  }
+
   // ── Load agent instructions file (Paperclip instruction bundles) ──────
   // Paperclip can materialize managed instructions into instructionsFilePath;
   // when present, inject that bundle into the Hermes prompt.
@@ -386,6 +395,7 @@ export async function execute(
       const loadedInstructionsLength = agentInstructions.length;
       const instructionsFileDir = path.dirname(instructionsFilePath);
       agentInstructions += `\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${instructionsFileDir}/.`;
+      agentInstructions += `\nYour execution workspace path is: ${cwd} (also available as the environment variable $PAPERCLIP_WORKSPACE_CWD).`;
       await ctx.onLog(
         "stdout",
         `[hermes] Loaded agent instructions from ${instructionsFilePath} (${loadedInstructionsLength} chars)\n`,
@@ -480,15 +490,6 @@ export async function execute(
   if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
   const wakePayloadJson = stringifyPaperclipWakePayload(ctxContext.paperclipWake);
   if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
-
-  // ── Resolve working directory ──────────────────────────────────────────
-  const cwd =
-    cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
-  try {
-    await ensureAbsoluteDirectory(cwd);
-  } catch {
-    // Non-fatal
-  }
 
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(

@@ -158,6 +158,7 @@ function buildWakeEnv(ctx: AdapterExecutionContext, configEnv: Record<string, st
 async function buildInstructionsPrefix(
   config: Record<string, unknown>,
   onLog: AdapterExecutionContext["onLog"],
+  workspaceCwd: string,
 ): Promise<{ prefix: string; notes: string[]; chars: number }> {
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   if (!instructionsFilePath) {
@@ -167,13 +168,15 @@ async function buildInstructionsPrefix(
   try {
     const contents = await fs.readFile(instructionsFilePath, "utf8");
     const instructionsDir = `${path.dirname(instructionsFilePath)}/`;
-    const prefix = `${contents.trim()}\n\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${instructionsDir}.\n`;
+    const prefix = `${contents.trim()}\n\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${instructionsDir}.\n` +
+      `Your execution workspace path is: ${workspaceCwd} (also available as the environment variable $PAPERCLIP_WORKSPACE_CWD).\n`;
     return {
       prefix,
       chars: prefix.length,
       notes: [
         `Loaded agent instructions from ${instructionsFilePath}`,
         `Prepended instructions + path directive to prompt (relative references from ${instructionsDir}).`,
+        `Injected literal workspace path ${workspaceCwd} into prompt.`,
       ],
     };
   } catch (err) {
@@ -392,7 +395,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     run: { id: runId, source: "on_demand" },
     context,
   };
-  const instructions = await buildInstructionsPrefix(config, onLog);
+  const instructions = await buildInstructionsPrefix(config, onLog, asString(workspace.cwd, ""));
   const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: canReuseSession });
   const renderedBootstrapPrompt =
     !canReuseSession && bootstrapPromptTemplate.trim().length > 0

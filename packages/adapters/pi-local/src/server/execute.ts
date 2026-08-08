@@ -573,6 +573,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `${instructionsContents}\n\n` +
           `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
           `Resolve any relative file references from ${instructionsFileDir}.\n\n` +
+          `Your execution workspace path is: ${cwd} (also available as the environment variable $PAPERCLIP_WORKSPACE_CWD).\n\n` +
           DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
       } catch (err) {
         instructionsReadFailed = true;
@@ -636,6 +637,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       notes.push(`Loaded agent instructions from ${resolvedInstructionsFilePath}`);
       notes.push(
         `Appended instructions + path directive to system prompt (relative references from ${instructionsFileDir}).`,
+      );
+      notes.push(
+        `Injected literal workspace path ${cwd} into system prompt.`,
       );
       return notes;
     })();
