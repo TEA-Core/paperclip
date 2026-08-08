@@ -766,6 +766,11 @@ export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupte
  * stop working the issue, not to escalate.
  */
 export const ORPHANED_DUPLICATE_RUN_CONFLICT_CODE = "orphaned_duplicate_run";
+
+function isUnstartedScheduledRetry(run: { status: string; startedAt: Date | null }) {
+  return run.status === "scheduled_retry" && run.startedAt == null;
+}
+
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -4810,6 +4815,7 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
     if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+    if (isUnstartedScheduledRetry({ status: run.status, startedAt: run.startedAt })) return true;
     // Same gate as the reaper: the stillborn signature only proves anything for adapters that
     // spawn a tracked local child. Declaring a live gateway run dead here would let an assignee
     // take a lock out from under it.
@@ -4857,18 +4863,18 @@ export function issueService(db: Db) {
       ]);
       const [existingRun, actorRun] = await Promise.all([
         tx
-          .select({ status: heartbeatRuns.status })
+          .select({ status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
           .then((rows) => rows[0] ?? null),
         tx
-          .select({ status: heartbeatRuns.status })
+          .select({ status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.actorRunId))
           .then((rows) => rows[0] ?? null),
       ]);
-      const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
-      const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
+      const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status) || isUnstartedScheduledRetry(existingRun);
+      const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status) && !isUnstartedScheduledRetry(actorRun);
       if (!stale || !actorLive) {
         return { adopted: null, latest: lockedIssue };
       }
