@@ -164,24 +164,24 @@ describe("paperclip MCP tools", () => {
     expect(response.content[0]?.text).toContain("/path/to/worktree");
   });
 
-  it("heartbeats a work session with no body", async () => {
+  it("heartbeats a work session with runId", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ runId: "run-1", expiresAt: "2026-08-09T14:00:00Z" }),
     );
     vi.stubGlobal("fetch", fetchMock);
 
     const tool = getTool("paperclipHeartbeatWorkSession");
-    const response = await tool.execute({ issueId: "PAP-1135" });
+    const response = await tool.execute({ issueId: "PAP-1135", runId: "00000000-0000-0000-0000-000000000001" });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-1135/work-session/heartbeat");
     expect(init.method).toBe("POST");
-    expect(JSON.parse(String(init.body))).toEqual({});
+    expect(JSON.parse(String(init.body))).toEqual({ runId: "00000000-0000-0000-0000-000000000001" });
     expect(response.content[0]?.text).toContain("2026-08-09T14:00:00Z");
   });
 
-  it("closes a work session with outcome and optional summary", async () => {
+  it("closes a work session with runId, outcome and optional summary", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ runId: "run-1", status: "succeeded" }),
     );
@@ -190,6 +190,7 @@ describe("paperclip MCP tools", () => {
     const tool = getTool("paperclipCloseWorkSession");
     await tool.execute({
       issueId: "PAP-1135",
+      runId: "00000000-0000-0000-0000-000000000001",
       outcome: "succeeded",
       summary: "All done",
     });
@@ -199,6 +200,7 @@ describe("paperclip MCP tools", () => {
     expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-1135/work-session/close");
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({
+      runId: "00000000-0000-0000-0000-000000000001",
       outcome: "succeeded",
       summary: "All done",
     });
