@@ -1974,7 +1974,7 @@ async function buildSessionConfigMetadata(
       projectConfigRevisionAt: "2026-06-01T00:00:00.000Z",
     },
     environment: {
-      selectionSource: "default",
+      environmentSelectionSource: "default",
       selectedEnvironmentId: "environment-1",
       selectedEnvironment: {
         id: "environment-1",
