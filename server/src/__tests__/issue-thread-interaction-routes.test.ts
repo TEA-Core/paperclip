@@ -1845,4 +1845,26 @@ describe.sequential("issue thread interaction routes", () => {
       }),
     );
   });
+
+  it("allows the assignee agent to create interactions on an in_progress issue without checkout ownership (SUP-11852 regression)", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-asker",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "suggest_tasks",
+        idempotencyKey: "interaction:sup-11852",
+        payload: {
+          version: 1,
+          tasks: [{ clientKey: "t1", title: "Verify" }],
+        },
+      });
+
+    expect(res.status).toBe(201);
+  });
 });

@@ -3700,6 +3700,7 @@ export function issueRoutes(
       assigneeUserId: string | null;
       createdByAgentId: string | null;
     },
+    opts?: { bypassCheckoutOwnership?: boolean },
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -3766,6 +3767,9 @@ export function issueRoutes(
       return false;
     }
     if (issue.status !== "in_progress") {
+      return true;
+    }
+    if (opts?.bypassCheckoutOwnership) {
       return true;
     }
     const runId = requireAgentRunId(req, res);
@@ -9467,7 +9471,7 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (req.actor.type === "agent") {
-      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (!(await assertAgentIssueMutationAllowed(req, res, issue, { bypassCheckoutOwnership: true }))) return;
       if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
     } else {
       assertBoard(req);
