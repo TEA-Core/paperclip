@@ -492,6 +492,33 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       async ({ issueId }) => client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/release`, { body: {} }),
     ),
     makeTool(
+      "paperclipOpenWorkSession",
+      "Open a self-declared work session for an issue. The returned workspace.cwd is the directory where the agent should perform its work.",
+      z.object({ issueId: issueIdSchema }),
+      async ({ issueId }) =>
+        client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/work-session`, { body: {} }),
+    ),
+    makeTool(
+      "paperclipHeartbeatWorkSession",
+      "Keep a self-declared work session alive by recording a heartbeat. Returns the runId and the new expiration time.",
+      z.object({ issueId: issueIdSchema }),
+      async ({ issueId }) =>
+        client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/work-session/heartbeat`, { body: {} }),
+    ),
+    makeTool(
+      "paperclipCloseWorkSession",
+      "Close a self-declared work session. Failing to call this leaves the issue locked until the session TTL expires.",
+      z.object({
+        issueId: issueIdSchema,
+        outcome: z.enum(["succeeded", "failed", "cancelled"]),
+        summary: z.string().trim().max(2000).optional(),
+      }),
+      async ({ issueId, outcome, summary }) =>
+        client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/work-session/close`, {
+          body: { outcome, summary },
+        }),
+    ),
+    makeTool(
       "paperclipAddComment",
       "Add a comment to an issue; include resume=true when intentionally requesting follow-up on resumable closed work",
       addCommentToolSchema,
