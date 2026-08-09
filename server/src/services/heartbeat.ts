@@ -17541,6 +17541,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     },
 
+    setRunStatusIfRunning: (
+      runId: string,
+      status: string,
+      patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    ) => setRunStatusIfRunning(runId, status, patch),
+
+    releaseIssueExecutionAndPromote: (run: typeof heartbeatRuns.$inferSelect, options: { suppressImmediateRecovery?: boolean } = {}) =>
+      releaseIssueExecutionAndPromote(run, options),
+
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
 
     /**

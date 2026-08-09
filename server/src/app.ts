@@ -48,6 +48,7 @@ import { resourceMembershipRoutes } from "./routes/resource-memberships.js";
 import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
 import { dispatchQuiesceRoutes } from "./routes/dispatch-quiesce.js";
+import { workSessionRoutes } from "./routes/work-sessions.js";
 import { openApiRoutes } from "./routes/openapi.js";
 import {
   instanceDatabaseBackupRoutes,
@@ -277,6 +278,7 @@ export async function createApp(
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
   api.use(dispatchQuiesceRoutes(db));
+  api.use(workSessionRoutes(db));
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }
