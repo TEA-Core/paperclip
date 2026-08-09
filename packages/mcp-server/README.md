@@ -69,6 +69,9 @@ Write tools:
 - `paperclipUpsertIssueDocument`
 - `paperclipRestoreIssueDocumentRevision`
 - `paperclipControlIssueWorkspaceServices`
+- `paperclipOpenWorkSession`
+- `paperclipHeartbeatWorkSession`
+- `paperclipCloseWorkSession`
 - `paperclipCreateApproval`
 - `paperclipLinkIssueApproval`
 - `paperclipUnlinkIssueApproval`

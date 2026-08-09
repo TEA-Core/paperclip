@@ -136,6 +136,86 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  it("opens a work session and surfaces the workspace cwd", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({
+        runId: "run-1",
+        issueId: "PAP-1135",
+        status: "running",
+        workspace: {
+          strategy: "git_worktree",
+          cwd: "/path/to/worktree",
+          branchName: "SUP-1135",
+          worktreePath: "/path/to/worktree",
+          executionWorkspaceId: "44444444-4444-4444-8444-444444444444",
+        },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipOpenWorkSession");
+    const response = await tool.execute({ issueId: "PAP-1135" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-1135/work-session");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({});
+    expect(response.content[0]?.text).toContain("/path/to/worktree");
+  });
+
+  it("heartbeats a work session with no body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ runId: "run-1", expiresAt: "2026-08-09T14:00:00Z" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipHeartbeatWorkSession");
+    const response = await tool.execute({ issueId: "PAP-1135" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-1135/work-session/heartbeat");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({});
+    expect(response.content[0]?.text).toContain("2026-08-09T14:00:00Z");
+  });
+
+  it("closes a work session with outcome and optional summary", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ runId: "run-1", status: "succeeded" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipCloseWorkSession");
+    await tool.execute({
+      issueId: "PAP-1135",
+      outcome: "succeeded",
+      summary: "All done",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-1135/work-session/close");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      outcome: "succeeded",
+      summary: "All done",
+    });
+  });
+
+  it("rejects invalid work session close outcomes", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+
+    const tool = getTool("paperclipCloseWorkSession");
+    const response = await tool.execute({
+      issueId: "PAP-1135",
+      outcome: "bogus" as unknown as "succeeded",
+    });
+
+    expect(response.content[0]?.text).toContain("Invalid enum value");
+  });
+
   it("allows create issue requests to omit status so the API applies assignee defaults", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ id: "issue-1", status: "todo" }),
