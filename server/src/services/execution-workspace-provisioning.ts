@@ -98,6 +98,13 @@ export interface ExecutionWorkspaceProvisioningRunLifecycle {
     workspaceOccupancyDecision: WorkspaceOccupancyDecision;
     workspaceReuseRequest: WorkspaceReuseRequest;
   }) => Promise<void>;
+  onProvisionFresh?: (input: {
+    run: HeartbeatRun;
+    issueRef: ExecutionWorkspaceProvisioningIssueRef | null;
+    issueId: string | null;
+    workspaceOccupancy: WorkspaceOccupancy | null;
+    deferrals: number;
+  }) => Promise<void>;
 }
 
 export interface ExecutionWorkspaceProvisioningInput {
@@ -316,6 +323,13 @@ export async function provisionIssueExecutionWorkspace(
       },
       "execution workspace stayed occupied for the whole wait budget; provisioning a fresh workspace instead of sharing a worktree with another issue's run",
     );
+    await input.runLifecycle.onProvisionFresh?.({
+      run,
+      issueRef,
+      issueId,
+      workspaceOccupancy,
+      deferrals: workspaceOccupancyDecision.deferrals,
+    });
   }
 
   const reusableExistingExecutionWorkspace =
@@ -342,7 +356,7 @@ export async function provisionIssueExecutionWorkspace(
     await resolveWorkspaceAfterLowTrustPreflight({
       db,
       trustPreset: input.trustPreset,
-      isolatedWorkspacesEnabled: true,
+      isolatedWorkspacesEnabled: input.isolatedWorkspacesEnabled,
       effectiveExecutionWorkspaceMode,
       issue: issueRef
         ? {
@@ -521,24 +535,25 @@ export async function provisionIssueExecutionWorkspace(
               recorder: workspaceOperationRecorder,
             })
         : null,
-      realizeWorkspace: () =>
-        realizeExecutionWorkspace({
-          db,
-          base: executionWorkspaceBase,
-          config: hostExecutionWorkspaceConfig,
-          issue: issueRef,
-          agent: {
-            id: agent.id,
-            name: agent.name,
-            companyId: agent.companyId,
-          },
-          heartbeatRunId: run.id,
-          enableWorkspaceBranchReconcileForward:
-            input.resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
-          enableWorkspaceDirtyQuarantineRepair:
-            input.resolvedInstanceSettings.experimental.enableWorkspaceDirtyQuarantineRepair,
-          recorder: workspaceOperationRecorder,
-        }),
+  realizeWorkspace: () =>
+    realizeExecutionWorkspace({
+      db,
+      base: executionWorkspaceBase,
+      config: hostExecutionWorkspaceConfig,
+      issue: issueRef,
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        companyId: agent.companyId,
+      },
+      heartbeatRunId: run.id,
+      existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+      enableWorkspaceBranchReconcileForward:
+        input.resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
+      enableWorkspaceDirtyQuarantineRepair:
+        input.resolvedInstanceSettings.experimental.enableWorkspaceDirtyQuarantineRepair,
+      recorder: workspaceOperationRecorder,
+    }),
     });
 
   const resolvedProjectId =

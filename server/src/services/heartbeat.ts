@@ -13025,6 +13025,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await releaseIssueExecutionAndPromote(deferredRun);
           }
         },
+        onProvisionFresh: async ({
+          run: provisionFreshRun,
+          issueRef: provisionFreshIssueRef,
+          issueId: provisionFreshIssueId,
+          workspaceOccupancy,
+          deferrals,
+        }) => {
+          const message = `execution workspace stayed occupied for the whole wait budget (${deferrals} deferrals); provisioning a fresh workspace instead of sharing a worktree with another issue's run`;
+          await appendRunEvent(
+            provisionFreshRun,
+            await nextRunEventSeq(provisionFreshRun.id),
+            {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message,
+              payload: {
+                issueId: provisionFreshIssueId,
+                issueIdentifier: provisionFreshIssueRef?.identifier ?? null,
+                occupantRunId: workspaceOccupancy?.runId ?? null,
+                occupantIssueId: workspaceOccupancy?.issueId ?? null,
+                deferrals,
+              },
+            },
+          );
+        },
       },
     });
 
