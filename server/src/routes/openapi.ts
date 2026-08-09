@@ -5392,7 +5392,7 @@ registry.registerPath({
   summary: "Keepalive a self-declared work session",
   request: {
     params: z.object({ issueId: z.string() }),
-    body: jsonBody(z.object({ runId: z.string() }).strict()),
+    body: jsonBody(z.object({ runId: z.string().uuid() }).strict()),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
@@ -5405,7 +5405,7 @@ registry.registerPath({
   request: {
     params: z.object({ issueId: z.string() }),
     body: jsonBody(
-      z.object({ runId: z.string(), outcome: z.enum(["succeeded", "failed", "cancelled"]), summary: z.string().optional() }).strict(),
+      z.object({ runId: z.string().uuid(), outcome: z.enum(["succeeded", "failed", "cancelled"]), summary: z.string().optional() }).strict(),
     ),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },

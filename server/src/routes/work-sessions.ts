@@ -1,6 +1,17 @@
 import { Router } from "express";
+import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { selfDeclaredRunService } from "../services/self-declared-run.js";
+
+const heartbeatBodySchema = z.object({
+  runId: z.string().uuid(),
+});
+
+const closeBodySchema = z.object({
+  runId: z.string().uuid(),
+  outcome: z.enum(["succeeded", "failed", "cancelled"]),
+  summary: z.string().optional(),
+});
 
 export function workSessionRoutes(db: Db) {
   const router = Router();
@@ -24,13 +35,13 @@ export function workSessionRoutes(db: Db) {
       return;
     }
 
-    const runId = req.body?.runId as string | undefined;
-    if (!runId) {
-      res.status(400).json({ error: "runId is required" });
+    const parsed = heartbeatBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "runId is required and must be a valid UUID" });
       return;
     }
 
-    const result = await svc.keepalive(runId, req.actor.agentId);
+    const result = await svc.keepalive(parsed.data.runId, req.actor.agentId, issueId);
     res.status(200).json(result);
   });
 
@@ -41,27 +52,18 @@ export function workSessionRoutes(db: Db) {
       return;
     }
 
-    const runId = req.body?.runId as string | undefined;
-    if (!runId) {
-      res.status(400).json({ error: "runId is required" });
+    const parsed = closeBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "runId (UUID), outcome, and optional summary are required" });
       return;
     }
 
-    const outcome = req.body?.outcome as
-      "succeeded" | "failed" | "cancelled" | undefined;
-    if (!outcome || !["succeeded", "failed", "cancelled"].includes(outcome)) {
-      res
-        .status(400)
-        .json({ error: "outcome must be succeeded, failed, or cancelled" });
-      return;
-    }
-
-    const summary = req.body?.summary as string | undefined;
     const result = await svc.closeSelfDeclaredRun(
-      runId,
+      parsed.data.runId,
       req.actor.agentId,
-      outcome,
-      summary,
+      issueId,
+      parsed.data.outcome,
+      parsed.data.summary,
     );
     res.status(200).json(result);
   });

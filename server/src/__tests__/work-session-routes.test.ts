@@ -10,7 +10,6 @@ import {
   heartbeatRuns,
   issues,
   projects,
-  activityLog,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/error-handler.js";
 import { workSessionRoutes } from "../routes/work-sessions.js";
@@ -382,6 +381,64 @@ describeEmbeddedPostgres("work-session routes", () => {
       .post(`/api/issues/${fixture.issueId}/work-session/close`)
       .send({ runId: openRes.body.runId, outcome: "succeeded" });
     expect(closeRes.status).toBe(403);
+  });
+
+  it("keepalive with runId from different issue gets 403", async () => {
+    const fixture1 = await seedExternalPullAgent();
+    const fixture2 = await seedExternalPullAgent();
+    const app1 = createApp(fixture1.agentId, fixture1.companyId);
+
+    const openRes = await request(app1).post(
+      `/api/issues/${fixture1.issueId}/work-session`,
+    );
+    expect(openRes.status).toBe(201);
+    const runId = openRes.body.runId;
+
+    const app2 = createApp(fixture1.agentId, fixture1.companyId);
+    const hbRes = await request(app2)
+      .post(`/api/issues/${fixture2.issueId}/work-session/heartbeat`)
+      .send({ runId });
+    expect(hbRes.status).toBe(403);
+    expect(hbRes.body.error).toBe("Run does not belong to this issue");
+  });
+
+  it("close with runId from different issue gets 403", async () => {
+    const fixture1 = await seedExternalPullAgent();
+    const fixture2 = await seedExternalPullAgent();
+    const app1 = createApp(fixture1.agentId, fixture1.companyId);
+
+    const openRes = await request(app1).post(
+      `/api/issues/${fixture1.issueId}/work-session`,
+    );
+    expect(openRes.status).toBe(201);
+    const runId = openRes.body.runId;
+
+    const app2 = createApp(fixture1.agentId, fixture1.companyId);
+    const closeRes = await request(app2)
+      .post(`/api/issues/${fixture2.issueId}/work-session/close`)
+      .send({ runId, outcome: "succeeded" });
+    expect(closeRes.status).toBe(403);
+    expect(closeRes.body.error).toBe("Run does not belong to this issue");
+  });
+
+  it("keepalive with invalid runId gets 400", async () => {
+    const fixture = await seedExternalPullAgent();
+    const app = createApp(fixture.agentId, fixture.companyId);
+
+    const hbRes = await request(app)
+      .post(`/api/issues/${fixture.issueId}/work-session/heartbeat`)
+      .send({ runId: "not-a-uuid" });
+    expect(hbRes.status).toBe(400);
+  });
+
+  it("close with invalid runId gets 400", async () => {
+    const fixture = await seedExternalPullAgent();
+    const app = createApp(fixture.agentId, fixture.companyId);
+
+    const closeRes = await request(app)
+      .post(`/api/issues/${fixture.issueId}/work-session/close`)
+      .send({ runId: "not-a-uuid", outcome: "succeeded" });
+    expect(closeRes.status).toBe(400);
   });
 
   it("non-agent actor gets 403", async () => {

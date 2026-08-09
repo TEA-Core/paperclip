@@ -1,16 +1,17 @@
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
   heartbeatRuns,
   issues,
-  executionWorkspaces,
+  projects,
 } from "@paperclipai/db";
 import { isExternalPullAgent } from "./agent-work-delivery.js";
 import { heartbeatService } from "./heartbeat.js";
-import { issueService } from "./issues.js";
 import { logActivity } from "./activity-log.js";
+import { executionWorkspaceService } from "./execution-workspaces.js";
 import { forbidden, notFound, conflict } from "../errors.js";
+import { asString, parseObject } from "../adapters/utils.js";
 
 export interface SelfDeclaredRunOpenResult {
   runId: string;
@@ -39,7 +40,6 @@ export const SELF_DECLARED_RUN_TTL_MS = 5 * 60 * 1000;
 
 export function selfDeclaredRunService(db: Db) {
   const heartbeat = heartbeatService(db);
-  const issuesSvc = issueService(db);
 
   async function getAgentById(agentId: string) {
     return db
@@ -65,12 +65,19 @@ export function selfDeclaredRunService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getExecutionWorkspaceById(executionWorkspaceId: string) {
+  async function getProjectById(projectId: string) {
     return db
       .select()
-      .from(executionWorkspaces)
-      .where(eq(executionWorkspaces.id, executionWorkspaceId))
+      .from(projects)
+      .where(eq(projects.id, projectId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  function resolveBaseRef(projectRow: { executionWorkspacePolicy: unknown } | null): string | null {
+    const policy = parseObject(projectRow?.executionWorkspacePolicy);
+    const strategy = parseObject(policy?.workspaceStrategy);
+    const baseRef = asString(strategy.baseRef, "");
+    return baseRef.length > 0 ? baseRef : null;
   }
 
   async function provisionIssueExecutionWorkspace(
@@ -88,44 +95,47 @@ export function selfDeclaredRunService(db: Db) {
     const issueRow = await getIssueById(issueId);
     if (!issueRow) throw notFound("Issue not found");
 
+    const projectRow = issueRow.projectId
+      ? await getProjectById(issueRow.projectId)
+      : null;
+    const baseRef = resolveBaseRef(projectRow);
+
+    const ews = executionWorkspaceService(db);
     const existingWorkspaceId = issueRow.executionWorkspaceId;
     let workspace = existingWorkspaceId
-      ? await getExecutionWorkspaceById(existingWorkspaceId)
+      ? await ews.getById(existingWorkspaceId)
       : null;
 
     if (workspace) {
       const now = new Date();
-      await db
-        .update(executionWorkspaces)
-        .set({ lastUsedAt: now, updatedAt: now })
-        .where(eq(executionWorkspaces.id, workspace.id));
+      await ews.update(workspace.id, {
+        lastUsedAt: now,
+        baseRef: baseRef ?? workspace.baseRef,
+      });
     } else {
       const now = new Date();
-      const newWorkspace = await db
-        .insert(executionWorkspaces)
-        .values({
-          companyId,
-          projectId: issueRow.projectId ?? "",
-          sourceIssueId: issueId,
-          mode: "isolated_workspace",
-          strategyType: "git_worktree",
-          name: `self-declared-${runId.slice(0, 8)}`,
-          status: "active",
-          baseRef: "main",
-          branchName: `self-declared-${runId.slice(0, 8)}`,
-          cwd: null,
-          lastUsedAt: now,
-          openedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const branchName = `self-declared-${runId.slice(0, 8)}`;
+      const created = await ews.create({
+        companyId,
+        projectId: issueRow.projectId ?? "",
+        sourceIssueId: issueId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: branchName,
+        status: "active",
+        baseRef: baseRef ?? null,
+        branchName,
+        cwd: null,
+        lastUsedAt: now,
+        openedAt: now,
+      });
 
-      if (newWorkspace) {
+      if (created) {
         await db
           .update(issues)
-          .set({ executionWorkspaceId: newWorkspace.id, updatedAt: now })
+          .set({ executionWorkspaceId: created.id, updatedAt: now })
           .where(eq(issues.id, issueId));
-        workspace = newWorkspace;
+        workspace = created;
       }
     }
 
@@ -291,6 +301,7 @@ export function selfDeclaredRunService(db: Db) {
   async function keepalive(
     runId: string,
     agentId: string,
+    issueId: string,
   ): Promise<SelfDeclaredRunKeepaliveResult> {
     const run = await getRunById(runId);
     if (!run) throw notFound("Run not found");
@@ -303,6 +314,17 @@ export function selfDeclaredRunService(db: Db) {
       throw conflict("Run is not in running status", {
         runId,
         status: run.status,
+      });
+    }
+
+    const ctx = parseObject(run.contextSnapshot);
+    const runIssueId = asString(ctx.issueId, "");
+    if (runIssueId.length > 0 && runIssueId !== issueId) {
+      throw forbidden("Run does not belong to this issue", {
+        code: "run_issue_mismatch",
+        runId,
+        issueId,
+        runIssueId,
       });
     }
 
@@ -323,6 +345,7 @@ export function selfDeclaredRunService(db: Db) {
   async function closeSelfDeclaredRun(
     runId: string,
     agentId: string,
+    issueId: string,
     outcome: "succeeded" | "failed" | "cancelled",
     summary?: string,
   ): Promise<SelfDeclaredRunCloseResult> {
@@ -337,6 +360,17 @@ export function selfDeclaredRunService(db: Db) {
       throw conflict("Run is not a self-declared run", {
         runId,
         invocationSource: run.invocationSource,
+      });
+    }
+
+    const ctx = parseObject(run.contextSnapshot);
+    const runIssueId = asString(ctx.issueId, "");
+    if (runIssueId.length > 0 && runIssueId !== issueId) {
+      throw forbidden("Run does not belong to this issue", {
+        code: "run_issue_mismatch",
+        runId,
+        issueId,
+        runIssueId,
       });
     }
 
@@ -364,20 +398,19 @@ export function selfDeclaredRunService(db: Db) {
     });
 
     const agent = await getAgentById(agentId);
-    const ctx = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(ctx.issueId);
+    const resolvedIssueId = runIssueId.length > 0 ? runIssueId : issueId;
 
-    if (issueId && agent) {
+    if (resolvedIssueId && agent) {
       await logActivity(db, {
         companyId: agent.companyId,
         actorType: "agent",
         actorId: agentId,
         action: "self_declared_run_closed",
         entityType: "issue",
-        entityId: issueId,
+        entityId: resolvedIssueId,
         agentId,
         runId: run.id,
-        issueId,
+        issueId: resolvedIssueId,
         details: {
           outcome,
           summary: summary ?? null,
@@ -397,18 +430,6 @@ export function selfDeclaredRunService(db: Db) {
     closeSelfDeclaredRun,
     getRunById,
   };
-}
-
-function parseObject(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
-}
-
-function readNonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0
-    ? value.trim()
-    : null;
 }
 
 function normalizeAgentNameKey(name: string): string | null {
