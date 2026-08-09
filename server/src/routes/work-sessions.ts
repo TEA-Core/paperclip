@@ -5,13 +5,13 @@ import { selfDeclaredRunService } from "../services/self-declared-run.js";
 
 const heartbeatBodySchema = z.object({
   runId: z.string().uuid(),
-});
+}).strict();
 
 const closeBodySchema = z.object({
   runId: z.string().uuid(),
   outcome: z.enum(["succeeded", "failed", "cancelled"]),
   summary: z.string().optional(),
-});
+}).strict();
 
 export function workSessionRoutes(db: Db) {
   const router = Router();

@@ -36,7 +36,7 @@ export interface SelfDeclaredRunCloseResult {
   status: string;
 }
 
-export const SELF_DECLARED_RUN_TTL_MS = 5 * 60 * 1000;
+import { DEFAULT_SELF_DECLARED_RUN_TTL_MS } from "./run-stillborn.js";
 
 export function selfDeclaredRunService(db: Db) {
   const heartbeat = heartbeatService(db);
@@ -73,11 +73,14 @@ export function selfDeclaredRunService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  function resolveBaseRef(projectRow: { executionWorkspacePolicy: unknown } | null): string | null {
+  function resolveProjectWorkspacePolicy(projectRow: { executionWorkspacePolicy: unknown } | null): { mode: string; strategyType: string; baseRef: string | null } {
     const policy = parseObject(projectRow?.executionWorkspacePolicy);
     const strategy = parseObject(policy?.workspaceStrategy);
-    const baseRef = asString(strategy.baseRef, "");
-    return baseRef.length > 0 ? baseRef : null;
+    return {
+      mode: asString(policy.defaultMode, "isolated_workspace"),
+      strategyType: asString(strategy.type, "git_worktree"),
+      baseRef: asString(strategy.baseRef, "") || null,
+    };
   }
 
   async function provisionIssueExecutionWorkspace(
@@ -98,7 +101,7 @@ export function selfDeclaredRunService(db: Db) {
     const projectRow = issueRow.projectId
       ? await getProjectById(issueRow.projectId)
       : null;
-    const baseRef = resolveBaseRef(projectRow);
+    const { mode, strategyType, baseRef } = resolveProjectWorkspacePolicy(projectRow);
 
     const ews = executionWorkspaceService(db);
     const existingWorkspaceId = issueRow.executionWorkspaceId;
@@ -119,8 +122,8 @@ export function selfDeclaredRunService(db: Db) {
         companyId,
         projectId: issueRow.projectId ?? "",
         sourceIssueId: issueId,
-        mode: "isolated_workspace",
-        strategyType: "git_worktree",
+        mode,
+        strategyType,
         name: branchName,
         status: "active",
         baseRef: baseRef ?? null,
@@ -334,7 +337,7 @@ export function selfDeclaredRunService(db: Db) {
       .set({ updatedAt: now })
       .where(eq(heartbeatRuns.id, runId));
 
-    const expiresAt = new Date(now.getTime() + SELF_DECLARED_RUN_TTL_MS);
+    const expiresAt = new Date(now.getTime() + DEFAULT_SELF_DECLARED_RUN_TTL_MS);
 
     return {
       runId: run.id,
