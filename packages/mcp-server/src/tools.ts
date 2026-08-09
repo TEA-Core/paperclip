@@ -501,21 +501,22 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     makeTool(
       "paperclipHeartbeatWorkSession",
       "Keep a self-declared work session alive by recording a heartbeat. Returns the runId and the new expiration time.",
-      z.object({ issueId: issueIdSchema }),
-      async ({ issueId }) =>
-        client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/work-session/heartbeat`, { body: {} }),
+      z.object({ issueId: issueIdSchema, runId: z.string().uuid() }),
+      async ({ issueId, runId }) =>
+        client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/work-session/heartbeat`, { body: { runId } }),
     ),
     makeTool(
       "paperclipCloseWorkSession",
       "Close a self-declared work session. Failing to call this leaves the issue locked until the session TTL expires.",
       z.object({
         issueId: issueIdSchema,
+        runId: z.string().uuid(),
         outcome: z.enum(["succeeded", "failed", "cancelled"]),
         summary: z.string().trim().max(2000).optional(),
       }),
-      async ({ issueId, outcome, summary }) =>
+      async ({ issueId, runId, outcome, summary }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/work-session/close`, {
-          body: { outcome, summary },
+          body: { runId, outcome, summary },
         }),
     ),
     makeTool(
