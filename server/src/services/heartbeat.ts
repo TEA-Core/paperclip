@@ -12937,9 +12937,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
           hasTaskSession: taskSession != null,
           configuredModel,
-          taskSessionParams: taskSession?.sessionParamsJson ?? null,
+          taskSessionParams: taskSession?.sessionParamsJson ?? taskSessionDecodedParams,
           configMetadata: sessionConfigMetadata,
           wakeResetReason: wakeSessionResetReason,
+          preserveLegacySessionWithoutConfigMetadata:
+            acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
         });
         const resetTaskSession =
           shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
@@ -13018,7 +13020,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (deferredRun) {
             await scheduleBoundedRetryForRun(deferredRun, agent, {
               retryReason: EXECUTION_WORKSPACE_OCCUPIED_RETRY_REASON,
-              wakeReason: "schedule",
+              wakeReason: EXECUTION_WORKSPACE_OCCUPIED_WAKE_REASON,
               maxAttempts: EXECUTION_WORKSPACE_OCCUPIED_MAX_DEFERRALS,
               delayMs: EXECUTION_WORKSPACE_OCCUPIED_DEFER_DELAY_MS,
             });
