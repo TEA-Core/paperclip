@@ -56,6 +56,7 @@ const apiPrefixes: Record<string, string> = {
   "tool-access.ts": "/api",
   "tool-gateway.ts": "/api",
   "user-profiles.ts": "/api",
+  "work-sessions.ts": "/api",
 };
 
 const ROUTE_LITERAL_PATTERN = /router\.(get|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;

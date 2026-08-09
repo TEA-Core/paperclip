@@ -5374,6 +5374,43 @@ registry.registerPath({
   responses: { 200: { description: "JavaScript file" }, 404: r.notFound },
 });
 
+// ─── Work sessions ─────────────────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{issueId}/work-session",
+  tags: ["issues"],
+  summary: "Open a self-declared work session for an external pull agent",
+  request: { params: z.object({ issueId: z.string() }) },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{issueId}/work-session/heartbeat",
+  tags: ["issues"],
+  summary: "Keepalive a self-declared work session",
+  request: {
+    params: z.object({ issueId: z.string() }),
+    body: jsonBody(z.object({ runId: z.string().uuid() }).strict()),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{issueId}/work-session/close",
+  tags: ["issues"],
+  summary: "Close a self-declared work session",
+  request: {
+    params: z.object({ issueId: z.string() }),
+    body: jsonBody(
+      z.object({ runId: z.string().uuid(), outcome: z.enum(["succeeded", "failed", "cancelled"]), summary: z.string().optional() }).strict(),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
 // ─── Current route coverage ─────────────────────────────────────────────────
 
 registerCurrentRoute({
