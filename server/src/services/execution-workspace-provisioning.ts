@@ -129,7 +129,7 @@ export interface ExecutionWorkspaceProvisioningInput {
   resolveSessionConfig: (input: {
     requestedShouldReuseExisting: boolean;
     reusableExistingExecutionWorkspace: ExecutionWorkspace | null;
-    requestedReusableExecutionWorkspaceConfig: Record<string, unknown> | null;
+    requestedReusableExecutionWorkspaceConfig: ExecutionWorkspaceConfig | null;
   }) => Promise<{
     previousSessionParams: Record<string, unknown> | null;
     resetTaskSession: boolean;
@@ -178,12 +178,12 @@ export interface ProvisionedIssueExecutionWorkspace {
   resolvedProjectId: string | null;
   resolvedProjectWorkspaceId: string | null;
    requestedShouldReuseExisting: boolean;
-   requestedReusableExecutionWorkspaceConfig: Record<string, unknown> | null;
+   requestedReusableExecutionWorkspaceConfig: ExecutionWorkspaceConfig | null;
    reusableExistingExecutionWorkspace: ExecutionWorkspace | null;
    hostExecutionWorkspaceConfig: Record<string, unknown>;
    sessionConfigMetadata: Awaited<ReturnType<typeof buildEffectiveRunSessionConfigMetadata>>;
    latestWorkspaceConfigMetadata: Awaited<ReturnType<typeof buildEffectiveRunWorkspaceConfigMetadata>>;
-   reusedExecutionWorkspace: ExecutionWorkspace | null;
+   reusedExecutionWorkspace: RealizedExecutionWorkspace | null;
    workspaceReuseRequest: WorkspaceReuseRequest;
    workspaceConfigFreshness: WorkspaceConfigFreshness;
   resolvedWorkspaceReusePolicy: WorkspaceReuseProvisioningPolicy;
@@ -336,7 +336,7 @@ export async function provisionIssueExecutionWorkspace(
     requestedReusableExecutionWorkspaceConfig,
   });
 
-  const effectiveExecutionWorkspaceMode = input.requestedExecutionWorkspaceMode;
+  const effectiveExecutionWorkspaceMode = input.effectiveExecutionWorkspaceMode;
 
   const { selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver, workspace: resolvedWorkspace } =
     await resolveWorkspaceAfterLowTrustPreflight({
@@ -354,7 +354,7 @@ export async function provisionIssueExecutionWorkspace(
       resolveSelectedEnvironmentDriver: async () => {
         const preflightEnvironment = await envOrchestrator.resolveEnvironment({
           companyId: agent.companyId,
-          selectedEnvironmentId: input.selectedEnvironmentId,
+          selectedEnvironmentId: input.selectedEnvironmentId ?? input.localEnvironment.id,
           localEnvironmentId: input.localEnvironment.id,
         });
         return preflightEnvironment.driver;
@@ -378,13 +378,13 @@ export async function provisionIssueExecutionWorkspace(
   } satisfies ExecutionWorkspaceInput;
 
   await assertGitWorktreeBaseWorkspaceReady({
-    requestedExecutionWorkspaceMode: input.requestedExecutionWorkspaceMode,
+    requestedExecutionWorkspaceMode: input.effectiveExecutionWorkspaceMode,
     config: hostExecutionWorkspaceConfig,
     issue: issueRef,
     base: executionWorkspaceBase,
   });
   await assertProjectPrimaryBaseWorkspaceReady({
-    requestedExecutionWorkspaceMode: input.requestedExecutionWorkspaceMode,
+    requestedExecutionWorkspaceMode: input.effectiveExecutionWorkspaceMode,
     config: hostExecutionWorkspaceConfig,
     agentId: agent.id,
     issue: issueRef,
@@ -395,13 +395,13 @@ export async function provisionIssueExecutionWorkspace(
   const workspaceStrategyFingerprintValue =
     Object.keys(workspaceStrategyForFingerprint).length > 0 ? workspaceStrategyForFingerprint : null;
   const latestWorkspaceStrategyType = resolveEffectiveWorkspaceStrategyType(
-    input.requestedExecutionWorkspaceMode,
+    input.effectiveExecutionWorkspaceMode,
     hostExecutionWorkspaceConfig,
   );
   const selectedEnvironmentConfigForFingerprint = parseObject(input.selectedEnvironmentForConfig?.config);
   const workspaceEnvironmentFingerprint = input.selectedEnvironmentForConfig
     ? {
-        selectionSource: input.environmentSelectionSource,
+        environmentSelectionSource: input.environmentSelectionSource,
         selectedEnvironmentId: input.selectedEnvironmentId,
         driver: input.selectedEnvironmentForConfig.driver,
         provider: readNonEmptyString(selectedEnvironmentConfigForFingerprint.provider),
@@ -420,7 +420,7 @@ export async function provisionIssueExecutionWorkspace(
     lowTrustSandboxDriver: lowTrustPreflightEnvironmentDriver,
   };
   const latestWorkspaceConfigMetadata = buildEffectiveRunWorkspaceConfigMetadata({
-    mode: input.requestedExecutionWorkspaceMode,
+    mode: input.effectiveExecutionWorkspaceMode,
     projectId: executionWorkspaceBase.projectId,
     projectWorkspaceId: executionWorkspaceBase.workspaceId,
     strategyType: latestWorkspaceStrategyType,
@@ -584,11 +584,11 @@ export async function provisionIssueExecutionWorkspace(
               projectWorkspaceId: resolvedProjectWorkspaceId,
               sourceIssueId: issueRef?.id ?? null,
               mode:
-                input.requestedExecutionWorkspaceMode === "isolated_workspace"
+                input.effectiveExecutionWorkspaceMode === "isolated_workspace"
                   ? "isolated_workspace"
-                  : input.requestedExecutionWorkspaceMode === "operator_branch"
+                  : input.effectiveExecutionWorkspaceMode === "operator_branch"
                     ? "operator_branch"
-                    : input.requestedExecutionWorkspaceMode === "agent_default"
+                    : input.effectiveExecutionWorkspaceMode === "agent_default"
                       ? "adapter_managed"
                       : "shared_workspace",
               strategyType:
@@ -682,8 +682,8 @@ export async function provisionIssueExecutionWorkspace(
     const nextIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode);
     const shouldSwitchIssueToExistingWorkspace =
       issueRef?.executionWorkspacePreference === "reuse_existing" ||
-      input.requestedExecutionWorkspaceMode === "isolated_workspace" ||
-      input.requestedExecutionWorkspaceMode === "operator_branch";
+      input.effectiveExecutionWorkspaceMode === "isolated_workspace" ||
+      input.effectiveExecutionWorkspaceMode === "operator_branch";
     const nextIssuePatch: Record<string, unknown> = {};
     if (issueRef?.executionWorkspaceId !== persistedExecutionWorkspace.id) {
       nextIssuePatch.executionWorkspaceId = persistedExecutionWorkspace.id;

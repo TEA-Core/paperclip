@@ -27,6 +27,55 @@ import type {
   ExecutionWorkspaceProvisioningIssueRef,
   ResolvedWorkspaceForRun,
 } from "./execution-workspace-provisioning.js";
+import {
+  EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION,
+  EFFECTIVE_RUN_CONFIG_FINGERPRINT_ALGORITHM,
+  EFFECTIVE_RUN_CONFIG_FINGERPRINT_CATEGORIES,
+} from "./effective-run-config-fingerprints.js";
+import type { EffectiveRunConfigFingerprint } from "./effective-run-config-fingerprints.js";
+import type { buildEffectiveRunSessionConfigMetadata } from "./heartbeat.js";
+
+type SessionConfigMetadata = Awaited<ReturnType<typeof buildEffectiveRunSessionConfigMetadata>>;
+
+function buildTestSessionConfigMetadata(): SessionConfigMetadata {
+  const dummyFingerprint = `v${EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION}:${EFFECTIVE_RUN_CONFIG_FINGERPRINT_ALGORITHM}:0000000000000000000000000000000000000000000000000000000000000000`;
+  const sessionCategories = [
+    "adapter",
+    "adapterConfig",
+    "agentRuntimeConfig",
+    "modelProfile",
+    "instructions",
+    "issueOverrides",
+    "workspaceConfig",
+    "environment",
+    "envBindings",
+    "secrets",
+    "runtimeSkills",
+  ] as const;
+  const categoryFingerprints = Object.fromEntries(
+    sessionCategories.map((cat) => [cat, dummyFingerprint]),
+  ) as Record<typeof sessionCategories[number], string>;
+  const makeFingerprint = (category: "session" | "workspace" | "lease"): EffectiveRunConfigFingerprint => ({
+    version: EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION,
+    category,
+    algorithm: EFFECTIVE_RUN_CONFIG_FINGERPRINT_ALGORITHM,
+    fingerprint: dummyFingerprint,
+    canonicalJson: "{}",
+  });
+  return {
+    version: EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION,
+    fingerprint: dummyFingerprint,
+    categories: [...sessionCategories],
+    categoryFingerprints,
+    fingerprints: {
+      version: EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION,
+      categories: [...EFFECTIVE_RUN_CONFIG_FINGERPRINT_CATEGORIES],
+      sessionFingerprint: makeFingerprint("session"),
+      workspaceFingerprint: makeFingerprint("workspace"),
+      leaseFingerprint: makeFingerprint("lease"),
+    },
+  };
+}
 
 const embeddedPostgresSupport = getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -235,17 +284,10 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       projectId,
       projectWorkspaceId,
       executionWorkspaceId: null,
-      executionWorkspacePreference: null,
-    };
+       executionWorkspacePreference: null,
+     };
 
-    const workspaceReuseRequest = {
-      requestedExecutionWorkspaceId: null,
-      requestedShouldReuseExisting: false,
-      existingExecutionWorkspaceAvailable: false,
-      bindingUnrestorable: false,
-    };
-
-    const run = await db.query.heartbeatRuns.findFirst({
+     const run = await db.query.heartbeatRuns.findFirst({
       where: eq(heartbeatRuns.id, runId),
     });
     expect(run).toBeDefined();
@@ -264,15 +306,11 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       runId,
       effectiveExecutionWorkspaceMode: "isolated_workspace",
       trustPreset: standardTrustResolution(),
-      isolatedWorkspacesEnabled: true,
-      workspaceReuseRequest,
-      requestedShouldReuseExisting: false,
-      reusableExistingExecutionWorkspace: null,
-      requestedReusableExecutionWorkspaceConfig: null,
-      selectedEnvironmentId: null,
+       isolatedWorkspacesEnabled: true,
+       selectedEnvironmentId: null,
       selectedEnvironmentForConfig: null,
       localEnvironment,
-      environmentResolutionSource: "local",
+       environmentSelectionSource: "local",
       configSnapshot: null,
       secretManifest: [],
       projectExecutionWorkspacePolicy: {
@@ -315,6 +353,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
           nextFingerprint: null,
           storedFingerprint: null,
         },
+        sessionConfigMetadata: buildTestSessionConfigMetadata(),
       }),
       runLifecycle: {
         onExecutionWorkspaceOccupied: async () => {
@@ -556,17 +595,10 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       projectId,
       projectWorkspaceId,
       executionWorkspaceId: executionWorkspaceId,
-      executionWorkspacePreference: "reuse_existing",
-    };
+       executionWorkspacePreference: "reuse_existing",
+     };
 
-    const workspaceReuseRequest = {
-      requestedExecutionWorkspaceId: executionWorkspaceId,
-      requestedShouldReuseExisting: true,
-      existingExecutionWorkspaceAvailable: true,
-      bindingUnrestorable: false,
-    };
-
-    const run = await db.query.heartbeatRuns.findFirst({
+     const run = await db.query.heartbeatRuns.findFirst({
       where: eq(heartbeatRuns.id, runId),
     });
     expect(run).toBeDefined();
@@ -586,15 +618,11 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       runId,
       effectiveExecutionWorkspaceMode: "isolated_workspace",
       trustPreset: standardTrustResolution(),
-      isolatedWorkspacesEnabled: true,
-      workspaceReuseRequest,
-      requestedShouldReuseExisting: true,
-      reusableExistingExecutionWorkspace: null,
-      requestedReusableExecutionWorkspaceConfig: null,
-      selectedEnvironmentId: null,
+       isolatedWorkspacesEnabled: true,
+       selectedEnvironmentId: null,
       selectedEnvironmentForConfig: null,
       localEnvironment,
-      environmentResolutionSource: "local",
+       environmentSelectionSource: "local",
       configSnapshot: null,
       secretManifest: [],
       projectExecutionWorkspacePolicy: {
@@ -637,6 +665,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
           nextFingerprint: null,
           storedFingerprint: null,
         },
+        sessionConfigMetadata: buildTestSessionConfigMetadata(),
       }),
       runLifecycle: {
         onExecutionWorkspaceOccupied: async () => {
