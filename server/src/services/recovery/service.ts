@@ -7,6 +7,7 @@ import {
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  INTENTIONALLY_OWNERLESS_LABEL,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
   type IssueRecoveryAction,
@@ -28,7 +29,9 @@ import {
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
+  issueLabels,
   issues,
+  labels,
   unWakeableArchives,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
@@ -3894,6 +3897,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
         const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
         if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
+          result.skipped += 1;
+          continue;
+        }
+        const exemptLabel = await db
+          .select({ id: labels.id })
+          .from(issueLabels)
+          .innerJoin(labels, eq(labels.id, issueLabels.labelId))
+          .where(
+            and(
+              eq(issueLabels.issueId, issue.id),
+              eq(labels.companyId, issue.companyId),
+              eq(labels.name, INTENTIONALLY_OWNERLESS_LABEL),
+            ),
+          )
+          .limit(1);
+        if (exemptLabel.length > 0) {
+          const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+          if (existingAction?.kind === "no_live_path_unowned") {
+            await recoveryActionsSvc.resolveActiveForIssue({
+              companyId: issue.companyId,
+              sourceIssueId: issue.id,
+              actionId: existingAction.id,
+              status: "resolved",
+              outcome: "false_positive",
+              resolutionNote:
+                "Issue is marked intentionally_ownerless; no_live_path_unowned action cleared as a deliberately ownerless standing tracking issue.",
+            });
+          }
           result.skipped += 1;
           continue;
         }

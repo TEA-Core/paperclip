@@ -10,10 +10,13 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueLabels,
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
+  labels,
 } from "@paperclipai/db";
+import { INTENTIONALLY_OWNERLESS_LABEL } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -51,6 +54,8 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     await db.delete(issueRecoveryActions);
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
+    await db.delete(issueLabels);
+    await db.delete(labels);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -277,6 +282,84 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     expect(action).toMatchObject({
       kind: "no_live_path_unowned",
       ownerType: "board",
+    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("unowned issue with intentionally_ownerless label is not escalated for no_live_path_unowned", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const labelId = randomUUID();
+    await db.insert(labels).values({
+      id: labelId,
+      companyId,
+      name: INTENTIONALLY_OWNERLESS_LABEL,
+      color: "#000000",
+    });
+    const issueId = await createIssue(companyId, prefix, "todo", null, {
+      updatedAt: pastGraceDate(),
+    });
+    await db.insert(issueLabels).values({
+      issueId,
+      labelId,
+      companyId,
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.noLivePathUnowned).toBe(0);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action).toBeUndefined();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("unowned issue with intentionally_ownerless label clears an existing active no_live_path_unowned action", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const labelId = randomUUID();
+    await db.insert(labels).values({
+      id: labelId,
+      companyId,
+      name: INTENTIONALLY_OWNERLESS_LABEL,
+      color: "#000000",
+    });
+    const issueId = await createIssue(companyId, prefix, "todo", null, {
+      updatedAt: pastGraceDate(),
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "no_live_path_unowned",
+      status: "active",
+      ownerType: "board",
+      cause: "no_live_path_unowned",
+      fingerprint: `no_live_path_unowned:${companyId}:${issueId}`,
+      evidence: { identifier: `${prefix}-1`, status: "todo", msSinceUpdate: 1000000 },
+      nextAction: "Assign an owner agent or record an intentional manual resolution.",
+      attemptCount: 1,
+    });
+    await db.insert(issueLabels).values({
+      issueId,
+      labelId,
+      companyId,
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.noLivePathUnowned).toBe(0);
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action).toMatchObject({
+      kind: "no_live_path_unowned",
+      status: "resolved",
+      outcome: "false_positive",
     });
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
