@@ -573,6 +573,11 @@ describe("issue validators", () => {
     });
   });
 
+  const unrecognizedKeysOf = (error: z.ZodError): string[] =>
+    error.issues.flatMap((issue) =>
+      issue.code === z.ZodIssueCode.unrecognized_keys ? issue.keys : [],
+    );
+
   it("rejects typo'd key at executionPolicy level (e.g. monitorr instead of monitor)", () => {
     const parsed = createIssueSchema.safeParse({
       title: "Silent monitor misspelling",
@@ -591,7 +596,7 @@ describe("issue validators", () => {
     });
 
     expect(parsed.success).toBe(false);
-    expect(parsed.error.issues.some((i) => i.keys?.includes("monitorr"))).toBe(true);
+    expect(parsed.success ? [] : unrecognizedKeysOf(parsed.error)).toContain("monitorr");
   });
 
   it("rejects typo'd key at execution policy stage level (e.g. typee instead of type)", () => {
@@ -609,7 +614,7 @@ describe("issue validators", () => {
     });
 
     expect(parsed.success).toBe(false);
-    expect(parsed.error.issues.some((i) => i.keys?.includes("typee"))).toBe(true);
+    expect(parsed.success ? [] : unrecognizedKeysOf(parsed.error)).toContain("typee");
   });
 
   it("rejects typo'd key at monitor level (e.g. nextCheckAtt instead of nextCheckAt)", () => {
@@ -630,7 +635,7 @@ describe("issue validators", () => {
     });
 
     expect(parsed.success).toBe(false);
-    expect(parsed.error.issues.some((i) => i.keys?.includes("nextCheckAtt"))).toBe(true);
+    expect(parsed.success ? [] : unrecognizedKeysOf(parsed.error)).toContain("nextCheckAtt");
   });
 
   it("rejects typo'd key at stage participant level (e.g. agentIdd instead of agentId)", () => {
@@ -648,7 +653,7 @@ describe("issue validators", () => {
     });
 
     expect(parsed.success).toBe(false);
-    expect(parsed.error.issues.some((i) => i.keys?.includes("agentIdd"))).toBe(true);
+    expect(parsed.success ? [] : unrecognizedKeysOf(parsed.error)).toContain("agentIdd");
   });
 
   it("accepts valid executionPolicy with monitor", () => {
