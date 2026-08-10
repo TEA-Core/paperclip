@@ -207,6 +207,7 @@ import {
   RECOVERY_ORIGIN_KINDS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
+  selectSuccessfulRunProgressSummary,
   RUN_LIVENESS_CONTINUATION_REASON,
   buildRunLivenessContinuationIdempotencyKey,
   buildFinishSuccessfulRunHandoffIdempotencyKey,
@@ -286,6 +287,7 @@ import {
   type HotRestartIntentRun,
   type HotRestartReportRun,
 } from "./hot-restart.js";
+import { dispatchQuiesce } from "./dispatch-quiesce.js";
 import {
   assertLowTrustRuntimeServicesAllowed,
   assertLowTrustWorkspaceIsolation,
@@ -5687,10 +5689,20 @@ function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
 }
 
+export type HeartbeatSchedulingSuppressionReason =
+  | "worktree_instance"
+  | "database_restore_in_progress"
+  | "dispatch_quiesced";
+
+export type HeartbeatSchedulingSuppression = {
+  suppressed: boolean;
+  reason: HeartbeatSchedulingSuppressionReason | null;
+};
+
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
-  overrides: { allowWorktreeRunExecution?: boolean } = {},
-): { suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | null } {
+  overrides: { allowWorktreeRunExecution?: boolean; dispatchQuiesced?: boolean } = {},
+): HeartbeatSchedulingSuppression {
   if (isTruthyRuntimeEnvValue(env.PAPERCLIP_IN_WORKTREE) && !overrides.allowWorktreeRunExecution) {
     return { suppressed: true, reason: "worktree_instance" };
   }
@@ -5699,6 +5711,12 @@ export function resolveHeartbeatSchedulingSuppression(
     isTruthyRuntimeEnvValue(env.PAPERCLIP_RESTORE_IN_PROGRESS)
   ) {
     return { suppressed: true, reason: "database_restore_in_progress" };
+  }
+  // SUP-9857. Runtime quiesce for deploys: gates new dispatch exactly the way
+  // the two env reasons above do, and like them never cancels anything that is
+  // already running.
+  if (overrides.dispatchQuiesced) {
+    return { suppressed: true, reason: "dispatch_quiesced" };
   }
   return { suppressed: false, reason: null };
 }
@@ -5770,6 +5788,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const override = await resolveWorktreeRunExecutionOverride();
     return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
+      // Module singleton, not closure state: `heartbeatService(db)` is
+      // constructed once per route module, so a per-instance flag would leave
+      // most dispatch paths unquiesced.
+      dispatchQuiesced: dispatchQuiesce.isQuiesced(),
     });
   };
   const getWorktreeExecutionCutoff = async () => {
@@ -8181,17 +8203,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function buildDetectedSuccessfulRunProgressSummary(run: typeof heartbeatRuns.$inferSelect) {
+  function readSuccessfulRunProgressInputs(run: typeof heartbeatRuns.$inferSelect) {
     const resultJson = parseObject(run.resultJson);
-    const candidates = [
-      hasUnmanagedBackgroundTaskEvidence(resultJson) ? UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON : null,
-      readNonEmptyString(run.nextAction) ? `Next action noted: ${readNonEmptyString(run.nextAction)}` : null,
-      readNonEmptyString(run.livenessReason),
-      readNonEmptyString(resultJson.summary),
-      readNonEmptyString(resultJson.result),
-      readNonEmptyString(resultJson.message),
-    ].filter((value): value is string => Boolean(value));
-    const summary = candidates[0];
+    return {
+      unmanagedBackgroundTask: hasUnmanagedBackgroundTaskEvidence(resultJson),
+      nextAction: run.nextAction ?? null,
+      resultJson,
+    };
+  }
+
+  /**
+   * Whether the run itself reported anything, ignoring Paperclip's own verdict
+   * on it. `livenessReason` is set for every classified run — including
+   * "Run succeeded without useful output or concrete action evidence" — so it
+   * is excluded here even though the board notice below still shows it.
+   */
+  function hasSuccessfulRunProgressEvidence(run: typeof heartbeatRuns.$inferSelect) {
+    return Boolean(selectSuccessfulRunProgressSummary(readSuccessfulRunProgressInputs(run)));
+  }
+
+  async function buildDetectedSuccessfulRunProgressSummary(run: typeof heartbeatRuns.$inferSelect) {
+    const summary = selectSuccessfulRunProgressSummary({
+      ...readSuccessfulRunProgressInputs(run),
+      classifierReason: run.livenessReason,
+    });
     if (!summary) return null;
     return redactDetectedSuccessfulRunProgressSummaryForBoard(
       summary,
@@ -10985,7 +11020,95 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
-  async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
+    /**
+     * SUP-9864. `enqueueWakeup` refuses to create a second run while one is
+     * already live on the issue, but that is a wake-time check, and queued
+     * runs reach this point from paths that never went through it — bounded
+     * retries, process-loss retries, recovery actions, deferred-wake
+     * promotion. Nothing downstream re-checks: the only per-agent limit is
+     * `maxConcurrentRuns`, which defaults to 20, so the slot cap does not
+     * serialize anything, and this is the single choke point every queued run
+     * must pass to become `running`.
+     *
+     * The cost of admitting the duplicate is not a wasted run. The newcomer
+     * takes the execution lock; the older run keeps its comment and push
+     * authority but loses every status transition to a 409, so it cannot
+     * record a disposition — not even `blocked` — and is re-woken forever.
+     *
+     * claims sequentially under `withAgentStartLock`, so the first of a pair is
+     * already `running` in the database by the time the second is evaluated here.
+     */
+    async function findRunningIssueRunForAgent(
+      run: typeof heartbeatRuns.$inferSelect,
+      issueId: string,
+    ) {
+      return db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          startedAt: heartbeatRuns.startedAt,
+        })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.agentId, run.agentId),
+          eq(heartbeatRuns.status, "running"),
+          sql`${heartbeatRuns.id} <> ${run.id}`,
+          sql`(
+            ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}
+            or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issueId}
+          )`,
+        ))
+        .orderBy(asc(heartbeatRuns.startedAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+    }
+
+    /**
+     * Leaves one board-visible record per (deferred run, holder) pair. The
+     * dispatcher re-evaluates a held run on every sweep, so the existence check
+     * is what keeps a long-running holder from writing a fresh row each time.
+     */
+    async function recordConcurrentRunDeferral(
+      run: typeof heartbeatRuns.$inferSelect,
+      issueId: string,
+      holder: { id: string; status: string; startedAt: Date | null },
+    ) {
+      const alreadyRecorded = await db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, run.companyId),
+          eq(activityLog.action, "issue.concurrent_run_deferred"),
+          eq(activityLog.entityType, "heartbeat_run"),
+          eq(activityLog.entityId, run.id),
+          sql`${activityLog.details} ->> 'holderRunId' = ${holder.id}`,
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (alreadyRecorded) return;
+
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: run.agentId,
+        runId: run.id,
+        action: "issue.concurrent_run_deferred",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        issueId,
+        details: {
+          issueId,
+          deferredRunId: run.id,
+          holderRunId: holder.id,
+          holderStatus: holder.status,
+          holderStartedAt: holder.startedAt ? new Date(holder.startedAt).toISOString() : null,
+        },
+      });
+    }
+
+    async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -11080,6 +11203,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             staleness,
           });
         }
+        return null;
+      }
+
+      // SUP-9864. `enqueueWakeup` refuses to create a second run while one is
+      // already live on the issue, but that is a wake-time check, and queued
+      // runs reach this point from paths that never went through it — bounded
+      // retries, process-loss retries, recovery actions, deferred-wake
+      // promotion. Nothing downstream re-checks: the only per-agent limit is
+      // `maxConcurrentRuns`, which defaults to 20, so the slot cap does not
+      // serialize anything, and this is the single choke point every queued run
+      // must pass to become `running`.
+      //
+      // The cost of admitting the duplicate is not a wasted run. The newcomer
+      // takes the execution lock; the older run keeps its comment and push
+      // authority but loses every status transition to a 409, so it cannot
+      // record a disposition — not even `blocked` — and is re-woken forever.
+      const concurrentHolder = await findRunningIssueRunForAgent(run, issueId);
+      if (concurrentHolder) {
+        // Held, not cancelled: this wake is still wanted, just not now. The
+        // holder's own completion calls startNextQueuedRunForAgent, and
+        // resumeQueuedRuns sweeps every agent with a queued run, so nothing
+        // strands the run if that dispatch is missed.
+        await recordConcurrentRunDeferral(run, issueId, concurrentHolder);
+        logger.info(
+          { runId: run.id, issueId, holderRunId: concurrentHolder.id },
+          "claimQueuedRun: deferred queued run while another run of the same agent is executing the issue",
+        );
         return null;
       }
     }
