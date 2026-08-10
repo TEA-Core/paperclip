@@ -69,7 +69,8 @@ vi.mock("./models.js", () => ({
 }));
 
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { runningProcesses } from "@paperclipai/adapter-utils/server-utils";
+import { runningProcesses, sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
+import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
 
 import {
   buildOpenCodeRunArgs,
@@ -805,4 +806,53 @@ describe("execute — opencode database growth guard", () => {
 
     expect(result.errorCode).not.toBe("opencode_db_growth_limit");
   }, 20000);
+});
+
+describe("execute — sanitizeInheritedPaperclipEnv at spawn points", () => {
+  function makeCtx(): AdapterExecutionContext {
+    return {
+      runId: "run-sanitize",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Agent",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { model: "router/coder", cwd: process.cwd() },
+      context: {},
+      onLog: async () => {},
+    } as AdapterExecutionContext;
+  }
+
+  beforeEach(() => {
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+    }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("passes process.env through the shared sanitizer before spawning", async () => {
+    const spy = vi.spyOn(serverUtils, "sanitizeInheritedPaperclipEnv");
+    
+    process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    try {
+      await execute(makeCtx());
+    } finally {
+      delete process.env.DATABASE_URL;
+    }
+
+    const spawnCall = runAdapterExecutionTargetProcessMock.mock.calls.at(-1);
+    expect(spawnCall?.[4].env.DATABASE_URL).toBeUndefined();
+    expect(spy).toHaveBeenCalled();
+  });
 });

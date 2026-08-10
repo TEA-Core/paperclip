@@ -75,6 +75,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 });
 
 import { execute } from "./execute.js";
+import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
 
 describe("claude remote execution", () => {
   const cleanupDirs: string[] = [];
@@ -333,4 +334,80 @@ describe("claude remote execution", () => {
     expect(call?.[2]).toContain("12345678-1234-4abc-9def-123456789012");
   });
 
+})
+
+describe("claude remote execution — sanitizeInheritedPaperclipEnv at spawn points", () => {
+  const cleanupDirs: string[] = [];
+
+  afterEach(async () => {
+    vi.clearAllMocks();
+    while (cleanupDirs.length > 0) {
+      const dir = cleanupDirs.pop();
+      if (!dir) continue;
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it("passes process.env through the shared sanitizer before spawning", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-sanitize-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    const spy = vi.spyOn(serverUtils, "sanitizeInheritedPaperclipEnv");
+
+    process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    try {
+      await execute({
+        runId: "run-1",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: { command: "claude" },
+        context: {
+          paperclipWorkspace: {
+            cwd: workspaceDir,
+            source: "project_primary",
+            strategy: "git_worktree",
+            workspaceId: "workspace-1",
+            repoUrl: "https://github.com/paperclipai/paperclip.git",
+            repoRef: "main",
+            branchName: "feature/remote-claude",
+            worktreePath: workspaceDir,
+          },
+        },
+        executionTransport: {
+          remoteExecution: {
+            host: "127.0.0.1",
+            port: 2222,
+            username: "fixture",
+            remoteWorkspacePath: "/remote/workspace",
+            remoteCwd: "/remote/workspace",
+            privateKey: "PRIVATE KEY",
+            knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+            strictHostKeyChecking: true,
+          },
+        },
+        onLog: async () => {},
+      });
+    } finally {
+      delete process.env.DATABASE_URL;
+    }
+
+    const call = runChildProcess.mock.calls[0] as unknown as
+      [string, string, string[], { env: Record<string, string> }] | undefined;
+    expect(call?.[3].env.DATABASE_URL).toBeUndefined();
+    expect(spy).toHaveBeenCalled();
+  });
 });
+;

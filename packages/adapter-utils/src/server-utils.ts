@@ -2073,6 +2073,8 @@ export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
     if (key === "PAPERCLIP_LISTEN_PORT") continue;
     delete env[key];
   }
+  delete env.DATABASE_URL;
+  delete env.DATABASE_MIGRATION_URL;
   return env;
 }
 
