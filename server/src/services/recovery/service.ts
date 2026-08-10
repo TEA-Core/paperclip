@@ -927,7 +927,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { consecutive, latestFinishedAt };
   }
 
-  async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
+  function hasFutureMonitorCheck(monitorNextCheckAt: string | Date | null | undefined) {
+    if (!monitorNextCheckAt) return false;
+    return new Date(monitorNextCheckAt).getTime() > Date.now();
+  }
+
+  async function hasActiveExecutionPath(
+    companyId: string,
+    issueId: string,
+    agentId?: string | null,
+    monitorNextCheckAt?: string | Date | null,
+  ) {
+    if (hasFutureMonitorCheck(monitorNextCheckAt)) return true;
+
     const [run, deferredWake] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
@@ -1002,7 +1014,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function hasPersistedDurableWaitPath(issue: typeof issues.$inferSelect) {
-    if (issue.monitorNextCheckAt) return true;
+    if (hasFutureMonitorCheck(issue.monitorNextCheckAt)) return true;
 
     return db
       .select({ id: issueRelations.issueId })
@@ -6206,6 +6218,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         updatedAt: issues.updatedAt,
         executionWorkspaceId: issues.executionWorkspaceId,
         executionWorkspacePreference: issues.executionWorkspacePreference,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
         totalCount: sql<number>`count(*) over()::int`,
       })
       .from(issues)
@@ -6244,7 +6257,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (await hasActiveExecutionPath(companyId, candidate.id)) {
+        if (await hasActiveExecutionPath(companyId, candidate.id, null, candidate.monitorNextCheckAt)) {
           result.livePathSkipped++;
           continue;
         }

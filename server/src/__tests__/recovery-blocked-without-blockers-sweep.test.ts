@@ -522,6 +522,106 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(result.issueIds).toEqual([]);
   });
 
+  it("suppresses escalation for issues with a future monitorNextCheckAt (auto-heal ON)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    const futureMonitor = new Date(Date.now() + 86400000);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Monitor-armed blocked issue",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+      monitorNextCheckAt: futureMonitor,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.livePathSkipped).toBe(1);
+    expect(result.healed).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+  });
+
+  it("auto-heals a blocked issue with monitorNextCheckAt in the past (auto-heal ON)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    const pastMonitor = new Date(Date.now() - 86400000);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Past-monitor blocked issue",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+      monitorNextCheckAt: pastMonitor,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.healed).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("todo");
+
+    await drainAgentRuns(agentId);
+  });
+
+  it("auto-heals a blocked issue with monitorNextCheckAt null (auto-heal ON)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Null-monitor blocked issue",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+      monitorNextCheckAt: null,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.healed).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("todo");
+
+    await drainAgentRuns(agentId);
+  });
+
   it("suppresses escalation for issues with a pending wake interaction", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
