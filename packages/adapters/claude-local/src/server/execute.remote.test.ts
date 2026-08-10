@@ -410,4 +410,3 @@ describe("claude remote execution — sanitizeInheritedPaperclipEnv at spawn poi
     expect(spy).toHaveBeenCalled();
   });
 });
-;
