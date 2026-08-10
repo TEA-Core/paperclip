@@ -14,7 +14,24 @@ import {
   summarizeAcpxTurnUsage,
 } from "./execute.js";
 import { runChildProcess } from "../server-utils.js";
-import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
+
+const { sanitizeCalls, sanitizeResults } = vi.hoisted(() => ({
+  sanitizeCalls: [] as Array<NodeJS.ProcessEnv>,
+  sanitizeResults: [] as Array<Record<string, string>>,
+}));
+
+vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
+  return {
+    ...actual,
+    sanitizeInheritedPaperclipEnv: (env: NodeJS.ProcessEnv) => {
+      sanitizeCalls.push(env);
+      const result = actual.sanitizeInheritedPaperclipEnv(env);
+      sanitizeResults.push(result);
+      return result;
+    },
+  };
+});
 
 
 const tempRoots: string[] = [];
@@ -1679,17 +1696,21 @@ describe("summarizeAcpxTurnUsage no-report turns", () => {
 describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
   it("passes process.env through the shared sanitizer before spawning", async () => {
     process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    process.env.ZZZ_SENTINEL = "sentinel-value";
     try {
-      const { sessionInputs } = await runExecutor({
+      await runExecutor({
         agent: "custom",
         agentCommand: "node ./fake-acp.js",
       });
-
-      const env = (sessionInputs[0] as { sessionOptions?: { env?: Record<string, string> } })
-        ?.sessionOptions?.env;
-      expect(env?.DATABASE_URL).toBeUndefined();
     } finally {
       delete process.env.DATABASE_URL;
+      delete process.env.ZZZ_SENTINEL;
     }
+
+    expect(sanitizeCalls.length).toBeGreaterThan(0);
+    expect(sanitizeCalls.at(-1)).toBe(process.env);
+    const sanitizedEnv = sanitizeResults.at(-1);
+    expect(sanitizedEnv.DATABASE_URL).toBeUndefined();
+    expect(sanitizedEnv.ZZZ_SENTINEL).toBe("sentinel-value");
   });
 });
