@@ -1190,9 +1190,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     childProcesses.add(child);
     expect(child.pid).toBeTypeOf("number");
 
+    // The detached window is bounded relative to `Date.now()` (SUP-6706): a run whose pid is
+    // alive but whose in-memory handle is lost is held `running` for 10 minutes, then converges
+    // to process_lost. The fixture default pins `updatedAt` to a fixed 2026-03-19, which is
+    // outside that window on any day but the one it was written, so the run would be reaped for
+    // being old rather than kept for being alive. Anchor it to now to test the pid check.
     const { runId, wakeupRequestId } = await seedRunFixture({
       processPid: child.pid ?? null,
       includeIssue: false,
+      updatedAt: new Date(),
     });
     const heartbeat = heartbeatService(db);
 
@@ -6177,11 +6183,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("preserves a persisted issue monitor as the durable external-wait path", async () => {
+    // `hasFutureMonitorCheck` compares the scheduled check against `Date.now()`, so the monitor
+    // only owns the wait while it is still in the future. A fixed 2026-03-19 timestamp stopped
+    // being in the future the day after it was written, which turns the durable-wait path into a
+    // stranded-issue requeue. Schedule it relative to now instead.
+    const monitorNextCheckAt = new Date(Date.now() + 60 * 60 * 1000);
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "succeeded",
       livenessState: "advanced",
-      monitorNextCheckAt: new Date("2026-03-19T01:00:00.000Z"),
+      monitorNextCheckAt,
       resultJson: {
         summary: "Waiting for the deploy to settle; monitor is scheduled.",
         externalWait: { kind: "issue_monitor", durable: true },
@@ -6196,7 +6207,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
-    expect(issue?.monitorNextCheckAt?.toISOString()).toBe("2026-03-19T01:00:00.000Z");
+    expect(issue?.monitorNextCheckAt?.toISOString()).toBe(monitorNextCheckAt.toISOString());
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
