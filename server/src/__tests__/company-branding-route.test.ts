@@ -229,7 +229,9 @@ describe("PATCH /api/companies/:companyId/branding", () => {
       });
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toBe("Validation error");
+    // The error handler names unrecognized keys in `error` itself so a caller that misspells a
+    // field does not have to dig through `details` to find out which key was rejected.
+    expect(res.body.error).toBe("Unrecognized field(s): status");
     expect(mockCompanyService.update).not.toHaveBeenCalled();
   });
 });
@@ -326,7 +328,11 @@ describe("PATCH /api/companies/:companyId", () => {
       });
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toBe("Validation error");
+    // Every privileged field is named, which is what proves none of them slipped through.
+    expect(res.body.error).toBe(
+      "Unrecognized field(s): status, budgetMonthlyCents, spentMonthlyCents, " +
+        "requireBoardApprovalForNewAgents, feedbackDataSharingEnabled, issuePrefix",
+    );
     expect(mockCompanyService.update).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
