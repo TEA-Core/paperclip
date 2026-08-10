@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
@@ -14,6 +14,7 @@ import {
   summarizeAcpxTurnUsage,
 } from "./execute.js";
 import { runChildProcess } from "../server-utils.js";
+import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
 
 
 const tempRoots: string[] = [];
@@ -1672,5 +1673,23 @@ describe("summarizeAcpxTurnUsage no-report turns", () => {
     expect(summary.usageDetail).toBeNull();
     expect(summary.costUsd).toBeCloseTo(0.25);
     expect(summary.cumulativeCostUsd).toBeCloseTo(0.75);
+  });
+});
+
+describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
+  it("passes process.env through the shared sanitizer before spawning", async () => {
+    process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    try {
+      const { sessionInputs } = await runExecutor({
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+      });
+
+      const env = (sessionInputs[0] as { sessionOptions?: { env?: Record<string, string> } })
+        ?.sessionOptions?.env;
+      expect(env?.DATABASE_URL).toBeUndefined();
+    } finally {
+      delete process.env.DATABASE_URL;
+    }
   });
 });

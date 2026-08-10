@@ -2278,3 +2278,40 @@ describe("appendWithByteCap", () => {
     expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(7);
   });
 });
+
+
+describe('sanitizeInheritedPaperclipEnv', () => {
+  it('strips unknown PAPERCLIP_* env vars while preserving allowed runtime keys', () => {
+    const sanitized = sanitizeInheritedPaperclipEnv({
+      PATH: '/usr/bin',
+      PAPERCLIP_API_URL: 'http://runtime:3100',
+      PAPERCLIP_API_KEY: 'secret',
+      PAPERCLIP_RUNTIME_API_URL: 'http://runtime.local:3000',
+      PAPERCLIP_LISTEN_HOST: '127.0.0.1',
+      PAPERCLIP_LISTEN_PORT: '3000',
+      PAPERCLIP_CUSTOM_VAR: 'should-be-removed',
+      HOME: '/home/test',
+    });
+
+    expect(sanitized.PATH).toBe('/usr/bin');
+    expect(sanitized.PAPERCLIP_API_URL).toBeUndefined();
+    expect(sanitized.PAPERCLIP_API_KEY).toBeUndefined();
+    expect(sanitized.PAPERCLIP_CUSTOM_VAR).toBeUndefined();
+    expect(sanitized.PAPERCLIP_RUNTIME_API_URL).toBe('http://runtime.local:3000');
+    expect(sanitized.PAPERCLIP_LISTEN_HOST).toBe('127.0.0.1');
+    expect(sanitized.PAPERCLIP_LISTEN_PORT).toBe('3000');
+    expect(sanitized.HOME).toBe('/home/test');
+  });
+
+  it('removes DATABASE_URL and DATABASE_MIGRATION_URL', () => {
+    const sanitized = sanitizeInheritedPaperclipEnv({
+      PATH: '/usr/bin',
+      DATABASE_URL: 'postgres://user:pass@db/paperclip',
+      DATABASE_MIGRATION_URL: 'postgres://user:pass@db/paperclip_migrations',
+    });
+
+    expect(sanitized.DATABASE_URL).toBeUndefined();
+    expect(sanitized.DATABASE_MIGRATION_URL).toBeUndefined();
+    expect(sanitized.PATH).toBe('/usr/bin');
+  });
+});
