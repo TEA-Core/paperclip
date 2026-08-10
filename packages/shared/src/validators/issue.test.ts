@@ -572,4 +572,110 @@ describe("issue validators", () => {
       }
     });
   });
+
+  const unrecognizedKeysOf = (error: z.ZodError): string[] =>
+    error.issues.flatMap((issue) =>
+      issue.code === z.ZodIssueCode.unrecognized_keys ? issue.keys : [],
+    );
+
+  it("rejects typo'd key at executionPolicy level (e.g. monitorr instead of monitor)", () => {
+    const parsed = createIssueSchema.safeParse({
+      title: "Silent monitor misspelling",
+      executionPolicy: {
+        mode: "normal",
+        monitorr: {
+          nextCheckAt: "2025-01-01T00:00:00Z",
+        },
+        stages: [
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e" }],
+          },
+        ],
+      },
+    });
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.success ? [] : unrecognizedKeysOf(parsed.error)).toContain("monitorr");
+  });
+
+  it("rejects typo'd key at execution policy stage level (e.g. typee instead of type)", () => {
+    const parsed = createIssueSchema.safeParse({
+      title: "Silent stage misspelling",
+      executionPolicy: {
+        mode: "normal",
+        stages: [
+          {
+            typee: "review",
+            participants: [{ type: "agent", agentId: "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e" }],
+          },
+        ],
+      },
+    });
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.success ? [] : unrecognizedKeysOf(parsed.error)).toContain("typee");
+  });
+
+  it("rejects typo'd key at monitor level (e.g. nextCheckAtt instead of nextCheckAt)", () => {
+    const parsed = createIssueSchema.safeParse({
+      title: "Silent monitor key misspelling",
+      executionPolicy: {
+        mode: "normal",
+        monitor: {
+          nextCheckAtt: "2025-01-01T00:00:00Z",
+        },
+        stages: [
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e" }],
+          },
+        ],
+      },
+    });
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.success ? [] : unrecognizedKeysOf(parsed.error)).toContain("nextCheckAtt");
+  });
+
+  it("rejects typo'd key at stage participant level (e.g. agentIdd instead of agentId)", () => {
+    const parsed = createIssueSchema.safeParse({
+      title: "Silent participant misspelling",
+      executionPolicy: {
+        mode: "normal",
+        stages: [
+          {
+            type: "review",
+            participants: [{ type: "agent", agentIdd: "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e" }],
+          },
+        ],
+      },
+    });
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.success ? [] : unrecognizedKeysOf(parsed.error)).toContain("agentIdd");
+  });
+
+  it("accepts valid executionPolicy with monitor", () => {
+    const parsed = createIssueSchema.parse({
+      title: "Valid monitor policy",
+      executionPolicy: {
+        mode: "normal",
+        monitor: {
+          nextCheckAt: "2025-01-01T00:00:00Z",
+        },
+        stages: [
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e" }],
+          },
+        ],
+      },
+    });
+
+    expect(parsed.executionPolicy?.monitor?.nextCheckAt).toBe("2025-01-01T00:00:00Z");
+    expect(parsed.executionPolicy?.monitor?.scheduledBy).toBe("assignee");
+    expect(parsed.executionPolicy?.stages).toHaveLength(1);
+    expect(parsed.executionPolicy?.stages[0].type).toBe("review");
+  });
 });

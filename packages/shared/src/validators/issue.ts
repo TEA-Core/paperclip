@@ -140,6 +140,7 @@ const issueExecutionStagePrincipalBaseSchema = z.object({
 });
 
 export const issueExecutionStagePrincipalSchema = issueExecutionStagePrincipalBaseSchema
+  .strict()
   .superRefine((value, ctx) => {
     if (value.type === "agent") {
       if (!value.agentId) {
@@ -160,30 +161,31 @@ export const issueExecutionStagePrincipalSchema = issueExecutionStagePrincipalBa
 
 export const issueExecutionStageParticipantSchema = issueExecutionStagePrincipalBaseSchema.extend({
   id: z.string().uuid().optional(),
-}).superRefine((value, ctx) => {
-  if (value.type === "agent") {
-    if (!value.agentId) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Agent participants require agentId", path: ["agentId"] });
+}).strict()
+  .superRefine((value, ctx) => {
+    if (value.type === "agent") {
+      if (!value.agentId) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Agent participants require agentId", path: ["agentId"] });
+      }
+      if (value.userId) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Agent participants cannot set userId", path: ["userId"] });
+      }
+      return;
     }
-    if (value.userId) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Agent participants cannot set userId", path: ["userId"] });
+    if (!value.userId) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "User participants require userId", path: ["userId"] });
     }
-    return;
-  }
-  if (!value.userId) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "User participants require userId", path: ["userId"] });
-  }
-  if (value.agentId) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "User participants cannot set agentId", path: ["agentId"] });
-  }
-});
+    if (value.agentId) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "User participants cannot set agentId", path: ["agentId"] });
+    }
+  });
 
 export const issueExecutionStageSchema = z.object({
   id: z.string().uuid().optional(),
   type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
   approvalsNeeded: z.literal(1).optional().default(1),
   participants: z.array(issueExecutionStageParticipantSchema).default([]),
-});
+}).strict();
 
 export const issueExecutionMonitorPolicySchema = z.object({
   nextCheckAt: z.string().datetime(),
