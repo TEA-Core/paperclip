@@ -4,6 +4,10 @@ on:
   pull_request:
     branches:
       - main
+      # TEA-Core fork: the deployed line is a fold branch, not `main`, so without
+      # this every PR merged here reached production having run only the AI
+      # reviewers. That is how the branch spent two days unable to compile.
+      - 'fold/**'
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}
