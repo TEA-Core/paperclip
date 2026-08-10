@@ -1296,6 +1296,13 @@
       "when": 1785930044829,
       "tag": "0186_un_wakeable_archives",
       "breakpoints": true
+    },
+    {
+      "idx": 187,
+      "version": "7",
+      "when": 1785930045829,
+      "tag": "0187_least_privilege_serving_role",
+      "breakpoints": true
     }
   ]
 }
