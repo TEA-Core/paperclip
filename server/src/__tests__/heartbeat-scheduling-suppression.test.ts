@@ -82,6 +82,38 @@ describe("heartbeat scheduling suppression", () => {
     });
   });
 
+  it("reports the worktree reason when a worktree instance overlaps a quiesce", () => {
+    expect(
+      resolveHeartbeatSchedulingSuppression(
+        { PAPERCLIP_IN_WORKTREE: "true" },
+        { dispatchQuiesced: true },
+      ),
+    ).toEqual({
+      suppressed: true,
+      reason: "worktree_instance",
+    });
+  });
+
+  // A released quiesce must not linger as suppression: the deploy drain relies
+  // on dispatch resuming once the controller is released or its TTL expires.
+  it("leaves scheduling unsuppressed once the quiesce is released", () => {
+    expect(
+      resolveHeartbeatSchedulingSuppression({}, { dispatchQuiesced: false }),
+    ).toEqual({
+      suppressed: false,
+      reason: null,
+    });
+  });
+
+  it("honours the legacy restore env alias", () => {
+    expect(resolveHeartbeatSchedulingSuppression({
+      PAPERCLIP_RESTORE_IN_PROGRESS: "yes",
+    })).toEqual({
+      suppressed: true,
+      reason: "database_restore_in_progress",
+    });
+  });
+
   it("maps unsuccessful heartbeat outcomes to terminal skill test run outcomes", () => {
     expect(resolveSkillTestRunCompletionForHeartbeatOutcome("succeeded", null)).toBeNull();
     expect(resolveSkillTestRunCompletionForHeartbeatOutcome("cancelled", null)).toEqual({
