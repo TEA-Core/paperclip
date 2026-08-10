@@ -195,7 +195,7 @@ export const issueExecutionMonitorPolicySchema = z.object({
   timeoutAt: z.string().datetime().optional().nullable().default(null),
   maxAttempts: z.number().int().positive().max(100).optional().nullable().default(null),
   recoveryPolicy: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES).optional().nullable().default(null),
-});
+}).strict();
 
 export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
@@ -205,7 +205,7 @@ export const issueExecutionPolicySchema = z.object({
   monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
-});
+}).strict();
 
 export const issueExecutionMonitorStateSchema = z.object({
   status: z.enum(ISSUE_EXECUTION_MONITOR_STATE_STATUSES),

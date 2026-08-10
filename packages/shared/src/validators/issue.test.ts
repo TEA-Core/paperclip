@@ -5,6 +5,8 @@ import {
   addIssueCommentSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
+  issueExecutionMonitorPolicySchema,
+  issueExecutionPolicySchema,
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,
@@ -481,5 +483,93 @@ describe("issue validators", () => {
     });
 
     expect(parsed.executionPolicy?.returnAssigneeAgentId).toBe(agentId);
+  });
+
+  describe("issueExecutionPolicySchema strictness", () => {
+    it("rejects an unrecognized key in executionPolicy with the offending key named", () => {
+      const result = createIssueSchema.safeParse({
+        title: "Strictness test",
+        executionPolicy: {
+          stages: [],
+          monitorPolicy: { nextCheckAt: "2026-08-15T00:00:00.000Z" },
+        },
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.some((i) =>
+          i.message.includes("monitorPolicy") || i.path?.includes("monitorPolicy"),
+        )).toBe(true);
+      }
+    });
+
+    it("rejects an unrecognized key in executionPolicy update path", () => {
+      const result = updateIssueSchema.safeParse({
+        executionPolicy: {
+          monitorPolicy: { nextCheckAt: "2026-08-15T00:00:00.000Z" },
+        },
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.some((i) =>
+          i.message.includes("monitorPolicy") || i.path?.includes("monitorPolicy"),
+        )).toBe(true);
+      }
+    });
+
+    it("accepts a well-formed executionPolicy.monitor", () => {
+      const result = createIssueSchema.safeParse({
+        title: "Happy path",
+        executionPolicy: {
+          stages: [],
+          monitor: {
+            nextCheckAt: "2026-08-15T00:00:00.000Z",
+            maxAttempts: 3,
+            notes: "Check something",
+          },
+        },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.executionPolicy?.monitor).toBeTruthy();
+        expect(result.data.executionPolicy?.monitor?.nextCheckAt).toBe("2026-08-15T00:00:00.000Z");
+      }
+    });
+
+    it("accepts a well-formed executionPolicy.monitor via update path", () => {
+      const result = updateIssueSchema.safeParse({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-15T00:00:00.000Z",
+          },
+        },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.executionPolicy?.monitor?.nextCheckAt).toBe("2026-08-15T00:00:00.000Z");
+      }
+    });
+  });
+
+  describe("issueExecutionMonitorPolicySchema strictness", () => {
+    it("rejects an unrecognized key in monitor policy with the offending key named", () => {
+      const result = issueExecutionMonitorPolicySchema.safeParse({
+        nextCheckAt: "2026-08-15T00:00:00.000Z",
+        misspelledKey: "should reject",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("accepts a well-formed monitor policy", () => {
+      const result = issueExecutionMonitorPolicySchema.safeParse({
+        nextCheckAt: "2026-08-15T00:00:00.000Z",
+        maxAttempts: 3,
+        notes: "Test monitor",
+        scheduledBy: "assignee",
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.nextCheckAt).toBe("2026-08-15T00:00:00.000Z");
+      }
+    });
   });
 });
