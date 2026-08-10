@@ -2064,22 +2064,28 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
-const PAPERCLIP_SECRET_ENV_KEYS = new Set([
+// Control-plane secrets that must never reach a spawned agent process. Checked
+// ahead of the `PAPERCLIP_` prefix guard below so that unprefixed keys are
+// covered too: `BETTER_AUTH_SECRET` forges authenticated sessions and
+// `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` forges signed tool actions, which
+// bypasses the approval gate.
+const SECRET_ENV_KEYS = new Set([
+  "BETTER_AUTH_SECRET",
   "PAPERCLIP_SECRETS_MASTER_KEY",
   "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+  "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
 ]);
 
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   for (const key of Object.keys(env)) {
-    if (!key.startsWith("PAPERCLIP_")) continue;
     // Secret keys are always stripped, even if the allowlist below were to
-    // change in the future. These carry the control-plane secrets master key
-    // (raw or via file path) and must never reach a spawned agent process.
-    if (PAPERCLIP_SECRET_ENV_KEYS.has(key)) {
+    // change in the future, and regardless of prefix.
+    if (SECRET_ENV_KEYS.has(key)) {
       delete env[key];
       continue;
     }
+    if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
     if (key === "PAPERCLIP_LISTEN_HOST") continue;
     if (key === "PAPERCLIP_LISTEN_PORT") continue;

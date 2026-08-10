@@ -2314,4 +2314,21 @@ describe('sanitizeInheritedPaperclipEnv', () => {
     expect(sanitized.DATABASE_MIGRATION_URL).toBeUndefined();
     expect(sanitized.PATH).toBe('/usr/bin');
   });
+
+  it('removes BETTER_AUTH_SECRET and PAPERCLIP_TOOL_ACTION_SIGNING_SECRET', () => {
+    const sanitized = sanitizeInheritedPaperclipEnv({
+      PATH: '/usr/bin',
+      SUP_12122_SENTINEL: 'must-survive',
+      BETTER_AUTH_SECRET: 'placeholder-auth',
+      PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: 'placeholder-signing',
+      PAPERCLIP_RUNTIME_API_URL: 'http://runtime.local:3000',
+    });
+
+    // Sentinel proves we are asserting against a populated sanitizer result and
+    // not an unrelated/empty object, where toBeUndefined() would pass for free.
+    expect(sanitized.SUP_12122_SENTINEL).toBe('must-survive');
+    expect(sanitized.BETTER_AUTH_SECRET).toBeUndefined();
+    expect(sanitized.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
+    expect(sanitized.PAPERCLIP_RUNTIME_API_URL).toBe('http://runtime.local:3000');
+  });
 });
