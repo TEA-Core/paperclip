@@ -2269,6 +2269,65 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
   });
 });
 
+describe("sanitizeInheritedPaperclipEnv", () => {
+  it("strips PAPERCLIP-prefixed vars except runtime allowlist", () => {
+    const env = sanitizeInheritedPaperclipEnv({
+      HOME: "/home/user",
+      PATH: "/usr/bin",
+      PAPERCLIP_API_KEY: "secret-key",
+      PAPERCLIP_DATABASE_URL: "postgres://...",
+      PAPERCLIP_STATSD_HOST: "localhost",
+      PAPERCLIP_RUNTIME_API_URL: "http://runtime",
+      PAPERCLIP_LISTEN_HOST: "0.0.0.0",
+      PAPERCLIP_LISTEN_PORT: "3100",
+      DATABASE_URL: "postgres://old",
+    });
+
+    expect(env.HOME).toBe("/home/user");
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.PAPERCLIP_API_KEY).toBeUndefined();
+    expect(env.PAPERCLIP_DATABASE_URL).toBeUndefined();
+    expect(env.PAPERCLIP_STATSD_HOST).toBeUndefined();
+    expect(env.PAPERCLIP_RUNTIME_API_URL).toBe("http://runtime");
+    expect(env.PAPERCLIP_LISTEN_HOST).toBe("0.0.0.0");
+    expect(env.PAPERCLIP_LISTEN_PORT).toBe("3100");
+    expect(env.DATABASE_URL).toBe("postgres://old");
+  });
+
+  it("no raw process.env in adapter spawn env builders", async () => {
+    const adapterFiles = [
+      path.resolve(import.meta.dirname, "../../../adapters/codex-local/src/server/execute.ts"),
+      path.resolve(import.meta.dirname, "../../../adapters/cursor-local/src/server/execute.ts"),
+      path.resolve(import.meta.dirname, "../../../adapters/pi-local/src/server/execute.ts"),
+      path.resolve(import.meta.dirname, "../execution-target.ts"),
+      path.resolve(import.meta.dirname, "../local-process-sandbox.ts"),
+    ];
+
+    for (const file of adapterFiles) {
+      const source = await fs.readFile(file, "utf8");
+      const lines = source.split("\n");
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const lineNo = i + 1;
+
+        if (!line.includes("process.env")) continue;
+        if (line.includes("sanitizeInheritedPaperclipEnv")) continue;
+
+        const isSpawnEnv =
+          /[{,]\s*\.\.\.process\.env/.test(line) ||
+          /\benv:\s*process\.env\b/.test(line);
+
+        if (isSpawnEnv) {
+          throw new Error(
+            `${path.basename(file)}:${lineNo} — raw process.env in spawn env without sanitizeInheritedPaperclipEnv:\n  ${line.trim()}`,
+          );
+        }
+      }
+    }
+  });
+});
+
 describe("appendWithByteCap", () => {
   it("keeps valid UTF-8 when trimming through multibyte text", () => {
     const output = appendWithByteCap("prefix ", "hello — world", 7);

@@ -3,6 +3,7 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { sanitizeInheritedPaperclipEnv } from "./server-utils.js";
 
 export type LocalProcessSandboxAccess = "ro" | "rw";
 export type LocalProcessNetworkScope = "deny" | "allowlist";
@@ -240,7 +241,7 @@ const server = net.createServer((client) => {
   upstream.on("error", close);
 });
 server.listen(${SANDBOX_PROXY_PORT}, "127.0.0.1", () => {
-  const child = spawn(executable, args, { stdio: "inherit", env: process.env });
+  const child = spawn(executable, args, { stdio: "inherit", env: sanitizeInheritedPaperclipEnv(process.env) });
   const forward = (signal) => { if (!child.killed) child.kill(signal); };
   process.on("SIGTERM", () => forward("SIGTERM"));
   process.on("SIGINT", () => forward("SIGINT"));

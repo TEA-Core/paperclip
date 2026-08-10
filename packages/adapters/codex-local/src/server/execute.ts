@@ -39,6 +39,7 @@ import {
   renderPaperclipWakePrompt,
   isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
+  sanitizeInheritedPaperclipEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -569,7 +570,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // readiness through the same `evaluateCodexCredentialReadiness` predicate, so
   // they cannot drift.
   const credentialReadiness = await evaluateCodexCredentialReadiness({
-    env: process.env,
+    env: sanitizeInheritedPaperclipEnv(process.env),
     companyId: agent.companyId,
     configuredCodexHome,
     configuredApiKey: configuredOpenAiApiKey,
@@ -821,7 +822,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
     const effectiveEnv = Object.fromEntries(
-      Object.entries({ ...process.env, ...env }).filter(
+      Object.entries({ ...sanitizeInheritedPaperclipEnv(process.env), ...env }).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
