@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const {
   runChildProcess,
+  runAdapterExecutionTargetProcess,
   ensureCommandResolvable,
   resolveCommandForLogs,
   prepareWorkspaceForSshExecution,
@@ -21,6 +22,15 @@ const {
       JSON.stringify({ type: "assistant", session_id: "claude-session-1", message: { content: [{ type: "text", text: "hello" }] } }),
       JSON.stringify({ type: "result", session_id: "claude-session-1", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }),
     ].join("\n"),
+    stderr: "",
+    pid: 123,
+    startedAt: new Date().toISOString(),
+  })),
+  runAdapterExecutionTargetProcess: vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "",
     stderr: "",
     pid: 123,
     startedAt: new Date().toISOString(),
@@ -71,6 +81,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   return {
     ...actual,
     startAdapterExecutionTargetPaperclipBridge,
+    runAdapterExecutionTargetProcess,
   };
 });
 
@@ -407,6 +418,7 @@ describe("claude remote execution — sanitizeInheritedPaperclipEnv at spawn poi
     }
 
     expect(spy).toHaveBeenCalledWith(process.env);
+
     const sanitizedEnv = spy.mock.results.at(-1)?.value as Record<string, string> | undefined;
     expect(sanitizedEnv).toBeDefined();
     expect(sanitizedEnv?.DATABASE_URL).toBeUndefined();
