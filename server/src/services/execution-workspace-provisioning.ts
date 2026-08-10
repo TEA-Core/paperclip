@@ -377,7 +377,10 @@ export async function provisionIssueExecutionWorkspace(
     });
 
   const hostExecutionWorkspaceConfig = stripHostWorkspaceProvisionForLowTrustSandbox({
-    config: input.mergedConfig,
+    config: {
+      workspaceStrategy: input.projectExecutionWorkspacePolicy?.workspaceStrategy,
+      ...input.mergedConfig,
+    },
     trustPreset: input.trustPreset,
     selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
   });

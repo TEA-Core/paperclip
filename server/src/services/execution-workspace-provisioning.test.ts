@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { execSync } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -153,6 +154,9 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
 
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-provisioning-test-"));
     tempRoots.push(tempRoot);
+    execSync("git init", { cwd: tempRoot, stdio: "pipe" });
+    execSync("git commit --allow-empty -m init", { cwd: tempRoot, stdio: "pipe" });
+
 
     await instanceSettingsService(db).updateExperimental({
       enableIsolatedWorkspaces: true,
@@ -416,6 +420,9 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
 
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-provisioning-deferred-"));
     tempRoots.push(tempRoot);
+    execSync("git init", { cwd: tempRoot, stdio: "pipe" });
+    execSync("git commit --allow-empty -m init", { cwd: tempRoot, stdio: "pipe" });
+
 
     await instanceSettingsService(db).updateExperimental({
       enableIsolatedWorkspaces: true,
@@ -486,15 +493,15 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       companyId,
       projectId,
       projectWorkspaceId,
-      sourceIssueId: otherIssueId,
+      sourceIssueId: null as never,
       mode: "isolated_workspace",
       strategyType: "git_worktree",
-      name: otherIssueIdentifier,
+      name: "master",
       status: "active",
       cwd: tempRoot,
       repoUrl: null,
       baseRef: "HEAD",
-      branchName: otherIssueIdentifier,
+      branchName: "master",
       providerType: "git_worktree",
       providerRef: tempRoot,
       lastUsedAt: now,
@@ -518,6 +525,23 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       responsibleUserId: "responsible-user",
       createdAt: now,
       updatedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: {
+        issueId: otherIssueId,
+        taskId: otherIssueId,
+        wakeReason: "issue_assigned",
+      },
+      responsibleUserId: "responsible-user",
+      createdAt: new Date(now.getTime() - 1000),
+      updatedAt: new Date(now.getTime() - 1000),
     });
 
     await db.insert(issues).values([
