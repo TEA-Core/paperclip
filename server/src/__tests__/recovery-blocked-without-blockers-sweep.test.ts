@@ -553,6 +553,69 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(result.issueIds).toEqual([]);
   });
 
+  // SUP-12010: a board ask has no blocker UUID to point at, so "waiting on the
+  // board" and "stranded" are byte-identical in the issue row — the pending
+  // interaction is the only field that separates them. These pin the exclusion
+  // in the regime that matters: the auto-heal setting ON. Without them the
+  // guard is only covered on the report-only (setting OFF) path, and a
+  // refactor could reorder it below the heal branch with the suite still green.
+  for (const { kind, continuationPolicy } of [
+    { kind: "request_confirmation" as const, continuationPolicy: "wake_assignee" as const },
+    { kind: "request_confirmation" as const, continuationPolicy: "wake_assignee_on_accept" as const },
+    { kind: "ask_user_questions" as const, continuationPolicy: "wake_assignee" as const },
+  ]) {
+    it(`setting ON: does NOT heal a candidate with a pending ${kind}/${continuationPolicy} interaction`, async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      await enableBlockedWithoutBlockersAutoHeal();
+
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Parked on a board ask — setting on",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: agentId,
+        updatedAt: oldDate(),
+      });
+      await db.insert(issueThreadInteractions).values({
+        id: randomUUID(),
+        companyId,
+        issueId,
+        kind,
+        status: "pending",
+        continuationPolicy,
+        title: "Wire the credential",
+        payload: { version: 1, questions: [] },
+      });
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+      expect(result.interactionSkipped).toBe(1);
+      expect(result.healed).toBe(0);
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).toEqual([]);
+
+      // The issue must stay parked, and no wake may be enqueued — a wake is
+      // what would make the assignee re-discover the missing credential and
+      // file a duplicate board ask it cannot withdraw.
+      const row = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.status).toBe("blocked");
+
+      const wakeups = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        .then((rows) => rows.length);
+      expect(wakeups).toBe(0);
+    });
+  }
+
   it("suppresses escalation for issues under pause hold", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
