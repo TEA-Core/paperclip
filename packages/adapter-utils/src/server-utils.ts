@@ -2064,10 +2064,22 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+const PAPERCLIP_SECRET_ENV_KEYS = new Set([
+  "PAPERCLIP_SECRETS_MASTER_KEY",
+  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+]);
+
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   for (const key of Object.keys(env)) {
     if (!key.startsWith("PAPERCLIP_")) continue;
+    // Secret keys are always stripped, even if the allowlist below were to
+    // change in the future. These carry the control-plane secrets master key
+    // (raw or via file path) and must never reach a spawned agent process.
+    if (PAPERCLIP_SECRET_ENV_KEYS.has(key)) {
+      delete env[key];
+      continue;
+    }
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
     if (key === "PAPERCLIP_LISTEN_HOST") continue;
     if (key === "PAPERCLIP_LISTEN_PORT") continue;

@@ -16,6 +16,7 @@ import {
   renderPaperclipWakePrompt,
   runningProcesses,
   runChildProcess,
+  sanitizeInheritedPaperclipEnv,
   sanitizeSshRemoteEnv,
   signalRunningProcess,
   shapePaperclipWorkspaceEnvForExecution,
@@ -149,6 +150,42 @@ describe("sanitizeSshRemoteEnv", () => {
         },
       ),
     ).toEqual({ PATH: "/explicit/remote/bin" });
+  });
+});
+
+describe("sanitizeInheritedPaperclipEnv", () => {
+  it("strips PAPERCLIP_SECRETS_MASTER_KEY and PAPERCLIP_SECRETS_MASTER_KEY_FILE", () => {
+    expect(
+      sanitizeInheritedPaperclipEnv({
+        PATH: "/usr/bin",
+        PAPERCLIP_SECRETS_MASTER_KEY: "super-secret-key",
+        PAPERCLIP_SECRETS_MASTER_KEY_FILE: "/etc/master.key",
+        PAPERCLIP_API_KEY: "run-token",
+        PAPERCLIP_RUNTIME_API_URL: "http://localhost:8080",
+        PAPERCLIP_LISTEN_HOST: "0.0.0.0",
+        PAPERCLIP_LISTEN_PORT: "8080",
+        PAPERCLIP_WORKSPACE_CWD: "/workspace",
+        UNRELATED_VAR: "visible",
+      }),
+    ).toEqual({
+      PATH: "/usr/bin",
+      PAPERCLIP_RUNTIME_API_URL: "http://localhost:8080",
+      PAPERCLIP_LISTEN_HOST: "0.0.0.0",
+      PAPERCLIP_LISTEN_PORT: "8080",
+      UNRELATED_VAR: "visible",
+    });
+  });
+
+  it("strips all PAPERCLIP_ keys except the allowlisted runtime keys", () => {
+    expect(
+      sanitizeInheritedPaperclipEnv({
+        PAPERCLIP_API_KEY: "should-be-stripped",
+        PAPERCLIP_WORKSPACE_CWD: "should-be-stripped",
+        PAPERCLIP_LISTEN_HOST: "0.0.0.0",
+      }),
+    ).toEqual({
+      PAPERCLIP_LISTEN_HOST: "0.0.0.0",
+    });
   });
 });
 
