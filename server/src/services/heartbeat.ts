@@ -10954,6 +10954,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return issuesSvc.listDependencyReadiness(companyId, issueIds);
   }
 
+  /**
+   * SUP-9857. Instance-wide picture of what a deploy would destroy if it swapped
+   * the container now. `running` is what a drain has to wait on; `queued` cannot
+   * start while dispatch is quiesced but still tells an operator there is a
+   * backlog piling up behind the window.
+   *
+   * Deliberately DB-backed rather than counting `runningProcesses`: a run whose
+   * child this server never owned (adopted after a hot restart, or executing on
+   * a workspace runtime) is still in flight.
+   */
+  async function summarizeInFlightRuns() {
+    const rows = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.status, ["running", "queued"]));
+    const runIds = rows.filter((row) => row.status === "running").map((row) => row.id);
+    return {
+      running: runIds.length,
+      queued: rows.length - runIds.length,
+      runIds,
+    };
+  }
+
   async function countRunningRunsForAgent(agentId: string) {
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
@@ -17434,6 +17457,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
+    summarizeInFlightRuns,
     drainRunningRunsForShutdown,
     drainActiveRunExecutions,
 

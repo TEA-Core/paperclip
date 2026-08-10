@@ -180,6 +180,20 @@ export const issueExecutionStageParticipantSchema = issueExecutionStagePrincipal
     }
   });
 
+/**
+ * The principal recorded on execution *state* (`currentParticipant`,
+ * `returnAssignee`), as opposed to the one accepted on execution *policy*.
+ *
+ * State principals are copied straight off a policy stage's participant list, so
+ * they carry that participant's `id`. Before SUP-12029/SUP-12041 made these
+ * schemas strict that extra key was silently tolerated on the way in and has been
+ * persisted into `issues.execution_state` ever since; rejecting it now makes
+ * `parseIssueExecutionState` return null for the row and the issue silently loses
+ * its place in the review chain. Unknown keys are still rejected — this permits
+ * exactly the one key the writer has always produced.
+ */
+export const issueExecutionStatePrincipalSchema = issueExecutionStageParticipantSchema;
+
 export const issueExecutionStageSchema = z.object({
   id: z.string().uuid().optional(),
   type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
@@ -235,8 +249,8 @@ export const issueExecutionStateSchema = z.object({
   currentStageId: z.string().uuid().nullable(),
   currentStageIndex: z.number().int().nonnegative().nullable(),
   currentStageType: z.enum(ISSUE_EXECUTION_STAGE_TYPES).nullable(),
-  currentParticipant: issueExecutionStagePrincipalSchema.nullable(),
-  returnAssignee: issueExecutionStagePrincipalSchema.nullable(),
+  currentParticipant: issueExecutionStatePrincipalSchema.nullable(),
+  returnAssignee: issueExecutionStatePrincipalSchema.nullable(),
   reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),
   completedStageIds: z.array(z.string().uuid()).default([]),
   lastDecisionId: z.string().uuid().nullable(),
