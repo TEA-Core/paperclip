@@ -77,7 +77,7 @@ function buildTestSessionConfigMetadata(): SessionConfigMetadata {
   };
 }
 
-const embeddedPostgresSupport = getEmbeddedPostgresTestSupport();
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
@@ -264,11 +264,13 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
 
     const localEnvironment: Environment = {
       id: "local-env",
-      companyId,
       name: "Local",
+      description: null,
       driver: "local",
+      status: "active",
       config: {},
-      envVars: null,
+      envVars: {},
+      metadata: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -575,11 +577,13 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
 
     const localEnvironment: Environment = {
       id: "local-env",
-      companyId,
       name: "Local",
+      description: null,
       driver: "local",
+      status: "active",
       config: {},
-      envVars: null,
+      envVars: {},
+      metadata: null,
       createdAt: now,
       updatedAt: now,
     };
