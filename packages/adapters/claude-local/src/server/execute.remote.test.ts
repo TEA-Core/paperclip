@@ -357,6 +357,7 @@ describe("claude remote execution — sanitizeInheritedPaperclipEnv at spawn poi
     const spy = vi.spyOn(serverUtils, "sanitizeInheritedPaperclipEnv");
 
     process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    process.env.ZZZ_SENTINEL = "sentinel-value";
     try {
       await execute({
         runId: "run-1",
@@ -402,11 +403,14 @@ describe("claude remote execution — sanitizeInheritedPaperclipEnv at spawn poi
       });
     } finally {
       delete process.env.DATABASE_URL;
+      delete process.env.ZZZ_SENTINEL;
     }
 
-    const call = runChildProcess.mock.calls[0] as unknown as
-      [string, string, string[], { env: Record<string, string> }] | undefined;
-    expect(call?.[3].env.DATABASE_URL).toBeUndefined();
-    expect(spy).toHaveBeenCalled();
+    expect(spy).toHaveBeenCalledWith(process.env);
+
+    const sanitizedEnv = spy.mock.results.at(-1)?.value as Record<string, string> | undefined;
+    expect(sanitizedEnv).toBeDefined();
+    expect(sanitizedEnv?.DATABASE_URL).toBeUndefined();
+    expect(sanitizedEnv?.ZZZ_SENTINEL).toBe("sentinel-value");
   });
 });

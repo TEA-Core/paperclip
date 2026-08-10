@@ -3,8 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runAdapterExecutionTargetProcessMock } = vi.hoisted(() => ({
+const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock } = vi.hoisted(() => ({
   runAdapterExecutionTargetProcessMock: vi.fn(),
+  ensureCommandResolvableMock: vi.fn(async () => {}),
 }));
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
@@ -16,7 +17,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   adapterExecutionTargetUsesManagedHome: () => false,
   adapterExecutionTargetUsesPaperclipBridge: () => false,
   describeAdapterExecutionTarget: () => "local",
-  ensureAdapterExecutionTargetCommandResolvable: vi.fn(async () => {}),
+  ensureAdapterExecutionTargetCommandResolvable: ensureCommandResolvableMock,
   ensureAdapterExecutionTargetRuntimeCommandInstalled: vi.fn(async () => {}),
   prepareAdapterExecutionTargetRuntime: vi.fn(async () => ({
     workspaceRemoteDir: null,
@@ -843,16 +844,20 @@ describe("execute — sanitizeInheritedPaperclipEnv at spawn points", () => {
 
   it("passes process.env through the shared sanitizer before spawning", async () => {
     const spy = vi.spyOn(serverUtils, "sanitizeInheritedPaperclipEnv");
-    
+
     process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    process.env.ZZZ_SENTINEL = "sentinel-value";
     try {
       await execute(makeCtx());
     } finally {
       delete process.env.DATABASE_URL;
+      delete process.env.ZZZ_SENTINEL;
     }
 
-    const spawnCall = runAdapterExecutionTargetProcessMock.mock.calls.at(-1);
-    expect(spawnCall?.[4].env.DATABASE_URL).toBeUndefined();
-    expect(spy).toHaveBeenCalled();
+    expect(spy).toHaveBeenCalledWith(process.env);
+    const resolveCall = ensureCommandResolvableMock.mock.calls.at(-1);
+    const runtimeEnv = resolveCall?.[3];
+    expect(runtimeEnv.DATABASE_URL).toBeUndefined();
+    expect(runtimeEnv.ZZZ_SENTINEL).toBe("sentinel-value");
   });
 });
