@@ -7,6 +7,7 @@ import {
   issueBlockedInboxAttentionSchema,
   issueExecutionMonitorPolicySchema,
   issueExecutionPolicySchema,
+  issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,
@@ -677,5 +678,48 @@ describe("issue validators", () => {
     expect(parsed.executionPolicy?.monitor?.scheduledBy).toBe("assignee");
     expect(parsed.executionPolicy?.stages).toHaveLength(1);
     expect(parsed.executionPolicy?.stages[0].type).toBe("review");
+  });
+});
+
+describe("issueExecutionStateSchema principal strictness", () => {
+  const unrecognizedKeys = (error: z.ZodError): string[] =>
+    error.issues.flatMap((issue) =>
+      issue.code === z.ZodIssueCode.unrecognized_keys ? issue.keys : [],
+    );
+  const stageId = "044300c9-e352-4b38-9a3c-1579a7bb9a96";
+  const participantId = "6ac26c92-8a89-4456-b9a1-e66f10387ef8";
+  const agentId = "22222222-2222-4222-8222-222222222222";
+
+  const stateWithParticipant = (participant: Record<string, unknown>) => ({
+    status: "pending",
+    currentStageId: stageId,
+    currentStageIndex: 0,
+    currentStageType: "review",
+    currentParticipant: participant,
+    returnAssignee: null,
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+  });
+
+  // The writer copies the principal off a policy stage's participant list, so the
+  // participant `id` rides along and is already persisted in execution_state.
+  // Rejecting it strands the issue: parseIssueExecutionState returns null and the
+  // review chain loses its place. See SUP-12029/SUP-12041.
+  it("accepts the participant id the writer has always persisted", () => {
+    const parsed = issueExecutionStateSchema.safeParse(
+      stateWithParticipant({ id: participantId, type: "agent", agentId, userId: null }),
+    );
+
+    expect(parsed.success).toBe(true);
+  });
+
+  it("still rejects a genuinely unrecognized principal key", () => {
+    const parsed = issueExecutionStateSchema.safeParse(
+      stateWithParticipant({ type: "agent", agentId, userId: null, agentIdd: agentId }),
+    );
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.success ? [] : unrecognizedKeys(parsed.error)).toContain("agentIdd");
   });
 });
