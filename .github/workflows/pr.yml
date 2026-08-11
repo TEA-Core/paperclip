@@ -39,6 +39,29 @@ jobs:
             exit 1
           fi
 
+      - name: Reject stale merge base
+        run: |
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          merge_base=$(git merge-base "$base_sha" "$head_sha")
+
+          # Time-based: merge base cut > 24h ago
+          base_age_seconds=$(($(date +%s) - $(git log -1 --format=%ct "$merge_base")))
+          if [ "$base_age_seconds" -gt 86400 ]; then
+            echo "::error::PR merge base is $((base_age_seconds / 3600))h old (> 24h)."
+            echo "::error::Stale bases silently revert merged work (SUP-12097). Please rebase onto current fold/tea-patches-v2026.722.0."
+            exit 1
+          fi
+
+          # Commit-count: merge base > 20 commits behind
+          behind=$(git rev-list --count "${merge_base}..${base_sha}")
+          if [ "$behind" -gt 20 ]; then
+            echo "::error::PR merge base is $behind commits behind (> 20). Please rebase."
+            exit 1
+          fi
+
+          echo "Merge base is ${base_age_seconds}s old, $behind commits behind — ok."
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
