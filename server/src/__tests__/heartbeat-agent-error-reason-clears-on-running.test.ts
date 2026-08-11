@@ -166,5 +166,8 @@ describeEmbeddedPostgres("heartbeat agent errorReason clears on running transiti
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
-  });
+    // The two polls plus waitForRunToFinish each allow up to 5s on their own, so
+    // vitest's 5s default can expire before the assertions do. Match the timeout
+    // the sibling embedded-Postgres heartbeat suites use.
+  }, 30_000);
 });
