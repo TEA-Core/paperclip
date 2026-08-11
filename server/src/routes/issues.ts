@@ -3731,6 +3731,7 @@ export function issueRoutes(
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
       createdByAgentId: string | null;
+      checkoutRunId?: string | null;
     },
     opts?: { bypassCheckoutOwnership?: boolean },
   ) {
