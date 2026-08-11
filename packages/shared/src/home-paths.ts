@@ -70,7 +70,7 @@ export function resolveDefaultSecretsKeyFilePath(input: {
   homeDir?: string;
   instanceId?: string;
 } = {}): string {
-  return path.resolve(resolvePaperclipInstanceRoot(input), "secrets", "master.key");
+  return path.resolve("/etc/paperclip/secrets/master.key");
 }
 
 export function resolveDefaultStorageDir(input: {
