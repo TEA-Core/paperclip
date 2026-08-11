@@ -615,6 +615,9 @@ export const APPROVAL_TYPES = [
 ] as const;
 export type ApprovalType = (typeof APPROVAL_TYPES)[number];
 
+export const ISSUE_GATING_APPROVAL_TYPES = ["request_board_approval", "budget_override_required"] as const;
+export type IssueGatingApprovalType = (typeof ISSUE_GATING_APPROVAL_TYPES)[number];
+
 export const APPROVAL_STATUSES = [
   "pending",
   "revision_requested",
