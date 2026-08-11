@@ -81,6 +81,7 @@ describeEmbeddedPostgres("work-session routes", () => {
       status: "todo",
       priority: "medium",
       assigneeAgentId: agentId,
+      responsibleUserId: "test-user",
       createdByUserId: "cloud-user-1",
     });
 
