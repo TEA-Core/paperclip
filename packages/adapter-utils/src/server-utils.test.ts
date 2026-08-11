@@ -2291,17 +2291,29 @@ describe("sanitizeInheritedPaperclipEnv", () => {
     expect(env.PAPERCLIP_RUNTIME_API_URL).toBe("http://runtime");
     expect(env.PAPERCLIP_LISTEN_HOST).toBe("0.0.0.0");
     expect(env.PAPERCLIP_LISTEN_PORT).toBe("3100");
-    expect(env.DATABASE_URL).toBe("postgres://old");
+    expect(env.DATABASE_URL).toBeUndefined();
   });
 
   it("no raw process.env in adapter spawn env builders", async () => {
-    const adapterFiles = [
-      path.resolve(import.meta.dirname, "../../../adapters/codex-local/src/server/execute.ts"),
-      path.resolve(import.meta.dirname, "../../../adapters/cursor-local/src/server/execute.ts"),
-      path.resolve(import.meta.dirname, "../../../adapters/pi-local/src/server/execute.ts"),
-      path.resolve(import.meta.dirname, "../execution-target.ts"),
-      path.resolve(import.meta.dirname, "../local-process-sandbox.ts"),
-    ];
+    const repoRoot = path.resolve(import.meta.dirname, "../../..");
+    const adaptersDir = path.resolve(repoRoot, "packages/adapters");
+
+    const adapterDirs = await fs.readdir(adaptersDir, { withFileTypes: true });
+    const adapterFiles: string[] = [];
+
+    for (const dir of adapterDirs) {
+      if (!dir.isDirectory()) continue;
+      const executeFile = path.resolve(adaptersDir, dir.name, "src/server/execute.ts");
+      try {
+        await fs.access(executeFile);
+        adapterFiles.push(executeFile);
+      } catch {
+        // file doesn't exist, skip
+      }
+    }
+
+    adapterFiles.push(path.resolve(import.meta.dirname, "execution-target.ts"));
+    adapterFiles.push(path.resolve(import.meta.dirname, "local-process-sandbox.ts"));
 
     for (const file of adapterFiles) {
       const source = await fs.readFile(file, "utf8");
@@ -2312,11 +2324,14 @@ describe("sanitizeInheritedPaperclipEnv", () => {
         const lineNo = i + 1;
 
         if (!line.includes("process.env")) continue;
-        if (line.includes("sanitizeInheritedPaperclipEnv")) continue;
+
+        const stripped = line.replace(/sanitizeInheritedPaperclipEnv\([^)]*\)/g, "");
+        if (!stripped.includes("process.env")) continue;
 
         const isSpawnEnv =
-          /[{,]\s*\.\.\.process\.env/.test(line) ||
-          /\benv:\s*process\.env\b/.test(line);
+          /[{,]\s*\.\.\.process\.env/.test(stripped) ||
+          /^\s*\.\.\.process\.env/.test(stripped) ||
+          /\benv:\s*process\.env\b/.test(stripped);
 
         if (isSpawnEnv) {
           throw new Error(
