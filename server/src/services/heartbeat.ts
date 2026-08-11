@@ -15431,7 +15431,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         isExecutionReviewParticipantRecoveryEligibleRun(run) &&
         HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
           run.status as (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
-        );
+        ) &&
+        !(recoveryAgent && isExternalPullAgent(recoveryAgent));
 
       if (issueNeedsReviewParticipantRecovery) {
         const existingReviewParticipantExecutionPath = await findExistingExecutionPath(currentParticipant.agentId);
