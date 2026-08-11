@@ -457,4 +457,39 @@ describeEmbeddedPostgres("work-session routes", () => {
     );
     expect(res.status).toBe(403);
   });
+
+  it("close with failed outcome releases the execution lock without creating an automation run for external pull agents", async () => {
+    const fixture = await seedExternalPullAgent();
+    const app = createApp(fixture.agentId, fixture.companyId);
+
+    const openRes = await request(app).post(
+      `/api/issues/${fixture.issueId}/work-session`,
+    );
+    expect(openRes.status).toBe(201);
+    const runId = openRes.body.runId;
+
+    const closeRes = await request(app)
+      .post(`/api/issues/${fixture.issueId}/work-session/close`)
+      .send({ runId, outcome: "failed", summary: "simulated reaper force-fail" });
+    expect(closeRes.status).toBe(200);
+    expect(closeRes.body.status).toBe("failed");
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, fixture.agentId));
+    const selfDeclaredRuns = runs.filter((r) => r.invocationSource === "self_declared");
+    const automationRuns = runs.filter((r) => r.invocationSource === "automation");
+    expect(selfDeclaredRuns).toHaveLength(1);
+    expect(automationRuns).toHaveLength(0);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId))
+      .then((rows) => rows[0]);
+    expect(issue.executionRunId).toBeNull();
+    expect(issue.executionLockedAt).toBeNull();
+    expect(issue.checkoutRunId).toBeNull();
+  });
 });

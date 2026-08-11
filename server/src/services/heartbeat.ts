@@ -128,6 +128,7 @@ import {
   DEFAULT_STILLBORN_RUN_TTL_MS,
   DEFAULT_SELF_DECLARED_RUN_TTL_MS,
 } from "./run-stillborn.js";
+import { isExternalPullAgent } from "./agent-work-delivery.js";
 import { logActivity, logActivityInTransaction, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
@@ -15570,7 +15571,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (issue.status === "todo" || issue.status === "in_progress") &&
         !issue.assigneeUserId &&
         issue.assigneeAgentId === run.agentId &&
-        (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
+        (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled") &&
+        !(recoveryAgent && isExternalPullAgent(recoveryAgent));
 
       if (!issueNeedsImmediateRecovery) {
         return { kind: "released" as const };
