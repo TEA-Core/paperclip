@@ -68,6 +68,8 @@ COPY . .
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @paperclipai/server build
+RUN pnpm --filter @paperclipai/shared build
+RUN pnpm --filter @paperclipai/mcp-server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 # Bundled plugins declare their entrypoints as build outputs under a gitignored dist/.
 # Without this, every image ships them unbuilt and activation fails on a package that
