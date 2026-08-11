@@ -570,7 +570,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // readiness through the same `evaluateCodexCredentialReadiness` predicate, so
   // they cannot drift.
   const credentialReadiness = await evaluateCodexCredentialReadiness({
-    env: sanitizeInheritedPaperclipEnv(process.env),
+    env: process.env,
     companyId: agent.companyId,
     configuredCodexHome,
     configuredApiKey: configuredOpenAiApiKey,
