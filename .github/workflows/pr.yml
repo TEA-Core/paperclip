@@ -321,6 +321,12 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Pre-create secrets key directory
+        # Serialized route suites exercise the real local-encrypted provider,
+        # which creates /etc/paperclip/secrets/master.key; the runner user cannot
+        # mkdir under /etc, so create it up front like the other test jobs do.
+        run: sudo mkdir -p /etc/paperclip/secrets && sudo chown runner:runner /etc/paperclip/secrets
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -423,6 +429,14 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+
+      - name: Pre-create secrets key directory
+        # The e2e webServer boots the real server, whose local-encrypted
+        # provider creates /etc/paperclip/secrets/master.key. The runner user
+        # cannot mkdir under /etc, so create it up front like the general tests
+        # job does; without this the webServer dies with
+        # "EACCES: permission denied, mkdir '/etc/paperclip/secrets'".
+        run: sudo mkdir -p /etc/paperclip/secrets && sudo chown runner:runner /etc/paperclip/secrets
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
