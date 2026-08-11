@@ -57,12 +57,8 @@ export function selfDeclaredRunService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getRunById(runId: string) {
-    return db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
+  async function getRun(runId: string) {
+    return heartbeat.getRun(runId);
   }
 
   async function getProjectById(projectId: string) {
@@ -306,7 +302,7 @@ export function selfDeclaredRunService(db: Db) {
     agentId: string,
     issueId: string,
   ): Promise<SelfDeclaredRunKeepaliveResult> {
-    const run = await getRunById(runId);
+    const run = await getRun(runId);
     if (!run) throw notFound("Run not found");
     if (run.agentId !== agentId) {
       throw forbidden("Run does not belong to calling agent", {
@@ -352,7 +348,7 @@ export function selfDeclaredRunService(db: Db) {
     outcome: "succeeded" | "failed" | "cancelled",
     summary?: string,
   ): Promise<SelfDeclaredRunCloseResult> {
-    const run = await getRunById(runId);
+    const run = await getRun(runId);
     if (!run) throw notFound("Run not found");
     if (run.agentId !== agentId) {
       throw forbidden("Run does not belong to calling agent", {
@@ -431,7 +427,7 @@ export function selfDeclaredRunService(db: Db) {
     openSelfDeclaredRun,
     keepalive,
     closeSelfDeclaredRun,
-    getRunById,
+    getRun,
   };
 }
 

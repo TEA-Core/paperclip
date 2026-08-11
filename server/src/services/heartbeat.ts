@@ -17746,15 +17746,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return run ?? null;
     },
 
-    getRunById: async (runId: string) => {
-      const [run] = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, runId))
-        .limit(1);
-      return run ?? null;
-    },
-
     getActiveRunForAgent: async (agentId: string) => {
       const [run] = await db
         .select()
