@@ -82,7 +82,6 @@ describeEmbeddedPostgres("work-session routes", () => {
       status: "todo",
       priority: "medium",
       assigneeAgentId: agentId,
-      responsibleUserId: "test-user",
       createdByUserId: "cloud-user-1",
     });
 
@@ -651,5 +650,49 @@ describeEmbeddedPostgres("work-session routes", () => {
         ),
       );
     expect(runs).toHaveLength(0);
+  });
+
+  it("two concurrent self-declared sessions on different issues both grant PATCH access to their respective issues", async () => {
+    const fixture = await seedExternalPullAgent();
+
+    const issueBId = randomUUID();
+    const projectBId = randomUUID();
+    await db.insert(projects).values({
+      id: projectBId,
+      companyId: fixture.companyId,
+      name: "Concurrent session project",
+      status: "active",
+    });
+    await db.insert(issues).values({
+      id: issueBId,
+      companyId: fixture.companyId,
+      identifier: `${fixture.identifier}-B`,
+      projectId: projectBId,
+      title: "Concurrent session issue B",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: fixture.agentId,
+      createdByUserId: "cloud-user-1",
+    });
+
+    const app = createFullApp(fixture.agentId, fixture.companyId);
+
+    const openARes = await request(app).post(`/api/issues/${fixture.issueId}/work-session`);
+    expect(openARes.status, JSON.stringify(openARes.body)).toBe(201);
+
+    const openBRes = await request(app).post(`/api/issues/${issueBId}/work-session`);
+    expect(openBRes.status, JSON.stringify(openBRes.body)).toBe(201);
+
+    const patchBRes = await request(app)
+      .patch(`/api/issues/${issueBId}`)
+      .send({ title: "Updated B" });
+    expect(patchBRes.status, JSON.stringify(patchBRes.body)).toBe(200);
+    expect(patchBRes.body.title).toBe("Updated B");
+
+    const patchARes = await request(app)
+      .patch(`/api/issues/${fixture.issueId}`)
+      .send({ title: "Updated A" });
+    expect(patchARes.status, JSON.stringify(patchARes.body)).toBe(200);
+    expect(patchARes.body.title).toBe("Updated A");
   });
 });

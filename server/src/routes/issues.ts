@@ -3670,29 +3670,35 @@ export function issueRoutes(
    * SUP-12232: an external pull agent that opened its own work session owns a
    * running `self_declared` heartbeat run, but its later requests do not replay
    * that run id, so run-scoped mutations on the issue it just checked out were
-   * rejected with 401. Fall back to that run, but only when it is this agent's
-   * own running self-declared run opened for this exact issue. Every other
-   * agent request must still prove run ownership by sending the run id.
+   * rejected with 401. Fall back to the issue's own `checkoutRunId`, validating
+   * it is a running self-declared run owned by this agent.
    */
-  async function resolveSelfDeclaredRunIdForIssue(agentId: string | undefined, issueId: string) {
-    if (!agentId) return null;
-    const activeRun = await heartbeat.getActiveRunForAgent(agentId);
-    if (!activeRun || activeRun.invocationSource !== "self_declared") return null;
-    const snapshot = activeRun.contextSnapshot as { issueId?: unknown } | null;
-    if (snapshot?.issueId !== issueId) return null;
-    return activeRun.id;
+  async function resolveSelfDeclaredRunIdForIssue(
+    agentId: string | undefined,
+    checkoutRunId: string | null | undefined,
+  ) {
+    if (!agentId || !checkoutRunId) return null;
+    const run = await heartbeat.getRunById(checkoutRunId);
+    if (!run) return null;
+    if (run.status !== "running") return null;
+    if (run.invocationSource !== "self_declared") return null;
+    if (run.agentId !== agentId) return null;
+    return run.id;
   }
 
   async function requireAgentRunId(
     req: Request,
     res: Response,
     issueId: string,
-    opts?: { suppressResponse?: boolean },
+    opts?: { suppressResponse?: boolean; checkoutRunId?: string | null },
   ) {
     if (req.actor.type !== "agent") return null;
     const runId = req.actor.runId?.trim();
     if (runId) return runId;
-    const selfDeclaredRunId = await resolveSelfDeclaredRunIdForIssue(req.actor.agentId, issueId);
+    const selfDeclaredRunId = await resolveSelfDeclaredRunIdForIssue(
+      req.actor.agentId,
+      opts?.checkoutRunId,
+    );
     if (selfDeclaredRunId) return selfDeclaredRunId;
     if (!opts?.suppressResponse) {
       res.status(401).json({ error: "Agent run id required" });
@@ -3798,11 +3804,8 @@ export function issueRoutes(
     if (opts?.bypassCheckoutOwnership) {
       return true;
     }
-    const runId = await requireAgentRunId(req, res, issue.id, { suppressResponse: true });
-    if (!runId) {
-      res.status(401).json({ error: "Agent run id required" });
-      return false;
-    }
+    const runId = await requireAgentRunId(req, res, issue.id, { checkoutRunId: issue.checkoutRunId });
+    if (!runId) return false;
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
@@ -9323,7 +9326,7 @@ export function issueRoutes(
       return;
     }
 
-    const checkoutRunId = await requireAgentRunId(req, res, id);
+    const checkoutRunId = await requireAgentRunId(req, res, id, { checkoutRunId: issue.checkoutRunId });
     if (req.actor.type === "agent" && !checkoutRunId) return;
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
     const actor = getActorInfo(req);
@@ -9373,7 +9376,7 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
-    const actorRunId = await requireAgentRunId(req, res, id);
+    const actorRunId = await requireAgentRunId(req, res, id, { checkoutRunId: existing.checkoutRunId });
     if (req.actor.type === "agent" && !actorRunId) return;
 
     const released = await svc.release(
@@ -9507,7 +9510,7 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const agentSourceRunId = req.actor.type === "agent" ? await requireAgentRunId(req, res, id) : null;
+    const agentSourceRunId = req.actor.type === "agent" ? await requireAgentRunId(req, res, id, { checkoutRunId: issue.checkoutRunId }) : null;
     if (req.actor.type === "agent" && !agentSourceRunId) return;
     if (req.body.kind === "request_confirmation" && req.body.payload?.toolAction !== undefined) {
       throw unprocessable("payload.toolAction is server-owned metadata and cannot be supplied when creating an interaction");

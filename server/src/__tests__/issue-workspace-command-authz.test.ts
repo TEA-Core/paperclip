@@ -39,6 +39,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   reportRunActivity: vi.fn(),
   getRun: vi.fn(),
   getActiveRunForAgent: vi.fn(),
+  getRunById: vi.fn(),
   cancelRun: vi.fn(),
 }));
 
