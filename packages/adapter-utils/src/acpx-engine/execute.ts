@@ -1296,7 +1296,7 @@ async function buildRuntime(input: {
     workspaceId,
     workspaceRepoUrl,
     workspaceRepoRef,
-    env,
+    env: runtimeEnv,
     loggedEnv,
     stateDir,
     permissionMode,

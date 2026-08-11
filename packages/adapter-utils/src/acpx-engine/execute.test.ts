@@ -1713,4 +1713,28 @@ describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
     expect(sanitizedEnv.DATABASE_URL).toBeUndefined();
     expect(sanitizedEnv.ZZZ_SENTINEL).toBe("sentinel-value");
   });
+
+  it("strips secrets from session options env while preserving non-secret inherited keys", async () => {
+    process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    process.env.BETTER_AUTH_SECRET = "secret-auth-value";
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "secret-tool-action";
+    process.env.ZZZ_SENTINEL = "sentinel-value";
+    try {
+      const { sessionInputs } = await runExecutor({
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+      });
+      const sessionEnv = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+      expect(sessionEnv.DATABASE_URL).toBeUndefined();
+      expect(sessionEnv.BETTER_AUTH_SECRET).toBeUndefined();
+      expect(sessionEnv.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
+      expect(sessionEnv.ZZZ_SENTINEL).toBe("sentinel-value");
+      expect(sessionEnv.PAPERCLIP_AGENT_ID).toBe("agent-1");
+    } finally {
+      delete process.env.DATABASE_URL;
+      delete process.env.BETTER_AUTH_SECRET;
+      delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      delete process.env.ZZZ_SENTINEL;
+    }
+  });
 });
