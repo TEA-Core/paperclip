@@ -59,47 +59,19 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     throw new Error("Timed out waiting for issue monitor heartbeat runs to settle");
   }
 
-  async function heartbeatSideEffectFingerprint() {
-    const [active, events, activity, leases, runtimeServices] = await Promise.all([
-      db
-        .select({ count: sql<number>`count(*)` })
-        .from(heartbeatRuns)
-        .where(sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`),
-      db.select({ count: sql<number>`count(*)` }).from(heartbeatRunEvents),
-      db.select({ count: sql<number>`count(*)` }).from(activityLog),
-      db.select({ count: sql<number>`count(*)` }).from(environmentLeases),
-      db.select({ count: sql<number>`count(*)` }).from(workspaceRuntimeServices),
-    ]);
-
-    return [
-      active[0]?.count ?? 0,
-      events[0]?.count ?? 0,
-      activity[0]?.count ?? 0,
-      leases[0]?.count ?? 0,
-      runtimeServices[0]?.count ?? 0,
-    ].join(":");
-  }
-
-  async function waitForHeartbeatSideEffectsSettled(timeoutMs = 5_000, quietMs = 500) {
-    const deadline = Date.now() + timeoutMs;
-    let previous = "";
-    let stableSince = Date.now();
-    while (Date.now() < deadline) {
-      const current = await heartbeatSideEffectFingerprint();
-      const activeCount = Number(current.split(":")[0] ?? 0);
-      if (current !== previous || activeCount > 0) {
-        previous = current;
-        stableSince = Date.now();
-      } else if (Date.now() - stableSince >= quietMs) {
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    throw new Error("Timed out waiting for issue monitor heartbeat side effects to settle");
-  }
-
   async function cleanupRows() {
-    await waitForHeartbeatSideEffectsSettled();
+    // Triggering a monitor enqueues an on-demand wake, which dispatches a
+    // heartbeat run fire-and-forget (startNextQueuedRunForAgent → executeRun),
+    // and that run keeps writing rows after tickTimers resolves. Await the
+    // in-flight executions the service tracks for exactly this purpose, the
+    // same way heartbeat-issue-liveness-escalation.test.ts does.
+    //
+    // This used to poll row counts for a 500ms window in which nothing changed
+    // and no run was queued/running. A run that completes only to promote the
+    // next queued run for the same agent never produces such a window, so on CI
+    // the poll burned its whole budget, cleanupRows threw before deleting
+    // anything, and the leaked rows failed every test that followed.
+    await heartbeatService(db).drainActiveRunExecutions();
     await db.delete(heartbeatRunEvents);
     await db.delete(issueComments);
     await db.delete(documentRevisions);

@@ -98,6 +98,18 @@ function standardTrustResolution(): TrustPresetResolution {
   };
 }
 
+// `git commit` refuses to run without an author, and a bare CI runner has no
+// global identity configured — only developer machines do, which is why this
+// only ever failed off-laptop. Pin the identity locally in the throwaway repo
+// rather than inheriting whatever the host happens to have, matching the
+// idiom in workspace-runtime.test.ts and the heartbeat-workspace-* suites.
+function initTempGitRepo(cwd: string) {
+  execSync("git init", { cwd, stdio: "pipe" });
+  execSync("git config user.email paperclip-test@example.com", { cwd, stdio: "pipe" });
+  execSync("git config user.name 'Paperclip Test'", { cwd, stdio: "pipe" });
+  execSync("git commit --allow-empty -m init", { cwd, stdio: "pipe" });
+}
+
 function buildResolvedWorkspace(overrides: Partial<ResolvedWorkspaceForRun> = {}): ResolvedWorkspaceForRun {
   return {
     cwd: "/tmp/project",
@@ -154,8 +166,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
 
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-provisioning-test-"));
     tempRoots.push(tempRoot);
-    execSync("git init", { cwd: tempRoot, stdio: "pipe" });
-    execSync("git commit --allow-empty -m init", { cwd: tempRoot, stdio: "pipe" });
+    initTempGitRepo(tempRoot);
 
 
     await instanceSettingsService(db).updateExperimental({
@@ -420,8 +431,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
 
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-provisioning-deferred-"));
     tempRoots.push(tempRoot);
-    execSync("git init", { cwd: tempRoot, stdio: "pipe" });
-    execSync("git commit --allow-empty -m init", { cwd: tempRoot, stdio: "pipe" });
+    initTempGitRepo(tempRoot);
 
 
     await instanceSettingsService(db).updateExperimental({
