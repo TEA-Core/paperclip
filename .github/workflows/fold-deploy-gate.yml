@@ -8,12 +8,17 @@ name: Fold deploy gate
 # while every PR page showed green, because the only checks running were AI
 # reviewers. The break was found by hand, during a pre-deploy spot check.
 #
-# Deliberately narrow and fast. It runs the two things that decide whether the
+# Deliberately narrow and fast. It runs the things that decide whether the
 # branch can ship at all:
 #
 #   1. `pnpm run typecheck` across the workspace
 #   2. `pnpm --filter @paperclipai/server build` — the exact command the
 #      Dockerfile runs, so a red build here means `docker build` cannot succeed
+#   3. `docker build` — the full image build, including the build-time JSON-RPC
+#      handshake that proves the MCP server binary starts, resolves its
+#      dependencies, and registers the WorkSession tools. This is the only
+#      verification that the handshake actually executes; the string-level test
+#      in pr.yml passes whether or not the layers work.
 #
 # Tests are pr.yml's job. Keeping this lane quick means it is still useful as a
 # branch-health signal rather than something people learn to ignore.
@@ -32,7 +37,7 @@ jobs:
   buildable:
     name: Branch is buildable
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -69,6 +74,22 @@ jobs:
         id: build
         run: pnpm --filter @paperclipai/server build
 
+      # The full image build. This is the only gate that runs the Dockerfile's
+      # build-time JSON-RPC handshake, which proves the MCP server binary starts,
+      # resolves its dependencies, and registers paperclipOpenWorkSession. Without
+      # this step, a broken dependency tree or missing tool ships silently — the
+      # string-level test in pr.yml asserts the handshake text is present but
+      # passes whether or not the layers actually work.
+      - name: Docker image build (runs the MCP handshake)
+        id: docker-build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: paperclip:fold-deploy-gate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Report — lockfile
         if: failure() && steps.install.outcome == 'failure'
         run: |
@@ -86,4 +107,13 @@ jobs:
         run: |
           echo "::error::The deployed fold branch does not build."
           echo "::error::docker build will fail at 'pnpm --filter @paperclipai/server build'."
+          echo "::error::Do not cut a release image from this commit."
+
+      - name: Report — docker build
+        if: failure() && steps.docker-build.outcome == 'failure'
+        run: |
+          echo "::error::docker build failed on the deployed fold branch."
+          echo "::error::This is the only gate that runs the build-time JSON-RPC handshake."
+          echo "::error::The MCP server binary did not start, did not resolve its dependencies,"
+          echo "::error::or did not register paperclipOpenWorkSession."
           echo "::error::Do not cut a release image from this commit."
