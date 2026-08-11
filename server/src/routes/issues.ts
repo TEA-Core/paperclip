@@ -3792,7 +3792,15 @@ export function issueRoutes(
       return true;
     }
     const runId = await requireAgentRunId(req, res, issue.id);
-    if (!runId) return false;
+    if (!runId) {
+      const checkoutInfo = await db
+        .select({ checkoutRunId: issueRows.checkoutRunId })
+        .from(issueRows)
+        .where(eq(issueRows.id, issue.id))
+        .then((rows) => rows[0] ?? null);
+      if (!checkoutInfo?.checkoutRunId) return true;
+      return false;
+    }
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
