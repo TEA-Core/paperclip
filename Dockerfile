@@ -76,34 +76,43 @@ RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" &
 # above because each plugin's prebuild depends on the SDK's output.
 RUN node scripts/build-bundled-plugins.mjs
 
+# Both packages declare "files": ["dist"], so they must be compiled before
+# npm pack or the tarballs ship a package.json with no code behind it.
 RUN pnpm --filter @paperclipai/shared build
 RUN pnpm --filter @paperclipai/mcp-server build
 RUN test -f packages/mcp-server/dist/stdio.js || (echo "ERROR: mcp-server build output missing" && exit 1)
 
-# Pack the two MCP packages into self-contained tarballs and install them
-# into a dedicated global prefix so the runtime tree carries real node_modules
-# (npm pack applies publishConfig exports; npm install resolves @modelcontextprotocol/sdk,
-# zod, and @paperclipai/shared into node_modules — the loose-file-copy approach
-# in SUP-12236 omitted the dependency tree, so stdio.js died with
-# ERR_MODULE_NOT_FOUND on fresh volumes).
-#
-# The mcp-server tarball still carries "workspace:*" for @paperclipai/shared,
-# which npm install --global cannot resolve. We install shared first, then
-# patch the mcp-server tarball's package.json to replace "workspace:*" with the
-# installed shared version before installing it.
+# Pack both MCP workspace packages into tarballs, then apply publishConfig
+# by hand (npm pack does NOT apply it — only npm publish does) and pin
+# @paperclipai/shared via a file: tarball path so the local build is used
+# rather than a stale registry version.
 RUN mkdir -p /opt/paperclip-mcp /opt/paperclip-mcp-tarballs \
   && cd packages/shared && npm pack --pack-destination /opt/paperclip-mcp-tarballs && cd /app \
   && cd packages/mcp-server && npm pack --pack-destination /opt/paperclip-mcp-tarballs && cd /app \
+  && node -e '\
+    const { readFileSync, writeFileSync } = require("fs"); \
+    const { execSync } = require("child_process"); \
+    const { join } = require("path"); \
+    const dir = "/opt/paperclip-mcp-tarballs"; \
+    ["shared", "mcp-server"].forEach(name => { \
+      const tgz = execSync("ls " + dir + "/paperclipai-" + name + "-*.tgz").toString().trim(); \
+      execSync("tar xzf " + tgz + " -C " + dir); \
+      const pkg = JSON.parse(readFileSync(dir + "/package/package.json", "utf8")); \
+      if (pkg.publishConfig) { \
+        for (const k of ["exports","main","types","bin"]) \
+          if (pkg.publishConfig[k]) pkg[k] = pkg.publishConfig[k]; \
+      } \
+      if (name === "mcp-server" && pkg.dependencies && pkg.dependencies["@paperclipai/shared"]) { \
+        const sharedTgz = execSync("ls " + dir + "/paperclipai-shared-*.tgz").toString().trim(); \
+        pkg.dependencies["@paperclipai/shared"] = "file:" + sharedTgz; \
+      } \
+      writeFileSync(dir + "/package/package.json", JSON.stringify(pkg, null, 2) + "\n"); \
+      execSync("tar czf " + tgz + " -C " + dir + " package"); \
+      execSync("rm -rf " + dir + "/package"); \
+    }); \
+  ' \
   && npm install --global --omit=dev --prefix /opt/paperclip-mcp \
-     /opt/paperclip-mcp-tarballs/paperclipai-shared-*.tgz \
-  && SHARED_VER=$(node -p "require('/opt/paperclip-mcp/lib/node_modules/@paperclipai/shared/package.json').version") \
-  && MCP_TGZ=$(ls /opt/paperclip-mcp-tarballs/paperclipai-mcp-server-*.tgz) \
-  && mkdir -p /tmp/mcp-patch \
-  && tar xzf "$MCP_TGZ" -C /tmp/mcp-patch \
-  && sed -i "s/\"workspace:\*\"/\"$SHARED_VER\"/" /tmp/mcp-patch/package/package.json \
-  && tar czf "$MCP_TGZ" -C /tmp/mcp-patch package \
-  && rm -rf /tmp/mcp-patch \
-  && npm install --global --omit=dev --prefix /opt/paperclip-mcp "$MCP_TGZ" \
+     /opt/paperclip-mcp-tarballs/paperclipai-mcp-server-*.tgz \
   && rm -rf /opt/paperclip-mcp-tarballs
 
 # Build-time JSON-RPC handshake: prove the installed binary starts, resolves
