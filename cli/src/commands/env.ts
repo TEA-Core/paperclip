@@ -30,7 +30,7 @@ const DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS = "30000";
 const DEFAULT_SECRETS_PROVIDER = "local_encrypted";
 const DEFAULT_STORAGE_PROVIDER = "local_disk";
 function defaultSecretsKeyFilePath(): string {
-  return resolveDefaultSecretsKeyFilePath(resolvePaperclipInstanceId());
+  return resolveDefaultSecretsKeyFilePath();
 }
 function defaultStorageBaseDir(): string {
   return resolveDefaultStorageDir(resolvePaperclipInstanceId());
