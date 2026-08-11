@@ -50,6 +50,7 @@ import {
   sanitizeInheritedPaperclipEnv,
   shapePaperclipWorkspaceEnvForExecution,
   stringifyPaperclipWakePayload,
+  SECRET_ENV_KEYS,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
@@ -163,6 +164,7 @@ interface AcpxPreparedRuntime {
   workspaceRepoRef: string;
   env: Record<string, string>;
   loggedEnv: Record<string, string>;
+  envUnset: string[];
   stateDir: string;
   permissionMode: "approve-all" | "approve-reads" | "deny-all";
   nonInteractivePermissions: "deny" | "fail";
@@ -1288,6 +1290,7 @@ async function buildRuntime(input: {
     includeRuntimeKeys: ["HOME"],
     resolvedCommand: agentCommand ?? acpxAgent,
   });
+  const envUnset = [...SECRET_ENV_KEYS, "DATABASE_URL", "DATABASE_MIGRATION_URL"];
 
   return {
     acpxAgent,
@@ -1298,6 +1301,7 @@ async function buildRuntime(input: {
     workspaceRepoRef,
     env: runtimeEnv,
     loggedEnv,
+    envUnset,
     stateDir,
     permissionMode,
     nonInteractivePermissions,
@@ -1985,7 +1989,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             mode: prepared.mode,
             cwd: prepared.cwd,
             resumeSessionId,
-            sessionOptions: { env: prepared.env },
+            sessionOptions: { env: prepared.env, envUnset: prepared.envUnset },
           });
         } catch (err) {
           if (!resumeSessionId || !isResumeFailure(err)) throw err;
@@ -2000,7 +2004,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             agent: prepared.acpxAgent,
             mode: prepared.mode,
             cwd: prepared.cwd,
-            sessionOptions: { env: prepared.env },
+            sessionOptions: { env: prepared.env, envUnset: prepared.envUnset },
           });
         }
       }

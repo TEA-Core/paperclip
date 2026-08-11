@@ -2069,7 +2069,7 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
 // covered too: `BETTER_AUTH_SECRET` forges authenticated sessions and
 // `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` forges signed tool actions, which
 // bypasses the approval gate.
-const SECRET_ENV_KEYS = new Set([
+export const SECRET_ENV_KEYS = new Set([
   "BETTER_AUTH_SECRET",
   "PAPERCLIP_SECRETS_MASTER_KEY",
   "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
