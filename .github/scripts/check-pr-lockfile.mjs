@@ -6,16 +6,23 @@
  */
 import { fileURLToPath } from 'node:url';
 
+// Mirrors the `Block manual lockfile edits` step in pr.yml, which is the gate
+// that actually enforces this policy and exempts `chore/refresh-lockfile` by
+// branch alone. Keying off the author too made this gate reject a human-pushed
+// lockfile refresh on that branch while quoting pr.yml as the reason — advice
+// pr.yml itself contradicts. Fork branches deploy from a ref the refresh bot
+// never runs on, so those refreshes have to be pushed by hand.
+const REFRESH_BRANCH = 'chore/refresh-lockfile';
+
 export function checkLockfile(files, prAuthor, prBranch) {
   const lockfileChanged = files.some(f => f.filename === 'pnpm-lock.yaml');
   if (!lockfileChanged) return { passed: true, failures: [] };
 
-  const isRefreshBot =
-    prAuthor === 'github-actions[bot]' && prBranch === 'chore/refresh-lockfile';
+  const isRefreshBranch = prBranch === REFRESH_BRANCH;
 
   return {
-    passed: isRefreshBot,
-    failures: isRefreshBot ? [] : [
+    passed: isRefreshBranch,
+    failures: isRefreshBranch ? [] : [
       'You have changes to `pnpm-lock.yaml` — `pr.yml` will hard-fail this PR with a confusing message about lockfile edits. ' +
       'To fix: run `pnpm install` locally, exclude the lockfile from your commit, push again. ' +
       'The lockfile is regenerated automatically by the refresh bot on a schedule.',
