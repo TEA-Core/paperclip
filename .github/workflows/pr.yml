@@ -86,7 +86,11 @@ jobs:
         id: regen_lockfile
         run: |
           changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
-          manifest_pattern='(^|/)package\.json$|^pnpm-workspace\.yaml$|^\.npmrc$|^pnpmfile\.(cjs|js|mjs)$'
+          # Patch files count as manifests: editing one changes the
+          # `patchedDependencies` hash recorded in pnpm-lock.yaml, so a frozen
+          # install fails with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH unless the
+          # lockfile is regenerated here.
+          manifest_pattern='(^|/)package\.json$|^pnpm-workspace\.yaml$|^\.npmrc$|^pnpmfile\.(cjs|js|mjs)$|^patches/'
           if printf '%s\n' "$changed" | grep -Eq "$manifest_pattern"; then
             pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
             echo "regenerated=1" >> "$GITHUB_OUTPUT"
