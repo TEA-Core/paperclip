@@ -3678,7 +3678,7 @@ export function issueRoutes(
     checkoutRunId: string | null | undefined,
   ) {
     if (!agentId || !checkoutRunId) return null;
-    const run = await heartbeat.getRunById(checkoutRunId);
+    const run = await heartbeat.getRun(checkoutRunId);
     if (!run) return null;
     if (run.status !== "running") return null;
     if (run.invocationSource !== "self_declared") return null;
