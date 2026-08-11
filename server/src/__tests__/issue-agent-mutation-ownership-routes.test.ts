@@ -964,6 +964,84 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
   });
 
+  it("falls back to the agent's own running self-declared run for this issue when no run id is sent", async () => {
+    // SUP-12232: an external pull agent that opened its own work session holds a
+    // running self_declared run but does not replay the run id on every request.
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+      id: ownerRunId,
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      contextSnapshot: { issueId, wakeReason: "self_declared" },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId: ownerAgentId,
+      companyId,
+      source: "agent_key",
+      // intentionally no runId — the self-declared run supplies it
+    });
+
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({ title: "Updated" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).toHaveBeenCalledWith(issueId, ownerAgentId, ownerRunId);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("still requires a run id when the agent's running self-declared run is for another issue", async () => {
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+      id: ownerRunId,
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      contextSnapshot: {
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        wakeReason: "self_declared",
+      },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId: ownerAgentId,
+      companyId,
+      source: "agent_key",
+    });
+
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({ title: "Updated" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(401);
+    expect(res.body.error).toBe("Agent run id required");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("still requires a run id when the agent's running run was dispatched rather than self-declared", async () => {
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+      id: ownerRunId,
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+      invocationSource: "scheduled",
+      contextSnapshot: { issueId },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId: ownerAgentId,
+      companyId,
+      source: "agent_key",
+    });
+
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({ title: "Updated" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(401);
+    expect(res.body.error).toBe("Agent run id required");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("allows the checked-out owner with the matching run id to patch and update documents", async () => {
     const app = await createApp(ownerActor());
 

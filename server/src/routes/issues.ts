@@ -3666,25 +3666,29 @@ export function issueRoutes(
     return decision.allowed;
   }
 
+  /**
+   * SUP-12232: an external pull agent that opened its own work session owns a
+   * running `self_declared` heartbeat run, but its later requests do not replay
+   * that run id, so run-scoped mutations on the issue it just checked out were
+   * rejected with 401. Fall back to that run, but only when it is this agent's
+   * own running self-declared run opened for this exact issue. Every other
+   * agent request must still prove run ownership by sending the run id.
+   */
+  async function resolveSelfDeclaredRunIdForIssue(agentId: string | undefined, issueId: string) {
+    if (!agentId) return null;
+    const activeRun = await heartbeat.getActiveRunForAgent(agentId);
+    if (!activeRun || activeRun.invocationSource !== "self_declared") return null;
+    const snapshot = activeRun.contextSnapshot as { issueId?: unknown } | null;
+    if (snapshot?.issueId !== issueId) return null;
+    return activeRun.id;
+  }
+
   async function requireAgentRunId(req: Request, res: Response, issueId: string) {
     if (req.actor.type !== "agent") return null;
     const runId = req.actor.runId?.trim();
     if (runId) return runId;
-    const agentId = req.actor.agentId;
-    if (agentId) {
-      const selfDeclared = await db
-        .select({ id: heartbeatRuns.id })
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.invocationSource, "self_declared"),
-            eq(heartbeatRuns.status, "running"),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
-      if (selfDeclared) return selfDeclared.id;
-    }
+    const selfDeclaredRunId = await resolveSelfDeclaredRunIdForIssue(req.actor.agentId, issueId);
+    if (selfDeclaredRunId) return selfDeclaredRunId;
     res.status(401).json({ error: "Agent run id required" });
     return null;
   }
