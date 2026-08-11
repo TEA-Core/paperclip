@@ -3683,13 +3683,20 @@ export function issueRoutes(
     return activeRun.id;
   }
 
-  async function requireAgentRunId(req: Request, res: Response, issueId: string) {
+  async function requireAgentRunId(
+    req: Request,
+    res: Response,
+    issueId: string,
+    opts?: { suppressResponse?: boolean },
+  ) {
     if (req.actor.type !== "agent") return null;
     const runId = req.actor.runId?.trim();
     if (runId) return runId;
     const selfDeclaredRunId = await resolveSelfDeclaredRunIdForIssue(req.actor.agentId, issueId);
     if (selfDeclaredRunId) return selfDeclaredRunId;
-    res.status(401).json({ error: "Agent run id required" });
+    if (!opts?.suppressResponse) {
+      res.status(401).json({ error: "Agent run id required" });
+    }
     return null;
   }
 
@@ -3791,12 +3798,11 @@ export function issueRoutes(
     if (opts?.bypassCheckoutOwnership) {
       return true;
     }
-    // `requireAgentRunId` has already written the 401 response when it returns
-    // null, so the only safe outcome here is to deny. Returning true on a
-    // missing run id (e.g. for issues without a `checkoutRunId`) lets the route
-    // handler keep mutating behind an already-sent 401.
-    const runId = await requireAgentRunId(req, res, issue.id);
-    if (!runId) return false;
+    const runId = await requireAgentRunId(req, res, issue.id, { suppressResponse: true });
+    if (!runId) {
+      res.status(401).json({ error: "Agent run id required" });
+      return false;
+    }
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
