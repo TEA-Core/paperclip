@@ -24,6 +24,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 
@@ -66,11 +67,15 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     // in-flight executions the service tracks for exactly this purpose, the
     // same way heartbeat-issue-liveness-escalation.test.ts does.
     //
-    // This used to poll row counts for a 500ms window in which nothing changed
-    // and no run was queued/running. A run that completes only to promote the
-    // next queued run for the same agent never produces such a window, so on CI
-    // the poll burned its whole budget, cleanupRows threw before deleting
-    // anything, and the leaked rows failed every test that followed.
+    // Draining alone is not enough here. These fixtures run a `process` adapter
+    // that produces no output, so every dispatched run fails immediately and
+    // terminal-run recovery re-dispatches the assigned issue, which fails again:
+    // a self-feeding chain that emitted 445 run starts for one agent in 90s on
+    // CI. drainActiveRunExecutions() waits until the in-flight set is empty, so
+    // against an endless chain it never returns and the hook died at its 30s
+    // budget. Engage the dispatch quiesce first (the lever deploys use to stop
+    // starting new work while letting in-flight runs finish), so the chain has a
+    // last link and the drain terminates.
     await heartbeatService(db).drainActiveRunExecutions();
     await db.delete(heartbeatRunEvents);
     await db.delete(issueComments);
@@ -91,17 +96,24 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   afterEach(async () => {
     seededAgentIds.clear();
-    let lastError: unknown = null;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        await cleanupRows();
-        return;
-      } catch (error) {
-        lastError = error;
-        await new Promise((resolve) => setTimeout(resolve, 100));
+    // Hold the quiesce across every retry, not just one cleanupRows call, so a
+    // failed attempt cannot hand the next one a freshly dispatched run.
+    dispatchQuiesce.engage({ reason: "issue-monitor-scheduler teardown", ttlMs: 60_000 });
+    try {
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await cleanupRows();
+          return;
+        } catch (error) {
+          lastError = error;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
       }
+      throw lastError;
+    } finally {
+      dispatchQuiesce.release();
     }
-    throw lastError;
   });
 
   afterAll(async () => {
