@@ -45,52 +45,24 @@ fi
 mkdir -p /etc/paperclip/secrets
 chown node:node /etc/paperclip/secrets
 
-# Refresh the MCP server and its shared dependency in the npm-global prefix.
-# The image builds both packages into /app/packages/<pkg>/dist/, but the MCP
-# client resolves paperclip-mcp-server from /paperclip/.npm-global/, which is a
-# mounted volume and therefore empty on first start. This block copies the
-# image's compiled artifacts into the volume so the binary is callable.
-# The two packages are atomic — the mcp-server built at this commit depends on
-# shared symbols that only exist in the shared build at this same commit.
-# Refreshing one without the other leaves the server broken.
-MCP_SERVER_DIST=/app/packages/mcp-server/dist
-SHARED_DIST=/app/packages/shared/dist
+# Populate the npm-global volume with the self-contained MCP server tree.
+# The build stage (Dockerfile) ran `npm pack` + `npm install --global --omit=dev
+# --prefix /opt/paperclip-mcp`, producing a fully-resolved node_modules tree
+# with @modelcontextprotocol/sdk, zod, and @paperclipai/shared. The runtime
+# prefix at /paperclip/.npm-global is a mounted volume and therefore empty on
+# first start, so we copy the build-time tree into it. The two packages are
+# atomic — the mcp-server built at this commit depends on shared symbols that
+# only exist in the shared build at this same commit.
+MCP_PREFIX=/opt/paperclip-mcp
 NPM_GLOBAL=/paperclip/.npm-global
 
-if [ -f "$MCP_SERVER_DIST/stdio.js" ] && [ -f "$SHARED_DIST/index.js" ]; then
+if [ -d "$MCP_PREFIX/lib/node_modules/@paperclipai/mcp-server" ]; then
     echo "docker-entrypoint.sh: refreshing MCP server packages in npm-global prefix..."
     gosu node sh -c '
-        MODULES="$1/lib/node_modules"
-        mkdir -p "$MODULES/@paperclipai/shared/dist" "$MODULES/@paperclipai/mcp-server/dist" "$1/bin"
-
-        # Copy package manifests so Node module resolution works
-        cp /app/packages/shared/package.json "$MODULES/@paperclipai/shared/"
-        cp /app/packages/mcp-server/package.json "$MODULES/@paperclipai/mcp-server/"
-
-        # Overwrite the exported entrypoint in the shared package.json so
-        # Node resolves "./dist/index.js" instead of "./src/index.ts"
-        # (the workspace default points at TypeScript source, not the
-        # compiled output that lives beside it in this prefix).
-        node -e "
-            const p = require(\"$MODULES/@paperclipai/shared/package.json\");
-            p.exports = p.publishConfig.exports;
-            p.main = void 0;
-            p.types = void 0;
-            require(\"fs\").writeFileSync(
-                \"$MODULES/@paperclipai/shared/package.json\",
-                JSON.stringify(p, null, 2) + \"\n\"
-            );
-        "
-
-        # Overwrite dist/ with the image'\''s compiled artifacts
-        cp -rf /app/packages/shared/dist/* "$MODULES/@paperclipai/shared/dist/"
-        cp -rf /app/packages/mcp-server/dist/* "$MODULES/@paperclipai/mcp-server/dist/"
-
-        # Symlink the bin entry so "paperclip-mcp-server" resolves
-        ln -sf ../lib/node_modules/@paperclipai/mcp-server/dist/stdio.js "$1/bin/paperclip-mcp-server"
-
+        mkdir -p "$2"
+        cp -a "$1/." "$2/"
         echo "docker-entrypoint.sh: MCP server packages refreshed"
-    ' -- "$NPM_GLOBAL"
+    ' -- "$MCP_PREFIX" "$NPM_GLOBAL"
 fi
 
 exec gosu node "$@"
