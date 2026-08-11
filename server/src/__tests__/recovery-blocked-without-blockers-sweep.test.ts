@@ -84,6 +84,15 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
+    // Wait for any background executeRun promises to fully settle before
+    // truncating. reconcileBlockedWithoutBlockers heals dispatch a wakeup that
+    // kicks off executeRun fire-and-forget; executeRun keeps writing to
+    // heartbeat_runs, heartbeat_run_events, agent_wakeup_requests, issues, etc.
+    // AFTER the run row leaves queued/running state. A TRUNCATE racing those
+    // late writes is what produces the 40P01 deadlock flake. drainActiveRunExecutions
+    // awaits the in-flight execution promises (module-level, shared across
+    // heartbeatService instances) so the DB is quiescent before we truncate.
+    await heartbeatService(db).drainActiveRunExecutions();
     // Cleans up the issue graph plus everything a dispatched heartbeat run may
     // create (run events, environment leases, documents/comments, company skills).
     // CASCADE handles FK references that are omitted from this list.
