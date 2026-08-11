@@ -2320,6 +2320,7 @@ describe("sanitizeInheritedPaperclipEnv", () => {
       const lines = source.split("\n");
 
       let inGeneratedScript = false;
+      let inReadOnlyPredicate = false;
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const lineNo = i + 1;
@@ -2331,18 +2332,26 @@ describe("sanitizeInheritedPaperclipEnv", () => {
           inGeneratedScript = false;
         }
 
+        if (/evaluateCodexCredentialReadiness\s*\(/.test(line)) {
+          inReadOnlyPredicate = true;
+        }
+        if (inReadOnlyPredicate && /\);/.test(line)) {
+          inReadOnlyPredicate = false;
+        }
+
         if (!line.includes("process.env")) continue;
 
         const stripped = line.replace(/sanitizeInheritedPaperclipEnv\([^)]*\)/g, "");
         if (!stripped.includes("process.env")) continue;
 
-        if (inGeneratedScript) {
+        if (inGeneratedScript || inReadOnlyPredicate) {
           continue;
         }
 
         const isSpawnEnv =
           /[{,]\s*\.\.\.\(?process\.env/.test(stripped) ||
-          /^\s*\.\.\.\(?process\.env/.test(stripped);
+          /^\s*\.\.\.\(?process\.env/.test(stripped) ||
+          /:\s*\(?process\.env\)?/.test(stripped);
 
         if (isSpawnEnv) {
           throw new Error(
