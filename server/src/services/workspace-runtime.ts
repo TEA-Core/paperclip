@@ -3130,6 +3130,8 @@ export async function assertWorktreeWritableByProcessUser(worktreePath: string):
   }
 }
 
+const LOCKFILE_CONFIG_MISMATCH_SIGNATURE = "ERR_PNPM_LOCKFILE_CONFIG_MISMATCH";
+
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -3140,36 +3142,56 @@ async function provisionExecutionWorktree(input: {
   agent: ExecutionWorkspaceAgentRef;
   created: boolean;
   recorder?: WorkspaceOperationRecorder | null;
-}) {
+}): Promise<string[]> {
   await assertWorktreeWritableByProcessUser(input.worktreePath);
   const provisionCommand = asString(input.strategy.provisionCommand, "").trim();
-  if (!provisionCommand) return;
+  if (!provisionCommand) return [];
   const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
 
-  await recordWorkspaceCommandOperation(input.recorder, {
-    phase: "workspace_provision",
-    command: provisionCommand,
-    resolvedCommand: resolvedProvisionCommand,
-    cwd: input.worktreePath,
-    env: buildWorkspaceCommandEnv({
-      base: input.base,
-      repoRoot: input.repoRoot,
-      worktreePath: input.worktreePath,
-      branchName: input.branchName,
-      issue: input.issue,
-      agent: input.agent,
-      created: input.created,
-    }),
-    label: `Execution workspace provision command "${provisionCommand}"`,
-    metadata: {
-      repoRoot: input.repoRoot,
-      worktreePath: input.worktreePath,
-      branchName: input.branchName,
-      created: input.created,
-      resolvedCommand: resolvedProvisionCommand === provisionCommand ? null : resolvedProvisionCommand,
-    },
-    successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
+  const provisionEnv = buildWorkspaceCommandEnv({
+    base: input.base,
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    branchName: input.branchName,
+    issue: input.issue,
+    agent: input.agent,
+    created: input.created,
   });
+
+  try {
+    await recordWorkspaceCommandOperation(input.recorder, {
+      phase: "workspace_provision",
+      command: provisionCommand,
+      resolvedCommand: resolvedProvisionCommand,
+      cwd: input.worktreePath,
+      env: provisionEnv,
+      label: `Execution workspace provision command "${provisionCommand}"`,
+      metadata: {
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        branchName: input.branchName,
+        created: input.created,
+        resolvedCommand: resolvedProvisionCommand === provisionCommand ? null : resolvedProvisionCommand,
+      },
+      successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
+    });
+    return [];
+  } catch (err) {
+    const errMessage = err instanceof Error ? err.message : String(err);
+    if (!errMessage.includes(LOCKFILE_CONFIG_MISMATCH_SIGNATURE)) {
+      throw err;
+    }
+
+    const retryCommand = resolvedProvisionCommand.replace("--frozen-lockfile", "--no-frozen-lockfile");
+    await runWorkspaceCommand({
+      command: retryCommand,
+      cwd: input.worktreePath,
+      env: provisionEnv,
+      label: `Execution workspace provision command "${provisionCommand}" (retry without --frozen-lockfile)`,
+    });
+
+    return ["pnpm lockfile config mismatch detected; retried install without --frozen-lockfile"];
+  }
 }
 
 export type BaseRepoHygieneDecision =
@@ -3556,7 +3578,7 @@ export async function realizeExecutionWorkspace(input: {
         }),
       });
     }
-    await provisionExecutionWorktree({
+    const provWarnings = await provisionExecutionWorktree({
       strategy: rawStrategy,
       base: input.base,
       repoRoot,
@@ -3574,7 +3596,7 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       branchName: effectiveBranchName,
       worktreePath: reusablePath,
-      warnings: [...extraWarnings, ...baseRepoHygieneWarnings, ...baseRefreshWarnings, ...baseDrift.warnings],
+      warnings: [...extraWarnings, ...baseRepoHygieneWarnings, ...baseRefreshWarnings, ...baseDrift.warnings, ...provWarnings],
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
@@ -3701,7 +3723,7 @@ export async function realizeExecutionWorkspace(input: {
       return await reuseExistingWorktree(reusablePath);
     }
   }
-  await provisionExecutionWorktree({
+  const provWarnings = await provisionExecutionWorktree({
     strategy: rawStrategy,
     base: input.base,
     repoRoot,
@@ -3720,7 +3742,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: [...baseRepoHygieneWarnings, ...baseRefreshWarnings],
+    warnings: [...baseRepoHygieneWarnings, ...baseRefreshWarnings, ...provWarnings],
     created: true,
     baseRefSha: currentBaseRefSha,
   };
@@ -3851,7 +3873,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     realized.warnings = [...repairWarnings, ...baseRefreshWarnings, ...baseDrift.warnings];
     realized.baseRefSha = refresh.baseRefSha ?? recordedBaseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha;
     if (provisionCommand) {
-      await provisionExecutionWorktree({
+      const provWarnings = await provisionExecutionWorktree({
         strategy: {
           type: "git_worktree",
           provisionCommand,
@@ -3865,6 +3887,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         created: false,
         recorder: input.recorder ?? null,
       });
+      realized.warnings = [...realized.warnings, ...provWarnings];
     }
     return realized;
   }
@@ -3937,7 +3960,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     skipRefresh: true,
   });
 
-  await provisionExecutionWorktree({
+  const provWarnings = await provisionExecutionWorktree({
     strategy: {
       type: "git_worktree",
       ...(provisionCommand ? { provisionCommand } : {}),
@@ -3956,7 +3979,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ...realized,
     cwd: worktreePath,
     worktreePath,
-    warnings: [...restoreRefreshWarnings, ...baseDrift.warnings],
+    warnings: [...restoreRefreshWarnings, ...baseDrift.warnings, ...provWarnings],
     created,
     baseRefSha:
       recordedBaseRefSha

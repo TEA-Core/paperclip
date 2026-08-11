@@ -575,6 +575,10 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
         rm -f "$stdout_path" "$stderr_path"
         return 90
       fi
+      if grep -q "ERR_PNPM_LOCKFILE_CONFIG_MISMATCH" "$stdout_path" "$stderr_path"; then
+        rm -f "$stdout_path" "$stderr_path"
+        return 91
+      fi
 
       rm -f "$stdout_path" "$stderr_path"
       return "$exit_code"
@@ -584,8 +588,8 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
       :
     else
       install_exit_code=$?
-      if [[ "$install_exit_code" -eq 90 ]]; then
-        echo "pnpm-lock.yaml is out of date in this execution workspace; retrying install without --frozen-lockfile." >&2
+      if [[ "$install_exit_code" -eq 90 || "$install_exit_code" -eq 91 ]]; then
+        echo "pnpm-lock.yaml is out of date or has a config mismatch in this execution workspace; retrying install without --frozen-lockfile." >&2
         run_pnpm_install --no-frozen-lockfile || {
           restore_moved_symlinks
           exit 1

@@ -415,8 +415,15 @@ export function environmentRunOrchestrator(
         ? lease.metadata.remoteCwd.trim()
         : executionWorkspace.cwd);
     if (provisionCommand && environment.driver !== "local") {
+      let provisionResult: {
+        exitCode: number | null;
+        signal?: string | null;
+        timedOut: boolean;
+        stdout: string;
+        stderr: string;
+      };
       try {
-        const provisionResult = await environmentRuntime.execute({
+        provisionResult = await environmentRuntime.execute({
           environment,
           lease,
           command: "bash",
@@ -428,7 +435,29 @@ export function environmentRunOrchestrator(
           timeoutMs: 300_000,
         });
         if (provisionResult.exitCode !== 0 || provisionResult.timedOut) {
-          throw new Error(formatProvisionFailureDetail(provisionResult));
+          const detail = formatProvisionFailureDetail(provisionResult);
+          if (
+            provisionResult.stderr.includes("ERR_PNPM_LOCKFILE_CONFIG_MISMATCH") ||
+            provisionResult.stdout.includes("ERR_PNPM_LOCKFILE_CONFIG_MISMATCH")
+          ) {
+            const retryCommand = provisionCommand.replace("--frozen-lockfile", "--no-frozen-lockfile");
+            const retryResult = await environmentRuntime.execute({
+              environment,
+              lease,
+              command: "bash",
+              args: ["-lc", retryCommand],
+              cwd: realizedCwd,
+              env: {
+                SHELL: "/bin/bash",
+              },
+              timeoutMs: 300_000,
+            });
+            if (retryResult.exitCode !== 0 || retryResult.timedOut) {
+              throw new Error(formatProvisionFailureDetail(retryResult));
+            }
+          } else {
+            throw new Error(detail);
+          }
         }
       } catch (err) {
         throw new EnvironmentRunError(

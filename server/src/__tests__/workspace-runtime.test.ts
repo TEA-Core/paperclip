@@ -7839,3 +7839,163 @@ describe("preserveUnpushedWorktreeCommits", () => {
     await runGit(repoRoot, ["worktree", "remove", "--force", worktreePath]);
   });
 });
+
+describe("provisionExecutionWorktree lockfile-config-mismatch retry", () => {
+  async function createMockProvisionScript(
+    repoRoot: string,
+    scriptName: string,
+    behavior: "lockfile-config-mismatch" | "unrelated-failure" | "always-succeed",
+  ) {
+    const scriptPath = path.join(repoRoot, scriptName);
+    const scriptContent = {
+      "lockfile-config-mismatch": `#!/bin/bash
+if echo "$@" | grep -q -- "--frozen-lockfile"; then
+  echo "ERR_PNPM_LOCKFILE_CONFIG_MISMATCH: The current patchedDependencies configuration doesn't match the value found in the lockfile" >&2
+  exit 1
+fi
+echo "install succeeded"
+exit 0
+`,
+      "unrelated-failure": `#!/bin/bash
+echo "ENOENT: Cannot find module 'nonexistent'" >&2
+exit 1
+`,
+      "always-succeed": `#!/bin/bash
+echo "install succeeded"
+exit 0
+`,
+    }[behavior];
+    await fs.writeFile(scriptPath, scriptContent, "utf8");
+    await fs.chmod(scriptPath, 0o755);
+    return scriptPath;
+  }
+
+  it("Test A+B: a provision command failing with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH succeeds via retry and records a warning (was RED before the fix — would have thrown)", async () => {
+    const repoRoot = await createTempRepo();
+    const scriptPath = await createMockProvisionScript(repoRoot, "test-provision-fail.sh", "lockfile-config-mismatch");
+
+    const provisionCommand = `bash ./test-provision-fail.sh --frozen-lockfile`;
+
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+          provisionCommand,
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Lockfile config mismatch retry",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(realized.warnings).toContain(
+      "pnpm lockfile config mismatch detected; retried install without --frozen-lockfile",
+    );
+  });
+
+  it("Test C: a provision failure that is NOT a lockfile-config mismatch still fails on the first attempt with no retry", async () => {
+    const repoRoot = await createTempRepo();
+    const scriptPath = await createMockProvisionScript(repoRoot, "test-provision-fail.sh", "unrelated-failure");
+
+    const provisionCommand = `bash ./test-provision-fail.sh --frozen-lockfile`;
+
+    let error: unknown = null;
+    try {
+      await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+            provisionCommand,
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-447",
+          title: "Unrelated failure",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).not.toBeNull();
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("ENOENT");
+    expect((error as Error).message).not.toContain("retried install without --frozen-lockfile");
+  });
+
+  it("Test D (mutation check): the unrelated failure case still rejects — confirming the retry signature match is narrow and does not fire on everything", async () => {
+    const repoRoot = await createTempRepo();
+    const scriptPath = await createMockProvisionScript(repoRoot, "test-provision-fail.sh", "unrelated-failure");
+
+    const provisionCommand = `bash ./test-provision-fail.sh --frozen-lockfile`;
+
+    let error: unknown = null;
+    try {
+      await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+            provisionCommand,
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-447",
+          title: "Mutation check",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).not.toBeNull();
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("ENOENT");
+    expect((error as Error).message).not.toContain("retried install without --frozen-lockfile");
+  });
+});
