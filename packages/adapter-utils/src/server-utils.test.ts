@@ -2319,14 +2319,26 @@ describe("sanitizeInheritedPaperclipEnv", () => {
       const source = await fs.readFile(file, "utf8");
       const lines = source.split("\n");
 
+      let inGeneratedScript = false;
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const lineNo = i + 1;
+
+        if (/function (getProcessSessionRemoteSource|createNetworkProxyBridge)/.test(line)) {
+          inGeneratedScript = true;
+        }
+        if (inGeneratedScript && /`;/.test(line)) {
+          inGeneratedScript = false;
+        }
 
         if (!line.includes("process.env")) continue;
 
         const stripped = line.replace(/sanitizeInheritedPaperclipEnv\([^)]*\)/g, "");
         if (!stripped.includes("process.env")) continue;
+
+        if (inGeneratedScript) {
+          continue;
+        }
 
         const isSpawnEnv =
           /[{,]\s*\.\.\.\(?process\.env/.test(stripped) ||

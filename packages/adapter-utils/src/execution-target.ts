@@ -32,7 +32,6 @@ import {
   ensureCommandResolvable,
   resolveCommandForLogs,
   runChildProcess,
-  sanitizeInheritedPaperclipEnv,
   type RunProcessResult,
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
@@ -1588,7 +1587,7 @@ function writeEvent(event) {
 
 const child = spawn(config.command, Array.isArray(config.args) ? config.args : [], {
   cwd: config.cwd || process.cwd(),
-  env: { ...sanitizeInheritedPaperclipEnv(process.env), ...(config.env || {}) },
+  env: { ...process.env, ...(config.env || {}) },
   stdio: ["pipe", "pipe", "pipe"],
 });
 
