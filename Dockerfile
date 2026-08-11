@@ -76,6 +76,10 @@ RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" &
 # above because each plugin's prebuild depends on the SDK's output.
 RUN node scripts/build-bundled-plugins.mjs
 
+RUN pnpm --filter @paperclipai/shared build
+RUN pnpm --filter @paperclipai/mcp-server build
+RUN test -f packages/mcp-server/dist/stdio.js || (echo "ERROR: mcp-server build output missing" && exit 1)
+
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
