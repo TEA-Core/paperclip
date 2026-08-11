@@ -209,6 +209,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Pre-create secrets key directory
+        run: sudo mkdir -p /etc/paperclip/secrets && sudo chown runner:runner /etc/paperclip/secrets
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
