@@ -1,0 +1,68 @@
+name: Fold deploy gate
+
+# TEA-Core fork only.
+#
+# `pr.yml` gates pull requests. This gates the *merged* state of the deployed
+# line, which is a different failure mode and the one that actually bit us:
+# on 2026-08-10 the fold branch sat merged and unable to compile for two days
+# while every PR page showed green, because the only checks running were AI
+# reviewers. The break was found by hand, during a pre-deploy spot check.
+#
+# Deliberately narrow and fast. It runs the two things that decide whether the
+# branch can ship at all:
+#
+#   1. `pnpm run typecheck` across the workspace
+#   2. `pnpm --filter @paperclipai/server build` — the exact command the
+#      Dockerfile runs, so a red build here means `docker build` cannot succeed
+#
+# Tests are pr.yml's job. Keeping this lane quick means it is still useful as a
+# branch-health signal rather than something people learn to ignore.
+
+on:
+  push:
+    branches:
+      - 'fold/**'
+  workflow_dispatch:
+
+concurrency:
+  group: fold-deploy-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  buildable:
+    name: Branch is buildable
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      # Not redundant with the typecheck above: this is the literal Dockerfile
+      # layer. If it fails, no deployable image can be produced from this commit.
+      - name: Server build (the Dockerfile layer)
+        run: pnpm --filter @paperclipai/server build
+
+      - name: Report
+        if: failure()
+        run: |
+          echo "::error::The deployed fold branch does not build."
+          echo "::error::docker build will fail at 'pnpm --filter @paperclipai/server build'."
+          echo "::error::Do not cut a release image from this commit."

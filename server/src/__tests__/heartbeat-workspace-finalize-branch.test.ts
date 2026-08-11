@@ -34,6 +34,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 
@@ -100,15 +101,6 @@ async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return heartbeat.getRun(runId);
-}
-
-async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
-    if (!runs.some((run) => run.status === "queued" || run.status === "running")) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
 }
 
 async function waitForRuntimeStateLastRun(db: Db, agentId: string, runId: string, timeoutMs = 5_000) {
@@ -275,39 +267,62 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
   }, 20_000);
 
   afterEach(async () => {
-    await waitForHeartbeatIdle(db);
-    adapterExecute.mockReset();
-    adapterExecute.mockImplementation(async () => ({
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      summary: "Finalization branch guard test run.",
-      provider: "test",
-      model: "test-model",
-    }));
-    while (tempRoots.length > 0) {
-      const root = tempRoots.pop();
-      if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    // A run reaching a terminal status is not the same as a run being done writing.
+    // executeRun sets the status and then, in its finally block, finalizes the
+    // workspace, records activity-log entries and promotes the next queued run,
+    // all of it after the row a status poll reads has already gone terminal. This
+    // hook used to poll for "no queued/running run" and then delete, so those
+    // trailing writes landed in the middle of teardown: an activity_log row for the
+    // failed-adapter run was inserted after the log had been cleared, and the
+    // `delete from "agents"` two statements later hit
+    // activity_log_agent_id_agents_id_fk on shard 1/3.
+    //
+    // Quiesce dispatch, then await the in-flight executions the service tracks for
+    // exactly this purpose, the way the sibling heartbeat suites do. The quiesce
+    // gates both dispatch entry points, so a run failing and re-dispatching cannot
+    // keep feeding the drain, and it is held until every row is gone so the next
+    // test starts clean and unsuppressed.
+    dispatchQuiesce.engage({
+      reason: "heartbeat workspace finalize branch teardown",
+      ttlMs: 60_000,
+    });
+    try {
+      await heartbeatService(db).drainActiveRunExecutions();
+      adapterExecute.mockReset();
+      adapterExecute.mockImplementation(async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Finalization branch guard test run.",
+        provider: "test",
+        model: "test-model",
+      }));
+      while (tempRoots.length > 0) {
+        const root = tempRoots.pop();
+        if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
+      }
+      await db.delete(issuePlanDecompositions);
+      await db.delete(issueDocuments);
+      await db.delete(documentRevisions);
+      await db.delete(documents);
+      await db.delete(agentTaskSessions);
+      await db.delete(environmentLeases);
+      await db.delete(workspaceOperations);
+      await deleteHeartbeatRowsAfterActivityLogDrains(db);
+      await db.delete(issueComments);
+      await db.delete(issues);
+      await db.delete(projectWorkspaces);
+      await db.delete(projects);
+      await db.delete(agentWakeupRequests);
+      await db.delete(agentRuntimeState);
+      await db.delete(agents);
+      await db.delete(executionWorkspaces);
+      await db.delete(environments);
+      await db.delete(companySkills);
+      await db.delete(companies);
+    } finally {
+      dispatchQuiesce.release();
     }
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(agentTaskSessions);
-    await db.delete(environmentLeases);
-    await db.delete(workspaceOperations);
-    await deleteHeartbeatRowsAfterActivityLogDrains(db);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(executionWorkspaces);
-    await db.delete(environments);
-    await db.delete(companySkills);
-    await db.delete(companies);
   });
 
   afterAll(async () => {

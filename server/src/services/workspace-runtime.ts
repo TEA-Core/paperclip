@@ -4060,6 +4060,9 @@ export async function preserveUnpushedWorktreeCommits(input: {
     const preservedRef = `${WORKTREE_PRESERVATION_REF_PREFIX}/${safeIdentifier}/${safeBranchName}`;
 
     try {
+      // paperclip:allow-git-push: worktree cleanup would otherwise destroy unpushed commits; this
+      // preserves them under refs/<preservation prefix>/, never a branch, and is the last step
+      // before the worktree is removed.
       await runGit(["push", "origin", `${commitSha}:${preservedRef}`], input.repoRoot);
     } catch (pushErr) {
       const pushMessage = pushErr instanceof Error ? pushErr.message : String(pushErr);
@@ -4074,6 +4077,7 @@ export async function preserveUnpushedWorktreeCommits(input: {
     if (input.recorder) {
       await input.recorder.recordOperation({
         phase: "worktree_cleanup",
+        // paperclip:allow-git-push: display string for the preservation push above, not a push.
         command: formatCommandForDisplay("git", ["push", "origin", `${commitSha}:${preservedRef}`]),
         cwd: input.repoRoot,
         metadata: {

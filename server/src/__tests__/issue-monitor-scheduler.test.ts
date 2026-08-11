@@ -24,6 +24,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 
@@ -59,47 +60,23 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     throw new Error("Timed out waiting for issue monitor heartbeat runs to settle");
   }
 
-  async function heartbeatSideEffectFingerprint() {
-    const [active, events, activity, leases, runtimeServices] = await Promise.all([
-      db
-        .select({ count: sql<number>`count(*)` })
-        .from(heartbeatRuns)
-        .where(sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`),
-      db.select({ count: sql<number>`count(*)` }).from(heartbeatRunEvents),
-      db.select({ count: sql<number>`count(*)` }).from(activityLog),
-      db.select({ count: sql<number>`count(*)` }).from(environmentLeases),
-      db.select({ count: sql<number>`count(*)` }).from(workspaceRuntimeServices),
-    ]);
-
-    return [
-      active[0]?.count ?? 0,
-      events[0]?.count ?? 0,
-      activity[0]?.count ?? 0,
-      leases[0]?.count ?? 0,
-      runtimeServices[0]?.count ?? 0,
-    ].join(":");
-  }
-
-  async function waitForHeartbeatSideEffectsSettled(timeoutMs = 5_000, quietMs = 500) {
-    const deadline = Date.now() + timeoutMs;
-    let previous = "";
-    let stableSince = Date.now();
-    while (Date.now() < deadline) {
-      const current = await heartbeatSideEffectFingerprint();
-      const activeCount = Number(current.split(":")[0] ?? 0);
-      if (current !== previous || activeCount > 0) {
-        previous = current;
-        stableSince = Date.now();
-      } else if (Date.now() - stableSince >= quietMs) {
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    throw new Error("Timed out waiting for issue monitor heartbeat side effects to settle");
-  }
-
   async function cleanupRows() {
-    await waitForHeartbeatSideEffectsSettled();
+    // Triggering a monitor enqueues an on-demand wake, which dispatches a
+    // heartbeat run fire-and-forget (startNextQueuedRunForAgent → executeRun),
+    // and that run keeps writing rows after tickTimers resolves. Await the
+    // in-flight executions the service tracks for exactly this purpose, the
+    // same way heartbeat-issue-liveness-escalation.test.ts does.
+    //
+    // Draining alone is not enough here. These fixtures run a `process` adapter
+    // that produces no output, so every dispatched run fails immediately and
+    // terminal-run recovery re-dispatches the assigned issue, which fails again:
+    // a self-feeding chain that emitted 445 run starts for one agent in 90s on
+    // CI. drainActiveRunExecutions() waits until the in-flight set is empty, so
+    // against an endless chain it never returns and the hook died at its 30s
+    // budget. Engage the dispatch quiesce first (the lever deploys use to stop
+    // starting new work while letting in-flight runs finish), so the chain has a
+    // last link and the drain terminates.
+    await heartbeatService(db).drainActiveRunExecutions();
     await db.delete(heartbeatRunEvents);
     await db.delete(issueComments);
     await db.delete(documentRevisions);
@@ -119,17 +96,24 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   afterEach(async () => {
     seededAgentIds.clear();
-    let lastError: unknown = null;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        await cleanupRows();
-        return;
-      } catch (error) {
-        lastError = error;
-        await new Promise((resolve) => setTimeout(resolve, 100));
+    // Hold the quiesce across every retry, not just one cleanupRows call, so a
+    // failed attempt cannot hand the next one a freshly dispatched run.
+    dispatchQuiesce.engage({ reason: "issue-monitor-scheduler teardown", ttlMs: 60_000 });
+    try {
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await cleanupRows();
+          return;
+        } catch (error) {
+          lastError = error;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
       }
+      throw lastError;
+    } finally {
+      dispatchQuiesce.release();
     }
-    throw lastError;
   });
 
   afterAll(async () => {

@@ -17,7 +17,9 @@ import { runChildProcess } from "../server-utils.js";
 
 const { sanitizeCalls, sanitizeResults } = vi.hoisted(() => ({
   sanitizeCalls: [] as Array<NodeJS.ProcessEnv>,
-  sanitizeResults: [] as Array<Record<string, string>>,
+  // `sanitizeInheritedPaperclipEnv` returns NodeJS.ProcessEnv, whose values are
+  // `string | undefined`; typing this as Record<string, string> does not compile.
+  sanitizeResults: [] as Array<NodeJS.ProcessEnv>,
 }));
 
 vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
@@ -1710,8 +1712,12 @@ describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
     expect(sanitizeCalls.length).toBeGreaterThan(0);
     expect(sanitizeCalls.at(-1)).toBe(process.env);
     const sanitizedEnv = sanitizeResults.at(-1);
-    expect(sanitizedEnv.DATABASE_URL).toBeUndefined();
-    expect(sanitizedEnv.ZZZ_SENTINEL).toBe("sentinel-value");
+    // `.at()` is `T | undefined`. Asserting it is defined keeps the sentinel
+    // assertions below meaningful — optional chaining would let a missing
+    // result pass `toBeUndefined()` and silently stop testing the strip.
+    expect(sanitizedEnv).toBeDefined();
+    expect(sanitizedEnv!.DATABASE_URL).toBeUndefined();
+    expect(sanitizedEnv!.ZZZ_SENTINEL).toBe("sentinel-value");
   });
 
   it("strips secrets from session options env while preserving non-secret inherited keys", async () => {

@@ -4469,8 +4469,19 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         sourceManifest.company?.name ??
         sourceManifest.source?.companyName ??
         "Imported Company";
+      // companies.create() auto-provisions the bundled agents, and their routines
+      // are seeded by the "built-in-bundles" attribution label rather than a real
+      // user, so resolveRoutineResponsibleUserId falls through to the company
+      // default. Set it in the same call the way POST /api/companies does:
+      // assigning it afterwards is too late, and a company created without one
+      // fails auto-provisioning with "Routine requires a responsible user",
+      // taking the whole import with it. Deliberately the importing operator
+      // rather than the exported company's default, which names a principal that
+      // need not exist on this instance.
+      const ownerPrincipalId = actorUserId ?? "board";
       const created = await companies.create({
         name: companyName,
+        defaultResponsibleUserId: ownerPrincipalId,
         description: include.company ? (sourceManifest.company?.description ?? null) : null,
         brandColor: include.company ? (sourceManifest.company?.brandColor ?? null) : null,
         attachmentMaxBytes: include.company
@@ -4495,7 +4506,6 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       if (mode === "agent_safe" && options?.sourceCompanyId) {
         await access.copyActiveUserMemberships(options.sourceCompanyId, created.id);
       } else {
-        const ownerPrincipalId = actorUserId ?? "board";
         await access.ensureMembership(created.id, "user", ownerPrincipalId, "owner", "active");
         await access.ensureRoleDefaultGrants(
           created.id,

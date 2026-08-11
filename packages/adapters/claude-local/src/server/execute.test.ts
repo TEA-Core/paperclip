@@ -4,7 +4,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock, resolveCommandForLogsMock } = vi.hoisted(() => ({
   runAdapterExecutionTargetProcessMock: vi.fn(),
-  ensureCommandResolvableMock: vi.fn(async () => {}),
+  // Typed to match `ensureAdapterExecutionTargetCommandResolvable`. With a
+  // bare `async () => {}` the recorded call tuple is `[]`, so `calls.at(-1)?.[3]`
+  // — the sanitized env this suite exists to assert on — does not typecheck.
+  ensureCommandResolvableMock: vi.fn(async (
+    _command: string,
+    _target: unknown,
+    _cwd: string,
+    _env: NodeJS.ProcessEnv,
+    _options?: { installCommand?: string | null; timeoutSec?: number | null },
+  ) => {}),
   resolveCommandForLogsMock: vi.fn(async (command: string) => command),
 }));
 
@@ -155,7 +164,10 @@ describe("claude local execution — sanitizeInheritedPaperclipEnv at spawn poin
     expect(spy).toHaveBeenCalledWith(process.env);
     const resolveCall = ensureCommandResolvableMock.mock.calls.at(-1);
     const runtimeEnv = resolveCall?.[3];
-    expect(runtimeEnv.DATABASE_URL).toBeUndefined();
-    expect(runtimeEnv.ZZZ_SENTINEL).toBe("sentinel-value");
+    // Assert it is present rather than optional-chaining: a missing call would
+    // otherwise satisfy `toBeUndefined()` and quietly stop testing the strip.
+    expect(runtimeEnv).toBeDefined();
+    expect(runtimeEnv!.DATABASE_URL).toBeUndefined();
+    expect(runtimeEnv!.ZZZ_SENTINEL).toBe("sentinel-value");
   });
 });
