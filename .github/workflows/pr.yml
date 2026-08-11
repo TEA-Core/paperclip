@@ -77,6 +77,9 @@ jobs:
       - name: Test bundled plugin image build coverage
         run: node --test ./scripts/__tests__/build-bundled-plugins.test.mjs
 
+      - name: Test MCP server image build and entrypoint wiring
+        run: node --test ./scripts/__tests__/dockerfile-mcp-server-build.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
