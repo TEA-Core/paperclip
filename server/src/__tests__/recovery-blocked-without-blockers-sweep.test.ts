@@ -202,14 +202,57 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     await instanceSettingsService(db).updateGeneral({ enableBlockedWithoutBlockersAutoHeal: true });
   }
 
-  async function drainAgentRuns(agentId: string, timeoutMs = 5000) {
+  // Waits until nothing the agent owns can still count as an active execution
+  // path, because reconcileBlockedWithoutBlockers skips such candidates
+  // (livePathSkipped) instead of healing them. Polling heartbeat_runs alone is
+  // not enough:
+  //   1. executeRun is dispatched fire-and-forget and its finally block can
+  //      promote and dispatch the next queued run for the same agent *after*
+  //      the previous row has left queued/running, so a poll landing in that
+  //      gap sees a false-quiet database and returns early.
+  //   2. The sweep's skip guards look wider than queued/running runs:
+  //      hasActiveExecutionPath also counts `scheduled_retry` runs and
+  //      `deferred_issue_execution` wakeups, and hasQueuedIssueWake counts
+  //      `queued` wakeups. None of those were awaited.
+  //   3. On a loaded CI runner a run can still be executing when a short wall
+  //      clock deadline lapses; returning silently there left the next sweep
+  //      pass to skip the candidate and fail on an unrelated count assertion.
+  // drainActiveRunExecutions awaits the actual in-flight execution promises
+  // (follow-ups included, since they are registered before the parent settles),
+  // so it is the deterministic primitive; the poll below only confirms the
+  // database agrees, and fails loudly rather than silently timing out.
+  async function drainAgentRuns(agentId: string, timeoutMs = 30_000) {
     const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const activeRuns = await db
-        .select({ id: heartbeatRuns.id })
-        .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, ["queued", "running"] as const)));
-      if (activeRuns.length === 0) return;
+    for (;;) {
+      await heartbeatService(db).drainActiveRunExecutions();
+      const [activeRuns, pendingWakes] = await Promise.all([
+        db
+          .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, agentId),
+              inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"] as const),
+            ),
+          ),
+        db
+          .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.agentId, agentId),
+              inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"] as const),
+            ),
+          ),
+      ]);
+      if (activeRuns.length === 0 && pendingWakes.length === 0) return;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `drainAgentRuns timed out after ${timeoutMs}ms for agent ${agentId}: ` +
+            `${activeRuns.length} active run(s) [${activeRuns.map((run) => run.status).join(", ")}], ` +
+            `${pendingWakes.length} pending wake(s) [${pendingWakes.map((wake) => wake.status).join(", ")}]`,
+        );
+      }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
