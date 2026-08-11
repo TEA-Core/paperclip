@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockLoggerWarn = vi.hoisted(() => vi.fn());
@@ -150,6 +150,17 @@ function blockedWithoutBlockersWrites() {
 }
 
 describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () => {
+  // createApp() pulls in the ../routes/issues.js module graph, whose first
+  // transform costs multiple seconds on a loaded serial CI shard. Charged to
+  // whichever test imports it first, that cost alone can blow vitest's 5s
+  // testTimeout (observed: first test 5005ms timeout, later tests ~150ms once
+  // the graph is cached). Warm the graph in beforeAll, which runs under the
+  // 30s hookTimeout configured in server/vitest.config.ts, so the tests
+  // themselves only pay module re-execution after vi.resetModules().
+  beforeAll(async () => {
+    await createApp();
+  });
+
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
