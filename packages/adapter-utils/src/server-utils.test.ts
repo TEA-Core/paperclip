@@ -2269,6 +2269,100 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
   });
 });
 
+describe("sanitizeInheritedPaperclipEnv", () => {
+  it("strips PAPERCLIP-prefixed vars except runtime allowlist", () => {
+    const env = sanitizeInheritedPaperclipEnv({
+      HOME: "/home/user",
+      PATH: "/usr/bin",
+      PAPERCLIP_API_KEY: "secret-key",
+      PAPERCLIP_DATABASE_URL: "postgres://...",
+      PAPERCLIP_STATSD_HOST: "localhost",
+      PAPERCLIP_RUNTIME_API_URL: "http://runtime",
+      PAPERCLIP_LISTEN_HOST: "0.0.0.0",
+      PAPERCLIP_LISTEN_PORT: "3100",
+      DATABASE_URL: "postgres://old",
+    });
+
+    expect(env.HOME).toBe("/home/user");
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.PAPERCLIP_API_KEY).toBeUndefined();
+    expect(env.PAPERCLIP_DATABASE_URL).toBeUndefined();
+    expect(env.PAPERCLIP_STATSD_HOST).toBeUndefined();
+    expect(env.PAPERCLIP_RUNTIME_API_URL).toBe("http://runtime");
+    expect(env.PAPERCLIP_LISTEN_HOST).toBe("0.0.0.0");
+    expect(env.PAPERCLIP_LISTEN_PORT).toBe("3100");
+    expect(env.DATABASE_URL).toBeUndefined();
+  });
+
+  it("no raw process.env in adapter spawn env builders", async () => {
+    const repoRoot = path.resolve(import.meta.dirname, "../../..");
+    const adaptersDir = path.resolve(repoRoot, "packages/adapters");
+
+    const adapterDirs = await fs.readdir(adaptersDir, { withFileTypes: true });
+    const adapterFiles: string[] = [];
+
+    for (const dir of adapterDirs) {
+      if (!dir.isDirectory()) continue;
+      const executeFile = path.resolve(adaptersDir, dir.name, "src/server/execute.ts");
+      try {
+        await fs.access(executeFile);
+        adapterFiles.push(executeFile);
+      } catch {
+        // file doesn't exist, skip
+      }
+    }
+
+    adapterFiles.push(path.resolve(import.meta.dirname, "execution-target.ts"));
+    adapterFiles.push(path.resolve(import.meta.dirname, "local-process-sandbox.ts"));
+
+    for (const file of adapterFiles) {
+      const source = await fs.readFile(file, "utf8");
+      const lines = source.split("\n");
+
+      let inGeneratedScript = false;
+      let inReadOnlyPredicate = false;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const lineNo = i + 1;
+
+        if (/function (getProcessSessionRemoteSource|createNetworkProxyBridge)/.test(line)) {
+          inGeneratedScript = true;
+        }
+        if (inGeneratedScript && /`;/.test(line)) {
+          inGeneratedScript = false;
+        }
+
+        if (/evaluateCodexCredentialReadiness\s*\(/.test(line)) {
+          inReadOnlyPredicate = true;
+        }
+        if (inReadOnlyPredicate && /\);/.test(line)) {
+          inReadOnlyPredicate = false;
+        }
+
+        if (!line.includes("process.env")) continue;
+
+        const stripped = line.replace(/sanitizeInheritedPaperclipEnv\([^)]*\)/g, "");
+        if (!stripped.includes("process.env")) continue;
+
+        if (inGeneratedScript || inReadOnlyPredicate) {
+          continue;
+        }
+
+        const isSpawnEnv =
+          /[{,]\s*\.\.\.\(?process\.env/.test(stripped) ||
+          /^\s*\.\.\.\(?process\.env/.test(stripped) ||
+          /:\s*\(?process\.env\)?/.test(stripped);
+
+        if (isSpawnEnv) {
+          throw new Error(
+            `${path.basename(file)}:${lineNo} — raw process.env in spawn env without sanitizeInheritedPaperclipEnv:\n  ${line.trim()}`,
+          );
+        }
+      }
+    }
+  });
+});
+
 describe("appendWithByteCap", () => {
   it("keeps valid UTF-8 when trimming through multibyte text", () => {
     const output = appendWithByteCap("prefix ", "hello — world", 7);
