@@ -73,6 +73,64 @@ if (!embeddedPostgresSupport.supported) {
 
 const GRACE_THRESHOLD_MS = 15 * 60 * 1000;
 
+// Cleans up the issue graph plus everything a dispatched heartbeat run may
+// create (run events, environment leases, documents/comments, company skills).
+// CASCADE handles FK references that are omitted from this list.
+const TRUNCATE_ALL_SQL = `
+  TRUNCATE TABLE
+    "activity_log",
+    "document_revisions",
+    "documents",
+    "environment_leases",
+    "environments",
+    "execution_workspaces",
+    "heartbeat_run_events",
+    "heartbeat_run_watchdog_decisions",
+    "heartbeat_runs",
+    "issue_comments",
+    "issue_documents",
+    "issue_relations",
+    "issue_recovery_actions",
+    "issue_thread_interactions",
+    "issue_tree_hold_members",
+    "issue_tree_holds",
+    "issue_work_products",
+    "issues",
+    "agent_wakeup_requests",
+    "agent_runtime_state",
+    "company_skill_versions",
+    "company_skills",
+    "agents",
+    "instance_settings",
+    "companies",
+    "project_workspaces",
+    "projects"
+  RESTART IDENTITY CASCADE
+`;
+
+// TRUNCATE takes AccessExclusiveLock on every listed table, so a heartbeat run
+// dispatched by a heal and still writing in the background can deadlock with it
+// (Postgres 40P01) or block it past lock_timeout (55P03). Losing that race used
+// to abort cleanup and leak the previous test's issues/recovery actions into the
+// next test, which then failed on unrelated count assertions. Retry instead: the
+// competing statement is already finishing when Postgres breaks the cycle.
+function isRetryableLockError(error: unknown): boolean {
+  const codes = new Set(["40P01", "55P03", "40001"]);
+  for (let current: unknown = error, depth = 0; current && depth < 6; depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && codes.has(code)) return true;
+    const message = (current as { message?: unknown }).message;
+    if (
+      typeof message === "string" &&
+      (message.includes("deadlock detected") || message.includes("due to lock timeout"))
+    ) {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -93,40 +151,19 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     // awaits the in-flight execution promises (module-level, shared across
     // heartbeatService instances) so the DB is quiescent before we truncate.
     await heartbeatService(db).drainActiveRunExecutions();
-    // Cleans up the issue graph plus everything a dispatched heartbeat run may
-    // create (run events, environment leases, documents/comments, company skills).
-    // CASCADE handles FK references that are omitted from this list.
-    await db.execute(sql.raw(`
-      TRUNCATE TABLE
-        "activity_log",
-        "document_revisions",
-        "documents",
-        "environment_leases",
-        "environments",
-        "execution_workspaces",
-        "heartbeat_run_events",
-        "heartbeat_run_watchdog_decisions",
-        "heartbeat_runs",
-        "issue_comments",
-        "issue_documents",
-        "issue_relations",
-        "issue_recovery_actions",
-        "issue_thread_interactions",
-        "issue_tree_hold_members",
-        "issue_tree_holds",
-        "issue_work_products",
-        "issues",
-        "agent_wakeup_requests",
-        "agent_runtime_state",
-        "company_skill_versions",
-        "company_skills",
-        "agents",
-        "instance_settings",
-        "companies",
-        "project_workspaces",
-        "projects"
-      RESTART IDENTITY CASCADE
-    `));
+
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await db.execute(sql.raw(TRUNCATE_ALL_SQL));
+        return;
+      } catch (error) {
+        if (!isRetryableLockError(error)) throw error;
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+      }
+    }
+    throw lastError;
   });
 
   afterAll(async () => {
