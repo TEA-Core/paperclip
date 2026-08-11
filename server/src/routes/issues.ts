@@ -3666,10 +3666,25 @@ export function issueRoutes(
     return decision.allowed;
   }
 
-  function requireAgentRunId(req: Request, res: Response) {
+  async function requireAgentRunId(req: Request, res: Response, issueId: string) {
     if (req.actor.type !== "agent") return null;
     const runId = req.actor.runId?.trim();
     if (runId) return runId;
+    const agentId = req.actor.agentId;
+    if (agentId) {
+      const selfDeclared = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.invocationSource, "self_declared"),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (selfDeclared) return selfDeclared.id;
+    }
     res.status(401).json({ error: "Agent run id required" });
     return null;
   }
@@ -3772,7 +3787,7 @@ export function issueRoutes(
     if (opts?.bypassCheckoutOwnership) {
       return true;
     }
-    const runId = requireAgentRunId(req, res);
+    const runId = await requireAgentRunId(req, res, issue.id);
     if (!runId) return false;
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
     if (ownership.adoptedFromRunId) {
@@ -9294,7 +9309,7 @@ export function issueRoutes(
       return;
     }
 
-    const checkoutRunId = requireAgentRunId(req, res);
+    const checkoutRunId = await requireAgentRunId(req, res, id);
     if (req.actor.type === "agent" && !checkoutRunId) return;
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
     const actor = getActorInfo(req);
@@ -9344,7 +9359,7 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
-    const actorRunId = requireAgentRunId(req, res);
+    const actorRunId = await requireAgentRunId(req, res, id);
     if (req.actor.type === "agent" && !actorRunId) return;
 
     const released = await svc.release(
@@ -9478,7 +9493,7 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const agentSourceRunId = req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
+    const agentSourceRunId = req.actor.type === "agent" ? await requireAgentRunId(req, res, id) : null;
     if (req.actor.type === "agent" && !agentSourceRunId) return;
     if (req.body.kind === "request_confirmation" && req.body.payload?.toolAction !== undefined) {
       throw unprocessable("payload.toolAction is server-owned metadata and cannot be supplied when creating an interaction");

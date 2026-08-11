@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -492,5 +492,50 @@ describeEmbeddedPostgres("work-session routes", () => {
     expect(issue.executionRunId).toBeNull();
     expect(issue.executionLockedAt).toBeNull();
     expect(issue.checkoutRunId).toBeNull();
+  });
+
+  it("self-declared run exists in heartbeatRuns after open and persists run ownership", async () => {
+    const fixture = await seedExternalPullAgent();
+    const app = createApp(fixture.agentId, fixture.companyId);
+
+    const openRes = await request(app).post(
+      `/api/issues/${fixture.issueId}/work-session`,
+    );
+    expect(openRes.status).toBe(201);
+    const runId = openRes.body.runId;
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(run.status).toBe("running");
+    expect(run.invocationSource).toBe("self_declared");
+    expect(run.agentId).toBe(fixture.agentId);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId))
+      .then((rows) => rows[0]);
+    expect(issue.checkoutRunId).toBe(runId);
+    expect(issue.executionRunId).toBe(runId);
+    expect(issue.status).toBe("in_progress");
+  });
+
+  it("agent without self-declared run has no running self_declared heartbeat row", async () => {
+    const fixture = await seedExternalPullAgent();
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, fixture.agentId),
+          eq(heartbeatRuns.invocationSource, "self_declared"),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      );
+    expect(runs).toHaveLength(0);
   });
 });
