@@ -49,19 +49,40 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      # Deliberately `--frozen-lockfile`, matching the Dockerfile. A lockfile that
+      # has drifted from the manifests (most often a changed file under patches/,
+      # whose hash the lockfile records) fails here — and would fail the image
+      # build for the same reason. `pr.yml` cannot catch this: it regenerates the
+      # lockfile into a throwaway artifact, and its policy job blocks committing
+      # one, so drift only becomes visible once the branch is merged.
       - name: Install dependencies
+        id: install
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck
+        id: typecheck
         run: pnpm run typecheck
 
       # Not redundant with the typecheck above: this is the literal Dockerfile
       # layer. If it fails, no deployable image can be produced from this commit.
       - name: Server build (the Dockerfile layer)
+        id: build
         run: pnpm --filter @paperclipai/server build
 
-      - name: Report
-        if: failure()
+      - name: Report — lockfile
+        if: failure() && steps.install.outcome == 'failure'
+        run: |
+          echo "::error::pnpm install --frozen-lockfile failed on the deployed branch."
+          echo "::error::The Dockerfile runs this same command, so docker build cannot succeed from this commit."
+          echo "::error::Usually a changed file under patches/ without a matching pnpm-lock.yaml update."
+          echo "::error::Fix: pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile, then commit pnpm-lock.yaml."
+
+      - name: Report — typecheck
+        if: failure() && steps.typecheck.outcome == 'failure'
+        run: echo "::error::The deployed fold branch does not typecheck."
+
+      - name: Report — build
+        if: failure() && steps.build.outcome == 'failure'
         run: |
           echo "::error::The deployed fold branch does not build."
           echo "::error::docker build will fail at 'pnpm --filter @paperclipai/server build'."
