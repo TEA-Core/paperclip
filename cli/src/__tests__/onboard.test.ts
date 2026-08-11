@@ -148,6 +148,16 @@ describe("onboard", () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-onboard-cwd-"));
     process.chdir(cwd);
     process.env.PAPERCLIP_HOME = home;
+    // The master key deliberately no longer lives under PAPERCLIP_HOME: its
+    // default is /etc/paperclip/secrets/master.key, outside the volume mounted
+    // into agent workspaces. Point the override at a temp path so this test
+    // still proves onboard creates the key without touching a machine-global
+    // directory that is not writable on every host.
+    const keyFilePath = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-onboard-secrets-")),
+      "master.key",
+    );
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = keyFilePath;
 
     await onboard({ yes: true, invokedByRun: true });
 
@@ -159,9 +169,10 @@ describe("onboard", () => {
     expect(raw.database.backup.dir).toBe(path.join(instanceRoot, "data", "backups"));
     expect(raw.logging.logDir).toBe(path.join(instanceRoot, "logs"));
     expect(raw.storage.localDisk.baseDir).toBe(path.join(instanceRoot, "data", "storage"));
-    expect(raw.secrets.localEncrypted.keyFilePath).toBe(path.join(instanceRoot, "secrets", "master.key"));
+    expect(raw.secrets.localEncrypted.keyFilePath).toBe(keyFilePath);
     expect(fs.existsSync(path.join(instanceRoot, ".env"))).toBe(true);
-    expect(fs.existsSync(path.join(instanceRoot, "secrets", "master.key"))).toBe(true);
+    expect(fs.existsSync(keyFilePath)).toBe(true);
+    expect(fs.existsSync(path.join(instanceRoot, "secrets", "master.key"))).toBe(false);
   });
 
   it("supports authenticated/private quickstart bind presets", async () => {

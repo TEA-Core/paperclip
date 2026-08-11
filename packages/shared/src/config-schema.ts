@@ -88,14 +88,14 @@ export const storageConfigSchema = z.object({
 });
 
 export const secretsLocalEncryptedConfigSchema = z.object({
-  keyFilePath: z.string().default("~/.paperclip/instances/default/secrets/master.key"),
+  keyFilePath: z.string().default("/etc/paperclip/secrets/master.key"),
 });
 
 export const secretsConfigSchema = z.object({
   provider: z.enum(SECRET_PROVIDERS).default("local_encrypted"),
   strictMode: z.boolean().default(false),
   localEncrypted: secretsLocalEncryptedConfigSchema.default({
-    keyFilePath: "~/.paperclip/instances/default/secrets/master.key",
+    keyFilePath: "/etc/paperclip/secrets/master.key",
   }),
 });
 
@@ -131,7 +131,7 @@ export const paperclipConfigSchema = z
       provider: "local_encrypted",
       strictMode: false,
       localEncrypted: {
-        keyFilePath: "~/.paperclip/instances/default/secrets/master.key",
+        keyFilePath: "/etc/paperclip/secrets/master.key",
       },
     }),
   })

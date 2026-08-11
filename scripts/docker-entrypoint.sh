@@ -39,6 +39,12 @@ if [ "$changed" = "1" ]; then
     chown -R node:node /paperclip
 fi
 
+# Pre-create the secrets key directory with paperclip-user ownership.
+# The server's local-encrypted provider writes /etc/paperclip/secrets/master.key
+# at startup; this directory is outside the agent-visible volume and must exist.
+mkdir -p /etc/paperclip/secrets
+chown node:node /etc/paperclip/secrets
+
 # Refresh the MCP server and its shared dependency in the npm-global prefix.
 # The image builds both packages into /app/packages/<pkg>/dist/, but the MCP
 # client resolves paperclip-mcp-server from /paperclip/.npm-global/, which is a

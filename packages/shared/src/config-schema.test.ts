@@ -22,6 +22,6 @@ describe("paperclip config schema", () => {
     expect(parsed.database.backup.dir).toBe("~/.paperclip/instances/default/data/backups");
     expect(parsed.logging.logDir).toBe("~/.paperclip/instances/default/logs");
     expect(parsed.storage.localDisk.baseDir).toBe("~/.paperclip/instances/default/data/storage");
-    expect(parsed.secrets.localEncrypted.keyFilePath).toBe("~/.paperclip/instances/default/secrets/master.key");
+    expect(parsed.secrets.localEncrypted.keyFilePath).toBe("/etc/paperclip/secrets/master.key");
   });
 });

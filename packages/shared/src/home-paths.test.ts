@@ -31,6 +31,6 @@ describe("home path resolution", () => {
     expect(resolveDefaultBackupDir()).toBe(path.join(instanceRoot, "data", "backups"));
     expect(resolveDefaultLogsDir()).toBe(path.join(instanceRoot, "logs"));
     expect(resolveDefaultStorageDir()).toBe(path.join(instanceRoot, "data", "storage"));
-    expect(resolveDefaultSecretsKeyFilePath()).toBe(path.join(instanceRoot, "secrets", "master.key"));
+    expect(resolveDefaultSecretsKeyFilePath()).toBe("/etc/paperclip/secrets/master.key");
   });
 });
