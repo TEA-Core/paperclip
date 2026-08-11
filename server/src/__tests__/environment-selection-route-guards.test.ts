@@ -78,6 +78,7 @@ vi.mock("../services/index.js", () => ({
   heartbeatService: () => ({
     getRun: vi.fn(),
     getActiveRunForAgent: vi.fn(),
+    getRunById: vi.fn(),
   }),
   issueApprovalService: () => ({
     listApprovalsForIssue: vi.fn(),

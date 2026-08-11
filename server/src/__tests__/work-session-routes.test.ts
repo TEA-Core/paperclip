@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -12,6 +12,7 @@ import {
   projects,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/error-handler.js";
+import { issueRoutes } from "../routes/issues.js";
 import { workSessionRoutes } from "../routes/work-sessions.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -81,7 +82,6 @@ describeEmbeddedPostgres("work-session routes", () => {
       status: "todo",
       priority: "medium",
       assigneeAgentId: agentId,
-      responsibleUserId: "test-user",
       createdByUserId: "cloud-user-1",
     });
 
@@ -149,6 +149,24 @@ describeEmbeddedPostgres("work-session routes", () => {
       next();
     });
     app.use("/api", workSessionRoutes(db));
+    app.use(errorHandler);
+    return app;
+  }
+
+  function createFullApp(agentId: string, companyId: string) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "agent",
+        agentId,
+        companyId,
+        source: "agent_jwt",
+      };
+      next();
+    });
+    app.use("/api", workSessionRoutes(db));
+    app.use("/api", issueRoutes(db, {} as any));
     app.use(errorHandler);
     return app;
   }
@@ -492,5 +510,189 @@ describeEmbeddedPostgres("work-session routes", () => {
     expect(issue.executionRunId).toBeNull();
     expect(issue.executionLockedAt).toBeNull();
     expect(issue.checkoutRunId).toBeNull();
+  });
+
+  it("agent with open self-declared session can PATCH the issue without replaying the run id", async () => {
+    const fixture = await seedExternalPullAgent();
+    const app = createFullApp(fixture.agentId, fixture.companyId);
+
+    const openRes = await request(app).post(
+      `/api/issues/${fixture.issueId}/work-session`,
+    );
+    expect(openRes.status).toBe(201);
+
+    const patchRes = await request(app)
+      .patch(`/api/issues/${fixture.issueId}`)
+      .send({ title: "Updated inside the work session" });
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(200);
+    expect(patchRes.body.title).toBe("Updated inside the work session");
+  });
+
+  it("agent without self-declared session gets 401 on PATCH of in_progress issue", async () => {
+    const fixture = await seedExternalPullAgent();
+    const app = createFullApp(fixture.agentId, fixture.companyId);
+
+    await db
+      .update(issues)
+      .set({ status: "in_progress" })
+      .where(eq(issues.id, fixture.issueId));
+
+    const patchRes = await request(app)
+      .patch(`/api/issues/${fixture.issueId}`)
+      .send({ title: "Updated without a session" });
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(401);
+    expect(patchRes.body.error).toBe("Agent run id required");
+  });
+
+  it("session on issue A does not grant run-scoped PATCH access to issue B", async () => {
+    const fixture = await seedExternalPullAgent();
+    const otherIssueId = randomUUID();
+    const app = createFullApp(fixture.agentId, fixture.companyId);
+
+    // Second issue in the same company, assigned to and checked out by the same
+    // agent: only the run scoping can keep this request out.
+    await db.insert(issues).values({
+      id: otherIssueId,
+      companyId: fixture.companyId,
+      identifier: `${fixture.identifier}-B`,
+      title: "Second work session test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: fixture.agentId,
+      createdByUserId: "cloud-user-1",
+    });
+
+    const openRes = await request(app).post(
+      `/api/issues/${fixture.issueId}/work-session`,
+    );
+    expect(openRes.status).toBe(201);
+
+    const patchRes = await request(app)
+      .patch(`/api/issues/${otherIssueId}`)
+      .send({ title: "Updated from another issue's session" });
+    expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(401);
+    expect(patchRes.body.error).toBe("Agent run id required");
+  });
+
+  it("closing the session ends the run-id fallback until a new session is opened", async () => {
+    const fixture = await seedExternalPullAgent();
+    const app = createFullApp(fixture.agentId, fixture.companyId);
+
+    const openRes = await request(app).post(
+      `/api/issues/${fixture.issueId}/work-session`,
+    );
+    expect(openRes.status).toBe(201);
+    const runId = openRes.body.runId;
+
+    const closeRes = await request(app)
+      .post(`/api/issues/${fixture.issueId}/work-session/close`)
+      .send({ runId, outcome: "succeeded", summary: "done" });
+    expect(closeRes.status).toBe(200);
+
+    const afterCloseRes = await request(app)
+      .patch(`/api/issues/${fixture.issueId}`)
+      .send({ title: "Updated after close" });
+    expect(afterCloseRes.status, JSON.stringify(afterCloseRes.body)).toBe(401);
+    expect(afterCloseRes.body.error).toBe("Agent run id required");
+
+    const reopenRes = await request(app).post(
+      `/api/issues/${fixture.issueId}/work-session`,
+    );
+    expect(reopenRes.status).toBe(201);
+
+    const afterReopenRes = await request(app)
+      .patch(`/api/issues/${fixture.issueId}`)
+      .send({ title: "Updated in the new session" });
+    expect(afterReopenRes.status, JSON.stringify(afterReopenRes.body)).toBe(200);
+    expect(afterReopenRes.body.title).toBe("Updated in the new session");
+  });
+
+  it("self-declared run exists in heartbeatRuns after open and persists run ownership", async () => {
+    const fixture = await seedExternalPullAgent();
+    const app = createApp(fixture.agentId, fixture.companyId);
+
+    const openRes = await request(app).post(
+      `/api/issues/${fixture.issueId}/work-session`,
+    );
+    expect(openRes.status).toBe(201);
+    const runId = openRes.body.runId;
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(run.status).toBe("running");
+    expect(run.invocationSource).toBe("self_declared");
+    expect(run.agentId).toBe(fixture.agentId);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId))
+      .then((rows) => rows[0]);
+    expect(issue.checkoutRunId).toBe(runId);
+    expect(issue.executionRunId).toBe(runId);
+    expect(issue.status).toBe("in_progress");
+  });
+
+  it("agent without self-declared run has no running self_declared heartbeat row", async () => {
+    const fixture = await seedExternalPullAgent();
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, fixture.agentId),
+          eq(heartbeatRuns.invocationSource, "self_declared"),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      );
+    expect(runs).toHaveLength(0);
+  });
+
+  it("two concurrent self-declared sessions on different issues both grant PATCH access to their respective issues", async () => {
+    const fixture = await seedExternalPullAgent();
+
+    const issueBId = randomUUID();
+    const projectBId = randomUUID();
+    await db.insert(projects).values({
+      id: projectBId,
+      companyId: fixture.companyId,
+      name: "Concurrent session project",
+      status: "active",
+    });
+    await db.insert(issues).values({
+      id: issueBId,
+      companyId: fixture.companyId,
+      identifier: `${fixture.identifier}-B`,
+      projectId: projectBId,
+      title: "Concurrent session issue B",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: fixture.agentId,
+      createdByUserId: "cloud-user-1",
+    });
+
+    const app = createFullApp(fixture.agentId, fixture.companyId);
+
+    const openARes = await request(app).post(`/api/issues/${fixture.issueId}/work-session`);
+    expect(openARes.status, JSON.stringify(openARes.body)).toBe(201);
+
+    const openBRes = await request(app).post(`/api/issues/${issueBId}/work-session`);
+    expect(openBRes.status, JSON.stringify(openBRes.body)).toBe(201);
+
+    const patchBRes = await request(app)
+      .patch(`/api/issues/${issueBId}`)
+      .send({ title: "Updated B" });
+    expect(patchBRes.status, JSON.stringify(patchBRes.body)).toBe(200);
+    expect(patchBRes.body.title).toBe("Updated B");
+
+    const patchARes = await request(app)
+      .patch(`/api/issues/${fixture.issueId}`)
+      .send({ title: "Updated A" });
+    expect(patchARes.status, JSON.stringify(patchARes.body)).toBe(200);
+    expect(patchARes.body.title).toBe("Updated A");
   });
 });
