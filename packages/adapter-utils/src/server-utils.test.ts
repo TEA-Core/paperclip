@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { Readable } from "node:stream";
+import { describe, expect, it, vi } from "vitest";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
@@ -26,6 +28,14 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    spawn: vi.fn().mockImplementation(actual.spawn),
+  };
+});
 
 function isPidAlive(pid: number) {
   try {
@@ -794,6 +804,88 @@ describe("runChildProcess", () => {
         } catch {
           // Ignore cleanup races.
         }
+      }
+    }
+  });
+
+  // SUP-12163: Behavioral guard for the sanitizeInheritedPaperclipEnv choke point
+  // in runChildProcess (server-utils.ts:~3057). The source-glob guard does not scan
+  // server-utils.ts, so this test is the only fixture that fails when the choke
+  // point is reverted to ...process.env.
+  it("strips sensitive env vars from spawned child process env", async () => {
+    const origEnv = { ...process.env };
+
+    // Positive sentinels: must survive into the observed child env. Without these,
+    // absence assertions (toBeUndefined) pass for free against an empty/undefined
+    // object.
+    process.env.TEST_SUP12163_HOME = "/home/test";
+    process.env.TEST_SUP12163_PATH = "/usr/bin";
+    // Sensitive vars the choke point must strip.
+    process.env.DATABASE_URL = "postgres://user:pass@db/paperclip";
+    process.env.DATABASE_MIGRATION_URL = "postgres://user:pass@db/paperclip_migrations";
+    process.env.PAPERCLIP_API_KEY = "test-secret-api-key";
+    process.env.BETTER_AUTH_SECRET = "test-secret-auth";
+    // Non-allowlist PAPERCLIP_ var that must be removed.
+    process.env.PAPERCLIP_CUSTOM = "should-be-stripped";
+
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+
+    try {
+      const mockedSpawn = vi.mocked(spawn);
+      mockedSpawn.mockImplementationOnce((_command, _args, options) => {
+        capturedEnv = options?.env;
+        // Return a mock child that resolves immediately so runChildProcess settles.
+        const child = new EventEmitter() as any;
+        child.pid = 99999;
+        child.killed = false;
+        child.exitCode = null;
+        child.signalCode = null;
+        child.stdout = new Readable({ read() { this.push(null); } });
+        child.stderr = new Readable({ read() { this.push(null); } });
+        child.kill = vi.fn();
+        setImmediate(() => {
+          child.exitCode = 0;
+          child.emit("close", 0, null);
+        });
+        return child;
+      });
+
+      const result = await runChildProcess(
+        randomUUID(),
+        "echo",
+        ["hello"],
+        {
+          cwd: "/tmp",
+          env: {},
+          timeoutSec: 1,
+          graceSec: 0,
+          onLog: async () => {},
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+
+      // Positive sentinels: prove we observed the real spawn env (not an
+      // empty/undefined object where toBeUndefined would pass for free).
+      expect(capturedEnv).toBeDefined();
+      expect(capturedEnv!.TEST_SUP12163_HOME).toBe("/home/test");
+      expect(capturedEnv!.TEST_SUP12163_PATH).toBe("/usr/bin");
+
+      // Sensitive vars must be absent from the env handed to spawn.
+      expect(capturedEnv!.DATABASE_URL).toBeUndefined();
+      expect(capturedEnv!.DATABASE_MIGRATION_URL).toBeUndefined();
+      expect(capturedEnv!.PAPERCLIP_API_KEY).toBeUndefined();
+      expect(capturedEnv!.BETTER_AUTH_SECRET).toBeUndefined();
+
+      // Non-allowlist PAPERCLIP_ var must be stripped.
+      expect(capturedEnv!.PAPERCLIP_CUSTOM).toBeUndefined();
+    } finally {
+      // Restore process.env to avoid cross-test pollution.
+      for (const key of Object.keys(process.env)) {
+        if (!(key in origEnv)) delete process.env[key];
+      }
+      for (const key of Object.keys(origEnv)) {
+        process.env[key] = origEnv[key];
       }
     }
   });
