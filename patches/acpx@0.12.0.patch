@@ -18,6 +18,19 @@
    sessionOptions?: {
      model?: string;
      allowedTools?: string[];
+@@ -268,6 +269,12 @@
+    * passing them to acpx.
+    */
+   env?: Record<string, string>;
++  /**
++   * Keys to delete from the agent child process environment before spawn.
++   * Unlike env (which overlays process.env), deletions here apply AFTER the
++   * process.env copy — callers can truly remove inherited secrets.
++   */
++  envUnset?: string[];
+ };
+ //#endregion
+ export { AcpPermissionRequest as a, NonInteractivePermissionPolicy as c, PermissionStats as d, SessionRecord as f, AcpPermissionDecision as i, PermissionMode as l, SystemPromptOption as n, AuthPolicy as o, PromptInput as p, AcpClientOptions as r, McpServer$1 as s, SessionAgentOptions as t, PermissionPolicy as u };
 --- a/dist/runtime.js
 +++ b/dist/runtime.js
 @@ -744,7 +744,8 @@
@@ -41,10 +54,46 @@
  const OPAQUE_VALUE_PATHS = /* @__PURE__ */ new Set([
  	"agent_capabilities",
  	"messages.Agent.content.ToolUse.input",
-@@ -2562,1 +2562,1 @@
+@@ -2557,7 +2557,7 @@
+ 		escaping: false,
+ 		hasPart: true
+ 	};
 -	if (state.ch === "\\" && state.quote !== "'") return {
 +	if (process.platform !== "win32" && state.ch === "\\" && state.quote !== "'") return {
-@@ -3960,6 +3960,10 @@
+ 		current: state.current,
+ 		quote: state.quote,
+ 		escaping: true,
+@@ -2912,7 +2912,7 @@
+ 	}
+ 	return protectedKeys;
+ }
+-function buildAgentEnvironment(authCredentials, sessionEnv) {
++function buildAgentEnvironment(authCredentials, sessionEnv, envUnset) {
+ 	const env = { ...process.env };
+ 	const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
+ 	if (authCredentials) for (const [methodId, credential] of Object.entries(authCredentials)) {
+@@ -2923,6 +2923,7 @@
+ 		if (typeof value !== "string" || protectedAuthEnvKeys.has(protectedEnvKey(key))) continue;
+ 		assignSessionEnv(env, key, value);
+ 	}
++	if (envUnset) for (const key of envUnset) delete env[key];
+ 	return env;
+ }
+ function assignSessionEnv(env, key, value) {
+@@ -2955,10 +2956,10 @@
+ 	const configCredentials = authCredentials ?? {};
+ 	return configCredentials[methodId] ?? configCredentials[toEnvToken(methodId)];
+ }
+-function buildAgentSpawnOptions(cwd, authCredentials, sessionEnv) {
++function buildAgentSpawnOptions(cwd, authCredentials, sessionEnv, envUnset) {
+ 	return {
+ 		cwd,
+-		env: buildAgentEnvironment(authCredentials, sessionEnv),
++		env: buildAgentEnvironment(authCredentials, sessionEnv, envUnset),
+ 		stdio: [
+ 			"pipe",
+ 			"pipe",
+@@ -3960,6 +3961,10 @@
  		const startupStderr = [];
  		child.stderr.on("data", (chunk) => {
  			this.captureStartupStderr(startupStderr, chunk);
@@ -55,3 +104,12 @@
  			if (!this.options.verbose) return;
  			process.stderr.write(chunk);
  		});
+@@ -3994,7 +3999,7 @@
+ 			geminiAcp: isGeminiAcpCommand(spawnCommand, args),
+ 			copilotAcp: isCopilotAcpCommand(spawnCommand, args),
+ 			claudeAcp: isClaudeAcpCommand(spawnCommand, args),
+-			spawnOptions: buildAgentSpawnOptions(this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env)
++			spawnOptions: buildAgentSpawnOptions(this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.sessionOptions?.envUnset)
+ 		};
+ 	}
+ 	logAgentLaunch(plan) {

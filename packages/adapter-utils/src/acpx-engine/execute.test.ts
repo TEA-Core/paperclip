@@ -1713,4 +1713,81 @@ describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
     expect(sanitizedEnv.DATABASE_URL).toBeUndefined();
     expect(sanitizedEnv.ZZZ_SENTINEL).toBe("sentinel-value");
   });
+
+  it("strips secrets from session options env while preserving non-secret inherited keys", async () => {
+    process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    process.env.BETTER_AUTH_SECRET = "secret-auth-value";
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "secret-tool-action";
+    process.env.ZZZ_SENTINEL = "sentinel-value";
+    try {
+      const { sessionInputs } = await runExecutor({
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+      });
+      const sessionEnv = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+      expect(sessionEnv.DATABASE_URL).toBeUndefined();
+      expect(sessionEnv.BETTER_AUTH_SECRET).toBeUndefined();
+      expect(sessionEnv.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
+      expect(sessionEnv.ZZZ_SENTINEL).toBe("sentinel-value");
+      expect(sessionEnv.PAPERCLIP_AGENT_ID).toBe("agent-1");
+    } finally {
+      delete process.env.DATABASE_URL;
+      delete process.env.BETTER_AUTH_SECRET;
+      delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      delete process.env.ZZZ_SENTINEL;
+    }
+  });
+
+  it("passes envUnset through sessionOptions so the spawn boundary can strip secrets from process.env", async () => {
+    process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    process.env.BETTER_AUTH_SECRET = "secret-auth-value";
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "secret-tool-action";
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = "secret-master-key";
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = "/tmp/secret-master-key-file";
+    process.env.DATABASE_MIGRATION_URL = "postgres://example.test/paperclip-mig";
+    process.env.ZZZ_SENTINEL = "sentinel-value";
+    try {
+      const { sessionInputs } = await runExecutor({
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+      });
+      const sessionOptions = sessionInputs[0]!.sessionOptions as {
+        env: Record<string, string>;
+        envUnset: string[];
+      };
+
+      expect(Array.isArray(sessionOptions.envUnset)).toBe(true);
+      expect(sessionOptions.envUnset).toContain("DATABASE_URL");
+      expect(sessionOptions.envUnset).toContain("DATABASE_MIGRATION_URL");
+      expect(sessionOptions.envUnset).toContain("BETTER_AUTH_SECRET");
+      expect(sessionOptions.envUnset).toContain("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET");
+      expect(sessionOptions.envUnset).toContain("PAPERCLIP_SECRETS_MASTER_KEY");
+      expect(sessionOptions.envUnset).toContain("PAPERCLIP_SECRETS_MASTER_KEY_FILE");
+
+      // Simulate the acpx spawn env construction (copy process.env + overlay
+      // session env + delete envUnset keys) to assert the spawn boundary.
+      const spawnEnv = {
+        ...process.env,
+        ...sessionOptions.env,
+      };
+      for (const key of sessionOptions.envUnset) delete spawnEnv[key];
+
+      expect(spawnEnv.DATABASE_URL).toBeUndefined();
+      expect(spawnEnv.DATABASE_MIGRATION_URL).toBeUndefined();
+      expect(spawnEnv.BETTER_AUTH_SECRET).toBeUndefined();
+      expect(spawnEnv.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
+      expect(spawnEnv.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
+      expect(spawnEnv.PAPERCLIP_SECRETS_MASTER_KEY_FILE).toBeUndefined();
+      expect(spawnEnv.ZZZ_SENTINEL).toBe("sentinel-value");
+      expect(spawnEnv.PAPERCLIP_AGENT_ID).toBe("agent-1");
+    } finally {
+      delete process.env.DATABASE_URL;
+      delete process.env.BETTER_AUTH_SECRET;
+      delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      delete process.env.DATABASE_MIGRATION_URL;
+      delete process.env.ZZZ_SENTINEL;
+    }
+  });
 });
