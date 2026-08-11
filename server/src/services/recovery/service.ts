@@ -5976,6 +5976,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       blockedWithoutBlockersHealed: 0,
       blockedWithoutBlockersEscalated: 0,
       blockedWithoutBlockersLivePathSkipped: 0,
+      blockedWithoutBlockersQueuedWakeSkipped: 0,
       blockedWithoutBlockersInteractionSkipped: 0,
       blockedWithoutBlockersPauseHoldSkipped: 0,
       blockedWithoutBlockersGraceThresholdSkipped: 0,
@@ -6017,6 +6018,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.blockedWithoutBlockersHealed = blockedWithoutBlockers.healed;
     result.blockedWithoutBlockersEscalated = blockedWithoutBlockers.escalated;
     result.blockedWithoutBlockersLivePathSkipped = blockedWithoutBlockers.livePathSkipped;
+    result.blockedWithoutBlockersQueuedWakeSkipped = blockedWithoutBlockers.queuedWakeSkipped;
     result.blockedWithoutBlockersInteractionSkipped = blockedWithoutBlockers.interactionSkipped;
     result.blockedWithoutBlockersPauseHoldSkipped = blockedWithoutBlockers.pauseHoldSkipped;
     result.blockedWithoutBlockersGraceThresholdSkipped = blockedWithoutBlockers.graceThresholdSkipped;
@@ -6188,6 +6190,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       escalated: 0,
       healed: 0,
       livePathSkipped: 0,
+      queuedWakeSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
       graceThresholdSkipped: 0,
@@ -6259,6 +6262,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         if (await hasActiveExecutionPath(companyId, candidate.id, null, candidate.monitorNextCheckAt)) {
           result.livePathSkipped++;
+          continue;
+        }
+
+        if (await hasQueuedIssueWake(companyId, candidate.id, candidate.assigneeAgentId)) {
+          result.queuedWakeSkipped++;
           continue;
         }
 
