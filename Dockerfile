@@ -91,7 +91,7 @@ RUN test -f packages/mcp-server/dist/stdio.js || (echo "ERROR: mcp-server build 
 # which npm install --global cannot resolve. We install shared first, then
 # patch the mcp-server tarball's package.json to replace "workspace:*" with the
 # installed shared version before installing it.
-RUN mkdir -p /opt/paperclip-mcp \
+RUN mkdir -p /opt/paperclip-mcp /opt/paperclip-mcp-tarballs \
   && cd packages/shared && npm pack --pack-destination /opt/paperclip-mcp-tarballs && cd /app \
   && cd packages/mcp-server && npm pack --pack-destination /opt/paperclip-mcp-tarballs && cd /app \
   && npm install --global --omit=dev --prefix /opt/paperclip-mcp \
