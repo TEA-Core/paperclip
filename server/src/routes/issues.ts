@@ -3687,17 +3687,8 @@ export function issueRoutes(
     if (req.actor.type !== "agent") return null;
     const runId = req.actor.runId?.trim();
     if (runId) return runId;
-    const agentId = req.actor.agentId;
-    if (agentId && issueId) {
-      const selfDeclaredRunId = await resolveSelfDeclaredRunIdForIssue(agentId, issueId);
-      if (selfDeclaredRunId) return selfDeclaredRunId;
-      const issue = await db
-        .select({ checkoutRunId: issueRows.checkoutRunId })
-        .from(issueRows)
-        .where(eq(issueRows.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      if (!issue?.checkoutRunId) return agentId;
-    }
+    const selfDeclaredRunId = await resolveSelfDeclaredRunIdForIssue(req.actor.agentId, issueId);
+    if (selfDeclaredRunId) return selfDeclaredRunId;
     res.status(401).json({ error: "Agent run id required" });
     return null;
   }
@@ -3802,7 +3793,6 @@ export function issueRoutes(
     }
     const runId = await requireAgentRunId(req, res, issue.id);
     if (!runId) return false;
-    if (runId === actorAgentId) return true;
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
