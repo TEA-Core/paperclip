@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
   createApprovalSchema,
+  createApprovalObjectSchema,
   addApprovalCommentSchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
@@ -102,5 +104,40 @@ describe("createApprovalSchema issue-gating validation", () => {
       payload: { title: "Strategy" },
     });
     expect(parsed.issueIds).toBeUndefined();
+  });
+});
+
+describe("createApprovalObjectSchema", () => {
+  it("stays a ZodObject so consumers can merge it", () => {
+    expect(createApprovalObjectSchema).toBeInstanceOf(z.ZodObject);
+
+    const merged = z.object({ companyId: z.string().uuid().optional() })
+      .merge(createApprovalObjectSchema);
+
+    expect(Object.keys(merged.shape).sort()).toEqual([
+      "companyId",
+      "issueIds",
+      "payload",
+      "requestedByAgentId",
+      "type",
+    ]);
+    expect(
+      merged.parse({
+        type: "request_board_approval",
+        payload: { title: "Approve" },
+      }),
+    ).toEqual({ type: "request_board_approval", payload: { title: "Approve" } });
+  });
+
+  it("carries the field-level rules without the issue-gating refinement", () => {
+    expect(() =>
+      createApprovalObjectSchema.parse({ type: "not_a_real_type", payload: {} }),
+    ).toThrow();
+    expect(
+      createApprovalObjectSchema.parse({
+        type: "request_board_approval",
+        payload: { title: "Approve" },
+      }).issueIds,
+    ).toBeUndefined();
   });
 });

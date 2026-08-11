@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import { PaperclipApiClient } from "./client.js";
 import { createToolDefinitions } from "./tools.js";
 
@@ -503,6 +504,37 @@ describe("paperclip MCP tools", () => {
       type: "hire_agent",
       payload: { branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
+    });
+  });
+
+  it("exposes paperclipCreateApproval as a mergeable object schema", () => {
+    const tool = getTool("paperclipCreateApproval");
+
+    expect(tool.schema).toBeInstanceOf(z.ZodObject);
+    expect(Object.keys(tool.schema.shape).sort()).toEqual([
+      "companyId",
+      "issueIds",
+      "payload",
+      "requestedByAgentId",
+      "type",
+    ]);
+  });
+
+  it("leaves issue-gating issueIds enforcement to the server on create approval", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ id: "approval-1" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipCreateApproval");
+    await tool.execute({
+      type: "request_board_approval",
+      payload: { title: "Approve" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({
+      type: "request_board_approval",
+      payload: { title: "Approve" },
     });
   });
 
