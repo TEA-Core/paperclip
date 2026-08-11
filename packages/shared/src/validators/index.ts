@@ -550,6 +550,8 @@ export {
 
 export {
   createApprovalSchema,
+  createApprovalObjectSchema,
+  refineIssueGatingApprovalIssueIds,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,

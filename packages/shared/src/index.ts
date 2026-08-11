@@ -1701,6 +1701,8 @@ export {
   type CreateGoal,
   type UpdateGoal,
   createApprovalSchema,
+  createApprovalObjectSchema,
+  refineIssueGatingApprovalIssueIds,
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   resolveApprovalSchema,
