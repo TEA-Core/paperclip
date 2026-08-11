@@ -3791,16 +3791,12 @@ export function issueRoutes(
     if (opts?.bypassCheckoutOwnership) {
       return true;
     }
+    // `requireAgentRunId` has already written the 401 response when it returns
+    // null, so the only safe outcome here is to deny. Returning true on a
+    // missing run id (e.g. for issues without a `checkoutRunId`) lets the route
+    // handler keep mutating behind an already-sent 401.
     const runId = await requireAgentRunId(req, res, issue.id);
-    if (!runId) {
-      const checkoutInfo = await db
-        .select({ checkoutRunId: issueRows.checkoutRunId })
-        .from(issueRows)
-        .where(eq(issueRows.id, issue.id))
-        .then((rows) => rows[0] ?? null);
-      if (!checkoutInfo?.checkoutRunId) return true;
-      return false;
-    }
+    if (!runId) return false;
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
