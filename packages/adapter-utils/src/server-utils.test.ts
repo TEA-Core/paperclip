@@ -2329,8 +2329,8 @@ describe("sanitizeInheritedPaperclipEnv", () => {
         if (!stripped.includes("process.env")) continue;
 
         const isSpawnEnv =
-          /[{,]\s*\.\.\.process\.env/.test(stripped) ||
-          /^\s*\.\.\.process\.env/.test(stripped);
+          /[{,]\s*\.\.\.\(?process\.env/.test(stripped) ||
+          /^\s*\.\.\.\(?process\.env/.test(stripped);
 
         if (isSpawnEnv) {
           throw new Error(
