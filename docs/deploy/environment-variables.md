@@ -26,7 +26,7 @@ All environment variables that Paperclip uses for server configuration.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PAPERCLIP_SECRETS_MASTER_KEY` | (from file) | 32-byte encryption key (base64/hex/raw) |
-| `PAPERCLIP_SECRETS_MASTER_KEY_FILE` | `~/.paperclip/.../secrets/master.key` | Path to key file |
+| `PAPERCLIP_SECRETS_MASTER_KEY_FILE` | `/etc/paperclip/secrets/master.key` | Path to key file |
 | `PAPERCLIP_SECRETS_STRICT_MODE` | `false` | Require secret refs for sensitive env vars |
 
 ## Agent Runtime (Injected into agent processes)

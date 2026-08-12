@@ -860,7 +860,7 @@ Local Paperclip data lives under the selected instance root. `PAPERCLIP_HOME` ch
         │   └── backups/                          # automatic DB backups
         ├── logs/
         ├── secrets/
-        │   └── master.key                        # local_encrypted master key
+        │   └── master.key                        # local_encrypted master key (default: /etc/paperclip/secrets/master.key)
         ├── workspaces/                           # default agent workspaces
         ├── projects/                             # project execution workspaces
         ├── companies/                            # per-company adapter homes (e.g. codex-home)

@@ -18,17 +18,10 @@ function isPathInside(candidatePath: string, rootPath: string): boolean {
   return candidate === root || candidate.startsWith(`${root}/`);
 }
 
-function isDefaultKeyPath(keyPath: string): boolean {
-  const envOverride = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
-  if (envOverride && envOverride.trim().length > 0) return false;
-  return resolve(keyPath) === resolve(resolveDefaultSecretsKeyFilePath());
-}
-
 function enforceKeyPathIsolation(keyPath: string): void {
   if (process.env.PAPERCLIP_SECRETS_MASTER_KEY && process.env.PAPERCLIP_SECRETS_MASTER_KEY.trim().length > 0) {
     return;
   }
-  if (!isDefaultKeyPath(keyPath)) return;
   const paperclipHome = resolvePaperclipHomeDir();
   if (isPathInside(keyPath, paperclipHome)) {
     throw new Error(

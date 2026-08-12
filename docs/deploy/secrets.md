@@ -164,7 +164,7 @@ what IAM allows if another code path is introduced outside Paperclip.
 Secrets are encrypted with a local master key stored at:
 
 ```
-~/.paperclip/instances/default/secrets/master.key
+/etc/paperclip/secrets/master.key
 ```
 
 This key is auto-created during onboarding. The key never leaves your machine.
