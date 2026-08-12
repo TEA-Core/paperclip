@@ -54,6 +54,12 @@ const {
     })),
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
+    reconcileBlockedWithoutBlockers: vi.fn(async () => ({ escalated: 0, healed: 0 })),
+    reconcilePendingReviewRearm: vi.fn(async () => ({ reArmed: 0, checked: 0 })),
+    reconcileStaleRecoveryActionWakes: vi.fn(async () => ({ reFired: 0, rerouted: 0, maxAttemptsReached: 0 })),
+    reconcileUnfinalizableWorkspaceBarriers: vi.fn(async () => ({ reported: 0 })),
+    ingestStaleInReviewChildIssues: vi.fn(async () => ({ archived: 0 })),
+    reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
     scanTerminableSilentActiveRuns: vi.fn(async () => ({
       scanned: 0,
       terminated: 0,
@@ -62,7 +68,6 @@ const {
       runIds: [],
     })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
-    reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
   };

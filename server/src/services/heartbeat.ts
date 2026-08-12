@@ -12224,6 +12224,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileBlockedWithoutBlockers();
   }
 
+  async function reconcilePendingReviewRearm(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+    rearmWindowMs?: number;
+    rearmMaxCount?: number;
+  }) {
+    return recovery.reconcilePendingReviewRearm(opts);
+  }
+
   async function reconcileResolvedDependencyWakeBackstop(opts?: {
     rearmWindowMs?: number;
     rearmMaxCount?: number;
@@ -17618,6 +17628,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     sweepStaleIssueLocks,
 
     reconcileBlockedWithoutBlockers,
+    reconcilePendingReviewRearm,
     reconcileResolvedDependencyWakeBackstop,
     reconcileStaleRecoveryActionWakes,
 
