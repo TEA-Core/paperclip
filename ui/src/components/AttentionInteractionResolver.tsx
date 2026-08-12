@@ -11,6 +11,7 @@ import {
   type IssueThreadInteraction,
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
+  type RequestBoardApprovalInteraction,
   type RequestItemVerdictsInteraction,
   type RequestItemVerdictValue,
   type SuggestTasksInteraction,
@@ -64,7 +65,7 @@ export function AttentionInteractionResolver({
 
   const acceptMutation = useMutation({
     mutationFn: (input: {
-      interaction: SuggestTasksInteraction | RequestConfirmationInteraction | RequestCheckboxConfirmationInteraction;
+      interaction: SuggestTasksInteraction | RequestConfirmationInteraction | RequestCheckboxConfirmationInteraction | RequestBoardApprovalInteraction;
       selectedClientKeys?: string[];
       selectedOptionIds?: string[];
     }) =>

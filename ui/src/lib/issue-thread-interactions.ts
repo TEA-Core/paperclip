@@ -237,6 +237,17 @@ export function buildIssueThreadInteractionSummary(
     return buildItemVerdictsSummary(interaction);
   }
 
+  if (interaction.kind === "request_board_approval") {
+    if (interaction.status === "accepted") return "Approved board request";
+    if (interaction.status === "rejected") return "Rejected board request";
+    if (interaction.status === "expired") {
+      const outcome = interaction.result?.outcome;
+      if (outcome === "superseded_by_comment") return "Board request expired after comment";
+      return "Board request expired";
+    }
+    return "Requested board approval";
+  }
+
   const count = interaction.payload.questions.length;
   if (interaction.status === "answered") {
     return count === 1 ? "Answered 1 question" : `Answered ${count} questions`;
