@@ -8491,7 +8491,7 @@ export function issueRoutes(
       return;
     }
 
-    if (transition.decision && transition.decision.outcome === "approved" && transition.decision.stageType === "approval") {
+    if (transition.decision && transition.decision.outcome === "approved") {
       const issueIdentifier = `SUP-${issue.issueNumber}`;
       try {
         const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier);
