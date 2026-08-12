@@ -110,6 +110,36 @@ If your change adds, removes, or modifies emitted telemetry events, update the [
 
 All Paperclip CI gates (lint, typecheck, tests, build, and any other required checks) must be satisfied before a PR can be merged. Don't ask for a merge while gates are red — fix them first.
 
+### Merge Queue (deployed `fold/**` branches)
+
+The deployed fold branch merges through a **GitHub merge queue**. You do not rebase
+by hand: press **Merge when ready**, and GitHub rebuilds your pull request on top of
+whatever has landed since, runs the required checks against that combined state, and
+merges only if they pass.
+
+This exists because a clean merge is not the same as a correct one. A branch cut from
+an older base can rewrite a file wholesale, merge without a single conflict, and
+silently delete work that landed in between — git has nothing to complain about,
+because textually there is no conflict. The pull request gate cannot catch it either:
+it compiles head-into-base *at the time it runs*, which stops being the real
+post-merge state the moment anything else merges.
+
+Required checks for the queue are the `verify` and `e2e` aggregate jobs. They exist
+to hold one stable check name over the sharded matrices behind them, so the required
+set does not churn every time a shard is added or renamed.
+
+If you add a workflow that must gate merges, give it a `merge_group` trigger as well
+as `pull_request`. A check that does not report for a queue entry can never go green
+for one, so requiring it parks every queued pull request until it times out. For the
+same reason the pull-request-scoped review apps are deliberately *not* queue-required.
+
+Workflows that read `github.event.pull_request.*` need care under `merge_group`: that
+payload uses `github.event.merge_group.*` instead, and the missing values do not
+degrade quietly. An empty SHA turns `git diff "$BASE...$HEAD"` into a hard error, and
+an empty `pull_request.number` in a `concurrency.group` collapses every queue entry
+into one group — which, with `cancel-in-progress`, makes each entry cancel the one
+ahead of it. See `.github/workflows/pr.yml` for the shape that handles both events.
+
 ### Greptile Review
 
 We use [Greptile](https://greptile.com) for automated code review. Your PR must achieve a **5/5 Greptile score** before it can be merged, with:
