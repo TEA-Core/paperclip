@@ -1486,7 +1486,7 @@ function ToolActionResolution({
   requestedByLabel,
 }: {
   state: ToolActionCardState;
-  interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction;
+  interaction: RequestConfirmationInteraction;
   resolvedByLabel: string | null;
   requestedByLabel: string;
 }) {
@@ -1639,7 +1639,7 @@ function RequestToolActionCard({
   onRejectInteraction,
   externalReferences,
 }: {
-  interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction;
+  interaction: RequestConfirmationInteraction;
   state: ToolActionCardState;
   resolvedByLabel: string | null;
   requestedByLabel: string;
