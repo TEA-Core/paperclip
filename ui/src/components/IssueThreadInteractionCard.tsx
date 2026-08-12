@@ -17,6 +17,7 @@ import {
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
   type RequestConfirmationTarget,
+  type RequestBoardApprovalInteraction,
   type RequestItemVerdictsInteraction,
   type RequestItemVerdictsItem,
   type RequestItemVerdictsResultItem,
@@ -47,7 +48,8 @@ interface IssueThreadInteractionCardProps {
     interaction:
       | SuggestTasksInteraction
       | RequestConfirmationInteraction
-      | RequestCheckboxConfirmationInteraction,
+      | RequestCheckboxConfirmationInteraction
+      | RequestBoardApprovalInteraction,
     selectedClientKeys?: string[],
     selectedOptionIds?: string[],
   ) => Promise<void> | void;
@@ -55,7 +57,8 @@ interface IssueThreadInteractionCardProps {
     interaction:
       | SuggestTasksInteraction
       | RequestConfirmationInteraction
-      | RequestCheckboxConfirmationInteraction,
+      | RequestCheckboxConfirmationInteraction
+      | RequestBoardApprovalInteraction,
     reason?: string,
   ) => Promise<void> | void;
   onSubmitInteractionAnswers?: (
@@ -123,6 +126,8 @@ function interactionKindLabel(kind: IssueThreadInteraction["kind"]) {
       return "Checkbox confirmation";
     case "request_item_verdicts":
       return "Item verdicts";
+    case "request_board_approval":
+      return "Board approval";
     default:
       return kind;
   }
@@ -3138,6 +3143,15 @@ export function IssueThreadInteractionCard({
           <RequestItemVerdictsCard
             interaction={interaction}
             onSubmitInteractionVerdicts={onSubmitInteractionVerdicts}
+            externalReferences={externalReferences}
+          />
+        ) : interaction.kind === "request_board_approval" ? (
+          <RequestConfirmationCard
+            interaction={interaction as unknown as RequestConfirmationInteraction}
+            isPlan={false}
+            onAcceptInteraction={onAcceptInteraction}
+            onRejectInteraction={onRejectInteraction}
+            onUploadImage={onUploadImage}
             externalReferences={externalReferences}
           />
         ) : (

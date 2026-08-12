@@ -256,6 +256,7 @@ export const ISSUE_THREAD_INTERACTION_KINDS = [
   "request_confirmation",
   "request_checkbox_confirmation",
   "request_item_verdicts",
+  "request_board_approval",
 ] as const;
 export type IssueThreadInteractionKind = (typeof ISSUE_THREAD_INTERACTION_KINDS)[number];
 
@@ -314,6 +315,7 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
   "no_live_path_unowned",
   "review_stage_unarmed",
   "no_live_path_owner_unavailable",
+  "pending_review_rearm_cap_exhausted",
 ] as const;
 export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[number];
 
@@ -607,6 +609,14 @@ export const PROJECT_COLORS = [
   "#3b82f6", // blue
 ] as const;
 
+/**
+ * The `request_board_approval` and `budget_override_required` approval types
+ * below are deprecated for new creation. Create the `request_board_approval`
+ * issue-thread interaction kind instead: it carries continuationPolicy,
+ * supersedeOnUserComment, and a post-decision handler. Existing approval rows
+ * remain readable via the approvals API.
+ * @see ISSUE_THREAD_INTERACTION_KINDS
+ */
 export const APPROVAL_TYPES = [
   "hire_agent",
   "approve_ceo_strategy",
@@ -614,6 +624,9 @@ export const APPROVAL_TYPES = [
   "request_board_approval",
 ] as const;
 export type ApprovalType = (typeof APPROVAL_TYPES)[number];
+
+export const ISSUE_GATING_APPROVAL_TYPES = ["request_board_approval", "budget_override_required"] as const;
+export type IssueGatingApprovalType = (typeof ISSUE_GATING_APPROVAL_TYPES)[number];
 
 export const APPROVAL_STATUSES = [
   "pending",

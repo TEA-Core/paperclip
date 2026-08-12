@@ -412,9 +412,11 @@ export {
   requestItemVerdictValueSchema,
   requestItemVerdictsItemSchema,
   requestItemVerdictsPayloadSchema,
-  requestItemVerdictsResultItemSchema,
-  requestItemVerdictsResultSchema,
-  createIssueThreadInteractionSchema,
+   requestItemVerdictsResultItemSchema,
+   requestItemVerdictsResultSchema,
+   requestBoardApprovalPayloadSchema,
+   requestBoardApprovalResultSchema,
+   createIssueThreadInteractionSchema,
   acceptIssueThreadInteractionSchema,
   rejectIssueThreadInteractionSchema,
   cancelIssueThreadInteractionSchema,
@@ -550,6 +552,8 @@ export {
 
 export {
   createApprovalSchema,
+  createApprovalObjectSchema,
+  refineIssueGatingApprovalIssueIds,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,

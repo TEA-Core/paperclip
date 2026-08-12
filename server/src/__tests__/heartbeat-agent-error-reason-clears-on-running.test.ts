@@ -53,21 +53,43 @@ describeEmbeddedPostgres("heartbeat agent errorReason clears on running transiti
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
+  // The adapter finishes in microseconds, so an ungated run can move the agent
+  // error -> running -> idle between two 50ms polls and the "running" assertion
+  // then sees the terminal state. Hold the adapter inside execute() until the
+  // test has observed the running transition, which makes it deterministic.
+  let releaseAdapterRun: (() => void) | null = null;
+  let adapterRunGate: Promise<void> = Promise.resolve();
+
+  function holdAdapterRun() {
+    adapterRunGate = new Promise<void>((resolve) => {
+      releaseAdapterRun = resolve;
+    });
+  }
+
+  function releaseHeldAdapterRun() {
+    releaseAdapterRun?.();
+    releaseAdapterRun = null;
+    adapterRunGate = Promise.resolve();
+  }
+
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-error-clears-on-running-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
     registerServerAdapter({
       type: SUCCESS_ADAPTER,
-      execute: async () => ({
-        exitCode: 0,
-        signal: null,
-        timedOut: false,
-        errorMessage: null,
-        summary: "Run completed successfully.",
-        provider: "test",
-        model: "test-model",
-      }),
+      execute: async () => {
+        await adapterRunGate;
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Run completed successfully.",
+          provider: "test",
+          model: "test-model",
+        };
+      },
       testEnvironment: async () => ({
         adapterType: SUCCESS_ADAPTER,
         status: "pass",
@@ -86,6 +108,7 @@ describeEmbeddedPostgres("heartbeat agent errorReason clears on running transiti
   }
 
   afterEach(async () => {
+    releaseHeldAdapterRun();
     await db.delete(activityLog);
     await db.delete(environmentLeases);
     await db.delete(issueRelations);
@@ -137,20 +160,25 @@ describeEmbeddedPostgres("heartbeat agent errorReason clears on running transiti
       permissions: {},
     });
 
+    holdAdapterRun();
     const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(run).not.toBeNull();
 
-    await expect
-      .poll(
-        () =>
-          db
-            .select({ status: agents.status, errorReason: agents.errorReason })
-            .from(agents)
-            .where(eq(agents.id, agentId))
-            .then((rows) => rows[0] ?? null),
-        { timeout: 5_000, interval: 50 },
-      )
-      .toEqual({ status: "running", errorReason: null });
+    try {
+      await expect
+        .poll(
+          () =>
+            db
+              .select({ status: agents.status, errorReason: agents.errorReason })
+              .from(agents)
+              .where(eq(agents.id, agentId))
+              .then((rows) => rows[0] ?? null),
+          { timeout: 5_000, interval: 50 },
+        )
+        .toEqual({ status: "running", errorReason: null });
+    } finally {
+      releaseHeldAdapterRun();
+    }
 
     const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
     expect(finishedRun?.status).toBe("succeeded");

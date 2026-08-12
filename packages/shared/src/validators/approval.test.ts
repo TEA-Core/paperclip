@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
+  createApprovalSchema,
+  createApprovalObjectSchema,
   addApprovalCommentSchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
@@ -27,5 +30,114 @@ describe("approval validators", () => {
       .toBe("Decision\n\nApproved.");
     expect(requestApprovalRevisionSchema.parse({ decisionNote: "Decision\\r\\nRevise." }).decisionNote)
       .toBe("Decision\nRevise.");
+  });
+});
+
+describe("createApprovalSchema issue-gating validation", () => {
+  it("requires non-empty issueIds for request_board_approval", () => {
+    expect(() =>
+      createApprovalSchema.parse({
+        type: "request_board_approval",
+        payload: { title: "Approve" },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects empty issueIds array for request_board_approval", () => {
+    expect(() =>
+      createApprovalSchema.parse({
+        type: "request_board_approval",
+        payload: { title: "Approve" },
+        issueIds: [],
+      }),
+    ).toThrow();
+  });
+
+  it("accepts non-empty issueIds for request_board_approval", () => {
+    const parsed = createApprovalSchema.parse({
+      type: "request_board_approval",
+      payload: { title: "Approve" },
+      issueIds: ["00000000-0000-0000-0000-000000000001"],
+    });
+    expect(parsed.issueIds).toEqual(["00000000-0000-0000-0000-000000000001"]);
+  });
+
+  it("allows missing issueIds for hire_agent", () => {
+    const parsed = createApprovalSchema.parse({
+      type: "hire_agent",
+      payload: { agentId: "agent-1" },
+    });
+    expect(parsed.issueIds).toBeUndefined();
+  });
+
+  it("requires non-empty issueIds for budget_override_required", () => {
+    expect(() =>
+      createApprovalSchema.parse({
+        type: "budget_override_required",
+        payload: { title: "Override" },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects empty issueIds array for budget_override_required", () => {
+    expect(() =>
+      createApprovalSchema.parse({
+        type: "budget_override_required",
+        payload: { title: "Override" },
+        issueIds: [],
+      }),
+    ).toThrow();
+  });
+
+  it("accepts non-empty issueIds for budget_override_required", () => {
+    const parsed = createApprovalSchema.parse({
+      type: "budget_override_required",
+      payload: { title: "Override" },
+      issueIds: ["00000000-0000-0000-0000-000000000001"],
+    });
+    expect(parsed.issueIds).toEqual(["00000000-0000-0000-0000-000000000001"]);
+  });
+
+  it("allows missing issueIds for approve_ceo_strategy", () => {
+    const parsed = createApprovalSchema.parse({
+      type: "approve_ceo_strategy",
+      payload: { title: "Strategy" },
+    });
+    expect(parsed.issueIds).toBeUndefined();
+  });
+});
+
+describe("createApprovalObjectSchema", () => {
+  it("stays a ZodObject so consumers can merge it", () => {
+    expect(createApprovalObjectSchema).toBeInstanceOf(z.ZodObject);
+
+    const merged = z.object({ companyId: z.string().uuid().optional() })
+      .merge(createApprovalObjectSchema);
+
+    expect(Object.keys(merged.shape).sort()).toEqual([
+      "companyId",
+      "issueIds",
+      "payload",
+      "requestedByAgentId",
+      "type",
+    ]);
+    expect(
+      merged.parse({
+        type: "request_board_approval",
+        payload: { title: "Approve" },
+      }),
+    ).toEqual({ type: "request_board_approval", payload: { title: "Approve" } });
+  });
+
+  it("carries the field-level rules without the issue-gating refinement", () => {
+    expect(() =>
+      createApprovalObjectSchema.parse({ type: "not_a_real_type", payload: {} }),
+    ).toThrow();
+    expect(
+      createApprovalObjectSchema.parse({
+        type: "request_board_approval",
+        payload: { title: "Approve" },
+      }).issueIds,
+    ).toBeUndefined();
   });
 });

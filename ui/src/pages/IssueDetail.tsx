@@ -205,6 +205,7 @@ import {
   type IssueWorkProduct,
   type IssueWorkMode,
   type IssueThreadInteraction,
+  type RequestBoardApprovalInteraction,
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
   type RequestItemVerdictsInteraction,
@@ -237,7 +238,8 @@ type CommentReassignment = IssueCommentReassignment;
 type ActionableIssueThreadInteraction =
   | SuggestTasksInteraction
   | RequestConfirmationInteraction
-  | RequestCheckboxConfirmationInteraction;
+  | RequestCheckboxConfirmationInteraction
+  | RequestBoardApprovalInteraction;
 type ResolveRecoveryActionOutcome = "restored" | "false_positive" | "blocked" | "cancelled";
 type IssueDetailComment = (IssueComment | OptimisticIssueComment) & {
   runId?: string | null;
@@ -2548,6 +2550,8 @@ export function IssueDetail() {
       pushToast({
         title: interaction.kind === "request_confirmation"
           ? "Request confirmed"
+          : interaction.kind === "request_board_approval"
+          ? "Board approval granted"
           : interaction.kind === "request_checkbox_confirmation"
           ? "Selection confirmed"
           : skippedCount > 0
@@ -2572,7 +2576,11 @@ export function IssueDetail() {
       invalidateIssueDetail();
       invalidateIssueCollections();
       pushToast({
-        title: interaction.kind === "request_confirmation" ? "Request declined" : "Suggestion rejected",
+        title: interaction.kind === "request_confirmation"
+          ? "Request declined"
+          : interaction.kind === "request_board_approval"
+          ? "Board approval rejected"
+          : "Suggestion rejected",
         tone: "success",
       });
     },

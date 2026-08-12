@@ -5572,6 +5572,56 @@ describe("waitForReadiness", () => {
       await server.close();
     }
   }, 60_000);
+
+  it("keeps the earned error instead of a degenerate probe that cannot succeed", async () => {
+    // The loop clamps each per-probe bound to the time left, so an attempt that
+    // starts a few milliseconds before the deadline is aborted before the
+    // socket can answer and its `probe timed out after Nms` buries the real
+    // diagnostic. fetch is stubbed so the timing is scripted rather than raced:
+    // the first probe answers 503 late in the window, which leaves the next
+    // iteration under one interval of budget.
+    const originalFetch = globalThis.fetch;
+    const probeStartOffsetsMs: number[] = [];
+    const startedAt = Date.now();
+    // 1s window, 100ms interval: the first probe answers at ~850ms and the
+    // 100ms inter-probe delay puts the loop back at ~950ms, with ~50ms left.
+    const firstResponseDelayMs = 850;
+    // Later probes answer far too late for that leftover budget, so an attempt
+    // issued with it can only abort.
+    const laterResponseDelayMs = 2_000;
+    globalThis.fetch = (async (_input: unknown, init?: { signal?: AbortSignal }) => {
+      const signal = init?.signal;
+      probeStartOffsetsMs.push(Date.now() - startedAt);
+      const responseDelayMs = probeStartOffsetsMs.length === 1 ? firstResponseDelayMs : laterResponseDelayMs;
+      return await new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(
+          () => resolve(new Response("unhealthy", { status: 503 })),
+          Math.max(0, responseDelayMs - (Date.now() - startedAt)),
+        );
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(signal.reason ?? new DOMException("aborted", "AbortError"));
+        });
+      });
+    }) as typeof globalThis.fetch;
+
+    try {
+      await expect(
+        waitForReadiness({
+          service: { readiness: { type: "http", intervalMs: 100, timeoutSec: 1 } },
+          serviceName: "web",
+          command: "node server.js",
+          url: "http://127.0.0.1:1/",
+          readinessUrl: "http://127.0.0.1:1/",
+        }),
+      ).rejects.toThrow(/received HTTP 503/);
+      // The second iteration had less than one interval left, so it must not
+      // have issued a probe at all.
+      expect(probeStartOffsetsMs).toHaveLength(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }, 60_000);
 });
 
 describe("readLocalServicePortOwner", () => {

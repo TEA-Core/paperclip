@@ -14,6 +14,12 @@ export interface Company {
   attachmentMaxBytes: number;
   defaultResponsibleUserId: string | null;
   requireBoardApprovalForNewAgents: boolean;
+  /**
+   * Per-company opt-in for arming auto-merge on the linked PR at the
+   * final-approval transition. Optional so existing consumers of this
+   * published SDK type (plugins, fixtures) stay source-compatible.
+   */
+  mergeArmingEnabled?: boolean;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;
   feedbackDataSharingConsentByUserId: string | null;

@@ -758,7 +758,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
   const routineEnv = stripForbiddenEnvBindings(input.routineEnv);
   const agentEnv = parseObject(executionRunConfig.env);
   const lowTrustAllowedBindingIds = input.trustPreset?.kind === "low_trust_review"
-    ? input.trustPreset.boundary.allowedSecretBindingIds ?? []
+    ? input.trustPreset.boundary.allowedSecretBindingIds
     : undefined;
   if (input.trustPreset?.kind === "low_trust_review") {
     assertLowTrustEnvConfigAllowed(environmentEnv, "environment.env");
@@ -12224,6 +12224,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileBlockedWithoutBlockers();
   }
 
+  async function reconcilePendingReviewRearm(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+    rearmWindowMs?: number;
+    rearmMaxCount?: number;
+  }) {
+    return recovery.reconcilePendingReviewRearm(opts);
+  }
+
   async function reconcileResolvedDependencyWakeBackstop(opts?: {
     rearmWindowMs?: number;
     rearmMaxCount?: number;
@@ -17619,6 +17629,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     sweepStaleIssueLocks,
 
     reconcileBlockedWithoutBlockers,
+    reconcilePendingReviewRearm,
     reconcileResolvedDependencyWakeBackstop,
     reconcileStaleRecoveryActionWakes,
 
@@ -17740,15 +17751,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     getRunIssueSummary: async (runId: string) => {
       const [run] = await db
         .select(heartbeatRunIssueSummaryColumns)
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, runId))
-        .limit(1);
-      return run ?? null;
-    },
-
-    getRunById: async (runId: string) => {
-      const [run] = await db
-        .select()
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId))
         .limit(1);

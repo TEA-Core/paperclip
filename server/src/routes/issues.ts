@@ -7,6 +7,7 @@ import type { Db } from "@paperclipai/db";
 import {
   activityLog,
   agents,
+  companies,
   documents,
   executionWorkspaces,
   heartbeatRuns,
@@ -122,6 +123,8 @@ import {
   projectService,
   routineService,
   workProductService,
+  armMergeOnApproval,
+  publishApprovalStatus,
 } from "../services/index.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
@@ -3678,7 +3681,7 @@ export function issueRoutes(
     checkoutRunId: string | null | undefined,
   ) {
     if (!agentId || !checkoutRunId) return null;
-    const run = await heartbeat.getRunById(checkoutRunId);
+    const run = await heartbeat.getRun(checkoutRunId);
     if (!run) return null;
     if (run.status !== "running") return null;
     if (run.invocationSource !== "self_declared") return null;
@@ -4966,6 +4969,40 @@ export function issueRoutes(
         return;
       }
     }
+    // The issue service has supported this filter since the reviewer
+    // self-discovery work, but it was only ever wired into the `inbox-lite`
+    // handler. On this route an unknown query parameter is silently dropped, so
+    // `?pendingReviewParticipantAgentId=<agent>&status=in_review` returned every
+    // in_review issue in the company and looked like a working probe — a bogus
+    // agent id returned the same rows. That false negative is on the record as
+    // having produced a wrong conclusion about a deployment. Accept the filter
+    // here so the query means what it reads as, and reject a malformed value
+    // rather than ignoring it.
+    let pendingReviewParticipantAgentId: string | undefined;
+    const pendingReviewFilterRaw = req.query.pendingReviewParticipantAgentId;
+    if (pendingReviewFilterRaw !== undefined) {
+      if (typeof pendingReviewFilterRaw !== "string") {
+        res.status(422).json({ error: "pendingReviewParticipantAgentId must be a UUID or 'me'" });
+        return;
+      }
+      const normalized = pendingReviewFilterRaw.trim();
+      if (normalized.length === 0) {
+        pendingReviewParticipantAgentId = undefined;
+      } else if (normalized.toLowerCase() === "me") {
+        // `me` mirrors the assigneeUserId=me convention, but resolves to the
+        // calling agent rather than a board user.
+        if (req.actor.type !== "agent" || !req.actor.agentId) {
+          res.status(403).json({ error: "pendingReviewParticipantAgentId=me requires agent authentication" });
+          return;
+        }
+        pendingReviewParticipantAgentId = req.actor.agentId;
+      } else if (isUuidLike(normalized)) {
+        pendingReviewParticipantAgentId = normalized;
+      } else {
+        res.status(422).json({ error: "pendingReviewParticipantAgentId must be a UUID or 'me'" });
+        return;
+      }
+    }
     const offset = parsedOffset ?? 0;
 
     const listFilters: IssueFilters = {
@@ -4973,6 +5010,7 @@ export function issueRoutes(
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId,
       participantAgentId: req.query.participantAgentId as string | undefined,
+      pendingReviewParticipantAgentId,
       assigneeUserId,
       touchedByUserId,
       inboxArchivedByUserId,
@@ -8437,6 +8475,36 @@ export function issueRoutes(
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
+    }
+
+    if (transition.decision && transition.decision.outcome === "approved" && transition.decision.stageType === "approval") {
+      const issueIdentifier = `SUP-${issue.issueNumber}`;
+      try {
+        const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier);
+        await svc.addComment(
+          issue.id,
+          `[Merge-arming] ${statusOutcome.message}`,
+          {},
+          { authorType: "system" },
+        );
+
+        const company = await db
+          .select({ mergeArmingEnabled: companies.mergeArmingEnabled })
+          .from(companies)
+          .where(eq(companies.id, issue.companyId))
+          .then((rows) => rows[0] ?? null);
+        if (company?.mergeArmingEnabled) {
+          const armingOutcome = await armMergeOnApproval(db, issue.companyId, issue.id, transition.decision);
+          await svc.addComment(
+            issue.id,
+            `[Merge-arming] ${armingOutcome.message}`,
+            {},
+            { authorType: "system" },
+          );
+        }
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id, companyId: issue.companyId }, "merge-arming hook failed");
+      }
     }
 
     let cancelledStatusRunId: string | null = null;

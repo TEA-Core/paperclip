@@ -4641,10 +4641,21 @@ export async function waitForReadiness(input: {
   // listening and healthy. Capping well under the total makes a stall cost one
   // retry instead of the whole window.
   const probeBudgetMs = Math.max(1_000, intervalMs * 4);
+  // A probe also needs enough budget left to mean anything. The loop clamps the
+  // per-probe bound to the time remaining, so an attempt that starts a
+  // millisecond before the deadline is aborted before the socket can answer and
+  // then overwrites the real diagnostic (`received HTTP 503`, a refused
+  // connection) with a misleading `probe timed out after 1ms`. Give every probe
+  // at least one interval, and stop early rather than issue one that can only
+  // fail.
+  const minProbeBudgetMs = Math.min(probeBudgetMs, intervalMs);
   const deadline = Date.now() + timeoutSec * 1000;
   let lastError = "service did not become ready";
+  let probed = false;
   while (Date.now() < deadline) {
     const probeTimeoutMs = Math.min(probeBudgetMs, deadline - Date.now());
+    if (probed && probeTimeoutMs < minProbeBudgetMs) break;
+    probed = true;
     try {
       const response = await fetch(readinessUrl, { signal: AbortSignal.timeout(probeTimeoutMs) });
       if (response.ok) return;

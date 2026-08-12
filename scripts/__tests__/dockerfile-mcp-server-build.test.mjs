@@ -1,88 +1,136 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import test from "node:test";
+import path from "node:path";
+import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
-const repoRoot = resolve(import.meta.dirname, "..", "..");
-const dockerfile = readFileSync(resolve(repoRoot, "Dockerfile"), "utf8");
-const entrypoint = readFileSync(resolve(repoRoot, "scripts", "docker-entrypoint.sh"), "utf8");
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
 
-test("Dockerfile builds the mcp-server package", () => {
+test("Dockerfile packs both shared and mcp-server via npm pack", () => {
   assert.match(
     dockerfile,
-    /RUN pnpm --filter @paperclipai\/mcp-server build/,
-    "Dockerfile must build @paperclipai/mcp-server"
+    /cd packages\/shared && npm pack --pack-destination \/opt\/paperclip-mcp-tarballs/,
+    "Dockerfile must npm pack @paperclipai/shared into the tarballs directory",
+  );
+  assert.match(
+    dockerfile,
+    /cd packages\/mcp-server && npm pack --pack-destination \/opt\/paperclip-mcp-tarballs/,
+    "Dockerfile must npm pack @paperclipai/mcp-server into the tarballs directory",
   );
 });
 
-test("Dockerfile builds the shared package (mcp-server dependency)", () => {
+test("Dockerfile applies publishConfig by hand (npm pack does NOT apply it)", () => {
   assert.match(
     dockerfile,
-    /RUN pnpm --filter @paperclipai\/shared build/,
-    "Dockerfile must build @paperclipai/shared before mcp-server"
+    /pkg\.publishConfig/,
+    "Dockerfile must read publishConfig from the packed package.json",
+  );
+  assert.match(
+    dockerfile,
+    /for \(const k of \["exports","main","types","bin"\]\)/,
+    "Dockerfile must copy publishConfig exports/main/types/bin into real fields",
   );
 });
 
-test("Dockerfile has a verify guard for mcp-server build output", () => {
+test("Dockerfile pins @paperclipai/shared via file: tarball, not a semver", () => {
   assert.match(
     dockerfile,
-    /RUN test -f packages\/mcp-server\/dist\/stdio\.js \|\| \(echo "ERROR: mcp-server build output missing" && exit 1\)/,
-    "Dockerfile must guard mcp-server dist/stdio.js"
+    /"file:" \+ sharedTgz/,
+    "Dockerfile must rewrite @paperclipai/shared dependency to a file: tarball path",
+  );
+  assert.doesNotMatch(
+    dockerfile,
+    /sed -i.*"workspace:\*"/,
+    "Dockerfile must NOT use sed workspace:* -> semver rewrite (stale registry shadow)",
   );
 });
 
-test("Dockerfile mcp-server build comes after the shared build", () => {
-  const sharedIdx = dockerfile.indexOf("RUN pnpm --filter @paperclipai/shared build");
-  const mcpIdx = dockerfile.indexOf("RUN pnpm --filter @paperclipai/mcp-server build");
-  assert.notEqual(sharedIdx, -1, "shared build line must exist");
-  assert.notEqual(mcpIdx, -1, "mcp-server build line must exist");
+test("Dockerfile installs mcp-server globally with resolved dependencies", () => {
+  assert.match(
+    dockerfile,
+    /npm install --global --omit=dev --prefix \/opt\/paperclip-mcp/,
+    "Dockerfile must npm install --global --omit=dev --prefix /opt/paperclip-mcp",
+  );
+});
+
+test("Dockerfile build stage includes a JSON-RPC handshake checking for paperclipOpenWorkSession", () => {
+  assert.match(
+    dockerfile,
+    /paperclip-mcp-server/,
+    "Dockerfile handshake must reference the installed binary",
+  );
+  assert.match(
+    dockerfile,
+    /tools\/list/,
+    "Dockerfile handshake must send tools/list",
+  );
+  assert.match(
+    dockerfile,
+    /paperclipOpenWorkSession/,
+    "Dockerfile handshake must assert paperclipOpenWorkSession is present",
+  );
+});
+
+test("Dockerfile build stage sets PAPERCLIP_API_URL before the handshake", () => {
+  const buildStage = dockerfile.split(/^FROM .* AS build$/m)[1]?.split(/^FROM /m)[0];
+  assert.ok(buildStage, "Dockerfile must have a build stage");
+
+  const envIndex = buildStage.search(/^ENV PAPERCLIP_API_URL=\S+/m);
+  assert.notEqual(
+    envIndex,
+    -1,
+    "Build stage must set PAPERCLIP_API_URL — the MCP server binary reads it at startup",
+  );
+
+  const handshakeIndex = buildStage.indexOf("paperclipOpenWorkSession");
+  assert.notEqual(handshakeIndex, -1, "Build stage must contain the handshake");
   assert.ok(
-    sharedIdx < mcpIdx,
-    "shared build must precede mcp-server build"
+    envIndex < handshakeIndex,
+    "PAPERCLIP_API_URL must be set before the handshake RUN, or the MCP server cannot start",
   );
 });
 
-test("Dockerfile verify guard comes after the mcp-server build", () => {
-  const buildIdx = dockerfile.indexOf("RUN pnpm --filter @paperclipai/mcp-server build");
-  const guardIdx = dockerfile.indexOf('test -f packages/mcp-server/dist/stdio.js');
-  assert.notEqual(buildIdx, -1, "mcp-server build line must exist");
-  assert.notEqual(guardIdx, -1, "mcp-server guard must exist");
+test("Dockerfile build stage sets PAPERCLIP_API_KEY before the handshake", () => {
+  const buildStage = dockerfile.split(/^FROM .* AS build$/m)[1]?.split(/^FROM /m)[0];
+  assert.ok(buildStage, "Dockerfile must have a build stage");
+
+  const envIndex = buildStage.search(/^ENV PAPERCLIP_API_KEY=\S+/m);
+  assert.notEqual(
+    envIndex,
+    -1,
+    "Build stage must set PAPERCLIP_API_KEY — readConfigFromEnv() throws without it before any tool registers",
+  );
+
+  const handshakeIndex = buildStage.indexOf("paperclipOpenWorkSession");
+  assert.notEqual(handshakeIndex, -1, "Build stage must contain the handshake");
   assert.ok(
-    buildIdx < guardIdx,
-    "verify guard must come after mcp-server build"
+    envIndex < handshakeIndex,
+    "PAPERCLIP_API_KEY must be set before the handshake RUN, or the MCP server cannot start",
+  );
+
+  const productionStage = dockerfile.split(/^FROM .* AS production$/m)[1];
+  assert.doesNotMatch(
+    productionStage ?? "",
+    /^\s*(ENV|ARG)\s+PAPERCLIP_API_(URL|KEY)\b/m,
+    "Handshake placeholders must stay scoped to the build stage, never baked into the production image",
   );
 });
 
-test("entrypoint refreshes MCP packages into the npm-global prefix", () => {
+test("Dockerfile production stage copies /opt/paperclip-mcp from build stage", () => {
+  const productionStage = dockerfile.split(/^FROM .* AS production$/m)[1];
+  assert.ok(productionStage, "Dockerfile must have a production stage");
   assert.match(
-    entrypoint,
-    /MCP_SERVER_DIST=\/app\/packages\/mcp-server\/dist/,
-    "entrypoint must define MCP_SERVER_DIST"
-  );
-  assert.match(
-    entrypoint,
-    /SHARED_DIST=\/app\/packages\/shared\/dist/,
-    "entrypoint must define SHARED_DIST"
-  );
-  assert.match(
-    entrypoint,
-    /NPM_GLOBAL=\/paperclip\/\.npm-global/,
-    "entrypoint must define NPM_GLOBAL"
+    productionStage,
+    /COPY --chown=node:node --from=build \/opt\/paperclip-mcp \/opt\/paperclip-mcp/,
+    "Production stage must COPY --from=build /opt/paperclip-mcp /opt/paperclip-mcp",
   );
 });
 
-test("entrypoint symlinks the bin entry for paperclip-mcp-server", () => {
+test("Dockerfile does not leave the tarballs directory in the image", () => {
   assert.match(
-    entrypoint,
-    /ln -sf \.\.\/lib\/node_modules\/@paperclipai\/mcp-server\/dist\/stdio\.js "\$1\/bin\/paperclip-mcp-server"/,
-    "entrypoint must symlink paperclip-mcp-server bin"
-  );
-});
-
-test("entrypoint only refreshes when both dist artifacts exist", () => {
-  assert.match(
-    entrypoint,
-    /if \[ -f "\$MCP_SERVER_DIST\/stdio\.js" \] && \[ -f "\$SHARED_DIST\/index\.js" \]; then/,
-    "entrypoint must guard on both stdio.js and index.js"
+    dockerfile,
+    /rm -rf \/opt\/paperclip-mcp-tarballs/,
+    "Dockerfile must clean up the tarballs directory after install",
   );
 });

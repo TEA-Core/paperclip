@@ -212,4 +212,90 @@ describe("issueThreadInteractionService", () => {
     expect(state.interactionUpdates).toHaveLength(1);
     expect(state.issueTouches).toHaveLength(1);
   });
+
+  it("create blocks the issue when kind is request_board_approval", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+    const interactionRow = {
+      id: "interaction-3",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "request_board_approval",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: "Approve hosting spend",
+      summary: null,
+      createdByAgentId: "agent-1",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        prompt: "Approve hosting spend",
+        target: null,
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+
+    const issueStatusUpdates: Array<Record<string, unknown>> = [];
+    const issueTouches: Array<Record<string, unknown>> = [];
+
+    const db: any = {
+      select: vi.fn(() => createSelectChain([interactionRow])),
+      insert: vi.fn(() => ({
+        values() {
+          return {
+            returning: async () => [interactionRow],
+          };
+        },
+      })) as any,
+      update: vi.fn(() => ({
+        set(values: Record<string, unknown>) {
+          return {
+            where() {
+              if ("status" in values) {
+                issueStatusUpdates.push(values);
+                return Promise.resolve(undefined);
+              }
+              if ("updatedAt" in values) {
+                issueTouches.push(values);
+                return Promise.resolve(undefined);
+              }
+              throw new Error(`Unexpected update target`);
+            },
+          };
+        },
+      })),
+      transaction: async (callback: (tx: typeof db) => Promise<void>) => callback(db),
+    };
+
+    const svc = issueThreadInteractionService(db as never);
+
+    const result = await svc.create({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+    }, {
+      kind: "request_board_approval",
+      continuationPolicy: "wake_assignee",
+      title: "Approve hosting spend",
+      payload: {
+        version: 1,
+        prompt: "Approve hosting spend",
+        target: null,
+      },
+    } as any, {
+      agentId: "agent-1",
+    });
+
+    expect(result.kind).toBe("request_board_approval");
+    expect(issueStatusUpdates).toHaveLength(1);
+    expect(issueStatusUpdates[0]).toEqual({ status: "blocked" });
+    expect(issueTouches).toHaveLength(1);
+  });
 });
