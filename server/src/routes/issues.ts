@@ -1908,14 +1908,19 @@ function queueResolvedInteractionContinuationWakeup(input: {
   newlyResolvedItemIds?: string[];
   idempotencyKey?: string | null;
 }) {
-  if (
-    input.interaction.continuationPolicy !== "wake_assignee"
-    && input.interaction.continuationPolicy !== "wake_assignee_on_accept"
-  ) return;
-  if (
-    input.interaction.continuationPolicy === "wake_assignee_on_accept"
-    && input.interaction.status !== "accepted"
-  ) return;
+  const isBoardApprovalReject =
+    input.interaction.kind === "request_board_approval"
+    && input.interaction.status === "rejected";
+  if (!isBoardApprovalReject) {
+    if (
+      input.interaction.continuationPolicy !== "wake_assignee"
+      && input.interaction.continuationPolicy !== "wake_assignee_on_accept"
+    ) return;
+    if (
+      input.interaction.continuationPolicy === "wake_assignee_on_accept"
+      && input.interaction.status !== "accepted"
+    ) return;
+  }
   if (input.interaction.status === "expired") return;
   if (isClosedIssueStatus(input.issue.status)) return;
   const wakeTargetAgentId = input.issue.assigneeAgentId ?? input.interaction.createdByAgentId ?? null;

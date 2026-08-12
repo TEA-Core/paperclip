@@ -322,6 +322,145 @@ describe("approval routes idempotent retries", () => {
     );
   });
 
+  it("queues a requester wakeup with reason approval_rejected on reject", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-reject-wake",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: "agent-1",
+    });
+    mockApprovalService.reject.mockResolvedValue({
+      approval: {
+        id: "approval-reject-wake",
+        companyId: "company-1",
+        type: "request_board_approval",
+        status: "rejected",
+        payload: {},
+        requestedByAgentId: "agent-1",
+      },
+      applied: true,
+    });
+    mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([
+      { id: "issue-1" },
+    ]);
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-reject-wake/reject")
+      .send({ decisionNote: "Needs changes" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "agent-1",
+      expect.objectContaining({
+        reason: "approval_rejected",
+        payload: expect.objectContaining({
+          approvalId: "approval-reject-wake",
+          approvalStatus: "rejected",
+          issueId: "issue-1",
+          issueIds: ["issue-1"],
+        }),
+        contextSnapshot: expect.objectContaining({
+          wakeReason: "approval_rejected",
+        }),
+      }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "approval.requester_wakeup_queued",
+      }),
+    );
+  });
+
+  it("catches and logs a throwing heartbeat.wakeup on reject without failing the request", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-reject-fail",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: "agent-1",
+    });
+    mockApprovalService.reject.mockResolvedValue({
+      approval: {
+        id: "approval-reject-fail",
+        companyId: "company-1",
+        type: "request_board_approval",
+        status: "rejected",
+        payload: {},
+        requestedByAgentId: "agent-1",
+      },
+      applied: true,
+    });
+    mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([
+      { id: "issue-1" },
+    ]);
+    mockHeartbeatService.wakeup.mockRejectedValue(new Error("wake service down"));
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-reject-fail/reject")
+      .send({ decisionNote: "Needs changes" });
+
+    expect(res.status).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "approval.requester_wakeup_failed",
+      }),
+    );
+  });
+
+  it("queues a requester wakeup with reason approval_revision_requested on request-revision", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-rev-wake",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: "agent-1",
+    });
+    mockApprovalService.requestRevision.mockResolvedValue({
+      id: "approval-rev-wake",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "revision_requested",
+      payload: {},
+      requestedByAgentId: "agent-1",
+    });
+    mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([
+      { id: "issue-1" },
+    ]);
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-rev-wake/request-revision")
+      .send({ decisionNote: "Need changes" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "agent-1",
+      expect.objectContaining({
+        reason: "approval_revision_requested",
+        payload: expect.objectContaining({
+          approvalId: "approval-rev-wake",
+          approvalStatus: "revision_requested",
+          issueId: "issue-1",
+          issueIds: ["issue-1"],
+        }),
+        contextSnapshot: expect.objectContaining({
+          wakeReason: "approval_revision_requested",
+        }),
+      }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "approval.requester_wakeup_queued",
+      }),
+    );
+  });
+
   it("lets agents create generic issue-linked board approval requests", async () => {
     mockApprovalService.create.mockResolvedValue({
       id: "approval-1",
