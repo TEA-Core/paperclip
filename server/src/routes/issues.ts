@@ -4969,6 +4969,40 @@ export function issueRoutes(
         return;
       }
     }
+    // The issue service has supported this filter since the reviewer
+    // self-discovery work, but it was only ever wired into the `inbox-lite`
+    // handler. On this route an unknown query parameter is silently dropped, so
+    // `?pendingReviewParticipantAgentId=<agent>&status=in_review` returned every
+    // in_review issue in the company and looked like a working probe — a bogus
+    // agent id returned the same rows. That false negative is on the record as
+    // having produced a wrong conclusion about a deployment. Accept the filter
+    // here so the query means what it reads as, and reject a malformed value
+    // rather than ignoring it.
+    let pendingReviewParticipantAgentId: string | undefined;
+    const pendingReviewFilterRaw = req.query.pendingReviewParticipantAgentId;
+    if (pendingReviewFilterRaw !== undefined) {
+      if (typeof pendingReviewFilterRaw !== "string") {
+        res.status(422).json({ error: "pendingReviewParticipantAgentId must be a UUID or 'me'" });
+        return;
+      }
+      const normalized = pendingReviewFilterRaw.trim();
+      if (normalized.length === 0) {
+        pendingReviewParticipantAgentId = undefined;
+      } else if (normalized.toLowerCase() === "me") {
+        // `me` mirrors the assigneeUserId=me convention, but resolves to the
+        // calling agent rather than a board user.
+        if (req.actor.type !== "agent" || !req.actor.agentId) {
+          res.status(403).json({ error: "pendingReviewParticipantAgentId=me requires agent authentication" });
+          return;
+        }
+        pendingReviewParticipantAgentId = req.actor.agentId;
+      } else if (isUuidLike(normalized)) {
+        pendingReviewParticipantAgentId = normalized;
+      } else {
+        res.status(422).json({ error: "pendingReviewParticipantAgentId must be a UUID or 'me'" });
+        return;
+      }
+    }
     const offset = parsedOffset ?? 0;
 
     const listFilters: IssueFilters = {
@@ -4976,6 +5010,7 @@ export function issueRoutes(
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId,
       participantAgentId: req.query.participantAgentId as string | undefined,
+      pendingReviewParticipantAgentId,
       assigneeUserId,
       touchedByUserId,
       inboxArchivedByUserId,
