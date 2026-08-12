@@ -16,6 +16,7 @@ import type {
   PipelineCaseDocumentOutputItem,
   PipelineCaseOutputItem,
   PipelineCaseWorkProductOutputItem,
+  RequestBoardApprovalInteraction,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
   SuggestTasksInteraction,
@@ -131,7 +132,8 @@ import { Badge } from "@/components/ui/badge";
 type PipelineConversationActionableInteraction =
   | SuggestTasksInteraction
   | RequestConfirmationInteraction
-  | RequestCheckboxConfirmationInteraction;
+  | RequestCheckboxConfirmationInteraction
+  | RequestBoardApprovalInteraction;
 
 type PipelineBoardAutomationAgent = Pick<Agent, "id" | "name" | "icon" | "urlKey">;
 

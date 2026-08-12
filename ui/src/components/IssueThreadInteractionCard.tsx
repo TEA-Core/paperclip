@@ -1294,7 +1294,7 @@ function RequestConfirmationTargetChip({
 function RequestConfirmationResolution({
   interaction,
 }: {
-  interaction: RequestConfirmationInteraction;
+  interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction;
 }) {
   const outcome = interaction.result?.outcome;
   const target = interaction.payload.target ?? null;
@@ -1822,13 +1822,13 @@ function RequestConfirmationCard({
   onUploadImage,
   externalReferences,
 }: {
-  interaction: RequestConfirmationInteraction;
+  interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction;
   isPlan?: boolean;
   onAcceptInteraction?: (
-    interaction: RequestConfirmationInteraction,
+    interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction,
   ) => Promise<void> | void;
   onRejectInteraction?: (
-    interaction: RequestConfirmationInteraction,
+    interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction,
     reason?: string,
   ) => Promise<void> | void;
   onUploadImage?: (file: File) => Promise<string>;
