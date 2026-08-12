@@ -3147,7 +3147,7 @@ export function IssueThreadInteractionCard({
           />
         ) : interaction.kind === "request_board_approval" ? (
           <RequestConfirmationCard
-            interaction={interaction as RequestConfirmationInteraction}
+            interaction={interaction as unknown as RequestConfirmationInteraction}
             isPlan={false}
             onAcceptInteraction={onAcceptInteraction}
             onRejectInteraction={onRejectInteraction}
