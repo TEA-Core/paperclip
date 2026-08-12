@@ -1,7 +1,8 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import path from "node:path";
+import path, { resolve } from "node:path";
 import { resolveDefaultSecretsKeyFilePath } from "../home-paths.js";
+import { resolvePaperclipHomeDir } from "@paperclipai/shared/home-paths";
 import type {
   PreparedSecretVersion,
   SecretProviderHealthCheck,
@@ -10,6 +11,34 @@ import type {
   StoredSecretVersionMaterial,
 } from "./types.js";
 import { badRequest } from "../errors.js";
+
+function isPathInside(candidatePath: string, rootPath: string): boolean {
+  const candidate = resolve(candidatePath);
+  const root = resolve(rootPath);
+  return candidate === root || candidate.startsWith(`${root}/`);
+}
+
+function isDefaultKeyPath(keyPath: string): boolean {
+  const envOverride = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  if (envOverride && envOverride.trim().length > 0) return false;
+  return resolve(keyPath) === resolve(resolveDefaultSecretsKeyFilePath());
+}
+
+function enforceKeyPathIsolation(keyPath: string): void {
+  if (process.env.PAPERCLIP_SECRETS_MASTER_KEY && process.env.PAPERCLIP_SECRETS_MASTER_KEY.trim().length > 0) {
+    return;
+  }
+  if (!isDefaultKeyPath(keyPath)) return;
+  const paperclipHome = resolvePaperclipHomeDir();
+  if (isPathInside(keyPath, paperclipHome)) {
+    throw new Error(
+      `Security violation: secrets master key file is reachable from agent execution workspaces. ` +
+        `Key path ${keyPath} is inside the Paperclip home volume. ` +
+        `Move the key file outside the agent-visible volume (e.g. /etc/paperclip/secrets/master.key) ` +
+        `or set PAPERCLIP_SECRETS_MASTER_KEY_FILE to an isolated path.`,
+    );
+  }
+}
 
 interface LocalEncryptedMaterial extends StoredSecretVersionMaterial {
   scheme: "local_encrypted_v1";
@@ -20,7 +49,7 @@ interface LocalEncryptedMaterial extends StoredSecretVersionMaterial {
 
 function resolveMasterKeyFilePath() {
   const fromEnv = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
-  if (fromEnv && fromEnv.trim().length > 0) return path.resolve(fromEnv.trim());
+  if (fromEnv && fromEnv.trim().length > 0) return resolve(fromEnv.trim());
   return resolveDefaultSecretsKeyFilePath();
 }
 
@@ -58,6 +87,7 @@ function loadOrCreateMasterKey(): Buffer {
   }
 
   const keyPath = resolveMasterKeyFilePath();
+  enforceKeyPathIsolation(keyPath);
   if (existsSync(keyPath)) {
     enforceKeyFilePermissionsBestEffort(keyPath);
     const raw = readFileSync(keyPath, "utf8");
@@ -130,6 +160,16 @@ async function inspectLocalEncryptedHealth(): Promise<SecretProviderHealthCheck>
   }
 
   const keyPath = resolveMasterKeyFilePath();
+  try {
+    enforceKeyPathIsolation(keyPath);
+  } catch (err) {
+    return {
+      provider: "local_encrypted",
+      status: "error",
+      message: err instanceof Error ? err.message : String(err),
+      details: { keySource: "file", keyFilePath: keyPath },
+    };
+  }
   if (!existsSync(keyPath)) {
     return {
       provider: "local_encrypted",

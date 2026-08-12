@@ -3,6 +3,8 @@ import {
   acceptIssueThreadInteractionSchema,
   askUserQuestionsResultSchema,
   createIssueThreadInteractionSchema,
+  requestBoardApprovalPayloadSchema,
+  requestBoardApprovalResultSchema,
   requestConfirmationPayloadSchema,
   requestConfirmationResultSchema,
   submitIssueThreadInteractionVerdictsSchema,
@@ -458,5 +460,75 @@ describe("issue thread interaction schemas", () => {
         { id: "api", verdict: "reject", reason: "Needs revision" },
       ],
     })).toThrow("verdict item ids must be unique");
+  });
+
+  it("parses request_board_approval payloads with default wake continuation", () => {
+    const parsed = createIssueThreadInteractionSchema.parse({
+      kind: "request_board_approval",
+      payload: {
+        version: 1,
+        prompt: "Budget override for project X?",
+        acceptLabel: "Approve",
+        rejectLabel: "Reject",
+        rejectRequiresReason: true,
+        rejectReasonLabel: "Why?",
+        declineReasonPlaceholder: "Optional reason",
+        detailsMarkdown: "Requesting budget override for Q3.",
+        supersedeOnUserComment: true,
+      },
+    });
+
+    expect(parsed).toMatchObject({
+      kind: "request_board_approval",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        prompt: "Budget override for project X?",
+        acceptLabel: "Approve",
+        rejectLabel: "Reject",
+        rejectRequiresReason: true,
+        rejectReasonLabel: "Why?",
+        allowDeclineReason: true,
+        declineReasonPlaceholder: "Optional reason",
+        supersedeOnUserComment: true,
+      },
+    });
+  });
+
+  it("parses request_board_approval payloads without supersedeOnUserComment", () => {
+    const parsed = createIssueThreadInteractionSchema.parse({
+      kind: "request_board_approval",
+      payload: {
+        version: 1,
+        prompt: "Board approval needed?",
+      },
+    });
+
+    expect(parsed.kind).toBe("request_board_approval");
+    expect(parsed).toMatchObject({
+      kind: "request_board_approval",
+      payload: { prompt: "Board approval needed?" },
+    });
+  });
+
+  it("round-trips request_board_approval result schemas", () => {
+    const result = requestBoardApprovalResultSchema.parse({
+      version: 1,
+      outcome: "accepted",
+    });
+    expect(result).toMatchObject({ version: 1, outcome: "accepted" });
+
+    const rejected = requestBoardApprovalResultSchema.parse({
+      version: 1,
+      outcome: "rejected",
+      reason: "Not enough budget.",
+    });
+    expect(rejected).toMatchObject({ version: 1, outcome: "rejected", reason: "Not enough budget." });
+  });
+
+  it("rejects request_board_approval result with invalid outcome", () => {
+    expect(() => requestBoardApprovalResultSchema.parse({
+      version: 1,
+      outcome: "resolved",
+    })).toThrow();
   });
 });

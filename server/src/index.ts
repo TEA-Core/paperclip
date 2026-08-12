@@ -987,6 +987,11 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...blockedWithoutBlockers }, "startup blocked-without-blockers sweep escalated issues");
         }
 
+        const pendingReviewRearm = await heartbeat.reconcilePendingReviewRearm();
+        if (pendingReviewRearm.reArmed > 0) {
+          logger.warn({ ...pendingReviewRearm }, "startup pending-review-rearm sweep re-surfaced undecided review stages");
+        }
+
         const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
         if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {
           logger.warn({ ...staleWakes }, "startup stale recovery action wake sweep re-fired wakes");
@@ -1165,6 +1170,10 @@ export async function startServer(): Promise<StartedServer> {
               const blockedWithoutBlockers = await heartbeat.reconcileBlockedWithoutBlockers();
               if (blockedWithoutBlockers.escalated > 0) {
                 logger.warn({ ...blockedWithoutBlockers }, "periodic blocked-without-blockers sweep escalated issues");
+              }
+              const pendingReviewRearm = await heartbeat.reconcilePendingReviewRearm();
+              if (pendingReviewRearm.reArmed > 0) {
+                logger.warn({ ...pendingReviewRearm }, "periodic pending-review-rearm sweep re-surfaced undecided review stages");
               }
               const staleWakes = await heartbeat.reconcileStaleRecoveryActionWakes({ intervalMs: config.recoveryActionWakeIntervalMs });
               if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {

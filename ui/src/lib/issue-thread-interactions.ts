@@ -10,6 +10,9 @@ export type {
   IssueThreadInteractionBase,
   IssueThreadInteractionContinuationPolicy,
   IssueThreadInteractionStatus,
+  RequestBoardApprovalInteraction,
+  RequestBoardApprovalPayload,
+  RequestBoardApprovalResult,
   RequestCheckboxConfirmationInteraction,
   RequestCheckboxConfirmationOption,
   RequestCheckboxConfirmationPayload,
@@ -39,6 +42,8 @@ import type {
   AskUserQuestionsInteraction,
   AskUserQuestionsQuestion,
   IssueThreadInteraction,
+  RequestBoardApprovalInteraction,
+  RequestBoardApprovalPayload,
   RequestCheckboxConfirmationPayload,
   RequestCheckboxConfirmationResult,
   RequestConfirmationInteraction,
@@ -71,6 +76,7 @@ export function isIssueThreadInteraction(
       || candidate.kind === "request_confirmation"
       || candidate.kind === "request_checkbox_confirmation"
       || candidate.kind === "request_item_verdicts"
+      || candidate.kind === "request_board_approval"
     );
 }
 
@@ -229,6 +235,19 @@ export function buildIssueThreadInteractionSummary(
 
   if (interaction.kind === "request_item_verdicts") {
     return buildItemVerdictsSummary(interaction);
+  }
+
+  if (interaction.kind === "request_board_approval") {
+    if (interaction.status === "accepted") return "Approved by the board";
+    if (interaction.status === "rejected") return "Rejected by the board";
+    if (interaction.status === "expired") {
+      const outcome = interaction.result?.outcome;
+      if (outcome === "superseded_by_comment") return "Board approval expired after comment";
+      if (outcome === "stale_target") return "Board approval expired after target changed";
+      if (outcome === "withdrawn_by_author") return "Board approval withdrawn by the author";
+      return "Board approval expired";
+    }
+    return "Requested board approval";
   }
 
   const count = interaction.payload.questions.length;

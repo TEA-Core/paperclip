@@ -294,6 +294,52 @@ describe("resolveExecutionRunAdapterConfig", () => {
     });
   });
 
+  it("omitted low-trust allowed secret binding ids mean unconstrained, not deny-all", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
+      config: { env: {} },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+    const resolveEnvBindings = vi.fn().mockResolvedValue({
+      env: {},
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+
+    await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      heartbeatRunId: "run-1",
+      environmentId: "environment-1",
+      projectId: "project-1",
+      routineId: "routine-1",
+      executionRunConfig: { env: {} },
+      environmentEnv: { ENVIRONMENT_FLAG: "plain" },
+      projectEnv: { PROJECT_FLAG: "plain" },
+      routineEnv: { ROUTINE_FLAG: "plain" },
+      trustPreset: {
+        kind: "low_trust_review",
+        preset: LOW_TRUST_REVIEW_PRESET,
+        boundary: {
+          mode: LOW_TRUST_REVIEW_PRESET,
+          companyId: "company-1",
+          issueIds: ["issue-1"],
+        },
+        sourcePresets: {},
+      },
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+      } as any,
+    });
+
+    expect(resolveAdapterConfigForRuntime.mock.calls[0]?.[2].allowedBindingIds).toBeUndefined();
+    expect(resolveEnvBindings.mock.calls[0]?.[2].allowedBindingIds).toBeUndefined();
+    expect(resolveEnvBindings.mock.calls[1]?.[2].allowedBindingIds).toBeUndefined();
+    expect(resolveEnvBindings.mock.calls[2]?.[2].allowedBindingIds).toBeUndefined();
+  });
+
   it("blocks required missing user secrets before runtime env resolution", async () => {
     const resolveAdapterConfigForRuntime = vi.fn();
     const resolveEnvBindings = vi.fn();

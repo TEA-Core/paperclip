@@ -20,6 +20,9 @@ export const companies = pgTable(
     requireBoardApprovalForNewAgents: boolean("require_board_approval_for_new_agents")
       .notNull()
       .default(false),
+    mergeArmingEnabled: boolean("merge_arming_enabled")
+      .notNull()
+      .default(false),
     feedbackDataSharingEnabled: boolean("feedback_data_sharing_enabled")
       .notNull()
       .default(false),

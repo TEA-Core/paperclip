@@ -112,6 +112,8 @@ const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiv
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+const PENDING_REVIEW_REARM_CANDIDATE_LIMIT = 500;
+const PENDING_REVIEW_REARM_REASON = "execution_review_requested";
 const BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT = 100;
 const BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS = 15 * 60 * 1000;
 const STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT = 100;
@@ -5899,6 +5901,254 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  async function reconcilePendingReviewRearm(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+    rearmWindowMs?: number;
+    rearmMaxCount?: number;
+  }) {
+    const result = {
+      checked: 0,
+      reArmed: 0,
+      dependencyBlockedSkipped: 0,
+      livePathSkipped: 0,
+      queuedWakeSkipped: 0,
+      interactionSkipped: 0,
+      pauseHoldSkipped: 0,
+      notReadySkipped: 0,
+      candidateLimitSkipped: 0,
+      reArmCapSkipped: 0,
+      reArmCapExhausted: 0,
+      reArmCapExhaustedIssueIds: [] as string[],
+      deferredOrFailed: 0,
+      enqueueFailed: 0,
+      issueIds: [] as string[],
+    };
+
+    const source = "issue_graph_liveness.pending_review_rearm";
+    const requestedByActorId = "issue_graph_liveness_pending_review_rearm";
+    const config = loadConfig();
+    const windowMs = opts?.rearmWindowMs ?? config.pendingReviewRearmWindowMs;
+    const maxCount = opts?.rearmMaxCount ?? config.pendingReviewRearmMaxCount;
+    const now = opts?.now ?? new Date();
+    const cutoff = new Date(now.getTime() - windowMs);
+    const recoveryActionsSvc = issueRecoveryActionService(db);
+
+    const filters = [
+      eq(issues.status, "in_review"),
+      visibleIssueCondition(),
+      sql`${issues.executionState}->>'status' = 'pending'`,
+      sql`${issues.executionState}->>'currentStageType' = 'review'`,
+      sql`${issues.executionState}->>'lastDecisionId' is null`,
+      sql`${issues.executionState}->'currentParticipant'->>'type' = 'agent'`,
+      sql`${issues.executionState}->'currentParticipant'->>'agentId' is not null`,
+      lt(issues.updatedAt, cutoff),
+    ];
+    if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
+
+    const rows = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        executionState: issues.executionState,
+        updatedAt: issues.updatedAt,
+        totalCount: sql<number>`count(*) over()::int`,
+      })
+      .from(issues)
+      .where(and(...filters))
+      .orderBy(asc(issues.id))
+      .limit(PENDING_REVIEW_REARM_CANDIDATE_LIMIT);
+
+    result.checked = rows.length;
+    result.candidateLimitSkipped = Math.max(0, (rows[0]?.totalCount ?? 0) - rows.length);
+
+    const candidates = rows.map(({ totalCount: _totalCount, ...candidate }) => candidate);
+    const candidatesByCompany = new Map<string, typeof candidates>();
+
+    for (const candidate of candidates) {
+      const companyCandidates = candidatesByCompany.get(candidate.companyId) ?? [];
+      companyCandidates.push(candidate);
+      candidatesByCompany.set(candidate.companyId, companyCandidates);
+    }
+
+    for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
+      const readinessMap = await issuesSvc.listDependencyReadiness(
+        companyId,
+        companyCandidates.map((candidate) => candidate.id),
+      );
+
+      for (const candidate of companyCandidates) {
+        const readiness = readinessMap.get(candidate.id);
+        if (!readiness?.isDependencyReady) {
+          result.dependencyBlockedSkipped += 1;
+          continue;
+        }
+
+        const state = parseIssueExecutionState(candidate.executionState);
+        const participant = state?.currentParticipant;
+        if (participant?.type !== "agent" || !participant.agentId) {
+          result.notReadySkipped += 1;
+          continue;
+        }
+        const agentId = participant.agentId;
+
+        if (await hasActiveExecutionPath(companyId, candidate.id, agentId)) {
+          result.livePathSkipped += 1;
+          continue;
+        }
+
+        if (await hasQueuedIssueWake(companyId, candidate.id, agentId)) {
+          result.queuedWakeSkipped += 1;
+          continue;
+        }
+
+        if (await hasPendingWakeInteraction(companyId, candidate.id)) {
+          result.interactionSkipped += 1;
+          continue;
+        }
+
+        if (await isAutomaticRecoverySuppressedByPauseHold(db, companyId, candidate.id, treeControlSvc)) {
+          result.pauseHoldSkipped += 1;
+          continue;
+        }
+
+        const consumedCount = await db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.reason, PENDING_REVIEW_REARM_REASON),
+              sql`${agentWakeupRequests.payload} ->> 'rearm' = 'true'`,
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${candidate.id}`,
+              gte(agentWakeupRequests.requestedAt, cutoff),
+              inArray(agentWakeupRequests.status, ["completed", "failed", "timed_out"]),
+            ),
+          )
+          .then((rows) => rows[0]?.count ?? 0);
+
+        if (consumedCount >= maxCount) {
+          result.reArmCapSkipped += 1;
+          if (!(await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id))) {
+            await recoveryActionsSvc.upsertSourceScoped({
+              companyId,
+              sourceIssueId: candidate.id,
+              kind: "pending_review_rearm_cap_exhausted",
+              ownerType: "board",
+              previousOwnerAgentId: agentId,
+              cause: "pending_review_rearm_cap_exhausted",
+              fingerprint: `prr:${companyId}:${candidate.id}`,
+              evidence: {
+                identifier: candidate.identifier,
+                reArmCount: consumedCount,
+                reArmMax: maxCount,
+                reArmWindowMs: windowMs,
+              },
+              nextAction:
+                "This issue's pending review was re-armed repeatedly without a decision. Review and take action.",
+              wakePolicy: null,
+              monitorPolicy: null,
+              maxAttempts: null,
+              lastAttemptAt: now,
+            });
+            result.reArmCapExhausted += 1;
+            result.reArmCapExhaustedIssueIds.push(candidate.id);
+          }
+          continue;
+        }
+
+        const executionStage = buildExecutionStageWakeContextFromState(state);
+        if (!executionStage) {
+          result.notReadySkipped += 1;
+          continue;
+        }
+
+        try {
+          const wake = await deps.enqueueWakeup(agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: PENDING_REVIEW_REARM_REASON,
+            payload: {
+              issueId: candidate.id,
+              mutation: "update",
+              executionStage,
+              rearm: true,
+            },
+            requestedByActorType: "system",
+            requestedByActorId,
+            contextSnapshot: {
+              issueId: candidate.id,
+              taskId: candidate.id,
+              wakeReason: PENDING_REVIEW_REARM_REASON,
+              source,
+              executionStage,
+              rearm: true,
+            },
+          });
+          if (!wake) {
+            result.deferredOrFailed += 1;
+            continue;
+          }
+
+          result.reArmed += 1;
+          result.issueIds.push(candidate.id);
+
+          await logActivity(db, {
+            companyId,
+            actorType: "system",
+            actorId: requestedByActorId,
+            agentId,
+            runId: opts?.runId ?? null,
+            action: "issue.pending_review_rearm_wake_emitted",
+            entityType: "issue",
+            entityId: candidate.id,
+            details: {
+              source,
+              wakeupRunId: wake.id,
+              reArmCount: consumedCount + 1,
+              reArmMax: maxCount,
+            },
+          });
+        } catch (err) {
+          result.deferredOrFailed += 1;
+          result.enqueueFailed += 1;
+          logger.warn(
+            { err, issueId: candidate.id, agentId, source },
+            "failed to enqueue pending review re-arm wake",
+          );
+        }
+      }
+    }
+
+    if (result.reArmed > 0) {
+      logger.warn(
+        { reArmed: result.reArmed, issueIds: result.issueIds, source },
+        "pending review re-arm sweep re-surfaced undecided review stages",
+      );
+    }
+
+    return result;
+
+    function buildExecutionStageWakeContextFromState(state: ReturnType<typeof parseIssueExecutionState>): Record<string, unknown> | null {
+      if (!state) return null;
+      const participant = state.currentParticipant;
+      if (!participant) return null;
+      return {
+        wakeRole: state.currentStageType === "approval" ? "approver" : "reviewer",
+        stageId: state.currentStageId,
+        stageType: state.currentStageType,
+        currentParticipant: participant,
+        returnAssignee: state.returnAssignee,
+        reviewRequest: state.reviewRequest,
+        lastDecisionOutcome: state.lastDecisionOutcome,
+        allowedActions: ["approve", "request_changes"],
+      };
+    }
+  }
+
   async function reconcileIssueGraphLiveness(opts?: {
     runId?: string | null;
     force?: boolean;
@@ -7268,6 +7518,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
     reconcileBlockedWithoutBlockers,
+    reconcilePendingReviewRearm,
     reconcileStaleRecoveryActionWakes,
     reconcileUnfinalizableWorkspaceBarriers,
     ingestStaleInReviewChildIssues,

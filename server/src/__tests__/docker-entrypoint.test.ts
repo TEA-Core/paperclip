@@ -18,8 +18,10 @@ const execFileAsync = promisify(execFile);
  *    container starts non-root, where neither the remap nor gosu can work,
  *    so the command must be exec'd directly (with a warning on mismatch).
  *
- * The system commands (id, usermod, groupmod, chown, gosu) are stubbed via
- * PATH so the branching logic runs unmodified on any host.
+ * The system commands (id, usermod, groupmod, chown, mkdir, gosu) are stubbed
+ * via PATH so the branching logic runs unmodified on any host. mkdir is stubbed
+ * because the root path creates /etc/paperclip/secrets, which an unprivileged
+ * test host cannot write.
  */
 
 const ENTRYPOINT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "scripts", "docker-entrypoint.sh");
@@ -43,7 +45,7 @@ function installStubs(ids: { uid: number; gid: number; nodeUid?: number; nodeGid
       `else echo 0; fi`,
     ].join("\n"),
   );
-  for (const cmd of ["usermod", "groupmod", "chown"]) {
+  for (const cmd of ["usermod", "groupmod", "chown", "mkdir"]) {
     writeStub(cmd, `echo "${cmd} $*" >> "${logFile}"`);
   }
   writeStub("gosu", `echo "gosu $*" >> "${logFile}"\nshift\nexec "$@"`);
@@ -75,7 +77,17 @@ describe("docker-entrypoint.sh", () => {
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(calls).toContain("gosu node echo ENTRYPOINT-CMD-RAN");
     expect(calls).not.toContain("usermod");
-    expect(calls).not.toContain("chown");
+    expect(calls).not.toContain("chown -R node:node /paperclip");
+  });
+
+  it("pre-creates the secrets key directory outside the paperclip volume when root", async () => {
+    installStubs({ uid: 0, gid: 0 });
+
+    const { stdout, calls } = await runEntrypoint();
+
+    expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
+    expect(calls).toContain("mkdir -p /etc/paperclip/secrets");
+    expect(calls).toContain("chown node:node /etc/paperclip/secrets");
   });
 
   it("remaps the node user and chowns /paperclip before gosu when root requests a different UID/GID", async () => {

@@ -34,6 +34,7 @@ import {
   clampIssueListLimit,
   deriveIssueCommentRunLogAttribution,
   ISSUE_LIST_MAX_LIMIT,
+  isPendingReviewParticipantCondition,
   issueService,
 } from "../services/issues.ts";
 import {
@@ -2706,6 +2707,110 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     expect(result?.description).toHaveLength(1200);
     expect(result?.description?.endsWith("—")).toBe(true);
+  });
+
+  it("returns issues where the agent is the currentParticipant of a pending review stage", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const pendingReviewIssueId = randomUUID();
+    const decidedReviewIssueId = randomUUID();
+    const nonParticipantReviewIssueId = randomUUID();
+    const todoIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Other",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(issues).values([
+      {
+        id: pendingReviewIssueId,
+        companyId,
+        title: "Pending review",
+        status: "in_review",
+        priority: "medium",
+        executionState: {
+          status: "pending",
+          currentStageType: "review",
+          currentStageId: randomUUID(),
+          currentParticipant: { type: "agent", agentId, userId: null },
+          lastDecisionId: null,
+        },
+      },
+      {
+        id: decidedReviewIssueId,
+        companyId,
+        title: "Decided review",
+        status: "in_review",
+        priority: "medium",
+        executionState: {
+          status: "pending",
+          currentStageType: "review",
+          currentStageId: randomUUID(),
+          currentParticipant: { type: "agent", agentId, userId: null },
+          lastDecisionId: randomUUID(),
+        },
+      },
+      {
+        id: nonParticipantReviewIssueId,
+        companyId,
+        title: "Non-participant review",
+        status: "in_review",
+        priority: "medium",
+        executionState: {
+          status: "pending",
+          currentStageType: "review",
+          currentStageId: randomUUID(),
+          currentParticipant: { type: "agent", agentId: otherAgentId, userId: null },
+          lastDecisionId: null,
+        },
+      },
+      {
+        id: todoIssueId,
+        companyId,
+        title: "Todo issue",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const result = await svc.list(companyId, {
+      pendingReviewParticipantAgentId: agentId,
+    });
+    const resultIds = new Set(result.map((issue) => issue.id));
+
+    expect(resultIds).toEqual(new Set([pendingReviewIssueId]));
+    expect(resultIds.has(decidedReviewIssueId)).toBe(false);
+    expect(resultIds.has(nonParticipantReviewIssueId)).toBe(false);
+    expect(resultIds.has(todoIssueId)).toBe(false);
   });
 });
 

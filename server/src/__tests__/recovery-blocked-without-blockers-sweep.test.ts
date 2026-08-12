@@ -73,6 +73,64 @@ if (!embeddedPostgresSupport.supported) {
 
 const GRACE_THRESHOLD_MS = 15 * 60 * 1000;
 
+// Cleans up the issue graph plus everything a dispatched heartbeat run may
+// create (run events, environment leases, documents/comments, company skills).
+// CASCADE handles FK references that are omitted from this list.
+const TRUNCATE_ALL_SQL = `
+  TRUNCATE TABLE
+    "activity_log",
+    "document_revisions",
+    "documents",
+    "environment_leases",
+    "environments",
+    "execution_workspaces",
+    "heartbeat_run_events",
+    "heartbeat_run_watchdog_decisions",
+    "heartbeat_runs",
+    "issue_comments",
+    "issue_documents",
+    "issue_relations",
+    "issue_recovery_actions",
+    "issue_thread_interactions",
+    "issue_tree_hold_members",
+    "issue_tree_holds",
+    "issue_work_products",
+    "issues",
+    "agent_wakeup_requests",
+    "agent_runtime_state",
+    "company_skill_versions",
+    "company_skills",
+    "agents",
+    "instance_settings",
+    "companies",
+    "project_workspaces",
+    "projects"
+  RESTART IDENTITY CASCADE
+`;
+
+// TRUNCATE takes AccessExclusiveLock on every listed table, so a heartbeat run
+// dispatched by a heal and still writing in the background can deadlock with it
+// (Postgres 40P01) or block it past lock_timeout (55P03). Losing that race used
+// to abort cleanup and leak the previous test's issues/recovery actions into the
+// next test, which then failed on unrelated count assertions. Retry instead: the
+// competing statement is already finishing when Postgres breaks the cycle.
+function isRetryableLockError(error: unknown): boolean {
+  const codes = new Set(["40P01", "55P03", "40001"]);
+  for (let current: unknown = error, depth = 0; current && depth < 6; depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && codes.has(code)) return true;
+    const message = (current as { message?: unknown }).message;
+    if (
+      typeof message === "string" &&
+      (message.includes("deadlock detected") || message.includes("due to lock timeout"))
+    ) {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -84,40 +142,28 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
-    // Cleans up the issue graph plus everything a dispatched heartbeat run may
-    // create (run events, environment leases, documents/comments, company skills).
-    // CASCADE handles FK references that are omitted from this list.
-    await db.execute(sql.raw(`
-      TRUNCATE TABLE
-        "activity_log",
-        "document_revisions",
-        "documents",
-        "environment_leases",
-        "environments",
-        "execution_workspaces",
-        "heartbeat_run_events",
-        "heartbeat_run_watchdog_decisions",
-        "heartbeat_runs",
-        "issue_comments",
-        "issue_documents",
-        "issue_relations",
-        "issue_recovery_actions",
-        "issue_thread_interactions",
-        "issue_tree_hold_members",
-        "issue_tree_holds",
-        "issue_work_products",
-        "issues",
-        "agent_wakeup_requests",
-        "agent_runtime_state",
-        "company_skill_versions",
-        "company_skills",
-        "agents",
-        "instance_settings",
-        "companies",
-        "project_workspaces",
-        "projects"
-      RESTART IDENTITY CASCADE
-    `));
+    // Wait for any background executeRun promises to fully settle before
+    // truncating. reconcileBlockedWithoutBlockers heals dispatch a wakeup that
+    // kicks off executeRun fire-and-forget; executeRun keeps writing to
+    // heartbeat_runs, heartbeat_run_events, agent_wakeup_requests, issues, etc.
+    // AFTER the run row leaves queued/running state. A TRUNCATE racing those
+    // late writes is what produces the 40P01 deadlock flake. drainActiveRunExecutions
+    // awaits the in-flight execution promises (module-level, shared across
+    // heartbeatService instances) so the DB is quiescent before we truncate.
+    await heartbeatService(db).drainActiveRunExecutions();
+
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await db.execute(sql.raw(TRUNCATE_ALL_SQL));
+        return;
+      } catch (error) {
+        if (!isRetryableLockError(error)) throw error;
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+      }
+    }
+    throw lastError;
   });
 
   afterAll(async () => {
@@ -156,14 +202,57 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     await instanceSettingsService(db).updateGeneral({ enableBlockedWithoutBlockersAutoHeal: true });
   }
 
-  async function drainAgentRuns(agentId: string, timeoutMs = 5000) {
+  // Waits until nothing the agent owns can still count as an active execution
+  // path, because reconcileBlockedWithoutBlockers skips such candidates
+  // (livePathSkipped) instead of healing them. Polling heartbeat_runs alone is
+  // not enough:
+  //   1. executeRun is dispatched fire-and-forget and its finally block can
+  //      promote and dispatch the next queued run for the same agent *after*
+  //      the previous row has left queued/running, so a poll landing in that
+  //      gap sees a false-quiet database and returns early.
+  //   2. The sweep's skip guards look wider than queued/running runs:
+  //      hasActiveExecutionPath also counts `scheduled_retry` runs and
+  //      `deferred_issue_execution` wakeups, and hasQueuedIssueWake counts
+  //      `queued` wakeups. None of those were awaited.
+  //   3. On a loaded CI runner a run can still be executing when a short wall
+  //      clock deadline lapses; returning silently there left the next sweep
+  //      pass to skip the candidate and fail on an unrelated count assertion.
+  // drainActiveRunExecutions awaits the actual in-flight execution promises
+  // (follow-ups included, since they are registered before the parent settles),
+  // so it is the deterministic primitive; the poll below only confirms the
+  // database agrees, and fails loudly rather than silently timing out.
+  async function drainAgentRuns(agentId: string, timeoutMs = 30_000) {
     const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const activeRuns = await db
-        .select({ id: heartbeatRuns.id })
-        .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, ["queued", "running"] as const)));
-      if (activeRuns.length === 0) return;
+    for (;;) {
+      await heartbeatService(db).drainActiveRunExecutions();
+      const [activeRuns, pendingWakes] = await Promise.all([
+        db
+          .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, agentId),
+              inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"] as const),
+            ),
+          ),
+        db
+          .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.agentId, agentId),
+              inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"] as const),
+            ),
+          ),
+      ]);
+      if (activeRuns.length === 0 && pendingWakes.length === 0) return;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `drainAgentRuns timed out after ${timeoutMs}ms for agent ${agentId}: ` +
+            `${activeRuns.length} active run(s) [${activeRuns.map((run) => run.status).join(", ")}], ` +
+            `${pendingWakes.length} pending wake(s) [${pendingWakes.map((wake) => wake.status).join(", ")}]`,
+        );
+      }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }

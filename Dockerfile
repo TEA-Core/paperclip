@@ -76,11 +76,83 @@ RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" &
 # above because each plugin's prebuild depends on the SDK's output.
 RUN node scripts/build-bundled-plugins.mjs
 
+# Both packages declare "files": ["dist"], so they must be compiled before
+# npm pack or the tarballs ship a package.json with no code behind it.
+RUN pnpm --filter @paperclipai/shared build
+RUN pnpm --filter @paperclipai/mcp-server build
+RUN test -f packages/mcp-server/dist/stdio.js || (echo "ERROR: mcp-server build output missing" && exit 1)
+
+# Pack both MCP workspace packages into tarballs, then apply publishConfig
+# by hand (npm pack does NOT apply it — only npm publish does) and pin
+# @paperclipai/shared via a file: tarball path so the local build is used
+# rather than a stale registry version.
+RUN mkdir -p /opt/paperclip-mcp /opt/paperclip-mcp-tarballs \
+  && cd packages/shared && npm pack --pack-destination /opt/paperclip-mcp-tarballs && cd /app \
+  && cd packages/mcp-server && npm pack --pack-destination /opt/paperclip-mcp-tarballs && cd /app \
+  && node -e '\
+    const { readFileSync, writeFileSync } = require("fs"); \
+    const { execSync } = require("child_process"); \
+    const { join } = require("path"); \
+    const dir = "/opt/paperclip-mcp-tarballs"; \
+    ["shared", "mcp-server"].forEach(name => { \
+      const tgz = execSync("ls " + dir + "/paperclipai-" + name + "-*.tgz").toString().trim(); \
+      execSync("tar xzf " + tgz + " -C " + dir); \
+      const pkg = JSON.parse(readFileSync(dir + "/package/package.json", "utf8")); \
+      if (pkg.publishConfig) { \
+        for (const k of ["exports","main","types","bin"]) \
+          if (pkg.publishConfig[k]) pkg[k] = pkg.publishConfig[k]; \
+      } \
+      if (name === "mcp-server" && pkg.dependencies && pkg.dependencies["@paperclipai/shared"]) { \
+        const sharedTgz = execSync("ls " + dir + "/paperclipai-shared-*.tgz").toString().trim(); \
+        pkg.dependencies["@paperclipai/shared"] = "file:" + sharedTgz; \
+      } \
+      writeFileSync(dir + "/package/package.json", JSON.stringify(pkg, null, 2) + "\n"); \
+      execSync("tar czf " + tgz + " -C " + dir + " package"); \
+      execSync("rm -rf " + dir + "/package"); \
+    }); \
+  ' \
+  && npm install --global --omit=dev --prefix /opt/paperclip-mcp \
+     /opt/paperclip-mcp-tarballs/paperclipai-mcp-server-*.tgz \
+  && rm -rf /opt/paperclip-mcp-tarballs
+
+# Build-time JSON-RPC handshake: prove the installed binary starts, resolves
+# its dependencies, and registers the three WorkSession tools. Fails the image
+# build if the dependency tree is broken or a tool is missing.
+RUN node -e '\
+  const { spawn } = require("child_process"); \
+  const proc = spawn("node", ["/opt/paperclip-mcp/bin/paperclip-mcp-server"], { \
+    stdio: ["pipe", "pipe", "pipe"] \
+  }); \
+  let stderr = ""; \
+  let stdout = ""; \
+  proc.stderr.on("data", d => { stderr += d.toString(); }); \
+  proc.stdout.on("data", d => { stdout += d.toString(); }); \
+  proc.on("error", err => { console.error("handshake spawn error:", err.message); process.exit(1); }); \
+  proc.on("close", code => { \
+    if (stderr) { console.error("handshake stderr:", stderr); } \
+    if (!stdout.includes("paperclipOpenWorkSession")) { \
+      console.error("handshake FAILED: paperclipOpenWorkSession not found in tools/list"); \
+      process.exit(1); \
+    } \
+    if (code !== 0) { console.error("handshake exit code:", code); process.exit(1); } \
+    console.log("handshake PASS: paperclipOpenWorkSession present"); \
+  }); \
+  proc.stdin.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2024-11-05",capabilities:{},clientInfo:{name:"test",version:"1.0.0"}}})); \
+  proc.stdin.write("\n"); \
+  proc.stdin.write(JSON.stringify({jsonrpc:"2.0",method:"notifications/initialized",params:{}})); \
+  proc.stdin.write("\n"); \
+  proc.stdin.write(JSON.stringify({jsonrpc:"2.0",id:2,method:"tools/list",params:{}})); \
+  proc.stdin.write("\n"); \
+  proc.stdin.end(); \
+'
+
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
 WORKDIR /app
 COPY --chown=node:node --from=build /app /app
+# Self-contained MCP server tree with resolved dependencies (npm pack + install).
+COPY --chown=node:node --from=build /opt/paperclip-mcp /opt/paperclip-mcp
 RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest supabase@latest \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \

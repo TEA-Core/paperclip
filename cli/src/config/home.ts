@@ -44,8 +44,8 @@ export function resolveDefaultLogsDir(instanceId?: string): string {
   return resolveSharedDefaultLogsDir({ instanceId });
 }
 
-export function resolveDefaultSecretsKeyFilePath(instanceId?: string): string {
-  return resolveSharedDefaultSecretsKeyFilePath({ instanceId });
+export function resolveDefaultSecretsKeyFilePath(): string {
+  return resolveSharedDefaultSecretsKeyFilePath();
 }
 
 export function resolveDefaultStorageDir(instanceId?: string): string {
@@ -67,7 +67,7 @@ export function describeLocalInstancePaths(instanceId?: string) {
     embeddedPostgresDataDir: resolveDefaultEmbeddedPostgresDir(resolvedInstanceId),
     backupDir: resolveDefaultBackupDir(resolvedInstanceId),
     logDir: resolveDefaultLogsDir(resolvedInstanceId),
-    secretsKeyFilePath: resolveDefaultSecretsKeyFilePath(resolvedInstanceId),
+    secretsKeyFilePath: resolveDefaultSecretsKeyFilePath(),
     storageDir: resolveDefaultStorageDir(resolvedInstanceId),
   };
 }
