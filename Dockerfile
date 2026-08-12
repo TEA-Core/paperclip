@@ -118,6 +118,9 @@ RUN mkdir -p /opt/paperclip-mcp /opt/paperclip-mcp-tarballs \
 # Build-time JSON-RPC handshake: prove the installed binary starts, resolves
 # its dependencies, and registers the three WorkSession tools. Fails the image
 # build if the dependency tree is broken or a tool is missing.
+# The MCP server reads PAPERCLIP_API_URL at startup to know where to connect;
+# set a dummy value so the binary can start during the build-only handshake.
+ENV PAPERCLIP_API_URL=http://localhost:3100
 RUN node -e '\
   const { spawn } = require("child_process"); \
   const proc = spawn("node", ["/opt/paperclip-mcp/bin/paperclip-mcp-server"], { \
