@@ -115,7 +115,7 @@ pnpm paperclipai allowed-hostname my-tailscale-host
 | Database | `~/.paperclip/instances/default/db` |
 | Logs | `~/.paperclip/instances/default/logs` |
 | Storage | `~/.paperclip/instances/default/data/storage` |
-| Secrets key | `~/.paperclip/instances/default/secrets/master.key` |
+| Secrets key | `/etc/paperclip/secrets/master.key` |
 
 Override with:
 

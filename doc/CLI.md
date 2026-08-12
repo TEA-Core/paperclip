@@ -860,7 +860,7 @@ Local Paperclip data lives under the selected instance root. `PAPERCLIP_HOME` ch
         │   └── backups/                          # automatic DB backups
         ├── logs/
         ├── secrets/
-        │   └── master.key                        # local_encrypted master key
+        │   └── master.key                        # local_encrypted master key (default: /etc/paperclip/secrets/master.key)
         ├── workspaces/                           # default agent workspaces
         ├── projects/                             # project execution workspaces
         ├── companies/                            # per-company adapter homes (e.g. codex-home)
@@ -873,7 +873,7 @@ Default paths for the canonical install:
 - embedded db: `~/.paperclip/instances/default/db`
 - logs: `~/.paperclip/instances/default/logs`
 - storage: `~/.paperclip/instances/default/data/storage`
-- secrets key: `~/.paperclip/instances/default/secrets/master.key`
+- secrets key: `/etc/paperclip/secrets/master.key`
 
 Override base home or instance with env vars:
 
