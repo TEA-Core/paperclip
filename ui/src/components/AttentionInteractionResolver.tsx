@@ -12,7 +12,6 @@ import {
   type RequestBoardApprovalInteraction,
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
-  type RequestBoardApprovalInteraction,
   type RequestItemVerdictsInteraction,
   type RequestItemVerdictValue,
   type SuggestTasksInteraction,
