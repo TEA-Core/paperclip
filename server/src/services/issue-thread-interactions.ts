@@ -1280,6 +1280,14 @@ export function issueThreadInteractionService(db: Db) {
       }
 
       await touchIssue(db, issue.id);
+
+      if (data.kind === "request_board_approval") {
+        await db
+          .update(issues)
+          .set({ status: "blocked" })
+          .where(eq(issues.id, issue.id));
+      }
+
       return hydrateInteraction(created);
     },
 
