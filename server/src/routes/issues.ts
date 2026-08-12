@@ -196,6 +196,7 @@ import {
 } from "../services/source-trust.js";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
+  assertIssueExecutionPolicySatisfiable,
   resolveCoreTrustPreset,
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
@@ -7381,8 +7382,10 @@ export function issueRoutes(
     }
     await assertIssueEnvironmentSelection(companyId, createBody.executionWorkspaceSettings?.environmentId);
 
+    const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(createBody.executionPolicy);
+    assertIssueExecutionPolicySatisfiable({ companyId, executionPolicy: normalizedExecutionPolicy });
     const executionPolicy = applyActorMonitorScheduledBy(
-      normalizeIssueExecutionPolicy(createBody.executionPolicy),
+      normalizedExecutionPolicy,
       actor.actorType,
     );
     await assertCanManageIssueMonitor(access, req, companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
@@ -7582,8 +7585,10 @@ export function issueRoutes(
     const currentSerializedChild = serializationContext
       ? await findCurrentSerializedWatchdogChild(parent)
       : null;
+    const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(createBody.executionPolicy);
+    assertIssueExecutionPolicySatisfiable({ companyId: parent.companyId, executionPolicy: normalizedExecutionPolicy });
     const executionPolicy = applyActorMonitorScheduledBy(
-      normalizeIssueExecutionPolicy(createBody.executionPolicy),
+      normalizedExecutionPolicy,
       actor.actorType,
     );
     await assertCanManageIssueMonitor(access, req, parent.companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
@@ -7757,8 +7762,10 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const normalizedChildren = [];
     for (const child of requestedChildren) {
+      const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(child.executionPolicy);
+      assertIssueExecutionPolicySatisfiable({ companyId: sourceIssue.companyId, executionPolicy: normalizedExecutionPolicy });
       const executionPolicy = applyActorMonitorScheduledBy(
-        normalizeIssueExecutionPolicy(child.executionPolicy),
+        normalizedExecutionPolicy,
         actor.actorType,
       );
       await assertCanManageIssueMonitor(access, req, sourceIssue.companyId, child.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
@@ -8228,8 +8235,10 @@ export function issueRoutes(
       });
     }
     if (req.body.executionPolicy !== undefined) {
+      const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+      assertIssueExecutionPolicySatisfiable({ companyId: existing.companyId, executionPolicy: normalizedExecutionPolicy });
       updateFields.executionPolicy = applyActorMonitorScheduledBy(
-        normalizeIssueExecutionPolicy(req.body.executionPolicy),
+        normalizedExecutionPolicy,
         actor.actorType,
       );
     }

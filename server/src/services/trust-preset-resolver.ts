@@ -8,12 +8,34 @@ import {
   trustAuthorizationPolicySchema,
   trustPresetSchema,
 } from "@paperclipai/shared";
+import { unprocessable } from "../errors.js";
 
 type JsonRecord = Record<string, unknown>;
 
 export const LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH = 12;
 
 export type TrustPresetPolicySource = "agent" | "project" | "issue" | "run";
+
+export type AssertIssueExecutionPolicySatisfiableInput = {
+  companyId: string;
+  executionPolicy: unknown;
+};
+
+export function assertIssueExecutionPolicySatisfiable(input: AssertIssueExecutionPolicySatisfiableInput): void {
+  const resolution = resolveCoreTrustPreset({
+    companyId: input.companyId,
+    issue: {
+      companyId: input.companyId,
+      executionPolicy: input.executionPolicy,
+    },
+  });
+  if (resolution.kind === "denied") {
+    throw unprocessable(
+      `Unsatisfiable low-trust authorization policy at write: ${resolution.reason}`,
+      { reason: resolution.reason, detail: resolution.detail },
+    );
+  }
+}
 
 export type ResolveCoreTrustPresetInput = {
   companyId: string;
