@@ -10,6 +10,9 @@ export type {
   IssueThreadInteractionBase,
   IssueThreadInteractionContinuationPolicy,
   IssueThreadInteractionStatus,
+  RequestBoardApprovalInteraction,
+  RequestBoardApprovalPayload,
+  RequestBoardApprovalResult,
   RequestCheckboxConfirmationInteraction,
   RequestCheckboxConfirmationOption,
   RequestCheckboxConfirmationPayload,
@@ -39,6 +42,8 @@ import type {
   AskUserQuestionsInteraction,
   AskUserQuestionsQuestion,
   IssueThreadInteraction,
+  RequestBoardApprovalInteraction,
+  RequestBoardApprovalPayload,
   RequestCheckboxConfirmationPayload,
   RequestCheckboxConfirmationResult,
   RequestConfirmationInteraction,
@@ -71,6 +76,7 @@ export function isIssueThreadInteraction(
       || candidate.kind === "request_confirmation"
       || candidate.kind === "request_checkbox_confirmation"
       || candidate.kind === "request_item_verdicts"
+      || candidate.kind === "request_board_approval"
     );
 }
 

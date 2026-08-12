@@ -256,6 +256,7 @@ export const ISSUE_THREAD_INTERACTION_KINDS = [
   "request_confirmation",
   "request_checkbox_confirmation",
   "request_item_verdicts",
+  "request_board_approval",
 ] as const;
 export type IssueThreadInteractionKind = (typeof ISSUE_THREAD_INTERACTION_KINDS)[number];
 
@@ -607,6 +608,13 @@ export const PROJECT_COLORS = [
   "#3b82f6", // blue
 ] as const;
 
+/**
+ * `request_board_approval` and `budget_override_required` are deprecated for
+ * creation. Use the `request_board_approval` interaction kind instead, which
+ * carries continuationPolicy, supersedeOnUserComment, expiresAt, and a post-
+ * decision handler. Existing rows remain readable via the approvals API.
+ * @see ISSUE_THREAD_INTERACTION_KINDS
+ */
 export const APPROVAL_TYPES = [
   "hire_agent",
   "approve_ceo_strategy",

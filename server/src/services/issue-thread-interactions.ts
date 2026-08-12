@@ -18,6 +18,7 @@ import type {
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
   IssueThreadInteraction,
+  RequestBoardApprovalInteraction,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
   RequestConfirmationTarget,
@@ -38,6 +39,8 @@ import {
   cancelIssueThreadInteractionSchema,
   createIssueThreadInteractionSchema,
   rejectIssueThreadInteractionSchema,
+  requestBoardApprovalPayloadSchema,
+  requestBoardApprovalResultSchema,
   requestCheckboxConfirmationPayloadSchema,
   requestCheckboxConfirmationResultSchema,
   requestConfirmationPayloadSchema,
@@ -93,7 +96,8 @@ type IssueResolutionContext = {
 type RequestConfirmationLikeKind = (typeof REQUEST_CONFIRMATION_INTERACTION_KINDS)[number];
 type RequestConfirmationLikeInteraction =
   | RequestConfirmationInteraction
-  | RequestCheckboxConfirmationInteraction;
+  | RequestCheckboxConfirmationInteraction
+  | RequestBoardApprovalInteraction;
 
 type TargetBoundInteractionKind = (typeof TARGET_BOUND_INTERACTION_KINDS)[number];
 type TargetBoundInteraction =
@@ -189,6 +193,13 @@ function hydrateInteraction(
         payload: requestItemVerdictsPayloadSchema.parse(row.payload),
         result: row.result ? requestItemVerdictsResultSchema.parse(row.result) : null,
       } satisfies RequestItemVerdictsInteraction;
+    case "request_board_approval":
+      return {
+        ...base,
+        kind: "request_board_approval",
+        payload: requestBoardApprovalPayloadSchema.parse(row.payload),
+        result: row.result ? requestBoardApprovalResultSchema.parse(row.result) : null,
+      } satisfies RequestBoardApprovalInteraction;
     default:
       throw unprocessable(`Unknown interaction kind: ${row.kind}`);
   }
@@ -250,6 +261,14 @@ function normalizeCreateInteractionInput(input: CreateIssueThreadInteraction): C
         },
       };
     case "request_item_verdicts":
+      return {
+        ...input,
+        payload: {
+          ...input.payload,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
+        },
+      };
+    case "request_board_approval":
       return {
         ...input,
         payload: {
@@ -390,6 +409,7 @@ function deriveTargetType(interaction: IssueThreadInteraction) {
     case "request_confirmation":
     case "request_checkbox_confirmation":
     case "request_item_verdicts":
+    case "request_board_approval":
       return interaction.payload.target?.type ?? "none";
     default:
       return "none";
@@ -412,6 +432,9 @@ function deriveResolutionReason(interaction: IssueThreadInteraction) {
         return interaction.result?.outcome ?? "expired";
       }
       if (interaction.kind === "request_item_verdicts") {
+        return interaction.result?.outcome ?? "expired";
+      }
+      if (interaction.kind === "request_board_approval") {
         return interaction.result?.outcome ?? "expired";
       }
       return "expired";
@@ -456,6 +479,8 @@ function buildInteractionResolvedCounts(interaction: IssueThreadInteraction, arg
         itemCount: nonNegativeInteger(interaction.payload.items.length),
         resolvedItemCount: nonNegativeInteger(interaction.result?.items?.length ?? 0),
       };
+    case "request_board_approval":
+      return {};
     default:
       return {};
   }
@@ -1207,6 +1232,7 @@ export function issueThreadInteractionService(db: Db) {
         data.kind === "request_confirmation"
         || data.kind === "request_checkbox_confirmation"
         || data.kind === "request_item_verdicts"
+        || data.kind === "request_board_approval"
       ) {
         await assertRequestConfirmationTargetIsCurrent(db, {
           companyId: issue.companyId,
@@ -1286,6 +1312,20 @@ export function issueThreadInteractionService(db: Db) {
           };
         }
         case "request_checkbox_confirmation": {
+          await assertIssueWorkspaceFinalizedForAccept({ db, issue, sourceRunId: current.sourceRunId });
+          const accepted = await acceptRequestConfirmation({
+            issue,
+            current,
+            input: data,
+            actor,
+          });
+          return {
+            interaction: accepted.interaction,
+            continuationIssue: accepted.continuationIssue,
+            createdIssues: [],
+          };
+        }
+        case "request_board_approval": {
           await assertIssueWorkspaceFinalizedForAccept({ db, issue, sourceRunId: current.sourceRunId });
           const accepted = await acceptRequestConfirmation({
             issue,
@@ -1468,6 +1508,7 @@ export function issueThreadInteractionService(db: Db) {
           return issueThreadInteractionService(db).rejectSuggestedTasks(issue, interactionId, data, actor, current);
         case "request_confirmation":
         case "request_checkbox_confirmation":
+        case "request_board_approval":
           return rejectRequestConfirmation({
             issue,
             current,

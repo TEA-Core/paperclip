@@ -1205,6 +1205,28 @@ export interface RequestItemVerdictsResult {
   staleTarget?: RequestConfirmationTarget | null;
 }
 
+export interface RequestBoardApprovalPayload {
+  version: 1;
+  prompt: string;
+  detailsMarkdown?: string | null;
+  acceptLabel?: string | null;
+  rejectLabel?: string | null;
+  rejectRequiresReason?: boolean;
+  rejectReasonLabel?: string | null;
+  allowDeclineReason?: boolean;
+  declineReasonPlaceholder?: string | null;
+  supersedeOnUserComment?: boolean;
+  target?: RequestConfirmationTarget | null;
+}
+
+export interface RequestBoardApprovalResult {
+  version: 1;
+  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "withdrawn_by_author" | "expired_issue_terminal";
+  reason?: string | null;
+  commentId?: string | null;
+  staleTarget?: RequestConfirmationTarget | null;
+}
+
 export interface IssueThreadInteractionBase extends IssueThreadInteractionActorFields {
   id: string;
   companyId: string;
@@ -1252,26 +1274,35 @@ export interface RequestItemVerdictsInteraction extends IssueThreadInteractionBa
   result?: RequestItemVerdictsResult | null;
 }
 
+export interface RequestBoardApprovalInteraction extends IssueThreadInteractionBase {
+  kind: "request_board_approval";
+  payload: RequestBoardApprovalPayload;
+  result?: RequestBoardApprovalResult | null;
+}
+
 export type IssueThreadInteraction =
   | SuggestTasksInteraction
   | AskUserQuestionsInteraction
   | RequestConfirmationInteraction
   | RequestCheckboxConfirmationInteraction
-  | RequestItemVerdictsInteraction;
+  | RequestItemVerdictsInteraction
+  | RequestBoardApprovalInteraction;
 
 export type IssueThreadInteractionPayload =
   | SuggestTasksPayload
   | AskUserQuestionsPayload
   | RequestConfirmationPayload
   | RequestCheckboxConfirmationPayload
-  | RequestItemVerdictsPayload;
+  | RequestItemVerdictsPayload
+  | RequestBoardApprovalPayload;
 
 export type IssueThreadInteractionResult =
   | SuggestTasksResult
   | AskUserQuestionsResult
   | RequestConfirmationResult
   | RequestCheckboxConfirmationResult
-  | RequestItemVerdictsResult;
+  | RequestItemVerdictsResult
+  | RequestBoardApprovalResult;
 
 export interface IssueAttachment {
   id: string;
