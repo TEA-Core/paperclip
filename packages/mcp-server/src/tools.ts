@@ -3,7 +3,7 @@ import {
   addIssueCommentSchema,
   askUserQuestionsPayloadSchema,
   checkoutIssueSchema,
-  createApprovalSchema,
+  createApprovalObjectSchema,
   createIssueInputSchema,
   issueThreadInteractionContinuationPolicySchema,
   requestCheckboxConfirmationPayloadSchema,
@@ -169,9 +169,12 @@ const approvalDecisionSchema = z.object({
   payloadJson: z.string().optional(),
 });
 
+// Merge the plain object form: `makeTool` requires a `ZodObject` for the MCP
+// tool JSON schema, and `createApprovalSchema` is a `ZodEffects`. The
+// issue-gating `issueIds` rule is still enforced server-side on POST.
 const createApprovalToolSchema = z.object({
   companyId: companyIdOptional,
-}).merge(createApprovalSchema);
+}).merge(createApprovalObjectSchema);
 
 const apiRequestSchema = z.object({
   method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
