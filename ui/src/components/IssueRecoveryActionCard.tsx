@@ -125,6 +125,7 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
   review_stage_unarmed: "Review Stage Unarmed",
   no_live_path_owner_unavailable: "Owner Unavailable",
   blocked_without_blockers: "Blocked Without Blockers",
+  pending_review_rearm_cap_exhausted: "Review Re-arm Cap Exhausted",
 };
 
 const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
@@ -147,6 +148,8 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "This task's assigned owner is not available and no live execution path exists.",
   blocked_without_blockers:
     "This task is marked blocked, but nothing is blocking it any more.",
+  pending_review_rearm_cap_exhausted:
+    "This task's review has been re-surfaced the maximum number of times without a decision.",
 };
 
 const STATE_TONE: Record<RecoveryCardCardState, {
