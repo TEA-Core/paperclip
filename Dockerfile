@@ -121,6 +121,7 @@ RUN mkdir -p /opt/paperclip-mcp /opt/paperclip-mcp-tarballs \
 # The MCP server reads PAPERCLIP_API_URL at startup to know where to connect;
 # set a dummy value so the binary can start during the build-only handshake.
 ENV PAPERCLIP_API_URL=http://localhost:3100
+ENV PAPERCLIP_API_KEY=dummy-for-build-handshake
 RUN node -e '\
   const { spawn } = require("child_process"); \
   const proc = spawn("node", ["/opt/paperclip-mcp/bin/paperclip-mcp-server"], { \
