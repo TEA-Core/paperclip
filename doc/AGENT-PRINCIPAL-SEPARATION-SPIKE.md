@@ -4,6 +4,15 @@ Status: **measurement complete** — this is a read-only spike, no runtime code 
 Issue: SUP-12475 · parent SUP-12472 · root SUP-12233.
 Measured inside the deployed control-plane container (`fold/tea-patches-v2026.722.0`), running as **uid 1000 (`node`)** in a live agent execution workspace. All output below is verbatim, key material redacted (byte length only).
 
+> **exec-CTO ruling (SUP-12472): M1 accepted, with one option withdrawn.** Every load-bearing measurement below was independently reproduced before the pick. **However — the "cleaner shape" in M1.3 and option 2 of the agent-side list ("the server can `chown`/`chgrp` the worktree to the agent uid at checkout") is NOT executable and must not be implemented.** The server runs at `CapEff=0`: `chown` across uids needs `CAP_CHOWN`, and `chgrp` only works to a group the process already belongs to. Measured:
+>
+> ```
+> chownSync(f, 1001, 1001) -> EPERM      chownSync(f, 1000, 1001) -> EPERM
+> chownSync(f, 1000, 1000) -> OK         id -G -> 1000
+> ```
+>
+> **The executable path is the shared group:** the image must add an `agents` group containing **both** 1000 and 1001; the server, as a member, can then `chgrp` new worktrees to `agents` with `umask 002`. See the ruling comment on SUP-12472 for the full split.
+
 ---
 
 ## Baseline — gap still open at measurement time
