@@ -531,6 +531,13 @@ export interface IssueFilters {
    */
   assigneeAgentId?: string | null;
   participantAgentId?: string;
+  /**
+   * Filter to issues where this agent is the currentParticipant of a pending
+   * review stage. The issue must be in_review with executionState.status =
+   * 'pending', currentStageType = 'review', lastDecisionId IS NULL, and
+   * currentParticipant.type = 'agent' with the given agentId.
+   */
+  pendingReviewParticipantAgentId?: string;
   assigneeUserId?: string;
   touchedByUserId?: string;
   inboxArchivedByUserId?: string;
@@ -1527,6 +1534,17 @@ function participatedByAgentCondition(companyId: string, agentId: string) {
       )
     )
   `;
+}
+
+export function isPendingReviewParticipantCondition(agentId: string) {
+  return and(
+    eq(issues.status, "in_review"),
+    sql`${issues.executionState}->>'status' = 'pending'`,
+    sql`${issues.executionState}->>'currentStageType' = 'review'`,
+    sql`${issues.executionState}->>'lastDecisionId' is null`,
+    sql`${issues.executionState}->'currentParticipant'->>'type' = 'agent'`,
+    sql`${issues.executionState}->'currentParticipant'->>'agentId' = ${agentId}`,
+  )!;
 }
 
 function myLastCommentAtExpr(companyId: string, userId: string) {
@@ -3858,6 +3876,7 @@ async function blockedInboxIssueConditions(
     conditions.push(eq(issues.assigneeAgentId, assigneeAgentFilter));
   }
   if (filters?.participantAgentId) conditions.push(participatedByAgentCondition(companyId, filters.participantAgentId));
+  if (filters?.pendingReviewParticipantAgentId) conditions.push(isPendingReviewParticipantCondition(filters.pendingReviewParticipantAgentId));
   if (filters?.assigneeUserId) conditions.push(eq(issues.assigneeUserId, filters.assigneeUserId));
   if (touchedByUserId) conditions.push(touchedByUserCondition(companyId, touchedByUserId));
   if (inboxArchivedByUserId) conditions.push(inboxVisibleForUserCondition(companyId, inboxArchivedByUserId));
@@ -5153,6 +5172,9 @@ export function issueService(db: Db) {
       }
       if (filters?.participantAgentId) {
         conditions.push(participatedByAgentCondition(companyId, filters.participantAgentId));
+      }
+      if (filters?.pendingReviewParticipantAgentId) {
+        conditions.push(isPendingReviewParticipantCondition(filters.pendingReviewParticipantAgentId));
       }
       if (filters?.assigneeUserId) {
         conditions.push(eq(issues.assigneeUserId, filters.assigneeUserId));

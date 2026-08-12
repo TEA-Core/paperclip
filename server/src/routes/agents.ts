@@ -2127,12 +2127,26 @@ export function agentRoutes(
 
     const issuesSvc = issueService(db);
     const recoveryActionsSvc = issueRecoveryActionService(db);
-    const rows = await issuesSvc.list(req.actor.companyId, {
-      assigneeAgentId: req.actor.agentId,
-      status: "todo,in_progress,blocked",
-      includeRoutineExecutions: true,
-      limit: ISSUE_LIST_DEFAULT_LIMIT,
-    });
+    const [assigneeRows, reviewRows] = await Promise.all([
+      issuesSvc.list(req.actor.companyId, {
+        assigneeAgentId: req.actor.agentId,
+        status: "todo,in_progress,blocked",
+        includeRoutineExecutions: true,
+        limit: ISSUE_LIST_DEFAULT_LIMIT,
+      }),
+      issuesSvc.list(req.actor.companyId, {
+        pendingReviewParticipantAgentId: req.actor.agentId,
+        status: "in_review",
+        includeRoutineExecutions: true,
+        limit: ISSUE_LIST_DEFAULT_LIMIT,
+      }),
+    ]);
+    const merged = new Map<string, (typeof assigneeRows)[number]>();
+    for (const row of assigneeRows) merged.set(row.id, row);
+    for (const row of reviewRows) {
+      if (!merged.has(row.id)) merged.set(row.id, row);
+    }
+    const rows = [...merged.values()];
     const worktreeActivation = await resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),
     });
