@@ -1486,7 +1486,7 @@ function ToolActionResolution({
   requestedByLabel,
 }: {
   state: ToolActionCardState;
-  interaction: RequestConfirmationInteraction;
+  interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction;
   resolvedByLabel: string | null;
   requestedByLabel: string;
 }) {
@@ -1639,15 +1639,15 @@ function RequestToolActionCard({
   onRejectInteraction,
   externalReferences,
 }: {
-  interaction: RequestConfirmationInteraction;
+  interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction;
   state: ToolActionCardState;
   resolvedByLabel: string | null;
   requestedByLabel: string;
   onAcceptInteraction?: (
-    interaction: RequestConfirmationInteraction,
+    interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction,
   ) => Promise<void> | void;
   onRejectInteraction?: (
-    interaction: RequestConfirmationInteraction,
+    interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction,
     reason?: string,
   ) => Promise<void> | void;
   externalReferences?: MarkdownExternalReferenceMap;
