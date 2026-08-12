@@ -124,6 +124,7 @@ import {
   routineService,
   workProductService,
   armMergeOnApproval,
+  publishApprovalStatus,
 } from "../services/index.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
@@ -8442,7 +8443,16 @@ export function issueRoutes(
     }
 
     if (transition.decision && transition.decision.outcome === "approved" && transition.decision.stageType === "approval") {
+      const issueIdentifier = `SUP-${issue.issueNumber}`;
       try {
+        const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier);
+        await svc.addComment(
+          issue.id,
+          `[Merge-arming] ${statusOutcome.message}`,
+          {},
+          { authorType: "system" },
+        );
+
         const company = await db
           .select({ mergeArmingEnabled: companies.mergeArmingEnabled })
           .from(companies)

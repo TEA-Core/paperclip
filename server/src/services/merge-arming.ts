@@ -161,6 +161,129 @@ async function enableAutoMerge(
   }
 }
 
+export async function publishApprovalStatus(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  issueIdentifier: string,
+): Promise<ArmingOutcome> {
+  const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId);
+
+  if (linkedPRs.length === 0) {
+    return { kind: "skipped", message: "status:skipped:no-pr: No linked pull request found" };
+  }
+
+  if (linkedPRs.length > 1) {
+    const prList = linkedPRs.map((pr) => pr.displayName).join(", ");
+    return {
+      kind: "skipped",
+      message: `status:skipped:ambiguous: Multiple linked PRs (${linkedPRs.length}): ${prList}`,
+    };
+  }
+
+  const pr = linkedPRs[0]!;
+  const token = await resolveGitHubToken(db, companyId);
+  if (!token) {
+    return { kind: "failed", message: "status:failed:auth_required: GitHub authentication failed" };
+  }
+
+  const headSha = await fetchPullRequestHeadSha(token, pr.owner, pr.repo, pr.number);
+  if (!headSha) {
+    return { kind: "failed", message: "status:failed:pr_not_found: Could not resolve PR head SHA" };
+  }
+
+  const result = await writeCommitStatus(token, pr.owner, pr.repo, headSha, issueIdentifier);
+  if (result.success) {
+    return {
+      kind: "armed",
+      message: `status:published: paperclip/approved status written to ${pr.displayName} head ${headSha.slice(0, 7)}`,
+    };
+  }
+
+  const safeError = result.error ?? "unknown_error";
+  const truncated = safeError.length > 200 ? safeError.slice(0, 200) + "..." : safeError;
+  return { kind: "failed", message: `status:failed:${truncated}` };
+}
+
+async function fetchPullRequestHeadSha(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<string | null> {
+  const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-merge-arming",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+
+  let response: Response;
+  try {
+    response = await ghFetch(url, { headers });
+  } catch {
+    return null;
+  }
+
+  if (!response.ok) return null;
+
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  if (!body) return null;
+
+  const head = body.head as Record<string, unknown> | undefined;
+  const sha = head?.sha as string | undefined;
+  return typeof sha === "string" && sha.length > 0 ? sha : null;
+}
+
+async function writeCommitStatus(
+  token: string,
+  owner: string,
+  repo: string,
+  headSha: string,
+  issueIdentifier: string,
+): Promise<{ success: boolean; error: string | null }> {
+  const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/statuses/${encodeURIComponent(headSha)}`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-merge-arming",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+
+  const body = JSON.stringify({
+    state: "success",
+    context: "paperclip/approved",
+    description: `${issueIdentifier} approved via Paperclip`,
+    target_url: `https://paperclip.example.com/issues/${issueIdentifier}`,
+  });
+
+  let response: Response;
+  try {
+    response = await ghFetch(url, {
+      method: "POST",
+      headers,
+      body,
+    });
+  } catch {
+    return { success: false, error: "network_error" };
+  }
+
+  if (response.ok) {
+    return { success: true, error: null };
+  }
+
+  const responseBody = await response.json().catch(() => null) as Record<string, unknown> | null;
+  const message = responseBody?.message as string | undefined;
+
+  if (response.status === 403 || response.status === 422) {
+    const detail = message ?? "";
+    return { success: false, error: `scope_missing: ${detail}` };
+  }
+
+  return { success: false, error: message ?? `HTTP ${response.status}` };
+}
+
 export async function armMergeOnApproval(
   db: Db,
   companyId: string,
