@@ -907,9 +907,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     let consecutive = 0;
     let latestFinishedAt: Date | null = null;
     for (const row of rows) {
-      const ctx = parseObject(row.contextSnapshot);
-      const retryReason = readNonEmptyString(ctx.retryReason);
-      if (retryReason !== "issue_continuation_needed") break;
+      // SUP-12466: the bound keys on *repetition of the same errorCode with zero
+      // progress*, not on retryReason. The stranded recovery re-dispatch can produce
+      // runs that carry no `retryReason` (source-scoped recovery wakes / assignment
+      // wakes), so do not break on the retryReason stamp -- any consecutive
+      // terminal-unsuccessful run with a matching errorCode counts toward the cap.
       if (
         !UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
           row.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
@@ -4632,13 +4634,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
-          const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
-            issue.companyId,
-            issue.id,
-            agentId,
-            classification.errorCode,
-          );
+        const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
+          issue.companyId,
+          issue.id,
+          agentId,
+          classification.errorCode,
+        );
+        // SUP-12466: apply the bounded-attempt policy to ANY unsuccessful terminal
+        // run whose errorCode repeats, not only to runs already stamped
+        // `retryReason === "issue_continuation_needed"`. A fresh dispatch failure
+        // (consecutive === 1) still gets its one free retry; once the same errorCode
+        // has repeated with zero progress (consecutive >= 2) -- or the latest run was
+        // already a continuation retry -- the cap applies.
+        if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed") || consecutive >= 2) {
           if (consecutive >= classification.maxAttempts) {
             const failureSummary = summarizeRunFailureForIssueComment(latestRun);
             const attemptCopy = consecutive <= 1 ? "" : ` (${consecutive}× attempts)`;
