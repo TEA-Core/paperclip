@@ -7,6 +7,7 @@ import type { Db } from "@paperclipai/db";
 import {
   activityLog,
   agents,
+  companies,
   documents,
   executionWorkspaces,
   heartbeatRuns,
@@ -122,6 +123,7 @@ import {
   projectService,
   routineService,
   workProductService,
+  armMergeOnApproval,
 } from "../services/index.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
@@ -8437,6 +8439,27 @@ export function issueRoutes(
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
+    }
+
+    if (transition.decision && transition.decision.outcome === "approved" && transition.decision.stageType === "approval") {
+      try {
+        const company = await db
+          .select({ mergeArmingEnabled: companies.mergeArmingEnabled })
+          .from(companies)
+          .where(eq(companies.id, issue.companyId))
+          .then((rows) => rows[0] ?? null);
+        if (company?.mergeArmingEnabled) {
+          const armingOutcome = await armMergeOnApproval(db, issue.companyId, issue.id, transition.decision);
+          await svc.addComment(
+            issue.id,
+            `[Merge-arming] ${armingOutcome.message}`,
+            {},
+            { authorType: "system" },
+          );
+        }
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id, companyId: issue.companyId }, "merge-arming hook failed");
+      }
     }
 
     let cancelledStatusRunId: string | null = null;
