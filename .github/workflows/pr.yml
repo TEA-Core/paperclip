@@ -8,9 +8,21 @@ on:
       # this every PR merged here reached production having run only the AI
       # reviewers. That is how the branch spent two days unable to compile.
       - 'fold/**'
+  # SUP-12280 phase 2: the merge queue tests each entry against the real
+  # post-merge state. The required checks (`verify`, `e2e`) only report on a
+  # queue entry if this workflow also runs for `merge_group`; without it every
+  # queued PR waits forever on a check that is never going to arrive.
+  merge_group:
+    branches:
+      - main
+      - 'fold/**'
 
 concurrency:
-  group: pr-${{ github.event.pull_request.number }}
+  # `github.event.pull_request.number` is empty on a merge_group event, so the
+  # bare `pr-` group would be shared by every queue entry at once — and with
+  # cancel-in-progress each new entry would cancel the one ahead of it. Key the
+  # merge_group runs on the queue ref instead, which is unique per entry.
+  group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -19,6 +31,14 @@ jobs:
     timeout-minutes: 5
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
+    # Every diff-based step below needs a base and a head. The `pull_request`
+    # payload carries them under `pull_request.*`; the `merge_group` payload
+    # uses a different shape, and reading the wrong one yields an empty string
+    # that turns `git diff "$BASE...$HEAD"` into a hard error. Resolve both
+    # spellings once, here, instead of at nine separate call sites.
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
     steps:
       - name: Checkout repository
@@ -33,16 +53,21 @@ jobs:
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
           if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
             echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
             exit 1
           fi
 
       - name: Reject stale merge base
+        # Only meaningful for a pull_request. A merge_group entry is built by
+        # GitHub on top of the current base by construction, so there is no
+        # stale base to reject — and the age check would misfire on a quiet
+        # base branch, failing the queue for a PR that is perfectly current.
+        if: github.event_name == 'pull_request'
         run: |
-          base_sha="${{ github.event.pull_request.base.sha }}"
-          head_sha="${{ github.event.pull_request.head.sha }}"
+          base_sha="$BASE_SHA"
+          head_sha="$HEAD_SHA"
           merge_base=$(git merge-base "$base_sha" "$head_sha")
 
           # Time-based: merge base cut > 24h ago
@@ -108,14 +133,14 @@ jobs:
 
       - name: Verify release package bootstrap for changed manifests
         run: |
-          mapfile -t changed_paths < <(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")
-          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ github.event.pull_request.base.sha }}" \
+          mapfile -t changed_paths < <(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="$BASE_SHA" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
       - name: Validate dependency resolution when manifests change
         id: regen_lockfile
         run: |
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
           # Patch files count as manifests: editing one changes the
           # `patchedDependencies` hash recorded in pnpm-lock.yaml, so a frozen
           # install fails with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH unless the
