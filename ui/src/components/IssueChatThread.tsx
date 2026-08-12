@@ -64,6 +64,7 @@ import type {
   AskUserQuestionsAnswer,
   AskUserQuestionsInteraction,
   IssueThreadInteraction,
+  RequestBoardApprovalInteraction,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
   RequestItemVerdictsInteraction,
@@ -206,7 +207,8 @@ interface IssueChatMessageContext {
     interaction:
       | SuggestTasksInteraction
       | RequestConfirmationInteraction
-      | RequestCheckboxConfirmationInteraction,
+      | RequestCheckboxConfirmationInteraction
+      | RequestBoardApprovalInteraction,
     selectedClientKeys?: string[],
     selectedOptionIds?: string[],
   ) => Promise<void> | void;
@@ -214,7 +216,8 @@ interface IssueChatMessageContext {
     interaction:
       | SuggestTasksInteraction
       | RequestConfirmationInteraction
-      | RequestCheckboxConfirmationInteraction,
+      | RequestCheckboxConfirmationInteraction
+      | RequestBoardApprovalInteraction,
     reason?: string,
   ) => Promise<void> | void;
   onSubmitInteractionAnswers?: (
@@ -504,7 +507,8 @@ interface IssueChatThreadProps {
     interaction:
       | SuggestTasksInteraction
       | RequestConfirmationInteraction
-      | RequestCheckboxConfirmationInteraction,
+      | RequestCheckboxConfirmationInteraction
+      | RequestBoardApprovalInteraction,
     selectedClientKeys?: string[],
     selectedOptionIds?: string[],
   ) => Promise<void> | void;
@@ -512,7 +516,8 @@ interface IssueChatThreadProps {
     interaction:
       | SuggestTasksInteraction
       | RequestConfirmationInteraction
-      | RequestCheckboxConfirmationInteraction,
+      | RequestCheckboxConfirmationInteraction
+      | RequestBoardApprovalInteraction,
     reason?: string,
   ) => Promise<void> | void;
   onSubmitInteractionAnswers?: (

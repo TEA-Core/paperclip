@@ -17,6 +17,7 @@ import {
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
   type RequestConfirmationTarget,
+  type RequestBoardApprovalInteraction,
   type RequestItemVerdictsInteraction,
   type RequestItemVerdictsItem,
   type RequestItemVerdictsResultItem,
@@ -47,7 +48,8 @@ interface IssueThreadInteractionCardProps {
     interaction:
       | SuggestTasksInteraction
       | RequestConfirmationInteraction
-      | RequestCheckboxConfirmationInteraction,
+      | RequestCheckboxConfirmationInteraction
+      | RequestBoardApprovalInteraction,
     selectedClientKeys?: string[],
     selectedOptionIds?: string[],
   ) => Promise<void> | void;
@@ -55,7 +57,8 @@ interface IssueThreadInteractionCardProps {
     interaction:
       | SuggestTasksInteraction
       | RequestConfirmationInteraction
-      | RequestCheckboxConfirmationInteraction,
+      | RequestCheckboxConfirmationInteraction
+      | RequestBoardApprovalInteraction,
     reason?: string,
   ) => Promise<void> | void;
   onSubmitInteractionAnswers?: (
@@ -123,6 +126,8 @@ function interactionKindLabel(kind: IssueThreadInteraction["kind"]) {
       return "Checkbox confirmation";
     case "request_item_verdicts":
       return "Item verdicts";
+    case "request_board_approval":
+      return "Board approval";
     default:
       return kind;
   }
@@ -1289,7 +1294,7 @@ function RequestConfirmationTargetChip({
 function RequestConfirmationResolution({
   interaction,
 }: {
-  interaction: RequestConfirmationInteraction;
+  interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction;
 }) {
   const outcome = interaction.result?.outcome;
   const target = interaction.payload.target ?? null;
@@ -1817,13 +1822,13 @@ function RequestConfirmationCard({
   onUploadImage,
   externalReferences,
 }: {
-  interaction: RequestConfirmationInteraction;
+  interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction;
   isPlan?: boolean;
   onAcceptInteraction?: (
-    interaction: RequestConfirmationInteraction,
+    interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction,
   ) => Promise<void> | void;
   onRejectInteraction?: (
-    interaction: RequestConfirmationInteraction,
+    interaction: RequestConfirmationInteraction | RequestBoardApprovalInteraction,
     reason?: string,
   ) => Promise<void> | void;
   onUploadImage?: (file: File) => Promise<string>;

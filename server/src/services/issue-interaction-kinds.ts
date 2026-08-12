@@ -11,6 +11,7 @@
 export const REQUEST_CONFIRMATION_INTERACTION_KINDS = [
   "request_confirmation",
   "request_checkbox_confirmation",
+  "request_board_approval",
 ] as const;
 
 export const TARGET_BOUND_INTERACTION_KINDS = [
