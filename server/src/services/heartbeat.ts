@@ -758,7 +758,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
   const routineEnv = stripForbiddenEnvBindings(input.routineEnv);
   const agentEnv = parseObject(executionRunConfig.env);
   const lowTrustAllowedBindingIds = input.trustPreset?.kind === "low_trust_review"
-    ? input.trustPreset.boundary.allowedSecretBindingIds ?? []
+    ? input.trustPreset.boundary.allowedSecretBindingIds
     : undefined;
   if (input.trustPreset?.kind === "low_trust_review") {
     assertLowTrustEnvConfigAllowed(environmentEnv, "environment.env");
