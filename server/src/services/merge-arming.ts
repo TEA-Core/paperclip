@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
-import { externalObjectMentions, externalObjects } from "@paperclipai/db";
+import { externalObjectMentions, externalObjects, issues } from "@paperclipai/db";
 import { secretService } from "./secrets.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 
@@ -22,6 +22,7 @@ export interface LinkedPullRequest {
   repo: string;
   number: number;
   nodeId: string | null;
+  headRefName: string | null;
   displayName: string;
 }
 
@@ -76,6 +77,9 @@ export async function resolveLinkedPullRequests(
     const repo = match[2]!;
     const number = Number(match[4]);
     const nodeId = row.data?.node_id as string | undefined | null;
+    const headRefName =
+      (row.data?.head as Record<string, unknown> | undefined | null)?.ref as string | undefined ??
+      (row.data?.headRefName as string | undefined);
 
     results.push({
       id: row.id,
@@ -83,6 +87,7 @@ export async function resolveLinkedPullRequests(
       repo,
       number,
       nodeId: nodeId ?? null,
+      headRefName: headRefName ?? null,
       displayName: `${owner}/${repo}#${number}`,
     });
   }
@@ -186,6 +191,52 @@ export async function armMergeOnApproval(
   }
 
   const pr = linkedPRs[0]!;
+
+  const ownerMatch = /^(SUP-\d+)/.exec(pr.headRefName ?? "");
+  if (!ownerMatch) {
+    return { kind: "skipped", message: "skipped:unowned-branch: PR headRefName does not name a SUP-\\d+ owner" };
+  }
+
+  const ownerIdentifier = ownerMatch[1]!;
+  const [ownerRow] = await db
+    .select({
+      id: issues.id,
+      executionPolicy: issues.executionPolicy,
+      executionState: issues.executionState,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), eq(issues.identifier, ownerIdentifier)))
+    .limit(1);
+
+  if (!ownerRow) {
+    return { kind: "skipped", message: `skipped:unowned-branch: No issue found for identifier ${ownerIdentifier}` };
+  }
+
+  if (ownerRow.id !== issueId) {
+    return {
+      kind: "skipped",
+      message: `skipped:not-branch-owner: PR ${pr.number} is owned by ${ownerIdentifier}, not the transitioning issue`,
+    };
+  }
+
+  const policy = ownerRow.executionPolicy as { stages?: Array<{ id: string }> } | undefined;
+  const state = ownerRow.executionState as
+    | { completedStageIds?: string[]; lastDecisionOutcome?: string | null }
+    | undefined;
+
+  const policyStages = policy?.stages ?? [];
+  const completedIds = state?.completedStageIds ?? [];
+  const allCompleted = policyStages.every((s) => completedIds.includes(s.id));
+  const isApproved = state?.lastDecisionOutcome === "approved";
+
+  if (!allCompleted || !isApproved) {
+    const incompleteIds = policyStages.filter((s) => !completedIds.includes(s.id)).map((s) => s.id);
+    return {
+      kind: "skipped",
+      message: `skipped:owner-not-approved: incomplete review/approval stages: ${incompleteIds.join(", ")}`,
+    };
+  }
+
   const token = await resolveGitHubToken(db, companyId);
   if (!token) {
     return { kind: "failed", message: "failed:auth_required: GitHub authentication failed" };
