@@ -91,6 +91,32 @@ test("Dockerfile build stage sets PAPERCLIP_API_URL before the handshake", () =>
   );
 });
 
+test("Dockerfile build stage sets PAPERCLIP_API_KEY before the handshake", () => {
+  const buildStage = dockerfile.split(/^FROM .* AS build$/m)[1]?.split(/^FROM /m)[0];
+  assert.ok(buildStage, "Dockerfile must have a build stage");
+
+  const envIndex = buildStage.search(/^ENV PAPERCLIP_API_KEY=\S+/m);
+  assert.notEqual(
+    envIndex,
+    -1,
+    "Build stage must set PAPERCLIP_API_KEY — readConfigFromEnv() throws without it before any tool registers",
+  );
+
+  const handshakeIndex = buildStage.indexOf("paperclipOpenWorkSession");
+  assert.notEqual(handshakeIndex, -1, "Build stage must contain the handshake");
+  assert.ok(
+    envIndex < handshakeIndex,
+    "PAPERCLIP_API_KEY must be set before the handshake RUN, or the MCP server cannot start",
+  );
+
+  const productionStage = dockerfile.split(/^FROM .* AS production$/m)[1];
+  assert.doesNotMatch(
+    productionStage ?? "",
+    /^\s*(ENV|ARG)\s+PAPERCLIP_API_(URL|KEY)\b/m,
+    "Handshake placeholders must stay scoped to the build stage, never baked into the production image",
+  );
+});
+
 test("Dockerfile production stage copies /opt/paperclip-mcp from build stage", () => {
   const productionStage = dockerfile.split(/^FROM .* AS production$/m)[1];
   assert.ok(productionStage, "Dockerfile must have a production stage");
