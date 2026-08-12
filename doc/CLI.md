@@ -873,7 +873,7 @@ Default paths for the canonical install:
 - embedded db: `~/.paperclip/instances/default/db`
 - logs: `~/.paperclip/instances/default/logs`
 - storage: `~/.paperclip/instances/default/data/storage`
-- secrets key: `~/.paperclip/instances/default/secrets/master.key`
+- secrets key: `/etc/paperclip/secrets/master.key`
 
 Override base home or instance with env vars:
 

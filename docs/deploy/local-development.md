@@ -121,7 +121,7 @@ pnpm dev
 | Config | `~/.paperclip/instances/default/config.json` |
 | Database | `~/.paperclip/instances/default/db` |
 | Storage | `~/.paperclip/instances/default/data/storage` |
-| Secrets key | `~/.paperclip/instances/default/secrets/master.key` |
+| Secrets key | `/etc/paperclip/secrets/master.key` |
 | Logs | `~/.paperclip/instances/default/logs` |
 
 Override with environment variables:
