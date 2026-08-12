@@ -80,6 +80,9 @@ jobs:
       # this step, a broken dependency tree or missing tool ships silently — the
       # string-level test in pr.yml asserts the handshake text is present but
       # passes whether or not the layers actually work.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Docker image build (runs the MCP handshake)
         id: docker-build
         uses: docker/build-push-action@v7
