@@ -8,6 +8,7 @@ import {
   issues,
   type Db,
 } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -64,6 +65,23 @@ const CHANGES_REQUESTED_DECISION: MergeArmingDecision = {
 const GITHUB_TOKEN = "ghp_test_token_value";
 const NODE_ID = "PR_node_id_12345";
 
+const APPROVAL_STAGE = { id: "approval-stage-1", type: "approval" as const, approvalsNeeded: 1 };
+
+const APPROVED_STATE = {
+  status: "completed",
+  completedStageIds: ["approval-stage-1"],
+  lastDecisionOutcome: "approved",
+  currentStageId: null,
+  currentParticipant: null,
+  returnAssignee: null,
+};
+
+const EXECUTION_POLICY = {
+  mode: "normal" as const,
+  commentRequired: true,
+  stages: [APPROVAL_STAGE],
+};
+
 function createMockResponse(body: unknown, ok = true, status = 200): Response {
   return {
     ok,
@@ -82,6 +100,7 @@ function createPRExternalObject(
     draft: boolean;
     node_id: string | null;
     externalId: string;
+    headRefName: string | null;
   }> = {},
 ) {
   const externalId = overrides.externalId ?? `${owner}/${repo}#pull/${number}`;
@@ -93,6 +112,13 @@ function createPRExternalObject(
     data.node_id = overrides.node_id;
   } else {
     data.node_id = NODE_ID;
+  }
+  if ("headRefName" in overrides) {
+    if (overrides.headRefName !== null) {
+      data.head = { ref: overrides.headRefName };
+    }
+  } else {
+    data.head = { ref: "some-branch-name" };
   }
   return {
     companyId,
@@ -107,6 +133,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
   let db: Db;
   let companyId: string;
   let issueId: string;
+  let issueIdentifier: string;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
@@ -134,20 +161,24 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       .insert(companies)
       .values({
         name: "Test Company",
-        issuePrefix: "TST",
+        issuePrefix: "SUP",
         mergeArmingEnabled: true,
       })
       .returning();
     companyId = companyRows[0]!.id;
 
     issueId = randomUUID();
+    issueIdentifier = `SUP-${Math.floor(Math.random() * 900000) + 100000}`;
     await db
       .insert(issues)
       .values({
         id: issueId,
         companyId,
         title: "Test Issue",
-        status: "in_progress",
+        status: "done",
+        identifier: issueIdentifier,
+        executionPolicy: EXECUTION_POLICY,
+        executionState: APPROVED_STATE,
       });
   });
 
@@ -158,6 +189,28 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
     await db.delete(companies);
   });
 
+  async function insertOwnerIssue(
+    overrides: {
+      identifier?: string;
+      executionPolicy?: Record<string, unknown>;
+      executionState?: Record<string, unknown>;
+    } = {},
+  ) {
+    const [ownerIssue] = await db
+      .insert(issues)
+      .values({
+        id: randomUUID(),
+        companyId,
+        title: "Owner Issue",
+        status: "done",
+        identifier: overrides.identifier ?? "SUP-12360",
+        executionPolicy: overrides.executionPolicy ?? EXECUTION_POLICY,
+        executionState: overrides.executionState ?? APPROVED_STATE,
+      })
+      .returning();
+    return ownerIssue!;
+  }
+
   async function insertMention(
     obj: {
       companyId: string;
@@ -165,6 +218,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       objectType: "pull_request";
       externalId: string;
       data: Record<string, unknown>;
+      sourceIssueId?: string;
     },
   ) {
     const [externalObj] = await db
@@ -173,7 +227,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       .returning();
     await db.insert(externalObjectMentions).values({
       companyId: obj.companyId,
-      sourceIssueId: issueId,
+      sourceIssueId: obj.sourceIssueId ?? issueId,
       sourceKind: "issue_comment",
       objectId: externalObj!.id,
       objectType: obj.objectType,
@@ -226,10 +280,140 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
     });
   });
 
-  describe("armed", () => {
-    it("arms a single linked open non-draft PR and returns armed:success", async () => {
+  describe("branch-ownership gate", () => {
+    it("returns skipped:unowned-branch when PR headRefName does not match SUP-\\d+", async () => {
       await insertMention(
-        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: "main",
+        }),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("skipped:unowned-branch");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("returns skipped:unowned-branch when PR headRefName is null", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: null,
+        }),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("skipped:unowned-branch");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("returns skipped:not-branch-owner when PR is owned by a different issue", async () => {
+      await insertOwnerIssue({
+        identifier: "SUP-99999",
+        executionState: APPROVED_STATE,
+      });
+
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: "SUP-99999-some-branch",
+        }),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("skipped:not-branch-owner");
+      expect(result.message).toContain("SUP-99999");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("returns skipped:owner-not-approved when owning issue has incomplete stages", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            status: "completed",
+            completedStageIds: [],
+            lastDecisionOutcome: "approved",
+            currentStageId: null,
+            currentParticipant: null,
+            returnAssignee: null,
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("skipped:owner-not-approved");
+      expect(result.message).toContain("incomplete review/approval stages");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("returns skipped:owner-not-approved when owning issue has lastDecisionOutcome changes_requested", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            status: "completed",
+            completedStageIds: ["approval-stage-1"],
+            lastDecisionOutcome: "changes_requested",
+            currentStageId: null,
+            currentParticipant: null,
+            returnAssignee: null,
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("skipped:owner-not-approved");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("regression: SUP-12360/SUP-12399 shape — transitioning issue SUP-12399, PR owned by SUP-12360 with incomplete stages", async () => {
+      await insertOwnerIssue({
+        identifier: "SUP-12360",
+        executionState: {
+          status: "completed",
+          completedStageIds: [],
+          lastDecisionOutcome: "changes_requested",
+          currentStageId: null,
+          currentParticipant: null,
+          returnAssignee: null,
+        },
+      });
+
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: "SUP-12360-emit-a-pipeline-event-something",
+        }),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("skipped:not-branch-owner");
+      expect(result.message).toContain("SUP-12360");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("armed", () => {
+    it("arms a single linked open non-draft PR owned by the transitioning issue and returns armed:success", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
       );
 
       mockGhFetch.mockResolvedValueOnce(
@@ -261,6 +445,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       await insertMention(
         createPRExternalObject(companyId, "TEA-Core", "paperclip", 7, {
           node_id: undefined,
+          headRefName: `${issueIdentifier}-some-branch`,
         }),
       );
 
@@ -285,7 +470,9 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
     it("returns failed:auth_required when no GitHub token is available", async () => {
       await insertMention(
-        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
       );
 
       mockGetByName.mockResolvedValue(null);
@@ -298,7 +485,9 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
     it("returns failed:auth_required when token is empty", async () => {
       await insertMention(
-        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
       );
 
       mockResolveSecretValue.mockResolvedValue("   ");
@@ -313,6 +502,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       await insertMention(
         createPRExternalObject(companyId, "TEA-Core", "paperclip", 7, {
           node_id: undefined,
+          headRefName: `${issueIdentifier}-some-branch`,
         }),
       );
 
@@ -328,7 +518,9 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
   describe("skipped:already-queued", () => {
     it("treats 'already queued' GraphQL error as success with already-queued message", async () => {
       await insertMention(
-        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
       );
 
       mockGhFetch.mockResolvedValueOnce(
@@ -346,7 +538,9 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
     it("treats 'already enabled' GraphQL error as success with already-queued message", async () => {
       await insertMention(
-        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
       );
 
       mockGhFetch.mockResolvedValueOnce(
@@ -366,7 +560,9 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
   describe("failed", () => {
     it("returns failed when GraphQL mutation fails with a non-already error", async () => {
       await insertMention(
-        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
       );
 
       mockGhFetch.mockResolvedValueOnce(
@@ -385,7 +581,9 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
     it("returns failed:network_error when ghFetch throws", async () => {
       await insertMention(
-        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
       );
 
       mockGhFetch.mockRejectedValueOnce(new Error("ECONNREFUSED"));
@@ -397,7 +595,9 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
     it("truncation: error message is truncated to 200 chars", async () => {
       await insertMention(
-        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
       );
 
       const longError = "x".repeat(300);
@@ -472,7 +672,9 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
   describe("no secret value appears in messages", () => {
     it("does not include the token in any failure message", async () => {
       await insertMention(
-        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
       );
 
       mockGhFetch.mockResolvedValueOnce(
