@@ -7,6 +7,7 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  companySkills,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -88,6 +89,10 @@ describeEmbeddedPostgres("recovery sweep wake candidacy", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
+    // A dispatched run syncs the bundled skill inventory for its company, and
+    // `company_skills.company_id` has no ON DELETE CASCADE, so these rows must go
+    // before the companies they point at.
+    await db.delete(companySkills);
     await db.delete(companies);
   });
 
