@@ -9,6 +9,7 @@ import {
   type AskUserQuestionsAnswer,
   type AskUserQuestionsInteraction,
   type IssueThreadInteraction,
+  type RequestBoardApprovalInteraction,
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
   type RequestBoardApprovalInteraction,

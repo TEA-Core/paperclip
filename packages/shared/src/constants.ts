@@ -609,10 +609,11 @@ export const PROJECT_COLORS = [
 ] as const;
 
 /**
- * `request_board_approval` and `budget_override_required` are deprecated for
- * creation. Use the `request_board_approval` interaction kind instead, which
- * carries continuationPolicy, supersedeOnUserComment, expiresAt, and a post-
- * decision handler. Existing rows remain readable via the approvals API.
+ * The `request_board_approval` and `budget_override_required` approval types
+ * below are deprecated for new creation. Create the `request_board_approval`
+ * issue-thread interaction kind instead: it carries continuationPolicy,
+ * supersedeOnUserComment, and a post-decision handler. Existing approval rows
+ * remain readable via the approvals API.
  * @see ISSUE_THREAD_INTERACTION_KINDS
  */
 export const APPROVAL_TYPES = [

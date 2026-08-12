@@ -201,6 +201,49 @@ describe("issue thread interaction helpers", () => {
     })).toBe("Selection expired after target changed");
   });
 
+  it("summarizes board approval interactions by status and outcome", () => {
+    const base = {
+      id: "interaction-board-approval",
+      companyId: "company-1",
+      issueId: "issue-1",
+      kind: "request_board_approval" as const,
+      continuationPolicy: "wake_assignee" as const,
+      createdAt: "2026-04-06T12:00:00.000Z",
+      updatedAt: "2026-04-06T12:00:00.000Z",
+      payload: {
+        version: 1 as const,
+        prompt: "Approve the budget override?",
+      },
+    };
+
+    expect(buildIssueThreadInteractionSummary({ ...base, status: "pending" }))
+      .toBe("Requested board approval");
+
+    expect(buildIssueThreadInteractionSummary({
+      ...base,
+      status: "accepted",
+      result: { version: 1, outcome: "accepted" },
+    })).toBe("Approved by the board");
+
+    expect(buildIssueThreadInteractionSummary({
+      ...base,
+      status: "rejected",
+      result: { version: 1, outcome: "rejected", reason: "Out of budget." },
+    })).toBe("Rejected by the board");
+
+    expect(buildIssueThreadInteractionSummary({
+      ...base,
+      status: "expired",
+      result: { version: 1, outcome: "superseded_by_comment" },
+    })).toBe("Board approval expired after comment");
+
+    expect(buildIssueThreadInteractionSummary({
+      ...base,
+      status: "expired",
+      result: { version: 1, outcome: "withdrawn_by_author" },
+    })).toBe("Board approval withdrawn by the author");
+  });
+
   it("maps selected checkbox option ids back to labels", () => {
     const labels = getCheckboxConfirmationSelectedLabels({
       payload: {

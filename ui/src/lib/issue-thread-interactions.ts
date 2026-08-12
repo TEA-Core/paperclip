@@ -238,12 +238,14 @@ export function buildIssueThreadInteractionSummary(
   }
 
   if (interaction.kind === "request_board_approval") {
-    if (interaction.status === "accepted") return "Approved board request";
-    if (interaction.status === "rejected") return "Rejected board request";
+    if (interaction.status === "accepted") return "Approved by the board";
+    if (interaction.status === "rejected") return "Rejected by the board";
     if (interaction.status === "expired") {
       const outcome = interaction.result?.outcome;
-      if (outcome === "superseded_by_comment") return "Board request expired after comment";
-      return "Board request expired";
+      if (outcome === "superseded_by_comment") return "Board approval expired after comment";
+      if (outcome === "stale_target") return "Board approval expired after target changed";
+      if (outcome === "withdrawn_by_author") return "Board approval withdrawn by the author";
+      return "Board approval expired";
     }
     return "Requested board approval";
   }
