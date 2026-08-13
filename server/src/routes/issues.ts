@@ -125,8 +125,8 @@ import {
   workProductService,
   armMergeOnApproval,
   publishApprovalStatus,
-  shouldPublishApprovalStatus,
 } from "../services/index.js";
+import { shouldPublishApprovalStatus } from "../services/merge-arming.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
 import {
