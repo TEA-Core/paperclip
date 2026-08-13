@@ -148,40 +148,59 @@ describe("shared-group-ownership", () => {
     it("refuses to chgrp the master-key directory itself", async () => {
       const { ensureSharedGroupOwnership } = await loadFreshModule();
       const keyDir = path.join(os.tmpdir(), "paperclip-shared-group-test-keydir-1");
+      const warnSpy = vi.fn();
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o755 });
 
       await ensureSharedGroupOwnership(keyDir, {
         resolveGid: async () => REAL_GID,
         resolveMasterKeyDir: () => keyDir,
+        warn: warnSpy,
       });
 
       expect(mockChown).not.toHaveBeenCalled();
       expect(mockChmod).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("refusing shared-group ownership"));
     });
 
     it("refuses to chgrp an ancestor of the master-key directory", async () => {
       const { ensureSharedGroupOwnership } = await loadFreshModule();
       const instanceRoot = path.join(os.tmpdir(), "paperclip-shared-group-test-ancestor");
       const secretsDir = path.join(instanceRoot, "secrets");
+      const warnSpy = vi.fn();
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o755 });
 
       await ensureSharedGroupOwnership(instanceRoot, {
         resolveGid: async () => REAL_GID,
         resolveMasterKeyDir: () => secretsDir,
+        warn: warnSpy,
       });
 
       expect(mockChown).not.toHaveBeenCalled();
       expect(mockChmod).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("refusing shared-group ownership"));
     });
 
     it("does not set the setgid bit on the master-key directory", async () => {
       const { ensureSharedGroupOwnership } = await loadFreshModule();
       const keyDir = path.join(os.tmpdir(), "paperclip-shared-group-test-keydir-2");
+      const warnSpy = vi.fn();
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o755 });
 
       await ensureSharedGroupOwnership(keyDir, {
         resolveGid: async () => REAL_GID,
         resolveMasterKeyDir: () => keyDir,
+        warn: warnSpy,
       });
 
+      expect(mockChown).not.toHaveBeenCalled();
       expect(mockChmod).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("refusing shared-group ownership"));
     });
 
     it("still applies chgrp to a directory that is not the master-key dir or its ancestor", async () => {
@@ -213,41 +232,59 @@ describe("shared-group-ownership", () => {
     it("refuses to chgrp the resolved embedded-Postgres data directory", async () => {
       const { ensureSharedGroupOwnership } = await loadFreshModule();
       const pgData = path.join(os.tmpdir(), "paperclip-shared-group-test-pgdata");
+      const warnSpy = vi.fn();
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o755 });
 
       await ensureSharedGroupOwnership(pgData, {
         resolveGid: async () => REAL_GID,
         resolvePostgresDataDir: () => pgData,
+        warn: warnSpy,
       });
 
       expect(mockChown).not.toHaveBeenCalled();
       expect(mockChmod).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("refusing shared-group ownership"));
     });
 
     it("refuses to chgrp an ancestor of the resolved embedded-Postgres data directory", async () => {
       const { ensureSharedGroupOwnership } = await loadFreshModule();
       const instanceRoot = path.join(os.tmpdir(), "paperclip-shared-group-test-pgdata-ancestor");
       const pgData = path.join(instanceRoot, "db");
+      const warnSpy = vi.fn();
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o755 });
 
       await ensureSharedGroupOwnership(instanceRoot, {
         resolveGid: async () => REAL_GID,
         resolvePostgresDataDir: () => pgData,
+        warn: warnSpy,
       });
 
       expect(mockChown).not.toHaveBeenCalled();
       expect(mockChmod).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("refusing shared-group ownership"));
     });
 
     it("refuses to chgrp the resolved database backup directory", async () => {
       const { ensureSharedGroupOwnership } = await loadFreshModule();
       const backupDir = path.join(os.tmpdir(), "paperclip-shared-group-test-backup");
+      const warnSpy = vi.fn();
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o755 });
 
       await ensureSharedGroupOwnership(backupDir, {
         resolveGid: async () => REAL_GID,
         resolveDatabaseBackupDir: () => backupDir,
+        warn: warnSpy,
       });
 
       expect(mockChown).not.toHaveBeenCalled();
       expect(mockChmod).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("refusing shared-group ownership"));
     });
   });
 });
