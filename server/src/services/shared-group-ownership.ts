@@ -83,7 +83,7 @@ export async function ensureSharedGroupOwnership(
     const stat = await fs.stat(dirPath);
     await fs.chown(dirPath, stat.uid, gid);
     const currentMode = stat.mode & 0o7777;
-    await fs.chmod(dirPath, currentMode | 0o2000);
+    await fs.chmod(dirPath, currentMode | 0o2070);
   } catch (err) {
     if (!chgrpFailedWarned) {
       chgrpFailedWarned = true;

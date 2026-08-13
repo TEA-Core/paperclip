@@ -46,7 +46,24 @@ describe("shared-group-ownership", () => {
       });
 
       expect(mockChmod).toHaveBeenCalledTimes(1);
-      expect(mockChmod).toHaveBeenCalledWith(dir, 0o755 | 0o2000);
+      expect(mockChmod).toHaveBeenCalledWith(dir, 0o755 | 0o2070);
+    });
+
+    it("adds group rwx and the setgid bit to a 0700 dir (the mkdtemp case)", async () => {
+      const { ensureSharedGroupOwnership } = await loadFreshModule();
+      const dir = path.join(os.tmpdir(), "paperclip-shared-group-test-mkdtemp");
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o700 });
+
+      await ensureSharedGroupOwnership(dir, {
+        resolveGid: async () => REAL_GID,
+        resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
+      });
+
+      expect(mockChmod).toHaveBeenCalledTimes(1);
+      const chmodMode = mockChmod.mock.calls[0]?.[1] as number;
+      expect(chmodMode & 0o2000).toBe(0o2000);
+      expect(chmodMode & 0o0070).toBe(0o0070); // group rwx — the fix under test
     });
 
     it("chgrps to the resolved group when the group exists", async () => {
@@ -180,7 +197,7 @@ describe("shared-group-ownership", () => {
       expect(mockChown).toHaveBeenCalledTimes(1);
       expect(mockChown).toHaveBeenCalledWith(otherDir, 1000, REAL_GID);
       expect(mockChmod).toHaveBeenCalledTimes(1);
-      expect(mockChmod).toHaveBeenCalledWith(otherDir, 0o755 | 0o2000);
+      expect(mockChmod).toHaveBeenCalledWith(otherDir, 0o755 | 0o2070);
     });
   });
 });

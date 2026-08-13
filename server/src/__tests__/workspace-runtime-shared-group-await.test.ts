@@ -147,6 +147,6 @@ describe("ensureSharedGroupOwnership settle semantics", () => {
     await pending;
 
     expect(mockChown).toHaveBeenCalledWith(dir, 1000, REAL_GID);
-    expect(mockChmod).toHaveBeenCalledWith(dir, 0o755 | 0o2000);
+    expect(mockChmod).toHaveBeenCalledWith(dir, 0o755 | 0o2070);
   });
 });
