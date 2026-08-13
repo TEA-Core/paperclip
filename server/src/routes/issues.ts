@@ -4500,12 +4500,12 @@ export function issueRoutes(
     rawAssigneeAgentId: string | null | undefined,
   ) {
     if (rawAssigneeAgentId === undefined || rawAssigneeAgentId === null) {
-      return rawAssigneeAgentId;
+      return { id: rawAssigneeAgentId, name: null };
     }
 
     const raw = rawAssigneeAgentId.trim();
     if (raw.length === 0) {
-      return rawAssigneeAgentId;
+      return { id: rawAssigneeAgentId, name: null };
     }
 
     const resolved = await agentsSvc.resolveByReference(companyId, raw);
@@ -4527,7 +4527,7 @@ export function issueRoutes(
           "Cannot assign work to agents with invalid org chains",
       );
     }
-    return resolved.agent.id;
+    return { id: resolved.agent.id, name: resolved.agent.name };
   }
   function toValidTimestamp(value: Date | string | null | undefined) {
     if (!value) return null;
@@ -7320,7 +7320,7 @@ export function issueRoutes(
       !watchdogProductBugFollowUp &&
       !(await assertTaskWatchdogCreateIssueAllowed(req, res, companyId, createParent))
     ) return;
-    const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+    const normalizedAssigneeAgentRef = await normalizeIssueAssigneeAgentReference(
       companyId,
       rawCreateBody.assigneeAgentId as string | null | undefined,
     );
@@ -7340,7 +7340,7 @@ export function issueRoutes(
     const createBody = {
       ...rawCreateBody,
       parentId: effectiveParentId,
-      ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
+      ...(normalizedAssigneeAgentRef.id !== undefined ? { assigneeAgentId: normalizedAssigneeAgentRef.id } : {}),
       ...(runWorkspaceInheritanceSourceIssueId
         ? { inheritExecutionWorkspaceFromIssueId: runWorkspaceInheritanceSourceIssueId }
         : {}),
@@ -7381,19 +7381,32 @@ export function issueRoutes(
       assigneeUserId: rawCreateBody.assigneeUserId ?? null,
     };
     await assertTaskBridgeCreateAllowed(req, companyId, createAssignmentScope);
-    const createReturnAssigneeAgentId =
-      normalizeIssueExecutionPolicy(createBody.executionPolicy)?.returnAssigneeAgentId ?? null;
-    if (rawCreateBody.assigneeAgentId || rawCreateBody.assigneeUserId || createReturnAssigneeAgentId) {
+    const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(createBody.executionPolicy);
+    const createReturnAssigneeAgentId = normalizedExecutionPolicy?.returnAssigneeAgentId ?? null;
+    const hasAgentAssignee = Boolean(rawCreateBody.assigneeAgentId) || Boolean(rawCreateBody.assigneeUserId) || Boolean(createReturnAssigneeAgentId);
+    const assigneeAgentName = normalizedAssigneeAgentRef.id != null ? normalizedAssigneeAgentRef.name : null;
+    const isCoderAgent = assigneeAgentName != null && assigneeAgentName.toLowerCase().startsWith("coder-");
+    if (isCoderAgent && (!normalizedExecutionPolicy || normalizedExecutionPolicy.stages.length === 0)) {
+      res.status(400).json({
+        error:
+          "An issue assigned to a coder agent requires a non-empty execution policy with at least one stage. deliver.sh cannot route the issue without a review stage.",
+        details: [
+          {
+            field: "executionPolicy",
+            message:
+              "executionPolicy is null/absent or has no stages. A coder-assigned issue must include an execution policy with at least one stage so deliver.sh can route the issue through a review stage.",
+          },
+        ],
+      });
+      return;
+    }
+    if (hasAgentAssignee) {
       await assertCanAssignTasks(req, companyId, createAssignmentScope);
     }
     await assertIssueEnvironmentSelection(companyId, createBody.executionWorkspaceSettings?.environmentId);
 
-    const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(createBody.executionPolicy);
     assertIssueExecutionPolicySatisfiable({ companyId, executionPolicy: normalizedExecutionPolicy });
-    const executionPolicy = applyActorMonitorScheduledBy(
-      normalizedExecutionPolicy,
-      actor.actorType,
-    );
+    const executionPolicy = applyActorMonitorScheduledBy(normalizedExecutionPolicy, actor.actorType);
     await assertCanManageIssueMonitor(access, req, companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
@@ -7563,13 +7576,13 @@ export function issueRoutes(
       entityId: parent.id,
     });
     if (!sanitizedBody) return;
-    const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+    const normalizedAssigneeAgentRef = await normalizeIssueAssigneeAgentReference(
       parent.companyId,
       sanitizedBody.assigneeAgentId as string | null | undefined,
     );
     const createBody = {
       ...sanitizedBody,
-      ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
+      ...(normalizedAssigneeAgentRef.id !== undefined ? { assigneeAgentId: normalizedAssigneeAgentRef.id } : {}),
     };
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, parent, createBody))) return;
     const childAssignmentScope = {
@@ -7579,9 +7592,26 @@ export function issueRoutes(
       assigneeUserId: createBody.assigneeUserId ?? null,
     };
     await assertTaskBridgeCreateAllowed(req, parent.companyId, childAssignmentScope);
-    const childReturnAssigneeAgentId =
-      normalizeIssueExecutionPolicy(createBody.executionPolicy)?.returnAssigneeAgentId ?? null;
-    if (sanitizedBody.assigneeAgentId || sanitizedBody.assigneeUserId || childReturnAssigneeAgentId) {
+    const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(createBody.executionPolicy);
+    const childReturnAssigneeAgentId = normalizedExecutionPolicy?.returnAssigneeAgentId ?? null;
+    const hasAgentAssignee = Boolean(sanitizedBody.assigneeAgentId) || Boolean(sanitizedBody.assigneeUserId) || Boolean(childReturnAssigneeAgentId);
+    const childAssigneeAgentName = normalizedAssigneeAgentRef.id != null ? normalizedAssigneeAgentRef.name : null;
+    const isChildCoderAgent = childAssigneeAgentName != null && childAssigneeAgentName.toLowerCase().startsWith("coder-");
+    if (isChildCoderAgent && (!normalizedExecutionPolicy || normalizedExecutionPolicy.stages.length === 0)) {
+      res.status(400).json({
+        error:
+          "An issue assigned to a coder agent requires a non-empty execution policy with at least one stage. deliver.sh cannot route the issue without a review stage.",
+        details: [
+          {
+            field: "executionPolicy",
+            message:
+              "executionPolicy is null/absent or has no stages. A coder-assigned issue must include an execution policy with at least one stage so deliver.sh can route the issue through a review stage.",
+          },
+        ],
+      });
+      return;
+    }
+    if (hasAgentAssignee) {
       await assertCanAssignTasks(req, parent.companyId, childAssignmentScope);
     }
     await assertIssueEnvironmentSelection(parent.companyId, createBody.executionWorkspaceSettings?.environmentId);
@@ -7591,12 +7621,8 @@ export function issueRoutes(
     const currentSerializedChild = serializationContext
       ? await findCurrentSerializedWatchdogChild(parent)
       : null;
-    const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(createBody.executionPolicy);
     assertIssueExecutionPolicySatisfiable({ companyId: parent.companyId, executionPolicy: normalizedExecutionPolicy });
-    const executionPolicy = applyActorMonitorScheduledBy(
-      normalizedExecutionPolicy,
-      actor.actorType,
-    );
+    const executionPolicy = applyActorMonitorScheduledBy(normalizedExecutionPolicy, actor.actorType);
     await assertCanManageIssueMonitor(access, req, parent.companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
@@ -7743,13 +7769,13 @@ export function issueRoutes(
         entityId: sourceIssue.id,
       });
       if (!sanitizedChild) return;
-      const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+      const normalizedAssigneeAgentRef = await normalizeIssueAssigneeAgentReference(
         sourceIssue.companyId,
         sanitizedChild.assigneeAgentId as string | null | undefined,
       );
       const childBody = {
         ...sanitizedChild,
-        ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
+        ...(normalizedAssigneeAgentRef.id !== undefined ? { assigneeAgentId: normalizedAssigneeAgentRef.id } : {}),
       };
       requestedChildren.push(childBody);
       assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(childBody));
@@ -8054,10 +8080,11 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
-    const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+    const normalizedAssigneeAgentRef = await normalizeIssueAssigneeAgentReference(
       existing.companyId,
       req.body.assigneeAgentId as string | null | undefined,
     );
+    const normalizedAssigneeAgentId = normalizedAssigneeAgentRef.id;
     const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
     const existingRelations =
       Array.isArray(req.body.blockedByIssueIds)

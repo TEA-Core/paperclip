@@ -68,15 +68,33 @@ function registerModuleMocks() {
         companyId: "company-1",
         permissions: null,
       })),
-      resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
-        ambiguous: false,
-        agent: {
-          id: reference,
-          companyId: "company-1",
-          status: "idle",
-          orgChainHealth: { status: "healthy" },
-        },
-      })),
+      resolveByReference: vi.fn(async (_companyId: string, reference: string) => {
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reference);
+        if (isUuid) {
+          const isCoder = reference.startsWith("00000000-0000-4000-8") || reference.startsWith("00000000-0000-4000-9");
+          return {
+            ambiguous: false,
+            agent: {
+              id: reference,
+              companyId: "company-1",
+              name: isCoder ? `coder-${reference.slice(0, 8)}` : `agent-${reference.slice(0, 8)}`,
+              status: "idle",
+              orgChainHealth: { status: "healthy" },
+            },
+          };
+        }
+        const isCoder = reference.toLowerCase().startsWith("coder-");
+        return {
+          ambiguous: false,
+          agent: {
+            id: reference,
+            companyId: "company-1",
+            name: isCoder ? reference : `agent-${reference.slice(0, 8)}`,
+            status: "idle",
+            orgChainHealth: { status: "healthy" },
+          },
+        };
+      }),
     }),
     companySkillService: () => ({
       completeTestRunForIssue: vi.fn(async () => null),
@@ -216,9 +234,10 @@ describe("issue execution policy routes", () => {
             "issue:read",
             "issue:mutate",
             "runtime:manage",
+            "tasks:assign",
           ].includes(input.action ?? "")
-          ? true
-          : Boolean(await mockAccessService.canUser() || await mockAccessService.hasPermission());
+        ? true
+        : Boolean(await mockAccessService.canUser() || await mockAccessService.hasPermission());
       return {
         allowed,
         action: input.action,
@@ -1051,6 +1070,382 @@ describe("issue execution policy routes", () => {
 
       expect(res.status).toBe(403);
       expect(res.body).toMatchObject({ error: "Missing permission: tasks:assign" });
+    });
+  });
+
+  describe("non-coder agent assignee with no execution policy", () => {
+    it("allows creating a company issue with assigneeAgentId and no execution policy", async () => {
+      mockIssueService.create.mockResolvedValue({
+        id: randomUUID(),
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        assigneeUserId: null,
+        title: "No policy issue",
+      } as any);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post("/api/companies/company-1/issues")
+        .send({ title: "No policy issue", assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.create).toHaveBeenCalled();
+    });
+
+    it("allows creating a company issue with assigneeUserId and no execution policy", async () => {
+      mockIssueService.create.mockResolvedValue({
+        id: randomUUID(),
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: null,
+        assigneeUserId: "user-1",
+        title: "No policy issue",
+      } as any);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post("/api/companies/company-1/issues")
+        .send({ title: "No policy issue", assigneeUserId: "user-1" });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.create).toHaveBeenCalled();
+    });
+
+    it("allows a non-coder agent with returnAssigneeAgentId and empty stages", async () => {
+      const assigneeAgentId = randomUUID();
+      const emptyPolicy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: assigneeAgentId,
+        stages: [],
+      });
+
+      expect(emptyPolicy).not.toBeNull();
+      expect(emptyPolicy?.stages).toEqual([]);
+
+      mockIssueService.create.mockResolvedValue({
+        id: randomUUID(),
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: assigneeAgentId,
+        assigneeUserId: null,
+        title: "Empty policy issue",
+      } as any);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post("/api/companies/company-1/issues")
+        .send({
+          title: "Empty policy issue",
+          assigneeAgentId: assigneeAgentId,
+          executionPolicy: { returnAssigneeAgentId: assigneeAgentId, stages: [] },
+        });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.create).toHaveBeenCalled();
+    });
+
+    it("allows creating a company issue with assigneeAgentId and a valid execution policy", async () => {
+      const reviewerAgentId = randomUUID();
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        }],
+      })!;
+
+      mockIssueService.create.mockResolvedValue({
+        id: randomUUID(),
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        assigneeUserId: null,
+        title: "Valid policy issue",
+      } as any);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post("/api/companies/company-1/issues")
+        .send({
+          title: "Valid policy issue",
+          assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+          executionPolicy: policy,
+        });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.create).toHaveBeenCalled();
+    });
+
+    it("allows creating a child issue with assigneeAgentId and no execution policy", async () => {
+      const parentId = randomUUID();
+      mockIssueService.getById.mockResolvedValue({ id: parentId, companyId: "company-1" });
+      mockIssueService.createChild.mockResolvedValue({
+        issue: {
+          id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          companyId: "company-1",
+          status: "todo",
+        },
+        parentBlockerAdded: false,
+      });
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post(`/api/issues/${parentId}/children`)
+        .send({ title: "Child no policy", assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.createChild).toHaveBeenCalled();
+    });
+
+    it("allows creating a child issue with assigneeAgentId and a valid execution policy", async () => {
+      const parentId = randomUUID();
+      const reviewerAgentId = randomUUID();
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        }],
+      })!;
+
+      mockIssueService.getById.mockResolvedValue({ id: parentId, companyId: "company-1" });
+      mockIssueService.createChild.mockResolvedValue({
+        issue: {
+          id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          companyId: "company-1",
+          status: "todo",
+        },
+        parentBlockerAdded: false,
+      });
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post(`/api/issues/${parentId}/children`)
+        .send({
+          title: "Child valid policy",
+          assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+          executionPolicy: policy,
+        });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.createChild).toHaveBeenCalled();
+    });
+  });
+
+  describe("coder agent assignee requires non-empty execution policy with stages", () => {
+    it("rejects creating a company issue with a coder-* agent and no execution policy (400)", async () => {
+      const coderAgentId = "00000000-0000-4000-8000-000000000001";
+      mockIssueService.create.mockResolvedValue({
+        id: randomUUID(),
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        title: "No policy coder issue",
+      } as any);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post("/api/companies/company-1/issues")
+        .send({ title: "No policy coder issue", assigneeAgentId: coderAgentId });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("coder agent requires a non-empty execution policy");
+      expect(res.body.error).toContain("deliver.sh cannot route");
+      expect(res.body.details).toBeDefined();
+      expect(res.body.details[0].field).toBe("executionPolicy");
+      expect(mockIssueService.create).not.toHaveBeenCalled();
+    });
+
+    it("rejects creating a company issue with a coder-* agent and empty execution policy stages (400)", async () => {
+      const coderAgentId = "00000000-0000-4000-8000-000000000002";
+      mockIssueService.create.mockResolvedValue({
+        id: randomUUID(),
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        title: "Empty stages coder issue",
+      } as any);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post("/api/companies/company-1/issues")
+        .send({
+          title: "Empty stages coder issue",
+          assigneeAgentId: coderAgentId,
+          executionPolicy: { stages: [] },
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("coder agent requires a non-empty execution policy");
+      expect(res.body.error).toContain("deliver.sh cannot route");
+      expect(res.body.details).toBeDefined();
+      expect(res.body.details[0].field).toBe("executionPolicy");
+      expect(mockIssueService.create).not.toHaveBeenCalled();
+    });
+
+    it("rejects creating a child issue with a coder-* agent and no execution policy (400)", async () => {
+      const parentId = randomUUID();
+      const coderAgentId = "00000000-0000-4000-8000-000000000003";
+      mockIssueService.getById.mockResolvedValue({ id: parentId, companyId: "company-1" });
+      mockIssueService.createChild.mockResolvedValue({
+        issue: {
+          id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          companyId: "company-1",
+          status: "todo",
+        },
+        parentBlockerAdded: false,
+      });
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post(`/api/issues/${parentId}/children`)
+        .send({ title: "Child coder no policy", assigneeAgentId: coderAgentId });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("coder agent requires a non-empty execution policy");
+      expect(res.body.error).toContain("deliver.sh cannot route");
+      expect(mockIssueService.createChild).not.toHaveBeenCalled();
+    });
+
+    it("allows creating a company issue with a coder-* agent and a valid execution policy with stages", async () => {
+      const coderAgentId = "00000000-0000-4000-8000-000000000004";
+      const reviewerAgentId = randomUUID();
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        }],
+      })!;
+
+      mockIssueService.create.mockResolvedValue({
+        id: randomUUID(),
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        title: "Valid policy coder issue",
+      } as any);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post("/api/companies/company-1/issues")
+        .send({
+          title: "Valid policy coder issue",
+          assigneeAgentId: coderAgentId,
+          executionPolicy: policy,
+        });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.create).toHaveBeenCalled();
+    });
+
+    it("rejects creating a company issue with a coder-* agent and empty stages via returnAssigneeAgentId (400)", async () => {
+      const coderAgentId = "00000000-0000-4000-8000-000000000005";
+      const returnAssigneeAgentId = "00000000-0000-4000-8000-000000000006";
+      mockIssueService.create.mockResolvedValue({
+        id: randomUUID(),
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        title: "Empty stages via returnAssignee",
+      } as any);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post("/api/companies/company-1/issues")
+        .send({
+          title: "Empty stages via returnAssignee",
+          assigneeAgentId: coderAgentId,
+          executionPolicy: { stages: [], returnAssigneeAgentId: returnAssigneeAgentId },
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("coder agent requires a non-empty execution policy");
+      expect(res.body.error).toContain("deliver.sh cannot route");
+      expect(res.body.details).toBeDefined();
+      expect(res.body.details[0].field).toBe("executionPolicy");
+      expect(mockIssueService.create).not.toHaveBeenCalled();
+    });
+
+    it("rejects creating a company issue with a coder-* agent and a stage with no participants that is silently dropped (400)", async () => {
+      const coderAgentId = "00000000-0000-4000-8000-000000000007";
+      const returnAssigneeAgentId = "00000000-0000-4000-8000-000000000008";
+      mockIssueService.create.mockResolvedValue({
+        id: randomUUID(),
+        companyId: "company-1",
+        status: "todo",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        title: "Silent drop",
+      } as any);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .post("/api/companies/company-1/issues")
+        .send({
+          title: "Silent drop",
+          assigneeAgentId: coderAgentId,
+          executionPolicy: {
+            returnAssigneeAgentId: returnAssigneeAgentId,
+            stages: [{ type: "review", participants: [] }],
+          },
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("coder agent requires a non-empty execution policy");
+      expect(res.body.error).toContain("deliver.sh cannot route");
+      expect(res.body.details).toBeDefined();
+      expect(res.body.details[0].field).toBe("executionPolicy");
+      expect(mockIssueService.create).not.toHaveBeenCalled();
     });
   });
 });
