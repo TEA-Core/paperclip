@@ -3140,6 +3140,8 @@ export async function assertWorktreeWritableByProcessUser(worktreePath: string):
   }
 }
 
+import { ensureSharedGroupOwnership } from "./shared-group-ownership.js";
+
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -3539,6 +3541,7 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
+  void ensureSharedGroupOwnership(worktreeParentDir);
 
   async function reuseExistingWorktree(reusablePath: string, effectiveBranchName = branchName, extraWarnings: string[] = []) {
     const refresh = currentBaseRefSha
@@ -3694,6 +3697,7 @@ export async function realizeExecutionWorkspace(input: {
       successMessage: `Created git worktree at ${worktreePath}\n`,
       failureLabel: `git worktree add ${worktreePath}`,
     });
+    await ensureSharedGroupOwnership(worktreePath);
   } catch (error) {
     if (!gitErrorIncludes(error, "already exists")) {
       throw error;
@@ -3715,6 +3719,7 @@ export async function realizeExecutionWorkspace(input: {
         successMessage: `Attached existing branch ${branchName} at ${worktreePath}\n`,
         failureLabel: `git worktree add ${worktreePath}`,
       });
+      await ensureSharedGroupOwnership(worktreePath);
     } catch (attachError) {
       if (!gitErrorIncludes(attachError, "already checked out")) {
         throw attachError;
@@ -3901,6 +3906,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   }
 
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+  void ensureSharedGroupOwnership(path.dirname(worktreePath));
   await runGit(["worktree", "prune"], repoRoot).catch(() => {});
   const restoreBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
   const restoreRefreshWarnings = restoreBaseRef ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef) : [];
@@ -3924,6 +3930,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       successMessage: `Reattached missing git worktree at ${worktreePath}\n`,
       failureLabel: `git worktree add ${worktreePath}`,
     });
+    await ensureSharedGroupOwnership(worktreePath);
   } catch (error) {
     if (
       !gitErrorIncludes(error, "invalid reference")
@@ -3950,6 +3957,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       successMessage: `Recreated missing git worktree at ${worktreePath}\n`,
       failureLabel: `git worktree add ${worktreePath}`,
     });
+    await ensureSharedGroupOwnership(worktreePath);
     created = true;
   }
 
