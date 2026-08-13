@@ -38,14 +38,15 @@ vi.mock("../home-paths.js", () => ({
 
 const REAL_GID = 1002;
 
-const WORKSPACE_RUNTIME_PATH = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "services",
-  "workspace-runtime.ts",
-);
+const __dirname2 = dirname(fileURLToPath(import.meta.url));
+
+const WORKSPACE_RUNTIME_PATH = join(__dirname2, "..", "services", "workspace-runtime.ts");
+const HEARTBEAT_PATH = join(__dirname2, "..", "services", "heartbeat.ts");
+const RUN_SCRATCH_PATH = join(__dirname2, "..", "services", "run-scratch.ts");
 
 const sourceLines = readFileSync(WORKSPACE_RUNTIME_PATH, "utf8").split("\n");
+const heartbeatLines = readFileSync(HEARTBEAT_PATH, "utf8").split("\n");
+const runScratchLines = readFileSync(RUN_SCRATCH_PATH, "utf8").split("\n");
 
 const CALL_RE = /ensureSharedGroupOwnership\s*\(/;
 const AWAITED_CALL_RE = /await\s+ensureSharedGroupOwnership\s*\(/;
@@ -108,6 +109,34 @@ describe("workspace-runtime shared-group ownership ordering", () => {
       expect(parentChgrpLine).toBeLessThan(worktreeAddLine);
     },
   );
+});
+
+describe("heartbeat + run-scratch shared-group ownership ordering", () => {
+  it("awaits every ensureSharedGroupOwnership call in heartbeat.ts (no fire-and-forget sites)", () => {
+    const floating = heartbeatLines
+      .map((line, index) => ({ line, lineNumber: index + 1 }))
+      .filter(({ line }) => CALL_RE.test(line) && !isImportLine(line))
+      .filter(({ lineNumber }) => !AWAITED_CALL_RE.test(heartbeatLines[lineNumber - 1]))
+      .map(({ lineNumber }) => `heartbeat.ts:${lineNumber} ${heartbeatLines[lineNumber - 1].trim()}`);
+
+    expect(floating).toEqual([]);
+    expect(
+      heartbeatLines.filter((line) => CALL_RE.test(line) && !isImportLine(line)).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("awaits every ensureSharedGroupOwnership call in run-scratch.ts (no fire-and-forget sites)", () => {
+    const floating = runScratchLines
+      .map((line, index) => ({ line, lineNumber: index + 1 }))
+      .filter(({ line }) => CALL_RE.test(line) && !isImportLine(line))
+      .filter(({ lineNumber }) => !AWAITED_CALL_RE.test(runScratchLines[lineNumber - 1]))
+      .map(({ lineNumber }) => `run-scratch.ts:${lineNumber} ${runScratchLines[lineNumber - 1].trim()}`);
+
+    expect(floating).toEqual([]);
+    expect(
+      runScratchLines.filter((line) => CALL_RE.test(line) && !isImportLine(line)).length,
+    ).toBeGreaterThan(0);
+  });
 });
 
 describe("ensureSharedGroupOwnership settle semantics", () => {
