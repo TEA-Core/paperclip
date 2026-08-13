@@ -43,10 +43,14 @@ vi.mock("pino-http", () => ({
 vi.mock("../config-file.js", () => ({
   readConfigFile: vi.fn(() => null),
 }));
-vi.mock("../home-paths.js", () => ({
-  resolveHomeAwarePath: vi.fn((p: string) => p),
-  resolveDefaultLogsDir: vi.fn(() => "/tmp/paperclip-test-logs"),
-}));
+vi.mock("../home-paths.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../home-paths.js")>();
+  return {
+    ...actual,
+    resolveHomeAwarePath: vi.fn((p: string) => p),
+    resolveDefaultLogsDir: vi.fn(() => "/tmp/paperclip-test-logs"),
+  };
+});
 
 describe("logger translateTime respects TZ environment variable", () => {
   beforeEach(() => {
