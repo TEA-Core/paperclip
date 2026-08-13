@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,5 +130,38 @@ describe("docker-entrypoint.sh", () => {
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(stderr).toContain("running unprivileged as 1000:1001; cannot remap to requested 1000:1000");
     expect(calls).toBe("");
+  });
+
+  it("has umask 002 set before the gosu exec on the root path (Docker Compose)", () => {
+    const script = readFileSync(ENTRYPOINT, "utf8");
+    const lines = script.split("\n");
+    const umaskLineIdx = lines.findIndex((l) => l.trim() === "umask 002");
+    const gosuExecIdx = lines.findIndex((l) => l.trim() === "exec gosu node \"$@\"");
+    expect(umaskLineIdx).toBeGreaterThanOrEqual(0);
+    expect(gosuExecIdx).toBeGreaterThanOrEqual(0);
+    expect(umaskLineIdx).toBeLessThan(gosuExecIdx);
+  });
+
+  it("has umask 002 set before the direct exec on the unprivileged path", () => {
+    const script = readFileSync(ENTRYPOINT, "utf8");
+    const lines = script.split("\n");
+    const umaskLineIdx = lines.findIndex((l) => l.trim() === "umask 002");
+    const directExecIdx = lines.findIndex((l) => l.trim().startsWith("exec ") && l.trim() !== "exec gosu node \"$@\"");
+    expect(umaskLineIdx).toBeGreaterThanOrEqual(0);
+    expect(directExecIdx).toBeGreaterThanOrEqual(0);
+    expect(umaskLineIdx).toBeLessThan(directExecIdx);
+  });
+
+  it("applies umask 002 so files created by the server command are group-writable", async () => {
+    installStubs({ uid: 0, gid: 0 });
+
+    const outFile = join(stubDir, "created-by-server.txt");
+    const result = await execFileAsync("sh", [ENTRYPOINT, "sh", "-c", `touch ${outFile}`], {
+      env: { PATH: `${stubDir}:${process.env.PATH}` },
+    });
+
+    expect(existsSync(outFile)).toBe(true);
+    const mode = statSync(outFile).mode;
+    expect(mode & 0o020).toBe(0o020);
   });
 });
