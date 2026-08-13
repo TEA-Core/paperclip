@@ -3541,7 +3541,7 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
-  void ensureSharedGroupOwnership(worktreeParentDir);
+  await ensureSharedGroupOwnership(worktreeParentDir);
 
   async function reuseExistingWorktree(reusablePath: string, effectiveBranchName = branchName, extraWarnings: string[] = []) {
     const refresh = currentBaseRefSha
@@ -3906,7 +3906,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   }
 
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });
-  void ensureSharedGroupOwnership(path.dirname(worktreePath));
+  await ensureSharedGroupOwnership(path.dirname(worktreePath));
   await runGit(["worktree", "prune"], repoRoot).catch(() => {});
   const restoreBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
   const restoreRefreshWarnings = restoreBaseRef ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef) : [];
