@@ -70,7 +70,7 @@ Seccomp_filters: 3
 
 - `CAP_SETUID`/`CAP_SETGID` are present **only in the bounding set**, not in effective/permitted/ambient/inheritable (all `0`). A non-root process **cannot use** them.
 - `NoNewPrivs = 0`, so setuid binaries are honoured (no NNP block); the root fs and `/paperclip` are **not** `nosuid` (`overlay rw,relatime`, `ext4 rw,relatime`).
-- Setuid helpers: `gosu` (mode `0755`, **not** setuid), `setpriv` (`0755`), `runuser` (`0755`), `su` (**`4755`**, setuid-root), `sudo` absent.
+- Setuid helpers: `gosu` (mode `0755`, **not** setuid — and it *cannot be made* setuid, see the withdrawal in M1.2), `setpriv` (`0755`), `runuser` (`0755`), `su` (**`4755`**, setuid-root), `sudo` absent.
 
 ### M1.2 — can uid-1000 obtain uid 1001? No.
 
@@ -87,12 +87,36 @@ Password: su: Authentication failure
 
 - `setpriv`/`gosu` fail with `EPERM` (need CAP_SETUID / root; both absent in the effective set).
 - `su` is setuid-root but requires the target account password → `Authentication failure`.
-- **No route exists to a second uid from inside.** Critically, the server itself (pid 7, uid 1000, `CapEff=0`) also **cannot** `setuid` to 1001 — so the runner in-container cannot drop privileges on its own. A uid-1001 agent can only be created by a **root** actor: `docker-entrypoint.sh`/compose on the host side, or a **setuid-root** helper (e.g. making `gosu` `4755`) that the server invokes to spawn agents.
+- **No route exists to a second uid from inside.** Critically, the server itself (pid 7, uid 1000, `CapEff=0`) also **cannot** `setuid` to 1001 — so the runner in-container cannot drop privileges on its own. A uid-1001 agent can only be created by a **root** actor: `docker-entrypoint.sh`/compose on the host side, or a **setuid-root** helper that the server invokes to spawn agents.
+
+#### WITHDRAWN 2026-08-13 — `chmod 4755 /usr/sbin/gosu` is not a spawn path; it bricks the container
+
+`gosu` **refuses to run when its own setuid bit is set**, by design, before it attempts any credential switch. Measured by the operator against `tea-core/paperclip:v2026.722.0-tea` in a throwaway container, and reproduced independently from an agent run on the live image with a non-setuid control:
+
+```
+$ cp /usr/sbin/gosu ./gosu-probe && chmod 4755 ./gosu-probe && ./gosu-probe node id
+error: "./gosu-probe" appears to be installed with the 'setuid' bit set, which is an
+*extremely* insecure and completely unsupported configuration! (what you want instead
+is likely 'sudo' or 'su')                                                    exit=1
+
+$ cp /usr/sbin/gosu ./gosu-ctl  && chmod 0755 ./gosu-ctl  && ./gosu-ctl  node id
+error: failed switching to "node": operation not permitted                   exit=1
+```
+
+The two failures differ, which is the point: the setuid copy aborts on the self-check *before* reaching the switch the control reaches. It refuses identically when invoked as root — the case that matters, since `scripts/docker-entrypoint.sh` ends in `exec gosu node "$@"`. So `chmod 4755` on `gosu` does not yield a root spawn path, it yields **a container that fails to start**.
+
+Also withdrawn, pre-emptively: **file capabilities on the `node` binary** (`setcap cap_setuid+ep …/node`). That grants `CAP_SETUID` to *every* node process including the agent's own runtime, so an agent can `setuid(0)`. It voids M1 rather than delivering it.
+
+**Surviving options for the spawn path — both root-side, both hardcode the target uid:**
+- **2a — a purpose-built setuid-root exec shim** shipped in the image: ~30 LOC, `setgid(1001)` then `setuid(1001)`, then `execvp` the argv it was given. No daemon, no IPC surface, no long-lived privileged process. Viable here as measured: `/` is `overlay rw,relatime` and `/paperclip` is `ext4 rw,relatime` (neither `nosuid`), `NoNewPrivs = 0`, and the image's own `4755` `/bin/su` demonstrably reaches euid 0 (it reads `/etc/shadow` and answers `Authentication failure`). `gcc` is present in the image, so it compiles in a build stage.
+- **2b — a root supervisor** in `docker-entrypoint.sh` that spawns agents as 1001 on request. Strictly larger: a new long-lived privileged process **with its own IPC surface**, not a Dockerfile line. PID 1 today is `/sbin/docker-init` (tini) — a zombie reaper, not something the server can ask to spawn a child — so this is net-new code, not a flag.
+
+**Binding on whichever is chosen: the target uid is hardcoded to 1001 and never taken from the caller.** A helper that accepts a uid parameter lets an agent ask for `0` — the same failure class `gosu` refuses to participate in, and it would green M1 while leaving the property open.
 
 **What has to change to reach the target shape (server stays unprivileged, agents run as 1001):**
 1. `Dockerfile`: create `node-agent` (uid/gid 1001) + a shared group.
-2. Provide a root/setuid spawn path: make `gosu` setuid-root (`4755`) in the image, **or** run a root supervisor in the entrypoint that spawns agents as 1001. (The server at `CapEff=0` cannot do it directly.)
-3. `scripts/docker-entrypoint.sh`/compose: wire the agent-spawn path through `gosu 1001 …` (or the supervisor).
+2. Provide a root/setuid spawn path: option **2a** (setuid-root exec shim, hardcoded uid 1001 — recommended) or **2b** (root supervisor). (The server at `CapEff=0` cannot do it directly.)
+3. `scripts/docker-entrypoint.sh`/compose: wire the agent-spawn path through that shim/supervisor.
 
 ### M1.3 — ownership blast radius (the deciding cost)
 
@@ -198,11 +222,11 @@ The deployed environment is a **single Docker container** (`pid 1 = /sbin/docker
 
 **Operator-side (image/compose/restart) — the board ask fires on this split:**
 1. `Dockerfile`: add `node-agent` (uid/gid **1001**) and a shared `agents` group (1001 + 1000).
-2. Provide the spawn path: make `gosu` **setuid-root** (`4755`) in the image, or run a root supervisor in `docker-entrypoint.sh` that launches agents as 1001.
+2. Provide the spawn path: ship a **purpose-built setuid-root exec shim with uid 1001 hardcoded** (option 2a, recommended), or run a root supervisor in `docker-entrypoint.sh` that launches agents as 1001 (option 2b). **NOT `gosu` 4755** — withdrawn 2026-08-13, it self-aborts and bricks startup; see M1.2.
 3. One-time ownership pass: `chgrp -R agents` over the ~969 existing worktree roots + the ~6 fixed cache/config dirs (M1.3) — or defer to per-checkout `chown` in the server.
 
 **Agent-side (repo diff — coder-LE):**
-1. Server spawns agents via the setuid helper (`gosu 1001 …`) / supervisor instead of direct spawn (the server at `CapEff=0` cannot setuid itself).
+1. Server spawns agents via the setuid shim / supervisor instead of direct spawn (the server at `CapEff=0` cannot setuid itself). The server passes **argv only** — it does not pass a uid.
 2. Server adopts `umask 002` + shared-group ownership (or per-worktree `chown` to the agent uid at checkout) so new worktrees are writable by uid 1001.
 3. Ensure caches/config/scratch/`opencode.db` are group-accessible (shared `agents` group, `umask 002`).
 
