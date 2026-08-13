@@ -131,6 +131,9 @@ jobs:
       - name: Test MCP server image build and entrypoint wiring
         run: node --test ./scripts/__tests__/dockerfile-mcp-server-build.test.mjs
 
+      - name: Test agent spawn shim invariants
+        run: node --test ./scripts/__tests__/agent-spawn-shim.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 

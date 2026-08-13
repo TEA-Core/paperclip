@@ -111,6 +111,46 @@ test("Dockerfile installs the shim setuid-root and proves it works at build time
   );
 });
 
+test("the exec probes run on a native build and are loudly skipped under emulation", () => {
+  // Under binfmt/qemu the kernel execs the non-setuid emulator, so the setuid
+  // bit is never honoured and the shim's euid!=0 refusal fires. The probes can
+  // therefore only ever pass natively -- but a skipped probe must be visible in
+  // the build log rather than reading like a passed one.
+  assert.match(dockerfile, /^ARG BUILDPLATFORM$/m, "BUILDPLATFORM must be declared for buildx to inject it");
+  assert.match(dockerfile, /^ARG TARGETPLATFORM$/m, "TARGETPLATFORM must be declared for buildx to inject it");
+
+  const gate = dockerfile.match(
+    /if \[ "\$\{BUILDPLATFORM\}" = "\$\{TARGETPLATFORM\}" \]; then([\s\S]*?)else([\s\S]*?)fi/,
+  );
+  assert.ok(gate, "the exec probes must be gated on BUILDPLATFORM == TARGETPLATFORM");
+
+  const [, nativeBranch, emulatedBranch] = gate;
+  assert.match(nativeBranch, /paperclip-spawn-agent id -u/, "the native branch must keep the uid probe");
+  assert.match(nativeBranch, /\/proc\/1\/environ/, "the native branch must keep the cross-uid /proc probe");
+
+  assert.doesNotMatch(
+    emulatedBranch,
+    /gosu node \/usr\/local\/sbin\/paperclip-spawn-agent/,
+    "the emulated branch must not attempt a probe that can never pass",
+  );
+  assert.match(emulatedBranch, /echo "SKIP/, "a skipped probe must be announced in the build log");
+
+  // The gate is worthless if a second, ungated copy of a probe survives: the
+  // arm64 build would fail on that one instead.
+  const probeLines = dockerfileInstructions
+    .split("\n")
+    .filter(line => /gosu node \/usr\/local\/sbin\/paperclip-spawn-agent/.test(line));
+  assert.ok(probeLines.length > 0, "the probes must still exist");
+  const gateIdx = dockerfileInstructions.indexOf('if [ "${BUILDPLATFORM}" = "${TARGETPLATFORM}" ]');
+  assert.ok(gateIdx > 0, "the gate must live in an instruction, not only in a comment");
+  for (const line of probeLines) {
+    assert.ok(
+      dockerfileInstructions.indexOf(line) > gateIdx,
+      `probe must sit inside the native-build gate: ${line.trim()}`,
+    );
+  }
+});
+
 test("gosu is never made setuid, and node never gets CAP_SETUID", () => {
   // Both are the tempting shortcuts. gosu self-aborts when setuid, which would
   // break `exec gosu node` in the entrypoint and stop the container starting.
