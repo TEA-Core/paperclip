@@ -115,6 +115,7 @@ export interface StartedServer {
 }
 
 export async function startServer(): Promise<StartedServer> {
+  process.umask(0o002);
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
