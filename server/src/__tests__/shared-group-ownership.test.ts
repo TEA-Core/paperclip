@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -20,7 +20,19 @@ function getModeOfPath(p: string): number {
   return fs.statSync(p).mode & 0o7777;
 }
 
-const REAL_GID = 1002;
+// The ownership assertions below exercise real chown/chmod syscalls, so the
+// target gid cannot be hardcoded: a non-root process (CI runs as uid/gid 1001)
+// may only chgrp to a group it belongs to, and ensureSharedGroupOwnership
+// deliberately swallows the resulting EPERM. Prefer a supplementary group so
+// the chgrp is observable, and fall back to the primary gid when the process
+// has none.
+function resolveApplicableGid(): number {
+  const currentGid = typeof process.getgid === "function" ? process.getgid() : 0;
+  const groups = typeof process.getgroups === "function" ? process.getgroups() : [];
+  return groups.find((gid) => gid !== currentGid) ?? currentGid;
+}
+
+const TARGET_GID = resolveApplicableGid();
 
 async function loadFreshModule() {
   vi.resetModules();
@@ -35,7 +47,7 @@ describe("shared-group-ownership", () => {
       const dir = createTempDir();
       try {
         await ensureSharedGroupOwnership(dir, {
-          resolveGid: async () => REAL_GID,
+          resolveGid: async () => TARGET_GID,
           resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
         });
         const mode = getModeOfPath(dir);
@@ -50,11 +62,11 @@ describe("shared-group-ownership", () => {
       const dir = createTempDir();
       try {
         await ensureSharedGroupOwnership(dir, {
-          resolveGid: async () => REAL_GID,
+          resolveGid: async () => TARGET_GID,
           resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
         });
         const gid = getGidOfPath(dir);
-        expect(gid).toBe(REAL_GID);
+        expect(gid).toBe(TARGET_GID);
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
@@ -65,7 +77,7 @@ describe("shared-group-ownership", () => {
       const dir = path.join(os.tmpdir(), "paperclip-nonexistent-dir-" + Date.now());
       await expect(
         ensureSharedGroupOwnership(dir, {
-          resolveGid: async () => REAL_GID,
+          resolveGid: async () => TARGET_GID,
           resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
         }),
       ).resolves.not.toThrow();
@@ -101,7 +113,7 @@ describe("shared-group-ownership", () => {
       const nonexistentDir = path.join(dir, "does-not-exist");
       try {
         await ensureSharedGroupOwnership(nonexistentDir, {
-          resolveGid: async () => REAL_GID,
+          resolveGid: async () => TARGET_GID,
           resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
           warn: warnSpy,
         });
@@ -116,19 +128,27 @@ describe("shared-group-ownership", () => {
     it("refuses to chgrp the master-key directory itself", async () => {
       const { ensureSharedGroupOwnership } = await loadFreshModule();
       const keyDir = createTempDir();
+      const warnSpy = vi.fn();
+      const resolveGid = vi.fn(async () => TARGET_GID);
       try {
         const originalGid = getGidOfPath(keyDir);
         const originalMode = getModeOfPath(keyDir);
 
         await ensureSharedGroupOwnership(keyDir, {
-          resolveGid: async () => REAL_GID,
+          resolveGid,
           resolveMasterKeyDir: () => keyDir,
+          warn: warnSpy,
         });
 
         const newGid = getGidOfPath(keyDir);
         const newMode = getModeOfPath(keyDir);
         expect(newGid).toBe(originalGid);
         expect(newMode).toBe(originalMode);
+        // The guard must short-circuit before any group is resolved, so the
+        // assertions above cannot pass merely because the chgrp was denied.
+        expect(resolveGid).not.toHaveBeenCalled();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(String(warnSpy.mock.calls[0][0])).toContain("master-key");
       } finally {
         fs.rmSync(keyDir, { recursive: true, force: true });
       }
@@ -139,6 +159,7 @@ describe("shared-group-ownership", () => {
       const instanceRoot = createTempDir();
       const secretsDir = path.join(instanceRoot, "secrets");
       const masterKeyPath = path.join(secretsDir, "master.key");
+      const resolveGid = vi.fn(async () => TARGET_GID);
       try {
         fs.mkdirSync(secretsDir, { recursive: true });
         fs.writeFileSync(masterKeyPath, "test-key", { mode: 0o600 });
@@ -147,10 +168,12 @@ describe("shared-group-ownership", () => {
         const originalMode = getModeOfPath(secretsDir);
 
         await ensureSharedGroupOwnership(instanceRoot, {
-          resolveGid: async () => REAL_GID,
+          resolveGid,
           resolveMasterKeyDir: () => secretsDir,
+          warn: () => {},
         });
 
+        expect(resolveGid).not.toHaveBeenCalled();
         const newGid = getGidOfPath(secretsDir);
         const newMode = getModeOfPath(secretsDir);
         expect(newGid).toBe(originalGid);
@@ -169,7 +192,7 @@ describe("shared-group-ownership", () => {
       const keyDir = createTempDir();
       try {
         await ensureSharedGroupOwnership(keyDir, {
-          resolveGid: async () => REAL_GID,
+          resolveGid: async () => TARGET_GID,
           resolveMasterKeyDir: () => keyDir,
         });
 
@@ -186,12 +209,12 @@ describe("shared-group-ownership", () => {
       const otherDir = createTempDir();
       try {
         await ensureSharedGroupOwnership(otherDir, {
-          resolveGid: async () => REAL_GID,
+          resolveGid: async () => TARGET_GID,
           resolveMasterKeyDir: () => keyDir,
         });
 
         const gid = getGidOfPath(otherDir);
-        expect(gid).toBe(REAL_GID);
+        expect(gid).toBe(TARGET_GID);
         const mode = getModeOfPath(otherDir);
         expect(mode & 0o2000).toBe(0o2000);
       } finally {
