@@ -43,10 +43,18 @@ vi.mock("pino-http", () => ({
 vi.mock("../config-file.js", () => ({
   readConfigFile: vi.fn(() => null),
 }));
-vi.mock("../home-paths.js", () => ({
-  resolveHomeAwarePath: vi.fn((p: string) => p),
-  resolveDefaultLogsDir: vi.fn(() => "/tmp/paperclip-test-logs"),
-}));
+// Partial mock: the logger module transitively pulls in other home-paths
+// exports (e.g. resolveDefaultSecretsKeyFilePath via the shared-group
+// ownership guard), so keep the real implementations for everything we do
+// not explicitly override.
+vi.mock("../home-paths.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../home-paths.js")>();
+  return {
+    ...actual,
+    resolveHomeAwarePath: vi.fn((p: string) => p),
+    resolveDefaultLogsDir: vi.fn(() => "/tmp/paperclip-test-logs"),
+  };
+});
 
 describe("logger translateTime respects TZ environment variable", () => {
   beforeEach(() => {
