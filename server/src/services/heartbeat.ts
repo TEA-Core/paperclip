@@ -145,6 +145,7 @@ import {
   type RealizedExecutionWorkspace,
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
+import { ensureSharedGroupOwnership } from "./shared-group-ownership.js";
 import { issueService } from "./issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
@@ -1400,11 +1401,13 @@ async function ensureManagedProjectWorkspace(input: {
     repoName: deriveRepoNameFromRepoUrl(input.repoUrl),
   });
   await fs.mkdir(path.dirname(cwd), { recursive: true });
+  void ensureSharedGroupOwnership(path.dirname(cwd));
   const stats = await fs.stat(cwd).catch(() => null);
 
   if (!input.repoUrl) {
     if (!stats) {
       await fs.mkdir(cwd, { recursive: true });
+      void ensureSharedGroupOwnership(cwd);
     }
     return { cwd, warning: null };
   }
@@ -7702,6 +7705,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
       await fs.mkdir(fallbackCwd, { recursive: true });
+      void ensureSharedGroupOwnership(fallbackCwd);
       const warnings: string[] = [];
       if (preferredWorkspaceWarning) {
         warnings.push(preferredWorkspaceWarning);
@@ -7774,6 +7778,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
     await fs.mkdir(cwd, { recursive: true });
+    void ensureSharedGroupOwnership(cwd);
     const warnings: string[] = [];
     if (sessionCwd && sessionCwdLooksUnsafe) {
       warnings.push(
@@ -13437,6 +13442,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agentHome: await (async () => {
         const home = resolveDefaultAgentWorkspaceDir(agent.id);
         await fs.mkdir(home, { recursive: true });
+        void ensureSharedGroupOwnership(home);
         return home;
       })(),
     };
