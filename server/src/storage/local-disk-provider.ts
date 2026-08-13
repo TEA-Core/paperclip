@@ -2,7 +2,6 @@ import { createReadStream, promises as fs } from "node:fs";
 import path from "node:path";
 import type { StorageProvider, GetObjectResult, HeadObjectResult } from "./types.js";
 import { notFound, badRequest } from "../errors.js";
-import { ensureSharedGroupOwnership } from "../services/shared-group-ownership.js";
 
 function normalizeObjectKey(objectKey: string): string {
   const normalized = objectKey.replace(/\\/g, "/").trim();
@@ -46,7 +45,6 @@ export function createLocalDiskStorageProvider(baseDir: string): StorageProvider
       const targetPath = resolveWithin(root, input.objectKey);
       const dir = path.dirname(targetPath);
       await fs.mkdir(dir, { recursive: true });
-      void ensureSharedGroupOwnership(dir);
 
       const tempPath = `${targetPath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       await fs.writeFile(tempPath, input.body);

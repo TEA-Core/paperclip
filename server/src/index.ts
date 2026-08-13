@@ -33,7 +33,6 @@ import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
-import { ensureSharedGroupOwnership } from "./services/shared-group-ownership.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import {
@@ -352,7 +351,6 @@ export async function startServer(): Promise<StartedServer> {
     await prepareEmbeddedPostgresNativeRuntime();
 
     const dataDir = resolve(config.embeddedPostgresDataDir);
-    void ensureSharedGroupOwnership(dataDir);
     const configuredPort = config.embeddedPostgresPort;
     let port = configuredPort;
     const logBuffer = createEmbeddedPostgresLogBuffer(120);
@@ -634,7 +632,6 @@ export async function startServer(): Promise<StartedServer> {
     const label = trigger === "scheduled" ? "Automatic" : "Manual";
     try {
       logger.info({ backupDir: config.databaseBackupDir, trigger }, `${label} database backup starting`);
-      void ensureSharedGroupOwnership(config.databaseBackupDir);
       // Read retention from Instance Settings (DB) so changes take effect without restart.
       const generalSettings = await backupSettingsSvc.getGeneral();
       const retention = generalSettings.backupRetention;

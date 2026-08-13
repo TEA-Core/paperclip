@@ -16,6 +16,8 @@ vi.mock("node:fs/promises", () => ({
 
 vi.mock("../home-paths.js", () => ({
   resolveDefaultSecretsKeyFilePath: vi.fn(() => "/tmp/nonexistent-secrets/master.key"),
+  resolveDefaultEmbeddedPostgresDir: vi.fn(() => "/tmp/nonexistent-db"),
+  resolveDefaultBackupDir: vi.fn(() => "/tmp/nonexistent-backups"),
 }));
 
 const REAL_GID = 1002;
@@ -198,6 +200,54 @@ describe("shared-group-ownership", () => {
       expect(mockChown).toHaveBeenCalledWith(otherDir, 1000, REAL_GID);
       expect(mockChmod).toHaveBeenCalledTimes(1);
       expect(mockChmod).toHaveBeenCalledWith(otherDir, 0o755 | 0o2070);
+    });
+  });
+
+  describe("server-owned directory guard", () => {
+    beforeEach(() => {
+      mockChown.mockReset();
+      mockChmod.mockReset();
+      mockStat.mockReset();
+    });
+
+    it("refuses to chgrp the resolved embedded-Postgres data directory", async () => {
+      const { ensureSharedGroupOwnership } = await loadFreshModule();
+      const pgData = path.join(os.tmpdir(), "paperclip-shared-group-test-pgdata");
+
+      await ensureSharedGroupOwnership(pgData, {
+        resolveGid: async () => REAL_GID,
+        resolvePostgresDataDir: () => pgData,
+      });
+
+      expect(mockChown).not.toHaveBeenCalled();
+      expect(mockChmod).not.toHaveBeenCalled();
+    });
+
+    it("refuses to chgrp an ancestor of the resolved embedded-Postgres data directory", async () => {
+      const { ensureSharedGroupOwnership } = await loadFreshModule();
+      const instanceRoot = path.join(os.tmpdir(), "paperclip-shared-group-test-pgdata-ancestor");
+      const pgData = path.join(instanceRoot, "db");
+
+      await ensureSharedGroupOwnership(instanceRoot, {
+        resolveGid: async () => REAL_GID,
+        resolvePostgresDataDir: () => pgData,
+      });
+
+      expect(mockChown).not.toHaveBeenCalled();
+      expect(mockChmod).not.toHaveBeenCalled();
+    });
+
+    it("refuses to chgrp the resolved database backup directory", async () => {
+      const { ensureSharedGroupOwnership } = await loadFreshModule();
+      const backupDir = path.join(os.tmpdir(), "paperclip-shared-group-test-backup");
+
+      await ensureSharedGroupOwnership(backupDir, {
+        resolveGid: async () => REAL_GID,
+        resolveDatabaseBackupDir: () => backupDir,
+      });
+
+      expect(mockChown).not.toHaveBeenCalled();
+      expect(mockChmod).not.toHaveBeenCalled();
     });
   });
 });

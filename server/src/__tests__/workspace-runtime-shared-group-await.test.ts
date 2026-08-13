@@ -34,6 +34,8 @@ vi.mock("node:fs/promises", () => ({
 
 vi.mock("../home-paths.js", () => ({
   resolveDefaultSecretsKeyFilePath: vi.fn(() => "/tmp/nonexistent-secrets/master.key"),
+  resolveDefaultEmbeddedPostgresDir: vi.fn(() => "/tmp/nonexistent-db"),
+  resolveDefaultBackupDir: vi.fn(() => "/tmp/nonexistent-backups"),
 }));
 
 const REAL_GID = 1002;
