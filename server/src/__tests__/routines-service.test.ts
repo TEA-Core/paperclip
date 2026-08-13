@@ -1,4 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
+import { mkdirSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -40,6 +43,9 @@ import { secretService } from "../services/secrets.ts";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const originalSecretsProviderEnv = process.env.PAPERCLIP_SECRETS_PROVIDER;
+const originalKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+const originalAllowKeyGeneration = process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+const secretsTmpDir = path.join(os.tmpdir(), `paperclip-routines-service-${randomUUID()}`);
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -52,6 +58,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
+    mkdirSync(secretsTmpDir, { recursive: true });
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
+    process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = "1";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-routines-service-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
@@ -89,6 +98,11 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+    if (originalKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = originalKeyFile;
+    if (originalAllowKeyGeneration === undefined) delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+    else process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = originalAllowKeyGeneration;
+    rmSync(secretsTmpDir, { recursive: true, force: true });
   });
 
   async function seedFixture(opts?: {

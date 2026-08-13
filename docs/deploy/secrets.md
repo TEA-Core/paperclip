@@ -205,6 +205,7 @@ pnpm paperclipai secrets doctor --company-id <company-id>
 |----------|-------------|
 | `PAPERCLIP_SECRETS_MASTER_KEY` | 32-byte key as base64, hex, or raw string |
 | `PAPERCLIP_SECRETS_MASTER_KEY_FILE` | Custom key file path |
+| `PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION` | Set to `1` to allow auto-generating a master key when none exists (default: deny) |
 | `PAPERCLIP_SECRETS_STRICT_MODE` | Set to `true` to enforce secret refs |
 
 ## Strict Mode
