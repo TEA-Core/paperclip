@@ -128,6 +128,7 @@ import {
 } from "../services/index.js";
 import { shouldPublishApprovalStatus } from "../services/merge-arming.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
+import { evaluateDoneTransitionGuard, writeAuditLog, type DoneTransitionOverride } from "../services/done-transition-guard.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
@@ -207,9 +208,14 @@ import { DIRECT_NON_INVOKABLE_STATUSES } from "../services/agent-invokability.js
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 // Strip must be re-applied after `.extend()`: the handler below rest-spreads the parsed body into
 // the column update, so the create-only attribution keys must not survive into `updateFields`.
+const doneTransitionOverrideSchema = z.object({
+  disposition: z.string().trim().min(1),
+  reason: z.string().trim().min(1).max(2000).optional(),
+});
 const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObjectSchema.extend({
   interrupt: z.boolean().optional(),
   force: z.boolean().optional(),
+  doneTransitionOverride: doneTransitionOverrideSchema.optional().nullable(),
 }));
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
@@ -8450,6 +8456,46 @@ export function issueRoutes(
           assigneeAgentId: nextAssigneeAgentId,
           assigneeUserId: nextAssigneeUserId,
         });
+      }
+    }
+
+    const requestedStatus = typeof updateFields.status === "string" ? updateFields.status : undefined;
+    const isDoneRequest = requestedStatus === "done" && existing.status !== "done";
+    if (isDoneRequest) {
+      const override: DoneTransitionOverride | null =
+        req.body.doneTransitionOverride && typeof req.body.doneTransitionOverride === "object"
+          ? {
+              disposition: (req.body.doneTransitionOverride as { disposition?: string }).disposition ?? "",
+              reason: (req.body.doneTransitionOverride as { reason?: string }).reason,
+            }
+          : null;
+      const guardResult = await evaluateDoneTransitionGuard(db, existing, override);
+      if (guardResult.skipped) {
+        void writeAuditLog(db, existing, "issue.done_transition_guard_skipped", {
+          reason: guardResult.reason,
+          skipReason: guardResult.skipReason,
+          branch: guardResult.branch,
+          defaultRef: guardResult.defaultRef,
+          owner: guardResult.owner,
+          repo: guardResult.repo,
+        });
+      }
+      if (!guardResult.allowed) {
+        res.status(409).json({
+          error: guardResult.reason,
+          code: "done_transition_missing_delivery",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            branch: guardResult.branch,
+            defaultRef: guardResult.defaultRef,
+            aheadBy: guardResult.aheadBy,
+            owner: guardResult.owner,
+            repo: guardResult.repo,
+            remedy: "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition.",
+          },
+        });
+        return;
       }
     }
 
