@@ -30,6 +30,13 @@ if (!process.env.CODEX_HOME) {
   process.env.CODEX_HOME = codexHome;
 }
 
+// Allow the local-encrypted secrets provider to auto-generate a master key
+// during tests. Individual tests that need to verify the deny-by-default
+// behavior explicitly delete this env var.
+if (process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION === undefined) {
+  process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = "1";
+}
+
 if (!SupertestTest.prototype.__paperclipLoopbackPatched) {
   SupertestTest.prototype.serverAddress = function serverAddress(app, path) {
     const addr = app.address();
