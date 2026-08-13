@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
@@ -2516,5 +2516,157 @@ describe('sanitizeInheritedPaperclipEnv', () => {
     expect(sanitized.BETTER_AUTH_SECRET).toBeUndefined();
     expect(sanitized.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
     expect(sanitized.PAPERCLIP_RUNTIME_API_URL).toBe('http://runtime.local:3000');
+  });
+});
+
+describe('resolveSpawnTarget setuid shim routing (SUP-12674)', () => {
+  const EXECUTABLE = process.execPath;
+  const ORIGINAL_ENV = { ...process.env };
+
+  let shimPath: string;
+
+  function mockSpawnChild() {
+    const child = new EventEmitter() as any;
+    child.pid = 99999;
+    child.killed = false;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new Readable({ read() { this.push(null); } });
+    child.stderr = new Readable({ read() { this.push(null); } });
+    child.kill = vi.fn();
+    setImmediate(() => {
+      child.exitCode = 0;
+      child.emit('close', 0, null);
+    });
+    return child;
+  }
+
+  beforeEach(async () => {
+    shimPath = path.join(os.tmpdir(), `paperclip-spawn-shim-${randomUUID()}`);
+    await fs.writeFile(shimPath, '#!/bin/sh\n', { mode: 0o755 });
+  });
+
+  afterEach(async () => {
+    process.env = { ...ORIGINAL_ENV };
+    vi.clearAllMocks();
+    try {
+      await fs.rm(shimPath, { force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  it('routes through the shim (argv-only) when PAPERCLIP_AGENT_UID is set and shim exists', async () => {
+    process.env.PAPERCLIP_AGENT_UID = '1001';
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = shimPath;
+
+    const mockedSpawn = vi.mocked(spawn);
+    let capturedCommand: string | undefined;
+    let capturedArgs: readonly string[] | undefined;
+    mockedSpawn.mockImplementationOnce((command, args) => {
+      capturedCommand = command;
+      capturedArgs = args;
+      return mockSpawnChild();
+    });
+
+    await runChildProcess(randomUUID(), EXECUTABLE, ['hello'], {
+      cwd: '/tmp',
+      env: {},
+      timeoutSec: 1,
+      graceSec: 0,
+      onLog: async () => {},
+    });
+
+    expect(capturedCommand).toBe(shimPath);
+    expect(capturedArgs).toEqual([EXECUTABLE, 'hello']);
+    // No uid token anywhere in args — argv-only.
+    expect(capturedArgs).not.toContain('1001');
+    expect(capturedArgs).not.toContain('1000');
+  });
+
+  it('fails loudly (no spawn, no fallback) when PAPERCLIP_AGENT_UID is set but shim is missing', async () => {
+    process.env.PAPERCLIP_AGENT_UID = '1001';
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = '/nonexistent/shim/path';
+
+    const mockedSpawn = vi.mocked(spawn);
+
+    await expect(
+      runChildProcess(randomUUID(), EXECUTABLE, ['hello'], {
+        cwd: '/tmp',
+        env: {},
+        timeoutSec: 1,
+        graceSec: 0,
+        onLog: async () => {},
+      }),
+    ).rejects.toThrow(/PAPERCLIP_AGENT_UID is set but the setuid spawn shim is not executable/);
+
+    // spawn must NOT have been called with the bare executable (no fallback to uid 1000).
+    expect(mockedSpawn).not.toHaveBeenCalled();
+  });
+
+  it('passes PAPERCLIP_AGENT_SPAWN_SHIM env override as the shim path', async () => {
+    process.env.PAPERCLIP_AGENT_UID = '1001';
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = shimPath;
+
+    const mockedSpawn = vi.mocked(spawn);
+    let capturedCommand: string | undefined;
+    mockedSpawn.mockImplementationOnce((command, args) => {
+      capturedCommand = command;
+      return mockSpawnChild();
+    });
+
+    await runChildProcess(randomUUID(), EXECUTABLE, ['hello'], {
+      cwd: '/tmp',
+      env: {},
+      timeoutSec: 1,
+      graceSec: 0,
+      onLog: async () => {},
+    });
+
+    expect(capturedCommand).toBe(shimPath);
+  });
+
+  it('does not route through the shim when PAPERCLIP_AGENT_UID is unset', async () => {
+    delete process.env.PAPERCLIP_AGENT_UID;
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = shimPath;
+
+    const mockedSpawn = vi.mocked(spawn);
+    let capturedCommand: string | undefined;
+    mockedSpawn.mockImplementationOnce((command, args) => {
+      capturedCommand = command;
+      return mockSpawnChild();
+    });
+
+    await runChildProcess(randomUUID(), EXECUTABLE, ['hello'], {
+      cwd: '/tmp',
+      env: {},
+      timeoutSec: 1,
+      graceSec: 0,
+      onLog: async () => {},
+    });
+
+    expect(capturedCommand).toBe(EXECUTABLE);
+  });
+
+  it('does not route through the shim when PAPERCLIP_AGENT_UID is empty string', async () => {
+    process.env.PAPERCLIP_AGENT_UID = '';
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = shimPath;
+
+    const mockedSpawn = vi.mocked(spawn);
+    let capturedCommand: string | undefined;
+    mockedSpawn.mockImplementationOnce((command, args) => {
+      capturedCommand = command;
+      return mockSpawnChild();
+    });
+
+    await runChildProcess(randomUUID(), EXECUTABLE, ['hello'], {
+      cwd: '/tmp',
+      env: {},
+      timeoutSec: 1,
+      graceSec: 0,
+      onLog: async () => {},
+    });
+
+    expect(capturedCommand).toBe(EXECUTABLE);
   });
 });
