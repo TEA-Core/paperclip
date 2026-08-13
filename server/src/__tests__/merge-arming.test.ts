@@ -13,7 +13,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { armMergeOnApproval, publishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
+import { armMergeOnApproval, publishApprovalStatus, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -1034,5 +1034,39 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       expect(result.message).toContain("TEA-Core/paperclip#2");
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("guard: shouldPublishApprovalStatus (SUP-12558)", () => {
+  it("approved decision on a review stage returns true", () => {
+    expect(
+      shouldPublishApprovalStatus({ stageId: "s", stageType: "review", outcome: "approved", body: "" }),
+    ).toBe(true);
+  });
+
+  it("approved decision on an approval stage returns true (pre-existing path)", () => {
+    expect(
+      shouldPublishApprovalStatus({ stageId: "s", stageType: "approval", outcome: "approved", body: "" }),
+    ).toBe(true);
+  });
+
+  it("changes_requested decision on a review stage returns false", () => {
+    expect(
+      shouldPublishApprovalStatus({ stageId: "s", stageType: "review", outcome: "changes_requested", body: "" }),
+    ).toBe(false);
+  });
+
+  it("rejected decision on a review stage returns false", () => {
+    expect(
+      shouldPublishApprovalStatus({ stageId: "s", stageType: "review", outcome: "rejected", body: "" }),
+    ).toBe(false);
+  });
+
+  it("null decision returns false", () => {
+    expect(shouldPublishApprovalStatus(null)).toBe(false);
+  });
+
+  it("undefined decision returns false", () => {
+    expect(shouldPublishApprovalStatus(undefined)).toBe(false);
   });
 });

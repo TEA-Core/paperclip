@@ -11,6 +11,12 @@ export interface MergeArmingDecision {
   body: string;
 }
 
+export function shouldPublishApprovalStatus<T extends Pick<MergeArmingDecision, "outcome">>(
+  decision: T | null | undefined,
+): decision is T {
+  return decision != null && decision.outcome === "approved";
+}
+
 export interface ArmingOutcome {
   kind: "armed" | "skipped" | "failed";
   message: string;

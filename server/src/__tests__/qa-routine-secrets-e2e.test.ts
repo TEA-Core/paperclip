@@ -52,10 +52,12 @@ describeEmbedded("PAP-9522 QA: routine secrets end-to-end", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const secretsTmpDir = path.join(os.tmpdir(), `paperclip-qa-routine-secrets-${randomUUID()}`);
   const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  const previousAllowKeyGeneration = process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
 
   beforeAll(async () => {
     mkdirSync(secretsTmpDir, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
+    process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = "1";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-qa-routine-secrets-");
     db = createDb(tempDb.connectionString);
   }, 30_000);
@@ -79,6 +81,8 @@ describeEmbedded("PAP-9522 QA: routine secrets end-to-end", () => {
     await tempDb?.cleanup();
     if (previousKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
     else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
+    if (previousAllowKeyGeneration === undefined) delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+    else process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = previousAllowKeyGeneration;
     rmSync(secretsTmpDir, { recursive: true, force: true });
   });
 

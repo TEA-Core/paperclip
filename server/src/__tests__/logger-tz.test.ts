@@ -43,6 +43,10 @@ vi.mock("pino-http", () => ({
 vi.mock("../config-file.js", () => ({
   readConfigFile: vi.fn(() => null),
 }));
+// Partial mock: the logger module transitively pulls in other home-paths
+// exports (e.g. resolveDefaultSecretsKeyFilePath via the shared-group
+// ownership guard), so keep the real implementations for everything we do
+// not explicitly override.
 vi.mock("../home-paths.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../home-paths.js")>();
   return {

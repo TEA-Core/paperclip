@@ -256,11 +256,13 @@ describeEmbeddedPostgres("prepareAgentDefaultsPayloadForJoinPersistence (hermes_
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
   const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  const previousAllowKeyGeneration = process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
   const secretsTmpDir = path.join(os.tmpdir(), `paperclip-hermes-join-defaults-${randomUUID()}`);
 
   beforeAll(async () => {
     mkdirSync(secretsTmpDir, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
+    process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = "1";
     const started = await startEmbeddedPostgresTestDatabase("hermes-join-defaults");
     stopDb = started.cleanup;
     db = createDb(started.connectionString);
@@ -281,6 +283,11 @@ describeEmbeddedPostgres("prepareAgentDefaultsPayloadForJoinPersistence (hermes_
       delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
     } else {
       process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
+    }
+    if (previousAllowKeyGeneration === undefined) {
+      delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+    } else {
+      process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = previousAllowKeyGeneration;
     }
     rmSync(secretsTmpDir, { recursive: true, force: true });
   });

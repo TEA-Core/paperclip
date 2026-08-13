@@ -126,6 +126,7 @@ import {
   armMergeOnApproval,
   publishApprovalStatus,
 } from "../services/index.js";
+import { shouldPublishApprovalStatus } from "../services/merge-arming.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
 import {
@@ -196,6 +197,7 @@ import {
 } from "../services/source-trust.js";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
+  assertIssueExecutionPolicySatisfiable,
   resolveCoreTrustPreset,
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
@@ -1908,14 +1910,19 @@ function queueResolvedInteractionContinuationWakeup(input: {
   newlyResolvedItemIds?: string[];
   idempotencyKey?: string | null;
 }) {
-  if (
-    input.interaction.continuationPolicy !== "wake_assignee"
-    && input.interaction.continuationPolicy !== "wake_assignee_on_accept"
-  ) return;
-  if (
-    input.interaction.continuationPolicy === "wake_assignee_on_accept"
-    && input.interaction.status !== "accepted"
-  ) return;
+  const isBoardApprovalReject =
+    input.interaction.kind === "request_board_approval"
+    && input.interaction.status === "rejected";
+  if (!isBoardApprovalReject) {
+    if (
+      input.interaction.continuationPolicy !== "wake_assignee"
+      && input.interaction.continuationPolicy !== "wake_assignee_on_accept"
+    ) return;
+    if (
+      input.interaction.continuationPolicy === "wake_assignee_on_accept"
+      && input.interaction.status !== "accepted"
+    ) return;
+  }
   if (input.interaction.status === "expired") return;
   if (isClosedIssueStatus(input.issue.status)) return;
   const wakeTargetAgentId = input.issue.assigneeAgentId ?? input.interaction.createdByAgentId ?? null;
@@ -7381,8 +7388,10 @@ export function issueRoutes(
     }
     await assertIssueEnvironmentSelection(companyId, createBody.executionWorkspaceSettings?.environmentId);
 
+    const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(createBody.executionPolicy);
+    assertIssueExecutionPolicySatisfiable({ companyId, executionPolicy: normalizedExecutionPolicy });
     const executionPolicy = applyActorMonitorScheduledBy(
-      normalizeIssueExecutionPolicy(createBody.executionPolicy),
+      normalizedExecutionPolicy,
       actor.actorType,
     );
     await assertCanManageIssueMonitor(access, req, companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
@@ -7582,8 +7591,10 @@ export function issueRoutes(
     const currentSerializedChild = serializationContext
       ? await findCurrentSerializedWatchdogChild(parent)
       : null;
+    const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(createBody.executionPolicy);
+    assertIssueExecutionPolicySatisfiable({ companyId: parent.companyId, executionPolicy: normalizedExecutionPolicy });
     const executionPolicy = applyActorMonitorScheduledBy(
-      normalizeIssueExecutionPolicy(createBody.executionPolicy),
+      normalizedExecutionPolicy,
       actor.actorType,
     );
     await assertCanManageIssueMonitor(access, req, parent.companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
@@ -7757,8 +7768,10 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const normalizedChildren = [];
     for (const child of requestedChildren) {
+      const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(child.executionPolicy);
+      assertIssueExecutionPolicySatisfiable({ companyId: sourceIssue.companyId, executionPolicy: normalizedExecutionPolicy });
       const executionPolicy = applyActorMonitorScheduledBy(
-        normalizeIssueExecutionPolicy(child.executionPolicy),
+        normalizedExecutionPolicy,
         actor.actorType,
       );
       await assertCanManageIssueMonitor(access, req, sourceIssue.companyId, child.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
@@ -8228,8 +8241,10 @@ export function issueRoutes(
       });
     }
     if (req.body.executionPolicy !== undefined) {
+      const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+      assertIssueExecutionPolicySatisfiable({ companyId: existing.companyId, executionPolicy: normalizedExecutionPolicy });
       updateFields.executionPolicy = applyActorMonitorScheduledBy(
-        normalizeIssueExecutionPolicy(req.body.executionPolicy),
+        normalizedExecutionPolicy,
         actor.actorType,
       );
     }
@@ -8477,7 +8492,7 @@ export function issueRoutes(
       return;
     }
 
-    if (transition.decision && transition.decision.outcome === "approved" && transition.decision.stageType === "approval") {
+    if (shouldPublishApprovalStatus(transition.decision)) {
       const issueIdentifier = `SUP-${issue.issueNumber}`;
       try {
         const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier);

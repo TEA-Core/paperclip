@@ -201,6 +201,55 @@ RUN mkdir -p /opt/blacksmith/bin \
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# Route M1 (SUP-12472 / SUP-12531): agent runtimes must land on a uid distinct
+# from the server's, so an agent cannot read PAPERCLIP_SECRETS_MASTER_KEY out of
+# /proc/<server-pid>/environ. The server runs at CapEff=0 and cannot change uid
+# itself, so the privilege has to be here.
+#
+# NOTE: this only creates the principal and the shim. Nothing spawns as
+# ${AGENT_UID} until SUP-12531 lands, and nothing chgrps to `agents` until
+# SUP-12530 lands, so shipping this alone is a no-op at runtime.
+#
+# Do NOT replace the shim with `chmod 4755` on gosu: gosu self-aborts when its
+# setuid bit is set (for root too), which would break `exec gosu node` in the
+# entrypoint and stop the container from starting. Do NOT use
+# `setcap cap_setuid+ep` on node either — that lets an agent setuid(0).
+ARG AGENT_UID=1001
+ARG AGENT_GID=1001
+ARG AGENTS_GID=1002
+# buildx injects these automatically. They let the exec probes below run only on
+# a native build: under binfmt/qemu emulation (BUILDPLATFORM != TARGETPLATFORM)
+# the kernel never honours the setuid bit, so the probes can never pass there.
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+COPY docker/agent-spawn-shim/spawn-agent.c /tmp/spawn-agent.c
+RUN groupadd -g ${AGENTS_GID} agents \
+  && groupadd -g ${AGENT_GID} node-agent \
+  && useradd -u ${AGENT_UID} -g ${AGENT_GID} -G agents -M -d /paperclip -s /usr/sbin/nologin node-agent \
+  # Both principals share `agents` so they can write the same worktrees; the
+  # server needs it to chgrp new checkouts (SUP-12530).
+  && usermod -aG agents node \
+  && gcc -O2 -Wall -Wextra -Werror \
+       -DAGENT_UID=${AGENT_UID} -DAGENT_GID=${AGENT_GID} -DAGENTS_GID=${AGENTS_GID} \
+       -o /usr/local/sbin/paperclip-spawn-agent /tmp/spawn-agent.c \
+  && rm -f /tmp/spawn-agent.c \
+  && chown root:root /usr/local/sbin/paperclip-spawn-agent \
+  && chmod 4755 /usr/local/sbin/paperclip-spawn-agent \
+  # Prove the drop works in the built image rather than at first agent run.
+  # A broken shim must fail the build, not present later as an agent fault.
+  # These probes can only pass on a native build: under binfmt/qemu emulation
+  # the setuid bit is never honoured (the non-setuid emulator is what execs),
+  # so the shim's euid!=0 refusal fires and the probe would fail forever. Gate
+  # them on BUILDPLATFORM == TARGETPLATFORM, and make a skipped probe
+  # unmistakable — it must never read as a passed one.
+  && if [ "${BUILDPLATFORM}" = "${TARGETPLATFORM}" ]; then \
+       [ "$(gosu node /usr/local/sbin/paperclip-spawn-agent id -u)" = "${AGENT_UID}" ] \
+       && gosu node /usr/local/sbin/paperclip-spawn-agent sh -c \
+            'cat /proc/1/environ >/dev/null 2>&1 && exit 1 || exit 0'; \
+     else \
+       echo "SKIP paperclip-spawn-agent exec probes: BUILDPLATFORM=${BUILDPLATFORM} != TARGETPLATFORM=${TARGETPLATFORM} (setuid bit is not honoured under binfmt emulation)"; \
+     fi
+
 ENV NODE_ENV=production \
   HOME=/paperclip \
   HOST=0.0.0.0 \

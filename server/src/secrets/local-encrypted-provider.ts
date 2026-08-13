@@ -91,6 +91,15 @@ function loadOrCreateMasterKey(): Buffer {
     return decoded;
   }
 
+  if (process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION !== "1") {
+    throw badRequest(
+      `No secrets master key found at ${keyPath} and PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION is not set to "1". ` +
+        `Refusing to auto-generate a master key to prevent silent data loss. ` +
+        `Set PAPERCLIP_SECRETS_MASTER_KEY or PAPERCLIP_SECRETS_MASTER_KEY_FILE to the existing key, ` +
+        `or set PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1 to allow one-time key generation.`,
+    );
+  }
+
   const dir = path.dirname(keyPath);
   mkdirSync(dir, { recursive: true });
   const generated = randomBytes(32);
@@ -164,16 +173,19 @@ async function inspectLocalEncryptedHealth(): Promise<SecretProviderHealthCheck>
     };
   }
   if (!existsSync(keyPath)) {
+    const allowKeyGeneration = process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION === "1";
     return {
       provider: "local_encrypted",
       status: "warn",
       message: `Secrets key file does not exist yet: ${keyPath}`,
-      warnings: ["The first managed secret write will create this key file with 0600 permissions."],
+      warnings: allowKeyGeneration
+        ? ["PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION is enabled; the first managed secret write will create this key file with 0600 permissions."]
+        : ["The key file does not exist and PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION is not set to \"1\"; managed secret writes will fail until a key is provided."],
       backupGuidance: [
         "Back up the key file together with database backups.",
         "The database alone cannot restore local encrypted secret values.",
       ],
-      details: { keySource: "file", keyFilePath: keyPath },
+      details: { keySource: "file", keyFilePath: keyPath, allowKeyGeneration },
     };
   }
 

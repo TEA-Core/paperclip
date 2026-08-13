@@ -145,5 +145,5 @@ export {
   type CodexAuthReconciliationSummary,
 } from "./codex-auth-reconciliation.js";
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
-export { armMergeOnApproval, publishApprovalStatus, type ArmingOutcome, type MergeArmingDecision } from "./merge-arming.js";
+export { armMergeOnApproval, publishApprovalStatus, shouldPublishApprovalStatus, type ArmingOutcome, type MergeArmingDecision } from "./merge-arming.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";
