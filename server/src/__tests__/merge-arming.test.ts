@@ -13,7 +13,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { armMergeOnApproval, publishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
+import { armMergeOnApproval, publishApprovalStatus, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -1037,179 +1037,36 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
   });
 });
 
-describe("guard: publishApprovalStatus fires on any approved decision (SUP-12558)", () => {
-  const REVIEW_DECISION: MergeArmingDecision = {
-    stageId: "review-stage-1",
-    stageType: "review",
-    outcome: "approved",
-    body: "Approved",
-  };
-
-  const APPROVAL_DECISION: MergeArmingDecision = {
-    stageId: "approval-stage-1",
-    stageType: "approval",
-    outcome: "approved",
-    body: "Approved",
-  };
-
-  const CHANGES_REQUESTED_REVIEW_DECISION: MergeArmingDecision = {
-    stageId: "review-stage-1",
-    stageType: "review",
-    outcome: "changes_requested",
-    body: "Please fix",
-  };
-
-  const REJECTED_REVIEW_DECISION: MergeArmingDecision = {
-    stageId: "review-stage-1",
-    stageType: "review",
-    outcome: "rejected",
-    body: "Rejected",
-  };
-
-  it("guard condition: approved decision on a review stage passes the outcome check", () => {
-    expect(REVIEW_DECISION.outcome).toBe("approved");
-    expect(REVIEW_DECISION.stageType).toBe("review");
+describe("guard: shouldPublishApprovalStatus (SUP-12558)", () => {
+  it("approved decision on a review stage returns true", () => {
+    expect(
+      shouldPublishApprovalStatus({ stageId: "s", stageType: "review", outcome: "approved", body: "" }),
+    ).toBe(true);
   });
 
-  it("guard condition: approved decision on an approval stage passes the outcome check (pre-existing path)", () => {
-    expect(APPROVAL_DECISION.outcome).toBe("approved");
-    expect(APPROVAL_DECISION.stageType).toBe("approval");
+  it("approved decision on an approval stage returns true (pre-existing path)", () => {
+    expect(
+      shouldPublishApprovalStatus({ stageId: "s", stageType: "approval", outcome: "approved", body: "" }),
+    ).toBe(true);
   });
 
-  it("guard condition: changes_requested decision on a review stage does NOT pass the outcome check", () => {
-    expect(CHANGES_REQUESTED_REVIEW_DECISION.outcome).not.toBe("approved");
-    expect(CHANGES_REQUESTED_REVIEW_DECISION.outcome).toBe("changes_requested");
-    expect(CHANGES_REQUESTED_REVIEW_DECISION.stageType).toBe("review");
+  it("changes_requested decision on a review stage returns false", () => {
+    expect(
+      shouldPublishApprovalStatus({ stageId: "s", stageType: "review", outcome: "changes_requested", body: "" }),
+    ).toBe(false);
   });
 
-  it("guard condition: rejected decision on a review stage does NOT pass the outcome check", () => {
-    expect(REJECTED_REVIEW_DECISION.outcome).not.toBe("approved");
-    expect(REJECTED_REVIEW_DECISION.outcome).toBe("rejected");
-    expect(REJECTED_REVIEW_DECISION.stageType).toBe("review");
+  it("rejected decision on a review stage returns false", () => {
+    expect(
+      shouldPublishApprovalStatus({ stageId: "s", stageType: "review", outcome: "rejected", body: "" }),
+    ).toBe(false);
   });
 
-  it("publishApprovalStatus does not depend on stageType (review stage approved decision publishes)", async () => {
-    const db = createDb("postgresql://dummy:dummy@localhost:5432/dummy");
-    const spy = vi.spyOn(db, "select").mockReturnValue({
-      from: () => ({
-        innerJoin: () => ({
-          where: () => ({
-            then: (onFulfilled: (rows: unknown[]) => unknown) =>
-              Promise.resolve([
-                {
-                  id: "pr-1",
-                  externalId: "TEA-Core/paperclip#pull/42",
-                  data: {
-                    state: "open",
-                    draft: false,
-                    node_id: NODE_ID,
-                    head: { ref: "SUP-12345-some-branch" },
-                  },
-                },
-              ]).then(onFulfilled),
-          }),
-        }),
-      }),
-    } as any);
-
-    mockGhFetch
-      .mockResolvedValueOnce(
-        createMockResponse({ head: { sha: "abc123def456789012345678901234567890abcd" }, html_url: "https://github.com/TEA-Core/paperclip/pull/42" }),
-      )
-      .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
-
-    const result = await publishApprovalStatus(db, "company-1", "issue-1", "SUP-12345");
-    expect(result.kind).toBe("armed");
-    expect(result.message).toContain("status:published");
-    expect(result.message).toContain("paperclip/approved");
-
-    spy.mockRestore();
+  it("null decision returns false", () => {
+    expect(shouldPublishApprovalStatus(null)).toBe(false);
   });
 
-  it("armMergeOnApproval accepts a review-stage decision (stageType is not discriminated in the service)", async () => {
-    const db = createDb("postgresql://dummy:dummy@localhost:5432/dummy");
-    const mockSelect = vi.spyOn(db, "select");
-    mockSelect.mockReturnValueOnce({
-      from: () => ({
-        innerJoin: () => ({
-          where: () => ({
-            then: (onFulfilled: (rows: unknown[]) => unknown) =>
-              Promise.resolve([
-                {
-                  id: "pr-1",
-                  externalId: "TEA-Core/paperclip#pull/42",
-                  data: {
-                    state: "open",
-                    draft: false,
-                    node_id: NODE_ID,
-                    head: { ref: "SUP-12345-some-branch" },
-                  },
-                },
-              ]).then(onFulfilled),
-          }),
-        }),
-      }),
-    } as any);
-    mockSelect.mockReturnValueOnce({
-      from: () => ({
-        where: () => ({
-          limit: () => ({
-            then: (onFulfilled: (rows: unknown[]) => unknown) =>
-              Promise.resolve([
-                {
-                  id: "issue-1",
-                  executionPolicy: { stages: [{ id: "review-stage-1" }] },
-                  executionState: {
-                    completedStageIds: ["review-stage-1"],
-                    lastDecisionOutcome: "approved",
-                  },
-                },
-              ]).then(onFulfilled),
-          }),
-        }),
-      }),
-    } as any);
-
-    mockGhFetch.mockResolvedValueOnce(
-      createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
-    );
-
-    const result = await armMergeOnApproval(db, "company-1", "issue-1", REVIEW_DECISION);
-    expect(["armed", "skipped", "failed"]).toContain(result.kind);
-    expect(result.message).not.toContain("stageType");
-
-    mockSelect.mockRestore();
-  });
-
-  it("publishApprovalStatus is called before armMergeOnApproval (ordering preserved)", async () => {
-    const publishSpy = vi.fn().mockResolvedValue({
-      kind: "armed" as const,
-      message: "status:published: paperclip/approved status written",
-    });
-    const armSpy = vi.fn().mockResolvedValue({
-      kind: "armed" as const,
-      message: "armed: Auto-merge enabled",
-    });
-
-    await publishSpy({} as any, "company-1", "issue-1", "SUP-12345");
-    await armSpy({} as any, "company-1", "issue-1", REVIEW_DECISION);
-
-    expect(publishSpy).toHaveBeenCalledBefore(armSpy);
-  });
-
-  it("armMergeOnApproval is NOT called when mergeArmingEnabled is false (publish still fires)", async () => {
-    const publishSpy = vi.fn().mockResolvedValue({
-      kind: "armed" as const,
-      message: "status:published: paperclip/approved status written",
-    });
-    const armSpy = vi.fn().mockResolvedValue({
-      kind: "armed" as const,
-      message: "armed: Auto-merge enabled",
-    });
-
-    await publishSpy({} as any, "company-1", "issue-1", "SUP-12345");
-
-    expect(publishSpy).toHaveBeenCalledTimes(1);
-    expect(armSpy).not.toHaveBeenCalled();
+  it("undefined decision returns false", () => {
+    expect(shouldPublishApprovalStatus(undefined)).toBe(false);
   });
 });
