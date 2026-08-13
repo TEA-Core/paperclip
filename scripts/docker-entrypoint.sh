@@ -15,6 +15,7 @@ if [ "$(id -u)" -ne 0 ]; then
     if [ "$(id -u)" -ne "$PUID" ] || [ "$(id -g)" -ne "$PGID" ]; then
         echo "docker-entrypoint.sh: running unprivileged as $(id -u):$(id -g); cannot remap to requested ${PUID}:${PGID}" >&2
     fi
+    umask 002
     exec "$@"
 fi
 
@@ -65,4 +66,5 @@ if [ -d "$MCP_PREFIX/lib/node_modules/@paperclipai/mcp-server" ]; then
     ' -- "$MCP_PREFIX" "$NPM_GLOBAL"
 fi
 
+umask 002
 exec gosu node "$@"
