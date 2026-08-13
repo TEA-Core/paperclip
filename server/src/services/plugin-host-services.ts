@@ -67,6 +67,7 @@ import { logActivity } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { lookup as dnsLookup } from "node:dns/promises";
+import { assertIssueExecutionPolicySatisfiable } from "./trust-preset-resolver.js";
 import type { IncomingMessage, RequestOptions as HttpRequestOptions } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -2532,6 +2533,7 @@ export function buildHostServices(
             : {};
           if (policy) executionPolicy.authorizationPolicy = policy;
           else delete executionPolicy.authorizationPolicy;
+          assertIssueExecutionPolicySatisfiable({ companyId, executionPolicy });
           await db
             .update(issuesTable)
             .set({ executionPolicy, updatedAt: new Date() })
