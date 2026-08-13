@@ -113,9 +113,30 @@ Also withdrawn, pre-emptively: **file capabilities on the `node` binary** (`setc
 
 **Binding on whichever is chosen: the target uid is hardcoded to 1001 and never taken from the caller.** A helper that accepts a uid parameter lets an agent ask for `0` — the same failure class `gosu` refuses to participate in, and it would green M1 while leaving the property open.
 
+#### DECIDED 2026-08-13 — prerequisite 2 is **2a**; 2b withdrawn
+
+The operator accepted **2a** and withdrew the "no setuid spawn helper is sound" framing that the `gosu` withdrawal had been over-generalised into: `gosu` self-refuses *by its own design choice*, which says nothing about a purpose-built helper. 2b is strictly larger for an identical outcome — a permanent privileged process plus an IPC surface that must be designed, authenticated and then defended indefinitely, versus 2a's privilege window that exists only between `exec` and the drop.
+
+**Independently re-derived, not accepted on spec.** The operator compiled the spec verbatim (`setgid(1001); setuid(1001); execvp(...)`), installed it `4755 root:root`, and ran it from uid 1000 in a throwaway container off the deployed image:
+
+| | Uid | Gid | Groups |
+|---|---|---|---|
+| caller (uid 1000) | `1000 1000 1000 1000` | `1000 1000 1000 1000` | `1002` |
+| child via shim | `1001 1001 1001 1001` | `1001 1001 1001 1001` | `1002` |
+
+- **Supplementary-group leakage — measured absent, objection withdrawn.** `setgid(1001)` replaces the primary gid and the only supplementary group carried through is `agents` (1002), which is the intended end state. No `1000` retention.
+- **Unchecked credential-change returns — a real omission, but not a demonstrated hole here.** The spec ignores `setgid`/`setuid` return values and `execvp` runs regardless; if the drop failed, the payload would execute at euid 0 (`setuid(2)` documents `EAGAIN` under `RLIMIT_NPROC`, the historical vector). The operator tried to trigger it under `ulimit -u 1` and **could not** — a privileged caller is not subject to that limit here, the call returned 0 and landed at uid 1001. Recorded as **hardening**, not as an exploitable finding on this container.
+
+**Binding shim requirements (all three are acceptance-bearing on [SUP-12531](/SUP/issues/SUP-12531)):**
+1. **Check every credential-change return and abort before `execvp` on any failure.** Never exec after a failed drop. Same family as the `PAPERCLIP_AGENT_UID` fail-loudly gate.
+2. **Call `setgroups()` explicitly to a fixed set** rather than inheriting the caller's. Correct today only *by inheritance* — it silently becomes wrong the day a supplementary group is added to the server user, and nothing fails visibly when it does.
+3. **Assert at startup that the shim's filesystem is not `nosuid`, and fail loudly if it is.** No `nosuid` on `/` or `/paperclip` today (measured, M1.1), but that is a compose-level property; a future mount option would disable the shim in a way that presents as an *agent* fault — this chain's signature failure mode.
+
+**Consequence for sequencing:** Phase A is no longer a pure image tweak. It now carries ~30 LOC of new privileged C that wants review in its own right, and SUP-12531 stays blocked on the shim existing.
+
 **What has to change to reach the target shape (server stays unprivileged, agents run as 1001):**
 1. `Dockerfile`: create `node-agent` (uid/gid 1001) + a shared group.
-2. Provide a root/setuid spawn path: option **2a** (setuid-root exec shim, hardcoded uid 1001 — recommended) or **2b** (root supervisor). (The server at `CapEff=0` cannot do it directly.)
+2. Provide a root/setuid spawn path: option **2a** (setuid-root exec shim, hardcoded uid 1001) — **decided 2026-08-13**, 2b withdrawn. (The server at `CapEff=0` cannot do it directly.)
 3. `scripts/docker-entrypoint.sh`/compose: wire the agent-spawn path through that shim/supervisor.
 
 ### M1.3 — ownership blast radius (the deciding cost)
@@ -222,7 +243,7 @@ The deployed environment is a **single Docker container** (`pid 1 = /sbin/docker
 
 **Operator-side (image/compose/restart) — the board ask fires on this split:**
 1. `Dockerfile`: add `node-agent` (uid/gid **1001**) and a shared `agents` group (1001 + 1000).
-2. Provide the spawn path: ship a **purpose-built setuid-root exec shim with uid 1001 hardcoded** (option 2a, recommended), or run a root supervisor in `docker-entrypoint.sh` that launches agents as 1001 (option 2b). **NOT `gosu` 4755** — withdrawn 2026-08-13, it self-aborts and bricks startup; see M1.2.
+2. Provide the spawn path: ship a **purpose-built setuid-root exec shim with uid 1001 hardcoded** — **option 2a, DECIDED 2026-08-13** (2b withdrawn as strictly larger; **NOT `gosu` 4755** — withdrawn same day, it self-aborts and bricks startup). The shim must check every credential-change return and abort before `execvp`, call `setgroups()` to a fixed set, and assert its filesystem is not `nosuid` at startup. See M1.2. ~30 LOC of privileged C — review it as code, not as a Dockerfile line.
 3. One-time ownership pass: `chgrp -R agents` over the ~969 existing worktree roots + the ~6 fixed cache/config dirs (M1.3) — or defer to per-checkout `chown` in the server.
 
 **Agent-side (repo diff — coder-LE):**
