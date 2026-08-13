@@ -2177,6 +2177,16 @@ function resolveWindowsCmdShell(env: NodeJS.ProcessEnv): string {
   return path.join(fallbackRoot, "System32", "cmd.exe");
 }
 
+const DEFAULT_AGENT_SPAWN_SHIM = "/usr/local/sbin/paperclip-spawn-agent";
+
+function resolveAgentSpawnShimPath(): string {
+  return process.env.PAPERCLIP_AGENT_SPAWN_SHIM?.trim() || DEFAULT_AGENT_SPAWN_SHIM;
+}
+
+function agentUidGateArmed(): boolean {
+  return process.env.PAPERCLIP_AGENT_UID !== undefined && process.env.PAPERCLIP_AGENT_UID !== "";
+}
+
 async function resolveSpawnTarget(
   command: string,
   args: string[],
@@ -2234,6 +2244,17 @@ async function resolveSpawnTarget(
   }
 
   if (process.platform !== "win32") {
+    if (agentUidGateArmed()) {
+      const shimPath = resolveAgentSpawnShimPath();
+      if (!(await pathExists(shimPath))) {
+        throw new Error(
+          `PAPERCLIP_AGENT_UID is set but the setuid spawn shim is not executable at "${shimPath}". ` +
+            "Agent runs would land at uid 1000, reopening the master-key exposure. " +
+            "Install the shim or unset PAPERCLIP_AGENT_UID.",
+        );
+      }
+      return { command: shimPath, args: [executable, ...args] };
+    }
     return { command: executable, args };
   }
 
