@@ -2223,6 +2223,14 @@ async function resolveSpawnTarget(
   const resolved = await resolveCommandPath(command, cwd, env);
   const executable = resolved ?? command;
 
+  if (agentUidGateArmed() && options.localProcessSandbox) {
+    throw new Error(
+      `PAPERCLIP_AGENT_UID is set but the local process sandbox (bwrap) was requested — ` +
+        "the sandbox bypasses the uid gate and would land the child at uid 1000, " +
+        "reopening the master-key exposure. Unset PAPERCLIP_AGENT_UID or remove localProcessSandbox.",
+    );
+  }
+
   if (options.localProcessSandbox) {
     if (!resolved) {
       throw new Error(`Command not found in PATH: "${command}"`);
