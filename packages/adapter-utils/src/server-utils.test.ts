@@ -2522,6 +2522,7 @@ describe('sanitizeInheritedPaperclipEnv', () => {
 describe('resolveSpawnTarget setuid shim routing (SUP-12674)', () => {
   const EXECUTABLE = process.execPath;
   const ORIGINAL_ENV = { ...process.env };
+  const cleanup: string[] = [];
 
   let shimPath: string;
 
@@ -2554,6 +2555,7 @@ describe('resolveSpawnTarget setuid shim routing (SUP-12674)', () => {
     } catch {
       // ignore
     }
+    await Promise.all(cleanup.splice(0).map((candidate) => fs.rm(candidate, { recursive: true, force: true })));
   });
 
   it('routes through the shim (argv-only) when PAPERCLIP_AGENT_UID is set and shim exists', async () => {
@@ -2668,5 +2670,63 @@ describe('resolveSpawnTarget setuid shim routing (SUP-12674)', () => {
     });
 
     expect(capturedCommand).toBe(EXECUTABLE);
+  });
+
+  it('throws (no spawn) when PAPERCLIP_AGENT_UID is set and localProcessSandbox is requested', async () => {
+    process.env.PAPERCLIP_AGENT_UID = '1001';
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = shimPath;
+
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'paperclip-sandbox-uid-gate-'));
+    cleanup.push(workspace);
+
+    const mockedSpawn = vi.mocked(spawn);
+
+    await expect(
+      runChildProcess(randomUUID(), EXECUTABLE, ['hello'], {
+        cwd: workspace,
+        env: {},
+        timeoutSec: 1,
+        graceSec: 0,
+        onLog: async () => {},
+        localProcessSandbox: {
+          workspaceDir: workspace,
+          filesystemScope: 'workspace',
+          command: 'bwrap',
+        },
+      }),
+    ).rejects.toThrow(/PAPERCLIP_AGENT_UID is set but the local process sandbox/);
+
+    expect(mockedSpawn).not.toHaveBeenCalled();
+  });
+
+  it('still returns the bwrap sandbox target when PAPERCLIP_AGENT_UID is unset and localProcessSandbox is requested', async () => {
+    delete process.env.PAPERCLIP_AGENT_UID;
+
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'paperclip-sandbox-uid-unset-'));
+    cleanup.push(workspace);
+    const bwrapPath = path.join(workspace, 'bwrap');
+    await fs.writeFile(bwrapPath, '#!/bin/sh\n', { mode: 0o755 });
+
+    const mockedSpawn = vi.mocked(spawn);
+    let capturedCommand: string | undefined;
+    mockedSpawn.mockImplementationOnce((command, args) => {
+      capturedCommand = command;
+      return mockSpawnChild();
+    });
+
+    await runChildProcess(randomUUID(), EXECUTABLE, ['hello'], {
+      cwd: workspace,
+      env: {},
+      timeoutSec: 1,
+      graceSec: 0,
+      onLog: async () => {},
+      localProcessSandbox: {
+        workspaceDir: workspace,
+        filesystemScope: 'workspace',
+        command: bwrapPath,
+      },
+    });
+
+    expect(capturedCommand).toBe(bwrapPath);
   });
 });
