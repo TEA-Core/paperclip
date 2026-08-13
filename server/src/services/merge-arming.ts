@@ -11,9 +11,9 @@ export interface MergeArmingDecision {
   body: string;
 }
 
-export function shouldPublishApprovalStatus(
-  decision: Pick<MergeArmingDecision, "outcome"> | null | undefined,
-): boolean {
+export function shouldPublishApprovalStatus<T extends Pick<MergeArmingDecision, "outcome">>(
+  decision: T | null | undefined,
+): decision is T {
   return decision != null && decision.outcome === "approved";
 }
 
