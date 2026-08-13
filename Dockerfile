@@ -217,6 +217,11 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ARG AGENT_UID=1001
 ARG AGENT_GID=1001
 ARG AGENTS_GID=1002
+# buildx injects these automatically. They let the exec probes below run only on
+# a native build: under binfmt/qemu emulation (BUILDPLATFORM != TARGETPLATFORM)
+# the kernel never honours the setuid bit, so the probes can never pass there.
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
 COPY docker/agent-spawn-shim/spawn-agent.c /tmp/spawn-agent.c
 RUN groupadd -g ${AGENTS_GID} agents \
   && groupadd -g ${AGENT_GID} node-agent \
@@ -232,9 +237,18 @@ RUN groupadd -g ${AGENTS_GID} agents \
   && chmod 4755 /usr/local/sbin/paperclip-spawn-agent \
   # Prove the drop works in the built image rather than at first agent run.
   # A broken shim must fail the build, not present later as an agent fault.
-  && [ "$(gosu node /usr/local/sbin/paperclip-spawn-agent id -u)" = "${AGENT_UID}" ] \
-  && gosu node /usr/local/sbin/paperclip-spawn-agent sh -c \
-       'cat /proc/1/environ >/dev/null 2>&1 && exit 1 || exit 0'
+  # These probes can only pass on a native build: under binfmt/qemu emulation
+  # the setuid bit is never honoured (the non-setuid emulator is what execs),
+  # so the shim's euid!=0 refusal fires and the probe would fail forever. Gate
+  # them on BUILDPLATFORM == TARGETPLATFORM, and make a skipped probe
+  # unmistakable — it must never read as a passed one.
+  && if [ "${BUILDPLATFORM}" = "${TARGETPLATFORM}" ]; then \
+       [ "$(gosu node /usr/local/sbin/paperclip-spawn-agent id -u)" = "${AGENT_UID}" ] \
+       && gosu node /usr/local/sbin/paperclip-spawn-agent sh -c \
+            'cat /proc/1/environ >/dev/null 2>&1 && exit 1 || exit 0'; \
+     else \
+       echo "SKIP paperclip-spawn-agent exec probes: BUILDPLATFORM=${BUILDPLATFORM} != TARGETPLATFORM=${TARGETPLATFORM} (setuid bit is not honoured under binfmt emulation)"; \
+     fi
 
 ENV NODE_ENV=production \
   HOME=/paperclip \
