@@ -8103,6 +8103,7 @@ export function issueRoutes(
       resume: resumeRequested,
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
+      doneTransitionOverride: _doneTransitionOverride,
       ...updateFields
     } = req.body;
     const shouldCancelActiveRunForCancelledStatus =
@@ -8460,7 +8461,7 @@ export function issueRoutes(
     }
 
     const requestedStatus = typeof updateFields.status === "string" ? updateFields.status : undefined;
-    const isDoneRequest = requestedStatus === "done" && existing.status !== "done";
+    const isDoneRequest = requestedStatus === "done" && existing.status !== "done" && !transition.decision;
     if (isDoneRequest) {
       const override: DoneTransitionOverride | null =
         req.body.doneTransitionOverride && typeof req.body.doneTransitionOverride === "object"

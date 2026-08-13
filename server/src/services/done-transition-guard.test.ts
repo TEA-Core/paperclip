@@ -311,7 +311,7 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
-  describe("PR #3065 shape (squash-merged, ahead_by: 1)", () => {
+  describe("PR #221 shape (squash-merged, ahead_by: 1)", () => {
     it("allows transition for a squash-merged branch reporting ahead_by: 1", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow()],
