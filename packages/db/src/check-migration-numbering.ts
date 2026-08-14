@@ -4,10 +4,24 @@ import { fileURLToPath } from "node:url";
 const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 const journalPath = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
 
+/**
+ * `when` monotonicity is enforced from this entry onward, not over the whole
+ * journal. The history before it carries 45 inversions inherited from upstream
+ * — drizzle-kit stamps `when` with `Date.now()` at generate time, so any two
+ * migrations authored out of merge order invert — and re-stamping them would
+ * rewrite migrations every database in existence has already applied, for no
+ * behavioural gain.
+ *
+ * This is the fold branch's tip migration as of 2026-08-14. Everything from
+ * here on is fork-controlled or fold-restamped, so it can and must be clean.
+ */
+const MIGRATION_WHEN_MONOTONIC_BASELINE_TAG = "0189_merge_arming_enabled";
+
 type JournalFile = {
   entries?: Array<{
     idx?: number;
     tag?: string;
+    when?: number;
   }>;
 };
 
@@ -40,6 +54,68 @@ function ensureStrictlyOrdered(values: string[], label: string) {
         `${label} are out of order at position ${index}: expected ${sorted[index]}, found ${values[index]}`,
       );
     }
+  }
+}
+
+/**
+ * `when` must increase strictly down the journal, in the same order as the
+ * filenames.
+ *
+ * drizzle's migrator does NOT dedupe per migration hash. It reads the single
+ * newest `created_at` from `drizzle.__drizzle_migrations` and runs only the
+ * migrations whose `when` is strictly greater than it
+ * (drizzle-orm/pg-core/dialect.js). So `when` is a global apply watermark, not
+ * a timestamp, and any entry that sorts after an applied migration but carries
+ * a lower `when` is skipped in silence — no error, no log line, just a schema
+ * that is missing it.
+ *
+ * That is not hypothetical here. On 2026-08-14 this fork's newest migration sat
+ * at when=1785930047830 while 24 pending upstream migrations sat below it,
+ * because the fork mints `when` at authoring time and upstream commits are
+ * folded in later than they were written. Folding them without a re-stamp would
+ * have skipped every one, and PAPERCLIP_MIGRATION_AUTO_APPLY=true means the
+ * container would have come up on the wrong schema and failed at first query.
+ *
+ * Keeping `when` monotonic in filename order collapses the two orderings into
+ * one, so the array order a reader sees IS the order the migrator uses.
+ * `fold-restamp-migrations.ts` is what re-establishes this after a fold.
+ */
+function ensureMonotonicWhen(entries: Array<{ tag?: string; when?: number }>) {
+  let runningMax = Number.NEGATIVE_INFINITY;
+  let runningMaxTag = "";
+  let enforcing = false;
+
+  for (const [index, entry] of entries.entries()) {
+    const when = entry.when;
+    const tag = entry.tag ?? `#${index}`;
+    if (typeof when !== "number" || !Number.isFinite(when)) {
+      throw new Error(`Migration journal entry ${tag} is missing a numeric "when"`);
+    }
+
+    if (enforcing && when <= runningMax) {
+      throw new Error(
+        `Migration journal "when" must exceed every entry before it: ${tag} has ${when}, `
+          + `but ${runningMaxTag} earlier in the journal has ${runningMax}. drizzle applies `
+          + `only migrations above the newest applied "when", so ${tag} would be SKIPPED `
+          + `silently on any database that already ran ${runningMaxTag}. `
+          + `Re-stamp with: pnpm --filter @paperclipai/db exec tsx src/fold-restamp-migrations.ts`,
+      );
+    }
+
+    if (when > runningMax) {
+      runningMax = when;
+      runningMaxTag = tag;
+    }
+    if (tag === MIGRATION_WHEN_MONOTONIC_BASELINE_TAG) enforcing = true;
+  }
+
+  if (!enforcing) {
+    throw new Error(
+      `Migration journal is missing the "when" monotonicity baseline `
+        + `${MIGRATION_WHEN_MONOTONIC_BASELINE_TAG}. If that migration was intentionally `
+        + `removed, move the baseline in check-migration-numbering.ts to the last entry `
+        + `that predates it.`,
+    );
   }
 }
 
@@ -84,6 +160,7 @@ async function main() {
   ensureNoDuplicates(journalTags, "migration journal");
   ensureStrictlyOrdered(journalTags, "migration journal");
   ensureJournalMatchesFiles(migrationFiles, journalTags);
+  ensureMonotonicWhen(journal.entries ?? []);
 }
 
 await main();
