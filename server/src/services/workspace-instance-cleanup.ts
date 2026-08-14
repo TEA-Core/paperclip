@@ -12,6 +12,7 @@ import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 const execFileAsync = promisify(execFile);
 const INSTANCE_ID_RE = /^[A-Za-z0-9_-]+$/;
 const POSTGRES_STOP_TIMEOUT_MS = 10_000;
+export const WORKTREE_INSTANCE_ROOT_METADATA_KEY = "worktreeInstanceRoot";
 
 export function deriveWorktreeInstanceId(workspacePath: string): string {
   const resolvedWorkspacePath = path.resolve(workspacePath);
@@ -173,8 +174,8 @@ export async function readWorktreeInstancePointer(workspacePath: string): Promis
   }
 }
 
-function resolveConfiguredInstanceRoot(pointer: WorktreeInstancePointer, expectedInstanceId: string):
-  | { instanceRoot: string }
+function resolveConfiguredInstanceRoot(pointer: WorktreeInstancePointer, expectedInstanceId?: string):
+  | { instanceRoot: string; instanceId: string }
   | { warning: string; instanceRoot: string | null; refusalReason: string | null } {
   const env = parseEnvContents(pointer.envContents);
   const configuredHome = env.PAPERCLIP_HOME?.trim();
@@ -199,14 +200,45 @@ function resolveConfiguredInstanceRoot(pointer: WorktreeInstancePointer, expecte
     };
   }
   const instanceRoot = path.resolve(expandedHome, "instances", instanceId);
-  if (instanceId !== expectedInstanceId) {
+  if (expectedInstanceId && instanceId !== expectedInstanceId) {
     return {
       instanceRoot,
       warning: `Refusing worktree instance cleanup from ${pointer.envPath}: PAPERCLIP_INSTANCE_ID "${instanceId}" does not match the expected workspace instance "${expectedInstanceId}".`,
       refusalReason: "instance_id_mismatch",
     };
   }
-  return { instanceRoot };
+  return { instanceRoot, instanceId };
+}
+
+function resolveManagedInstancesDir(worktreesDir?: string): string {
+  const managedWorktreesDir = path.resolve(
+    expandHomePrefix(
+      worktreesDir?.trim()
+      || process.env.PAPERCLIP_WORKTREES_DIR?.trim()
+      || path.join(os.homedir(), ".paperclip-worktrees"),
+    ),
+  );
+  return path.join(managedWorktreesDir, "instances");
+}
+
+export async function readManagedWorktreeInstanceOwnership(
+  workspacePath: string,
+  worktreesDir?: string,
+): Promise<{ instanceRoot: string; instanceId: string } | null> {
+  const pointer = await readWorktreeInstancePointer(workspacePath);
+  if (!pointer) return null;
+  const configured = resolveConfiguredInstanceRoot(pointer);
+  if ("warning" in configured) {
+    if (!configured.warning) return null;
+    throw new Error(configured.warning);
+  }
+  const managedInstancesDir = resolveManagedInstancesDir(worktreesDir);
+  if (!isStrictChildPath(configured.instanceRoot, managedInstancesDir)) {
+    throw new Error(
+      `Refusing to record worktree instance ownership for "${configured.instanceRoot}" because it is outside "${managedInstancesDir}".`,
+    );
+  }
+  return configured;
 }
 
 export async function cleanupWorktreeInstanceArtifacts(input: {
@@ -214,6 +246,7 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   workspaceId: string;
   workspacePath: string;
   expectedInstanceId: string;
+  expectedInstanceRoot: string | null;
   recorder?: WorkspaceOperationRecorder | null;
   worktreesDir?: string;
   dependencies?: WorktreeInstanceCleanupDependencies;
@@ -221,14 +254,13 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   const configured = resolveConfiguredInstanceRoot(input.pointer, input.expectedInstanceId);
   if ("warning" in configured && !configured.warning) return { status: "not_configured" };
 
-  const managedWorktreesDir = path.resolve(
-    expandHomePrefix(input.worktreesDir?.trim() || process.env.PAPERCLIP_WORKTREES_DIR?.trim() || path.join(os.homedir(), ".paperclip-worktrees")),
-  );
-  const managedInstancesDir = path.join(managedWorktreesDir, "instances");
+  const managedInstancesDir = resolveManagedInstancesDir(input.worktreesDir);
+  const managedWorktreesDir = path.dirname(managedInstancesDir);
+  const configuredInstanceRoot = configured.instanceRoot;
+  let warning = "warning" in configured ? configured.warning : "";
   const recordRefusal = async (
-    instanceRoot: string | null,
-    refusalWarning: string,
     metadata: Record<string, unknown>,
+    refusalWarning = warning,
   ) => {
     if (!input.recorder) return;
     await input.recorder.recordOperation({
@@ -237,7 +269,7 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
       metadata: {
         workspaceId: input.workspaceId,
         workspacePath: input.workspacePath,
-        instanceRoot,
+        instanceRoot: configuredInstanceRoot,
         managedInstancesDir,
         cleanupAction: "remove_worktree_instance",
         ...metadata,
@@ -247,16 +279,25 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   };
 
   if ("warning" in configured) {
-    await recordRefusal(configured.instanceRoot, configured.warning, { refusalReason: configured.refusalReason });
+    await recordRefusal({ refusalReason: configured.refusalReason }, configured.warning);
     return { status: "refused", instanceRoot: configured.instanceRoot, warning: configured.warning };
   }
 
-  const configuredInstanceRoot = configured.instanceRoot;
-  let warning = "";
+  if (!configuredInstanceRoot || !isStrictChildPath(configuredInstanceRoot, managedInstancesDir)) {
+    warning ||= `Refusing to remove instance directory "${configuredInstanceRoot ?? "unknown"}" because it is outside "${managedInstancesDir}".`;
+    await recordRefusal({ refusalReason: "outside_managed_instances_dir" });
+    return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
+  }
 
-  if (!isStrictChildPath(configuredInstanceRoot, managedInstancesDir)) {
-    warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because it is outside "${managedInstancesDir}".`;
-    await recordRefusal(configuredInstanceRoot, warning, { refusalReason: "outside_managed_instances_dir" });
+  const expectedInstanceRoot = input.expectedInstanceRoot
+    ? path.resolve(input.expectedInstanceRoot)
+    : null;
+  if (expectedInstanceRoot && configuredInstanceRoot !== expectedInstanceRoot) {
+    warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because it does not match execution workspace ${input.workspaceId}'s persisted instance root "${expectedInstanceRoot}".`;
+    await recordRefusal({
+      expectedInstanceRoot,
+      refusalReason: "instance_root_workspace_mismatch",
+    });
     return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
   }
 
@@ -269,19 +310,19 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   let canonicalInstanceRoot: string;
   try {
     [canonicalManagedWorktreesDir, canonicalManagedInstancesDir, canonicalInstanceRoot] = await Promise.all([
-      fs.realpath(managedWorktreesDir, { encoding: "utf8" }),
-      fs.realpath(managedInstancesDir, { encoding: "utf8" }),
-      fs.realpath(configuredInstanceRoot, { encoding: "utf8" }),
+      fs.realpath(managedWorktreesDir),
+      fs.realpath(managedInstancesDir),
+      fs.realpath(configuredInstanceRoot),
     ]);
   } catch (error) {
     warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because its canonical path could not be verified: ${error instanceof Error ? error.message : String(error)}`;
-    await recordRefusal(configuredInstanceRoot, warning, { refusalReason: "canonical_path_unavailable" });
+    await recordRefusal({ refusalReason: "canonical_path_unavailable" });
     return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
   }
 
   if (canonicalManagedInstancesDir !== path.join(canonicalManagedWorktreesDir, "instances")) {
     warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because the managed instances directory resolves outside "${canonicalManagedWorktreesDir}".`;
-    await recordRefusal(configuredInstanceRoot, warning, {
+    await recordRefusal({
       canonicalInstanceRoot,
       canonicalManagedInstancesDir,
       refusalReason: "managed_instances_dir_symlink",
@@ -291,7 +332,7 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
 
   if (!isStrictChildPath(canonicalInstanceRoot, canonicalManagedInstancesDir)) {
     warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because its canonical path "${canonicalInstanceRoot}" is outside "${canonicalManagedInstancesDir}".`;
-    await recordRefusal(configuredInstanceRoot, warning, {
+    await recordRefusal({
       canonicalInstanceRoot,
       canonicalManagedInstancesDir,
       refusalReason: "canonical_path_outside_managed_instances_dir",
@@ -304,8 +345,8 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   const cleanup = async () => {
     postgresStopped = await dependencies.stopEmbeddedPostgres(path.join(canonicalInstanceRoot, "db"));
     const [currentManagedInstancesDir, currentInstanceRoot] = await Promise.all([
-      fs.realpath(managedInstancesDir, { encoding: "utf8" }),
-      fs.realpath(configuredInstanceRoot, { encoding: "utf8" }),
+      fs.realpath(managedInstancesDir),
+      fs.realpath(configuredInstanceRoot),
     ]);
     if (
       currentManagedInstancesDir !== canonicalManagedInstancesDir

@@ -461,6 +461,8 @@ Decision-desk triage uses company-scoped sidecars rather than adding queue field
 - `decision_queue_items` keys membership by `(queue_id, source_kind, source_id)` and repeats `company_id` for company-consistent joins.
 - `decision_triage` keys current decide-by/snooze state by `(company_id, source_kind, source_id)` and preserves the latest setter attribution.
 - `decision_triage_events` is the immutable mutation history for queue membership and triage overrides, including actor, run, API-key, and responsible-user provenance.
+- `decision_retention` stores the attention source's last observed activity timestamp, monotonic version, Keep flag, and reversible archive provenance. Queue `retention_days` overrides use the shortest assigned queue threshold; otherwise the shelf threshold is 30 days.
+- `decision_archive_notification_outbox` records one retry-safe origin-agent notification per source/archive version. The 90-day internal sweeper archives only unkept rows and coalesces delivery per origin agent.
 - Queue membership never grants source visibility. Item writes re-authorize the referenced source, and queue reads re-authorize every member before returning rows or counts.
 
 ## 8. State Machines
@@ -529,8 +531,9 @@ Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and
 - Bearer API key mapped to one agent and company
 - Agent key scope:
   - read org/task/company context for own company
-  - read/write own assigned tasks and comments
-  - create tasks/comments for delegation
+  - read company-visible tasks and comments
+  - comment on and update visible tasks under the shared write rule
+  - create child tasks and assign visible work for delegation under the same rule
   - report heartbeat status
   - report cost events
 - Agent cannot:
@@ -554,6 +557,40 @@ Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and
 | Manage responsible user's inbox state | yes | yes (default-open policy) |
 | Manage another user's inbox state | yes | scoped `inbox:manage` grant |
 | Set work-object visibility (issue/project) | no | no (pro gate) |
+
+### 9.3.1 Shared default-open issue writes
+
+For standard-trust agents, issue comments, issue field/status updates, child
+creation under a parent, and assignment share one authorization rule: the
+target issue must be visible to the agent and the responsible user represented
+by the run must also be authorized. In V1, issue visibility defaults to the
+whole company, so these writes are company-wide by default.
+
+The shared rule does not widen low-trust, `skill_test`, or `task_bridge` key
+scopes. It also does not replace run-lifecycle controls: checkout ownership,
+active-run conflicts, status-transition validation, interaction ownership,
+budget gates, and pause gates remain independently enforced. Comment access is
+structurally downstream of issue read access (`issue:comment` is a subset of
+`issue:read`).
+
+Cross-issue writes are contained per heartbeat run. An agent-authored comment
+may wake the target assignee, including an explicit `resume: true` comment on a
+`done` or `cancelled` issue, but the wake remains agent-class and is subject to
+the normal agent rewake throttle; comment presentation cannot give it human
+wake privileges. Agent issue comments and updates require a persisted heartbeat
+run bound to the authenticated agent and company; missing, invalid, or mismatched
+run context fails closed before mutation. A run may attempt at most 20 cross-issue comments or issue
+updates across the shared counter. The server records each attempt with its
+source issue, target issue, run, count, and rollout mode, and fails closed with
+the cap in the error once enforcement is active. Assignee self-comments do not
+wake the assignee, and a non-assignee comment cannot mint a mention grant.
+
+Agent-authored issue comments persist the responsible user derived from the
+authenticated actor; clients cannot choose that attribution. Each comment also
+records the write-policy reason, and spoof attempts fail with an audited 422.
+Every issue PATCH emits an `issue.updated` activity receipt containing the
+actor, responsible user, run, authorization reason, and field-level before/after
+changes so both agent and board edits are visible in the issue activity stream.
 
 ## 9.4 Permission Terminology and Default Visibility Rule
 
@@ -608,6 +645,15 @@ The approved term set is:
 - Managed-subtree scope: `managerAgentId`, `managerAgentIds`, `managedSubtreeAgentId`, `managedSubtreeAgentIds`, `subtreeAgentId`, `subtreeAgentIds`, `subtreeRootAgentId`, `subtreeRootAgentIds`, or `allow: ["subtree:<agentId>"]`.
 
 When multiple constraint families are present, assignment must satisfy all of them. Denials return `403` with a generic scope explanation and do not disclose details about hidden or unrelated resources.
+
+A protected-agent hard block is represented canonically as
+`authorizationPolicy.protectedAgent.blockAssignment: true`. It denies assignment
+even when the caller has a broad or scoped assignment grant. A company
+administrator must remove the block before assignment can be retried; no pending
+approval is created. The legacy fields `protectedAgent.requiresApproval` and
+`assignmentPolicy.protectedAgentRequiresApproval` remain fail-closed compatibility
+aliases for the same hard block, but API denial copy must describe the block and
+administrator remediation rather than promising a nonexistent approval step.
 
 ## 9.9 Task Watchdog Authority Contract
 
@@ -846,6 +892,20 @@ All endpoints are under `/api` and return JSON.
 - `PATCH /companies/:companyId/branding`
 - `POST /companies/:companyId/archive`
 
+On a Paperclip Cloud-managed instance, `POST /companies` returns `403` with
+code `cloud_managed`; the trusted-header provisioning path and company import
+routes remain the only company-creation paths there.
+
+## 10.1.1 Cloud Stack Portfolio
+
+- `GET /cloud/stacks`
+
+The route exists only on a Cloud-managed instance, requires a trusted
+`cloud_tenant` actor, and proxies the current actor's user id plus the current
+stack id to the Cloud tenant portfolio endpoint. Client-supplied user ids are
+never forwarded. Successful responses are cached briefly per user; self-hosted
+instances return `404`.
+
 ## 10.2 Goals
 
 - `GET /companies/:companyId/goals`
@@ -977,7 +1037,10 @@ The current app also exposes V1-supporting surfaces for:
   `GET /companies/:companyId/search/extract`; extraction accepts a server-escaped literal `contains`, optional
   server-owned URL expansion, issue/comment/document scopes, status/date filters, issue-level pagination, a
   bounded `matchesPerIssue` override for machine consumers, and explicit issue/match truncation flags
-- execution workspaces, project workspaces, workspace runtime services, and workspace operations
+- execution workspaces, project workspaces, workspace runtime services, and workspace operations. Workspace reads
+  derive `deliveryState` as `merged_via_pr | merged_by_ancestry | unmerged | unknown`; terminal issue trees with a
+  merged delivery and no active checkout run become cleanup-eligible with reason `issue_terminal` and are archived
+  through the workspace cleanup path. Reopening the source issue records activity but does not restore that workspace.
 - task watchdog configuration and reusable watchdog issue orchestration for explicitly watched issue subtrees
 - routines and scheduled/API/webhook triggers
 - plugin installation, configuration, state, jobs, logs, webhooks, and plugin database namespace migration
@@ -990,8 +1053,13 @@ The current app also exposes V1-supporting surfaces for:
   - `DELETE /companies/:companyId/decision-queues/:key/items/:sourceKind/:sourceId`
   - `GET /companies/:companyId/decision-queue-seed-rules`
   - `GET|PUT /companies/:companyId/decision-triage/:sourceKind/:sourceId`
+  - `PATCH /companies/:companyId/decision-retention/:sourceKind/:sourceId` (Keep)
+  - `POST /companies/:companyId/decision-retention/:sourceKind/:sourceId/archive|revive`
+  - `POST /companies/:companyId/decision-archive-proposals`
 
 Queue and triage mutations accept board non-viewers and active standard-scope agents, apply responsible-user intersection for run JWTs, and reject low-trust, `task_bridge`, and `skill_test` contexts. Missing, cross-company, and unauthorized attention sources share the same not-found response.
+
+The attention feed returns server-computed `shelf`, `retentionDays`, `keep`, `archivedAt`, and `retentionVersion` fields. Archived rows are excluded by default and selected with `archived=true`. Bulk archive proposals bind the exact source identities, per-item reasons, activity timestamps, and expected retention versions into the signed decisions-v1 target snapshots; acceptance re-authorizes both proposer and decider and commits all rows or none.
 
 ## 11. Heartbeat and Adapter Contract
 

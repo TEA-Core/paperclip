@@ -4,6 +4,7 @@ import type {
   IssueExecutionWorkspaceSettings,
   ProjectExecutionWorkspaceDefaultMode,
   ProjectExecutionWorkspacePolicy,
+  SharedWorkspaceConcurrency,
 } from "@paperclipai/shared";
 import { asString, parseObject } from "../adapters/utils.js";
 
@@ -47,6 +48,9 @@ function parseExecutionWorkspaceStrategy(raw: unknown): ExecutionWorkspaceStrate
     ...(typeof parsed.branchTemplate === "string" ? { branchTemplate: parsed.branchTemplate } : {}),
     ...(typeof parsed.worktreeParentDir === "string" ? { worktreeParentDir: parsed.worktreeParentDir } : {}),
     ...(typeof parsed.provisionCommand === "string" ? { provisionCommand: parsed.provisionCommand } : {}),
+    ...(typeof parsed.runtimeProvisionCommand === "string"
+      ? { runtimeProvisionCommand: parsed.runtimeProvisionCommand }
+      : {}),
     ...(typeof parsed.teardownCommand === "string" ? { teardownCommand: parsed.teardownCommand } : {}),
   };
 }
@@ -113,6 +117,7 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
     typeof parsed.defaultProjectWorkspaceId === "string" ? parsed.defaultProjectWorkspaceId : undefined;
   const allowIssueOverride =
     typeof parsed.allowIssueOverride === "boolean" ? parsed.allowIssueOverride : undefined;
+  const sharedWorkspaceConcurrency = parseSharedWorkspaceConcurrency(parsed.sharedWorkspaceConcurrency);
   const normalizedDefaultMode = (() => {
     if (
       defaultMode === "shared_workspace" ||
@@ -128,6 +133,7 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
   })();
   return {
     enabled,
+    ...(sharedWorkspaceConcurrency ? { sharedWorkspaceConcurrency } : {}),
     ...(normalizedDefaultMode ? { defaultMode: normalizedDefaultMode } : {}),
     ...(allowIssueOverride !== undefined ? { allowIssueOverride } : {}),
     ...(defaultProjectWorkspaceId ? { defaultProjectWorkspaceId } : {}),
@@ -172,6 +178,7 @@ export function parseIssueExecutionWorkspaceSettings(
   const parsed = parseObject(raw);
   if (Object.keys(parsed).length === 0) return null;
   const workspaceStrategy = parseExecutionWorkspaceStrategy(parsed.workspaceStrategy);
+  const sharedWorkspaceConcurrency = parseSharedWorkspaceConcurrency(parsed.sharedWorkspaceConcurrency);
   const mode = asString(parsed.mode, "");
   const normalizedMode = (() => {
     if (
@@ -203,6 +210,7 @@ export function parseIssueExecutionWorkspaceSettings(
     ...(normalizedMode
       ? { mode: normalizedMode as IssueExecutionWorkspaceSettings["mode"] }
       : {}),
+    ...(sharedWorkspaceConcurrency ? { sharedWorkspaceConcurrency } : {}),
     ...(options.includeEnvironmentId && (typeof parsed.environmentId === "string" || parsed.environmentId === null)
       ? { environmentId: parsed.environmentId }
       : {}),
@@ -310,6 +318,19 @@ export function resolveExecutionWorkspaceMode(input: {
     return "agent_default";
   }
   return "shared_workspace";
+}
+
+function parseSharedWorkspaceConcurrency(raw: unknown): SharedWorkspaceConcurrency | undefined {
+  return raw === "auto" || raw === "serialize" || raw === "allow" ? raw : undefined;
+}
+
+export function resolveSharedWorkspaceConcurrency(input: {
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  issueSettings: IssueExecutionWorkspaceSettings | null;
+}): SharedWorkspaceConcurrency {
+  return input.issueSettings?.sharedWorkspaceConcurrency
+    ?? (input.projectPolicy?.enabled ? input.projectPolicy.sharedWorkspaceConcurrency : undefined)
+    ?? "auto";
 }
 
 export function buildExecutionWorkspaceAdapterConfig(input: {

@@ -72,6 +72,12 @@ export interface LogActivityInput {
   responsibleUserIdOverride?: string | null;
 }
 
+export interface ActivityPublication {
+  companyId: string;
+  payload: Record<string, unknown>;
+  pluginEvent: PluginEvent | null;
+}
+
 export async function createActivityDetailsRedactor(db: Db) {
   const currentUserRedactionOptions = {
     enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
@@ -164,7 +170,16 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
   return resolveResponsibleUserIdWithRun(db, input, await lookupActivityRun(db, input));
 }
 
-async function writeActivity(db: Db, input: LogActivityInput) {
+export function publishActivity(publication: ActivityPublication) {
+  publishLiveEvent({
+    companyId: publication.companyId,
+    type: "activity.logged",
+    payload: publication.payload,
+  });
+  if (publication.pluginEvent) publishPluginDomainEvent(publication.pluginEvent);
+}
+
+export async function persistActivity(db: Db, input: LogActivityInput) {
   const redactedDetails = await redactActivityDetails(db, input.details ?? null);
   const run = await lookupActivityRun(db, input);
   const responsibleUserId = input.responsibleUserIdOverride !== undefined
@@ -200,44 +215,45 @@ async function writeActivity(db: Db, input: LogActivityInput) {
     details: redactedDetails,
   }).returning({ id: activityLog.id });
 
-  publishLiveEvent({
-    companyId: input.companyId,
-    type: "activity.logged",
-    payload: {
-      actorType: input.actorType,
-      actorId: input.actorId,
-      action: input.action,
-      entityType: input.entityType,
-      entityId: input.entityId,
-      agentId: input.agentId ?? null,
-      runId,
-      responsibleUserId,
-      details: redactedDetails,
-    },
-  });
-
+  const payload = {
+    actorType: input.actorType,
+    actorId: input.actorId,
+    action: input.action,
+    entityType: input.entityType,
+    entityId: input.entityId,
+    agentId: input.agentId ?? null,
+    runId,
+    responsibleUserId,
+    details: redactedDetails,
+  };
   const pluginEventType = eventTypeForActivityAction(input.action);
-  if (pluginEventType) {
-    const event: PluginEvent = {
-      eventId: randomUUID(),
-      eventType: pluginEventType,
-      occurredAt: new Date().toISOString(),
-      actorId: input.actorId,
-      actorType: input.actorType,
-      entityId: input.entityId,
-      entityType: input.entityType,
-      companyId: input.companyId,
-      payload: {
-        ...redactedDetails,
-        agentId: input.agentId ?? null,
-        runId,
-        responsibleUserId,
-      },
-    };
-    publishPluginDomainEvent(event);
-  }
+  const pluginEvent: PluginEvent | null = pluginEventType
+    ? {
+        eventId: randomUUID(),
+        eventType: pluginEventType,
+        occurredAt: new Date().toISOString(),
+        actorId: input.actorId,
+        actorType: input.actorType,
+        entityId: input.entityId,
+        entityType: input.entityType,
+        companyId: input.companyId,
+        payload: {
+          ...redactedDetails,
+          agentId: input.agentId ?? null,
+          runId,
+          responsibleUserId,
+        },
+      }
+    : null;
 
-  return activity;
+  return {
+    activity,
+    publication: {
+      companyId: input.companyId,
+      payload,
+      pluginEvent,
+    } satisfies ActivityPublication,
+  };
 }
 
 /**
@@ -250,7 +266,9 @@ async function writeActivity(db: Db, input: LogActivityInput) {
  */
 export async function logActivity(db: Db, input: LogActivityInput) {
   try {
-    return await writeActivity(db, input);
+    const { activity, publication } = await persistActivity(db, input);
+    publishActivity(publication);
+    return activity;
   } catch (err) {
     logger.error(
       {
@@ -277,5 +295,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
  * share a fate, which is exactly the guarantee a caller opens a transaction for.
  */
 export async function logActivityInTransaction(tx: Db, input: LogActivityInput) {
-  return writeActivity(tx, input);
+  const { activity, publication } = await persistActivity(tx, input);
+  publishActivity(publication);
+  return activity;
 }

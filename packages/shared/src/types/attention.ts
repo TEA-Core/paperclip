@@ -78,6 +78,9 @@ export type AttentionSortMode = "activity" | "decide";
 
 export interface AttentionFeedQuery {
   includeDismissed?: boolean;
+  archived?: boolean;
+  /** Return the complete filtered snapshot in one response. */
+  all?: boolean;
   activitySince?: string;
   activityUntil?: string;
   queue?: string;
@@ -155,6 +158,7 @@ export type AttentionItemDetail =
         identifier: string | null;
         title: string | null;
       } | null;
+      blockedTaskCount?: number;
       images: AttentionDetailImage[];
     }
   | {
@@ -201,6 +205,11 @@ export interface AttentionItem {
   ruleKey: string | null;
   originAgentName: string | null;
   queues: AttentionQueueRef[];
+  shelf: boolean;
+  retentionDays: number;
+  keep: boolean;
+  archivedAt: string | null;
+  retentionVersion: number;
   decideBy: string | null;
   decideByAttribution: AttentionTriageAttribution | null;
   snoozedUntil: string | null;
@@ -212,7 +221,13 @@ export interface AttentionFeed {
   companyId: string;
   generatedAt: string;
   totalCount: number;
-  decideNowCount: number;
+  /**
+   * The sidebar badge: distinct items that either surfaced today ("new today")
+   * or carry an explicit decide-by deadline that is due today/past ("overdue").
+   * Computed before pagination so a small first page still reflects the
+   * company-wide load. The desk no longer editorializes about what "can wait".
+   */
+  deskBadgeCount: number;
   nextCursor: string | null;
   countsBySourceKind: Record<AttentionSourceKind, number>;
   items: AttentionItem[];

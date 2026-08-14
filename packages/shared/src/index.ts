@@ -20,6 +20,8 @@ export {
   type DecisionSpecInput,
 } from "./validators/decision.js";
 
+export { decisionEffectTargetIssueIds } from "./types/decision.js";
+
 export type {
   DecisionEffectStaleness,
   DecisionOptionStyle,
@@ -36,6 +38,8 @@ export type {
   DecisionChosenOptionCount,
   DecisionRuleKeyStats,
   DecisionStatsResponse,
+  AttentionArchiveManifestEntry,
+  AttentionArchiveTargetSnapshot,
 } from "./types/decision.js";
 
 export {
@@ -80,6 +84,18 @@ export {
   type OriginatingActor,
 } from "./issue-attribution.js";
 export {
+  ISSUE_WRITE_DENIAL_CODES,
+  describeIssueWriteDenial,
+  isIssueWriteDenialCode,
+  issueWriteDenialApiMessage,
+  issueWriteDenialCodeForResponsibleUserDenial,
+  issueWriteDenialResponse,
+  type IssueWriteDenialCode,
+  type IssueWriteDenialContext,
+  type IssueWriteDenialCopy,
+  type IssueWriteDenialTone,
+} from "./issue-write-denial.js";
+export {
   RESPONSIBLE_USER_DENIAL_CODES,
   describeResponsibleUserDenial,
   isResponsibleUserDenialCode,
@@ -121,12 +137,18 @@ export {
   createDecisionQueueSchema,
   updateDecisionQueueSchema,
   addDecisionQueueItemSchema,
+  removeDecisionQueueItemSchema,
   decisionTriageDecideBySchema,
   updateDecisionTriageSchema,
+  updateDecisionRetentionSchema,
+  createDecisionArchiveProposalSchema,
   type CreateDecisionQueueInput,
   type UpdateDecisionQueueInput,
   type AddDecisionQueueItemInput,
+  type RemoveDecisionQueueItemInput,
   type UpdateDecisionTriageInput,
+  type UpdateDecisionRetentionInput,
+  type CreateDecisionArchiveProposalInput,
 } from "./validators/decision-queue.js";
 export type {
   DecisionTrainingExample,
@@ -201,6 +223,8 @@ export {
   type LowTrustOutputPromotionTarget,
   type LowTrustBoundary,
   type LowTrustReviewPresetPolicy,
+  type AssignmentAuthorizationPolicy,
+  type ProtectedAgentAuthorizationPolicy,
   type TrustAuthorizationPolicy,
   type SourceTrustArtifactKind,
   type SourceTrustDisposition,
@@ -259,6 +283,7 @@ export {
   ISSUE_COMMENT_PRESENTATION_DENSITIES,
   clampIssueRequestDepth,
   ISSUE_THREAD_INTERACTION_KINDS,
+  ISSUE_THREAD_INTERACTION_RESOLVER_POLICIES,
   ISSUE_THREAD_INTERACTION_STATUSES,
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
   ISSUE_ORIGIN_KINDS,
@@ -445,6 +470,7 @@ export {
   type IssueCommentPresentationTone,
   type IssueCommentPresentationDensity,
   type IssueThreadInteractionKind,
+  type IssueThreadInteractionResolverPolicy,
   type IssueThreadInteractionStatus,
   type IssueThreadInteractionContinuationPolicy,
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
@@ -602,6 +628,8 @@ export {
 
 export type {
   Company,
+  InteractionResolverGovernance,
+  InteractionResolverKindGovernance,
   GenerateSummarySlotRequest,
   GenerateSummarySlotResponse,
   GetSummarySlotResponse,
@@ -677,6 +705,9 @@ export type {
   CompanySkillImportRequest,
   CompanySkillImportResult,
   CompanySkillProjectScanRequest,
+  CompanySkillProjectBrowseRequest,
+  CompanySkillProjectBrowseEntry,
+  CompanySkillProjectBrowseResult,
   CompanySkillProjectScanCandidateStatus,
   CompanySkillProjectScanCandidate,
   CompanySkillProjectScanSkipped,
@@ -804,6 +835,7 @@ export type {
   ExecutionWorkspaceCloseLinkedIssue,
   ExecutionWorkspaceCloseReadiness,
   ExecutionWorkspaceCloseReadinessState,
+  ExecutionWorkspaceDeliveryState,
   WorkspaceOverviewItem,
   WorkspaceOverviewLinkedIssue,
   WorkspaceOverviewPrimaryService,
@@ -837,6 +869,7 @@ export type {
   WorkspaceRealizationTransport,
   ExecutionWorkspaceStrategyType,
   ExecutionWorkspaceMode,
+  SharedWorkspaceConcurrency,
   ExecutionWorkspaceProviderType,
   ExecutionWorkspaceStatus,
   ExecutionWorkspaceStrategy,
@@ -905,6 +938,12 @@ export type {
   IssueBlockerAttention,
   IssueBlockerAttentionReason,
   IssueBlockerAttentionState,
+  IssueReviewAttention,
+  IssueReviewAttentionPath,
+  IssueReviewAttentionPathKind,
+  IssueReviewAttentionState,
+  StalledReviewDecisionAction,
+  StalledReviewDecisionResponse,
   IssueInboxAttentionKind,
   IssueBlockedInboxAction,
   IssueBlockedInboxAttention,
@@ -1501,6 +1540,8 @@ export {
   trustPresetSchema,
   lowTrustBoundarySchema,
   lowTrustReviewPresetPolicySchema,
+  assignmentAuthorizationPolicySchema,
+  protectedAgentAuthorizationPolicySchema,
   trustAuthorizationPolicySchema,
   type PatchInstanceExperimentalSettings,
   type PatchInstanceSettings,
@@ -1515,6 +1556,7 @@ export {
 
 export {
   createCompanySchema,
+  interactionResolverGovernanceSchema,
   updateCompanySchema,
   updateCompanyBrandingSchema,
   feedbackTargetTypeSchema,
@@ -1647,6 +1689,7 @@ export {
   updateIssueObjectSchema,
   stripCreateOnlyIssueAttribution,
   ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS,
+  stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
@@ -1716,6 +1759,7 @@ export {
   reconcileExecutionWorkspaceBranchSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
+  executionWorkspaceDeliveryStateSchema,
   executionWorkspaceStatusSchema,
   executionWorkspaceCloseActionKindSchema,
   executionWorkspaceCloseActionSchema,
@@ -1747,6 +1791,7 @@ export {
   type CreateAcceptedPlanDecomposition,
   type CreateIssueLabel,
   type UpdateIssue,
+  type StalledReviewDecision,
   type ResolveIssueRecoveryAction,
   type CheckoutIssue,
   type AddIssueComment,
@@ -2051,6 +2096,9 @@ export {
   companySkillAuditResultSchema,
   companySkillImportSchema,
   companySkillProjectScanRequestSchema,
+  companySkillProjectBrowseRequestSchema,
+  companySkillProjectBrowseEntrySchema,
+  companySkillProjectBrowseResultSchema,
   companySkillProjectScanSkippedSchema,
   companySkillProjectScanConflictSchema,
   companySkillProjectScanResultSchema,

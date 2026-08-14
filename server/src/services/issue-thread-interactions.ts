@@ -1,8 +1,9 @@
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  companies,
   documents,
   heartbeatRuns,
   issueComments,
@@ -18,8 +19,11 @@ import type {
   AskUserQuestionsInteraction,
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
+  InteractionResolverGovernance,
   IssueThreadInteraction,
   RequestBoardApprovalInteraction,
+  IssueThreadInteractionKind,
+  IssueThreadInteractionResolverPolicy,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
   RequestConfirmationTarget,
@@ -54,19 +58,157 @@ import {
   withdrawIssueThreadInteractionSchema,
 } from "@paperclipai/shared";
 import { z } from "zod";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import {
   REQUEST_CONFIRMATION_INTERACTION_KINDS,
   TARGET_BOUND_INTERACTION_KINDS,
   USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS,
 } from "./issue-interaction-kinds.js";
+import { logActivity } from "./activity-log.js";
+import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService, runWorkspaceIsFinalized } from "./issues.js";
+import {
+  createPullRequestMergeStateResolver,
+  extractGitHubPullRequestReferences,
+  setBoundedPullRequestCacheEntry,
+  type GitHubPullRequestReference,
+  type PullRequestMergeState,
+} from "./github-pull-request-merge.js";
+
+export { extractGitHubPullRequestReferences } from "./github-pull-request-merge.js";
+export type { GitHubPullRequestReference } from "./github-pull-request-merge.js";
 
 type InteractionActor = {
   agentId?: string | null;
+  runId?: string | null;
   userId?: string | null;
+  systemId?: string | null;
+  resolutionDetails?: Record<string, unknown>;
 };
+
+type InteractionWakeup = (agentId: string, options: {
+  source: "automation";
+  triggerDetail: "system";
+  reason: "issue_commented";
+  payload: Record<string, unknown>;
+  idempotencyKey: string;
+  requestedByActorType: "system";
+  requestedByActorId: string;
+  contextSnapshot: Record<string, unknown>;
+}) => Promise<unknown>;
+
+export type IssueThreadInteractionServiceOptions = {
+  resolvePullRequestState?: (
+    companyId: string,
+    reference: GitHubPullRequestReference,
+  ) => Promise<PullRequestMergeState>;
+  wakeup?: InteractionWakeup;
+  pullRequestCacheTtlMs?: number;
+  now?: () => Date;
+};
+
+const GITHUB_PULL_REQUEST_URL_PATTERN = /https:\/\/(?:www\.)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([1-9][0-9]*)/gi;
+const GITHUB_PULL_REQUEST_SHORTHAND_PATTERN = /(^|[^A-Za-z0-9_.-])([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)\b/g;
+const MERGE_CONFIRMATION_INTENT_PATTERN = /^(?:please\s+)?(?:confirm(?:\s+that)?\s+.{0,80}\s+)?(?:merge|merged)\b|\bready\s+to\s+merge\b/i;
+const MERGE_CONFIRMATION_ALLOWED_WORDS = new Set([
+  "all",
+  "and",
+  "approved",
+  "are",
+  "both",
+  "checks",
+  "ci",
+  "confirm",
+  "github",
+  "green",
+  "is",
+  "it",
+  "link",
+  "linked",
+  "links",
+  "merge",
+  "merged",
+  "merging",
+  "passed",
+  "passing",
+  "please",
+  "pr",
+  "primary",
+  "prs",
+  "pull",
+  "ready",
+  "reference",
+  "references",
+  "request",
+  "requests",
+  "review",
+  "secondary",
+  "tests",
+  "that",
+  "the",
+  "these",
+  "this",
+  "to",
+  "url",
+]);
+
+function isMergeConfirmationOnlyText(value: string) {
+  GITHUB_PULL_REQUEST_URL_PATTERN.lastIndex = 0;
+  const withoutUrls = value.replace(GITHUB_PULL_REQUEST_URL_PATTERN, " pr_reference ");
+  GITHUB_PULL_REQUEST_SHORTHAND_PATTERN.lastIndex = 0;
+  const withoutReferences = withoutUrls.replace(
+    GITHUB_PULL_REQUEST_SHORTHAND_PATTERN,
+    (_match, prefix: string) => `${prefix} pr_reference `,
+  );
+  const normalized = withoutReferences
+    .replace(/\b(?:github-)?pr-[1-9][0-9]*\b/gi, " pr_reference ")
+    .replace(/[`*_\[\]{}()<>:;,.!?"'=+&|\\/-]+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return true;
+  return normalized
+    .split(/\s+/)
+    .every((word) => word === "pr_reference" || MERGE_CONFIRMATION_ALLOWED_WORDS.has(word));
+}
+
+export function getMergeConfirmationPullRequestReferences(
+  row: Pick<IssueThreadInteractionRow, "kind" | "title" | "summary" | "payload">,
+) {
+  if (row.kind !== "request_confirmation") return [];
+  const payload = row.payload && typeof row.payload === "object" && !Array.isArray(row.payload)
+    ? row.payload as unknown as Record<string, unknown>
+    : null;
+  if (!payload || payload.toolAction !== undefined) return [];
+
+  const target = payload.target && typeof payload.target === "object" && !Array.isArray(payload.target)
+    ? payload.target as Record<string, unknown>
+    : null;
+  // Plan/document confirmations and governed action cards must never inherit
+  // merge-confirmation authority merely because their prose links to a PR.
+  if (target?.type === "issue_document") return [];
+
+  const intentValues = [row.title, row.summary, payload.prompt, payload.acceptLabel];
+  const intentText = intentValues.filter((value): value is string => typeof value === "string").join("\n");
+  if (!MERGE_CONFIRMATION_INTENT_PATTERN.test(intentText)) return [];
+
+  const trustedTextValues = [
+    ...intentValues,
+    payload.detailsMarkdown,
+    target?.key,
+    target?.label,
+    target?.href,
+  ];
+  // System acceptance is intentionally fail-closed: after replacing recognized
+  // PR references, every trusted field must contain merge-only vocabulary. This
+  // prevents an otherwise valid merge prompt from smuggling an additional action
+  // that a governed-action denylist did not anticipate.
+  if (!trustedTextValues.every((value) => typeof value !== "string" || isMergeConfirmationOnlyText(value))) {
+    return [];
+  }
+
+  return extractGitHubPullRequestReferences(trustedTextValues);
+}
 
 const ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT =
   "issue_thread_interactions_company_issue_idempotency_uq";
@@ -86,6 +228,58 @@ type ResolvedInteractionResult = {
 
 type IssueThreadInteractionRow = typeof issueThreadInteractions.$inferSelect;
 type IssueTouchDb = Pick<Db, "update">;
+
+const DEFAULT_RESOLVER_POLICY_BY_KIND: Record<IssueThreadInteractionKind, IssueThreadInteractionResolverPolicy> = {
+  suggest_tasks: "board_only",
+  ask_user_questions: "board_or_agents",
+  request_confirmation: "board_only",
+  request_checkbox_confirmation: "board_only",
+  request_item_verdicts: "board_only",
+  // A board approval is board business by definition; agents never resolve it.
+  request_board_approval: "board_only",
+};
+
+export function resolveInteractionPolicy(args: {
+  kind: IssueThreadInteractionKind;
+  requested?: IssueThreadInteractionResolverPolicy;
+  governance: InteractionResolverGovernance;
+  hasToolAction: boolean;
+}) {
+  const kindGovernance = args.governance[args.kind];
+  const requestedResolverPolicy = args.requested
+    ?? kindGovernance?.defaultPolicy
+    ?? DEFAULT_RESOLVER_POLICY_BY_KIND[args.kind];
+  const effectiveResolverPolicy = args.hasToolAction || kindGovernance?.cap === "board_only"
+    ? "board_only"
+    : requestedResolverPolicy;
+  return { requestedResolverPolicy, effectiveResolverPolicy } as const;
+}
+
+function assertAgentResolutionAllowed(current: IssueThreadInteractionRow, actor: InteractionActor) {
+  if (!actor.agentId) return;
+  if (!actor.runId) throw forbidden("Agent run id required to resolve an issue-thread interaction");
+  if (current.effectiveResolverPolicy !== "board_or_agents") {
+    throw forbidden("This issue-thread interaction is board-only");
+  }
+  if (current.addresseeAgentId && current.addresseeAgentId !== actor.agentId) {
+    throw forbidden("Only the addressed agent or a board user may resolve this issue-thread interaction");
+  }
+  if (current.createdByAgentId === actor.agentId) {
+    throw forbidden("Agents cannot resolve interactions they created");
+  }
+  if (current.sourceRunId && current.sourceRunId === actor.runId) {
+    throw forbidden("Agents cannot resolve interactions created by the same run");
+  }
+  if (
+    current.kind === "request_confirmation"
+    && current.payload
+    && typeof current.payload === "object"
+    && "toolAction" in current.payload
+    && current.payload.toolAction !== undefined
+  ) {
+    throw forbidden("Tool-action confirmations are always board-only");
+  }
+}
 
 type IssueResolutionContext = {
   id: string;
@@ -137,6 +331,8 @@ function isEquivalentCreateRequest(
 ) {
   return (
     row.kind === input.kind
+    && row.requestedResolverPolicy === input.resolverPolicy
+    && (row.addresseeAgentId ?? null) === (input.addresseeAgentId ?? null)
     && row.continuationPolicy === input.continuationPolicy
     && (row.idempotencyKey ?? null) === (input.idempotencyKey ?? null)
     && (row.sourceCommentId ?? null) === (input.sourceCommentId ?? null)
@@ -181,8 +377,12 @@ function hydrateInteraction(
   const base = {
     ...row,
     idempotencyKey: row.idempotencyKey ?? null,
+    addresseeAgentId: row.addresseeAgentId ?? null,
     status: row.status as IssueThreadInteraction["status"],
     continuationPolicy: row.continuationPolicy as IssueThreadInteraction["continuationPolicy"],
+    resolverPolicy: row.requestedResolverPolicy,
+    requestedResolverPolicy: row.requestedResolverPolicy,
+    effectiveResolverPolicy: row.effectiveResolverPolicy,
   };
 
   switch (row.kind) {
@@ -252,10 +452,12 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
   if (!isRequestConfirmationLikeKind(args.current.kind)) return false;
   if (!args.current.createdByAgentId) return false;
   if (!args.actor.userId) return false;
-  if (!args.issue.assigneeUserId) return false;
-  if (args.issue.assigneeAgentId) return false;
   if (isTerminalIssueStatus(args.issue.status)) return false;
-  return true;
+  if (args.issue.assigneeAgentId) {
+    return args.issue.status === "in_review"
+      && args.issue.assigneeAgentId === args.current.createdByAgentId;
+  }
+  return Boolean(args.issue.assigneeUserId);
 }
 
 function shouldSupersedeInteractionOnUserComment(interaction: UserCommentSupersedableInteraction) {
@@ -360,9 +562,17 @@ function buildStaleTargetResult(
   } as const;
 }
 
+function buildSupersededByNewerRequestResult(replacementInteractionId: string) {
+  return {
+    version: 1,
+    outcome: "superseded_by_newer_request",
+    supersededByInteractionId: replacementInteractionId,
+  } as const;
+}
+
 function buildAdministrativeOutcomeResult(
   row: IssueThreadInteractionRow,
-  outcome: "withdrawn" | "issue_closed",
+  outcome: "withdrawn" | "issue_closed" | "addressee_deleted",
   reason: string | null = null,
 ) {
   if (row.kind === "ask_user_questions") {
@@ -946,6 +1156,7 @@ async function expireStaleRequestConfirmationTarget(db: Db | any, args: {
         ...buildStaleTargetResult(args.row, target),
       },
       resolvedByAgentId: args.actor.agentId ?? null,
+      resolvedByRunId: args.actor.runId ?? null,
       resolvedByUserId: args.actor.userId ?? null,
       resolvedAt: now,
       updatedAt: now,
@@ -965,7 +1176,37 @@ async function expireStaleRequestConfirmationTarget(db: Db | any, args: {
   return expired;
 }
 
-export function issueThreadInteractionService(db: Db) {
+export function issueThreadInteractionService(db: Db, opts: IssueThreadInteractionServiceOptions = {}) {
+  const pullRequestStateCache = new Map<string, { state: PullRequestMergeState; checkedAt: number }>();
+  const now = opts.now ?? (() => new Date());
+  const defaultPullRequestStateResolver = opts.resolvePullRequestState
+    ? null
+    : createPullRequestMergeStateResolver(db);
+
+  async function resolvePullRequestState(
+    companyId: string,
+    reference: GitHubPullRequestReference,
+  ): Promise<PullRequestMergeState> {
+    if (opts.resolvePullRequestState) return opts.resolvePullRequestState(companyId, reference);
+    return defaultPullRequestStateResolver?.(companyId, reference) ?? "unknown";
+  }
+
+  async function resolvePullRequestStates(
+    entries: Array<{ key: string; companyId: string; reference: GitHubPullRequestReference }>,
+  ) {
+    const states = new Map<string, PullRequestMergeState>();
+    const pending = entries.slice();
+    const workerCount = Math.min(8, pending.length);
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (pending.length > 0) {
+        const entry = pending.shift();
+        if (!entry) return;
+        const state = await resolvePullRequestState(entry.companyId, entry.reference);
+        states.set(entry.key, state);
+      }
+    }));
+    return states;
+  }
   async function getIdempotentInteraction(args: {
     issueId: string;
     companyId: string;
@@ -1087,6 +1328,7 @@ export function issueThreadInteractionService(db: Db) {
             ...(selectedOptionIds ? { selectedOptionIds } : {}),
           },
           resolvedByAgentId: args.actor.agentId ?? null,
+          resolvedByRunId: args.actor.runId ?? null,
           resolvedByUserId: args.actor.userId ?? null,
           resolvedAt: now,
           updatedAt: now,
@@ -1144,6 +1386,28 @@ export function issueThreadInteractionService(db: Db) {
         await touchIssue(tx, args.issue.id);
       }
 
+      if (args.actor.systemId) {
+        await logActivity(tx as unknown as Db, {
+          companyId: args.issue.companyId,
+          actorType: "system",
+          actorId: args.actor.systemId,
+          agentId: null,
+          runId: null,
+          action: "issue.thread_interaction_accepted",
+          entityType: "issue",
+          entityId: args.issue.id,
+          details: {
+            interactionId: args.current.id,
+            interactionKind: args.current.kind,
+            interactionStatus: "accepted",
+            resolutionActorKind: "system",
+            requestedResolverPolicy: args.current.requestedResolverPolicy,
+            effectiveResolverPolicy: args.current.effectiveResolverPolicy,
+            ...(args.actor.resolutionDetails ?? {}),
+          },
+        });
+      }
+
       return {
         interaction: hydrateInteraction(updated),
         continuationIssue,
@@ -1184,6 +1448,7 @@ export function issueThreadInteractionService(db: Db) {
           reason: reason || null,
         },
         resolvedByAgentId: args.actor.agentId ?? null,
+        resolvedByRunId: args.actor.runId ?? null,
         resolvedByUserId: args.actor.userId ?? null,
         resolvedAt: now,
         updatedAt: now,
@@ -1205,6 +1470,135 @@ export function issueThreadInteractionService(db: Db) {
 
   const service = {
     getForIssue,
+    sweepMergedPullRequestConfirmations: async () => {
+      const rows = await db
+        .select({
+          interaction: issueThreadInteractions,
+          issue: {
+            id: issues.id,
+            companyId: issues.companyId,
+            projectId: issues.projectId,
+            goalId: issues.goalId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+          },
+        })
+        .from(issueThreadInteractions)
+        .innerJoin(issues, eq(issueThreadInteractions.issueId, issues.id))
+        .where(and(
+          eq(issueThreadInteractions.kind, "request_confirmation"),
+          eq(issueThreadInteractions.status, "pending"),
+        ));
+
+      const candidates = rows.flatMap((row) => {
+        const references = getMergeConfirmationPullRequestReferences(row.interaction);
+        return references.length > 0 ? [{ ...row, references }] : [];
+      });
+      if (candidates.length === 0) {
+        return { checked: rows.length, candidates: 0, accepted: 0, woken: 0 };
+      }
+
+      const candidateIds = candidates.map(({ interaction }) => interaction.id);
+      const linkedToolActions = await db
+        .select({ interactionId: toolActionRequests.interactionId })
+        .from(toolActionRequests)
+        .where(inArray(toolActionRequests.interactionId, candidateIds));
+      const toolActionInteractionIds = new Set(linkedToolActions
+        .map((row) => row.interactionId)
+        .filter((value): value is string => Boolean(value)));
+      const eligible = candidates.filter(({ interaction }) => !toolActionInteractionIds.has(interaction.id));
+
+      const checkedAt = now().getTime();
+      const cacheTtlMs = opts.pullRequestCacheTtlMs ?? 5 * 60 * 1000;
+      const uniqueReferences = new Map<string, {
+        key: string;
+        companyId: string;
+        reference: GitHubPullRequestReference;
+      }>();
+      for (const candidate of eligible) {
+        for (const reference of candidate.references) {
+          const key = `${candidate.issue.companyId}:${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`;
+          const cached = pullRequestStateCache.get(key);
+          if (cached && checkedAt - cached.checkedAt < cacheTtlMs) continue;
+          uniqueReferences.set(key, { key, companyId: candidate.issue.companyId, reference });
+        }
+      }
+
+      const refreshedStates = await resolvePullRequestStates([...uniqueReferences.values()]);
+      for (const [key, state] of refreshedStates) {
+        setBoundedPullRequestCacheEntry(pullRequestStateCache, key, { state, checkedAt });
+      }
+
+      let accepted = 0;
+      let woken = 0;
+      for (const candidate of eligible) {
+        const allMerged = candidate.references.every((reference) => {
+          const key = `${candidate.issue.companyId}:${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`;
+          return pullRequestStateCache.get(key)?.state === "merged";
+        });
+        if (!allMerged) continue;
+
+        let resolved: Awaited<ReturnType<typeof acceptRequestConfirmation>>;
+        try {
+          resolved = await acceptRequestConfirmation({
+            issue: candidate.issue,
+            current: candidate.interaction,
+            input: {},
+            actor: {
+              systemId: "system:pr-merged",
+              resolutionDetails: {
+                source: "merged_pull_request_sweep",
+                pullRequests: candidate.references.map((reference) =>
+                  `${reference.owner}/${reference.repo}#${reference.number}`
+                ),
+              },
+            },
+          });
+        } catch (error) {
+          if (error && typeof error === "object" && "status" in error && error.status === 409) continue;
+          throw error;
+        }
+        if (resolved.interaction.status !== "accepted") continue;
+        accepted += 1;
+
+        const wakeIssue = resolved.continuationIssue ?? candidate.issue;
+        const shouldWake = resolved.interaction.continuationPolicy === "wake_assignee"
+          || resolved.interaction.continuationPolicy === "wake_assignee_on_accept";
+        if (!opts.wakeup || !shouldWake || !wakeIssue.assigneeAgentId || isTerminalIssueStatus(wakeIssue.status)) {
+          continue;
+        }
+        await opts.wakeup(wakeIssue.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_commented",
+          payload: {
+            issueId: wakeIssue.id,
+            interactionId: resolved.interaction.id,
+            interactionKind: resolved.interaction.kind,
+            interactionStatus: resolved.interaction.status,
+            sourceCommentId: resolved.interaction.sourceCommentId ?? null,
+            sourceRunId: resolved.interaction.sourceRunId ?? null,
+            mutation: "interaction",
+            resolutionSource: "merged_pull_request_sweep",
+          },
+          idempotencyKey: `interaction:${resolved.interaction.id}:accepted`,
+          requestedByActorType: "system",
+          requestedByActorId: "system:pr-merged",
+          contextSnapshot: {
+            issueId: wakeIssue.id,
+            taskId: wakeIssue.id,
+            interactionId: resolved.interaction.id,
+            interactionKind: resolved.interaction.kind,
+            interactionStatus: resolved.interaction.status,
+            wakeReason: "issue_commented",
+            source: "merged_pull_request_sweep",
+          },
+        });
+        woken += 1;
+      }
+
+      return { checked: rows.length, candidates: eligible.length, accepted, woken };
+    },
     listForIssue: async (issueId: string) => {
       const rows = await db
         .select()
@@ -1225,23 +1619,186 @@ export function issueThreadInteractionService(db: Db) {
       return row ? hydrateInteraction(row) : null;
     },
 
+    cancelPendingForDeletedAddressee: async (companyId: string, addresseeAgentId: string) => {
+      const rows = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.companyId, companyId),
+          eq(issueThreadInteractions.addresseeAgentId, addresseeAgentId),
+          eq(issueThreadInteractions.status, "pending"),
+        ));
+      if (rows.length === 0) return [];
+
+      const now = new Date();
+      const cancelled: IssueThreadInteraction[] = [];
+      for (const row of rows) {
+        const [updated] = await db
+          .update(issueThreadInteractions)
+          .set({
+            status: "cancelled",
+            result: buildAdministrativeOutcomeResult(
+              row,
+              "addressee_deleted",
+              "Cancelled because the addressed agent was deleted",
+            ),
+            resolvedByAgentId: null,
+            resolvedByRunId: null,
+            resolvedByUserId: null,
+            resolvedAt: now,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issueThreadInteractions.id, row.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .returning();
+        if (updated) cancelled.push(hydrateInteraction(updated));
+      }
+
+      for (const issueId of new Set(cancelled.map((interaction) => interaction.issueId))) {
+        await touchIssue(db, issueId);
+      }
+      await emitResolvedInteractionsTelemetry(db, cancelled);
+      return cancelled;
+    },
+
+    sweepSupersededPendingRequestConfirmations: async () => {
+      const rows = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.kind, "request_confirmation"),
+          eq(issueThreadInteractions.status, "pending"),
+          isNotNull(issueThreadInteractions.createdByAgentId),
+        ))
+        .orderBy(
+          asc(issueThreadInteractions.companyId),
+          asc(issueThreadInteractions.issueId),
+          asc(issueThreadInteractions.kind),
+          asc(issueThreadInteractions.createdByAgentId),
+          desc(issueThreadInteractions.createdAt),
+          desc(issueThreadInteractions.id),
+        );
+
+      const newestByGroup = new Map<string, IssueThreadInteractionRow>();
+      const supersededRows: Array<{
+        row: IssueThreadInteractionRow;
+        replacementInteractionId: string;
+      }> = [];
+      for (const row of rows) {
+        if (!row.createdByAgentId) continue;
+        const groupKey = `${row.companyId}:${row.issueId}:${row.kind}:${row.createdByAgentId}`;
+        const newest = newestByGroup.get(groupKey);
+        if (!newest) {
+          newestByGroup.set(groupKey, row);
+          continue;
+        }
+        supersededRows.push({ row, replacementInteractionId: newest.id });
+      }
+
+      if (supersededRows.length === 0) return { expired: 0 };
+
+      const now = new Date();
+      const expired: IssueThreadInteraction[] = [];
+      for (const { row, replacementInteractionId } of supersededRows) {
+        const updated = await db.transaction(async (tx) => {
+          const [updatedRow] = await tx
+            .update(issueThreadInteractions)
+            .set({
+              status: "expired",
+              result: buildSupersededByNewerRequestResult(replacementInteractionId),
+              resolvedByAgentId: null,
+              resolvedByUserId: null,
+              resolvedAt: now,
+              updatedAt: now,
+            })
+            .where(and(
+              eq(issueThreadInteractions.id, row.id),
+              eq(issueThreadInteractions.status, "pending"),
+            ))
+            .returning();
+          if (!updatedRow) return null;
+          await resolveLinkedToolActionRequests(tx, updatedRow, {
+            status: "expired",
+            fromStatuses: ["pending", "approved"],
+            actor: {},
+            now,
+          });
+          return updatedRow;
+        });
+        if (!updated) continue;
+        expired.push(hydrateInteraction(updated));
+      }
+
+      if (expired.length > 0) {
+        for (const issueId of new Set(expired.map((interaction) => interaction.issueId))) {
+          await touchIssue(db, issueId);
+        }
+        await emitResolvedInteractionsTelemetry(db, expired);
+      }
+      return { expired: expired.length };
+    },
+
     create: async (
       issue: { id: string; companyId: string },
       input: CreateIssueThreadInteraction,
       actor: InteractionActor,
     ) => {
       const data = normalizeCreateInteractionInput(createIssueThreadInteractionSchema.parse(input));
+      const governance = await db
+        .select({ interactionResolverGovernance: companies.interactionResolverGovernance })
+        .from(companies)
+        .where(eq(companies.id, issue.companyId))
+        .then((rows) => rows[0]?.interactionResolverGovernance ?? {});
+      const policy = resolveInteractionPolicy({
+        kind: data.kind,
+        requested: data.resolverPolicy,
+        governance,
+        hasToolAction: data.kind === "request_confirmation" && data.payload.toolAction !== undefined,
+      });
+      const normalizedData = { ...data, resolverPolicy: policy.requestedResolverPolicy };
 
-      if (data.idempotencyKey) {
+      if (normalizedData.addresseeAgentId) {
+        if (normalizedData.addresseeAgentId === actor.agentId) {
+          throw unprocessable("Agents cannot address issue-thread interactions to themselves");
+        }
+        if (normalizedData.kind === "request_confirmation" && normalizedData.payload.toolAction !== undefined) {
+          throw unprocessable("Tool-action confirmations cannot be addressed to agents");
+        }
+        const addressee = await db
+          .select({
+            id: agents.id,
+            companyId: agents.companyId,
+            name: agents.name,
+            reportsTo: agents.reportsTo,
+            status: agents.status,
+          })
+          .from(agents)
+          .where(eq(agents.id, normalizedData.addresseeAgentId))
+          .then((rows) => rows[0] ?? null);
+        if (!addressee || addressee.companyId !== issue.companyId) {
+          throw unprocessable("addresseeAgentId must belong to the same company");
+        }
+        const invokability = await evaluateAgentInvokabilityFromDb(db, addressee);
+        if (!invokability.invokable) {
+          throw unprocessable("addresseeAgentId must reference an invokable agent", {
+            reason: invokability.reason,
+            ...invokability.details,
+          });
+        }
+      }
+
+      if (normalizedData.idempotencyKey) {
         const existing = await getIdempotentInteraction({
           issueId: issue.id,
           companyId: issue.companyId,
-          idempotencyKey: data.idempotencyKey,
+          idempotencyKey: normalizedData.idempotencyKey,
         });
         if (existing) {
-          if (!isEquivalentCreateRequest(existing, data, actor)) {
+          if (!isEquivalentCreateRequest(existing, normalizedData, actor)) {
             throw conflict("Interaction idempotency key already exists for a different request", {
-              idempotencyKey: data.idempotencyKey,
+              idempotencyKey: normalizedData.idempotencyKey,
             });
           }
           return hydrateInteraction(existing);
@@ -1289,20 +1846,19 @@ export function issueThreadInteractionService(db: Db) {
       }
 
       let created: IssueThreadInteractionRow;
+      let superseded: IssueThreadInteractionRow[] = [];
       try {
-        // A terminal issue must not regain pending actionable cards. FOR SHARE
-        // on the issue row serializes this insert against the terminal status
-        // transition's row lock: either the close committed first and this
-        // read rejects the create, or the insert commits before the close
-        // proceeds and the close's expiry sweep collects the new row.
+        // A terminal issue must not regain pending actionable cards. FOR UPDATE
+        // on the issue row serializes this insert both against terminal status
+        // transitions and against concurrent confirmations on the same issue.
         // Idempotent reuse above stays allowed so retries of a pre-close
         // create keep returning the (by now expired) original.
-        created = await db.transaction(async (tx) => {
+        const result = await db.transaction(async (tx) => {
           const [issueRow] = await tx
             .select({ status: issues.status })
             .from(issues)
             .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)))
-            .for("share");
+            .for("update");
           if (!issueRow || isTerminalIssueStatus(issueRow.status)) {
             throw conflict("Cannot create an interaction on a closed issue");
           }
@@ -1314,37 +1870,78 @@ export function issueThreadInteractionService(db: Db) {
               kind: data.kind,
               status: "pending",
               continuationPolicy: data.continuationPolicy,
+              requestedResolverPolicy: policy.requestedResolverPolicy,
+              effectiveResolverPolicy: policy.effectiveResolverPolicy,
               idempotencyKey: data.idempotencyKey ?? null,
               sourceCommentId: data.sourceCommentId ?? null,
               sourceRunId: data.sourceRunId ?? null,
               title: data.title ?? null,
               summary: data.summary ?? null,
               createdByAgentId: actor.agentId ?? null,
+              addresseeAgentId: data.addresseeAgentId ?? null,
               createdByUserId: actor.userId ?? null,
               payload: data.payload,
             })
             .returning();
-          return row;
+
+          if (data.kind !== "request_confirmation" || !actor.agentId) {
+            return { row, supersededRows: [] };
+          }
+
+          const now = new Date();
+          const supersededRows = await tx
+            .update(issueThreadInteractions)
+            .set({
+              status: "expired",
+              result: buildSupersededByNewerRequestResult(row.id),
+              resolvedByAgentId: actor.agentId,
+              resolvedByUserId: actor.userId ?? null,
+              resolvedAt: now,
+              updatedAt: now,
+            })
+            .where(and(
+              eq(issueThreadInteractions.companyId, issue.companyId),
+              eq(issueThreadInteractions.issueId, issue.id),
+              eq(issueThreadInteractions.kind, data.kind),
+              eq(issueThreadInteractions.createdByAgentId, actor.agentId),
+              eq(issueThreadInteractions.status, "pending"),
+              ne(issueThreadInteractions.id, row.id),
+            ))
+            .returning();
+          for (const supersededRow of supersededRows) {
+            await resolveLinkedToolActionRequests(tx, supersededRow, {
+              status: "expired",
+              fromStatuses: ["pending", "approved"],
+              actor,
+              now,
+            });
+          }
+          return { row, supersededRows };
         });
+        created = result.row;
+        superseded = result.supersededRows;
       } catch (error) {
-        if (!data.idempotencyKey || !isIssueThreadInteractionIdempotencyConflict(error)) {
+        if (!normalizedData.idempotencyKey || !isIssueThreadInteractionIdempotencyConflict(error)) {
           throw error;
         }
         const existing = await getIdempotentInteraction({
           issueId: issue.id,
           companyId: issue.companyId,
-          idempotencyKey: data.idempotencyKey,
+          idempotencyKey: normalizedData.idempotencyKey,
         });
         if (!existing) throw error;
-        if (!isEquivalentCreateRequest(existing, data, actor)) {
+        if (!isEquivalentCreateRequest(existing, normalizedData, actor)) {
           throw conflict("Interaction idempotency key already exists for a different request", {
-            idempotencyKey: data.idempotencyKey,
+            idempotencyKey: normalizedData.idempotencyKey,
           });
         }
         return hydrateInteraction(existing);
       }
 
       await touchIssue(db, issue.id);
+      if (superseded.length > 0) {
+        await emitResolvedInteractionsTelemetry(db, superseded.map(hydrateInteraction));
+      }
 
       if (data.kind === "request_board_approval" && data.continuationPolicy === "wake_assignee") {
         await db
@@ -1364,6 +1961,7 @@ export function issueThreadInteractionService(db: Db) {
     ): Promise<ResolvedInteractionResult> => {
       const data = acceptIssueThreadInteractionSchema.parse(input);
       const current = await getPendingInteractionForResolution({ issue, interactionId });
+      assertAgentResolutionAllowed(current, actor);
       switch (current.kind) {
         case "suggest_tasks":
           // Accepting suggest_tasks only creates follow-up issues; it does not
@@ -1433,6 +2031,7 @@ export function issueThreadInteractionService(db: Db) {
       if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
         throw notFound("Interaction not found");
       }
+      assertAgentResolutionAllowed(current, actor);
       if (current.kind !== "suggest_tasks") {
         throw unprocessable("Only suggest_tasks interactions can be accepted");
       }
@@ -1479,6 +2078,7 @@ export function issueThreadInteractionService(db: Db) {
           .set({
             status: "accepted",
             resolvedByAgentId: actor.agentId ?? null,
+            resolvedByRunId: actor.runId ?? null,
             resolvedByUserId: actor.userId ?? null,
             resolvedAt,
             updatedAt: resolvedAt,
@@ -1576,6 +2176,7 @@ export function issueThreadInteractionService(db: Db) {
     ) => {
       const data = rejectIssueThreadInteractionSchema.parse(input);
       const current = await getPendingInteractionForResolution({ issue, interactionId });
+      assertAgentResolutionAllowed(current, actor);
       switch (current.kind) {
         case "suggest_tasks":
           return issueThreadInteractionService(db).rejectSuggestedTasks(issue, interactionId, data, actor, current);
@@ -1665,6 +2266,7 @@ export function issueThreadInteractionService(db: Db) {
             status: complete ? "answered" : "pending",
             result,
             resolvedByAgentId: complete ? actor.agentId ?? null : null,
+            resolvedByRunId: complete ? actor.runId ?? null : null,
             resolvedByUserId: complete ? actor.userId ?? null : null,
             resolvedAt: complete ? now : null,
             updatedAt: now,
@@ -1719,6 +2321,7 @@ export function issueThreadInteractionService(db: Db) {
             rejectionReason: input.reason?.trim() || null,
           },
           resolvedByAgentId: actor.agentId ?? null,
+          resolvedByRunId: actor.runId ?? null,
           resolvedByUserId: actor.userId ?? null,
           resolvedAt: new Date(),
           updatedAt: new Date(),
@@ -2136,6 +2739,7 @@ export function issueThreadInteractionService(db: Db) {
             status: "cancelled",
             result: buildAdministrativeOutcomeResult(current, "withdrawn", reason),
             resolvedByAgentId: actor.agentId ?? null,
+            resolvedByRunId: actor.runId ?? null,
             resolvedByUserId: actor.userId ?? null,
             resolvedAt: now,
             updatedAt: now,
@@ -2167,10 +2771,11 @@ export function issueThreadInteractionService(db: Db) {
         .where(eq(issueThreadInteractions.id, interactionId))
         .then((rows) => rows[0] ?? null);
 
-      if (!current) throw notFound("Interaction not found");
-      if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
-        throw notFound("Interaction not found");
-      }
+        if (!current) throw notFound("Interaction not found");
+        if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
+          throw notFound("Interaction not found");
+        }
+        assertAgentResolutionAllowed(current, actor);
       if (current.kind !== "ask_user_questions") {
         throw unprocessable("Only ask_user_questions interactions can be answered");
       }
@@ -2193,7 +2798,8 @@ export function issueThreadInteractionService(db: Db) {
             answers: normalizedAnswers,
             summaryMarkdown: input.summaryMarkdown ?? null,
           },
-          resolvedByAgentId: actor.agentId ?? null,
+            resolvedByAgentId: actor.agentId ?? null,
+            resolvedByRunId: actor.runId ?? null,
           resolvedByUserId: actor.userId ?? null,
           resolvedAt: new Date(),
           updatedAt: new Date(),
@@ -2251,6 +2857,7 @@ export function issueThreadInteractionService(db: Db) {
             summaryMarkdown: null,
           },
           resolvedByAgentId: actor.agentId ?? null,
+          resolvedByRunId: actor.runId ?? null,
           resolvedByUserId: actor.userId ?? null,
           resolvedAt: new Date(),
           updatedAt: new Date(),

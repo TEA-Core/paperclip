@@ -5576,6 +5576,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       config: {
         environmentId: null,
         provisionCommand: "bash ./scripts/provision-new.sh",
+        runtimeProvisionCommand: null,
         teardownCommand: "bash ./scripts/teardown-new.sh",
         cleanupCommand: null,
         workspaceRuntime: { profile: "new" },

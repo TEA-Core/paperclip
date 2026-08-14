@@ -9,12 +9,18 @@
  */
 import type { Agent } from "@paperclipai/shared";
 import type { IssueChatComment } from "@/lib/issue-chat-messages";
+import { resolveCommentAttribution } from "@/lib/comment-attribution";
 import type { TaskChatAuthorKind, TaskChatItem } from "./task-chat-model";
 
 export interface TaskChatAdapterContext {
   agentMap?: Map<string, Agent>;
   userLabelMap?: ReadonlyMap<string, string> | null;
   currentUserId?: string | null;
+  /**
+   * Task's current assignee. Agent comments from anyone else are cross-issue
+   * writes and get a "for {user}" attribution chip (the open cross-task write design (attribution)).
+   */
+  issueAssigneeAgentId?: string | null;
   /**
    * Capitalized mode chip for agent-authored bubbles ("Agent mode" / "Plan
    * mode" / "Ask mode") — resolved per comment, so each reply is tagged with
@@ -34,7 +40,8 @@ function authorKind(comment: IssueChatComment): TaskChatAuthorKind {
   return "system";
 }
 
-function formatTimestamp(value: unknown): string | undefined {
+/** Shared bubble-footer time format ("2:34 PM") — also used by the description bubble (PAP-375). */
+export function formatTaskChatTimestamp(value: unknown): string | undefined {
   if (!value) return undefined;
   const d = value instanceof Date ? value : new Date(value as string);
   if (Number.isNaN(d.getTime())) return undefined;
@@ -51,10 +58,17 @@ export function commentsToTaskChatItems(
     const kind = authorKind(comment);
     let authorName: string | undefined;
     let agentIcon: string | null | undefined;
+    let onBehalfOfUserName: string | undefined;
     if (kind === "agent") {
       const agentId = effectiveAgentId(comment);
       authorName = (agentId && ctx.agentMap?.get(agentId)?.name) || "Agent";
       agentIcon = agentId ? ctx.agentMap?.get(agentId)?.icon : undefined;
+      onBehalfOfUserName = resolveCommentAttribution({
+        authorAgentId: agentId,
+        onBehalfOfUserId: comment.onBehalfOfUserId ?? null,
+        issueAssigneeAgentId: ctx.issueAssigneeAgentId,
+        resolveUserLabel: (userId) => ctx.userLabelMap?.get(userId),
+      })?.userName;
     } else if (kind === "human") {
       authorName =
         (comment.authorUserId && ctx.userLabelMap?.get(comment.authorUserId)) || undefined;
@@ -71,9 +85,10 @@ export function commentsToTaskChatItems(
       author: kind,
       authorName,
       text: comment.body,
-      timestamp: formatTimestamp(comment.createdAt),
+      timestamp: formatTaskChatTimestamp(comment.createdAt),
       optimistic,
       agentIcon,
+      onBehalfOfUserName,
       modeLabel: kind === "agent" ? ctx.agentModeLabelFor?.(comment) : undefined,
     });
   }
