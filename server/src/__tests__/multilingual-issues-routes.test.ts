@@ -38,7 +38,6 @@ describeEmbeddedPostgres("multilingual issue routes", () => {
     "हिन्दी उत्तर भी सुरक्षित है।",
   ].join("\n");
   const completionNote = [
-    "Closed at Tier 2 (live): probe confirms the fix is live in production.",
     "完成: 已验证中文。",
     "日本語: 完了しました。",
     "हिन्दी: सत्यापन पूरा हुआ।",
