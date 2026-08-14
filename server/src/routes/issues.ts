@@ -128,7 +128,12 @@ import {
 } from "../services/index.js";
 import { shouldPublishApprovalStatus } from "../services/merge-arming.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
-import { evaluateDoneTransitionGuard, writeAuditLog, type DoneTransitionOverride } from "../services/done-transition-guard.js";
+import {
+  evaluateDoneTransitionGuard,
+  evaluateDoneTierDeclaration,
+  writeAuditLog,
+  type DoneTransitionOverride,
+} from "../services/done-transition-guard.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
@@ -8497,6 +8502,44 @@ export function issueRoutes(
           },
         });
         return;
+      }
+    }
+
+    if (isDoneRequest) {
+      const tierResult = await evaluateDoneTierDeclaration(
+        db,
+        existing,
+        commentBody ?? null,
+        actor.runId ?? null,
+        (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
+      );
+      if (tierResult.skipped) {
+        void writeAuditLog(db, existing, "issue.done_tier_declaration_skipped", {
+          reason: tierResult.reason,
+          skipReason: tierResult.skipReason,
+        });
+      }
+      if (!tierResult.allowed) {
+        res.status(409).json({
+          error: tierResult.reason,
+          code: "done_transition_missing_tier_declaration",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            remedy:
+              "Include a done-tier declaration in the close comment: " +
+              `"Closed at Tier 2 (live): <probe evidence>"` +
+              ` or ` +
+              `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+              ` — per SUP-12693.`,
+          },
+        });
+        return;
+      }
+      if (tierResult.tier === "tier1") {
+        void writeAuditLog(db, existing, "issue.done_transition_tier1_close", {
+          reason: tierResult.reason,
+        });
       }
     }
 
