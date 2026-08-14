@@ -1,5 +1,6 @@
+import { basename } from "node:path";
 import { readdir, readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 const journalPath = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
@@ -15,7 +16,7 @@ const journalPath = fileURLToPath(new URL("./migrations/meta/_journal.json", imp
  * This is the fold branch's tip migration as of 2026-08-14. Everything from
  * here on is fork-controlled or fold-restamped, so it can and must be clean.
  */
-const MIGRATION_WHEN_MONOTONIC_BASELINE_TAG = "0189_merge_arming_enabled";
+export const MIGRATION_WHEN_MONOTONIC_BASELINE_TAG = "0189_merge_arming_enabled";
 
 type JournalFile = {
   entries?: Array<{
@@ -80,7 +81,7 @@ function ensureStrictlyOrdered(values: string[], label: string) {
  * one, so the array order a reader sees IS the order the migrator uses.
  * `fold-restamp-migrations.ts` is what re-establishes this after a fold.
  */
-function ensureMonotonicWhen(entries: Array<{ tag?: string; when?: number }>) {
+export function ensureMonotonicWhen(entries: Array<{ tag?: string; when?: number }>) {
   let runningMax = Number.NEGATIVE_INFINITY;
   let runningMaxTag = "";
   let enforcing = false;
@@ -163,4 +164,12 @@ async function main() {
   ensureMonotonicWhen(journal.entries ?? []);
 }
 
-await main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    await main();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`${basename(process.argv[1])}: ${detail}`);
+    process.exitCode = 1;
+  }
+}

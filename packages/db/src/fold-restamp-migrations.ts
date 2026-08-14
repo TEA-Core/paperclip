@@ -46,15 +46,31 @@
  */
 import { execFileSync } from "node:child_process";
 import { readFile, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 const journalPath = join(migrationsDir, "meta", "_journal.json");
 const journalRepoPath = "packages/db/src/migrations/meta/_journal.json";
 
-type JournalEntry = { idx: number; version: string; when: number; tag: string; breakpoints?: boolean };
-type Journal = { version: string; dialect: string; entries: JournalEntry[] };
+export type JournalEntry = { idx: number; version: string; when: number; tag: string; breakpoints?: boolean };
+export type Journal = { version: string; dialect: string; entries: JournalEntry[] };
+
+export type FoldRestampRename = { from: string; to: string; when: number };
+export type FoldRestampPlan = {
+  /** Fork entries, untouched and kept at the front of the journal. */
+  ours: JournalEntry[];
+  /** Newly folded entries, renumbered and re-stamped above the fork line. */
+  restamped: JournalEntry[];
+  /** File renames implied by the renumbering. */
+  renames: FoldRestampRename[];
+  /** Highest migration number on the fork line. */
+  maxNumber: number;
+  /** Highest `when` on the fork line: the deployed apply watermark. */
+  maxWhen: number;
+  /** The journal to write: fork line first, re-stamped folds after, `idx` resequenced. */
+  journal: Journal;
+};
 
 function arg(name: string, fallback: string | null = null): string | null {
   const index = process.argv.indexOf(name);
@@ -78,6 +94,50 @@ function renumber(tag: string, next: number): string {
   return `${String(next).padStart(4, "0")}_${tag.slice(5)}`;
 }
 
+/**
+ * Compute the re-stamp plan. Pure: no disk, no git, no process state.
+ *
+ * `baseJournal` is the pre-fold journal, and its tags are what identifies the
+ * fork's own entries. Everything in `journal` that it does not know about is a
+ * newly folded upstream migration. Returns null when there is nothing to do.
+ */
+export function planFoldRestamp(journal: Journal, baseJournal: Journal): FoldRestampPlan | null {
+  const forkTags = new Set(baseJournal.entries.map((entry) => entry.tag));
+  const ours = journal.entries.filter((entry) => forkTags.has(entry.tag));
+  const folded = journal.entries.filter((entry) => !forkTags.has(entry.tag));
+
+  if (folded.length === 0) return null;
+  if (ours.length === 0) throw new Error("Journal shares no entries with the base journal — wrong --base ref?");
+
+  // The fork's own line is the fixed point: its highest number and highest
+  // `when` are what the deployed database has already applied.
+  const maxNumber = Math.max(...ours.map((entry) => migrationNumber(entry.tag)));
+  const maxWhen = Math.max(...ours.map((entry) => entry.when));
+
+  // Keep upstream's relative order. Their own `when` values are the only
+  // ordering signal we have for them, and upstream authored them in that order.
+  const ordered = [...folded].sort((a, b) => a.when - b.when);
+
+  const renames: FoldRestampRename[] = [];
+  const restamped: JournalEntry[] = ordered.map((entry, index) => {
+    const tag = renumber(entry.tag, maxNumber + 1 + index);
+    const when = maxWhen + 1000 * (index + 1);
+    if (tag !== entry.tag) renames.push({ from: `${entry.tag}.sql`, to: `${tag}.sql`, when });
+    return { ...entry, tag, when };
+  });
+
+  const entries = [...ours, ...restamped].map((entry, index) => ({ ...entry, idx: index }));
+
+  return {
+    ours,
+    restamped,
+    renames,
+    maxNumber,
+    maxWhen,
+    journal: { version: journal.version, dialect: journal.dialect, entries },
+  };
+}
+
 async function main() {
   const apply = process.argv.includes("--apply");
   const baseRef = arg("--base", "origin/fold/tea-patches-v2026.722.0")!;
@@ -92,36 +152,17 @@ async function main() {
     throw new Error(`Could not read ${journalRepoPath} at ${baseRef}. Pass --base <ref>.`);
   }
 
-  const forkTags = new Set(baseJournal.entries.map((entry) => entry.tag));
-  const ours = journal.entries.filter((entry) => forkTags.has(entry.tag));
-  const folded = journal.entries.filter((entry) => !forkTags.has(entry.tag));
-
-  if (folded.length === 0) {
+  const plan = planFoldRestamp(journal, baseJournal);
+  if (!plan) {
     console.log("No newly folded migrations — journal already reflects the fork line.");
     return;
   }
 
-  // The fork's own line is the fixed point: its highest number and highest
-  // `when` are what the deployed database has already applied.
-  const maxNumber = Math.max(...ours.map((entry) => migrationNumber(entry.tag)));
-  const maxWhen = Math.max(...ours.map((entry) => entry.when));
-
-  // Keep upstream's relative order. Their own `when` values are the only
-  // ordering signal we have for them, and upstream authored them in that order.
-  const ordered = [...folded].sort((a, b) => a.when - b.when);
-
-  const renames: Array<{ from: string; to: string; when: number }> = [];
-  const restamped: JournalEntry[] = ordered.map((entry, index) => {
-    const tag = renumber(entry.tag, maxNumber + 1 + index);
-    const when = maxWhen + 1000 * (index + 1);
-    if (tag !== entry.tag) renames.push({ from: `${entry.tag}.sql`, to: `${tag}.sql`, when });
-    return { ...entry, tag, when };
-  });
-
-  const merged = [...ours, ...restamped].map((entry, index) => ({ ...entry, idx: index }));
+  const { ours, restamped, renames, maxNumber, maxWhen } = plan;
+  const merged = plan.journal.entries;
 
   console.log(`fork line:      ${ours.length} entries, highest ${String(maxNumber).padStart(4, "0")}, when ${maxWhen}`);
-  console.log(`newly folded:   ${folded.length} entries -> ${String(maxNumber + 1).padStart(4, "0")}..${String(maxNumber + folded.length).padStart(4, "0")}, when ${maxWhen + 1000}..${maxWhen + 1000 * folded.length}`);
+  console.log(`newly folded:   ${restamped.length} entries -> ${String(maxNumber + 1).padStart(4, "0")}..${String(maxNumber + restamped.length).padStart(4, "0")}, when ${maxWhen + 1000}..${maxWhen + 1000 * restamped.length}`);
   for (const rename_ of renames) console.log(`  ${rename_.from} -> ${rename_.to}  (when ${rename_.when})`);
 
   if (!apply) {
@@ -140,13 +181,17 @@ async function main() {
     }
   }
 
-  const next: Journal = { version: journal.version, dialect: journal.dialect, entries: merged };
-  await writeFile(journalPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  await writeFile(journalPath, `${JSON.stringify(plan.journal, null, 2)}\n`, "utf8");
   console.log(`\nRewrote ${journalRepoPath}: ${merged.length} entries, last ${merged[merged.length - 1].tag} @ ${merged[merged.length - 1].when}.`);
   console.log("Run `pnpm --filter @paperclipai/db run check:migrations` to verify.");
 }
 
-await main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    await main();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`${basename(process.argv[1])}: ${detail}`);
+    process.exitCode = 1;
+  }
+}
