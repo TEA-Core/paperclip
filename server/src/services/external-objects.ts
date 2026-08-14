@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, isNull, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { documents, externalObjectMentions, externalObjects, issueComments, issueDocuments, issues, plugins } from "@paperclipai/db";
+import { companies, documents, externalObjectMentions, externalObjects, issueComments, issueDocuments, issues, plugins } from "@paperclipai/db";
 import {
   formatExternalObjectMentionSourceLabel,
   type ExternalObjectCanonicalUrl,
@@ -918,13 +918,34 @@ export function externalObjectService(
       .limit(limit);
     const results = [];
     for (const row of due) {
-      results.push(await refreshObject(row.id, {
-        companyId,
-        actor: { actorType: "system", actorId: "external-object-resolver", agentId: null, runId: null },
-        now,
-      }));
+      try {
+        results.push(await refreshObject(row.id, {
+          companyId,
+          actor: { actorType: "system", actorId: "external-object-resolver", agentId: null, runId: null },
+          now,
+        }));
+      } catch (err) {
+        logger.error({ err, objectId: row.id, companyId }, "external object refresh failed for object");
+      }
     }
     return results;
+  }
+
+  async function refreshDueObjectsForAllCompanies(limit = 50) {
+    if (!(await isEnabled())) return { companies: 0, refreshed: 0 };
+    const companyIds = await db
+      .select({ id: companies.id })
+      .from(companies);
+    let refreshed = 0;
+    for (const row of companyIds) {
+      try {
+        const results = await refreshDueObjects(row.id, limit);
+        refreshed += results.length;
+      } catch (err) {
+        logger.error({ err, companyId: row.id }, "external object refresh sweep failed for company");
+      }
+    }
+    return { companies: companyIds.length, refreshed };
   }
 
   return {
@@ -941,5 +962,67 @@ export function externalObjectService(
     refreshObject,
     refreshIssueObjects,
     refreshDueObjects,
+    refreshDueObjectsForAllCompanies,
+  };
+}
+
+export type ExternalObjectRefreshSweepOptions = {
+  intervalMs: number;
+  /**
+   * Delay before the first sweep. Not zero, so a restart does not add a
+   * refresh sweep to the boot path; not the whole interval either, because a
+   * server that restarts more often than the interval would then never sweep.
+   */
+  initialDelayMs?: number;
+  /** Maximum objects to refresh per company per tick. */
+  limit?: number;
+  /** Seam for tests. */
+  runSweep?: (svc: ReturnType<typeof externalObjectService>) => Promise<unknown>;
+};
+
+const DEFAULT_INITIAL_DELAY_MS = 60_000;
+const DEFAULT_LIMIT = 50;
+
+export function startExternalObjectRefreshSweep(
+  db: Db,
+  opts: {
+    detectors?: ExternalObjectDetector[];
+    resolvers?: ExternalObjectResolver[];
+    pluginWorkerManager?: PluginWorkerManager;
+    github?: GitHubExternalObjectProviderOptions | false;
+    enabled?: boolean | (() => boolean | Promise<boolean>);
+  },
+  schedule: ExternalObjectRefreshSweepOptions,
+): () => void {
+  const svc = externalObjectService(db, opts);
+  const runSweep = schedule.runSweep ?? ((s) => s.refreshDueObjectsForAllCompanies(schedule.limit ?? DEFAULT_LIMIT));
+  let inFlight = false;
+  let stopped = false;
+
+  const tick = () => {
+    if (stopped) return;
+    if (inFlight) {
+      logger.info("external object refresh sweep still running; skipping this tick");
+      return;
+    }
+    inFlight = true;
+    void Promise.resolve(runSweep(svc))
+      .catch((err) => {
+        logger.warn({ err }, "external object refresh sweep threw");
+      })
+      .finally(() => {
+        inFlight = false;
+      });
+  };
+
+  const initialTimer = setTimeout(tick, schedule.initialDelayMs ?? DEFAULT_INITIAL_DELAY_MS);
+  initialTimer.unref?.();
+  const timer = setInterval(tick, schedule.intervalMs);
+  timer.unref?.();
+
+  return () => {
+    stopped = true;
+    clearTimeout(initialTimer);
+    clearInterval(timer);
   };
 }

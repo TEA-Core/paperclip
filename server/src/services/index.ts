@@ -53,10 +53,12 @@ export {
   createExternalObjectDetectorRegistry,
   createExternalObjectResolverRegistry,
   externalObjectService,
+  startExternalObjectRefreshSweep,
   type ExternalObjectDetector,
   type ExternalObjectResolver,
   type ExternalObjectResolveResult,
   type ExternalObjectResolverSnapshot,
+  type ExternalObjectRefreshSweepOptions,
 } from "./external-objects.js";
 export { goalService } from "./goals.js";
 export { activityService, type ActivityFilters } from "./activity.js";
