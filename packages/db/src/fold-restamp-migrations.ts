@@ -114,9 +114,15 @@ export function planFoldRestamp(journal: Journal, baseJournal: Journal): FoldRes
   const maxNumber = Math.max(...ours.map((entry) => migrationNumber(entry.tag)));
   const maxWhen = Math.max(...ours.map((entry) => entry.when));
 
-  // Keep upstream's relative order. Their own `when` values are the only
-  // ordering signal we have for them, and upstream authored them in that order.
-  const ordered = [...folded].sort((a, b) => a.when - b.when);
+  // Keep upstream's relative order, which is the journal ARRAY order and not
+  // `when` order. drizzle reads the single newest `created_at` once and then
+  // walks `journal.entries` in array order, so the array is what decides the
+  // sequence a migration is applied in; `when` only gates whether it runs at
+  // all. Upstream's own `when` values are not monotonic against that array
+  // (0194_company_skill_releases carries a lower `when` than the
+  // 0193_document_memberships that precedes it), so sorting by `when` here
+  // would silently reorder upstream's migrations against each other.
+  const ordered = folded;
 
   const renames: FoldRestampRename[] = [];
   const restamped: JournalEntry[] = ordered.map((entry, index) => {

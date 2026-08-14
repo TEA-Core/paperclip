@@ -83,20 +83,33 @@ describe("fold re-stamp plan", () => {
     }
   });
 
-  it("keeps upstream's relative order even when files sort the other way", () => {
+  // drizzle-orm/migrator.js walks `journal.entries` with a plain
+  // `for (const journalEntry of journal.entries)` and never sorts, so the ARRAY
+  // is what decides the order migrations are applied in; `when` only gates
+  // whether an entry runs at all against the single newest `created_at`. That
+  // makes upstream's array order the order upstream itself applies them in, and
+  // it is the only ordering the re-stamp is allowed to preserve. Upstream's
+  // `when` values are NOT monotonic against that array — in the 2026-08-14 fold,
+  // 0194_company_skill_releases carried a lower `when` than the
+  // 0193_document_memberships preceding it — so sorting by `when` would reorder
+  // upstream's migrations against each other and against their dependencies.
+  it("keeps upstream's journal array order even when `when` sorts the other way", () => {
     const plan = planFoldRestamp(
       journal([
         ...baseJournal.entries,
-        { tag: "0190_authored_second", when: 1784916886226 },
-        { tag: "0191_authored_first", when: 1784916880226 },
+        { tag: "0190_applied_first", when: 1784916886226 },
+        { tag: "0191_applied_second", when: 1784916880226 },
       ]),
       baseJournal,
     )!;
 
     expect(plan.restamped.map((entry) => entry.tag)).toEqual([
-      "0190_authored_first",
-      "0191_authored_second",
+      "0190_applied_first",
+      "0191_applied_second",
     ]);
+    // And the re-stamped `when` values are monotonic in that same order, so the
+    // watermark can never skip the second one.
+    expect(plan.restamped[0].when).toBeLessThan(plan.restamped[1].when);
   });
 
   it("returns null when the journal holds no newly folded migrations", () => {
