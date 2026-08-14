@@ -69,6 +69,21 @@ export interface LogActivityInput {
   agentApiKeyId?: string | null;
   issueId?: string | null;
   details?: Record<string, unknown> | null;
+  responsibleUserIdOverride?: string | null;
+}
+
+export async function createActivityDetailsRedactor(db: Db) {
+  const currentUserRedactionOptions = {
+    enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
+  };
+  return (details: Record<string, unknown> | null) => (
+    details ? redactCurrentUserValue(sanitizeRecord(details), currentUserRedactionOptions) : null
+  );
+}
+
+export async function redactActivityDetails(db: Db, details: Record<string, unknown> | null) {
+  if (!details) return null;
+  return (await createActivityDetailsRedactor(db))(details);
 }
 
 function readNonEmptyString(value: unknown) {
@@ -142,22 +157,21 @@ async function resolveResponsibleUserIdWithRun(
 }
 
 export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActivityInput) {
+  if (input.responsibleUserIdOverride !== undefined) {
+    return readNonEmptyString(input.responsibleUserIdOverride);
+  }
   if (input.actorType === "user") return readNonEmptyString(input.actorId);
   return resolveResponsibleUserIdWithRun(db, input, await lookupActivityRun(db, input));
 }
 
 async function writeActivity(db: Db, input: LogActivityInput) {
-  const currentUserRedactionOptions = {
-    enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
-  };
-  const sanitizedDetails = input.details ? sanitizeRecord(input.details) : null;
-  const redactedDetails = sanitizedDetails
-    ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
-    : null;
+  const redactedDetails = await redactActivityDetails(db, input.details ?? null);
   const run = await lookupActivityRun(db, input);
-  const responsibleUserId = input.actorType === "user"
-    ? readNonEmptyString(input.actorId)
-    : await resolveResponsibleUserIdWithRun(db, input, run);
+  const responsibleUserId = input.responsibleUserIdOverride !== undefined
+    ? readNonEmptyString(input.responsibleUserIdOverride)
+    : input.actorType === "user"
+      ? readNonEmptyString(input.actorId)
+      : await resolveResponsibleUserIdWithRun(db, input, run);
   // Only stamp run_id when the run actually exists here; a dangling reference would trip the
   // `activity_log_run_id_heartbeat_runs_id_fk` foreign key and cost us the whole audit row.
   const runId = run?.row ? run.runId : null;
@@ -173,7 +187,7 @@ async function writeActivity(db: Db, input: LogActivityInput) {
       "activity log references an unknown run; recording the entry without a run id",
     );
   }
-  await db.insert(activityLog).values({
+  const [activity] = await db.insert(activityLog).values({
     companyId: input.companyId,
     actorType: input.actorType,
     actorId: input.actorId,
@@ -184,7 +198,7 @@ async function writeActivity(db: Db, input: LogActivityInput) {
     runId,
     responsibleUserId,
     details: redactedDetails,
-  });
+  }).returning({ id: activityLog.id });
 
   publishLiveEvent({
     companyId: input.companyId,
@@ -222,6 +236,8 @@ async function writeActivity(db: Db, input: LogActivityInput) {
     };
     publishPluginDomainEvent(event);
   }
+
+  return activity;
 }
 
 /**
@@ -234,7 +250,7 @@ async function writeActivity(db: Db, input: LogActivityInput) {
  */
 export async function logActivity(db: Db, input: LogActivityInput) {
   try {
-    await writeActivity(db, input);
+    return await writeActivity(db, input);
   } catch (err) {
     logger.error(
       {
@@ -261,5 +277,5 @@ export async function logActivity(db: Db, input: LogActivityInput) {
  * share a fate, which is exactly the guarantee a caller opens a transaction for.
  */
 export async function logActivityInTransaction(tx: Db, input: LogActivityInput) {
-  await writeActivity(tx, input);
+  return writeActivity(tx, input);
 }

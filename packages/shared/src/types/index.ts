@@ -19,13 +19,26 @@ export type {
   AttentionItem,
   AttentionItemDetail,
   AttentionItemDismissal,
+  AttentionFeedQuery,
   AttentionProjectRef,
+  AttentionQueueRef,
   AttentionSeverity,
+  AttentionSortMode,
   AttentionSourceKind,
   AttentionSubject,
   AttentionSubjectKind,
+  AttentionTriageAttribution,
   AttentionWorkspaceRef,
 } from "./attention.js";
+export { ATTENTION_SOURCE_KINDS } from "./attention.js";
+export type {
+  DecisionQueue,
+  DecisionQueueItem,
+  DecisionQueueSeedRule,
+  DecisionQueueSeedRuleSignal,
+  DecisionTriage,
+  DecisionTriageDecideBy,
+} from "./decision-queue.js";
 export type {
   DecisionTrainingExample,
   DecisionTrainingNotesHistoryEntry,
@@ -542,6 +555,8 @@ export type {
 export type {
   CompactIssue,
   Issue,
+  IssueChangeReceiptEntry,
+  IssueChanges,
   IssueWorkMode,
   IssueAssigneeAdapterOverrides,
   IssueBlockerDiagnosticFlag,
@@ -794,6 +809,23 @@ export type {
 } from "./resource-memberships.js";
 export { RESOURCE_MEMBERSHIP_STATES } from "./resource-memberships.js";
 export type { InboxDismissal, InboxDismissalKind } from "./inbox-dismissal.js";
+export type {
+  DecisionEffectStaleness,
+  DecisionOptionStyle,
+  DecisionInput,
+  CommentOnIssueDecisionEffect,
+  CreateIssueDecisionEffect,
+  UpdateIssueStatusDecisionEffect,
+  AssignIssueDecisionEffect,
+  CancelIssueTreeDecisionEffect,
+  ResolveBlockerDecisionEffect,
+  DecisionEffect,
+  DecisionOption,
+  DecisionStatsCounts,
+  DecisionChosenOptionCount,
+  DecisionRuleKeyStats,
+  DecisionStatsResponse,
+} from "./decision.js";
 export type {
   AccessUserProfile,
   CompanyMemberRecord,

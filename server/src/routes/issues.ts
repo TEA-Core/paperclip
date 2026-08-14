@@ -91,6 +91,7 @@ import {
   type IssueWakeDiagnosticWakeRequest,
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
+  type IssueCommentPresentation,
   type IssueWatchdogDiscoveryKind,
   type ProjectWorkspace,
   type SourceTrustMetadata,
@@ -227,6 +228,13 @@ const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObject
   force: z.boolean().optional(),
   doneTransitionOverride: doneTransitionOverrideSchema.optional().nullable(),
 }));
+
+function prefersMinimalIssueUpdateResponse(req: Request) {
+  return (req.get("Prefer") ?? "")
+    .split(",")
+    .some((preference) => preference.trim().toLowerCase() === "return=minimal");
+}
+
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
 }).strict();
@@ -4277,6 +4285,53 @@ export function issueRoutes(
     return run;
   }
 
+  function readObject(value: unknown): Record<string, unknown> {
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  }
+
+  async function deriveRecoveryCommentPresentation(
+    req: Request,
+    companyId: string,
+    body: string,
+  ): Promise<IssueCommentPresentation | null> {
+    const run = await loadActorRunContext(req, companyId);
+    if (!run) return null;
+
+    const context = readObject(run.contextSnapshot);
+    const paperclipWake = readObject(context.paperclipWake);
+    const recovery = readObject(paperclipWake.recovery);
+    const wakeReason = typeof context.wakeReason === "string"
+      ? context.wakeReason
+      : typeof paperclipWake.reason === "string"
+        ? paperclipWake.reason
+        : null;
+    if (wakeReason !== "source_scoped_recovery_action") return null;
+
+    const recoveryCause = typeof context.recoveryCause === "string"
+      ? context.recoveryCause
+      : typeof recovery.cause === "string"
+        ? recovery.cause
+        : null;
+    if (
+      recoveryCause === "successful_run_missing_state" ||
+      recoveryCause === "successful_run_missing_issue_disposition"
+    ) {
+      return null;
+    }
+
+    const firstLine = body.split(/\r?\n/, 1)[0]?.trim() || "Recovery update";
+    const title = firstLine.length > 160 ? `${firstLine.slice(0, 159)}…` : firstLine;
+    return {
+      kind: "system_notice",
+      tone: "info",
+      title,
+      detailsDefaultOpen: false,
+      density: "compact",
+    };
+  }
+
   async function assertCheapRecoveryIssueAssigneeProfileAllowed(
     req: Request,
     res: Response,
@@ -4584,9 +4639,38 @@ export function issueRoutes(
     };
   }
 
+  /**
+   * Refuse an agent creating a child issue assigned to the agent that created
+   * a still-open ancestor in the same chain. That shape is a delegation cycle
+   * (A delegates to B, B delegates the same work back to A): each agent lacks
+   * something the other assumed it had, the chain of blocked issues grows,
+   * and no one tells the human. Humans are unaffected, and closed ancestors
+   * do not count — re-engaging the creator of finished work is normal.
+   */
+  async function assertNoAgentDelegationCycle(input: {
+    actorType: string;
+    parentIssueId: string | null | undefined;
+    assigneeAgentId: string | null | undefined;
+  }) {
+    if (input.actorType !== "agent") return;
+    if (!input.parentIssueId || !input.assigneeAgentId) return;
+    const ancestor = await svc.findOpenAncestorCreatedByAgent(input.parentIssueId, input.assigneeAgentId);
+    if (!ancestor) return;
+    throw conflict(
+      `Delegation cycle: ${ancestor.identifier ?? "an ancestor issue"} in this chain was created by the agent this child would be assigned to. ` +
+        "Complete the remaining work in your own issue, leave the child unassigned, or escalate to a board operator — do not delegate the work back to the agent that delegated it to you.",
+      {
+        code: "delegation_cycle",
+        ancestorIssueId: ancestor.id,
+        assigneeAgentId: input.assigneeAgentId,
+      },
+    );
+  }
+
   async function normalizeIssueAssigneeAgentReference(
     companyId: string,
     rawAssigneeAgentId: string | null | undefined,
+    options: { actorType?: string } = {},
   ) {
     if (rawAssigneeAgentId === undefined || rawAssigneeAgentId === null) {
       return { id: rawAssigneeAgentId, name: null };
@@ -4609,6 +4693,18 @@ export function issueRoutes(
     }
     if (resolved.agent.status === "terminated") {
       throw conflict("Cannot assign work to terminated agents");
+    }
+    // Agents must not route work to a paused peer/manager: the assignment is
+    // accepted silently, nothing will ever run it, and the issue becomes an
+    // invisible dead letter (e.g. escalation issues assigned to a paused
+    // manager via the org chart). Humans may still assign to paused agents
+    // deliberately — the pause state is visible in the UI and staging work
+    // for a later unpause is a legitimate workflow.
+    if (options.actorType === "agent" && resolved.agent.status === "paused") {
+      throw conflict(
+        "Cannot assign work to a paused agent. Assign an invokable agent, leave the issue unassigned, or escalate to a board operator instead.",
+        { assigneeAgentId: resolved.agent.id, assigneeStatus: "paused" },
+      );
     }
     if (resolved.agent.orgChainHealth?.status === "invalid_org_chain") {
       throw conflict(
@@ -7412,7 +7508,13 @@ export function issueRoutes(
     const normalizedAssigneeAgentRef = await normalizeIssueAssigneeAgentReference(
       companyId,
       rawCreateBody.assigneeAgentId as string | null | undefined,
+      { actorType: req.actor.type },
     );
+    await assertNoAgentDelegationCycle({
+      actorType: req.actor.type,
+      parentIssueId: typeof effectiveParentId === "string" ? effectiveParentId : null,
+      assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+    });
     const actor = getActorInfo(req);
     const requestsWorkspaceInheritanceFromRun = !hasExplicitIssueWorkspaceCreateSelection(rawCreateBody);
     const runWorkspaceInheritanceSourceIssueId = requestsWorkspaceInheritanceFromRun
@@ -7668,7 +7770,13 @@ export function issueRoutes(
     const normalizedAssigneeAgentRef = await normalizeIssueAssigneeAgentReference(
       parent.companyId,
       sanitizedBody.assigneeAgentId as string | null | undefined,
+      { actorType: req.actor.type },
     );
+    await assertNoAgentDelegationCycle({
+      actorType: req.actor.type,
+      parentIssueId: parent.id,
+      assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+    });
     const createBody = {
       ...sanitizedBody,
       ...(normalizedAssigneeAgentRef.id !== undefined ? { assigneeAgentId: normalizedAssigneeAgentRef.id } : {}),
@@ -7861,6 +7969,7 @@ export function issueRoutes(
       const normalizedAssigneeAgentRef = await normalizeIssueAssigneeAgentReference(
         sourceIssue.companyId,
         sanitizedChild.assigneeAgentId as string | null | undefined,
+        { actorType: req.actor.type },
       );
       const childBody = {
         ...sanitizedChild,
@@ -8172,6 +8281,7 @@ export function issueRoutes(
     const normalizedAssigneeAgentRef = await normalizeIssueAssigneeAgentReference(
       existing.companyId,
       req.body.assigneeAgentId as string | null | undefined,
+      { actorType: req.actor.type },
     );
     const normalizedAssigneeAgentId = normalizedAssigneeAgentRef.id;
     const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
@@ -8469,6 +8579,7 @@ export function issueRoutes(
         agentId: actor.agentId ?? null,
         userId: actor.actorType === "user" ? actor.actorId : null,
       },
+      allowBoardOverride: req.actor.type === "board",
       commentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
@@ -8892,6 +9003,8 @@ export function issueRoutes(
       updatedRelations = await svc.getRelationSummaries(issue.id);
       issueResponse = {
         ...issue,
+        blockedByIssueIds:
+          issue.blockedByIssueIds ?? [...new Set(req.body.blockedByIssueIds as string[])].sort(),
         blockedBy: updatedRelations.blockedBy,
         blocks: updatedRelations.blocks,
       };
@@ -9683,7 +9796,19 @@ export function issueRoutes(
     })();
 
     await queueTaskWatchdogEvaluation(issue, actor.runId);
-    res.json({ ...issueResponse, comment });
+    const changes = issueResponse.changes ?? {};
+    if (prefersMinimalIssueUpdateResponse(req)) {
+      res.setHeader("Preference-Applied", "return=minimal");
+      res.json({
+        id: issueResponse.id,
+        identifier: issueResponse.identifier,
+        updatedAt: issueResponse.updatedAt,
+        changes,
+        comment,
+      });
+      return;
+    }
+    res.json({ ...issueResponse, changes, comment });
   });
 
   router.delete("/issues/:id", async (req, res) => {
@@ -10663,6 +10788,8 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
+    const commentPresentation = req.body.presentation ??
+      await deriveRecoveryCommentPresentation(req, issue.companyId, req.body.body);
     const reopenRequested = req.body.reopen === true;
     const resumeRequested = req.body.resume === true;
     const interruptRequested = req.body.interrupt === true;
@@ -10884,7 +11011,7 @@ export function issueRoutes(
       const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);
       const commentOptions = {
         authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
-        presentation: req.body.presentation ?? null,
+        presentation: commentPresentation,
         metadata: req.body.metadata ?? null,
         sourceTrust,
       };
@@ -10969,7 +11096,7 @@ export function issueRoutes(
         runId: actor.runId,
       }, {
         authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
-        presentation: req.body.presentation ?? null,
+        presentation: commentPresentation,
         metadata: req.body.metadata ?? null,
         sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
       });
