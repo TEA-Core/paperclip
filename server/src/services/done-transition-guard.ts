@@ -5,6 +5,7 @@ import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
+import type { IssueComment } from "@paperclipai/shared";
 
 const GITHUB_TOKEN_SECRET_NAMES = ["GITHUB_TOKEN", "GH_TOKEN", "PAPERCLIP_GITHUB_TOKEN"] as const;
 
@@ -13,6 +14,10 @@ const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "child-delivery-parent-close",
   "merged-elsewhere",
 ]);
+
+const TIER_2_PREFIX = "Closed at Tier 2 (live):";
+const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
+const TIER_1_SUFFIX = "Liveness unverified.";
 
 export interface DoneTransitionGuardResult {
   allowed: boolean;
@@ -29,6 +34,14 @@ export interface DoneTransitionGuardResult {
 export interface DoneTransitionOverride {
   disposition: string;
   reason?: string;
+}
+
+export interface DoneTierDeclarationResult {
+  allowed: boolean;
+  reason: string;
+  tier: "tier1" | "tier2" | null;
+  skipped: boolean;
+  skipReason: string | null;
 }
 
 function parseRepoUrl(repoUrl: string | null): { hostname: string; owner: string; repo: string } | null {
@@ -210,6 +223,191 @@ async function writeAuditLog(
   } catch (err) {
     logger.warn({ err, issueId: issue.id, action }, "failed to write done-transition audit log");
   }
+}
+
+function parseTier2Declaration(body: string): { matched: boolean; evidence: string } {
+  const lines = body.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith(TIER_2_PREFIX)) {
+      const evidence = trimmed.slice(TIER_2_PREFIX.length).trim();
+      if (evidence.length > 0) {
+        return { matched: true, evidence };
+      }
+      const idx = lines.indexOf(line);
+      const nextLine = idx >= 0 && idx + 1 < lines.length ? lines[idx + 1] : undefined;
+      if (nextLine !== undefined) {
+        const nextTrimmed = nextLine.trim();
+        if (nextTrimmed.length > 0) {
+          return { matched: true, evidence: nextTrimmed };
+        }
+      }
+      return { matched: false, evidence: "" };
+    }
+  }
+  return { matched: false, evidence: "" };
+}
+
+function parseTier1Declaration(body: string): { matched: boolean; reason: string } {
+  const lines = body.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith(TIER_1_PREFIX)) {
+      const rest = trimmed.slice(TIER_1_PREFIX.length).trim();
+      const suffixIdx = rest.lastIndexOf(TIER_1_SUFFIX);
+      if (suffixIdx === -1) {
+        return { matched: false, reason: "" };
+      }
+      const reason = rest.slice(0, suffixIdx).trim();
+      return { matched: true, reason };
+    }
+  }
+  return { matched: false, reason: "" };
+}
+
+export async function evaluateDoneTierDeclaration(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  accompanyingComment: string | null,
+  runId: string | null,
+  listComments: (issueId: string) => Promise<IssueComment[]>,
+): Promise<DoneTierDeclarationResult> {
+  const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTierDeclarationResult => ({
+    allowed: true,
+    reason,
+    tier: null,
+    skipped,
+    skipReason,
+  });
+
+  if (accompanyingComment && accompanyingComment.trim().length > 0) {
+    const tier2 = parseTier2Declaration(accompanyingComment);
+    if (tier2.matched) {
+      return {
+        allowed: true,
+        reason: `Tier 2 declaration found: ${tier2.evidence.slice(0, 200)}`,
+        tier: "tier2",
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    const tier1 = parseTier1Declaration(accompanyingComment);
+    if (tier1.matched) {
+      if (tier1.reason.length === 0) {
+        return {
+          allowed: false,
+          reason: `Tier 1 declaration found but <reason> is empty. Use: "Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."`,
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return {
+        allowed: true,
+        reason: `Tier 1 declaration found: ${tier1.reason.slice(0, 200)}`,
+        tier: "tier1",
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    return {
+      allowed: false,
+      reason:
+        "Close comment is missing a done-tier declaration. Accepted forms: " +
+        `"Closed at Tier 2 (live): <probe evidence>"` +
+        ` or ` +
+        `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+        ` — per SUP-12693.`,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  if (!runId) {
+    return fallback(
+      "No accompanying comment and no run id to look up same-run comment; transition allowed",
+      true,
+      "no_accompanying_comment_no_run_id",
+    );
+  }
+
+  let comments: IssueComment[];
+  try {
+    comments = await listComments(issue.id);
+  } catch (err) {
+    return fallback(
+      "Comment store lookup failed; transition allowed",
+      true,
+      `comment_store_failed:${err instanceof Error ? err.message : "unknown"}`,
+    );
+  }
+
+  const sameRunComment = comments.find((c) => {
+    const commentRunId = c.createdByRunId ?? c.derivedCreatedByRunId;
+    return commentRunId === runId;
+  });
+
+  if (!sameRunComment || !sameRunComment.body || sameRunComment.body.trim().length === 0) {
+    return {
+      allowed: false,
+      reason:
+        "No done-tier declaration found in the accompanying comment or the most recent same-run comment. " +
+        `Accepted forms: "Closed at Tier 2 (live): <probe evidence>"` +
+        ` or ` +
+        `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+        ` — per SUP-12693.`,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  const tier2 = parseTier2Declaration(sameRunComment.body);
+  if (tier2.matched) {
+    return {
+      allowed: true,
+      reason: `Tier 2 declaration found in same-run comment: ${tier2.evidence.slice(0, 200)}`,
+      tier: "tier2",
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  const tier1 = parseTier1Declaration(sameRunComment.body);
+  if (tier1.matched) {
+    if (tier1.reason.length === 0) {
+      return {
+        allowed: false,
+        reason:
+          "Tier 1 declaration found in same-run comment but <reason> is empty. " +
+          `Use: "Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."`,
+        tier: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    return {
+      allowed: true,
+      reason: `Tier 1 declaration found in same-run comment: ${tier1.reason.slice(0, 200)}`,
+      tier: "tier1",
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  return {
+    allowed: false,
+    reason:
+      "Same-run comment does not contain a done-tier declaration. " +
+      `Accepted forms: "Closed at Tier 2 (live): <probe evidence>"` +
+      ` or ` +
+      `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+      ` — per SUP-12693.`,
+    tier: null,
+    skipped: false,
+    skipReason: null,
+  };
 }
 
 export async function evaluateDoneTransitionGuard(

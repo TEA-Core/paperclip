@@ -1,5 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { evaluateDoneTransitionGuard, type DoneTransitionOverride } from "./done-transition-guard.js";
+import {
+  evaluateDoneTransitionGuard,
+  evaluateDoneTierDeclaration,
+  type DoneTransitionOverride,
+} from "./done-transition-guard.js";
 
 const mockDb = {
   select: vi.fn(),
@@ -333,6 +337,228 @@ describe("evaluateDoneTransitionGuard", () => {
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
       expect(result.allowed).toBe(true);
       expect(result.aheadBy).toBe(1);
+    });
+  });
+});
+
+describe("evaluateDoneTierDeclaration", () => {
+  const tierIssue = {
+    id: "issue-1",
+    companyId: "company-1",
+    identifier: "SUP-12345",
+  };
+
+  function mockComment(body: string, runId: string | null = null) {
+    return {
+      id: "comment-1",
+      companyId: "company-1",
+      issueId: "issue-1",
+      authorType: "agent" as const,
+      authorAgentId: "agent-1",
+      authorUserId: null,
+      createdByRunId: runId,
+      derivedCreatedByRunId: runId,
+      derivedAuthorSource: null,
+      body,
+      presentation: null,
+      metadata: null,
+      deletedAt: null,
+      deletedByType: null,
+      deletedByAgentId: null,
+      deletedByUserId: null,
+      deletedByRunId: null,
+      sourceTrust: null,
+      followUpRequested: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
+  describe("Tier 2 via accompanying comment", () => {
+    it("allows transition with well-formed Tier 2 declaration and non-empty evidence", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 2 (live): probe output shows the fix is live.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+    });
+
+    it("allows transition with Tier 2 declaration and evidence on the following line", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Some context\nClosed at Tier 2 (live):\nProbe output: fix confirmed live.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+    });
+
+    it("rejects Tier 2 declaration with empty evidence and no following line", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 2 (live):",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("Tier 2");
+    });
+
+    it("rejects Tier 2 declaration with only whitespace on the following line", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 2 (live):\n   ",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+    });
+  });
+
+  describe("Tier 1 via accompanying comment", () => {
+    it("allows transition with well-formed Tier 1 substitution and non-empty reason", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 1 (landed, not liveness-probed): production probe unavailable. Liveness unverified.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("rejects Tier 1 substitution with empty reason", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 1 (landed, not liveness-probed): Liveness unverified.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("empty");
+    });
+
+    it("rejects Tier 1 line missing the suffix", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 1 (landed, not liveness-probed): some reason",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+    });
+  });
+
+  describe("no accompanying comment — same-run comment lookup", () => {
+    it("allows transition when same-run comment has Tier 2 declaration", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        null,
+        "run-1",
+        () => Promise.resolve([mockComment("Closed at Tier 2 (live): probe evidence here.", "run-1")]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+    });
+
+    it("allows transition when same-run comment has Tier 1 substitution", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        null,
+        "run-1",
+        () => Promise.resolve([
+          mockComment(
+            "Closed at Tier 1 (landed, not liveness-probed): probe unavailable. Liveness unverified.",
+            "run-1",
+          ),
+        ]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("rejects when same-run comment has no tier declaration", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        null,
+        "run-1",
+        () => Promise.resolve([mockComment("Fixed the bug.", "run-1")]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("done-tier declaration");
+    });
+
+    it("rejects when no same-run comment exists", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        null,
+        "run-1",
+        () => Promise.resolve([mockComment("Fixed the bug.", "run-2")]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+    });
+
+    it("rejects when no run id and no accompanying comment", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        null,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("no_accompanying_comment_no_run_id");
+    });
+  });
+
+  describe("fail-open on comment store errors", () => {
+    it("allows transition when listComments throws", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        null,
+        "run-1",
+        () => Promise.reject(new Error("store unavailable")),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("comment_store_failed");
+    });
+  });
+
+  describe("ordering with SUP-12686", () => {
+    it("Tier 2 declaration in accompanying comment is accepted without GitHub API calls", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Closed at Tier 2 (live): probe confirms fix.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
     });
   });
 });
