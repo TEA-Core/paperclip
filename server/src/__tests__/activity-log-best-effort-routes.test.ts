@@ -233,7 +233,9 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
     const runId = unresolvableRunId();
     currentActor = label === "agent" ? agentActor(companyId, agentId, runId) : boardActor(companyId, runId);
 
-    const res = await request(app).patch(`/api/issues/${identifier}`).send({ status: "done" });
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Closed at Tier 2 (live): best-effort audit path exercised." });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await readStatus(issueId)).toBe("done");
@@ -274,7 +276,9 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
       : boardActor(companyId, unresolvableRunId());
     await rejectActivityLogInserts();
 
-    const res = await request(app).patch(`/api/issues/${identifier}`).send({ status: "done" });
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Closed at Tier 2 (live): best-effort audit path exercised." });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await readStatus(issueId)).toBe("done");
