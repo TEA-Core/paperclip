@@ -96,6 +96,7 @@ export interface Config {
   pendingReviewRearmMaxCount: number;
   recoveryActionWakeIntervalMs: number;
   companyDeletionEnabled: boolean;
+  externalObjectRefreshIntervalMs: number;
   telemetryEnabled: boolean;
 }
 
@@ -371,6 +372,7 @@ export function loadConfig(): Config {
     pendingReviewRearmWindowMs: Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_REARM_WINDOW_MS) || 30 * 60 * 1000),
     pendingReviewRearmMaxCount: Math.max(1, Number(process.env.PENDING_REVIEW_REARM_MAX_COUNT) || 3),
     companyDeletionEnabled,
+    externalObjectRefreshIntervalMs: Math.max(60000, Number(process.env.EXTERNAL_OBJECT_REFRESH_INTERVAL_MS) || 60_000),
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }
