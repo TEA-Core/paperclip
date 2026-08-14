@@ -8505,9 +8505,7 @@ export function issueRoutes(
       }
     }
 
-    const requestedStatus2 = typeof updateFields.status === "string" ? updateFields.status : undefined;
-    const isDoneRequest2 = requestedStatus2 === "done" && existing.status !== "done" && !transition.decision;
-    if (isDoneRequest2) {
+    if (isDoneRequest) {
       const tierResult = await evaluateDoneTierDeclaration(
         db,
         existing,
