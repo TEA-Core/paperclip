@@ -120,6 +120,8 @@ function buildResolvedWorkspace(overrides: Partial<ResolvedWorkspaceForRun> = {}
     repoRef: null,
     workspaceHints: [],
     warnings: [],
+    additionalWorkspaces: [],
+    referencedProjectFailures: [],
     ...overrides,
   };
 }

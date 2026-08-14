@@ -29,6 +29,7 @@ import {
   resolveTaskSessionConfigFreshness,
   resolveWorkspaceAfterLowTrustPreflight,
   stripHostWorkspaceProvisionForLowTrustSandbox,
+  type ResolvedWorkspaceForRun,
   type WorkspaceConfigFreshnessOperationInput,
 } from "./heartbeat.js";
 import { environmentRuntimeService, type EnvironmentRuntimeService } from "./environment-runtime.js";
@@ -147,22 +148,12 @@ export interface ExecutionWorkspaceProvisioningInput {
   runLifecycle: ExecutionWorkspaceProvisioningRunLifecycle;
 }
 
-export interface ResolvedWorkspaceForRun {
-  cwd: string;
-  source: "project_primary" | "task_session" | "agent_home";
-  projectId: string | null;
-  workspaceId: string | null;
-  repoUrl: string | null;
-  repoRef: string | null;
-  workspaceHints: Array<{
-    workspaceId: string;
-    cwd: string | null;
-    repoUrl: string | null;
-    repoRef: string | null;
-    defaultRef: string | null;
-  }>;
-  warnings: string[];
-}
+// Re-exported rather than redeclared. This module was extracted out of
+// heartbeat.ts, and a structural copy of the resolved-workspace shape silently
+// drifts every time upstream extends the original -- the 2026-08-14 fold added
+// `additionalWorkspaces` and `referencedProjectFailures` there, and a duplicate
+// would have dropped both without a type error at the seam.
+export type { ResolvedWorkspaceForRun };
 
 type WorkspaceReuseRequest = ReturnType<typeof resolveExecutionWorkspaceReuseRequestForIssue>;
 
@@ -181,6 +172,7 @@ type WorkspaceReuseProvisioningPolicy = ReturnType<
 export interface ProvisionedIssueExecutionWorkspace {
   kind: "provisioned";
   executionWorkspace: RealizedExecutionWorkspace;
+  resolvedWorkspace: ResolvedWorkspaceForRun;
   persistedExecutionWorkspace: ExecutionWorkspace | null;
   resolvedProjectId: string | null;
   resolvedProjectWorkspaceId: string | null;
@@ -392,6 +384,7 @@ export async function provisionIssueExecutionWorkspace(
     workspaceId: resolvedWorkspace.workspaceId,
     repoUrl: resolvedWorkspace.repoUrl,
     repoRef: resolvedWorkspace.repoRef,
+    additionalWorkspaces: resolvedWorkspace.additionalWorkspaces,
   } satisfies ExecutionWorkspaceInput;
 
   await assertGitWorktreeBaseWorkspaceReady({
@@ -735,6 +728,11 @@ export async function provisionIssueExecutionWorkspace(
   return {
     kind: "provisioned",
     executionWorkspace,
+    // The full resolved anchor+referenced workspace, not just the realized
+    // execution workspace. Run preparation needs `workspaceHints` and the
+    // referenced-project set off this, and rebuilding it from
+    // `executionWorkspace` alone silently drops both.
+    resolvedWorkspace,
     persistedExecutionWorkspace,
     resolvedProjectId,
     resolvedProjectWorkspaceId,

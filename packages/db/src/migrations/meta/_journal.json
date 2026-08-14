@@ -1380,6 +1380,34 @@
       "when": 1785930056830,
       "tag": "0198_task_watchdog_stop_snapshots",
       "breakpoints": true
+    },
+    {
+      "idx": 197,
+      "version": "7",
+      "when": 1785930057830,
+      "tag": "0199_document_memberships",
+      "breakpoints": true
+    },
+    {
+      "idx": 198,
+      "version": "7",
+      "when": 1785930058830,
+      "tag": "0200_company_skill_releases",
+      "breakpoints": true
+    },
+    {
+      "idx": 199,
+      "version": "7",
+      "when": 1785930059830,
+      "tag": "0201_built_in_agent_unique_marker",
+      "breakpoints": true
+    },
+    {
+      "idx": 200,
+      "version": "7",
+      "when": 1785930060830,
+      "tag": "0202_drop_cloud_upstream_tables",
+      "breakpoints": true
     }
   ]
 }

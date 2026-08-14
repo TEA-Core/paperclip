@@ -35,6 +35,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 
@@ -287,7 +288,10 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
       ttlMs: 60_000,
     });
     try {
-      await heartbeatService(db).drainActiveRunExecutions();
+      // The shared drain re-checks the run table after awaiting in-flight
+      // executions, so it also covers a wakeup that is still before run
+      // registration -- which drainActiveRunExecutions alone cannot see.
+      await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
       adapterExecute.mockReset();
       adapterExecute.mockImplementation(async () => ({
         exitCode: 0,
