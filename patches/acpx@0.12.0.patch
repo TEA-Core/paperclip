@@ -1,51 +1,8 @@
---- a/dist/runtime.d.ts
-+++ b/dist/runtime.d.ts
-@@ -266,6 +266,7 @@
-   timeoutMs?: number;
-   probeAgent?: string;
-   verbose?: boolean;
-+  onAgentStderr?: (chunk: string) => void;
-   onPermissionRequest?: (req: AcpPermissionRequest, ctx: {
-     signal: AbortSignal;
-   }) => Promise<AcpPermissionDecision | undefined>;
---- a/dist/session-options-jkYbBxGE.d.ts
-+++ b/dist/session-options-jkYbBxGE.d.ts
-@@ -84,6 +84,7 @@
-   terminal?: boolean;
-   suppressSdkConsoleErrors?: boolean;
-   verbose?: boolean;
-+  onAgentStderr?: (chunk: string) => void;
-   sessionOptions?: {
-     model?: string;
-     allowedTools?: string[];
-@@ -268,6 +269,12 @@
-    * passing them to acpx.
-    */
-   env?: Record<string, string>;
-+  /**
-+   * Keys to delete from the agent child process environment before spawn.
-+   * Unlike env (which overlays process.env), deletions here apply AFTER the
-+   * process.env copy — callers can truly remove inherited secrets.
-+   */
-+  envUnset?: string[];
- };
- //#endregion
- export { AcpPermissionRequest as a, NonInteractivePermissionPolicy as c, PermissionStats as d, SessionRecord as f, AcpPermissionDecision as i, PermissionMode as l, SystemPromptOption as n, AuthPolicy as o, PromptInput as p, AcpClientOptions as r, McpServer$1 as s, SessionAgentOptions as t, PermissionPolicy as u };
---- a/dist/runtime.js
-+++ b/dist/runtime.js
-@@ -744,7 +744,8 @@
- 		this.deps = deps;
- 	}
- 	createClient(options) {
--		return this.deps.clientFactory?.(options) ?? new AcpClient(options);
-+		const clientOptions = { ...options, onAgentStderr: this.options.onAgentStderr };
-+		return this.deps.clientFactory?.(clientOptions) ?? new AcpClient(clientOptions);
- 	}
- 	async readPendingPersistentClient(record, options) {
- 		const pendingClient = this.pendingPersistentClients.get(record.acpxRecordId);
+diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
+index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73ee2ad1626 100644
 --- a/dist/live-checkpoint-ClPCSdrW.js
 +++ b/dist/live-checkpoint-ClPCSdrW.js
-@@ -1532,7 +1532,7 @@
+@@ -1532,7 +1532,7 @@ const ZED_TAG_KEYS = /* @__PURE__ */ new Set([
  	"RedactedThinking",
  	"ToolUse"
  ]);
@@ -54,7 +11,7 @@
  const OPAQUE_VALUE_PATHS = /* @__PURE__ */ new Set([
  	"agent_capabilities",
  	"messages.Agent.content.ToolUse.input",
-@@ -2557,7 +2557,7 @@
+@@ -2557,7 +2557,7 @@ function readCommandLineChar(state) {
  		escaping: false,
  		hasPart: true
  	};
@@ -63,7 +20,7 @@
  		current: state.current,
  		quote: state.quote,
  		escaping: true,
-@@ -2912,7 +2912,7 @@
+@@ -2912,7 +2912,7 @@ function collectProtectedAuthEnvKeys(env) {
  	}
  	return protectedKeys;
  }
@@ -72,7 +29,7 @@
  	const env = { ...process.env };
  	const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
  	if (authCredentials) for (const [methodId, credential] of Object.entries(authCredentials)) {
-@@ -2923,6 +2923,7 @@
+@@ -2923,6 +2923,7 @@ function buildAgentEnvironment(authCredentials, sessionEnv) {
  		if (typeof value !== "string" || protectedAuthEnvKeys.has(protectedEnvKey(key))) continue;
  		assignSessionEnv(env, key, value);
  	}
@@ -80,7 +37,7 @@
  	return env;
  }
  function assignSessionEnv(env, key, value) {
-@@ -2955,10 +2956,10 @@
+@@ -2955,10 +2956,10 @@ function readAuthCredential(authCredentials, methodId) {
  	const configCredentials = authCredentials ?? {};
  	return configCredentials[methodId] ?? configCredentials[toEnvToken(methodId)];
  }
@@ -93,7 +50,7 @@
  		stdio: [
  			"pipe",
  			"pipe",
-@@ -3960,6 +3961,10 @@
+@@ -3960,6 +3961,10 @@ var AcpClient = class {
  		const startupStderr = [];
  		child.stderr.on("data", (chunk) => {
  			this.captureStartupStderr(startupStderr, chunk);
@@ -104,12 +61,65 @@
  			if (!this.options.verbose) return;
  			process.stderr.write(chunk);
  		});
-@@ -3994,7 +3999,7 @@
+@@ -3994,7 +3999,7 @@ var AcpClient = class {
  			geminiAcp: isGeminiAcpCommand(spawnCommand, args),
  			copilotAcp: isCopilotAcpCommand(spawnCommand, args),
  			claudeAcp: isClaudeAcpCommand(spawnCommand, args),
 -			spawnOptions: buildAgentSpawnOptions(this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env)
-+			spawnOptions: buildAgentSpawnOptions(this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.sessionOptions?.envUnset)
++			spawnOptions: buildAgentSpawnOptions(this.options.spawnCwd ?? this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.sessionOptions?.envUnset)
  		};
  	}
  	logAgentLaunch(plan) {
+diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
+index ccdbe5b032521518022223733049b8b38793473b..3d4e04231e78efeecd8540735b08e1e43547ff2d 100644
+--- a/dist/runtime.d.ts
++++ b/dist/runtime.d.ts
+@@ -266,6 +266,8 @@ type AcpRuntimeOptions = {
+   timeoutMs?: number;
+   probeAgent?: string;
+   verbose?: boolean;
++  onAgentStderr?: (chunk: string) => void;
++  spawnCwd?: string;
+   onPermissionRequest?: (req: AcpPermissionRequest, ctx: {
+     signal: AbortSignal;
+   }) => Promise<AcpPermissionDecision | undefined>;
+diff --git a/dist/runtime.js b/dist/runtime.js
+index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..33b5054b2906502d1d4b512bfa259bd2ba5a9f05 100644
+--- a/dist/runtime.js
++++ b/dist/runtime.js
+@@ -744,7 +744,8 @@ var AcpRuntimeManager = class {
+ 		this.deps = deps;
+ 	}
+ 	createClient(options) {
+-		return this.deps.clientFactory?.(options) ?? new AcpClient(options);
++		const clientOptions = { ...options, onAgentStderr: this.options.onAgentStderr, spawnCwd: this.options.spawnCwd };
++		return this.deps.clientFactory?.(clientOptions) ?? new AcpClient(clientOptions);
+ 	}
+ 	async readPendingPersistentClient(record, options) {
+ 		const pendingClient = this.pendingPersistentClients.get(record.acpxRecordId);
+diff --git a/dist/session-options-jkYbBxGE.d.ts b/dist/session-options-jkYbBxGE.d.ts
+index 9d37f377fb6a0828e0d2bc5a48754f3aa71509a4..680bc080fc5d6ffd266ed1b27d3d5056add9d980 100644
+--- a/dist/session-options-jkYbBxGE.d.ts
++++ b/dist/session-options-jkYbBxGE.d.ts
+@@ -84,6 +84,8 @@ type AcpClientOptions = {
+   terminal?: boolean;
+   suppressSdkConsoleErrors?: boolean;
+   verbose?: boolean;
++  onAgentStderr?: (chunk: string) => void;
++  spawnCwd?: string;
+   sessionOptions?: {
+     model?: string;
+     allowedTools?: string[];
+@@ -268,6 +270,12 @@ type SessionAgentOptions = {
+    * passing them to acpx.
+    */
+   env?: Record<string, string>;
++  /**
++   * Keys to delete from the agent child process environment before spawn.
++   * Unlike env (which overlays process.env), deletions here apply AFTER the
++   * process.env copy — callers can truly remove inherited secrets.
++   */
++  envUnset?: string[];
+ };
+ //#endregion
+ export { AcpPermissionRequest as a, NonInteractivePermissionPolicy as c, PermissionStats as d, SessionRecord as f, AcpPermissionDecision as i, PermissionMode as l, SystemPromptOption as n, AuthPolicy as o, PromptInput as p, AcpClientOptions as r, McpServer$1 as s, SessionAgentOptions as t, PermissionPolicy as u };

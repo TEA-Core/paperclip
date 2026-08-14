@@ -152,6 +152,7 @@ export {
   recommendedDefaultsForApp,
 } from "./app-definitions.js";
 export { APP_DEFINITIONS } from "./app-definitions.generated.js";
+export * from "./validators/status-card.js";
 export { appDefinitionSchema, appDefinitionsSchema, connectionMethodDefSchema } from "./validators/app-definition.js";
 export {
   humanizeConnectionDisplayName,
@@ -672,8 +673,11 @@ export type {
   AgentSkillSyncRequest,
   InstanceExecutionMode,
   InstanceExperimentalSettings,
+  InstanceExperimentalSettingsWithManaged,
   InstanceGeneralSettings,
   InstanceSettings,
+  ManagedExperimentalFeatureKey,
+  ManagedSettingMetadata,
   IssueGraphLivenessAutoRecoveryPreview,
   IssueGraphLivenessAutoRecoveryPreviewItem,
   BackupRetentionPolicy,
@@ -833,6 +837,8 @@ export type {
   IssueInboxAttentionKind,
   IssueBlockedInboxAction,
   IssueBlockedInboxAttention,
+  IssueUnblockDescriptor,
+  IssueUnblockOwner,
   IssueBlockedInboxIssueRef,
   IssueBlockedInboxOwner,
   IssueBlockedInboxOwnerType,
@@ -1367,6 +1373,7 @@ export {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  PAPERCLIP_CLOUD_MANAGED_BY,
 } from "./types/instance.js";
 
 export type {
@@ -1415,6 +1422,8 @@ export {
   patchInstanceGeneralSettingsSchema,
   type PatchInstanceGeneralSettings,
   instanceExperimentalSettingsSchema,
+  instanceExperimentalSettingsWithManagedSchema,
+  managedSettingMetadataSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceSettingsSchema,
   issueGraphLivenessAutoRecoveryRequestSchema,
@@ -2235,3 +2244,15 @@ export {
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
 export * from "./validators/skill-policy.js";
+export {
+  FEATURE_TIERS,
+  INSTANCE_FEATURE_CATALOG,
+  INSTANCE_FEATURE_KEYS,
+  buildFeatureCatalogArtifact,
+  featureCatalogArtifactSchema,
+  renderFeatureCatalogArtifact,
+  type FeatureCatalogArtifact,
+  type FeatureCatalogEntry,
+  type FeatureTier,
+  type InstanceFeatureKey,
+} from "./feature-catalog.js";

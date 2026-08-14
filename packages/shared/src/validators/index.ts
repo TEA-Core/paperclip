@@ -5,6 +5,8 @@ export {
   type InstanceGeneralSettings,
   type PatchInstanceGeneralSettings,
   instanceExperimentalSettingsSchema,
+  instanceExperimentalSettingsWithManagedSchema,
+  managedSettingMetadataSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceSettingsSchema,
   issueGraphLivenessAutoRecoveryRequestSchema,
@@ -106,6 +108,8 @@ export {
   type SummarySlotScopeSelectorInput,
   type WriteSummarySlotInput,
 } from "./summary-slot.js";
+
+export * from "./status-card.js";
 
 export {
   externalObjectStatusCategorySchema,

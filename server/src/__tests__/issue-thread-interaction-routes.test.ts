@@ -17,6 +17,7 @@ const mockIssueService = vi.hoisted(() => ({
 
 const mockInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(),
+  getForIssue: vi.fn(),
   create: vi.fn(),
   acceptInteraction: vi.fn(),
   acceptSuggestedTasks: vi.fn(),
@@ -24,6 +25,7 @@ const mockInteractionService = vi.hoisted(() => ({
   rejectSuggestedTasks: vi.fn(),
   expireRequestConfirmationsSupersededByComment: vi.fn(),
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(),
+  expirePendingInteractionsForTerminalIssue: vi.fn(),
   answerQuestions: vi.fn(),
   submitItemVerdicts: vi.fn(),
   cancelQuestions: vi.fn(),
@@ -220,6 +222,24 @@ describe.sequential("issue thread interaction routes", () => {
       authorAgentId: null,
       authorUserId: "local-board",
     });
+    mockInteractionService.expirePendingInteractionsForTerminalIssue.mockResolvedValue([]);
+    mockInteractionService.getForIssue.mockResolvedValue({
+      id: "interaction-withdraw",
+      createdByAgentId: CREATED_AGENT_ID,
+      continuationPolicy: "wake_assignee",
+      status: "pending",
+    });
+    mockInteractionService.withdrawInteraction.mockResolvedValue({
+      id: "interaction-withdraw",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      createdByAgentId: CREATED_AGENT_ID,
+      status: "cancelled",
+      continuationPolicy: "wake_assignee",
+      payload: { version: 1, prompt: "Proceed?" },
+      result: { version: 1, outcome: "withdrawn", reason: "Replanning" },
+    });
     mockInteractionService.create.mockResolvedValue({
       id: "interaction-1",
       companyId: "company-1",
@@ -396,7 +416,7 @@ describe.sequential("issue thread interaction routes", () => {
       companyId: "company-1",
       issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       kind: "request_confirmation",
-      status: "expired",
+      status: "cancelled",
       continuationPolicy: "wake_assignee",
       idempotencyKey: null,
       sourceCommentId: null,
@@ -407,7 +427,7 @@ describe.sequential("issue thread interaction routes", () => {
       },
       result: {
         version: 1,
-        outcome: "withdrawn_by_author",
+        outcome: "withdrawn",
         reason: "No longer needed",
       },
       createdAt: "2026-04-20T12:00:00.000Z",
@@ -631,6 +651,57 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+  it("allows a board user to withdraw and wakes the assignee", async () => {
+    const app = await createApp();
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
+      .send({ reason: "Replanning" });
+
+    expect(res.status).toBe(200);
+    expect(mockInteractionService.withdrawInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-withdraw",
+      { reason: "Replanning" },
+      expect.objectContaining({ userId: "local-board" }),
+    );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(ASSIGNEE_AGENT_ID, expect.objectContaining({
+      payload: expect.objectContaining({ interactionStatus: "cancelled" }),
+    }));
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.thread_interaction_withdrawn",
+    }));
+  });
+
+  // fail in; widening it is a governance decision, not a merge decision.
+
+  it("allows the creator agent to withdraw and wakes a different assignee", async () => {
+    const app = await createApp({ type: "agent", agentId: CREATED_AGENT_ID, companyId: "company-1", runId: "run-1" });
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
+      .send({});
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(ASSIGNEE_AGENT_ID, expect.anything());
+  });
+
+  it("allows the assignee agent to withdraw without waking itself", async () => {
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({ status: "todo" }));
+    const app = await createApp({ type: "agent", agentId: ASSIGNEE_AGENT_ID, companyId: "company-1", runId: "run-2" });
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
+      .send({});
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("rejects withdrawal by an unrelated agent", async () => {
+    const app = await createApp({ type: "agent", agentId: "33333333-3333-4333-8333-333333333333", companyId: "company-1", runId: "run-3" });
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
+      .send({});
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
+  });
+
   it("cancels question interactions and emits a continuation wake", async () => {
     const app = await createApp();
 
@@ -696,8 +767,8 @@ describe.sequential("issue thread interaction routes", () => {
       .send({ reason: "No longer needed" });
 
     expect(res.status).toBe(200);
-    expect(res.body.status).toBe("expired");
-    expect(res.body.result.outcome).toBe("withdrawn_by_author");
+    expect(res.body.status).toBe("cancelled");
+    expect(res.body.result.outcome).toBe("withdrawn");
     expect(mockInteractionService.withdrawInteraction).toHaveBeenCalledWith(
       expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
       "interaction-2",
@@ -708,10 +779,12 @@ describe.sequential("issue thread interaction routes", () => {
       ASSIGNEE_AGENT_ID,
       expect.objectContaining({
         reason: "issue_commented",
-        payload: expect.objectContaining({
+        // Upstream moved the wake's interaction details from `payload` to
+        // `contextSnapshot`, and withdrawal now resolves to `cancelled`.
+        contextSnapshot: expect.objectContaining({
           interactionId: "interaction-2",
           interactionKind: "request_confirmation",
-          interactionStatus: "expired",
+          interactionStatus: "cancelled",
         }),
       }),
     );
@@ -723,9 +796,15 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
-  it("rejects non-author agents from withdrawing interactions", async () => {
-    const { forbidden } = await import("../errors.js");
-    mockInteractionService.withdrawInteraction.mockRejectedValueOnce(forbidden("Only the author of this interaction can withdraw it"));
+  // The fork's SUP-10095 pair of tests lived here. Both mocked the SERVICE into
+  // throwing `forbidden` and then asserted the route turned it into a 403, so
+  // what they actually covered was error mapping, not authorization — and the
+  // service-level author check they described is gone: withdrawal authorization
+  // is upstream's (creator, current assignee, or board), enforced in
+  // `assertIssueThreadInteractionWithdrawalAllowed`. This replaces them with a
+  // test of that gate, which is the thing that can actually let the wrong actor
+  // through. Board withdrawal is covered by the board test above.
+  it("rejects an agent that is neither the interaction creator nor the issue assignee", async () => {
     const app = await createApp({
       type: "agent",
       agentId: "33333333-3333-4333-8333-333333333333",
@@ -734,23 +813,12 @@ describe.sequential("issue thread interaction routes", () => {
     });
 
     const res = await request(app)
-      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
       .send({});
 
     expect(res.status).toBe(403);
-    expect(mockInteractionService.withdrawInteraction).toHaveBeenCalled();
-  });
-
-  it("rejects board actors from withdrawing interactions they did not author", async () => {
-    const { forbidden } = await import("../errors.js");
-    mockInteractionService.withdrawInteraction.mockRejectedValueOnce(forbidden("Only the author of this interaction can withdraw it"));
-    const app = await createApp();
-
-    const res = await request(app)
-      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
-      .send({});
-
-    expect(res.status).toBe(403);
+    // The gate must stop it before the service runs, not after.
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
   });
 
   it("withdrawInteraction returns 409 for an already resolved interaction", async () => {

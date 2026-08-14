@@ -908,6 +908,28 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(rows[0]?.idempotencyKey).toBe("run-1:questionnaire");
   });
 
+  it("refuses to create an interaction on a closed issue", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Closed issue create guard");
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+
+    await expect(interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: { version: 1, prompt: "Approve after close?" },
+    }, {
+      userId: "local-board",
+    })).rejects.toMatchObject({ status: 409 });
+
+    const rows = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, issueId));
+    expect(rows).toHaveLength(0);
+  });
+
   it("accepts request_confirmation interactions without creating child issues", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();
@@ -1590,6 +1612,39 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(rows[0]?.status).toBe("pending");
   });
 
+  it("lists interactions whose stored result predates the current schema without throwing (LOOA-629)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Legacy result outcome");
+
+    // Simulate a row persisted by an older build: a resolved confirmation whose
+    // result.outcome is a value no longer in the current enum. A hard parse
+    // would 500 the whole listForIssue call and brick every consumer (web
+    // thread + Slack gateway notifier/digest/aging).
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "cancelled",
+      continuationPolicy: { kind: "none" },
+      payload: {
+        version: 1,
+        prompt: "Proceed with the current draft?",
+      },
+      result: {
+        version: 1,
+        outcome: "withdrawn_by_creator",
+      },
+      createdByUserId: "local-board",
+    });
+
+    const listed = await interactionsSvc.listForIssue(issueId);
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.kind).toBe("request_confirmation");
+    // The unparseable result degrades to null; the interaction still lists.
+    expect(listed[0]?.result).toBeNull();
+    expect(listed[0]?.status).toBe("cancelled");
+  });
+
   it("does not supersede request confirmations for agent, system, or older user comments", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Comment supersede exclusions");
 
@@ -2085,6 +2140,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     async function seedAcceptGateFixture(options?: {
       kind?: AcceptGateInteractionKind;
       sourceRunId?: string | null;
+      sourceRunStatus?: string;
     }) {
       const companyId = randomUUID();
       const projectId = randomUUID();
@@ -2131,6 +2187,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         runtimeConfig: {},
         permissions: {},
       });
+      const sourceRunStatus = options?.sourceRunStatus ?? "succeeded";
+      const sourceRunTerminal = sourceRunStatus !== "running";
       await db.insert(heartbeatRuns).values([
         ...(sourceRunId
           ? [
@@ -2139,9 +2197,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
                 companyId,
                 agentId,
                 invocationSource: "manual",
-                status: "succeeded",
+                status: sourceRunStatus,
                 startedAt: new Date("2026-05-23T21:55:00.000Z"),
-                finishedAt: new Date("2026-05-23T22:05:00.000Z"),
+                finishedAt: sourceRunTerminal ? new Date("2026-05-23T22:05:00.000Z") : null,
               },
             ]
           : []),
@@ -2313,6 +2371,105 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         id: interactionId,
         kind: "request_confirmation",
         status: "accepted",
+      });
+    });
+
+    it("allows request_confirmation accept when the source run's workspace_finalize failed", async () => {
+      // A sync-back that ran and FAILED is terminal. The run will not retry it, so
+      // the confirmation must not stay wedged behind a misleading "still syncing"
+      // error — the user can merge/act manually.
+      const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+        await seedAcceptGateFixture({ sourceRunStatus: "failed" });
+
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "workspace_config_freshness",
+        status: "succeeded",
+        startedAt: new Date("2026-05-23T22:00:00.000Z"),
+      });
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "workspace_finalize",
+        status: "failed",
+        startedAt: new Date("2026-05-23T22:05:00.000Z"),
+      });
+
+      const accepted = await interactionsSvc.acceptInteraction(
+        { id: issueId, companyId, goalId, projectId: null },
+        interactionId,
+        {},
+        { userId: "local-board" },
+      );
+
+      expect(accepted.interaction).toMatchObject({
+        id: interactionId,
+        kind: "request_confirmation",
+        status: "accepted",
+      });
+    });
+
+    it("allows request_confirmation accept when a running workspace_finalize is stale (source run ended)", async () => {
+      // The source run died mid-finalize, leaving a `running` op that will never
+      // advance. A terminal/missing owner run means the record is stale, so the
+      // gate must not wait on it forever.
+      const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+        await seedAcceptGateFixture({ sourceRunStatus: "failed" });
+
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "workspace_finalize",
+        status: "running",
+        startedAt: new Date("2026-05-23T22:05:00.000Z"),
+      });
+
+      const accepted = await interactionsSvc.acceptInteraction(
+        { id: issueId, companyId, goalId, projectId: null },
+        interactionId,
+        {},
+        { userId: "local-board" },
+      );
+
+      expect(accepted.interaction).toMatchObject({
+        id: interactionId,
+        kind: "request_confirmation",
+        status: "accepted",
+      });
+    });
+
+    it("refuses request_confirmation accept while a workspace_finalize is running on a live source run", async () => {
+      // A genuinely in-flight sync-back on a still-active run must still block, so
+      // the confirmation cannot race commits that are actively being synced back.
+      const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+        await seedAcceptGateFixture({ sourceRunStatus: "running" });
+
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "workspace_finalize",
+        status: "running",
+        startedAt: new Date("2026-05-23T22:05:00.000Z"),
+      });
+
+      await expect(
+        interactionsSvc.acceptInteraction(
+          { id: issueId, companyId, goalId, projectId: null },
+          interactionId,
+          {},
+          { userId: "local-board" },
+        ),
+      ).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining(
+          "the run that created this interaction has not finished syncing its workspace",
+        ),
+        details: { executionWorkspaceId, sourceRunId },
       });
     });
 
@@ -2565,19 +2722,24 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       { agentId: authorAgentId },
     );
 
-    expect(withdrawn.status).toBe("expired");
+    expect(withdrawn.status).toBe("cancelled");
     expect(withdrawn.result).toMatchObject({
       version: 1,
-      outcome: "withdrawn_by_author",
+      outcome: "withdrawn",
       reason: "No longer needed",
     });
 
     const rows = await db.select().from(issueThreadInteractions);
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.status).toBe("expired");
+    expect(rows[0]?.status).toBe("cancelled");
   });
 
-  it("non-author agent withdrawal returns 403 and leaves the row pending", async () => {
+  // Was `non-author agent withdrawal returns 403 and leaves the row pending`. The
+  // service carries no authorization check now — withdrawal authorization is
+  // upstream's (creator, current assignee, or board), enforced in the route gate,
+  // and the route test `rejects an agent that is neither the interaction creator
+  // nor the issue assignee` is what covers the 403.
+  it("a non-author agent reaching the service withdraws the interaction", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Non-author withdrawal");
     const authorAgentId = await seedAgent(companyId);
     const otherAgentId = await seedAgent(companyId);
@@ -2596,21 +2758,24 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       agentId: authorAgentId,
     });
 
-    await expect(
-      interactionsSvc.withdrawInteraction(
-        { id: issueId, companyId },
-        created.id,
-        {},
-        { agentId: otherAgentId },
-      ),
-    ).rejects.toThrow("Only the author of this interaction can withdraw it");
+    const withdrawn = await interactionsSvc.withdrawInteraction(
+      { id: issueId, companyId },
+      created.id,
+      {},
+      { agentId: otherAgentId },
+    );
+    expect(withdrawn.status).toBe("cancelled");
 
     const rows = await db.select().from(issueThreadInteractions);
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.status).toBe("pending");
+    expect(rows[0]?.status).toBe("cancelled");
   });
 
-  it("board actors cannot withdraw interactions (agent-only authz)", async () => {
+  // Was `board actors cannot withdraw interactions (agent-only authz)`. The
+  // service no longer carries an authorization check of its own — withdrawal
+  // authorization is upstream's (creator, current assignee, or board) and is
+  // enforced in the route gate — so a board actor withdrawing here succeeds.
+  it("board actors can withdraw an interaction they did not author", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Board actor withdrawal");
     const authorAgentId = await seedAgent(companyId);
 
@@ -2628,18 +2793,19 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       agentId: authorAgentId,
     });
 
-    await expect(
-      interactionsSvc.withdrawInteraction(
-        { id: issueId, companyId },
-        created.id,
-        {},
-        { userId: "local-board" },
-      ),
-    ).rejects.toThrow("Only the author of this interaction can withdraw it");
+    const withdrawn = await interactionsSvc.withdrawInteraction(
+      { id: issueId, companyId },
+      created.id,
+      {},
+      { userId: "local-board" },
+    );
+
+    expect(withdrawn.status).toBe("cancelled");
 
     const rows = await db.select().from(issueThreadInteractions);
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.status).toBe("pending");
+    expect(rows[0]?.status).toBe("cancelled");
+    expect(rows[0]?.resolvedByUserId).toBe("local-board");
   });
 
   it("withdrawal without a reason persists null reason", async () => {
@@ -2669,7 +2835,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     expect(withdrawn.result).toMatchObject({
       version: 1,
-      outcome: "withdrawn_by_author",
+      outcome: "withdrawn",
       reason: null,
     });
   });
@@ -2701,12 +2867,12 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     expect(withdrawn.result).toMatchObject({
       version: 1,
-      outcome: "withdrawn_by_author",
+      outcome: "withdrawn",
       reason: null,
     });
   });
 
-  it("withdrawal reason is capped at 500 characters", async () => {
+  it("withdrawal reason is capped at 4000 characters", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Withdrawal reason cap");
     const authorAgentId = await seedAgent(companyId);
 
@@ -2724,7 +2890,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       agentId: authorAgentId,
     });
 
-    const longReason = "x".repeat(501);
+    const longReason = "x".repeat(4001);
     await expect(
       interactionsSvc.withdrawInteraction(
         { id: issueId, companyId },
@@ -2771,7 +2937,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     const rows = await db.select().from(issueThreadInteractions);
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.status).toBe("expired");
+    expect(rows[0]?.status).toBe("cancelled");
   });
 
   it("accepting a withdrawn interaction returns 409 and leaves the row unchanged", async () => {
@@ -2810,7 +2976,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     const rows = await db.select().from(issueThreadInteractions);
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.status).toBe("expired");
+    expect(rows[0]?.status).toBe("cancelled");
   });
 
   it("withdrawal of an unknown interaction returns 404", async () => {
@@ -2882,15 +3048,15 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       { agentId: authorAgentId },
     );
 
-    expect(withdrawn.status).toBe("expired");
+    expect(withdrawn.status).toBe("cancelled");
     expect(withdrawn.result).toMatchObject({
       version: 1,
-      outcome: "withdrawn_by_author",
+      outcome: "withdrawn",
       reason: "Done",
     });
   });
 
-  it("expiring pending interactions on terminal status (done) with expired_issue_terminal outcome", async () => {
+  it("expiring pending interactions on terminal status (done) with issue_closed outcome", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Terminal expiry done");
     const authorAgentId = await seedAgent(companyId);
 
@@ -2918,11 +3084,11 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(expired[0]?.status).toBe("expired");
     expect(expired[0]?.result).toMatchObject({
       version: 1,
-      outcome: "expired_issue_terminal",
+      outcome: "issue_closed",
     });
   });
 
-  it("expiring pending interactions on terminal status (cancelled) with expired_issue_terminal outcome", async () => {
+  it("expiring pending interactions on terminal status (cancelled) with issue_closed outcome", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Terminal expiry cancelled");
     const authorAgentId = await seedAgent(companyId);
 
@@ -2950,7 +3116,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(expired[0]?.status).toBe("expired");
     expect(expired[0]?.result).toMatchObject({
       version: 1,
-      outcome: "expired_issue_terminal",
+      outcome: "issue_closed",
     });
   });
 
@@ -2989,7 +3155,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     const rows = await db.select().from(issueThreadInteractions);
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.status).toBe("expired");
+    expect(rows[0]?.status).toBe("cancelled");
   });
 
   it("terminal status expiry is a no-op for non-terminal statuses", async () => {
