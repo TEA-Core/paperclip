@@ -848,6 +848,59 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
     });
   });
 
+  describe("D1: fail-open on un-hydrated data (draft-hoist fix)", () => {
+    it("returns status:published when PR data is empty {} (un-hydrated) — head SHA resolved live", async () => {
+      await insertMention({
+        companyId,
+        providerKey: "github",
+        objectType: "pull_request",
+        externalId: "TEA-Core/paperclip#pull/42",
+        data: {},
+      });
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/42" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("armed");
+      expect(result.message).toContain("status:published");
+      expect(result.message).toContain("paperclip/approved");
+
+      expect(mockGhFetch).toHaveBeenCalledTimes(2);
+      expect(mockGhFetch.mock.calls[0]![0]).toBe(
+        "https://api.github.com/repos/TEA-Core/paperclip/pulls/42",
+      );
+      expect(mockGhFetch.mock.calls[1]![0]).toBe(
+        `https://api.github.com/repos/TEA-Core/paperclip/statuses/${HEAD_SHA}`,
+      );
+    });
+
+    it("drops a PR with { data: { draft: true } } (draft present, state absent) — draft-hoist", async () => {
+      await insertMention({
+        companyId,
+        providerKey: "github",
+        objectType: "pull_request",
+        externalId: "TEA-Core/paperclip#pull/42",
+        data: { draft: true },
+      });
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toBe("status:skipped:no-pr: No linked pull request found");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("returns status:skipped:no-pr only when there is genuinely no pull_request mention row", async () => {
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toBe("status:skipped:no-pr: No linked pull request found");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+  });
+
   describe("status:failed:auth_required", () => {
     it("returns status:failed:auth_required when no GitHub token is available", async () => {
       await insertMention(
