@@ -288,7 +288,9 @@ Response:
 
 When migrating a master key to a new isolated path (for example, moving out of
 the Paperclip home volume so agent execution workspaces cannot reach it),
-follow this safe order:
+follow this safe order.
+
+#### From An Existing Key File
 
 1. **Stop the server.**
 2. **Copy the existing key file** to the new isolated path (e.g.
@@ -306,9 +308,33 @@ follow this safe order:
    matching fingerprints.
 6. **Verify** with `paperclipai doctor` or the health check endpoint.
 
+#### From An Inline Env Key To A Key File
+
+To move from `PAPERCLIP_SECRETS_MASTER_KEY` to an isolated key file:
+
+1. **Stop the server.**
+2. **Write the existing env key value verbatim** into the isolated file
+   (e.g. `/etc/paperclip/secrets/master.key`), preserving `0600` permissions:
+   ```sh
+   # The value below must be byte-identical to the current PAPERCLIP_SECRETS_MASTER_KEY.
+   # Never generate a fresh key here — a new key cannot decrypt existing secrets.
+   printf '%s' "$PAPERCLIP_SECRETS_MASTER_KEY" > /etc/paperclip/secrets/master.key
+   chmod 600 /etc/paperclip/secrets/master.key
+   ```
+3. **Set `PAPERCLIP_SECRETS_MASTER_KEY_FILE`** to the file path (or leave it
+   unset to use the default `/etc/paperclip/secrets/master.key`).
+4. **Remove the inline `PAPERCLIP_SECRETS_MASTER_KEY`** from the server
+   environment. If both are set and disagree, the server will refuse to start.
+5. **Start the server** and confirm the boot log shows `keySource=file` and
+   matching fingerprints.
+6. **Verify** with `paperclipai doctor` or the health check endpoint.
+
 > **Warning:** Never copy a new/different key into the file path while
 > `PAPERCLIP_SECRETS_MASTER_KEY` is set to the old value. The divergence guard
 > will catch this, but the server will not start until the sources are aligned.
+> The key written to the file must be byte-identical to the key that encrypted
+> the stored secrets — a fresh key would silently corrupt all existing
+> encrypted data.
 
 ## Strict Mode
 
