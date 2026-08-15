@@ -208,6 +208,134 @@ pnpm paperclipai secrets doctor --company-id <company-id>
 | `PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION` | Set to `1` to allow auto-generating a master key when none exists (default: deny) |
 | `PAPERCLIP_SECRETS_STRICT_MODE` | Set to `true` to enforce secret refs |
 
+## Master Key Resolution And Divergence Refusal
+
+At boot, the Paperclip server resolves the local master key from one of two
+sources, in priority order:
+
+1. `PAPERCLIP_SECRETS_MASTER_KEY` — an inline key value (base64, hex, or raw
+   32-char string).
+2. `PAPERCLIP_SECRETS_MASTER_KEY_FILE` — a path to a key file
+   (default: `/etc/paperclip/secrets/master.key`).
+
+The resolved key path and a non-sensitive fingerprint of each source are
+asserted and logged at boot:
+
+```
+INFO secrets master key path resolved at boot
+  keyPath=/etc/paperclip/secrets/master.key
+  keySource=env
+  insidePaperclipHome=false
+  envKeyFingerprint=sha256:a1b2c3d4e5f6a7b8
+  fileKeyFingerprint=sha256:f8e7d6c5b4a3f2e1
+```
+
+### Refusing A Divergent Key File
+
+When `PAPERCLIP_SECRETS_MASTER_KEY` is set **and** a key file exists at the
+resolved path, Paperclip compares the two. If they disagree, the server
+**refuses to start**:
+
+```
+Refusing to start: the master key file at /etc/paperclip/secrets/master.key
+disagrees with PAPERCLIP_SECRETS_MASTER_KEY.
+The env key fingerprint (sha256:a1b2c3d4e5f6a7b8) does not match the
+file key fingerprint (sha256:f8e7d6c5b4a3f2e1).
+Remove the stray key file, or set PAPERCLIP_SECRETS_MASTER_KEY to the key
+that matches the file.
+Loading the wrong key would silently corrupt all existing encrypted secrets.
+```
+
+This guard prevents a silent data-loss scenario: if the server loaded a
+mismatched key, every existing encrypted secret would become undecryptable
+and new writes would be encrypted with the wrong key.
+
+### Resolving A Divergence
+
+To fix a divergence, choose **one** source of truth and align the other:
+
+- **Use the env key** (file is stray): delete the key file at the resolved
+  path, then restart.
+- **Use the file key** (env key is stale): unset `PAPERCLIP_SECRETS_MASTER_KEY`
+  or set it to the value that matches the file, then restart.
+
+The health check endpoint also reports this condition without starting the
+server:
+
+```
+POST /api/secret-provider-configs/{id}/health
+```
+
+Response:
+
+```json
+{
+  "provider": "local_encrypted",
+  "status": "error",
+  "message": "Master key file at /etc/paperclip/secrets/master.key disagrees
+    with PAPERCLIP_SECRETS_MASTER_KEY (env sha256:a1b2... vs file sha256:f8e7...).
+    Remove the stray key file or align PAPERCLIP_SECRETS_MASTER_KEY with the file.",
+  "details": {
+    "keySource": "env",
+    "keyFilePath": "/etc/paperclip/secrets/master.key",
+    "envKeyFingerprint": "a1b2c3d4e5f6a7b8",
+    "fileKeyFingerprint": "f8e7d6c5b4a3f2e1"
+  }
+}
+```
+
+### Safe Isolated-Path Migration
+
+When migrating a master key to a new isolated path (for example, moving out of
+the Paperclip home volume so agent execution workspaces cannot reach it),
+follow this safe order.
+
+#### From An Existing Key File
+
+1. **Stop the server.**
+2. **Copy the existing key file** to the new isolated path (e.g.
+   `/etc/paperclip/secrets/master.key`), preserving `0600` permissions:
+   ```sh
+   cp /old/path/master.key /etc/paperclip/secrets/master.key
+   chmod 600 /etc/paperclip/secrets/master.key
+   ```
+3. **Set `PAPERCLIP_SECRETS_MASTER_KEY_FILE`** to the new path, or leave it
+   unset to use the default `/etc/paperclip/secrets/master.key`.
+4. **Do not set `PAPERCLIP_SECRETS_MASTER_KEY`** unless you are certain it
+   matches the file. If both are set and disagree, the server will refuse to
+   start.
+5. **Start the server** and confirm the boot log shows `keySource=file` and
+   matching fingerprints.
+6. **Verify** with `paperclipai doctor` or the health check endpoint.
+
+#### From An Inline Env Key To A Key File
+
+To move from `PAPERCLIP_SECRETS_MASTER_KEY` to an isolated key file:
+
+1. **Stop the server.**
+2. **Write the existing env key value verbatim** into the isolated file
+   (e.g. `/etc/paperclip/secrets/master.key`), preserving `0600` permissions:
+   ```sh
+   # The value below must be byte-identical to the current PAPERCLIP_SECRETS_MASTER_KEY.
+   # Never generate a fresh key here — a new key cannot decrypt existing secrets.
+   printf '%s' "$PAPERCLIP_SECRETS_MASTER_KEY" > /etc/paperclip/secrets/master.key
+   chmod 600 /etc/paperclip/secrets/master.key
+   ```
+3. **Set `PAPERCLIP_SECRETS_MASTER_KEY_FILE`** to the file path (or leave it
+   unset to use the default `/etc/paperclip/secrets/master.key`).
+4. **Remove the inline `PAPERCLIP_SECRETS_MASTER_KEY`** from the server
+   environment. If both are set and disagree, the server will refuse to start.
+5. **Start the server** and confirm the boot log shows `keySource=file` and
+   matching fingerprints.
+6. **Verify** with `paperclipai doctor` or the health check endpoint.
+
+> **Warning:** Never copy a new/different key into the file path while
+> `PAPERCLIP_SECRETS_MASTER_KEY` is set to the old value. The divergence guard
+> will catch this, but the server will not start until the sources are aligned.
+> The key written to the file must be byte-identical to the key that encrypted
+> the stored secrets — a fresh key would silently corrupt all existing
+> encrypted data.
+
 ## Strict Mode
 
 When strict mode is enabled, sensitive env keys (matching `*_API_KEY`, `*_TOKEN`, `*_SECRET`) must use secret references instead of inline plain values.

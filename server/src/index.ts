@@ -131,7 +131,12 @@ export async function startServer(): Promise<StartedServer> {
   if (process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE === undefined) {
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = config.secretsMasterKeyFilePath;
   }
-  
+
+  if (process.env.PAPERCLIP_SECRETS_PROVIDER === "local_encrypted") {
+    const { assertKeyPathAtBoot } = await import("./secrets/local-encrypted-provider.js");
+    assertKeyPathAtBoot();
+  }
+
   type MigrationSummary =
     | "skipped"
     | "already applied"

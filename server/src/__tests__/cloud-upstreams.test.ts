@@ -1,4 +1,7 @@
 import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { companies, cloudUpstreamConnections, cloudUpstreamRuns, companySkills, createDb } from "@paperclipai/db";
 
@@ -48,6 +51,8 @@ describe("cloud upstream remote failures", () => {
 
 describe("cloud upstream credential storage", () => {
   const previousMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+  const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  const secretsTmpDir = mkdtempSync(join(tmpdir(), "paperclip-cloud-upstream-secrets-"));
 
   afterEach(() => {
     if (previousMasterKey === undefined) {
@@ -55,9 +60,21 @@ describe("cloud upstream credential storage", () => {
     } else {
       process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousMasterKey;
     }
+    if (previousKeyFile === undefined) {
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    } else {
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
+    }
+  });
+
+  afterAll(() => {
+    rmSync(secretsTmpDir, { recursive: true, force: true });
   });
 
   it("stores new credentials as encrypted envelopes and preserves legacy plaintext reads", async () => {
+    // Point the key file at an empty temp dir so the env key is the only key in
+    // play; a stray key file at the default path is refused by design.
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(secretsTmpDir, "master.key");
     process.env.PAPERCLIP_SECRETS_MASTER_KEY = "12345678901234567890123456789012";
     const sealed = await sealCloudUpstreamCredential("cloud-access-token");
 
@@ -72,8 +89,14 @@ describeEmbeddedPostgres("cloud upstream persistence", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const previousMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+  const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  let secretsTmpDir: string | null = null;
 
   beforeAll(async () => {
+    // Isolate the key file path: the provider refuses to run when a key file at
+    // the resolved path disagrees with PAPERCLIP_SECRETS_MASTER_KEY.
+    secretsTmpDir = mkdtempSync(join(tmpdir(), "paperclip-cloud-upstream-secrets-"));
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(secretsTmpDir, "master.key");
     process.env.PAPERCLIP_SECRETS_MASTER_KEY = "12345678901234567890123456789012";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-cloud-upstreams-");
     db = createDb(tempDb.connectionString);
@@ -92,6 +115,15 @@ describeEmbeddedPostgres("cloud upstream persistence", () => {
       delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
     } else {
       process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousMasterKey;
+    }
+    if (previousKeyFile === undefined) {
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    } else {
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
+    }
+    if (secretsTmpDir) {
+      rmSync(secretsTmpDir, { recursive: true, force: true });
+      secretsTmpDir = null;
     }
     await tempDb?.cleanup();
   });
