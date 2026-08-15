@@ -104,6 +104,20 @@ test("the docker workflow runs the secrets hardening probe on every PR", () => {
   assert.match(job, /-e EXPECTED_KEY=/, "must pass the expected key value to the probe");
 });
 
+test("the docker workflow asserts /etc/paperclip/secrets ownership with a failing step", () => {
+  const job = dockerWorkflow.slice(dockerWorkflow.indexOf("docker-build-assert:"));
+  assert.match(
+    job,
+    /stat -c[^\n]*root:root 700/,
+    "the root-owned step must fail on regressed ownership, not just print",
+  );
+  assert.doesNotMatch(
+    job,
+    /ls -ld \/etc\/paperclip\/secrets.*\|\| true/,
+    "the root-owned step must not be a print-only step that swallows failures",
+  );
+});
+
 test("the secrets probe does not run the container as uid 1000 directly", () => {
   // Regression guard for the shape this replaced: `docker run -u 1000:1000` makes
   // the entrypoint take its unprivileged branch, so /etc/paperclip/secrets is
