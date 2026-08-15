@@ -6,8 +6,11 @@ import {
   activityLog,
   agentApiKeys,
   agents,
+  authUsers,
   boardApiKeys,
+  companyMemberships,
   heartbeatRuns,
+  instanceUserRoles,
 } from "@paperclipai/db";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
@@ -101,6 +104,9 @@ function createApp(db: any) {
   );
   app.get("/actor", (req, res) => {
     res.json(req.actor);
+  });
+  app.patch("/actor", (req, res) => {
+    res.json({ ...req.actor, patched: true });
   });
   app.get("/companies/:companyId/protected", (req, res) => {
     assertCompanyAccess(req, req.params.companyId);
@@ -376,6 +382,103 @@ describe("agent auth middleware", () => {
       entityType: "agent_api_key",
       entityId: keyId,
       details: { method: "GET", url: `/companies/${companyId}/protected` },
+    });
+  });
+
+  it("enforces read_only board API key scope: GET succeeds, PATCH returns 403", async () => {
+    const companyId = randomUUID();
+    const userId = randomUUID();
+    const token = "pcp_board_readonly_key";
+    const boardKeyRow = {
+      id: randomUUID(),
+      userId,
+      name: "read-only-key",
+      keyHash: hashToken(token),
+      scope: "read_only",
+      lastUsedAt: null,
+      revokedAt: null,
+      expiresAt: null,
+      createdAt: new Date(),
+    };
+    const { db } = createDbState({
+      agent: { id: randomUUID(), companyId },
+    });
+
+    db.select = () =>
+      createSelectChain((table) => {
+        if (table === boardApiKeys) return [boardKeyRow];
+        if (table === authUsers) return [{ id: userId, name: "Test User", email: "test@example.com" }];
+        if (table === companyMemberships) return [];
+        if (table === instanceUserRoles) return [];
+        if (table === agentApiKeys) return [];
+        if (table === agents) return [];
+        if (table === heartbeatRuns) return [];
+        return [];
+      });
+
+    const app = createApp(db);
+    const getRes = await request(app)
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`);
+    const patchRes = await request(app)
+      .patch("/actor")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ title: "should not write" });
+
+    expect(getRes.status).toBe(200);
+    expect(getRes.body).toMatchObject({
+      type: "board",
+      userId,
+      boardKeyScope: "read_only",
+      source: "board_key",
+    });
+    expect(patchRes.status).toBe(403);
+    expect(patchRes.body.error).toBe("read_only board API key cannot perform write operations");
+  });
+
+  it("allows all_access board API key to perform write operations", async () => {
+    const companyId = randomUUID();
+    const userId = randomUUID();
+    const token = "pcp_board_all_access_key";
+    const boardKeyRow = {
+      id: randomUUID(),
+      userId,
+      name: "all-access-key",
+      keyHash: hashToken(token),
+      scope: "all_access",
+      lastUsedAt: null,
+      revokedAt: null,
+      expiresAt: null,
+      createdAt: new Date(),
+    };
+    const { db } = createDbState({
+      agent: { id: randomUUID(), companyId },
+    });
+
+    db.select = () =>
+      createSelectChain((table) => {
+        if (table === boardApiKeys) return [boardKeyRow];
+        if (table === authUsers) return [{ id: userId, name: "Test User", email: "test@example.com" }];
+        if (table === companyMemberships) return [];
+        if (table === instanceUserRoles) return [];
+        if (table === agentApiKeys) return [];
+        if (table === agents) return [];
+        if (table === heartbeatRuns) return [];
+        return [];
+      });
+
+    const app = createApp(db);
+    const patchRes = await request(app)
+      .patch("/actor")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ title: "should write" });
+
+    expect(patchRes.status).toBe(200);
+    expect(patchRes.body).toMatchObject({
+      type: "board",
+      userId,
+      boardKeyScope: "all_access",
+      source: "board_key",
     });
   });
 });

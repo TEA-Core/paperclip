@@ -89,6 +89,7 @@ export const createBoardApiKeySchema = z.object({
   name: z.string().trim().min(1).max(120).default("paperclipai cli"),
   expiresAt: z.coerce.date().optional().nullable(),
   requestedCompanyId: z.string().uuid().optional().nullable(),
+  scope: z.enum(["all_access", "read_only"]).default("all_access"),
 });
 
 export type CreateBoardApiKey = z.infer<typeof createBoardApiKeySchema>;
