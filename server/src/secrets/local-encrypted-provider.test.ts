@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolvePaperclipHomeDir } from "@paperclipai/shared/home-paths";
 
 const tmpDir = path.join(os.tmpdir(), `paperclip-secrets-test-${randomUUID()}`);
 
@@ -196,6 +197,37 @@ describe("local-encrypted-provider", () => {
         envKeyFingerprint: "a8ae6e6ee929",
         fileKeyFingerprint: "7b9d07f2404b",
       });
+    });
+  });
+
+  describe("enforceKeyPathIsolation with env key set (SUP-12990)", () => {
+    it("createSecret rejects when env key is set and the resolved key path is inside the Paperclip home volume", async () => {
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(
+        resolvePaperclipHomeDir(),
+        "secrets",
+        "master.key",
+      );
+
+      const { localEncryptedProvider } = await import("./local-encrypted-provider.js");
+      await expect(localEncryptedProvider.createSecret({ value: "x" })).rejects.toThrow(
+        /Security violation/,
+      );
+    });
+
+    it("createSecret and resolveVersion succeed when env key is set and the key file is isolated (outside home)", async () => {
+      const envKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+      writeFileSync(path.join(tmpDir, "master.key"), envKey, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY = envKey;
+
+      const { localEncryptedProvider } = await import("./local-encrypted-provider.js");
+      const secret = await localEncryptedProvider.createSecret({ value: "x" });
+      expect(secret.material.scheme).toBe("local_encrypted_v1");
+      await localEncryptedProvider.resolveVersion({ material: secret.material });
     });
   });
 });
