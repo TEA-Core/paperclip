@@ -3861,9 +3861,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       agentId: authorAgentId,
     });
 
-    const expired = await interactionsSvc.expirePendingInteractionsOnTerminalIssueStatus(
-      { id: issueId, companyId },
-      "done",
+    const expired = await interactionsSvc.expirePendingInteractionsForTerminalIssue(
+      { id: issueId, companyId, status: "done" },
       { agentId: authorAgentId },
     );
 
@@ -3893,9 +3892,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       agentId: authorAgentId,
     });
 
-    const expired = await interactionsSvc.expirePendingInteractionsOnTerminalIssueStatus(
-      { id: issueId, companyId },
-      "cancelled",
+    const expired = await interactionsSvc.expirePendingInteractionsForTerminalIssue(
+      { id: issueId, companyId, status: "cancelled" },
       { agentId: authorAgentId },
     );
 
@@ -3932,9 +3930,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       { agentId: authorAgentId },
     );
 
-    const expired = await interactionsSvc.expirePendingInteractionsOnTerminalIssueStatus(
-      { id: issueId, companyId },
-      "done",
+    const expired = await interactionsSvc.expirePendingInteractionsForTerminalIssue(
+      { id: issueId, companyId, status: "done" },
       { agentId: authorAgentId },
     );
 
@@ -3963,9 +3960,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       agentId: authorAgentId,
     });
 
-    const expired = await interactionsSvc.expirePendingInteractionsOnTerminalIssueStatus(
-      { id: issueId, companyId },
-      "in_progress",
+    const expired = await interactionsSvc.expirePendingInteractionsForTerminalIssue(
+      { id: issueId, companyId, status: "in_progress" },
       { agentId: authorAgentId },
     );
 

@@ -100,7 +100,6 @@ function registerModuleMocks() {
       expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
       expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
       expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
-      expirePendingInteractionsOnTerminalIssueStatus: vi.fn(async () => []),
     }),
     issueRecoveryActionService: () => ({
       getActiveForIssue: vi.fn(async () => null),

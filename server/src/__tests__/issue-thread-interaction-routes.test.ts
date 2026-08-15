@@ -32,7 +32,6 @@ const mockInteractionService = vi.hoisted(() => ({
   submitItemVerdicts: vi.fn(),
   cancelQuestions: vi.fn(),
   withdrawInteraction: vi.fn(),
-  expirePendingInteractionsOnTerminalIssueStatus: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({

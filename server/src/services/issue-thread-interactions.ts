@@ -2902,20 +2902,6 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
       await emitInteractionResolvedTelemetry(db, cancelled);
       return cancelled;
     },
-
-    // Fork-era alias (SUP-10095). Upstream #10251 landed the same capability as
-    // `expirePendingInteractionsForTerminalIssue`, with linked tool-action
-    // revocation and concurrent-resolution rollback the fork version never had,
-    // so the fork implementation is gone and this forwards to upstream's.
-    // Two behaviour changes ride along, both upstream's: every pending kind is
-    // expired (not only the user-comment-supersedable ones), and a linked
-    // tool_action_requests row is expired with the card. Retire this alias when
-    // the remaining call sites move to the upstream name.
-    expirePendingInteractionsOnTerminalIssueStatus: async (
-      issue: { id: string; companyId: string },
-      status: string,
-      actor: InteractionActor = {},
-    ) => service.expirePendingInteractionsForTerminalIssue({ ...issue, status }, actor),
   };
 
   return service;

@@ -39,7 +39,6 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
-  expirePendingInteractionsOnTerminalIssueStatus: vi.fn(async () => []),
 }));
 const mockDocumentAnnotationService = vi.hoisted(() => ({
   cleanupForIssueCommentDeletion: vi.fn(async () => ({ deletedCommentIds: [], resolvedThreadIds: [] })),

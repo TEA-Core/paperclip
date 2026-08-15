@@ -7948,7 +7948,7 @@ export function issueService(db: Db) {
 
       // SUP-11332. A terminal issue status expires every pending interaction in
       // USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS (see
-      // expirePendingInteractionsOnTerminalIssueStatus), so a routine that opens
+      // expirePendingInteractionsForTerminalIssue), so a routine that opens
       // acceptance gates and then closes its own issue destroys the gates it was
       // waiting on — the Reflection Coach sweep did exactly that to all four of
       // its coaching proposals. Guard the whole set the sweep touches, not just
