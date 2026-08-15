@@ -6,6 +6,8 @@ import {
   externalObjectMentions,
   externalObjects,
   issues,
+  projectWorkspaces,
+  projects,
   type Db,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
@@ -510,7 +512,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
       const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
       expect(result.kind).toBe("failed");
-      expect(result.message).toBe("failed:node_id_missing: Could not resolve GitHub node ID for linked PR");
+      expect(result.message).toBe("failed:node_id_missing: Could not resolve GitHub node ID for linked PR (HTTP 404)");
       expect(mockGhFetch).toHaveBeenCalledTimes(1);
     });
   });
@@ -719,6 +721,8 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issues);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
     await db.delete(companies);
 
     const companyRows = await db
@@ -746,6 +750,8 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issues);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
     await db.delete(companies);
   });
 
@@ -911,7 +917,9 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
 
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
-      expect(result.message).toBe("status:failed:auth_required: GitHub authentication failed");
+      expect(result.message).toBe(
+        "status:failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope)",
+      );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
@@ -924,7 +932,9 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
 
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
-      expect(result.message).toBe("status:failed:auth_required: GitHub authentication failed");
+      expect(result.message).toBe(
+        "status:failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope)",
+      );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
   });
@@ -950,6 +960,7 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
       expect(result.message).toContain("status:failed:scope_missing");
+      expect(result.message).toContain("HTTP 403");
       expect(result.message).toContain("Resource not accessible by integration");
     });
 
@@ -973,6 +984,7 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
       expect(result.message).toContain("status:failed:scope_missing");
+      expect(result.message).toContain("HTTP 422");
       expect(result.message).toContain("Validation Failed");
     });
   });
@@ -1001,7 +1013,80 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       );
     });
 
-    it("returns status:failed:pr_not_found when REST API does not return head.sha", async () => {
+    it("returns status:failed:pr_not_found with HTTP 404 when REST API returns 404", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ message: "Not Found" }, false, 404),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe("status:failed:pr_not_found: HTTP 404 Not Found");
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns status:failed:pr_auth with HTTP 401 when REST API returns 401", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ message: "Bad credentials" }, false, 401),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe("status:failed:pr_auth: HTTP 401 Bad credentials");
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns status:failed:pr_auth with HTTP 403 when REST API returns 403", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ message: "Forbidden" }, false, 403),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe("status:failed:pr_auth: HTTP 403 Forbidden");
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns status:failed:pr_rate_limited with HTTP 429 when REST API returns 429", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ message: "API rate limit exceeded" }, false, 429),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe("status:failed:pr_rate_limited: HTTP 429 API rate limit exceeded");
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns status:failed:pr_network when ghFetch throws", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe("status:failed:pr_network: network_error");
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns status:failed:pr_error when REST API does not return head.sha", async () => {
       await insertMention(
         createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
       );
@@ -1012,20 +1097,23 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
 
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
-      expect(result.message).toBe("status:failed:pr_not_found: Could not resolve PR head SHA");
+      expect(result.message).toContain("status:failed:pr_error");
+      expect(result.message).toContain("head.sha missing from response");
       expect(mockGhFetch).toHaveBeenCalledTimes(1);
     });
 
-    it("returns status:failed:pr_not_found when REST API returns 404", async () => {
+    it("returns status:failed:pr_not_found with HTTP 404 and no message when REST API returns 404 without message body", async () => {
       await insertMention(
         createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
       );
 
-      mockGhFetch.mockResolvedValueOnce(createMockResponse({}, false, 404));
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({}, false, 404),
+      );
 
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
-      expect(result.message).toBe("status:failed:pr_not_found: Could not resolve PR head SHA");
+      expect(result.message).toBe("status:failed:pr_not_found: HTTP 404 ");
       expect(mockGhFetch).toHaveBeenCalledTimes(1);
     });
   });
@@ -1087,6 +1175,163 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       expect(result.message).toContain("TEA-Core/paperclip#2");
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
+  });
+});
+
+describeEmbeddedPostgres("resolveGitHubTokenForRepo — project-scoped token probing", () => {
+  let db: Db;
+  let companyId: string;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-merge-arming-token-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  beforeEach(async () => {
+    vi.resetAllMocks();
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(companies);
+
+    const companyRows = await db
+      .insert(companies)
+      .values({
+        name: "Test Company",
+        issuePrefix: "TST",
+        mergeArmingEnabled: true,
+      })
+      .returning();
+    companyId = companyRows[0]!.id;
+  });
+
+  afterEach(async () => {
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(companies);
+  });
+
+  it("falls back to project-scoped GH_TOKEN_<PROJECT> when no company-scoped token is available", async () => {
+    const [projectRow] = await db
+      .insert(projects)
+      .values({
+        id: randomUUID(),
+        companyId,
+        name: "TSP",
+        urlKey: "tsp",
+        status: "in_progress",
+      })
+      .returning();
+
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId,
+      projectId: projectRow!.id,
+      name: "paperclip",
+      repoUrl: "https://github.com/TEA-Core/Trading-Signal-Platform",
+      isPrimary: true,
+    });
+
+    mockGetByName.mockImplementation((_companyId: string, name: string) => {
+      if (name === "GH_TOKEN_TSP") {
+        return Promise.resolve({ id: "secret-tsp", name: "GH_TOKEN_TSP" });
+      }
+      return Promise.resolve(null);
+    });
+    mockResolveSecretValue.mockResolvedValue("ghp_tsp_token_value");
+
+    const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
+    const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
+
+    expect(result.token).toBe("ghp_tsp_token_value");
+    expect(result.source).toBe("GH_TOKEN_TSP");
+    expect(mockGetByName).toHaveBeenCalledWith(companyId, "GH_TOKEN_TSP");
+  });
+
+  it("prefers company-scoped token over project-scoped token", async () => {
+    const [projectRow] = await db
+      .insert(projects)
+      .values({
+        id: randomUUID(),
+        companyId,
+        name: "TSP",
+        urlKey: "tsp",
+        status: "in_progress",
+      })
+      .returning();
+
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId,
+      projectId: projectRow!.id,
+      name: "paperclip",
+      repoUrl: "https://github.com/TEA-Core/Trading-Signal-Platform",
+      isPrimary: true,
+    });
+
+    mockGetByName.mockImplementation((_companyId: string, name: string) => {
+      if (name === "GITHUB_TOKEN") {
+        return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+      }
+      if (name === "GH_TOKEN_TSP") {
+        return Promise.resolve({ id: "secret-tsp", name: "GH_TOKEN_TSP" });
+      }
+      return Promise.resolve(null);
+    });
+    mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
+      if (secretId === "secret-company") return Promise.resolve("ghp_company_token");
+      return Promise.resolve("ghp_tsp_token_value");
+    });
+
+    const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
+    const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
+
+    expect(result.token).toBe("ghp_company_token");
+    expect(result.source).toBe("GITHUB_TOKEN");
+  });
+
+  it("returns failure when no token is resolvable at company or project scope", async () => {
+    const [projectRow] = await db
+      .insert(projects)
+      .values({
+        id: randomUUID(),
+        companyId,
+        name: "TSP",
+        urlKey: "tsp",
+        status: "in_progress",
+      })
+      .returning();
+
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId,
+      projectId: projectRow!.id,
+      name: "paperclip",
+      repoUrl: "https://github.com/TEA-Core/Trading-Signal-Platform",
+      isPrimary: true,
+    });
+
+    mockGetByName.mockResolvedValue(null);
+
+    const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
+    const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
+
+    expect(result.token).toBeNull();
+    expect(result.reason).toBe("No GitHub token resolvable for TEA-Core/Trading-Signal-Platform at company or project scope");
+  });
+
+  it("returns failure when repo is not found at company or project scope", async () => {
+    mockGetByName.mockResolvedValue(null);
+
+    const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
+    const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Some-Unknown-Repo");
+
+    expect(result.token).toBeNull();
+    expect(result.reason).toBe("No GitHub token resolvable for TEA-Core/Some-Unknown-Repo (repo not found at company or project scope)");
   });
 });
 
