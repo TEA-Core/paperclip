@@ -786,7 +786,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     });
   });
 
-  it("preserves direct-parent reporting while default-opening visible standard-trust writes", async () => {
+  it("allows only standard checked-out runs to comment one hop upward", async () => {
     const fixture = await seedLowTrustFixture(db);
     const standardApp = createApp(db, standardReportActor(fixture));
     const lowTrustApp = createApp(db, agentActor(fixture));
@@ -810,30 +810,31 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
       .send({ body: "Contained report must not cross" });
     expect(lowTrustParentComment.status, JSON.stringify(lowTrustParentComment.body)).toBe(403);
 
-    const defaultOpenComments = [
+    // The direct-parent report grant is one hop and non-transitive: a
+    // grandparent or sibling is not reachable through it, and the fork does not
+    // supply a default-open fallback behind it.
+    const forbiddenStandardWrites = [
       request(standardApp)
         .post(`/api/issues/${fixture.issues.reviewGrandparent.id}/comments`)
-        .send({ body: "Visible grandparent context" }),
+        .send({ body: "No grandparent report" }),
       request(standardApp)
         .post(`/api/issues/${fixture.issues.sameBoundaryChild.id}/comments`)
-        .send({ body: "Visible sibling context" }),
+        .send({ body: "No sibling report" }),
     ];
-    for (const defaultOpenComment of defaultOpenComments) {
-      const response = await defaultOpenComment;
-      expect(response.status, JSON.stringify(response.body)).toBe(201);
+    for (const forbiddenWrite of forbiddenStandardWrites) {
+      const response = await forbiddenWrite;
+      expect(response.status, JSON.stringify(response.body)).toBe(403);
     }
 
     const checkedOutPeerUpdate = await request(standardApp)
       .patch(`/api/issues/${fixture.issues.reviewRoot.id}`)
       .send({ status: "blocked" });
-    expect(checkedOutPeerUpdate.status, JSON.stringify(checkedOutPeerUpdate.body)).toBe(409);
-    expect(checkedOutPeerUpdate.body.details.code).toBe("issue_write_assignee_run_lock");
+    expect(checkedOutPeerUpdate.status, JSON.stringify(checkedOutPeerUpdate.body)).toBe(403);
 
     const documentWrite = await request(standardApp)
       .put(`/api/issues/${fixture.issues.reviewRoot.id}/documents/upward-write`)
       .send({ format: "markdown", body: "No upward document write" });
-    expect(documentWrite.status, JSON.stringify(documentWrite.body)).toBe(409);
-    expect(documentWrite.body.details.code).toBe("issue_write_assignee_run_lock");
+    expect(documentWrite.status, JSON.stringify(documentWrite.body)).toBe(403);
 
     for (const closedParent of [
       { assigneeAgentId: null, intent: { reopen: true } },

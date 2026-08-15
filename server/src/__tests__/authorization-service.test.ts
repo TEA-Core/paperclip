@@ -557,7 +557,10 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.explanation).toContain("shared default-open");
   });
 
-  it("allows standard-trust agents to comment on and update visible peer-owned issues", async () => {
+  // Fork policy (ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE): upstream #10804 allows
+  // this; the fork does not. Inverted rather than deleted so the divergence stays
+  // visible at the point upstream asserts the opposite.
+  it("denies standard-trust agents writing to visible peer-owned issues", async () => {
     const company = await createCompany(db, "DefaultOpenPeerWrites");
     const actorAgent = await createAgent(db, company.id);
     const ownerAgent = await createAgent(db, company.id);
@@ -579,17 +582,20 @@ describeEmbeddedPostgres("authorization service", () => {
 
     for (const action of ["issue:comment", "issue:mutate"] as const) {
       await expect(authorization.decide({ actor, action, resource })).resolves.toMatchObject({
-        allowed: true,
-        reason: "allow_visible_issue_write",
+        allowed: false,
+        reason: "deny_missing_grant",
       });
     }
   });
 
-  it("keeps the responsible-user ceiling on every default-open peer write", async () => {
+  // The actor is the issue assignee here. Under upstream's default-open rule any
+  // peer reached the responsible-user ceiling; under the fork's rule a peer is
+  // denied before it, so the ceiling has to be exercised through an actor that
+  // holds a write grant on its own.
+  it("keeps the responsible-user ceiling on assignee writes", async () => {
     const company = await createCompany(db, "DefaultOpenPeerWriteCeiling");
     const actorAgent = await createAgent(db, company.id);
-    const ownerAgent = await createAgent(db, company.id);
-    const issue = await createIssue(db, company.id, { assigneeAgentId: ownerAgent.id });
+    const issue = await createIssue(db, company.id, { assigneeAgentId: actorAgent.id });
     const unavailableUserId = await createUser(db);
     const actor = {
       type: "agent" as const,
@@ -602,7 +608,7 @@ describeEmbeddedPostgres("authorization service", () => {
       type: "issue" as const,
       companyId: company.id,
       issueId: issue.id,
-      assigneeAgentId: ownerAgent.id,
+      assigneeAgentId: actorAgent.id,
       status: issue.status,
     };
     const authorization = authorizationService(db);
@@ -667,7 +673,7 @@ describeEmbeddedPostgres("authorization service", () => {
     }
   });
 
-  it("does not let default-open non-assignee comments mint mention grants", async () => {
+  it("does not let non-assignee comments mint mention grants", async () => {
     const company = await createCompany(db, "DefaultOpenMentionNonTransitive");
     const ownerAgent = await createAgent(db, company.id);
     const commentingAgent = await createAgent(db, company.id);
@@ -696,8 +702,8 @@ describeEmbeddedPostgres("authorization service", () => {
         status: issue.status,
       },
     })).resolves.toMatchObject({
-      allowed: true,
-      reason: "allow_visible_issue_write",
+      allowed: false,
+      reason: "deny_missing_grant",
     });
   });
 

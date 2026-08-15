@@ -966,7 +966,7 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.getComment).not.toHaveBeenCalled();
   });
 
-  it("allows visible issue field updates for peer agents", async () => {
+  it("keeps true issue mutations denied for mentioned peer agents", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:comment" || input.action === "issue:mutate",
@@ -992,11 +992,9 @@ describe("agent issue mutation checkout ownership", () => {
         comment: "Closed at Tier 2 (live): peer visible-write path exercised.",
       });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      issueId,
-      expect.objectContaining({ status: "done" }),
-    );
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("denies cross-company agents before comment authorization is evaluated", async () => {
@@ -1466,7 +1464,7 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
-  it("authorizes child creation through the shared visible-issue write path", async () => {
+  it("authorizes child creation through the parent read path", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
 
     const res = await request(await createApp(peerActor()))
@@ -1475,7 +1473,7 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
-      action: "issue:mutate",
+      action: "issue:read",
       resource: expect.objectContaining({ issueId }),
     }));
     expect(mockIssueService.createChild).toHaveBeenCalledWith(
@@ -1769,14 +1767,15 @@ describe("agent issue mutation checkout ownership", () => {
   it.each([
     ["todo", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Todo update" })],
     ["blocked", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked update" })],
-  ])("allows peer agent %s issue %s updates outside active checkout ownership", async (status, _kind, sendRequest) => {
+  ])("rejects peer agent %s issue %s mutations outside active checkout ownership", async (status, _kind, sendRequest) => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: status as "todo" | "blocked", assigneeAgentId: ownerAgentId }));
 
     const res = await sendRequest(await createApp(peerActor()));
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
-    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
@@ -1934,9 +1933,9 @@ describe("agent issue mutation checkout ownership", () => {
   });
 
   it.each([
-    ["done", "todo", 403, "Agent cannot request follow-up for another agent's issue"],
-    ["cancelled", "todo", 409, "Cancelled issues must be restored through the dedicated restore flow"],
-    ["blocked", "done", 403, "Agent cannot request follow-up for another agent's issue"],
+    ["done", "todo", 403, "Agent cannot mutate another agent's issue"],
+    ["cancelled", "todo", 403, "Agent cannot mutate another agent's issue"],
+    ["blocked", "done", 403, "Agent cannot mutate another agent's issue"],
   ])(
     "rejects peer agent direct status transitions from %s to %s",
     async (status, nextStatus, expectedStatus, expectedError) => {

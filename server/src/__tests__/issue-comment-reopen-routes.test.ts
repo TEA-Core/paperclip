@@ -687,9 +687,11 @@ describe.sequential("issue comment reopen routes", () => {
         .send({ body: "Please continue this closed issue.", ...intent });
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.details.code).toBe("issue_write_not_visible");
+      // The actor holds a mention grant, so it can read the issue -- naming
+      // visibility here would send it to ask for access it already has.
+      expect(res.body.details.code).toBe("issue_write_no_grant");
       // Plan §6: name the boundary, who can act, and the sanctioned path.
-      expect(res.body.error).toContain("Issue visibility");
+      expect(res.body.error).toContain("Issue write grant");
       expect(res.body.error).toContain("Who can act:");
       expect(res.body.details.sanctionedPath).toContain("child issue");
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment" }));
@@ -1488,7 +1490,7 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("allows default-open non-assignee PATCH comments on closed issues without reopening", async () => {
+  it("rejects non-assignee agent PATCH comments on closed issues", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-1",
@@ -1515,9 +1517,10 @@ describe.sequential("issue comment reopen routes", () => {
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ comment: "hello" });
 
-    expect(res.status).toBe(200);
-    expect(mockIssueService.update).toHaveBeenCalled();
-    expect(mockIssueService.addComment).toHaveBeenCalled();
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
@@ -1818,7 +1821,7 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("honors explicit agent resume intent from a default-open peer as an agent-class wake", async () => {
+  it("refuses explicit agent resume intent from a peer with only a visible-write decision", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue("done"),
@@ -1837,20 +1840,11 @@ describe.sequential("issue comment reopen routes", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "restart someone else's work", resume: true });
 
-    expect(res.status).toBe(201);
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      { status: "todo" },
-    );
-    expect(mockIssueService.addComment).toHaveBeenCalled();
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      "22222222-2222-4222-8222-222222222222",
-      expect.objectContaining({
-        requestedByActorType: "agent",
-        reason: "issue_reopened_via_comment",
-        payload: expect.objectContaining({ resumeIntent: true }),
-      }),
-    );
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("bounds a cross-agent reply loop: peer comments wake and assignee self-replies do not", async () => {
@@ -1905,7 +1899,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ title: "cross-issue attempt 21" })],
   ] as const)("fails closed when a run exceeds the cross-issue %s cap", async (kind, sendRequest) => {
     const agentA = "44444444-4444-4444-8444-444444444444";
-    mockIssueService.getById.mockResolvedValue({ ...makeIssue("todo"), assigneeAgentId: "22222222-2222-4222-8222-222222222222" });
+    mockIssueService.getById.mockResolvedValue({ ...makeIssue("todo"), assigneeAgentId: "44444444-4444-4444-8444-444444444444" });
     mockHeartbeatService.getRun.mockResolvedValue({
       id: "run-1",
       companyId: "company-1",
@@ -1945,7 +1939,7 @@ describe.sequential("issue comment reopen routes", () => {
     const agentA = "44444444-4444-4444-8444-444444444444";
     mockIssueService.getById.mockResolvedValue({
       ...makeIssue("todo"),
-      assigneeAgentId: "22222222-2222-4222-8222-222222222222",
+      assigneeAgentId: "44444444-4444-4444-8444-444444444444",
       hiddenAt: hiddenAt === null ? new Date("2026-08-04T17:00:00.000Z") : null,
     });
     mockObserveCrossIssueInfluence.mockResolvedValue({
@@ -1974,7 +1968,7 @@ describe.sequential("issue comment reopen routes", () => {
     const agentA = "44444444-4444-4444-8444-444444444444";
     mockIssueService.getById.mockResolvedValue({
       ...makeIssue("todo"),
-      assigneeAgentId: "22222222-2222-4222-8222-222222222222",
+      assigneeAgentId: "44444444-4444-4444-8444-444444444444",
     });
     const app = await installActor(createApp(), agentActor(agentA));
     mockObserveCrossIssueInfluence
@@ -2010,7 +2004,7 @@ describe.sequential("issue comment reopen routes", () => {
     const agentA = "44444444-4444-4444-8444-444444444444";
     const existing = {
       ...makeIssue("todo"),
-      assigneeAgentId: "22222222-2222-4222-8222-222222222222",
+      assigneeAgentId: "44444444-4444-4444-8444-444444444444",
     };
     mockIssueService.getById.mockResolvedValue(existing);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
@@ -2038,7 +2032,12 @@ describe.sequential("issue comment reopen routes", () => {
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ title: "cross-issue write" })],
   ] as const)("rejects cross-issue %s writes without a run header", async (_kind, sendRequest) => {
-    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    // Assigned to the actor: the run-context requirement is what must reject
+    // this, not the assignee-ownership boundary one gate earlier.
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("todo"),
+      assigneeAgentId: "44444444-4444-4444-8444-444444444444",
+    });
     const actor = { ...agentActor("44444444-4444-4444-8444-444444444444"), runId: undefined };
     const res = await sendRequest(await installActor(createApp(), actor));
 
@@ -2053,7 +2052,11 @@ describe.sequential("issue comment reopen routes", () => {
   it.each(["invalid", "wrong agent", "wrong company"])(
     "rejects comment and PATCH writes with a %s run",
     async () => {
-      mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+      // Assigned to the actor, as above: the invalid run is the gate under test.
+      mockIssueService.getById.mockResolvedValue({
+        ...makeIssue("todo"),
+        assigneeAgentId: "44444444-4444-4444-8444-444444444444",
+      });
       mockObserveCrossIssueInfluence.mockRejectedValue(new HttpError(
         403,
         "Agent issue comments and updates require a valid heartbeat run so cross-issue influence can be contained",

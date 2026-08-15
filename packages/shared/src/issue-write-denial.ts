@@ -1,10 +1,13 @@
 /**
  * Copy contract for denied issue writes (open cross-task writes: failure UX).
  *
- * Cross-issue issue writes are default-open for standard-trust agents on issues
- * they can already read (see SPEC-implementation §9.3). The remaining walls are
- * rare — but a real incident burned a full detour discovering a workaround
- * behind an opaque 403, so every one of them must say three things:
+ * Upstream makes cross-issue writes default-open for standard-trust agents on
+ * issues they can already read (SPEC-implementation §9.3); this fork withholds
+ * that ALLOW and keeps the narrower grant model (see
+ * ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE in services/authorization.ts), so the
+ * walls here fire more often than upstream's copy assumes. A real incident
+ * burned a full detour discovering a workaround behind an opaque 403, so every
+ * one of them must say three things:
  *
  *   1. which boundary fired,
  *   2. who *can* act,
@@ -25,6 +28,7 @@ import {
 
 export const ISSUE_WRITE_DENIAL_CODES = [
   "issue_write_not_visible",
+  "issue_write_no_grant",
   "issue_write_actor_class_excluded",
   "issue_write_responsible_user_ceiling",
   "issue_write_responsible_user_unavailable",
@@ -141,13 +145,33 @@ export function describeIssueWriteDenial(
         boundary: "Issue visibility",
         title: "Task is outside this actor's visibility",
         description:
-          `Issue writes are open by default, but only for tasks the actor can already ` +
-          `read. ${issue} is not visible to ${actor}, so its comment, update, child, and ` +
-          `assignment channels are all closed — the wall is visibility, not the write itself.`,
+          `Every issue write is gated on visibility first. ${issue} is not visible to ` +
+          `${actor}, so its comment, update, child, and assignment channels are all ` +
+          `closed — the wall here is visibility, not the write itself. Visibility is ` +
+          `necessary but not sufficient: a visible task still needs a write grant.`,
         whoCanAct:
           `${assignee}, and any agent or board member the task is visible to.`,
         sanctionedPath:
           `Ask the board to widen visibility for ${actor}, or ${CHILD_ISSUE_PATH}.`,
+      };
+
+    case "issue_write_no_grant":
+      return {
+        code,
+        status: 403,
+        tone: "boundary",
+        boundary: "Issue write grant",
+        title: "This actor has no write grant on the task",
+        description:
+          `${actor} can read ${issue} but holds no write grant on it. Reading a task ` +
+          `does not carry the right to write to it: the grant has to come from being ` +
+          `its assignee or creator, from an org-chain ancestor relationship, or from ` +
+          `an explicit mention.`,
+        whoCanAct:
+          `${assignee}, the task creator, an org-chain ancestor of the assignee, or a ` +
+          `board member.`,
+        sanctionedPath:
+          `Ask ${assignee} to act, get mentioned on the task, or ${CHILD_ISSUE_PATH}.`,
       };
 
     case "issue_write_actor_class_excluded":
@@ -158,9 +182,9 @@ export function describeIssueWriteDenial(
         boundary: "Actor-class boundary",
         title: "This actor class cannot write to tasks",
         description:
-          `Default-open issue writes are a standard-trust privilege. Low-trust, ` +
-          `skill-test, and task-bridge scopes keep their existing tight walls, so ` +
-          `${actor} cannot write to ${issue} no matter who it acts for.`,
+          `Issue write grants are a standard-trust privilege. Low-trust, skill-test, ` +
+          `and task-bridge scopes keep their existing tight walls, so ${actor} cannot ` +
+          `write to ${issue} no matter who it acts for.`,
         whoCanAct:
           `A standard-trust agent in this company, or a board member.`,
         sanctionedPath:

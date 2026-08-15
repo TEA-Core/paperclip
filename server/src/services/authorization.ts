@@ -538,6 +538,32 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
   };
 }
 
+/**
+ * Fork policy for upstream's default-open visible-issue writes (#10804).
+ *
+ * Upstream made `issue:comment` and `issue:mutate` default-open for every
+ * standard-trust agent that can READ the issue, so that agents coordinate
+ * freely on work they can already see. This fork runs on the opposite default:
+ * write influence is granted, not assumed. SUP-10963 deliberately keeps the
+ * org-chain escape hatch comment-only and leaves mutation as a narrow inline
+ * ancestor check in the PATCH handler, and the cross-issue influence cap is
+ * built on the same premise — a peer that can read an issue is not thereby
+ * entitled to write to it.
+ *
+ * Only the ALLOW half of upstream's rule is withheld. The DENY half is kept:
+ * routing every standard-trust issue write through `issue:read` first is
+ * strictly tighter than what preceded it, and it keeps `issue:read` the single
+ * visibility hook that future scoping can be implemented in.
+ *
+ * `tasks:assign` is unaffected. There the same rule replaced an unconditional
+ * `allow_simple_company_member`, so it only ever narrows.
+ *
+ * Flip to true to adopt upstream's model wholesale. Every call site is left in
+ * upstream's shape and resolves this flag instead of being deleted, so the next
+ * fold merges against upstream rather than against a fork-shaped hole.
+ */
+export const ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE = false;
+
 export function authorizationService(db: Db) {
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
@@ -1424,6 +1450,10 @@ export function authorizationService(db: Db) {
     /**
      * Shared default-open decision for issue write-influence channels.
      *
+     * Fork note: this function still runs, because the DENY half of it is a
+     * tightening the fork wants (see ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE).
+     * Only its ALLOW half is withheld.
+     *
      * Keep visibility structurally upstream of every standard-trust write so
      * future visibility scoping can be implemented in issue:read without
      * recreating per-action scope checks. The responsible-user ceiling remains
@@ -2129,7 +2159,11 @@ export function authorizationService(db: Db) {
       ) {
         return allowIssueMentionGrant(input.action);
       }
-      if (visibleIssueWriteDecision) return visibleIssueWriteDecision;
+      // Fork policy: withheld unless the instance opts into upstream's
+      // default-open model. See ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE.
+      if (ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE && visibleIssueWriteDecision) {
+        return visibleIssueWriteDecision;
+      }
     }
     if (
       input.action === "agent_config:update" &&

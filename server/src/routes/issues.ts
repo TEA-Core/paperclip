@@ -197,7 +197,10 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
   readAcceptedPlanConfirmationTarget,
 } from "../services/issues.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import {
+  ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE,
+  authorizationDeniedDetails,
+} from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -3891,9 +3894,14 @@ export function issueRoutes(
    *
    * The two responsible-user ceiling codes are the most specific signal, so they
    * win. Actor-class walls (low-trust, skill-test, task-bridge scopes) stay shut
-   * by design and get their own copy. Everything else reaching a write channel is
-   * a visibility denial, because the default-open rule puts `issue:read` structurally
-   * upstream of every standard-trust write.
+   * by design and get their own copy.
+   *
+   * Upstream collapses everything remaining into a visibility denial, because
+   * under its default-open rule `issue:read` is the only thing left that can
+   * refuse a standard-trust write. The fork withholds that ALLOW
+   * (ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE), so `deny_missing_grant` reaches
+   * here on issues the actor *can* see — telling that actor the task is
+   * invisible would send it to ask for visibility it already has.
    */
   function issueWriteDenialCodeForDecision(
     decision: Awaited<ReturnType<typeof decideIssueAccess>>,
@@ -3902,6 +3910,7 @@ export function issueRoutes(
     if (decision.reason === "deny_low_trust_boundary" || decision.reason === "deny_policy_restricted") {
       return "issue_write_actor_class_excluded";
     }
+    if (decision.reason === "deny_missing_grant") return "issue_write_no_grant";
     return "issue_write_not_visible";
   }
 
@@ -3960,12 +3969,20 @@ export function issueRoutes(
     return false;
   }
 
+  // Upstream threads `allowVisibleIssueWrite: true` through each channel that
+  // adopted its default-open rule. Resolving the fork policy here instead of at
+  // those call sites keeps them byte-identical to upstream for the next fold.
+  function defaultOpenIssueWriteAllowed(options: { allowVisibleIssueWrite?: boolean }) {
+    return options.allowVisibleIssueWrite === true && ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE;
+  }
+
   async function assertIssueWriteInfluenceAllowed(
     req: Request,
     res: Response,
     issue: Parameters<typeof decideIssueAccess>[1],
   ) {
     if (req.actor.type !== "agent") return true;
+    if (!ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE) return assertIssueReadAllowed(req, res, issue);
     // Watchdog child creation keeps its dedicated subtree/revalidation grant;
     // assertTaskWatchdogCreateIssueAllowed performs that check immediately
     // after this generic collaboration gate at both create call sites.
@@ -4174,9 +4191,10 @@ export function issueRoutes(
           actorAgentId,
         });
       }
-      // Past the run lock the issue is idle, so only channels that have not
-      // adopted the default-open rule still refuse another agent's issue.
-      if (!options.allowVisibleIssueWrite) {
+      // Past the run lock the issue is idle. Upstream lets the channels that
+      // adopted its default-open rule through here; under the fork's policy the
+      // gate is closed for all of them and the issue stays its assignee's.
+      if (!defaultOpenIssueWriteAllowed(options)) {
         res.status(403).json({
           error: "Agent cannot mutate another agent's issue",
           details: {

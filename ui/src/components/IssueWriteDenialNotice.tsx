@@ -10,8 +10,10 @@ import { cn } from "../lib/utils";
 /**
  * Renders actionable copy for a denied issue write (the open cross-task write design (failure UX)).
  *
- * Cross-issue writes are open by default, so the walls that remain are rare —
- * which is exactly why hitting one has to be self-explaining. A real incident
+ * Upstream leaves cross-issue writes open by default; this fork withholds that
+ * ALLOW (see ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE), so these walls fire more
+ * often here than upstream's copy assumes — which is exactly why hitting one has
+ * to be self-explaining. A real incident
  * burned a full detour discovering a workaround behind an opaque 403; this notice always
  * states the boundary that fired, who *can* act, and the sanctioned path.
  *

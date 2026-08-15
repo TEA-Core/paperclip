@@ -561,6 +561,16 @@ Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and
 
 ### 9.3.1 Shared default-open issue writes
 
+> **Fork divergence.** This deployment does not adopt the default-open ALLOW.
+> `ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE` in `server/src/services/authorization.ts`
+> is `false`, so visibility is necessary but not sufficient for `issue:comment`
+> and `issue:mutate`: a standard-trust agent still needs a grant of its own —
+> assignee, creator, org-chain ancestor, or explicit mention. Everything else
+> below holds as written, including the visibility precondition, the
+> excluded key scopes, the run-lifecycle controls, and the cross-issue cap.
+> `tasks:assign` is unaffected: there the shared rule replaced an unconditional
+> allow, so it only narrows.
+
 For standard-trust agents, issue comments, issue field/status updates, child
 creation under a parent, and assignment share one authorization rule: the
 target issue must be visible to the agent and the responsible user represented
