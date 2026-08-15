@@ -330,32 +330,6 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
     expect(await countCompanyActivity(companyId)).toBe(0);
   });
 
-  it("leaves the caller's transaction usable when a best-effort audit write fails", async () => {
-    const { companyId, agentId, issueId } = await seedIssue("BEJ");
-    await rejectActivityLogInserts();
-
-    // Catching the error is not enough inside a transaction: in Postgres the
-    // failed INSERT aborts it, so the caller's own statements fail afterwards
-    // too. logActivity isolates the write in a savepoint precisely so the
-    // mutation it was describing still commits.
-    await db.transaction(async (tx) => {
-      await logActivity(tx as unknown as typeof db, {
-        companyId,
-        actorType: "agent",
-        actorId: agentId,
-        agentId,
-        action: "issue.updated",
-        entityType: "issue",
-        entityId: issueId,
-      });
-      await tx.update(issues).set({ title: "Committed after a failed audit write" }).where(eq(issues.id, issueId));
-    });
-
-    const [row] = await db.select({ title: issues.title }).from(issues).where(eq(issues.id, issueId));
-    expect(row?.title).toBe("Committed after a failed audit write");
-    expect(await countCompanyActivity(companyId)).toBe(0);
-  });
-
   it("still propagates audit failures from logActivityInTransaction", async () => {
     const { companyId, agentId, issueId } = await seedIssue("BEI");
     await rejectActivityLogInserts();

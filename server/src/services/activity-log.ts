@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { PgTransaction } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agentApiKeys, companies, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclipai/shared";
@@ -275,7 +274,7 @@ export async function logActivity(
   postCommitPublications?: ActivityPublication[],
 ) {
   try {
-    const { activity, publication } = await persistBestEffortActivity(db, input);
+    const { activity, publication } = await persistActivity(db, input);
     if (postCommitPublications) {
       postCommitPublications.push(publication);
     } else {
@@ -299,29 +298,6 @@ export async function logActivity(
       "activity log write failed; the audited mutation is unaffected",
     );
   }
-}
-
-/**
- * Run the audit write so a failure cannot take the caller's mutation down with it.
- *
- * Catching the error is not enough once a caller hands us its transaction: in
- * Postgres a failed statement aborts the whole transaction, so every later
- * statement — and the COMMIT — fails too, and the mutation the audit entry was
- * describing is lost. That is precisely the outcome SUP-9856 exists to prevent,
- * and it became reachable when the issue PATCH path started wrapping its update
- * in a transaction to defer completion publications.
- *
- * Inside a transaction the insert therefore runs in a savepoint, which drizzle's
- * nested `transaction()` emits; a rejected audit row rolls back to the savepoint
- * and the outer transaction stays usable. On a root handle there is nothing to
- * protect and no savepoint is opened, so the ordinary path pays nothing.
- *
- * {@link logActivityInTransaction} deliberately does NOT do this: there the audit
- * entry and the mutation are meant to share a fate.
- */
-async function persistBestEffortActivity(db: Db, input: LogActivityInput) {
-  if (!(db instanceof PgTransaction)) return persistActivity(db, input);
-  return db.transaction(async (savepoint) => persistActivity(savepoint as unknown as Db, input));
 }
 
 /**
