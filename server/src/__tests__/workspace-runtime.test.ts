@@ -3626,7 +3626,12 @@ describe("realizeExecutionWorkspace", () => {
         name: "Codex Coder",
         companyId: "company-1",
       },
-      enableWorkspaceBranchReconcileForward: true,
+      // Reconcile-forward off on purpose. With it on, a missing recorded branch over a
+      // clean registered branch is handled by forward adoption, which shadows this
+      // narrower default-branch rebind and needs a database to audit itself with; that
+      // path is covered by the deleted-branch adoption test above. Off, the rebind this
+      // test exists for is the code that runs, and it still needs no database.
+      enableWorkspaceBranchReconcileForward: false,
     });
 
     expect(result.branchName).toBe("main");
@@ -3735,7 +3740,13 @@ describe("realizeExecutionWorkspace", () => {
       issueId: "issue-unrelated-deleted",
       executionWorkspaceId: "execution-workspace-unrelated-deleted",
       expectedAncestryVerdict: "unknown",
-      expectedReason: "expected branch does not exist",
+      // Same shape as the sibling deleted-branch case above: the recorded branch is
+      // gone and the worktree is clean on its registered branch, so this now enters
+      // the forward-adoption path, which fails closed here because there is no
+      // database to audit the adoption with. The refusal itself is unchanged
+      // (eligible/attempted/succeeded stay false), and the flag-off test still pins
+      // the "expected branch does not exist" refusal.
+      expectedReason: "forward reconciliation adoption requires database access to audit after workspace realization",
     });
   }, 15_000);
 
@@ -4760,16 +4771,22 @@ describe("realizeExecutionWorkspace", () => {
       "workspace_teardown",
       "worktree_cleanup",
       "worktree_cleanup",
+      "worktree_cleanup",
     ]);
     expect(operations[0]?.command).toBe("printf 'cleanup ok\\n'");
     expect(operations[1]?.metadata).toMatchObject({
       cleanupAction: "remove_worktree_instance",
       instanceRoot,
     });
+    // The `.paperclip/.env` written above leaves the worktree dirty, so cleanup
+    // now rescues that uncommitted work on a rescue ref before removing it.
     expect(operations[2]?.metadata).toMatchObject({
-      cleanupAction: "worktree_remove",
+      cleanupAction: "preserve_uncommitted_work",
     });
     expect(operations[3]?.metadata).toMatchObject({
+      cleanupAction: "worktree_remove",
+    });
+    expect(operations[4]?.metadata).toMatchObject({
       cleanupAction: "branch_delete",
     });
     await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
