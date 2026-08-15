@@ -677,19 +677,25 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
       stdout_path="$(mktemp)"
       stderr_path="$(mktemp)"
 
-      if (
+      # SUP-12984: take the install status from `|| exit_code=$?`, not from `$?` after
+      # the `fi`. A bash `if` whose condition fails and which has no `else` branch exits
+      # 0, so the post-`fi` read always yielded 0: an install failure that was NOT a
+      # lockfile mismatch (registry 404, EACCES, missing peer) propagated as success,
+      # and provisioning reported exit 0 with no node_modules installed.
+      local exit_code=0
+      (
         cd "$worktree_cwd"
         pnpm install --prod=false "$@"
-      ) >"$stdout_path" 2>"$stderr_path"; then
-        cat "$stdout_path"
-        cat "$stderr_path" >&2
+      ) >"$stdout_path" 2>"$stderr_path" || exit_code=$?
+
+      cat "$stdout_path"
+      cat "$stderr_path" >&2
+
+      if [[ "$exit_code" -eq 0 ]]; then
         rm -f "$stdout_path" "$stderr_path"
         return 0
       fi
 
-      local exit_code=$?
-      cat "$stdout_path"
-      cat "$stderr_path" >&2
       # SUP-12984: pnpm reports "the committed lockfile disagrees with this branch's
       # manifests" under two different codes. A changed dependency version yields
       # ERR_PNPM_OUTDATED_LOCKFILE; a changed pnpm setting inside package.json
