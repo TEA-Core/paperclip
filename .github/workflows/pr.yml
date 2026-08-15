@@ -60,7 +60,14 @@ jobs:
         # whose manifests name packages its lockfile has never heard of cannot
         # be built at all, and the manual build path in the deploy runbook has
         # no regeneration step to paper over it.
+        #
+        # Only meaningful for a pull_request. `github.head_ref` is empty on
+        # `merge_group`, which voids every `startsWith` exemption above and
+        # fails the queue entry for a PR whose own pull_request run passed this
+        # same step. The queue is not a place to author a lockfile edit — the
+        # PR-event run is where this policy binds.
         if: >-
+          github.event_name == 'pull_request' &&
           !startsWith(github.head_ref, 'chore/refresh-lockfile') &&
           !startsWith(github.head_ref, 'fold-sync/') &&
           github.event.pull_request.user.login != 'dependabot[bot]'

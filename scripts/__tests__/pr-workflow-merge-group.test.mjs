@@ -76,3 +76,22 @@ test("the stale-merge-base check does not run for merge_group", () => {
   // so on a quiet base branch it would fail the queue for a current PR.
   assert.match(step[1], /if: github\.event_name == 'pull_request'/);
 });
+
+test("the manual-lockfile-edit guard does not run for merge_group", () => {
+  const pr = readWorkflow("pr.yml");
+  const step = pr.match(/- name: Block manual lockfile edits\n((?: {8}.*\n|\n)*)/);
+  assert.ok(step, "the lockfile-edit guard step should exist");
+
+  // `github.head_ref` is empty on a merge_group event, so every `startsWith`
+  // exemption above is evaluated against the empty string and the guard runs
+  // anyway — failing the queue entry for a PR whose own pull_request run passed
+  // this exact step. The guard must be scoped to pull_request, where the
+  // exemptions actually bind.
+  assert.match(step[1], /if: >-\n\s+github\.event_name == 'pull_request' &&/);
+
+  // The exemptions themselves are unchanged; they must keep working on the
+  // pull_request event.
+  assert.match(step[1], /!startsWith\(github\.head_ref, 'chore\/refresh-lockfile'\)/);
+  assert.match(step[1], /!startsWith\(github\.head_ref, 'fold-sync\/'\)/);
+  assert.match(step[1], /github\.event\.pull_request\.user\.login != 'dependabot\[bot\]'/);
+});
