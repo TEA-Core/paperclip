@@ -1588,13 +1588,13 @@ async function materializeManagedProjectWorkspace(
   },
 ): Promise<{ cwd: string; warning: string | null }> {
   await fs.mkdir(path.dirname(cwd), { recursive: true });
-  void ensureSharedGroupOwnership(path.dirname(cwd));
+  await ensureSharedGroupOwnership(path.dirname(cwd));
   const stats = await fs.stat(cwd).catch(() => null);
 
   if (!input.repoUrl) {
     if (!stats) {
       await fs.mkdir(cwd, { recursive: true });
-      void ensureSharedGroupOwnership(cwd);
+      await ensureSharedGroupOwnership(cwd);
     }
     return { cwd, warning: null };
   }
@@ -8897,7 +8897,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
       await fs.mkdir(fallbackCwd, { recursive: true });
-      void ensureSharedGroupOwnership(fallbackCwd);
+      // SUP-12631: awaited, not fire-and-forget. `git worktree add` runs right
+      // after and raced the chgrp, so the checkout could land before the agent
+      // group could reach the parent.
+      await ensureSharedGroupOwnership(fallbackCwd);
       const warnings = buildAnchorFallbackWorkspaceNotes({
         fallbackCwd,
         preferredWorkspaceWarning,
@@ -8966,7 +8969,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
     await fs.mkdir(cwd, { recursive: true });
-    void ensureSharedGroupOwnership(cwd);
+    await ensureSharedGroupOwnership(cwd);
     const warnings: string[] = [];
     if (sessionCwd && sessionCwdLooksUnsafe) {
       warnings.push(
@@ -15337,7 +15340,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agentHome: await (async () => {
         const home = resolveDefaultAgentWorkspaceDir(agent.id);
         await fs.mkdir(home, { recursive: true });
-        void ensureSharedGroupOwnership(home);
+        await ensureSharedGroupOwnership(home);
         return home;
       })(),
     };

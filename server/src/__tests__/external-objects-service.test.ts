@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   companies,
@@ -19,6 +19,7 @@ import {
   createExternalObjectDetectorRegistry,
   createExternalObjectResolverRegistry,
   externalObjectService,
+  startExternalObjectRefreshSweep,
   type ExternalObjectResolver,
 } from "../services/external-objects.js";
 import { canonicalizeExternalObjectUrl } from "@paperclipai/shared/external-objects-server";
@@ -903,4 +904,206 @@ describeEmbeddedPostgres("externalObjectService", () => {
       liveness: "fresh",
     });
   });
+
+  it("refreshDueObjectsForAllCompanies refreshes due objects across companies", async () => {
+    const first = await createIssue();
+    const second = await createIssue();
+    const resolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "open" as const,
+        statusTone: "info" as const,
+        statusKey: "open",
+        statusLabel: "Open",
+        ttlSeconds: 300,
+      },
+    }));
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(first.issueId);
+    await svc.syncIssue(second.issueId);
+
+    const result = await svc.refreshDueObjectsForAllCompanies(50);
+    expect(result.companies).toBe(2);
+    expect(result.refreshed).toBe(2);
+    expect(resolve).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshDueObjectsForAllCompanies returns zero when external objects are disabled", async () => {
+    const { companyId, issueId } = await createIssue();
+    const svc = externalObjectService(db, { enabled: false });
+    await svc.syncIssue(issueId);
+
+    const result = await svc.refreshDueObjectsForAllCompanies(50);
+    expect(result.companies).toBe(0);
+    expect(result.refreshed).toBe(0);
+  });
+
+  it("refreshDueObjects survives a throwing object and continues the rest of the company", async () => {
+    const { companyId, issueId } = await createIssue();
+    const resolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "open" as const,
+        statusTone: "info" as const,
+        statusKey: "open",
+        statusLabel: "Open",
+        ttlSeconds: 300,
+      },
+    }));
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(issueId);
+
+    resolve.mockImplementationOnce(async () => {
+      throw new Error("resolver exploded");
+    });
+
+    const results = await svc.refreshDueObjects(companyId, 50);
+    expect(results).toHaveLength(0);
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshDueObjectsForAllCompanies isolates per-company: a throwing company does not abort the tick", async () => {
+    const first = await createIssue();
+    const second = await createIssue();
+    const resolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "open" as const,
+        statusTone: "info" as const,
+        statusKey: "open",
+        statusLabel: "Open",
+        ttlSeconds: 300,
+      },
+    }));
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(first.issueId);
+    await svc.syncIssue(second.issueId);
+
+    const result = await svc.refreshDueObjectsForAllCompanies(50);
+    expect(result.companies).toBe(2);
+    expect(result.refreshed).toBe(2);
+    expect(resolve).toHaveBeenCalledTimes(2);
+
+    await db.update(externalObjects).set({ nextRefreshAt: new Date() });
+
+    resolve.mockReset();
+    resolve.mockImplementationOnce(async () => {
+      throw new Error("company A threw");
+    });
+
+    const result2 = await svc.refreshDueObjectsForAllCompanies(50);
+    expect(result2.companies).toBe(2);
+    expect(result2.refreshed).toBe(1);
+  });
 });
+
+describe("startExternalObjectRefreshSweep", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("runs the sweep on an interval and stop() halts further invocations", async () => {
+    const db = {
+      select: () => ({
+        from: () => ({
+          then: (resolve: (rows: Array<{ id: string }>) => void) => resolve([]),
+        }),
+      }),
+    } as any;
+    const runSweep = vi.fn(async () => ({ companies: 0, refreshed: 0 }));
+    const stop = startExternalObjectRefreshSweep(
+      db,
+      { github: false },
+      { intervalMs: 1000, initialDelayMs: 500, runSweep },
+    );
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(runSweep).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(runSweep).toHaveBeenCalledTimes(2);
+
+    stop();
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(runSweep).toHaveBeenCalledTimes(2);
+  });
+
+  it("survives a throwing sweep: later ticks still run", async () => {
+    const db = {
+      select: () => ({
+        from: () => ({
+          then: (resolve: (rows: Array<{ id: string }>) => void) => resolve([]),
+        }),
+      }),
+    } as any;
+    let callCount = 0;
+    const runSweep = vi.fn(async () => {
+      callCount++;
+      if (callCount === 1) {
+        throw new Error("sweep exploded");
+      }
+      return { companies: 0, refreshed: 0 };
+    });
+    const stop = startExternalObjectRefreshSweep(
+      db,
+      { github: false },
+      { intervalMs: 1000, initialDelayMs: 500, runSweep },
+    );
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(runSweep).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(runSweep).toHaveBeenCalledTimes(2);
+
+    stop();
+  });
+
+  it("skips overlapping sweeps", async () => {
+    const db = {
+      select: () => ({
+        from: () => ({
+          then: (resolve: (rows: Array<{ id: string }>) => void) => resolve([]),
+        }),
+      }),
+    } as any;
+    let resolveSweep: () => void;
+    const runSweep = vi.fn(async () => {
+      await new Promise((resolve) => {
+        resolveSweep = resolve;
+      });
+      return { companies: 0, refreshed: 0 };
+    });
+    const stop = startExternalObjectRefreshSweep(
+      db,
+      { github: false },
+      { intervalMs: 1000, initialDelayMs: 500, runSweep },
+    );
+    await vi.advanceTimersByTimeAsync(500);
+    expect(runSweep).toHaveBeenCalledTimes(1);
+    resolveSweep!();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(runSweep).toHaveBeenCalledTimes(2);
+    stop();
+  });
+ });

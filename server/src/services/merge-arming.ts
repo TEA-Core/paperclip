@@ -74,7 +74,8 @@ export async function resolveLinkedPullRequests(
   for (const row of rows) {
     const state = row.data?.state as string | undefined;
     const draft = row.data?.draft as boolean | undefined;
-    if (state !== "open" || draft === true) continue;
+    if (draft === true) continue;
+    if (state !== undefined && state !== "open") continue;
 
     const match = /^([^/]+)\/([^/]+)#(pull|issues)\/([1-9][0-9]*)$/.exec(row.externalId);
     if (!match) continue;

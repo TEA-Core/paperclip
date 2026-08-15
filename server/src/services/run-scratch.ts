@@ -89,7 +89,7 @@ export async function prepareHeartbeatRunScratch(input: {
   const issueSegment = sanitizePathSegment(input.issueIdentifier, "unassigned");
   const runSegment = sanitizePathSegment(input.runId.slice(0, 12), "run");
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-run-${issueSegment}-${runSegment}-`));
-  void ensureSharedGroupOwnership(dir);
+  await ensureSharedGroupOwnership(dir);
   const markerPath = path.join(dir, HEARTBEAT_RUN_SCRATCH_MARKER);
   const metadata: HeartbeatRunScratchMetadata = {
     version: 1,

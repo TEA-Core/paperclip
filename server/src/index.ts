@@ -33,7 +33,6 @@ import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
-import { ensureSharedGroupOwnership } from "./services/shared-group-ownership.js";
 import {
   getManagedInstanceConfig,
   type ManagedInstanceConfig,
@@ -51,6 +50,7 @@ import {
   decisionService,
   decisionRetentionService,
   externalObjectService,
+  startExternalObjectRefreshSweep,
   executionWorkspaceService,
   heartbeatService,
   issueThreadInteractionService,
@@ -151,7 +151,12 @@ export async function startServer(): Promise<StartedServer> {
   if (process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE === undefined) {
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = config.secretsMasterKeyFilePath;
   }
-  
+
+  if (process.env.PAPERCLIP_SECRETS_PROVIDER === "local_encrypted") {
+    const { assertKeyPathAtBoot } = await import("./secrets/local-encrypted-provider.js");
+    assertKeyPathAtBoot();
+  }
+
   type MigrationSummary =
     | "skipped"
     | "already applied"
@@ -378,7 +383,6 @@ export async function startServer(): Promise<StartedServer> {
     await prepareEmbeddedPostgresNativeRuntime();
 
     const dataDir = resolve(config.embeddedPostgresDataDir);
-    void ensureSharedGroupOwnership(dataDir);
     const configuredPort = config.embeddedPostgresPort;
     let port = configuredPort;
     const logBuffer = createEmbeddedPostgresLogBuffer(120);
@@ -691,7 +695,6 @@ export async function startServer(): Promise<StartedServer> {
     const label = trigger === "scheduled" ? "Automatic" : "Manual";
     try {
       logger.info({ backupDir: config.databaseBackupDir, trigger }, `${label} database backup starting`);
-      void ensureSharedGroupOwnership(config.databaseBackupDir);
       // Read retention from Instance Settings (DB) so changes take effect without restart.
       const generalSettings = await backupSettingsSvc.getGeneral();
       const retention = generalSettings.backupRetention;
@@ -930,6 +933,7 @@ export async function startServer(): Promise<StartedServer> {
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  let stopExternalObjectRefreshSweep: (() => void) | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1475,6 +1479,19 @@ export async function startServer(): Promise<StartedServer> {
     });
   }
 
+  if (config.heartbeatSchedulerEnabled) {
+    stopExternalObjectRefreshSweep = startExternalObjectRefreshSweep(
+      db,
+      {
+        pluginWorkerManager,
+        enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,
+      },
+      {
+        intervalMs: config.externalObjectRefreshIntervalMs,
+      },
+    );
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
@@ -1565,6 +1582,8 @@ export async function startServer(): Promise<StartedServer> {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
       }
+      stopExternalObjectRefreshSweep?.();
+      stopExternalObjectRefreshSweep = null;
 
       // SUP-10309. Run children are detached, so they never receive the
       // container's signals -- only this handler can reach them, and only
