@@ -240,6 +240,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     const boardKey = await boardAuth.findBoardApiKeyByToken(token);
     if (boardKey) {
+      if (boardKey.scope === "read_only" && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+        next(forbidden("read_only board API key cannot perform write operations"));
+        return;
+      }
       const access = await boardAuth.resolveBoardAccess(boardKey.userId);
       if (access.user) {
         await boardAuth.touchBoardApiKey(boardKey.id);
@@ -252,6 +256,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           memberships: access.memberships,
           isInstanceAdmin: access.isInstanceAdmin,
           keyId: boardKey.id,
+          boardKeyScope: boardKey.scope,
           runId: runIdHeader || undefined,
           source: "board_key",
         };
