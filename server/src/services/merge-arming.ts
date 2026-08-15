@@ -70,15 +70,9 @@ export async function resolveGitHubTokenForRepo(
   repo: string,
 ): Promise<GitHubTokenResult> {
   const secrets = secretService(db);
-  for (const secretName of GITHUB_TOKEN_SECRET_NAMES) {
-    const secret = await secrets.getByName(companyId, secretName);
-    if (!secret) continue;
-    const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
-    const trimmed = token.trim();
-    if (trimmed) return { token: trimmed, source: secretName };
-  }
-
   const repoUrl = `${owner}/${repo}`;
+  const escapedRepoUrl = repoUrl.replace(/[\\%_]/g, (c) => `\\${c}`);
+
   const projectRows = await db
     .select({
       id: projectWorkspaces.id,
@@ -91,7 +85,7 @@ export async function resolveGitHubTokenForRepo(
     .where(
       and(
         eq(projectWorkspaces.companyId, companyId),
-        ilike(projectWorkspaces.repoUrl, `%${repoUrl}%`),
+        ilike(projectWorkspaces.repoUrl, `%${escapedRepoUrl}%`),
       ),
     );
 
@@ -111,6 +105,9 @@ export async function resolveGitHubTokenForRepo(
       if (trimmed) return { token: trimmed, source: secretName };
     }
   }
+
+  const companyToken = await resolveGitHubToken(db, companyId);
+  if (companyToken) return { token: companyToken, source: "company-scoped" };
 
   if (projectRows.length > 0) {
     return { token: null, reason: `No GitHub token resolvable for ${owner}/${repo} at company or project scope` };
@@ -487,10 +484,11 @@ export async function armMergeOnApproval(
     };
   }
 
-  const token = await resolveGitHubToken(db, companyId);
-  if (!token) {
-    return { kind: "failed", message: "failed:auth_required: GitHub authentication failed" };
+  const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
+  if (!isGitHubTokenResolution(tokenResult)) {
+    return { kind: "failed", message: `failed:auth_required: ${tokenResult.reason}` };
   }
+  const token = tokenResult.token;
 
   let nodeId = pr.nodeId;
   if (!nodeId) {

@@ -481,7 +481,9 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
       const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
       expect(result.kind).toBe("failed");
-      expect(result.message).toBe("failed:auth_required: GitHub authentication failed");
+      expect(result.message).toBe(
+        "failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope)",
+      );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
@@ -496,7 +498,9 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
       const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
       expect(result.kind).toBe("failed");
-      expect(result.message).toBe("failed:auth_required: GitHub authentication failed");
+      expect(result.message).toBe(
+        "failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope)",
+      );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
@@ -1252,7 +1256,7 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project-scoped token pro
     expect(mockGetByName).toHaveBeenCalledWith(companyId, "GH_TOKEN_TSP");
   });
 
-  it("prefers company-scoped token over project-scoped token", async () => {
+  it("prefers project-scoped token over company-scoped token", async () => {
     const [projectRow] = await db
       .insert(projects)
       .values({
@@ -1290,8 +1294,90 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project-scoped token pro
     const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
+    expect(result.token).toBe("ghp_tsp_token_value");
+    expect(result.source).toBe("GH_TOKEN_TSP");
+  });
+
+  it("falls back to company-scoped token when no project-scoped token resolves", async () => {
+    const [projectRow] = await db
+      .insert(projects)
+      .values({
+        id: randomUUID(),
+        companyId,
+        name: "TSP",
+        urlKey: "tsp",
+        status: "in_progress",
+      })
+      .returning();
+
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId,
+      projectId: projectRow!.id,
+      name: "paperclip",
+      repoUrl: "https://github.com/TEA-Core/Trading-Signal-Platform",
+      isPrimary: true,
+    });
+
+    mockGetByName.mockImplementation((_companyId: string, name: string) => {
+      if (name === "GITHUB_TOKEN") {
+        return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+      }
+      return Promise.resolve(null);
+    });
+    mockResolveSecretValue.mockResolvedValue("ghp_company_token");
+
+    const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
+    const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
+
     expect(result.token).toBe("ghp_company_token");
-    expect(result.source).toBe("GITHUB_TOKEN");
+    expect(result.source).toBe("company-scoped");
+  });
+
+  it("matches repo name containing underscore exactly, not as a single-char wildcard", async () => {
+    const [projectRow] = await db
+      .insert(projects)
+      .values({
+        id: randomUUID(),
+        companyId,
+        name: "TSP",
+        urlKey: "tsp",
+        status: "in_progress",
+      })
+      .returning();
+
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId,
+      projectId: projectRow!.id,
+      name: "paperclip",
+      repoUrl: "https://github.com/TEA-Core/Trading-Signal-Platform",
+      isPrimary: true,
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId,
+      projectId: projectRow!.id,
+      name: "paperclip",
+      repoUrl: "https://github.com/TEA-Core/TradingXSignal-Platform",
+      isPrimary: false,
+    });
+
+    mockGetByName.mockImplementation((_companyId: string, name: string) => {
+      if (name === "GH_TOKEN_TSP") {
+        return Promise.resolve({ id: "secret-tsp", name: "GH_TOKEN_TSP" });
+      }
+      return Promise.resolve(null);
+    });
+    mockResolveSecretValue.mockResolvedValue("ghp_tsp_token_value");
+
+    const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
+    const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
+
+    expect(result.token).toBe("ghp_tsp_token_value");
+    expect(result.source).toBe("GH_TOKEN_TSP");
+    expect(mockResolveSecretValue).toHaveBeenCalledTimes(1);
   });
 
   it("returns failure when no token is resolvable at company or project scope", async () => {
