@@ -158,6 +158,9 @@ jobs:
       - name: Test /app runtime tree ownership invariants
         run: node --test ./scripts/__tests__/dockerfile-app-root-owned.test.mjs
 
+      - name: Test docker image build cache ref casing
+        run: node --test ./scripts/__tests__/docker-workflow-cache-refs.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
