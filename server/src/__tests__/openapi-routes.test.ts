@@ -221,7 +221,7 @@ describe("openapi routes", () => {
     expect(JSON.stringify(res.body.paths["/api/tool-gateway/tools/call"].post)).not.toContain("sessionToken");
     expect(res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"]).toBeDefined();
     expect(res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.summary).toBe(
-      "Withdraw a pending issue thread interaction as its author",
+      "Withdraw a pending issue thread interaction",
     );
     expect(res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.responses["409"]).toBeDefined();
     expect(res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.responses["403"]).toBeDefined();

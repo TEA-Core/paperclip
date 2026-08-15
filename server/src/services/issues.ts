@@ -2683,11 +2683,15 @@ async function listIssueBlockerAttentionMap(
         childRowsPromise,
       ]);
 
-      const unresolvedExplicitBlockerRows = explicitBlockerRows.filter(
-        (row) => row.status !== "done" || pendingFinalizeBlockerIssueIds.has(row.blockerIssueId),
-      );
+      // Done explicit blockers stay in the edge map and in nodesById on purpose.
+      // Every consumer below re-applies the done/pending-finalize filter itself
+      // (`topLevelEdges`, `downstream`, `pathHasLiveWork`), and the root loop
+      // needs the unfiltered edges: when a blocked root's blockers are *all*
+      // done, `allEdges[0]` is what names the terminal blocker in the
+      // needs_attention sample. Filtering here left that branch unreachable and
+      // the sample null.
       appendBlockerAttentionEdges(edgesByIssueId, [
-        ...unresolvedExplicitBlockerRows
+        ...explicitBlockerRows
           .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
           .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId, kind: "explicit" as const })),
         ...childRows
@@ -2695,7 +2699,7 @@ async function listIssueBlockerAttentionMap(
           .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId, kind: "child" as const })),
       ]);
 
-      for (const row of [...unresolvedExplicitBlockerRows, ...childRows]) {
+      for (const row of [...explicitBlockerRows, ...childRows]) {
         if (!row.issueId || nodesById.has(row.blockerIssueId)) continue;
         nodesById.set(row.blockerIssueId, {
           id: row.blockerIssueId,

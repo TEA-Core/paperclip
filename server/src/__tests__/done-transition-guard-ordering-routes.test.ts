@@ -9,6 +9,7 @@ import {
   companyMemberships,
   createDb,
   executionWorkspaces,
+  heartbeatRuns,
   issues,
   projectWorkspaces,
   projects,
@@ -202,14 +203,29 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     };
   }
 
-  function unresolvableRunId() {
-    return randomUUID();
+  /**
+   * A run this instance can resolve, anchored on the issue under test.
+   *
+   * Agent writes are contained per heartbeat run, and that guard runs ahead of
+   * the done-transition guards this test is about — an unresolvable run gets a
+   * 403 before either of them is reached. Anchoring the run on the same issue
+   * also keeps the write off the cross-issue path entirely.
+   */
+  async function seedRun(companyId: string, agentId: string, issueId: string) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+    return runId;
   }
 
   it("Tier-0 409 (done_transition_missing_delivery) fires before tier declaration check on a branch-ahead/no-merged-PR issue with no declaration", async () => {
     const { companyId, agentId, issueId, identifier } = await seedIssue("ORD");
-    const runId = unresolvableRunId();
-    currentActor = agentActor(companyId, agentId, runId);
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
 
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");

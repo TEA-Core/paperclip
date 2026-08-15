@@ -184,8 +184,20 @@ describeEmbeddedPostgres("recovery bounds deterministic setup-failure re-dispatc
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("2× attempts");
-    expect(comments[0]?.body).toContain("Latest cause: `setup_failed`");
     expect(comments[0]?.body).toContain("Moving it to `blocked`");
+    // The repeating errorCode moved out of the body and into the notice
+    // metadata: run failure detail is redacted out of issue copy, which
+    // `heartbeat-process-recovery` asserts directly. The bound itself — park
+    // after the repetition rather than enqueue another wake — is unchanged.
+    expect(comments[0]?.body).not.toContain("setup_failed");
+    const metadataRows = ((comments[0]?.metadata as {
+      sections?: Array<{ rows?: Array<Record<string, unknown>> }>;
+    } | null)?.sections ?? []).flatMap((section) => section.rows ?? []);
+    expect(metadataRows).toContainEqual({
+      type: "key_value",
+      label: "Failure code",
+      value: "setup_failed",
+    });
 
     const actions = await db
       .select()
