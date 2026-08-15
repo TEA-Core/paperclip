@@ -70,6 +70,18 @@ export function assertKeyPathAtBoot(): void {
     },
     "secrets master key path resolved at boot",
   );
+
+  if (insideHome && hasEnvKey) {
+    logger.warn(
+      {
+        keyPath,
+        paperclipHome,
+      },
+      "secrets master key file resolves inside PAPERCLIP_HOME while PAPERCLIP_SECRETS_MASTER_KEY is set; " +
+        "the isolated key path is not configured. Set PAPERCLIP_SECRETS_MASTER_KEY_FILE to an isolated path outside " +
+        "PAPERCLIP_HOME (e.g. /etc/paperclip/secrets/master.key).",
+    );
+  }
 }
 
 interface LocalEncryptedMaterial extends StoredSecretVersionMaterial {
