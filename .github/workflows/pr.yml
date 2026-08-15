@@ -47,8 +47,22 @@ jobs:
           fetch-depth: 0
 
       - name: Block manual lockfile edits
+        # `refresh-lockfile.yml` names its branch
+        # `chore/refresh-lockfile-<sanitized base ref>`, so on any base other
+        # than one literally called `chore/refresh-lockfile` the exact-match
+        # exemption missed and the bot's own PR was refused by the guard it
+        # exists to satisfy. Prefix match instead.
+        #
+        # Fold branches are exempt for a different reason: a fold does not
+        # hand-edit the lockfile, it imports upstream's resolved one wholesale,
+        # and that resolution is what upstream tested. Dropping it is not an
+        # option either — `Dockerfile` installs `--frozen-lockfile`, so a tree
+        # whose manifests name packages its lockfile has never heard of cannot
+        # be built at all, and the manual build path in the deploy runbook has
+        # no regeneration step to paper over it.
         if: >-
-          github.head_ref != 'chore/refresh-lockfile' &&
+          !startsWith(github.head_ref, 'chore/refresh-lockfile') &&
+          !startsWith(github.head_ref, 'fold-sync/') &&
           github.event.pull_request.user.login != 'dependabot[bot]'
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
