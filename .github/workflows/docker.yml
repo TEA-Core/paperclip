@@ -7,6 +7,10 @@ on:
       - "fold/**"
     tags:
       - "v*"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/docker.yml"
 
 permissions:
   contents: read
@@ -14,6 +18,7 @@ permissions:
 
 jobs:
   build-and-push:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     concurrency:
@@ -71,3 +76,75 @@ jobs:
           cache-to: type=gha,mode=max
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  docker-build-assert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build production image (no push)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: paperclip:pr
+          target: production
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Assert /app is root-owned
+        run: |
+          docker run --rm paperclip:pr sh -c 'ls -ld /app/packages /app/server'
+
+      - name: Assert uid-1000 cannot write to /app (EACCES)
+        run: |
+          set +e
+          docker run --rm -u 1000:1000 paperclip:pr sh -c 'touch /app/packages/adapter-utils/src/acpx-engine/.probe' > /tmp/touch-out.txt 2>&1
+          touch_rc=$?
+          if [ "$touch_rc" -eq 0 ]; then
+            echo "FAIL: touch succeeded (uid 1000 was able to write to /app)"
+            cat /tmp/touch-out.txt
+            exit 1
+          fi
+          echo "PASS: touch failed with exit code $touch_rc (EACCES as expected)"
+          cat /tmp/touch-out.txt
+
+      - name: Assert uid-1000 cannot overwrite executed source (EACCES)
+        run: |
+          set +e
+          docker run --rm -u 1000:1000 paperclip:pr sh -c 'echo x > /app/packages/adapter-utils/src/acpx-engine/execute.ts' > /tmp/overwrite-out.txt 2>&1
+          overwrite_rc=$?
+          if [ "$overwrite_rc" -eq 0 ]; then
+            echo "FAIL: overwrite succeeded (uid 1000 was able to write to /app)"
+            cat /tmp/overwrite-out.txt
+            exit 1
+          fi
+          echo "PASS: overwrite failed with exit code $overwrite_rc (EACCES as expected)"
+          cat /tmp/overwrite-out.txt
+
+      - name: Assert server can still read+execute /app under uid 1000
+        run: |
+          docker run --rm -u 1000:1000 paperclip:pr node --import ./server/node_modules/tsx/dist/loader.mjs -e 'console.log("tsx-loader-ok")'
+
+      # Read-only is not enough: hardening that strips executable bits leaves an
+      # image that boots and then fails with EACCES the first time the tsx
+      # loader shells out to esbuild, or an agent runs a bundled skill helper.
+      - name: Assert executable bits survived hardening (tsx transform + skill helper)
+        run: |
+          docker run --rm -u 1000:1000 paperclip:pr sh -c '
+            set -e
+            printf "const msg: string = \"tsx-transform-ok\";\nconsole.log(msg);\n" > /tmp/probe.ts
+            node --import /app/server/node_modules/tsx/dist/loader.mjs /tmp/probe.ts
+            test -x /app/skills/paperclip/scripts/paperclip-upload-artifact.sh \
+              || { echo "FAIL: bundled skill helper lost its executable bit"; exit 1; }
+            echo "PASS: executable bits preserved under /app"
+          '

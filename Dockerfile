@@ -156,7 +156,21 @@ FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
 WORKDIR /app
-COPY --chown=node:node --from=build /app /app
+COPY --from=build /app /app
+# Root-own the entire runtime tree so uid-1000 agent runs cannot modify
+# executed control-plane code or forge content-based deploy probes. Root
+# ownership is what closes the write path: the server runs as uid 1000 and only
+# needs read+traverse here, so it lands in the "other" class with no write bit.
+# `go-w` strips write from group/other for the few trees npm/pnpm leave
+# group- or world-writable.
+#
+# Do NOT normalise modes to 0644 files / 0755 dirs. /app ships files that must
+# stay executable: the esbuild binary the tsx loader in CMD spawns, the
+# node_modules/.bin targets, and the bundled skill helpers agents invoke
+# directly (doc/AGENT-ARTIFACTS.md). A blanket 0644 leaves a readable tree that
+# fails with EACCES the first time any of them is executed.
+RUN chown -R root:root /app \
+    && chmod -R go-w /app
 # Self-contained MCP server tree with resolved dependencies (npm pack + install).
 COPY --chown=node:node --from=build /opt/paperclip-mcp /opt/paperclip-mcp
 RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest supabase@latest \

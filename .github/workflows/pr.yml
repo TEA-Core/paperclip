@@ -134,6 +134,9 @@ jobs:
       - name: Test agent spawn shim invariants
         run: node --test ./scripts/__tests__/agent-spawn-shim.test.mjs
 
+      - name: Test /app runtime tree ownership invariants
+        run: node --test ./scripts/__tests__/dockerfile-app-root-owned.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
