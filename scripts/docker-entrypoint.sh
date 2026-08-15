@@ -66,11 +66,19 @@ if [ -d "$home_dir" ] && [ "$(stat -c %u "$home_dir")" != "$(id -u node)" ]; the
     chown node "$home_dir"
 fi
 
-# Pre-create the secrets key directory with paperclip-user ownership.
-# The server's local-encrypted provider writes /etc/paperclip/secrets/master.key
-# at startup; this directory is outside the agent-visible volume and must exist.
-mkdir -p /etc/paperclip/secrets
-chown node:node /etc/paperclip/secrets
+# Root-own the secrets directory so agent runs (uid 1000) can neither read nor
+# write it. DAC cannot distinguish the server from agents — both run uid 1000 —
+# so the key is handed to the server via the environment (exported below) BEFORE
+# privileges drop to node.
+install -d -m 0700 -o root -g root /etc/paperclip/secrets
+if [ -f /etc/paperclip/secrets/master.key ]; then
+    chown root:root /etc/paperclip/secrets/master.key
+    chmod 0600 /etc/paperclip/secrets/master.key
+    # Hand the master key to the server before the gosu drop. NEVER echo it;
+    # this entrypoint must never run under `set -x`.
+    PAPERCLIP_SECRETS_MASTER_KEY="$(cat /etc/paperclip/secrets/master.key)"
+    export PAPERCLIP_SECRETS_MASTER_KEY
+fi
 
 # Populate the npm-global volume with the self-contained MCP server tree.
 # The build stage (Dockerfile) ran `npm pack` + `npm install --global --omit=dev

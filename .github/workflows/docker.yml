@@ -483,4 +483,34 @@ jobs:
             test -x /app/skills/paperclip/scripts/paperclip-upload-artifact.sh \
               || { echo "FAIL: bundled skill helper lost its executable bit"; exit 1; }
             echo "PASS: executable bits preserved under /app"
-          '
+           '
+
+      - name: Assert /etc/paperclip/secrets is root-owned
+        run: |
+          docker run --rm paperclip:pr sh -c 'ls -ld /etc/paperclip/secrets; ls -l /etc/paperclip/secrets/master.key 2>/dev/null || true'
+
+      - name: Assert uid-1000 cannot write to /etc/paperclip/secrets (EACCES)
+        run: |
+          set +e
+          docker run --rm -u 1000:1000 paperclip:pr sh -c 'touch /etc/paperclip/secrets/.probe' > /tmp/secrets-touch-out.txt 2>&1
+          touch_rc=$?
+          if [ "$touch_rc" -eq 0 ]; then
+            echo "FAIL: touch succeeded (uid 1000 was able to write to /etc/paperclip/secrets)"
+            cat /tmp/secrets-touch-out.txt
+            exit 1
+          fi
+          echo "PASS: touch failed with exit code $touch_rc (EACCES as expected)"
+          cat /tmp/secrets-touch-out.txt
+
+      - name: Assert uid-1000 cannot unlink master.key (EACCES)
+        run: |
+          set +e
+          docker run --rm -u 1000:1000 paperclip:pr sh -c 'rm -f /etc/paperclip/secrets/master.key' > /tmp/secrets-rm-out.txt 2>&1
+          rm_rc=$?
+          if [ "$rm_rc" -eq 0 ]; then
+            echo "FAIL: rm succeeded (uid 1000 was able to unlink master.key)"
+            cat /tmp/secrets-rm-out.txt
+            exit 1
+          fi
+          echo "PASS: rm failed with exit code $rm_rc (EACCES as expected)"
+          cat /tmp/secrets-rm-out.txt
