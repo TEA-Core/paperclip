@@ -421,6 +421,41 @@ jobs:
           fi
           echo "PASS: no raw \${{ github.repository }} in cache refs"
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      # The image runs `pnpm install --frozen-lockfile` in its deps stage, so it
+      # needs the same refreshed lockfile the publishing jobs above build with.
+      # Without this the assert job died in the deps stage with
+      # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH whenever the committed lockfile lagged
+      # the manifests, before any hardening assertion below could run.
+      - name: Refresh lockfile for Docker build context
+        run: |
+          set -euo pipefail
+          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+
+          changed="$(git status --porcelain)"
+          if [ -z "$changed" ]; then
+            echo "Lockfile already matches package metadata."
+            exit 0
+          fi
+
+          if printf '%s\n' "$changed" | grep -Fvq ' pnpm-lock.yaml'; then
+            echo "Unexpected files changed during lockfile refresh:"
+            echo "$changed"
+            exit 1
+          fi
+
+          echo "Using refreshed pnpm-lock.yaml in the Docker build context."
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
