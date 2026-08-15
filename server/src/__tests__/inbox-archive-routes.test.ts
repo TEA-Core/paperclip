@@ -294,7 +294,10 @@ describeEmbeddedPostgres("inbox archive routes", () => {
 
     await request(appFor(agentActor(seeded)))
       .patch(`/api/issues/${seeded.issueId}`)
-      .send({ status: "done" })
+      // SUP-12693: an agent close carries a done-tier declaration. The subject
+      // here is that an *agent* completion archives no inbox, so the declaration
+      // is supplied rather than the guard relaxed.
+      .send({ status: "done", comment: "Closed at Tier 2 (live): inbox archive attribution exercised." })
       .expect(200);
 
     expect(await db.select().from(issueInboxArchives)).toHaveLength(0);

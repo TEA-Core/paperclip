@@ -148,6 +148,7 @@ import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalizat
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
   logActivity,
+  logActivityInTransaction,
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
@@ -8389,13 +8390,17 @@ export function issueService(db: Db) {
             undefined,
             tx,
           );
-          // Best-effort, like every other audit write on a committed mutation
-          // (SUP-9856). Calling persistActivity directly bypassed that: a failed
-          // audit insert propagated out of the update transaction and turned a
-          // successful human completion into a 500. logActivity swallows the
-          // failure and, given the queue, pushes the publication for the caller
-          // to drain after commit.
-          await logActivity(tx as unknown as Db, {
+          // Deliberately fate-shared, and the one audit write on this route that
+          // is. SUP-9856 makes audits best-effort because they run *after* their
+          // mutation has committed, so failing the request would only make a
+          // retrying client double-post. This one is different in kind: the
+          // archive row and its audit are both still inside the transaction, so
+          // rolling both back loses nothing and leaves no inbox archived without
+          // a record of why. `inbox-archive-routes` pins that contract.
+          //
+          // The publication queue still applies: the caller drains it after the
+          // commit that this write is now part of.
+          await logActivityInTransaction(tx as unknown as Db, {
             companyId: updated.companyId,
             actorType: "user",
             actorId: actorUserId,

@@ -307,9 +307,14 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
   });
 
   it.each([
-    { label: "agent", issuePrefix: "BEG" },
-    { label: "board", issuePrefix: "BEH" },
-  ])("keeps a $label status change committed when the audit insert fails", async ({ label, issuePrefix }) => {
+    // A human completion is deliberately excluded: it archives the responsible
+    // user's inbox, and that archive shares a fate with its audit row inside the
+    // same transaction (see issues.ts and `inbox-archive-routes`). Best-effort
+    // covers the audits that run *after* their mutation has committed, which is
+    // every other one on this route.
+    { label: "agent", issuePrefix: "BEG", nextStatus: "done", comment: "Closed at Tier 2 (live): best-effort audit path exercised." },
+    { label: "board", issuePrefix: "BEH", nextStatus: "in_progress", comment: "Picked up: best-effort audit path exercised." },
+  ])("keeps a $label status change committed when the audit insert fails", async ({ label, issuePrefix, nextStatus, comment }) => {
     const { companyId, agentId, issueId, identifier } = await seedIssue(issuePrefix);
     currentActor = label === "agent"
       ? agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId))
@@ -318,10 +323,10 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
 
     const res = await request(app)
       .patch(`/api/issues/${identifier}`)
-      .send({ status: "done", comment: "Closed at Tier 2 (live): best-effort audit path exercised." });
+      .send({ status: nextStatus, comment });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(await readStatus(issueId)).toBe("done");
+    expect(await readStatus(issueId)).toBe(nextStatus);
     expect(await countCompanyActivity(companyId)).toBe(0);
   });
 
