@@ -230,6 +230,7 @@ Routine execution issues add a routine-scoped env overlay after project env and 
 - `description` text null
 - `status` enum: `backlog | todo | in_progress | in_review | done | blocked | cancelled`
 - `priority` enum: `critical | high | medium | low`
+- `review_policy` nullable enum: `anyone | not_creator | human_only`; null is equivalent to `anyone`
 - `assignee_agent_id` uuid fk `agents.id` null
 - `assignee_user_id` text null
 - checkout/execution locks: `checkout_run_id`, `execution_run_id`, `execution_agent_name_key`, `execution_locked_at`
@@ -1031,6 +1032,7 @@ Dashboard payload must include:
 
 The current app also exposes V1-supporting surfaces for:
 
+- company-scoped summary slots for projects, the workspaces overview, project workspaces, and individual execution workspaces; execution-workspace slots are keyed by execution workspace id so a new workspace never inherits another workspace's summary
 - issue thread interactions (`suggest_tasks`, `ask_user_questions`, `request_confirmation`)
 - issue approvals, issue references/search, labels, read state, inbox/archive state, and work products
 - company search through `GET /companies/:companyId/search` plus agent-oriented bulk extraction through

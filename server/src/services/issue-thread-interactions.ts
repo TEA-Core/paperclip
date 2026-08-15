@@ -84,6 +84,7 @@ type InteractionActor = {
   runId?: string | null;
   userId?: string | null;
   systemId?: string | null;
+  reviewVerdictAuthorized?: boolean;
   resolutionDetails?: Record<string, unknown>;
 };
 
@@ -258,18 +259,6 @@ export function resolveInteractionPolicy(args: {
 function assertAgentResolutionAllowed(current: IssueThreadInteractionRow, actor: InteractionActor) {
   if (!actor.agentId) return;
   if (!actor.runId) throw forbidden("Agent run id required to resolve an issue-thread interaction");
-  if (current.effectiveResolverPolicy !== "board_or_agents") {
-    throw forbidden("This issue-thread interaction is board-only");
-  }
-  if (current.addresseeAgentId && current.addresseeAgentId !== actor.agentId) {
-    throw forbidden("Only the addressed agent or a board user may resolve this issue-thread interaction");
-  }
-  if (current.createdByAgentId === actor.agentId) {
-    throw forbidden("Agents cannot resolve interactions they created");
-  }
-  if (current.sourceRunId && current.sourceRunId === actor.runId) {
-    throw forbidden("Agents cannot resolve interactions created by the same run");
-  }
   if (
     current.kind === "request_confirmation"
     && current.payload
@@ -278,6 +267,26 @@ function assertAgentResolutionAllowed(current: IssueThreadInteractionRow, actor:
     && current.payload.toolAction !== undefined
   ) {
     throw forbidden("Tool-action confirmations are always board-only");
+  }
+  if (actor.reviewVerdictAuthorized && isRequestConfirmationLikeKind(current.kind)) {
+    assertAgentInteractionActorAllowed(current, actor);
+    return;
+  }
+  if (current.effectiveResolverPolicy !== "board_or_agents") {
+    throw forbidden("This issue-thread interaction is board-only");
+  }
+  assertAgentInteractionActorAllowed(current, actor);
+}
+
+function assertAgentInteractionActorAllowed(current: IssueThreadInteractionRow, actor: InteractionActor) {
+  if (current.addresseeAgentId && current.addresseeAgentId !== actor.agentId) {
+    throw forbidden("Only the addressed agent or a board user may resolve this issue-thread interaction");
+  }
+  if (current.createdByAgentId === actor.agentId) {
+    throw forbidden("Agents cannot resolve interactions they created");
+  }
+  if (current.sourceRunId && current.sourceRunId === actor.runId) {
+    throw forbidden("Agents cannot resolve interactions created by the same run");
   }
 }
 
@@ -1029,10 +1038,14 @@ async function getIssueDocumentTargetSnapshot(db: Db | any, args: {
   companyId: string;
   issueId: string;
   target: RequestConfirmationTarget;
+  // When true, take a FOR UPDATE row lock on the joined document so a concurrent
+  // revision publish (which updates documents.latestRevisionId) must serialize
+  // behind the caller's transaction. Only meaningful inside a transaction.
+  lockForUpdate?: boolean;
 }) {
   if (args.target.type !== "issue_document") return null;
   const targetIssueId = args.target.issueId ?? args.issueId;
-  const row = await db
+  const query = db
     .select({
       issueId: issueDocuments.issueId,
       documentId: issueDocuments.documentId,
@@ -1046,7 +1059,8 @@ async function getIssueDocumentTargetSnapshot(db: Db | any, args: {
       eq(issueDocuments.companyId, args.companyId),
       eq(issueDocuments.issueId, targetIssueId),
       eq(issueDocuments.key, args.target.key),
-    ))
+    ));
+  const row = await (args.lockForUpdate ? query.for("update", { of: documents }) : query)
     .then((rows: Array<{
       issueId: string;
       documentId: string;
@@ -1100,6 +1114,10 @@ async function assertRequestConfirmationTargetIsCurrent(db: Db | any, args: {
   companyId: string;
   issueId: string;
   target?: RequestConfirmationTarget | null;
+  // Forwarded to getIssueDocumentTargetSnapshot; pass true when validating
+  // inside the create transaction so the revision read locks the document row
+  // and stays atomic with the interaction insert.
+  lockForUpdate?: boolean;
 }) {
   if (!args.target) return;
   if (args.target.type !== "issue_document") return;
@@ -1107,6 +1125,7 @@ async function assertRequestConfirmationTargetIsCurrent(db: Db | any, args: {
     companyId: args.companyId,
     issueId: args.issueId,
     target: args.target,
+    lockForUpdate: args.lockForUpdate,
   });
   if (!snapshot || snapshot.latestRevisionId !== args.target.revisionId) {
     throw unprocessable("request_confirmation target must reference the current issue document revision");
@@ -1832,18 +1851,11 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
         }
       }
 
-      if (
+      const requiresCurrentTarget =
         data.kind === "request_confirmation"
         || data.kind === "request_checkbox_confirmation"
         || data.kind === "request_item_verdicts"
-        || data.kind === "request_board_approval"
-      ) {
-        await assertRequestConfirmationTargetIsCurrent(db, {
-          companyId: issue.companyId,
-          issueId: issue.id,
-          target: data.payload.target ?? null,
-        });
-      }
+        || data.kind === "request_board_approval";
 
       let created: IssueThreadInteractionRow;
       let superseded: IssueThreadInteractionRow[] = [];
@@ -1861,6 +1873,19 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
             .for("update");
           if (!issueRow || isTerminalIssueStatus(issueRow.status)) {
             throw conflict("Cannot create an interaction on a closed issue");
+          }
+          // Validate the plan/document confirmation target inside the same
+          // transaction (locking the document row) so the latest-revision check
+          // is atomic with the insert below. A concurrent revision publish can no
+          // longer slip between the check and the insert to leave a confirmation
+          // pointing at a stale revision.
+          if (requiresCurrentTarget) {
+            await assertRequestConfirmationTargetIsCurrent(tx, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              target: data.payload.target ?? null,
+              lockForUpdate: true,
+            });
           }
           const [row] = await tx
             .insert(issueThreadInteractions)

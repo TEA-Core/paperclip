@@ -21,6 +21,7 @@ import {
   mergeExecutionWorkspaceMetadataForPersistence,
   provisionExecutionWorkspaceForFreshnessDecision,
   readExecutionWorkspaceOccupancyDeferrals,
+  reconcileReusedExecutionWorkspaceProjectWorkspaceId,
   recordWorkspaceConfigFreshnessOperation,
   resolveExecutionWorkspaceConfigFreshness,
   resolveExecutionWorkspaceOccupancyDecision,
@@ -642,6 +643,10 @@ export async function provisionIssueExecutionWorkspace(
             status: "active",
             lastUsedAt: new Date(),
             metadata: nextExecutionWorkspaceMetadata,
+            projectWorkspaceId: reconcileReusedExecutionWorkspaceProjectWorkspaceId(
+              reusableExistingExecutionWorkspace.projectWorkspaceId,
+              resolvedProjectWorkspaceId,
+            ),
           })
         : resolvedProjectId
           ? await executionWorkspacesSvc.create({

@@ -72,6 +72,7 @@ import type {
   SuggestTasksInteraction,
 } from "../lib/issue-thread-interactions";
 import { buildIssueThreadInteractionSummary, isIssueThreadInteraction } from "../lib/issue-thread-interactions";
+import { isLiveIssueRun } from "../lib/liveIssueIds";
 import { resolveIssueChatTranscriptRuns } from "../lib/issueChatTranscriptRuns";
 import {
   formatTimelineWorkspaceLabel,
@@ -776,6 +777,18 @@ function formatAttachmentSize(bytes: number) {
 function toIsoString(value: string | Date | null | undefined): string | null {
   if (!value) return null;
   return typeof value === "string" ? value : value.toISOString();
+}
+
+/**
+ * ISO timestamp for display, or undefined when the value does not parse as a
+ * real date. Comment timestamps can arrive malformed (e.g. a server
+ * serialization bug turning Dates into `{}`); formatting must degrade to "no
+ * timestamp" instead of throwing mid-render (PAP-16607).
+ */
+function toValidIsoString(value: Date | string | number | undefined): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
 function loadDraft(draftKey: string): string {
@@ -2742,7 +2755,7 @@ function SystemNoticeCommentRow({
         {bodyText}
       </MarkdownBody>
     ),
-    timestamp: message.createdAt ? new Date(message.createdAt).toISOString() : undefined,
+    timestamp: toValidIsoString(message.createdAt),
     source,
     runAgentId,
   });
@@ -4431,9 +4444,10 @@ export function IssueChatThread({
   const displayLiveRuns = useMemo(() => {
     const deduped = new Map<string, LiveRunForIssue>();
     for (const run of liveRuns) {
+      if (!isLiveIssueRun(run, issueStatus)) continue;
       deduped.set(run.id, run);
     }
-    if (activeRun) {
+    if (activeRun && isLiveIssueRun(activeRun, issueStatus)) {
       deduped.set(activeRun.id, {
         id: activeRun.id,
         status: activeRun.status,
@@ -4464,7 +4478,7 @@ export function IssueChatThread({
       });
     }
     return [...deduped.values()].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-  }, [activeRun, liveRuns]);
+  }, [activeRun, issueStatus, liveRuns]);
   const transcriptRuns = useMemo(() => {
     return resolveIssueChatTranscriptRuns({
       linkedRuns,
@@ -4482,8 +4496,8 @@ export function IssueChatThread({
     return ids;
   }, [displayLiveRuns]);
   const hasActiveRun = useMemo(
-    () => displayLiveRuns.some((run) => run.status === "running") || activeRun?.status === "running",
-    [displayLiveRuns, activeRun],
+    () => displayLiveRuns.some((run) => run.status === "running"),
+    [displayLiveRuns],
   );
   // Real-time view of the handoff: a run that starts after the issue payload
   // was fetched must quiet the missing-disposition warnings without waiting
@@ -4529,6 +4543,7 @@ export function IssueChatThread({
         agentMap,
         currentUserId,
         userLabelMap,
+        issueStatus,
       }),
     [
       comments,
@@ -4545,6 +4560,7 @@ export function IssueChatThread({
       agentMap,
       currentUserId,
       userLabelMap,
+      issueStatus,
     ],
   );
   const stableMessagesRef = useRef<readonly ThreadMessage[]>([]);

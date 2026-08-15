@@ -326,6 +326,12 @@ vi.mock("../services/index.js", () => ({
   })),
 }));
 
+vi.mock("../services/secret-proposals.js", () => ({
+  createSecretProposalsService: vi.fn(() => ({
+    sweepExpired: vi.fn(async () => 0),
+  })),
+}));
+
 vi.mock("../storage/index.js", () => ({
   createStorageServiceFromConfig: vi.fn(() => ({ id: "storage-service" })),
 }));

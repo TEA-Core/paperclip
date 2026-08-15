@@ -64,6 +64,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
+import { createSecretProposalsService } from "./services/secret-proposals.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
   parseAdapterRegistryEnv,
@@ -967,6 +968,7 @@ export async function startServer(): Promise<StartedServer> {
   };
 
   if (heartbeat) {
+    const secretProposals = createSecretProposalsService(db as any);
     const decisionExecutor = decisionService(db as any, decisionServiceOptions);
     const retentionExecutor = decisionRetentionService(db as any, {
       notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
@@ -1186,18 +1188,15 @@ export async function startServer(): Promise<StartedServer> {
       const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
       let archived = 0;
       for (const company of activeCompanies) {
-        const items = [];
-        let cursor: string | undefined;
-        do {
-          const page = await attentionService(db as any).list(company.id, {
-            includeDismissed: true,
-            limit: 100,
-            cursor,
-          });
-          items.push(...page.items);
-          cursor = page.nextCursor ?? undefined;
-        } while (cursor);
-        archived += await retentionExecutor.autoArchive({ companyId: company.id, items });
+        // Cursor pagination rebuilds the whole feed for every page; one
+        // unscoped all-items build keeps this sweep at a single feed build
+        // per company per tick.
+        const page = await attentionService(db as any).list(company.id, {
+          includeDismissed: true,
+          all: true,
+          allowUnscopedAll: true,
+        });
+        archived += await retentionExecutor.autoArchive({ companyId: company.id, items: page.items });
       }
       const notifications = await retentionExecutor.deliverNotifications();
       return { archived, ...notifications };
@@ -1307,6 +1306,14 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "periodic tool connection health sweep failed");
+          }));
+
+        trackHeartbeatSchedulerWork(secretProposals.sweepExpired()
+          .then((expired) => {
+            if (expired > 0) logger.warn({ expired }, "periodic secret proposal expiry scrubbed proposals");
+          })
+          .catch((err) => {
+            logger.error({ err }, "periodic secret proposal expiry sweep failed");
           }));
 
         if (heartbeatSchedulerStopped) return;

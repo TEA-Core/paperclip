@@ -263,11 +263,23 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
  * audit write is logged with the entity it belonged to instead (SUP-9856).
  *
  * Callers running inside a transaction must use {@link logActivityInTransaction}.
+ *
+ * `postCommitPublications` defers the realtime/plugin publication instead of firing it inline:
+ * a caller that is still mid-write collects the publications and drains them once its write
+ * has actually landed, so subscribers never see an activity for a mutation that rolled back.
  */
-export async function logActivity(db: Db, input: LogActivityInput) {
+export async function logActivity(
+  db: Db,
+  input: LogActivityInput,
+  postCommitPublications?: ActivityPublication[],
+) {
   try {
     const { activity, publication } = await persistActivity(db, input);
-    publishActivity(publication);
+    if (postCommitPublications) {
+      postCommitPublications.push(publication);
+    } else {
+      publishActivity(publication);
+    }
     return activity;
   } catch (err) {
     logger.error(
@@ -294,8 +306,16 @@ export async function logActivity(db: Db, input: LogActivityInput) {
  * statement fails anyway with a far less useful error. Here the audit entry and the mutation
  * share a fate, which is exactly the guarantee a caller opens a transaction for.
  */
-export async function logActivityInTransaction(tx: Db, input: LogActivityInput) {
+export async function logActivityInTransaction(
+  tx: Db,
+  input: LogActivityInput,
+  postCommitPublications?: ActivityPublication[],
+) {
   const { activity, publication } = await persistActivity(tx, input);
-  publishActivity(publication);
+  if (postCommitPublications) {
+    postCommitPublications.push(publication);
+  } else {
+    publishActivity(publication);
+  }
   return activity;
 }

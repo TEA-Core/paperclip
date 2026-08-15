@@ -246,6 +246,13 @@ import {
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
+  buildConfigurationIncompleteRecoveryNoticeSeed,
+  buildExecutionReviewParticipantRecoveryNoticeSeed,
+  buildImmediateExecutionPathRecoveryNoticeSeed,
+  buildWorkspaceValidationRecoveryNoticeSeed,
+  type StrandedRecoveryNoticeSeed,
+} from "./recovery/stranded-notice.js";
+import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
@@ -280,6 +287,7 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -2110,6 +2118,26 @@ export async function assertPushCapabilityCheckoutValid(input: {
   );
 }
 
+/**
+ * Reconcile the `projectWorkspaceId` for a reused execution workspace.
+ *
+ * A `reuse_existing` workspace can have been persisted with a null
+ * `projectWorkspaceId` (e.g. it was created before its project had a primary
+ * project workspace). When we later restore it for a run whose issue now
+ * expects a concrete project workspace, backfill the column so the launch
+ * guard (`persisted_workspace_missing_project_workspace_id`) stops rejecting
+ * it on every requeue — otherwise `reuse_existing` re-binds the same stale
+ * record forever and the run crash-loops. Prefer the existing binding when
+ * present so we never null out a good value or silently rebind a genuine
+ * mismatch (which the guard still surfaces).
+ */
+export function reconcileReusedExecutionWorkspaceProjectWorkspaceId(
+  existingProjectWorkspaceId: string | null | undefined,
+  resolvedProjectWorkspaceId: string | null | undefined,
+): string | null {
+  return existingProjectWorkspaceId ?? resolvedProjectWorkspaceId ?? null;
+}
+
 export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   adapterType: string;
   agentId: string;
@@ -3726,30 +3754,6 @@ export function summarizeHeartbeatRunListResultJson(input: {
   }
 
   return Object.keys(summary).length > 0 ? summary : null;
-}
-
-function summarizeRunFailureForIssueComment(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined,
-) {
-  if (!run) return null;
-
-  const errorCode = readNonEmptyString(run.errorCode)?.trim() ?? null;
-  const rawError = readNonEmptyString(run.error)?.trim() ?? null;
-  const apiMessageMatch = rawError?.match(/"message"\s*:\s*"([^"]+)"/);
-  const firstLine = rawError
-    ?.split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean) ?? null;
-  const summarySource = apiMessageMatch?.[1] ?? firstLine;
-  const summary =
-    summarySource && summarySource.length > 240
-      ? `${summarySource.slice(0, 237)}...`
-      : summarySource;
-
-  if (errorCode && summary) return ` Latest retry failure: \`${errorCode}\` - ${summary}.`;
-  if (errorCode) return ` Latest retry failure: \`${errorCode}\`.`;
-  if (summary) return ` Latest retry failure: ${summary}.`;
-  return null;
 }
 
 function didAutomaticRecoveryFail(
@@ -5771,6 +5775,9 @@ export async function buildPaperclipWakePayload(input: {
       }
     | null;
   exposeLowTrustRaw?: boolean;
+  // Experimental: agents write user-interaction content in ASD-STE100
+  // Simplified Technical English (rendered as a prompt directive downstream).
+  simplifiedEnglishInteractions?: boolean;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
@@ -5988,7 +5995,7 @@ export async function buildPaperclipWakePayload(input: {
       .then((rows) => rows[0] ?? null)
     : null;
 
-  return {
+  const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     recovery: recoveryAction || recoveryCause
       ? {
@@ -6046,6 +6053,7 @@ export async function buildPaperclipWakePayload(input: {
     interactionStatus,
     checkboxSelection: Object.keys(checkboxSelection).length > 0 ? checkboxSelection : null,
     checkedOutByHarness: input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true,
+    simplifiedEnglishInteractions: input.simplifiedEnglishInteractions === true,
     dependencyBlockedInteraction: input.contextSnapshot.dependencyBlockedInteraction === true,
     treeHoldInteraction: input.contextSnapshot.treeHoldInteraction === true,
     activeTreeHold: parseObject(input.contextSnapshot.activeTreeHold),
@@ -6084,6 +6092,9 @@ export async function buildPaperclipWakePayload(input: {
     truncated: payloadTruncated,
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
   };
+  return issueId
+    ? createRunSecretRedactionRegistry(input.db).redactForIssue(input.companyId, issueId, payload)
+    : payload;
 }
 
 function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
@@ -9172,10 +9183,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    return setRunStatusFromLive(runId, status, ["running"], patch);
+  }
+
+  // Move a run to a new status only when its current status is one of
+  // `fromStatuses`. The compare-and-set is a single conditional update, so a
+  // concurrent path can win the race. When this update matches nothing, the
+  // function reads the current row and reports updated=false, so the caller can
+  // keep the terminal outcome that another path already wrote.
+  async function setRunStatusFromLive(
+    runId: string,
+    status: string,
+    fromStatuses: string[],
+    patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+  ) {
     const updated = await db
       .update(heartbeatRuns)
       .set({ status, ...patch, updatedAt: new Date() })
-      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+      .where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, fromStatuses)))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -9199,6 +9224,75 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
 
     return { run: current, updated: false as const };
+  }
+
+  // Invariant: when a run releases its environment lease, the run row must be
+  // terminal. The finalizer writes the terminal status in a step that is
+  // separate from the agent status=done PATCH. If the sandbox or the run
+  // process stops between the two steps, heartbeat_runs.status stays "running".
+  // The UI reads liveness from that row, so a finished task shows "Live"
+  // forever. This function closes the gap in the run teardown: when the run is
+  // still running or queued, it forces a terminal status before the lease is
+  // released. It never overwrites a status that another path already made
+  // terminal.
+  async function terminalizeRunOnLeaseRelease(
+    run: typeof heartbeatRuns.$inferSelect,
+  ): Promise<typeof heartbeatRuns.$inferSelect> {
+    if (isHeartbeatRunTerminalStatus(run.status)) return run;
+    if (run.status !== "running" && run.status !== "queued") return run;
+
+    // Choose the terminal status that reflects the true outcome. When the issue
+    // already reached a terminal status, the run reached its goal, so use the
+    // matching terminal run status. Otherwise the teardown cut the run short,
+    // so use "interrupted".
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    let terminalStatus: "succeeded" | "cancelled" | "interrupted" = "interrupted";
+    if (issueId) {
+      const issueStatus = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]?.status ?? null);
+      if (issueStatus === "done") terminalStatus = "succeeded";
+      else if (issueStatus === "cancelled") terminalStatus = "cancelled";
+    }
+
+    const message =
+      `run terminalized on environment lease release: heartbeat_runs.status was still ${run.status} at teardown`;
+    // Match both "running" and "queued". A queued run has released its lease but
+    // never reached "running", so a running-only update would miss it and leave
+    // a phantom live run behind.
+    const write = await setRunStatusFromLive(run.id, terminalStatus, ["running", "queued"], {
+      finishedAt: run.finishedAt ?? new Date(),
+      error: run.error ?? (terminalStatus === "interrupted" ? message : null),
+      errorCode: run.errorCode ?? (terminalStatus === "interrupted" ? "lease_released_before_terminal" : null),
+    });
+    if (!write.updated) {
+      // Another path already finalized the run. Keep that terminal outcome.
+      return write.run ?? run;
+    }
+
+    const terminalRun = write.run;
+    if (terminalRun) {
+      await appendRunEvent(terminalRun, await nextRunEventSeq(terminalRun.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: terminalStatus === "interrupted" ? "warn" : "info",
+        message,
+        payload: {
+          previousStatus: run.status,
+          terminalStatus,
+          reason: "environment_lease_release",
+          ...(issueId ? { issueId } : {}),
+        },
+      }).catch((eventErr) => {
+        logger.warn(
+          { err: eventErr, runId: run.id },
+          "failed to append run event for lease-release terminalization",
+        );
+      });
+    }
+    return terminalRun ?? run;
   }
 
   function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect) {
@@ -14282,7 +14376,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueContext.assigneeAdapterOverrides,
           )
         : null;
-    const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
+    const experimentalInstanceSettings = await instanceSettings.getExperimental();
+    const isolatedWorkspacesEnabled = experimentalInstanceSettings.enableIsolatedWorkspaces;
     const parsedIssueExecutionWorkspaceSettings = parseIssueExecutionWorkspaceSettings(
       issueContext?.executionWorkspaceSettings,
     );
@@ -14484,6 +14579,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : null,
       exposeLowTrustRaw,
+      simplifiedEnglishInteractions: experimentalInstanceSettings.enableSimplifiedEnglishInteractions === true,
     });
     if (paperclipWakePayload) {
       context[PAPERCLIP_WAKE_PAYLOAD_KEY] = paperclipWakePayload;
@@ -14544,7 +14640,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // `workspaceReuseRequest` / `requestedShouldReuseExisting` below and hands
     // the reusable-workspace values to `resolveSessionConfig` as callback
     // arguments — so the inline copy is dead, and keeping it only re-declares
-    // the same names in the same scope.
+    // the same names in the same scope. The wake-context redaction below is not
+    // part of that block and stays here.
+    if (issueRef) {
+      const redactedWakeContext = await createRunSecretRedactionRegistry(db).redactForIssue(
+        agent.companyId,
+        issueRef.id,
+        {
+          paperclipIssue: context.paperclipIssue,
+          paperclipWakeComment: context.paperclipWakeComment,
+          paperclipTaskMarkdown: context.paperclipTaskMarkdown,
+          paperclipTaskMarkdownCompact: context.paperclipTaskMarkdownCompact,
+        },
+      );
+      context.paperclipIssue = redactedWakeContext.paperclipIssue;
+      if (redactedWakeContext.paperclipWakeComment) {
+        context.paperclipWakeComment = redactedWakeContext.paperclipWakeComment;
+      }
+      if (redactedWakeContext.paperclipTaskMarkdown) {
+        context.paperclipTaskMarkdown = redactedWakeContext.paperclipTaskMarkdown;
+      }
+      if (redactedWakeContext.paperclipTaskMarkdownCompact) {
+        context.paperclipTaskMarkdownCompact = redactedWakeContext.paperclipTaskMarkdownCompact;
+      }
+    }
     const localEnvironment = await environmentsSvc.ensureLocalEnvironment(agent.companyId);
     const resolvedInstanceSettings = await instanceSettings.get();
     const environmentResolution = resolveExecutionWorkspaceEnvironmentId({
@@ -16673,7 +16792,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           }
         } finally {
-          const latestRun = await getRun(run.id).catch(() => null);
+          let latestRun = await getRun(run.id).catch(() => null);
+          // Close the invariant "environment lease released implies the run is
+          // terminal". When the teardown reaches this point with the run still
+          // running or queued, force a terminal status before the lease is
+          // released, so the UI never shows a finished task as "Live".
+          if (latestRun) {
+            latestRun = await terminalizeRunOnLeaseRelease(latestRun).catch((terminalizeErr) => {
+              logger.error(
+                { err: terminalizeErr, runId: run.id },
+                "failed to terminalize run before environment lease release",
+              );
+              return latestRun;
+            });
+          }
           await releaseEnvironmentLeasesForRun({
             runId: run.id,
             companyId: run.companyId,
@@ -16739,104 +16871,83 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
   }
 
-  function buildImmediateExecutionPathRecoveryComment(input: {
-    status: "todo" | "in_progress";
-    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
-  }) {
-    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
-    if (input.status === "todo") {
-      return (
-        "Paperclip automatically retried dispatch for this assigned `todo` issue during terminal run recovery, " +
-        `but it still has no live execution path.${failureSummary ?? ""} ` +
-        "Moving it to `blocked` so it is visible for intervention."
-      );
-    }
-
-    return (
-      "Paperclip automatically retried continuation for this assigned `in_progress` issue during terminal run " +
-      `recovery, but it still has no live execution path.${failureSummary ?? ""} ` +
-      "Moving it to `blocked` so it is visible for intervention."
-    );
-  }
-
-  function buildWorkspaceValidationRecoveryComment(input: {
+  /**
+   * Workspace-validation seed that keeps the fork's base-materialization variant.
+   * Upstream's seed has a single body; a failed *clone* is a different repair
+   * (repo URL / clone access / local cwd) from a broken workspace link, and
+   * saying so is the whole value of the notice.
+   */
+  function buildWorkspaceValidationRecoveryNoticeSeedForRun(input: {
     latestRun:
       | Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">
       | null
       | undefined;
-  }) {
-    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+  }): StrandedRecoveryNoticeSeed {
     const validationReason = readNonEmptyString(
       readWorkspaceValidationPayloadFromRun(input.latestRun).reason,
     );
     if (validationReason === "git_worktree_base_materialization_failed") {
-      return (
-        "Paperclip stopped before launching the local adapter because the project workspace checkout could not be prepared " +
-        `(for example the repository clone failed).${failureSummary ?? ""} ` +
-        "Moving it to `blocked` with a source-scoped recovery action so the repository URL, clone access, or configured local cwd can be repaired before resuming."
-      );
+      return {
+        body:
+          "Paperclip stopped before launching the local adapter because the project workspace checkout could not be prepared " +
+          "(for example the repository clone failed). " +
+          "Moving it to `blocked` with a source-scoped recovery action so the repository URL, clone access, or configured local cwd can be repaired before resuming.",
+        title: "Workspace validation failed",
+        tone: "danger",
+      };
     }
-    return (
-      "Paperclip stopped before launching the local adapter because the issue workspace failed validation. " +
-      `This prevents git-sensitive adapters from running in an unrelated fallback cwd.${failureSummary ?? ""} ` +
-      "Moving it to `blocked` with a source-scoped recovery action so the workspace link, cwd, or git checkout can be repaired before resuming."
-    );
+    return buildWorkspaceValidationRecoveryNoticeSeed();
   }
 
-  function buildOpenCodeDatabaseGrowthLimitRecoveryComment(input: {
-    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
-  }) {
-    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
-    return (
-      "Paperclip terminated this run because its OpenCode database grew past the per-run budget. " +
-      "That is caused by a command whose output streams faster than the database can absorb it — " +
-      "each output chunk is written as a full snapshot — so retrying the same work would run the same " +
-      `command and fail the same way.${failureSummary ?? ""} ` +
-      "Moving it to `blocked` so the offending command can be changed before resuming: redirect long or " +
-      "chatty command output to a file and report a bounded slice of it " +
-      "(`cmd > /tmp/run.log 2>&1; tail -100 /tmp/run.log`)."
-    );
+  /** Fork-only recovery cause: upstream has no seed for the OpenCode growth limit. */
+  function buildOpenCodeDatabaseGrowthLimitRecoveryNoticeSeed(): StrandedRecoveryNoticeSeed {
+    return {
+      body:
+        "Paperclip terminated this run because its OpenCode database grew past the per-run budget. " +
+        "That is caused by a command whose output streams faster than the database can absorb it — " +
+        "each output chunk is written as a full snapshot — so retrying the same work would run the same " +
+        "command and fail the same way. " +
+        "Moving it to `blocked` so the offending command can be changed before resuming: redirect long or " +
+        "chatty command output to a file and report a bounded slice of it " +
+        "(`cmd > /tmp/run.log 2>&1; tail -100 /tmp/run.log`).",
+      title: "OpenCode database growth limit",
+      tone: "danger",
+    };
   }
 
-  function buildConfigurationIncompleteRecoveryComment(input: {
-    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
-  }) {
-    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
-    return (
-      "Paperclip stopped before dispatching the adapter because required secret/env bindings are missing. " +
-      `Resolving them as a runtime failure would only produce repeated opaque setup failures.${failureSummary ?? ""} ` +
-      "Moving it to `blocked` with a source-scoped recovery action so an operator can bind the missing secret(s) before resuming."
-    );
-  }
-
-  function buildExecutionReviewParticipantRecoveryComment(input: {
+  /**
+   * Review-participant seed that keeps the fork's two extra outcomes. Upstream's
+   * seed only describes "retried once, still no decision"; the deferral-limit and
+   * ran-clean-but-left-nothing cases point the recovery owner somewhere different.
+   */
+  function buildExecutionReviewParticipantRecoveryNoticeSeedForRun(input: {
     latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "status"> | null | undefined;
     deferralRetriesExhausted?: boolean;
-  }) {
-    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+  }): StrandedRecoveryNoticeSeed {
     if (input.deferralRetriesExhausted) {
-      return (
-        "Paperclip re-armed the pending execution-review participant up to the deferral limit " +
-        `(${EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT} attempts). The reviewer ran to completion and ` +
-        `commented each time but never recorded a decision, so the review stage is still pending.${failureSummary ?? ""} ` +
-        "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can record the decision, " +
-        "restore the review stage, or record an intentional manual resolution."
-      );
+      return {
+        body:
+          "Paperclip re-armed the pending execution-review participant up to the deferral limit " +
+          `(${EXECUTION_REVIEW_PARTICIPANT_DEFERRAL_RETRY_LIMIT} attempts). The reviewer ran to completion and ` +
+          "commented each time but never recorded a decision, so the review stage is still pending. " +
+          "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can record the decision, " +
+          "restore the review stage, or record an intentional manual resolution.",
+        title: "Review recovery stalled",
+        tone: "danger",
+      };
     }
     if (input.latestRun?.status === "succeeded") {
-      return (
-        "Paperclip retried the pending execution-review participant once, but the retry run completed without " +
-        `recording a decision and without leaving any trace on the issue.${failureSummary ?? ""} ` +
-        "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can repair the reviewer runtime, " +
-        "restore the review stage, or record an intentional manual resolution."
-      );
+      return {
+        body:
+          "Paperclip retried the pending execution-review participant once, but the retry run completed without " +
+          "recording a decision and without leaving any trace on the issue. " +
+          "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can repair the reviewer runtime, " +
+          "restore the review stage, or record an intentional manual resolution.",
+        title: "Review recovery stalled",
+        tone: "danger",
+      };
     }
-    return (
-      "Paperclip retried the pending execution-review participant once, but the review stage still has no completed decision " +
-      `or live reviewer run.${failureSummary ?? ""} ` +
-      "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can repair the reviewer runtime, " +
-      "restore the review stage, or record an intentional manual resolution."
-    );
+    return buildExecutionReviewParticipantRecoveryNoticeSeed();
   }
 
   async function releaseIssueExecutionAndPromote(
@@ -16972,9 +17083,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           kind: "blocked" as const,
           issue,
           previousStatus: issue.status,
-          comment: configurationIncomplete
-            ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
-            : buildWorkspaceValidationRecoveryComment({ latestRun: run }),
+          notice: configurationIncomplete
+            ? buildConfigurationIncompleteRecoveryNoticeSeed()
+            : buildWorkspaceValidationRecoveryNoticeSeedForRun({ latestRun: run }),
           recoveryCause: configurationIncomplete
             ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
             : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
@@ -17373,7 +17484,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             kind: "blocked" as const,
             issue,
             previousStatus: issue.status,
-            comment: buildExecutionReviewParticipantRecoveryComment({
+            notice: buildExecutionReviewParticipantRecoveryNoticeSeedForRun({
               latestRun: run,
               deferralRetriesExhausted: reviewDeferralRetriesExhausted,
             }),
@@ -17500,21 +17611,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const workspaceValidationFailure = isWorkspaceValidationFailedRun(run);
         const configurationIncompleteFailure = isConfigurationIncompleteFailedRun(run);
         const databaseGrowthLimitFailure = isOpenCodeDatabaseGrowthLimitFailedRun(run);
-        const comment = workspaceValidationFailure
-          ? buildWorkspaceValidationRecoveryComment({ latestRun: run })
+        const notice = workspaceValidationFailure
+          ? buildWorkspaceValidationRecoveryNoticeSeedForRun({ latestRun: run })
           : configurationIncompleteFailure
-            ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
+            ? buildConfigurationIncompleteRecoveryNoticeSeed()
             : databaseGrowthLimitFailure
-              ? buildOpenCodeDatabaseGrowthLimitRecoveryComment({ latestRun: run })
-              : buildImmediateExecutionPathRecoveryComment({
+              ? buildOpenCodeDatabaseGrowthLimitRecoveryNoticeSeed()
+              : buildImmediateExecutionPathRecoveryNoticeSeed({
                   status: issue.status as "todo" | "in_progress",
-                  latestRun: run,
                 });
         return {
           kind: "blocked" as const,
           issue,
           previousStatus: issue.status,
-          comment,
+          notice,
           recoveryCause: workspaceValidationFailure
             ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
             : configurationIncompleteFailure
@@ -17626,7 +17736,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue: promotionResult.issue,
         previousStatus: promotionResult.previousStatus as "todo" | "in_progress" | "in_review",
         latestRun: run,
-        comment: promotionResult.comment,
+        notice: promotionResult.notice,
         recoveryCause:
           promotionResult.recoveryCause === WORKSPACE_VALIDATION_RECOVERY_CAUSE
             ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
@@ -19515,6 +19625,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+
+    terminalizeRunOnLeaseRelease,
 
     sweepStaleIssueLocks,
 

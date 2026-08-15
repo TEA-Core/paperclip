@@ -213,13 +213,20 @@ export const INBOX_MINE_ISSUE_STATUS_FILTER = INBOX_MINE_ISSUE_STATUSES.join(","
 
 export const ISSUE_PRIORITIES = ["critical", "high", "medium", "low"] as const;
 export type IssuePriority = (typeof ISSUE_PRIORITIES)[number];
+export const ISSUE_REVIEW_POLICIES = ["anyone", "not_creator", "human_only"] as const;
+export type IssueReviewPolicy = (typeof ISSUE_REVIEW_POLICIES)[number];
 export const ISSUE_WORK_MODES = ["standard", "ask", "planning", "skill_test"] as const;
 export type IssueWorkMode = (typeof ISSUE_WORK_MODES)[number];
 export const ISSUE_HARNESS_KINDS = ["skill_test"] as const;
 export type IssueHarnessKind = (typeof ISSUE_HARNESS_KINDS)[number];
 export const MAX_ISSUE_REQUEST_DEPTH = 1024;
 
-export const SUMMARY_SLOT_SCOPE_KINDS = ["project", "workspaces_overview", "project_workspace"] as const;
+export const SUMMARY_SLOT_SCOPE_KINDS = [
+  "project",
+  "workspaces_overview",
+  "project_workspace",
+  "execution_workspace",
+] as const;
 export type SummarySlotScopeKind = (typeof SUMMARY_SLOT_SCOPE_KINDS)[number];
 export const SUMMARY_SLOT_KEYS = ["header"] as const;
 export type SummarySlotKey = (typeof SUMMARY_SLOT_KEYS)[number];
