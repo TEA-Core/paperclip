@@ -133,3 +133,17 @@ jobs:
       - name: Assert server can still read+execute /app under uid 1000
         run: |
           docker run --rm -u 1000:1000 paperclip:pr node --import ./server/node_modules/tsx/dist/loader.mjs -e 'console.log("tsx-loader-ok")'
+
+      # Read-only is not enough: hardening that strips executable bits leaves an
+      # image that boots and then fails with EACCES the first time the tsx
+      # loader shells out to esbuild, or an agent runs a bundled skill helper.
+      - name: Assert executable bits survived hardening (tsx transform + skill helper)
+        run: |
+          docker run --rm -u 1000:1000 paperclip:pr sh -c '
+            set -e
+            printf "const msg: string = \"tsx-transform-ok\";\nconsole.log(msg);\n" > /tmp/probe.ts
+            node --import /app/server/node_modules/tsx/dist/loader.mjs /tmp/probe.ts
+            test -x /app/skills/paperclip/scripts/paperclip-upload-artifact.sh \
+              || { echo "FAIL: bundled skill helper lost its executable bit"; exit 1; }
+            echo "PASS: executable bits preserved under /app"
+          '
