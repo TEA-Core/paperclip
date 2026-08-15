@@ -148,7 +148,6 @@ import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalizat
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
   logActivity,
-  persistActivity,
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
@@ -8390,7 +8389,13 @@ export function issueService(db: Db) {
             undefined,
             tx,
           );
-          const { publication } = await persistActivity(tx as unknown as Db, {
+          // Best-effort, like every other audit write on a committed mutation
+          // (SUP-9856). Calling persistActivity directly bypassed that: a failed
+          // audit insert propagated out of the update transaction and turned a
+          // successful human completion into a 500. logActivity swallows the
+          // failure and, given the queue, pushes the publication for the caller
+          // to drain after commit.
+          await logActivity(tx as unknown as Db, {
             companyId: updated.companyId,
             actorType: "user",
             actorId: actorUserId,
@@ -8403,8 +8408,7 @@ export function issueService(db: Db) {
               targetResolvedFrom: "responsible_user",
               source: "issue_status_done",
             },
-          });
-          activityPublications.push(publication);
+          }, activityPublications);
         }
         return {
           ...enriched,
