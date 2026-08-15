@@ -1038,6 +1038,7 @@ export function externalObjectService(
           ),
         ),
       )
+      .orderBy(asc(externalObjects.nextRefreshAt))
       .limit(limit);
     const results = [];
     for (const row of due) {
