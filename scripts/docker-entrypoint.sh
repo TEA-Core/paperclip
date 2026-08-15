@@ -36,14 +36,34 @@ fi
 # (Docker named volume, Railway volume, Kubernetes PV) arrives root-owned
 # and shadows the image's build-time chown, so with the default UID the old
 # remap-only condition dropped privileges onto an unwritable home and the
-# server crashed on its first mkdir. The probe is a first-mismatch find
-# over the WHOLE tree (uid and gid): a root-owned mount or descendant
-# (init containers, backup restores, files written before a remap) is
-# found immediately and repaired recursively, a GID-only remap is caught,
-# and a fully-correct tree costs one metadata-only walk with no chown.
+# server crashed on its first mkdir.
+#
+# FORK DIVERGENCE -- do not re-adopt upstream's whole-tree repair on merge.
+# Upstream probes the WHOLE tree for `! -user node -o ! -group node` and then
+# runs `chown -R node:node "$home_dir"`. That is right for a plain volume and
+# wrong here, because this fork's PAPERCLIP_HOME deliberately contains:
+#
+#   - read-only bind mounts (vaults, skills-lib). chown returns non-zero on
+#     them and, under `set -e`, kills the entrypoint before the server ever
+#     listens -- a total outage, not a degraded boot. Measured 2026-08-15:
+#     the deploy of fold-de08d947e never reached /api/health and was rolled
+#     back at gate 2 for exactly this reason;
+#   - directories group-owned by `agents` (see shared-group-ownership.ts).
+#     `chown -R node:node` strips that group fork-wide and silently dismantles
+#     shared agent access. The probe trips on those directories in ~5s, so this
+#     fires on every boot, not in some rare edge case;
+#   - a root-owned shared toolchain (/paperclip/toolchain) that agents read but
+#     must NOT be able to write. Chowning it to node makes it agent-writable;
+#   - a large host-managed workspaces bind, where a recursive walk is costly.
+#
+# A freshly mounted volume is empty, so repairing the home root alone is
+# sufficient: everything beneath it is created by the server as node. That is
+# one stat instead of a full-tree walk, and it touches nothing that the fork
+# owns deliberately.
 home_dir="${PAPERCLIP_HOME:-/paperclip}"
-if [ -d "$home_dir" ] && [ -n "$(find "$home_dir" \( ! -user node -o ! -group node \) -print -quit 2>/dev/null)" ]; then
-    chown -R node:node "$home_dir"
+if [ -d "$home_dir" ] && [ "$(stat -c %u "$home_dir")" != "$(id -u node)" ]; then
+    echo "docker-entrypoint.sh: repairing ownership of $home_dir root"
+    chown node "$home_dir"
 fi
 
 # Pre-create the secrets key directory with paperclip-user ownership.
