@@ -161,6 +161,9 @@ jobs:
       - name: Test docker image build cache ref casing
         run: node --test ./scripts/__tests__/docker-workflow-cache-refs.test.mjs
 
+      - name: Test lockfile refresh auto-merge gate
+        run: node --test ./scripts/__tests__/refresh-lockfile-auto-merge.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 

@@ -94,7 +94,12 @@ jobs:
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
 
       - name: Enable auto-merge for lockfile PR
-        if: steps.upsert-pr.outputs.pr_url != '' && github.ref_name == 'master'
+        # The fold branch is the deployed line, so its regenerated lockfile must
+        # land without a manual merge too; otherwise the PR sits open and the
+        # branch becomes unbuildable (`Dockerfile` installs --frozen-lockfile).
+        if: >-
+          steps.upsert-pr.outputs.pr_url != '' &&
+          (github.ref_name == 'master' || startsWith(github.ref_name, 'fold/'))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
