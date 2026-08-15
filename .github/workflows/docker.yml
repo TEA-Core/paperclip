@@ -487,12 +487,11 @@ jobs:
 
       - name: Assert /etc/paperclip/secrets is root-owned
         run: |
-          docker run --rm paperclip:pr sh -c '\
-            set -e\
-            ls -ld /etc/paperclip/secrets\
-            [ "$(stat -c "%U:%G %a" /etc/paperclip/secrets)" = "root:root 700" ] \
-              || { echo "FAIL: /etc/paperclip/secrets is not root:root 0700"; exit 1; }\
-            echo "PASS: /etc/paperclip/secrets is root:root 0700"\
+          docker run --rm paperclip:pr sh -c '
+            set -e
+            ls -ld /etc/paperclip/secrets
+            [ "$(stat -c "%U:%G %a" /etc/paperclip/secrets)" = "root:root 700" ] || { echo "FAIL: /etc/paperclip/secrets is $(stat -c "%U:%G %a" /etc/paperclip/secrets), want root:root 700"; exit 1; }
+            echo "PASS: /etc/paperclip/secrets is root:root 0700"
           '
 
       # The secrets probes deliberately do NOT use `-u 1000:1000`: with a non-root

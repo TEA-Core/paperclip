@@ -116,6 +116,19 @@ test("the docker workflow asserts /etc/paperclip/secrets ownership with a failin
     /ls -ld \/etc\/paperclip\/secrets.*\|\| true/,
     "the root-owned step must not be a print-only step that swallows failures",
   );
+  // A `run: |` block keeps its newlines, so a trailing backslash inside the
+  // single-quoted `sh -c` script is passed through literally and splices the
+  // whole script onto one line: `sh: Syntax error: word unexpected`, which is a
+  // step failure that says nothing about the invariant.
+  const rootOwnedStep = job.slice(
+    job.indexOf("Assert /etc/paperclip/secrets is root-owned"),
+    job.indexOf("Assert entrypoint hardens secrets against uid 1000"),
+  );
+  assert.doesNotMatch(
+    rootOwnedStep,
+    /\\\n/,
+    "the root-owned step's sh -c script must not use backslash line continuations",
+  );
 });
 
 test("the secrets probe does not run the container as uid 1000 directly", () => {
