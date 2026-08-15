@@ -222,7 +222,7 @@ describe("secret provider registry", () => {
     });
   });
 
-  it("rejects PAPERCLIP_SECRETS_MASTER_KEY when no key file is configured and the default path is inside the Paperclip home dir (SUP-12990)", async () => {
+  it("accepts PAPERCLIP_SECRETS_MASTER_KEY when no key file is configured and the default path is outside the Paperclip home dir (SUP-12990)", async () => {
     delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
     process.env.PAPERCLIP_SECRETS_MASTER_KEY = "12345678901234567890123456789012";
 
