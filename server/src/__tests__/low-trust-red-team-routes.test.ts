@@ -895,6 +895,17 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
       .send({ status: "blocked", unblockDescriptor })
       .expect(200);
     await request(app).patch(`/api/issues/${fixture.issues.standardChild.id}`).send({ status: "todo" }).expect(200);
+    // SUP-10525 gates in_review reachability on a real review path for board
+    // actors too, so the ladder has to leave one behind before it steps through
+    // in_review on its way to done.
+    await db.insert(issueThreadInteractions).values({
+      companyId: fixture.company.id,
+      issueId: fixture.issues.standardChild.id,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: { version: 1, prompt: "Confirm the child is ready to close" },
+    });
     await request(app).patch(`/api/issues/${fixture.issues.standardChild.id}`).send({ status: "in_review" }).expect(200);
     await request(app).patch(`/api/issues/${fixture.issues.standardChild.id}`).send({ status: "done" }).expect(200);
 
