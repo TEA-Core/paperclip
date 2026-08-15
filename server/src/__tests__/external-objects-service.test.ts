@@ -787,6 +787,49 @@ describeEmbeddedPostgres("externalObjectService", () => {
     expect(resolve).toHaveBeenCalledTimes(1);
   });
 
+  it("refreshes due objects in nextRefreshAt order so the backlog is not starved", async () => {
+    const { companyId, issueId } = await createIssue();
+    const resolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "open" as const,
+        statusTone: "info" as const,
+        statusKey: "open",
+        statusLabel: "Open",
+        ttlSeconds: 300,
+      },
+    }));
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(issueId);
+
+    const rows = await db.select().from(externalObjects);
+    const [first] = rows;
+    const second = { ...first, id: randomUUID(), externalId: "acme/app#pull/43", sanitizedCanonicalUrl: "https://github.com/acme/app/pull/43", canonicalIdentityHash: "hash43" };
+    const third = { ...first, id: randomUUID(), externalId: "acme/app#pull/44", sanitizedCanonicalUrl: "https://github.com/acme/app/pull/44", canonicalIdentityHash: "hash44" };
+    await db.insert(externalObjects).values([
+      { ...second, nextRefreshAt: new Date(0) },
+      { ...third, nextRefreshAt: new Date(1) },
+    ]);
+    await db
+      .update(externalObjects)
+      .set({ nextRefreshAt: new Date(2) })
+      .where(eq(externalObjects.id, first.id));
+
+    const refreshed = await svc.refreshDueObjects(companyId, 2, new Date(Date.now() + 1_000));
+
+    const refreshedIds = refreshed.map((r) => r.object.id);
+    expect(refreshedIds).toHaveLength(2);
+    expect(refreshedIds).toEqual(
+      expect.arrayContaining([second.id, third.id]),
+    );
+    expect(refreshedIds).not.toContain(first.id);
+  });
+
   it("keeps external object identities company-scoped for duplicate urls", async () => {
     const first = await createIssue();
     const second = await createIssue();
