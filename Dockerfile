@@ -156,7 +156,13 @@ FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
 WORKDIR /app
-COPY --chown=node:node --from=build /app /app
+COPY --from=build /app /app
+# Root-own the entire runtime tree so uid-1000 agent runs cannot modify
+# executed control-plane code or forge content-based deploy probes.
+# The server only needs read+traverse on /app (0755 dirs, 0644 files).
+RUN chown -R root:root /app \
+    && find /app -type d -exec chmod 0755 {} + \
+    && find /app -type f -exec chmod 0644 {} +
 # Self-contained MCP server tree with resolved dependencies (npm pack + install).
 COPY --chown=node:node --from=build /opt/paperclip-mcp /opt/paperclip-mcp
 RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest supabase@latest \
