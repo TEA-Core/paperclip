@@ -2809,7 +2809,10 @@ describe("sanitizeInheritedPaperclipEnv", () => {
         const line = lines[i];
         const lineNo = i + 1;
 
-        if (/function (getProcessSessionRemoteSource|createNetworkProxyBridge)/.test(line)) {
+        // Every `getProcessSession*Source` builder emits a script that runs on the
+        // REMOTE side, where inheriting that host's own env is the point. Matched by
+        // shape so newly added session-source variants stay covered by default.
+        if (/function (getProcessSession[A-Za-z]*Source|createNetworkProxyBridge)/.test(line)) {
           inGeneratedScript = true;
         }
         if (inGeneratedScript && /`;/.test(line)) {
@@ -2829,6 +2832,23 @@ describe("sanitizeInheritedPaperclipEnv", () => {
         if (!stripped.includes("process.env")) continue;
 
         if (inGeneratedScript || inReadOnlyPredicate) {
+          continue;
+        }
+
+        // Explicit, reviewed exemption for env that is only READ, never handed to
+        // a child process. Sanitizing those call sites would strip the very
+        // `PAPERCLIP_*` switch the helper reads (e.g. the Codex auth-cache
+        // off-switch), silently changing behavior instead of protecting anything.
+        // The marker has to sit on the flagged line or in the comment block directly
+        // above it, so every exemption is annotated at the call site and greppable.
+        const readOnlyMarker = /spawn-env-guard:\s*read-only/;
+        let exemptedAsReadOnly = readOnlyMarker.test(line);
+        for (let back = i - 1; !exemptedAsReadOnly && back >= 0; back--) {
+          const above = lines[back];
+          if (!/^\s*(\/\/|\/\*|\*)/.test(above)) break;
+          exemptedAsReadOnly = readOnlyMarker.test(above);
+        }
+        if (exemptedAsReadOnly) {
           continue;
         }
 

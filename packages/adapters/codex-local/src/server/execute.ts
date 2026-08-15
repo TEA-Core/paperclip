@@ -837,6 +837,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                     // guarded. The off-switch (default on) is read inside.
                     resolveCacheEntryPath: (accountId) =>
                       ensureCodexAuthCacheEntryDir(process.env, accountId, agent.companyId),
+                    // spawn-env-guard: read-only. `copyBackCodexAuth` only reads
+                    // PAPERCLIP_CODEX_AUTH_CACHE out of this env to honour the
+                    // cache off-switch; it never spawns a process. Passing a
+                    // sanitized copy would delete that switch and force the
+                    // cache on.
                     env: process.env,
                   })),
                 // No `exclude` denylist: `stagedCodexHomeDir` already contains
