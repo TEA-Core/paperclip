@@ -240,6 +240,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           memberships: access.memberships,
           isInstanceAdmin: access.isInstanceAdmin,
           keyId: boardKey.id,
+          boardKeyScope: boardKey.scope,
           runId: runIdHeader || undefined,
           source: "board_key",
         };

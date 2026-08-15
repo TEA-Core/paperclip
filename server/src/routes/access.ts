@@ -2882,6 +2882,7 @@ export function accessRoutes(
         userId: req.actor.userId,
         name: req.body.name,
         expiresAt: req.body.expiresAt === undefined ? undefined : req.body.expiresAt,
+        scope: req.body.scope,
       });
       const companyIds = await boardAuth.resolveBoardActivityCompanyIds({
         userId: req.actor.userId,

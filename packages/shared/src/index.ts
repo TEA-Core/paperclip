@@ -498,6 +498,8 @@ export {
   type PluginApiRouteCheckoutPolicy,
   type PluginEventType,
   type PluginBridgeErrorCode,
+  BOARD_API_KEY_SCOPES,
+  type BoardApiKeyScope,
 } from "./constants.js";
 
 export {

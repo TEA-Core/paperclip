@@ -1638,3 +1638,6 @@ export const PLUGIN_BRIDGE_ERROR_CODES = [
   "UNKNOWN",
 ] as const;
 export type PluginBridgeErrorCode = (typeof PLUGIN_BRIDGE_ERROR_CODES)[number];
+
+export const BOARD_API_KEY_SCOPES = ["read_only", "all_access"] as const;
+export type BoardApiKeyScope = (typeof BOARD_API_KEY_SCOPES)[number];

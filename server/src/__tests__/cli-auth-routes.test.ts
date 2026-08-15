@@ -311,6 +311,7 @@ describe.sequential("cli auth routes", () => {
       id: "board-key-4",
       name: "external-admin",
       token: "pcp_board_plaintext",
+      scope: "all_access",
       createdAt: new Date("2026-05-23T12:00:00.000Z"),
       lastUsedAt: null,
       revokedAt: null,
@@ -344,6 +345,7 @@ describe.sequential("cli auth routes", () => {
       userId: "user-1",
       name: "external-admin",
       expiresAt: new Date("2026-06-23T12:00:00.000Z"),
+      scope: "all_access",
     });
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -361,6 +363,7 @@ describe.sequential("cli auth routes", () => {
       {
         id: keyId,
         name: "external-admin",
+        scope: "all_access",
         createdAt: new Date("2026-05-23T12:00:00.000Z"),
         lastUsedAt: null,
         revokedAt: null,
@@ -371,6 +374,7 @@ describe.sequential("cli auth routes", () => {
       id: keyId,
       userId: "user-1",
       name: "external-admin",
+      scope: "all_access",
     });
     mockBoardAuthService.revokeBoardApiKey.mockResolvedValue({
       id: keyId,

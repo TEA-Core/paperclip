@@ -1317,6 +1317,13 @@
       "when": 1785930047830,
       "tag": "0189_merge_arming_enabled",
       "breakpoints": true
+    },
+    {
+      "idx": 190,
+      "version": "7",
+      "when": 1785930046829,
+      "tag": "0190_board_api_key_scope",
+      "breakpoints": true
     }
   ]
 }

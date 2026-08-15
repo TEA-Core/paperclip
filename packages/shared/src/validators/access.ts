@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   AGENT_ADAPTER_TYPES,
+  BOARD_API_KEY_SCOPES,
   HUMAN_COMPANY_MEMBERSHIP_ROLES,
   INVITE_JOIN_TYPES,
   JOIN_REQUEST_STATUSES,
@@ -89,6 +90,7 @@ export const createBoardApiKeySchema = z.object({
   name: z.string().trim().min(1).max(120).default("paperclipai cli"),
   expiresAt: z.coerce.date().optional().nullable(),
   requestedCompanyId: z.string().uuid().optional().nullable(),
+  scope: z.enum(BOARD_API_KEY_SCOPES).default("all_access"),
 });
 
 export type CreateBoardApiKey = z.infer<typeof createBoardApiKeySchema>;

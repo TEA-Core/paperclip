@@ -164,6 +164,7 @@ export function boardAuthService(db: Db) {
     userId: string;
     name: string;
     expiresAt?: Date | null;
+    scope?: "read_only" | "all_access";
   }) {
     const token = createBoardApiToken();
     const created = await db
@@ -173,6 +174,7 @@ export function boardAuthService(db: Db) {
         name: input.name.trim(),
         keyHash: hashBearerToken(token),
         expiresAt: input.expiresAt === undefined ? boardApiKeyExpiresAt() : input.expiresAt,
+        scope: input.scope ?? "all_access",
       })
       .returning()
       .then((rows) => rows[0]);
@@ -181,6 +183,7 @@ export function boardAuthService(db: Db) {
       id: created.id,
       name: created.name,
       token,
+      scope: created.scope,
       createdAt: created.createdAt,
       lastUsedAt: created.lastUsedAt,
       revokedAt: created.revokedAt,
@@ -207,6 +210,7 @@ export function boardAuthService(db: Db) {
       .select({
         id: boardApiKeys.id,
         name: boardApiKeys.name,
+        scope: boardApiKeys.scope,
         createdAt: boardApiKeys.createdAt,
         lastUsedAt: boardApiKeys.lastUsedAt,
         revokedAt: boardApiKeys.revokedAt,
@@ -223,6 +227,7 @@ export function boardAuthService(db: Db) {
         id: boardApiKeys.id,
         userId: boardApiKeys.userId,
         name: boardApiKeys.name,
+        scope: boardApiKeys.scope,
         createdAt: boardApiKeys.createdAt,
         lastUsedAt: boardApiKeys.lastUsedAt,
         revokedAt: boardApiKeys.revokedAt,
@@ -360,6 +365,7 @@ export function boardAuthService(db: Db) {
             name: challenge.pendingKeyName,
             keyHash: challenge.pendingKeyHash,
             expiresAt: boardApiKeyExpiresAt(),
+            scope: "all_access",
           })
           .returning()
           .then((rows) => rows[0]);
