@@ -489,28 +489,19 @@ jobs:
         run: |
           docker run --rm paperclip:pr sh -c 'ls -ld /etc/paperclip/secrets; ls -l /etc/paperclip/secrets/master.key 2>/dev/null || true'
 
-      - name: Assert uid-1000 cannot write to /etc/paperclip/secrets (EACCES)
+      # The secrets probes deliberately do NOT use `-u 1000:1000`: with a non-root
+      # uid the entrypoint takes its unprivileged branch, never creates
+      # /etc/paperclip/secrets, and the probes then measure ENOENT instead of
+      # EACCES — `touch` "passes" for the wrong reason and `rm -f` on a missing
+      # path exits 0, failing the step on a container that was never hardened.
+      # scripts/assert-secrets-hardening.sh instead runs one container that starts
+      # as root, seeds the pre-fix node-owned state, hands over to the real
+      # entrypoint, and probes read/list/write/unlink plus the env handoff from
+      # uid 1000 after the gosu drop.
+      - name: Assert entrypoint hardens secrets against uid 1000 (EACCES + key handoff)
         run: |
-          set +e
-          docker run --rm -u 1000:1000 paperclip:pr sh -c 'touch /etc/paperclip/secrets/.probe' > /tmp/secrets-touch-out.txt 2>&1
-          touch_rc=$?
-          if [ "$touch_rc" -eq 0 ]; then
-            echo "FAIL: touch succeeded (uid 1000 was able to write to /etc/paperclip/secrets)"
-            cat /tmp/secrets-touch-out.txt
-            exit 1
-          fi
-          echo "PASS: touch failed with exit code $touch_rc (EACCES as expected)"
-          cat /tmp/secrets-touch-out.txt
-
-      - name: Assert uid-1000 cannot unlink master.key (EACCES)
-        run: |
-          set +e
-          docker run --rm -u 1000:1000 paperclip:pr sh -c 'rm -f /etc/paperclip/secrets/master.key' > /tmp/secrets-rm-out.txt 2>&1
-          rm_rc=$?
-          if [ "$rm_rc" -eq 0 ]; then
-            echo "FAIL: rm succeeded (uid 1000 was able to unlink master.key)"
-            cat /tmp/secrets-rm-out.txt
-            exit 1
-          fi
-          echo "PASS: rm failed with exit code $rm_rc (EACCES as expected)"
-          cat /tmp/secrets-rm-out.txt
+          docker run --rm \
+            --entrypoint /bin/sh \
+            -e EXPECTED_KEY=ci-assert-master-key \
+            -v "$PWD/scripts/assert-secrets-hardening.sh:/probe.sh:ro" \
+            paperclip:pr /probe.sh

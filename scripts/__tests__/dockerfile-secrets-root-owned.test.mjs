@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const entrypoint = readFileSync(path.join(repoRoot, "scripts/docker-entrypoint.sh"), "utf8");
 const dockerWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/docker.yml"), "utf8");
+const probe = readFileSync(path.join(repoRoot, "scripts/assert-secrets-hardening.sh"), "utf8");
 
 // The secrets directory at /etc/paperclip/secrets holds master.key. The server
 // and agent runs both run as uid 1000, so DAC cannot distinguish them — the
@@ -92,21 +93,59 @@ test("entrypoint exports before the gosu drop", () => {
   );
 });
 
-test("the docker workflow proves both secrets EACCES assertions on every PR", () => {
+test("the docker workflow runs the secrets hardening probe on every PR", () => {
   const job = dockerWorkflow.slice(dockerWorkflow.indexOf("docker-build-assert:"));
   assert.match(job, /target: production/, "the assert job must build the production stage");
-
-  // Write path closed: uid 1000 cannot create files in the secrets directory.
   assert.match(
     job,
-    /docker run --rm -u 1000:1000 [^\n]*touch \/etc\/paperclip\/secrets\/\.probe/,
-    "must prove uid 1000 cannot create files under /etc/paperclip/secrets",
+    /scripts\/assert-secrets-hardening\.sh:\/probe\.sh:ro/,
+    "must mount and run scripts/assert-secrets-hardening.sh inside the built image",
   );
+  assert.match(job, /-e EXPECTED_KEY=/, "must pass the expected key value to the probe");
+});
 
-  // Unlink path closed: uid 1000 cannot remove master.key.
+test("the secrets probe does not run the container as uid 1000 directly", () => {
+  // Regression guard for the shape this replaced: `docker run -u 1000:1000` makes
+  // the entrypoint take its unprivileged branch, so /etc/paperclip/secrets is
+  // never created and the probes measure ENOENT instead of EACCES — `rm -f` on a
+  // missing path even exits 0. The hardening only exists after the root phase, so
+  // the probe must start as root and drop through the entrypoint.
+  const job = dockerWorkflow.slice(dockerWorkflow.indexOf("docker-build-assert:"));
+  const secretsProbeStep = job.slice(job.indexOf("assert-secrets-hardening.sh"));
+  assert.doesNotMatch(
+    secretsProbeStep.split("- name:")[0],
+    /-u 1000:1000/,
+    "the secrets probe must not bypass the entrypoint's root phase with -u 1000:1000",
+  );
+});
+
+test("the probe asserts the hardened state, the denials, and the key handoff", () => {
   assert.match(
-    job,
-    /docker run --rm -u 1000:1000 [^\n]*rm -f \/etc\/paperclip\/secrets\/master\.key/,
-    "must prove uid 1000 cannot unlink master.key",
+    probe,
+    /chown -R node:node \/etc\/paperclip/,
+    "must seed the pre-fix node-owned state so a no-op entrypoint cannot pass",
+  );
+  assert.match(probe, /!= "0 0 700"/, "must assert the directory is root:root mode 0700");
+  assert.match(probe, /!= "0 0 600"/, "must assert master.key is root:root mode 0600");
+  assert.match(probe, /\[ "\$uid" != "1000" \]/, "must assert the probe phase runs as uid 1000");
+
+  for (const denial of [
+    /must_fail "read of master\.key" cat/,
+    /must_fail "listing of \$SECRETS_DIR" ls/,
+    /must_fail "create in \$SECRETS_DIR" touch/,
+    /must_fail "unlink of master\.key" rm -f/,
+  ]) {
+    assert.match(probe, denial, `must probe the denial: ${denial}`);
+  }
+
+  assert.match(
+    probe,
+    /"\$\{PAPERCLIP_SECRETS_MASTER_KEY:-\}" != "\$EXPECTED_KEY"/,
+    "must prove the server still inherits the key across the gosu drop",
+  );
+  assert.doesNotMatch(
+    probe,
+    /echo[^\n]*\$\{?PAPERCLIP_SECRETS_MASTER_KEY|echo[^\n]*\$\{?EXPECTED_KEY/,
+    "must never echo the key value",
   );
 });
