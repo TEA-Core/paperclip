@@ -41,12 +41,8 @@ if [ "$changed" = "1" ]; then
 fi
 
 # Pre-create the secrets key directory with paperclip-user ownership.
-# The server's local-encrypted provider writes the master key to the path
-# resolved by PAPERCLIP_SECRETS_MASTER_KEY_FILE (default: $PAPERCLIP_HOME/secrets/master.key).
-# If the default path is used, the key file lands inside the agent-visible volume
-# and enforceKeyPathIsolation() will refuse to start unless PAPERCLIP_SECRETS_MASTER_KEY
-# is set instead. To use a file outside the agent-visible volume, set
-# PAPERCLIP_SECRETS_MASTER_KEY_FILE=/etc/paperclip/secrets/master.key.
+# The server's local-encrypted provider writes /etc/paperclip/secrets/master.key
+# at startup; this directory is outside the agent-visible volume and must exist.
 mkdir -p /etc/paperclip/secrets
 chown node:node /etc/paperclip/secrets
 
