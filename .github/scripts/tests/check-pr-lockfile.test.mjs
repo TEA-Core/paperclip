@@ -30,6 +30,29 @@ test('passes when lockfile changed by a human on the refresh branch', () => {
   assert.deepEqual(result.failures, []);
 });
 
+// refresh-lockfile.yml pushes `chore/refresh-lockfile-<sanitized base ref>`, so
+// an exact-match exemption missed the refresh bot's own PR on every base but one.
+test('passes for the refresh bot branch on a non-master base', () => {
+  const result = checkLockfile(
+    makeFiles(['pnpm-lock.yaml']),
+    'github-actions[bot]',
+    'chore/refresh-lockfile-fold-tea-patches-v2026.722.0',
+  );
+  assert.equal(result.passed, true);
+});
+
+// A fold imports upstream's resolved lockfile wholesale; pr.yml exempts it, so
+// this gate must not tell the fold author to strip the file.
+test('passes when a fold sync carries the folded lockfile', () => {
+  const result = checkLockfile(
+    makeFiles(['pnpm-lock.yaml', 'package.json']),
+    'someuser',
+    'fold-sync/backlog-2026-08-14',
+  );
+  assert.equal(result.passed, true);
+  assert.deepEqual(result.failures, []);
+});
+
 test('fails when lockfile changed by regular user', () => {
   const result = checkLockfile(makeFiles(['pnpm-lock.yaml']), 'someuser', 'fix/bug');
   assert.equal(result.passed, false);
