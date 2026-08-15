@@ -1290,7 +1290,15 @@ async function buildRuntime(input: {
     includeRuntimeKeys: ["HOME"],
     resolvedCommand: agentCommand ?? acpxAgent,
   });
-  const envUnset = [...SECRET_ENV_KEYS, "DATABASE_URL", "DATABASE_MIGRATION_URL"];
+  const secretEnvKeys = Object.keys(process.env).filter((key) =>
+    key.startsWith("PAPERCLIP_SECRETS_"),
+  );
+  const envUnset = [
+    ...SECRET_ENV_KEYS,
+    ...secretEnvKeys,
+    "DATABASE_URL",
+    "DATABASE_MIGRATION_URL",
+  ];
 
   return {
     acpxAgent,
