@@ -20,9 +20,6 @@ function isPathInside(candidatePath: string, rootPath: string): boolean {
 }
 
 function enforceKeyPathIsolation(keyPath: string): void {
-  if (process.env.PAPERCLIP_SECRETS_MASTER_KEY && process.env.PAPERCLIP_SECRETS_MASTER_KEY.trim().length > 0) {
-    return;
-  }
   const paperclipHome = resolvePaperclipHomeDir();
   if (isPathInside(keyPath, paperclipHome)) {
     throw new Error(
@@ -118,6 +115,8 @@ function decodeMasterKey(raw: string): Buffer | null {
 
 function loadOrCreateMasterKey(): Buffer {
   const envKeyRaw = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+  const keyPath = resolveMasterKeyFilePath();
+  enforceKeyPathIsolation(keyPath);
   if (envKeyRaw && envKeyRaw.trim().length > 0) {
     const fromEnv = decodeMasterKey(envKeyRaw);
     if (!fromEnv) {
@@ -126,7 +125,6 @@ function loadOrCreateMasterKey(): Buffer {
       );
     }
 
-    const keyPath = resolveMasterKeyFilePath();
     if (existsSync(keyPath)) {
       enforceKeyFilePermissionsBestEffort(keyPath);
       try {
@@ -153,8 +151,6 @@ function loadOrCreateMasterKey(): Buffer {
     return fromEnv;
   }
 
-  const keyPath = resolveMasterKeyFilePath();
-  enforceKeyPathIsolation(keyPath);
   if (existsSync(keyPath)) {
     enforceKeyFilePermissionsBestEffort(keyPath);
     const raw = readFileSync(keyPath, "utf8");
@@ -221,6 +217,16 @@ async function inspectLocalEncryptedHealth(): Promise<SecretProviderHealthCheck>
     }
 
     const keyPath = resolveMasterKeyFilePath();
+    try {
+      enforceKeyPathIsolation(keyPath);
+    } catch (err) {
+      return {
+        provider: "local_encrypted",
+        status: "error",
+        message: err instanceof Error ? err.message : String(err),
+        details: { keySource: "env", keyFilePath: keyPath },
+      };
+    }
     if (existsSync(keyPath)) {
       try {
         const fileRaw = readFileSync(keyPath, "utf8");
