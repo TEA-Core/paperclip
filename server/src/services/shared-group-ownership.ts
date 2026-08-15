@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { resolveDefaultSecretsKeyFilePath } from "../home-paths.js";
+import { resolveSecretsKeyDir } from "../home-paths.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -12,12 +12,7 @@ let missingGroupWarned = false;
 let chgrpFailedWarned = false;
 
 function resolveDefaultMasterKeyDir(): string {
-  const fromEnv = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
-  const keyPath =
-    fromEnv && fromEnv.trim().length > 0
-      ? path.resolve(fromEnv.trim())
-      : resolveDefaultSecretsKeyFilePath();
-  return path.dirname(keyPath);
+  return resolveSecretsKeyDir();
 }
 
 function isMasterKeyDirOrAncestor(dirPath: string, resolveMasterKeyDir: () => string): boolean {

@@ -139,7 +139,11 @@ describe("docker-entrypoint.sh", () => {
 
     const { calls } = await runEntrypoint({ PAPERCLIP_HOME: stubDir });
 
-    expect(calls).not.toContain("chown");
+    // Scoped to the recursive walk this test is named for. The fork's
+    // unconditional single-directory `chown node:node /etc/paperclip/secrets`
+    // is a different guard (see the secrets-key-directory test above) and
+    // costs nothing per boot.
+    expect(calls).not.toContain("chown -R");
     expect(calls).toContain("gosu node echo ENTRYPOINT-CMD-RAN");
   });
 

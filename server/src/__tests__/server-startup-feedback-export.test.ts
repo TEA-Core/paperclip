@@ -362,6 +362,35 @@ vi.mock("../auth/better-auth.js", () => ({
 }));
 
 import { startServer } from "../index.ts";
+import { resolvePaperclipHomeDir } from "@paperclipai/shared/home-paths";
+
+function isInside(candidate: string, directory: string) {
+  const relative = path.relative(path.resolve(directory), path.resolve(candidate));
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+/**
+ * Point the generated decision signing key at a throwaway secrets directory.
+ *
+ * The fork resolves every persisted key file from the master key's location
+ * (PAPERCLIP_SECRETS_MASTER_KEY_FILE, defaulting to /etc/paperclip/secrets),
+ * deliberately NOT from the instance root, so PAPERCLIP_HOME cannot steer it.
+ */
+function useIsolatedSecretsDir(prefix: string) {
+  const originalMasterKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  const root = mkdtempSync(path.join(tmpdir(), prefix));
+  const secretsDir = path.join(root, "secrets");
+  process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsDir, "master.key");
+  return {
+    root,
+    keyPath: path.join(secretsDir, "decision-signing.key"),
+    cleanup() {
+      if (originalMasterKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = originalMasterKeyFile;
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -379,42 +408,31 @@ describe("startServer feedback export wiring", () => {
   });
 
   it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {
-    const originalHome = process.env.PAPERCLIP_HOME;
-    const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
-    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-decision-key-"));
-    process.env.PAPERCLIP_HOME = tempHome;
-    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    const { keyPath, cleanup } = useIsolatedSecretsDir("paperclip-decision-key-");
     delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
     try {
       const started = await startServer();
       expect(started.server).toBe(fakeServer);
-      const keyPath = path.join(tempHome, "instances", "default", "secrets", "decision-signing.key");
       expect(readFileSync(keyPath, "utf8").trim().length).toBeGreaterThanOrEqual(32);
       if (process.platform !== "win32") {
         expect(statSync(path.dirname(keyPath)).mode & 0o777).toBe(0o700);
         expect(statSync(keyPath).mode & 0o777).toBe(0o600);
       }
+      // Fork guard (SUP-12234): the key an agent could forge signatures with
+      // must never land inside the volume mounted into agent workspaces.
+      expect(isInside(keyPath, resolvePaperclipHomeDir())).toBe(false);
     } finally {
-      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
-      else process.env.PAPERCLIP_HOME = originalHome;
-      if (originalInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
-      else process.env.PAPERCLIP_INSTANCE_ID = originalInstanceId;
-      rmSync(tempHome, { recursive: true, force: true });
+      cleanup();
     }
   });
 
   it("repairs permissive permissions on an existing generated decision signing key", async () => {
-    const originalHome = process.env.PAPERCLIP_HOME;
-    const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
-    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-decision-key-mode-"));
-    const keyPath = path.join(tempHome, "instances", "default", "secrets", "decision-signing.key");
+    const { keyPath, cleanup } = useIsolatedSecretsDir("paperclip-decision-key-mode-");
     const existingKey = Buffer.alloc(32, 7).toString("base64");
     mkdirSync(path.dirname(keyPath), { recursive: true, mode: 0o777 });
     chmodSync(path.dirname(keyPath), 0o777);
     writeFileSync(keyPath, existingKey, { encoding: "utf8", mode: 0o644 });
     chmodSync(keyPath, 0o644);
-    process.env.PAPERCLIP_HOME = tempHome;
-    process.env.PAPERCLIP_INSTANCE_ID = "default";
     delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
     try {
       const started = await startServer();
@@ -425,39 +443,26 @@ describe("startServer feedback export wiring", () => {
         expect(statSync(keyPath).mode & 0o777).toBe(0o600);
       }
     } finally {
-      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
-      else process.env.PAPERCLIP_HOME = originalHome;
-      if (originalInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
-      else process.env.PAPERCLIP_INSTANCE_ID = originalInstanceId;
-      rmSync(tempHome, { recursive: true, force: true });
+      cleanup();
     }
   });
 
   it("refuses a symlink planted as the generated decision signing key", async () => {
     if (process.platform === "win32") return;
 
-    const originalHome = process.env.PAPERCLIP_HOME;
-    const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
-    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-decision-key-symlink-"));
-    const keyPath = path.join(tempHome, "instances", "default", "secrets", "decision-signing.key");
-    const plantedTarget = path.join(tempHome, "planted.key");
+    const { keyPath, root, cleanup } = useIsolatedSecretsDir("paperclip-decision-key-symlink-");
+    const plantedTarget = path.join(root, "planted.key");
     const plantedKey = Buffer.alloc(32, 9).toString("base64");
     mkdirSync(path.dirname(keyPath), { recursive: true, mode: 0o777 });
     chmodSync(path.dirname(keyPath), 0o777);
     writeFileSync(plantedTarget, plantedKey, { encoding: "utf8", mode: 0o600 });
     symlinkSync(plantedTarget, keyPath);
-    process.env.PAPERCLIP_HOME = tempHome;
-    process.env.PAPERCLIP_INSTANCE_ID = "default";
     delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
     try {
       await expect(startServer()).rejects.toThrow("must be a regular file");
       expect(readFileSync(plantedTarget, "utf8")).toBe(plantedKey);
     } finally {
-      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
-      else process.env.PAPERCLIP_HOME = originalHome;
-      if (originalInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
-      else process.env.PAPERCLIP_INSTANCE_ID = originalInstanceId;
-      rmSync(tempHome, { recursive: true, force: true });
+      cleanup();
     }
   });
 

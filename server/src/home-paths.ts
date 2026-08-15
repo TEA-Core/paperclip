@@ -39,6 +39,31 @@ export function resolveDefaultSecretsKeyFilePath(): string {
   return resolveSharedDefaultSecretsKeyFilePath();
 }
 
+/**
+ * Resolve the secrets master key file, honouring PAPERCLIP_SECRETS_MASTER_KEY_FILE.
+ *
+ * SUP-12234 moved the fork's default master key OUT of the Paperclip home
+ * volume (to /etc/paperclip/secrets/master.key) because that volume is mounted
+ * into agent execution workspaces. `resolveDefaultSecretsKeyFilePath()` is only
+ * the fallback: the deployed instance overrides it, and a call site that reads
+ * the default directly silently pins itself to a path the operator has moved.
+ */
+export function resolveSecretsMasterKeyFilePath(): string {
+  const fromEnv = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  if (fromEnv && fromEnv.trim().length > 0) return path.resolve(fromEnv.trim());
+  return resolveSharedDefaultSecretsKeyFilePath();
+}
+
+/**
+ * Directory holding the master key. Every other key file the server persists
+ * (decision signing, and anything a future fold adds) belongs beside it: the
+ * isolation SUP-12234 bought is a property of the directory, so a sibling
+ * inherits it and a key written anywhere else does not.
+ */
+export function resolveSecretsKeyDir(): string {
+  return path.dirname(resolveSecretsMasterKeyFilePath());
+}
+
 export function resolveDefaultStorageDir(): string {
   return resolveSharedDefaultStorageDir();
 }

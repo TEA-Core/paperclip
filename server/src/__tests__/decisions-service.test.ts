@@ -29,6 +29,27 @@ import type { AttentionArchiveManifestEntry, AttentionArchiveTargetSnapshot } fr
 const support = await getEmbeddedPostgresTestSupport();
 const describePg = support.supported ? describe : describe.skip;
 
+/**
+ * Point the generated decision signing key at a throwaway secrets directory.
+ *
+ * The fork resolves every persisted key file from the master key's location
+ * (PAPERCLIP_SECRETS_MASTER_KEY_FILE, defaulting to /etc/paperclip/secrets),
+ * deliberately NOT from the instance root, so PAPERCLIP_HOME cannot steer it.
+ */
+function useIsolatedSecretsDir(prefix: string) {
+  const original = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  const root = mkdtempSync(path.join(tmpdir(), prefix));
+  process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(root, "secrets", "master.key");
+  return {
+    root,
+    cleanup() {
+      if (original === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = original;
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
 describePg("decisionService", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
@@ -355,9 +376,7 @@ describePg("decisionService", () => {
 
   it("fails closed when the configured signing secret is removed after proposal", async () => {
     const created = await createCommentDecision();
-    const originalHome = process.env.PAPERCLIP_HOME;
-    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-decision-rotate-"));
-    process.env.PAPERCLIP_HOME = tempHome;
+    const secrets = useIsolatedSecretsDir("paperclip-decision-rotate-");
     delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
     process.env.PAPERCLIP_AGENT_JWT_SECRET = "agent-jwt-secret-must-not-sign-decisions";
     try {
@@ -365,25 +384,19 @@ describePg("decisionService", () => {
         .rejects.toThrow("Decision signature verification failed");
       expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(0);
     } finally {
-      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
-      else process.env.PAPERCLIP_HOME = originalHome;
-      rmSync(tempHome, { recursive: true, force: true });
+      secrets.cleanup();
     }
   });
 
   it("signs and verifies with an auto-generated key when no secret is configured", async () => {
-    const originalHome = process.env.PAPERCLIP_HOME;
-    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-decision-generated-"));
-    process.env.PAPERCLIP_HOME = tempHome;
+    const secrets = useIsolatedSecretsDir("paperclip-decision-generated-");
     delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
     try {
       const created = await createCommentDecision();
       const result = await service().decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
       expect(result.executionStatus).toBe("succeeded");
     } finally {
-      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
-      else process.env.PAPERCLIP_HOME = originalHome;
-      rmSync(tempHome, { recursive: true, force: true });
+      secrets.cleanup();
     }
   });
 

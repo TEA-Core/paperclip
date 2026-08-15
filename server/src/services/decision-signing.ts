@@ -1,13 +1,17 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, linkSync, lstatSync, mkdirSync, readFileSync, type Stats, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { resolveDefaultSecretsKeyFilePath } from "../home-paths.js";
+import { resolveSecretsKeyDir } from "../home-paths.js";
 
 const VERSION = "decision-spec-v1";
 const MIN_SECRET_LENGTH = 32;
 
+// Beside the master key, not under the Paperclip home volume: an agent that can
+// read this key can forge decision signatures, which is the same exposure
+// SUP-12234 closed for the master key. Upstream resolves the secrets directory
+// from the instance root, where agent workspaces can reach it.
 function resolveGeneratedSecretFilePath() {
-  return path.join(path.dirname(resolveDefaultSecretsKeyFilePath()), "decision-signing.key");
+  return path.join(resolveSecretsKeyDir(), "decision-signing.key");
 }
 
 function assertOwnedByCurrentUser(stats: Stats, description: string) {
