@@ -6,6 +6,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const tmpDir = path.join(os.tmpdir(), `paperclip-secrets-test-${randomUUID()}`);
 
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    readFileSync: vi.fn(actual.readFileSync),
+  };
+});
+
 describe("local-encrypted-provider", () => {
   let originalEnv: NodeJS.ProcessEnv;
 
@@ -56,15 +64,16 @@ describe("local-encrypted-provider", () => {
       expect(result.material.scheme).toBe("local_encrypted_v1");
     });
 
-    it("does not read the key file when env key is set and file key matches", async () => {
+    it("reads the key file to verify env key matches when env key is set and file exists", async () => {
       const keyPath = path.join(tmpDir, "master.key");
       writeFileSync(keyPath, envKey, { encoding: "utf8", mode: 0o600 });
       process.env.PAPERCLIP_SECRETS_MASTER_KEY = envKey;
 
-      const spy = vi.spyOn(require("node:fs"), "readFileSync");
+      const fs = await import("node:fs");
+      vi.mocked(fs.readFileSync).mockClear();
       const { localEncryptedProvider } = await import("./local-encrypted-provider.js");
       await localEncryptedProvider.createSecret({ value: "test" });
-      expect(spy).not.toHaveBeenCalledWith(keyPath, "utf8");
+      expect(fs.readFileSync).toHaveBeenCalledWith(keyPath, "utf8");
     });
   });
 
@@ -87,8 +96,30 @@ describe("local-encrypted-provider", () => {
       const callArg = spy.mock.calls[0][0] as Record<string, unknown>;
       expect(callArg.keyPath).toBe(keyPath);
       expect(callArg.keySource).toBe("env");
+      expect(callArg.insidePaperclipHome).toBe(false);
       expect(callArg.envKeyFingerprint).toBeTruthy();
       expect(callArg.fileKeyFingerprint).toBeTruthy();
+    });
+
+    it("reports insidePaperclipHome=true when key path is inside PAPERCLIP_HOME", async () => {
+      const keyPath = path.join(tmpDir, "master.key");
+      writeFileSync(keyPath, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      process.env.PAPERCLIP_HOME = tmpDir;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+      const logger = await import("../middleware/logger.js");
+      const spy = vi.spyOn(logger.logger, "info").mockImplementation(() => logger.logger);
+
+      const { assertKeyPathAtBoot } = await import("./local-encrypted-provider.js");
+      assertKeyPathAtBoot();
+
+      expect(spy).toHaveBeenCalled();
+      const callArg = spy.mock.calls[0][0] as Record<string, unknown>;
+      expect(callArg.keyPath).toBe(keyPath);
+      expect(callArg.insidePaperclipHome).toBe(true);
     });
   });
 
