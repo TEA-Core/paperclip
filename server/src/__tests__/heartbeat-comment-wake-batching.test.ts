@@ -30,7 +30,10 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 10_000, intervalMs = 50) {
+// 90s is what every explicit call site in this file passes; the default is the
+// same budget so the two bare call sites do not silently get a 10s one and read
+// a slow dispatch as a failed one.
+async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 90_000, intervalMs = 50) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     if (await condition()) return;
@@ -1872,9 +1875,13 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         .where(eq(heartbeatRuns.agentId, primaryAgentId))
         .orderBy(asc(heartbeatRuns.createdAt));
       expect(primaryRuns).toHaveLength(2);
-      expect(primaryRuns[0]?.issueCommentStatus).toBe("retry_queued");
-      expect(primaryRuns[1]?.retryOfRunId).toBe(primaryRuns[0]?.id);
-      expect(primaryRuns[1]?.issueCommentStatus).toBe("retry_exhausted");
+      // Identify the pair by the retry link, not by createdAt: both rows can
+      // land in the same millisecond and the sort then picks either order.
+      const primaryOriginal = primaryRuns.find((run) => run.retryOfRunId === null);
+      const primaryRetry = primaryRuns.find((run) => run.retryOfRunId !== null);
+      expect(primaryOriginal?.issueCommentStatus).toBe("retry_queued");
+      expect(primaryRetry?.retryOfRunId).toBe(primaryOriginal?.id);
+      expect(primaryRetry?.issueCommentStatus).toBe("retry_exhausted");
 
       const missingCommentRetries = await db
         .select()

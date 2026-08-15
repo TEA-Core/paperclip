@@ -29,6 +29,11 @@ import {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
+// SUP-12693: every done transition must carry a tier declaration. These tests
+// are about review policy, not about the tier guard, so they satisfy it and
+// move on.
+const DONE_TIER_DECLARATION = "Closed at Tier 2 (live): review verdict path exercised.";
+
 if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres stalled-review decision route tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
@@ -246,7 +251,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     const selfRunId = await seedRun(primary.companyId, primary.assigneeAgentId, issueId);
     const selfApproval = await request(app(agentActor(primary.companyId, primary.assigneeAgentId, selfRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done" });
+      .send({ status: "done", comment: DONE_TIER_DECLARATION });
     expect(selfApproval.status, JSON.stringify(selfApproval.body)).toBe(200);
     expect(selfApproval.body).toMatchObject({ id: issueId, status: "done" });
   });
@@ -328,12 +333,26 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       },
     });
 
+    // Upstream admits a peer *agent* here, because its visible-issue writes are
+    // default-open. The fork withholds that half of the rule
+    // (ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE = false), so an agent with no
+    // grant on the issue is refused at the authorization boundary and the
+    // issue stays its assignee's. Pinned rather than dropped: relaxing this is
+    // what re-adopting upstream's model would look like.
     const peerRunId = await seedRun(seeded.companyId, seeded.peerAgentId, issueId);
     const peerVerdict = await request(app(agentActor(seeded.companyId, seeded.peerAgentId, peerRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done" });
-    expect(peerVerdict.status, JSON.stringify(peerVerdict.body)).toBe(200);
-    expect(peerVerdict.body).toMatchObject({ id: issueId, status: "done" });
+      .send({ status: "done", comment: DONE_TIER_DECLARATION });
+    expect(peerVerdict.status, JSON.stringify(peerVerdict.body)).toBe(403);
+    expect(peerVerdict.body.error).toBe("Issue is outside this actor's authorization boundary");
+
+    // The policy itself still admits a writer other than the review requester;
+    // under the fork that writer is an authenticated operator, not a peer agent.
+    const otherWriterVerdict = await request(app(boardActor(seeded.companyId, seeded.peerUserId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", comment: DONE_TIER_DECLARATION });
+    expect(otherWriterVerdict.status, JSON.stringify(otherWriterVerdict.body)).toBe(200);
+    expect(otherWriterVerdict.body).toMatchObject({ id: issueId, status: "done" });
   });
 
   it("enforces human_only from the authenticated principal and admits a user", async () => {
@@ -378,7 +397,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
 
     const verdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done", reviewPolicy: "anyone" });
+      .send({ status: "done", reviewPolicy: "anyone", comment: DONE_TIER_DECLARATION });
 
     expect(verdict.status, JSON.stringify(verdict.body)).toBe(200);
     expect(verdict.body).toMatchObject({ id: issueId, status: "done", reviewPolicy: "anyone" });
