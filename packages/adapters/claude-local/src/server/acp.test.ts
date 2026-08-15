@@ -85,7 +85,19 @@ afterEach(async () => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  await Promise.all(tempRoots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+  // The remote-sandbox tests in this file stage a process-session bridge whose
+  // detached event writer can still be flushing a trailing file into
+  // `.../process-sessions/<id>/events` after the run's own best-effort session-dir
+  // removal (which production catch-wraps) has returned. Under CI load that write
+  // lands between this recursive delete's directory snapshot and its `rmdir` and
+  // surfaces as `ENOTEMPTY`, failing a test that already passed. `maxRetries`/
+  // `retryDelay` ride out that window, matching the cleanup in
+  // `packages/adapter-utils/src/acpx-engine/execute.test.ts`.
+  await Promise.all(
+    tempRoots
+      .splice(0)
+      .map((root) => fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })),
+  );
 });
 
 class FakeRuntime {
