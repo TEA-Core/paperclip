@@ -1290,14 +1290,21 @@ async function buildRuntime(input: {
     includeRuntimeKeys: ["HOME"],
     resolvedCommand: agentCommand ?? acpxAgent,
   });
-  const secretEnvKeys = Object.keys(process.env).filter((key) =>
+  // SECRET_ENV_KEYS only names the master-key pair explicitly, so any other
+  // PAPERCLIP_SECRETS_* var present in the harness env (provider selection,
+  // strict mode, allow-key-generation) would still be inherited by the spawned
+  // agent. Prefix-scan the live env so the whole namespace is unset at the
+  // spawn boundary. Deduped because the master-key names appear in both lists.
+  const secretsNamespaceKeys = Object.keys(process.env).filter((key) =>
     key.startsWith("PAPERCLIP_SECRETS_"),
   );
   const envUnset = [
-    ...SECRET_ENV_KEYS,
-    ...secretEnvKeys,
-    "DATABASE_URL",
-    "DATABASE_MIGRATION_URL",
+    ...new Set([
+      ...SECRET_ENV_KEYS,
+      ...secretsNamespaceKeys,
+      "DATABASE_URL",
+      "DATABASE_MIGRATION_URL",
+    ]),
   ];
 
   return {
