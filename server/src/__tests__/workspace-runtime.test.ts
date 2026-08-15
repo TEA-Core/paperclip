@@ -2643,6 +2643,83 @@ describe("realizeExecutionWorkspace", () => {
     }
   });
 
+  // SUP-12984: a branch that only edits pnpm settings inside package.json (overrides,
+  // patchedDependencies) fails the frozen install with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH,
+  // not ERR_PNPM_OUTDATED_LOCKFILE. The retry above matched only the latter, so those
+  // branches were unprovisionable and no agent run could launch on them.
+  it("retries worktree-local pnpm install when the lockfile config mismatches the branch manifests", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-lockfile-config-mismatch-"));
+    const baseRoot = path.join(tempRoot, "base");
+    const worktreeRoot = path.join(tempRoot, "worktree");
+    const fakeBin = path.join(tempRoot, "bin");
+    const fakePnpmPath = path.join(fakeBin, "pnpm");
+    const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
+
+    try {
+      await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
+      await fs.mkdir(worktreeRoot, { recursive: true });
+      await fs.mkdir(fakeBin, { recursive: true });
+      await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
+      await fs.chmod(scriptPath, 0o755);
+      await fs.writeFile(
+        path.join(worktreeRoot, "package.json"),
+        JSON.stringify(
+          {
+            name: "workspace-root",
+            private: true,
+            packageManager: "pnpm@9.15.4",
+            pnpm: { overrides: { undici: "5.29.0" } },
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(worktreeRoot, "pnpm-lock.yaml"),
+        ["lockfileVersion: '9.0'", "", "importers:", "  .: {}", ""].join("\n"),
+        "utf8",
+      );
+      await fs.writeFile(
+        fakePnpmPath,
+        [
+          "#!/bin/sh",
+          "if [ \"$1\" = \"paperclipai\" ] && [ \"$2\" = \"--help\" ]; then",
+          "  exit 1",
+          "fi",
+          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--frozen-lockfile\" ]; then",
+          "  echo \" ERR_PNPM_LOCKFILE_CONFIG_MISMATCH  Cannot proceed with the frozen installation.\" >&2",
+          "  exit 1",
+          "fi",
+          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--no-frozen-lockfile\" ]; then",
+          "  mkdir -p \"$PWD/node_modules\"",
+          "  : > \"$PWD/node_modules/.retry-success\"",
+          "  exit 0",
+          "fi",
+          "exit 0",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await fs.chmod(fakePnpmPath, 0o755);
+
+      const result = await execFileAsync(scriptPath, [], {
+        cwd: worktreeRoot,
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
+          PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
+        },
+      });
+
+      expect(result.stderr).toContain("retrying install without --frozen-lockfile");
+      await expect(fs.readFile(path.join(worktreeRoot, "node_modules", ".retry-success"), "utf8")).resolves.toBe("");
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it(
     "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
     async () => {
