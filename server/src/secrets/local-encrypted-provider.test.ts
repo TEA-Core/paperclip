@@ -227,7 +227,11 @@ describe("local-encrypted-provider", () => {
       const { localEncryptedProvider } = await import("./local-encrypted-provider.js");
       const secret = await localEncryptedProvider.createSecret({ value: "x" });
       expect(secret.material.scheme).toBe("local_encrypted_v1");
-      await localEncryptedProvider.resolveVersion({ material: secret.material });
+      const resolved = await localEncryptedProvider.resolveVersion({
+        material: secret.material,
+        externalRef: null,
+      });
+      expect(resolved).toBe("x");
     });
   });
 });
