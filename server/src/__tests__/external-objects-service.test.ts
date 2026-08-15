@@ -316,6 +316,38 @@ describe("GitHub external object provider", () => {
     expect(JSON.stringify(result)).not.toContain("ghp_secret");
   });
 
+  it("does not retry anonymously when no token was configured", async () => {
+    const fetch = vi.fn(async () => new Response("{}", { status: 401, headers: { "content-type": "application/json" } }));
+    const provider = createGitHubExternalObjectProvider({} as any, { fetch, tokenProvider: null });
+    const resolver = provider.resolvers.find((entry) => entry.objectType === "pull_request")!;
+
+    const result = await resolver.resolve({
+      companyId: "company-1",
+      object: githubObject("pull/42", "pull_request"),
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ ok: false, errorCode: "github_auth_required" });
+  });
+
+  it("keeps the auth failure when the anonymous retry is also unauthorized", async () => {
+    const fetch = vi.fn(async () => new Response("{}", { status: 401, headers: { "content-type": "application/json" } }));
+    const provider = createGitHubExternalObjectProvider({} as any, {
+      fetch,
+      tokenProvider: async () => "ghp_stale",
+    });
+    const resolver = provider.resolvers.find((entry) => entry.objectType === "pull_request")!;
+
+    const result = await resolver.resolve({
+      companyId: "company-1",
+      object: githubObject("pull/42", "pull_request"),
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ ok: false, liveness: "auth_required", errorCode: "github_auth_required" });
+    expect(JSON.stringify(result)).not.toContain("ghp_stale");
+  });
+
   it.each([
     [
       "auth-required",
@@ -1092,6 +1124,45 @@ describeEmbeddedPostgres("externalObjectService", () => {
 
     const refreshed = await svc.refreshDueObjects(companyId, 50, new Date(Date.now() + 1_000));
     expect(refreshed).toEqual([]);
+  });
+
+  it("hydrates a public object anonymously when the configured token is rejected", async () => {
+    const { companyId, issueId } = await createIssue();
+    const seen: Array<Record<string, string>> = [];
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      seen.push(headers);
+      if (headers.authorization) {
+        return new Response(JSON.stringify({ message: "Bad credentials" }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ state: "open", draft: false, merged: false, title: "Public PR" }), {
+        status: 200,
+        headers: { "content-type": "application/json", etag: '"etag-1"' },
+      });
+    });
+    const svc = externalObjectService(db, {
+      github: { fetch, tokenProvider: async () => "ghp_stale" },
+    });
+
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    const refreshed = await svc.refreshObject(object.id, { companyId, force: true });
+
+    // First attempt carries the stale credential, second drops it.
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toHaveProperty("authorization", "Bearer ghp_stale");
+    expect(seen[1]).not.toHaveProperty("authorization");
+    expect(refreshed.object).toMatchObject({
+      liveness: "fresh",
+      statusKey: "open",
+      statusCategory: "open",
+      lastErrorCode: null,
+    });
+    expect(JSON.stringify(refreshed)).not.toContain("ghp_stale");
   });
 });
 
