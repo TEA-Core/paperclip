@@ -1,4 +1,18 @@
-import type { CompanyStatus, PauseReason } from "../constants.js";
+import type {
+  CompanyStatus,
+  IssueThreadInteractionKind,
+  IssueThreadInteractionResolverPolicy,
+  PauseReason,
+} from "../constants.js";
+
+export interface InteractionResolverKindGovernance {
+  defaultPolicy?: IssueThreadInteractionResolverPolicy;
+  cap?: IssueThreadInteractionResolverPolicy;
+}
+
+export type InteractionResolverGovernance = Partial<
+  Record<IssueThreadInteractionKind, InteractionResolverKindGovernance>
+>;
 
 export interface Company {
   id: string;
@@ -20,6 +34,7 @@ export interface Company {
    * published SDK type (plugins, fixtures) stay source-compatible.
    */
   mergeArmingEnabled?: boolean;
+  interactionResolverGovernance: InteractionResolverGovernance;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;
   feedbackDataSharingConsentByUserId: string | null;

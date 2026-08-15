@@ -12,6 +12,7 @@ const mockIssueService = vi.hoisted(() => ({
   getCommentCursor: vi.fn(),
   getComment: vi.fn(),
   listBlockerAttention: vi.fn(),
+  listReviewAttention: vi.fn(),
   listProductivityReviews: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
   getActiveInboxArchiveFields: vi.fn(),
@@ -125,7 +126,6 @@ vi.mock("../services/index.js", () => ({
     listForIssue: vi.fn(async () => []),
     expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
     expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
-    expirePendingInteractionsOnTerminalIssueStatus: vi.fn(async () => []),
   }),
   issueReferenceService: () => mockIssueReferenceService,
   issueService: () => mockIssueService,
@@ -210,6 +210,7 @@ describe.sequential("issue goal context routes", () => {
     });
     mockIssueService.getComment.mockResolvedValue(null);
     mockIssueService.listBlockerAttention.mockResolvedValue(new Map());
+    mockIssueService.listReviewAttention.mockResolvedValue(new Map());
     mockIssueService.listProductivityReviews.mockResolvedValue(new Map());
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
     mockIssueService.getActiveInboxArchiveFields.mockResolvedValue({});

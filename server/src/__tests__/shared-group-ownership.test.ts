@@ -15,6 +15,11 @@ vi.mock("node:fs/promises", () => ({
 }));
 
 vi.mock("../home-paths.js", () => ({
+  // The master-key directory is resolved through resolveSecretsKeyDir now, so
+  // that the PAPERCLIP_SECRETS_MASTER_KEY_FILE override reaches every key file
+  // the server persists rather than only the master key itself.
+  resolveSecretsKeyDir: vi.fn(() => "/tmp/nonexistent-secrets"),
+  resolveSecretsMasterKeyFilePath: vi.fn(() => "/tmp/nonexistent-secrets/master.key"),
   resolveDefaultSecretsKeyFilePath: vi.fn(() => "/tmp/nonexistent-secrets/master.key"),
   resolveDefaultEmbeddedPostgresDir: vi.fn(() => "/tmp/nonexistent-db"),
   resolveDefaultBackupDir: vi.fn(() => "/tmp/nonexistent-backups"),

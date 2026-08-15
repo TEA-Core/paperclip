@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, integer, timestamp, boolean, uniqueIndex } from "drizzle-orm/pg-core";
+import type { InteractionResolverGovernance } from "@paperclipai/shared";
+import { pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const companies = pgTable(
   "companies",
@@ -23,6 +24,10 @@ export const companies = pgTable(
     mergeArmingEnabled: boolean("merge_arming_enabled")
       .notNull()
       .default(false),
+    interactionResolverGovernance: jsonb("interaction_resolver_governance")
+      .$type<InteractionResolverGovernance>()
+      .notNull()
+      .default({}),
     feedbackDataSharingEnabled: boolean("feedback_data_sharing_enabled")
       .notNull()
       .default(false),

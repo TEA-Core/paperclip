@@ -124,6 +124,51 @@ export function sweepDetachedRunProcesses(input: {
   return { signalled, skipped, failed };
 }
 
+const COORDINATED_SHUTDOWN_SIGNALS = ["SIGINT", "SIGTERM"] as const;
+
+type ShutdownSignalTarget = {
+  rawListeners(eventName: string): Function[];
+  removeListener(eventName: string, listener: (...args: any[]) => void): unknown;
+};
+
+/**
+ * Some dependencies eagerly install process signal handlers as an import side
+ * effect. Paperclip must remain the sole owner of SIGINT/SIGTERM ordering: its
+ * handler first snapshots live heartbeat runs and only then stops embedded
+ * infrastructure. Remove only listeners added by the supplied import, while
+ * preserving every listener that was already registered.
+ */
+export async function loadWithoutCoordinatedShutdownSignalHooks<T>(
+  load: () => Promise<T>,
+  signalTarget: ShutdownSignalTarget = process,
+) {
+  const listenersBeforeLoad = new Map(
+    COORDINATED_SHUTDOWN_SIGNALS.map((signal) => [
+      signal,
+      signalTarget.rawListeners(signal),
+    ]),
+  );
+
+  let loaded: T;
+  try {
+    loaded = await load();
+  } finally {
+    for (const signal of COORDINATED_SHUTDOWN_SIGNALS) {
+      const remainingBeforeLoad = [...(listenersBeforeLoad.get(signal) ?? [])];
+      for (const listener of signalTarget.rawListeners(signal)) {
+        const existingIndex = remainingBeforeLoad.indexOf(listener);
+        if (existingIndex >= 0) {
+          remainingBeforeLoad.splice(existingIndex, 1);
+          continue;
+        }
+        signalTarget.removeListener(signal, listener as (...args: any[]) => void);
+      }
+    }
+  }
+
+  return loaded;
+}
+
 export async function coordinateHeartbeatSchedulerShutdown<
   TPreparation extends HotRestartShutdownPreparation,
 >(input: {
@@ -140,6 +185,26 @@ export async function coordinateHeartbeatSchedulerShutdown<
   let hotRestart: TPreparation | null = null;
   let preparationError: unknown = null;
 
+  // The signal handler stops the scheduler before entering this coordinator.
+  // Quiesce any callback that was already in flight BEFORE querying running rows
+  // for the shutdown snapshot, otherwise a late queue claim can create a run that
+  // is absent from both the snapshot and the selective drain set. The wait has to
+  // happen here rather than after preparation, so it also covers the hot-restart
+  // path -- which is why there is exactly one wait in this function.
+  //
+  // It is still bounded: the wait blocks on in-flight scheduler work, which
+  // includes whole agent runs, and without a bound it can outlast the container's
+  // stop timeout on its own before the drain has signalled anything (SUP-10309).
+  let waitedForSchedulerIdle = true;
+  let schedulerIdleTimedOut = false;
+  if (input.deadline) {
+    const idle = await withShutdownDeadline(input.waitForHeartbeatSchedulerIdle(), input.deadline);
+    waitedForSchedulerIdle = idle.completed;
+    schedulerIdleTimedOut = !idle.completed;
+  } else {
+    await input.waitForHeartbeatSchedulerIdle();
+  }
+
   if (input.prepareHotRestartShutdown) {
     try {
       hotRestart = await input.prepareHotRestartShutdown(input.signal);
@@ -148,33 +213,10 @@ export async function coordinateHeartbeatSchedulerShutdown<
     }
   }
 
-  if (hotRestart?.skipDrain) {
-    return {
-      hotRestart,
-      preparationError,
-      waitedForSchedulerIdle: false,
-      schedulerIdleTimedOut: false,
-    };
-  }
-
-  // The idle wait blocks on in-flight scheduler work, which includes whole
-  // agent runs. Without a bound it can outlast the container's stop timeout on
-  // its own, before the drain has had a chance to signal anything.
-  if (input.deadline) {
-    const idle = await withShutdownDeadline(input.waitForHeartbeatSchedulerIdle(), input.deadline);
-    return {
-      hotRestart,
-      preparationError,
-      waitedForSchedulerIdle: idle.completed,
-      schedulerIdleTimedOut: !idle.completed,
-    };
-  }
-
-  await input.waitForHeartbeatSchedulerIdle();
   return {
     hotRestart,
     preparationError,
-    waitedForSchedulerIdle: true,
-    schedulerIdleTimedOut: false,
+    waitedForSchedulerIdle,
+    schedulerIdleTimedOut,
   };
 }

@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path, { resolve } from "node:path";
-import { resolveDefaultSecretsKeyFilePath } from "../home-paths.js";
+import { resolveSecretsMasterKeyFilePath } from "../home-paths.js";
 import { resolvePaperclipHomeDir } from "@paperclipai/shared/home-paths";
 import type {
   PreparedSecretVersion,
@@ -92,9 +92,7 @@ interface LocalEncryptedMaterial extends StoredSecretVersionMaterial {
 }
 
 function resolveMasterKeyFilePath() {
-  const fromEnv = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
-  if (fromEnv && fromEnv.trim().length > 0) return resolve(fromEnv.trim());
-  return resolveDefaultSecretsKeyFilePath();
+  return resolveSecretsMasterKeyFilePath();
 }
 
 function decodeMasterKey(raw: string): Buffer | null {
