@@ -677,20 +677,34 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
       stdout_path="$(mktemp)"
       stderr_path="$(mktemp)"
 
-      if (
+      # SUP-12984: take the install status from `|| exit_code=$?`, not from `$?` after
+      # the `fi`. A bash `if` whose condition fails and which has no `else` branch exits
+      # 0, so the post-`fi` read always yielded 0: an install failure that was NOT a
+      # lockfile mismatch (registry 404, EACCES, missing peer) propagated as success,
+      # and provisioning reported exit 0 with no node_modules installed.
+      local exit_code=0
+      (
         cd "$worktree_cwd"
         pnpm install --prod=false "$@"
-      ) >"$stdout_path" 2>"$stderr_path"; then
-        cat "$stdout_path"
-        cat "$stderr_path" >&2
+      ) >"$stdout_path" 2>"$stderr_path" || exit_code=$?
+
+      cat "$stdout_path"
+      cat "$stderr_path" >&2
+
+      if [[ "$exit_code" -eq 0 ]]; then
         rm -f "$stdout_path" "$stderr_path"
         return 0
       fi
 
-      local exit_code=$?
-      cat "$stdout_path"
-      cat "$stderr_path" >&2
-      if grep -q "ERR_PNPM_OUTDATED_LOCKFILE" "$stdout_path" "$stderr_path"; then
+      # SUP-12984: pnpm reports "the committed lockfile disagrees with this branch's
+      # manifests" under two different codes. A changed dependency version yields
+      # ERR_PNPM_OUTDATED_LOCKFILE; a changed pnpm setting inside package.json
+      # (overrides, patchedDependencies, packageExtensions) yields
+      # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH. Both mean the lockfile has not been
+      # regenerated for this branch, and the same --no-frozen-lockfile retry clears
+      # both -- but only the first was matched, so an overrides-only branch
+      # (SUP-12943) failed provisioning outright and no agent run could launch.
+      if grep -qE "ERR_PNPM_OUTDATED_LOCKFILE|ERR_PNPM_LOCKFILE_CONFIG_MISMATCH" "$stdout_path" "$stderr_path"; then
         rm -f "$stdout_path" "$stderr_path"
         return 90
       fi
@@ -704,7 +718,7 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
     else
       install_exit_code=$?
       if [[ "$install_exit_code" -eq 90 ]]; then
-        echo "pnpm-lock.yaml is out of date in this execution workspace; retrying install without --frozen-lockfile." >&2
+        echo "pnpm-lock.yaml does not match this branch's manifests in this execution workspace; retrying install without --frozen-lockfile." >&2
         run_pnpm_install --no-frozen-lockfile || {
           restore_moved_symlinks
           exit 1
