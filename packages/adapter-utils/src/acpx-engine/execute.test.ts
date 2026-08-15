@@ -1750,6 +1750,9 @@ describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
     process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "secret-tool-action";
     process.env.PAPERCLIP_SECRETS_MASTER_KEY = "secret-master-key";
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = "/tmp/secret-master-key-file";
+    process.env.PAPERCLIP_SECRETS_PROVIDER = "aws_secrets_manager";
+    process.env.PAPERCLIP_SECRETS_STRICT_MODE = "true";
+    process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = "1";
     process.env.DATABASE_MIGRATION_URL = "postgres://example.test/paperclip-mig";
     process.env.ZZZ_SENTINEL = "sentinel-value";
     try {
@@ -1769,6 +1772,9 @@ describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
       expect(sessionOptions.envUnset).toContain("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET");
       expect(sessionOptions.envUnset).toContain("PAPERCLIP_SECRETS_MASTER_KEY");
       expect(sessionOptions.envUnset).toContain("PAPERCLIP_SECRETS_MASTER_KEY_FILE");
+      expect(sessionOptions.envUnset).toContain("PAPERCLIP_SECRETS_PROVIDER");
+      expect(sessionOptions.envUnset).toContain("PAPERCLIP_SECRETS_STRICT_MODE");
+      expect(sessionOptions.envUnset).toContain("PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION");
 
       // Simulate the acpx spawn env construction (copy process.env + overlay
       // session env + delete envUnset keys) to assert the spawn boundary.
@@ -1784,6 +1790,9 @@ describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
       expect(spawnEnv.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
       expect(spawnEnv.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
       expect(spawnEnv.PAPERCLIP_SECRETS_MASTER_KEY_FILE).toBeUndefined();
+      expect(spawnEnv.PAPERCLIP_SECRETS_PROVIDER).toBeUndefined();
+      expect(spawnEnv.PAPERCLIP_SECRETS_STRICT_MODE).toBeUndefined();
+      expect(spawnEnv.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION).toBeUndefined();
       expect(spawnEnv.ZZZ_SENTINEL).toBe("sentinel-value");
       expect(spawnEnv.PAPERCLIP_AGENT_ID).toBe("agent-1");
     } finally {
@@ -1792,6 +1801,9 @@ describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
       delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
       delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
       delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      delete process.env.PAPERCLIP_SECRETS_PROVIDER;
+      delete process.env.PAPERCLIP_SECRETS_STRICT_MODE;
+      delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
       delete process.env.DATABASE_MIGRATION_URL;
       delete process.env.ZZZ_SENTINEL;
     }
