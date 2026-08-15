@@ -39,6 +39,7 @@
   ],
   "scripts": {
     "check:migrations": "tsx src/check-migration-numbering.ts && tsx src/check-migration-safety.ts",
+    "fold:restamp": "tsx src/fold-restamp-migrations.ts",
     "build": "pnpm run check:migrations && tsc && cp -r src/migrations dist/migrations",
     "clean": "rm -rf dist",
     "typecheck": "pnpm run check:migrations && tsc --noEmit",
