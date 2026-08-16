@@ -411,7 +411,7 @@ export function createGitHubExternalObjectProvider(
           const { authorization: _dropped, ...anonymousHeaders } = headers;
           try {
             const anonymous = await fetchImpl(url, { headers: anonymousHeaders });
-            if (anonymous.ok || anonymous.status === 404) response = anonymous;
+            if (anonymous.ok) response = anonymous;
           } catch {
             // Keep the original 401 response and let it map to auth_required.
           }

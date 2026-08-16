@@ -348,6 +348,32 @@ describe("GitHub external object provider", () => {
     expect(JSON.stringify(result)).not.toContain("ghp_stale");
   });
 
+  it("does not mask a rejected token as not-found when the anonymous retry returns 404", async () => {
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      if (headers.authorization) {
+        return new Response(JSON.stringify({ message: "Bad credentials" }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("", { status: 404, headers: { etag: '"missing"' } });
+    });
+    const provider = createGitHubExternalObjectProvider({} as any, {
+      fetch,
+      tokenProvider: async () => "ghp_stale",
+    });
+    const resolver = provider.resolvers.find((entry) => entry.objectType === "pull_request")!;
+
+    const result = await resolver.resolve({
+      companyId: "company-1",
+      object: githubObject("pull/42", "pull_request"),
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ ok: false, liveness: "auth_required", errorCode: "github_auth_required" });
+  });
+
   it.each([
     [
       "auth-required",
