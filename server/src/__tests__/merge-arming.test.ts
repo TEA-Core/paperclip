@@ -1182,7 +1182,7 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
   });
 });
 
-describeEmbeddedPostgres("resolveGitHubTokenForRepo — project-scoped token probing", () => {
+describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref binding", () => {
   let db: Db;
   let companyId: string;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -1219,15 +1219,22 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project-scoped token pro
     await db.delete(companies);
   });
 
-  it("falls back to project-scoped GH_TOKEN_<PROJECT> when no company-scoped token is available", async () => {
+  it("resolves project-scoped GitHub token via env secret_ref binding", async () => {
     const [projectRow] = await db
       .insert(projects)
       .values({
         id: randomUUID(),
         companyId,
-        name: "TSP",
-        urlKey: "tsp",
+        name: "Trading Signal Platform v2",
+        urlKey: "trading-signal-platform-v2",
         status: "in_progress",
+        env: {
+          GITHUB_TOKEN: {
+            type: "secret_ref",
+            secretId: "secret-tsp",
+            version: "latest",
+          },
+        },
       })
       .returning();
 
@@ -1240,31 +1247,32 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project-scoped token pro
       isPrimary: true,
     });
 
-    mockGetByName.mockImplementation((_companyId: string, name: string) => {
-      if (name === "GH_TOKEN_TSP") {
-        return Promise.resolve({ id: "secret-tsp", name: "GH_TOKEN_TSP" });
-      }
-      return Promise.resolve(null);
-    });
     mockResolveSecretValue.mockResolvedValue("ghp_tsp_token_value");
 
     const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
     expect(result.token).toBe("ghp_tsp_token_value");
-    expect(result.source).toBe("GH_TOKEN_TSP");
-    expect(mockGetByName).toHaveBeenCalledWith(companyId, "GH_TOKEN_TSP");
+    expect(result.source).toBe("GITHUB_TOKEN");
+    expect(mockResolveSecretValue).toHaveBeenCalledWith(companyId, "secret-tsp", "latest");
   });
 
-  it("prefers project-scoped token over company-scoped token", async () => {
+  it("prefers project env secret_ref binding over company-scoped token", async () => {
     const [projectRow] = await db
       .insert(projects)
       .values({
         id: randomUUID(),
         companyId,
-        name: "TSP",
-        urlKey: "tsp",
+        name: "Trading Signal Platform v2",
+        urlKey: "trading-signal-platform-v2",
         status: "in_progress",
+        env: {
+          GITHUB_TOKEN: {
+            type: "secret_ref",
+            secretId: "secret-tsp",
+            version: "latest",
+          },
+        },
       })
       .returning();
 
@@ -1281,9 +1289,6 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project-scoped token pro
       if (name === "GITHUB_TOKEN") {
         return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
       }
-      if (name === "GH_TOKEN_TSP") {
-        return Promise.resolve({ id: "secret-tsp", name: "GH_TOKEN_TSP" });
-      }
       return Promise.resolve(null);
     });
     mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
@@ -1295,18 +1300,19 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project-scoped token pro
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
     expect(result.token).toBe("ghp_tsp_token_value");
-    expect(result.source).toBe("GH_TOKEN_TSP");
+    expect(result.source).toBe("GITHUB_TOKEN");
   });
 
-  it("falls back to company-scoped token when no project-scoped token resolves", async () => {
+  it("falls back to company-scoped token when project env has no GitHub token binding", async () => {
     const [projectRow] = await db
       .insert(projects)
       .values({
         id: randomUUID(),
         companyId,
-        name: "TSP",
-        urlKey: "tsp",
+        name: "Trading Signal Platform v2",
+        urlKey: "trading-signal-platform-v2",
         status: "in_progress",
+        env: {},
       })
       .returning();
 
@@ -1334,61 +1340,16 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project-scoped token pro
     expect(result.source).toBe("company-scoped");
   });
 
-  it("matches repo name containing underscore exactly, not as a single-char wildcard", async () => {
+  it("returns failure naming the project when no binding and no company token", async () => {
     const [projectRow] = await db
       .insert(projects)
       .values({
         id: randomUUID(),
         companyId,
-        name: "TSP",
-        urlKey: "tsp",
+        name: "Trading Signal Platform v2",
+        urlKey: "trading-signal-platform-v2",
         status: "in_progress",
-      })
-      .returning();
-
-    await db.insert(projectWorkspaces).values({
-      id: randomUUID(),
-      companyId,
-      projectId: projectRow!.id,
-      name: "paperclip",
-      repoUrl: "https://github.com/TEA-Core/Trading-Signal-Platform",
-      isPrimary: true,
-    });
-
-    await db.insert(projectWorkspaces).values({
-      id: randomUUID(),
-      companyId,
-      projectId: projectRow!.id,
-      name: "paperclip",
-      repoUrl: "https://github.com/TEA-Core/TradingXSignal-Platform",
-      isPrimary: false,
-    });
-
-    mockGetByName.mockImplementation((_companyId: string, name: string) => {
-      if (name === "GH_TOKEN_TSP") {
-        return Promise.resolve({ id: "secret-tsp", name: "GH_TOKEN_TSP" });
-      }
-      return Promise.resolve(null);
-    });
-    mockResolveSecretValue.mockResolvedValue("ghp_tsp_token_value");
-
-    const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
-    const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
-
-    expect(result.token).toBe("ghp_tsp_token_value");
-    expect(result.source).toBe("GH_TOKEN_TSP");
-    expect(mockResolveSecretValue).toHaveBeenCalledTimes(1);
-  });
-
-  it("returns failure when no token is resolvable at company or project scope", async () => {
-    const [projectRow] = await db
-      .insert(projects)
-      .values({
-        id: randomUUID(),
-        companyId,
-        name: "TSP",
-        urlKey: "tsp",
-        status: "in_progress",
+        env: {},
       })
       .returning();
 
@@ -1407,7 +1368,7 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project-scoped token pro
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
     expect(result.token).toBeNull();
-    expect(result.reason).toBe("No GitHub token resolvable for TEA-Core/Trading-Signal-Platform at company or project scope");
+    expect(result.reason).toBe("No GitHub token bound to project for TEA-Core/Trading-Signal-Platform");
   });
 
   it("returns failure when repo is not found at company or project scope", async () => {

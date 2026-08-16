@@ -78,7 +78,7 @@ export async function resolveGitHubTokenForRepo(
       id: projectWorkspaces.id,
       projectId: projectWorkspaces.projectId,
       repoUrl: projectWorkspaces.repoUrl,
-      projectName: projects.name,
+      projectEnv: projects.env,
     })
     .from(projectWorkspaces)
     .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId))
@@ -90,19 +90,21 @@ export async function resolveGitHubTokenForRepo(
     );
 
   for (const row of projectRows) {
-    const projectName = row.projectName;
-    if (!projectName) continue;
-    const candidateNames = [
-      `GH_TOKEN_${projectName}`,
-      `GITHUB_TOKEN_${projectName}`,
-      `PAPERCLIP_GITHUB_TOKEN_${projectName}`,
-    ];
-    for (const secretName of candidateNames) {
-      const secret = await secrets.getByName(companyId, secretName);
-      if (!secret) continue;
-      const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
+    const projectEnv = row.projectEnv as Record<string, unknown> | null;
+    if (!projectEnv) continue;
+    for (const key of GITHUB_TOKEN_SECRET_NAMES) {
+      const binding = projectEnv[key];
+      if (!binding || typeof binding !== "object") continue;
+      const ref = binding as { type?: unknown; secretId?: unknown; version?: unknown };
+      if (ref.type !== "secret_ref") continue;
+      if (typeof ref.secretId !== "string") continue;
+      const token = await secrets.resolveSecretValue(
+        companyId,
+        ref.secretId,
+        ref.version ?? "latest",
+      );
       const trimmed = token.trim();
-      if (trimmed) return { token: trimmed, source: secretName };
+      if (trimmed) return { token: trimmed, source: key };
     }
   }
 
@@ -110,7 +112,7 @@ export async function resolveGitHubTokenForRepo(
   if (companyToken) return { token: companyToken, source: "company-scoped" };
 
   if (projectRows.length > 0) {
-    return { token: null, reason: `No GitHub token resolvable for ${owner}/${repo} at company or project scope` };
+    return { token: null, reason: `No GitHub token bound to project for ${owner}/${repo}` };
   }
   return { token: null, reason: `No GitHub token resolvable for ${owner}/${repo} (repo not found at company or project scope)` };
 }
