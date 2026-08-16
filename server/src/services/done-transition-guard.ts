@@ -2,12 +2,10 @@ import type { Db } from "@paperclipai/db";
 import { and, eq, inArray } from "drizzle-orm";
 import { executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
-import { secretService } from "./secrets.js";
+import { resolveGitHubToken } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
-
-const GITHUB_TOKEN_SECRET_NAMES = ["GITHUB_TOKEN", "GH_TOKEN", "PAPERCLIP_GITHUB_TOKEN"] as const;
 
 const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "upstream-equivalent-fix-no-deliverable-head",
@@ -60,18 +58,6 @@ function parseRepoUrl(repoUrl: string | null): { hostname: string; owner: string
   const repo = parts[1]!.replace(/\.git$/i, "");
   if (!owner || !repo) return null;
   return { hostname: url.hostname, owner, repo };
-}
-
-async function resolveGitHubToken(db: Db, companyId: string): Promise<string | null> {
-  const secrets = secretService(db);
-  for (const secretName of GITHUB_TOKEN_SECRET_NAMES) {
-    const secret = await secrets.getByName(companyId, secretName);
-    if (!secret) continue;
-    const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
-    const trimmed = token.trim();
-    if (trimmed) return trimmed;
-  }
-  return null;
 }
 
 async function resolveIssueRepoContext(
@@ -474,7 +460,8 @@ export async function evaluateDoneTransitionGuard(
 
   let token: string | null;
   try {
-    token = await resolveGitHubToken(db, issue.companyId);
+    const tokenResult = await resolveGitHubToken(db, issue.companyId);
+    token = tokenResult.token;
   } catch (err) {
     return fallback(
       "GitHub token resolution failed; transition allowed",

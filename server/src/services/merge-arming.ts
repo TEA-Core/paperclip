@@ -1,9 +1,20 @@
 import type { Db } from "@paperclipai/db";
 import { and, eq, ilike } from "drizzle-orm";
-import { externalObjectMentions, externalObjects, issues, projectWorkspaces, projects } from "@paperclipai/db";
-import type { SecretVersionSelector } from "@paperclipai/shared";
-import { secretService } from "./secrets.js";
+import { externalObjectMentions, externalObjects, issues } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import {
+  isGitHubTokenResolution,
+  resolveGitHubTokenForRepo,
+} from "./github-credential.js";
+
+export {
+  isGitHubTokenResolution,
+  resolveGitHubTokenForRepo,
+  type GitHubTokenResolution,
+  type GitHubTokenResolutionFailure,
+  type GitHubTokenResult,
+  type GitHubTokenScope,
+} from "./github-credential.js";
 
 export interface MergeArmingDecision {
   stageId: string;
@@ -34,86 +45,6 @@ export interface LinkedPullRequest {
 }
 
 const GITHUB_GRAPHQL_URL = "https://api.github.com/graphql";
-const GITHUB_TOKEN_SECRET_NAMES = ["GITHUB_TOKEN", "GH_TOKEN", "PAPERCLIP_GITHUB_TOKEN"] as const;
-
-export interface GitHubTokenResolution {
-  token: string;
-  source: string;
-}
-
-export interface GitHubTokenResolutionFailure {
-  token: null;
-  reason: string;
-}
-
-export type GitHubTokenResult = GitHubTokenResolution | GitHubTokenResolutionFailure;
-
-function isGitHubTokenResolution(r: GitHubTokenResult): r is GitHubTokenResolution {
-  return r.token !== null;
-}
-
-async function resolveGitHubToken(db: Db, companyId: string): Promise<string | null> {
-  const secrets = secretService(db);
-  for (const secretName of GITHUB_TOKEN_SECRET_NAMES) {
-    const secret = await secrets.getByName(companyId, secretName);
-    if (!secret) continue;
-    const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
-    const trimmed = token.trim();
-    if (trimmed) return trimmed;
-  }
-  return null;
-}
-
-export async function resolveGitHubTokenForRepo(
-  db: Db,
-  companyId: string,
-  owner: string,
-  repo: string,
-): Promise<GitHubTokenResult> {
-  const secrets = secretService(db);
-  const repoUrl = `${owner}/${repo}`;
-  const escapedRepoUrl = repoUrl.replace(/[\\%_]/g, (c) => `\\${c}`);
-
-  const projectRows = await db
-    .select({
-      id: projectWorkspaces.id,
-      projectId: projectWorkspaces.projectId,
-      repoUrl: projectWorkspaces.repoUrl,
-      projectEnv: projects.env,
-    })
-    .from(projectWorkspaces)
-    .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId))
-    .where(
-      and(
-        eq(projectWorkspaces.companyId, companyId),
-        ilike(projectWorkspaces.repoUrl, `%${escapedRepoUrl}%`),
-      ),
-    );
-
-  for (const row of projectRows) {
-    const projectEnv = row.projectEnv as Record<string, unknown> | null;
-    if (!projectEnv) continue;
-    for (const key of GITHUB_TOKEN_SECRET_NAMES) {
-      const binding = projectEnv[key];
-      if (!binding || typeof binding !== "object") continue;
-      const ref = binding as { type?: unknown; secretId?: unknown; version?: unknown };
-      if (ref.type !== "secret_ref") continue;
-      if (typeof ref.secretId !== "string") continue;
-      const version: SecretVersionSelector = typeof ref.version === "number" ? ref.version : "latest";
-      const token = await secrets.resolveSecretValue(companyId, ref.secretId, version);
-      const trimmed = token.trim();
-      if (trimmed) return { token: trimmed, source: key };
-    }
-  }
-
-  const companyToken = await resolveGitHubToken(db, companyId);
-  if (companyToken) return { token: companyToken, source: "company-scoped" };
-
-  if (projectRows.length > 0) {
-    return { token: null, reason: `No GitHub token bound to project for ${owner}/${repo}` };
-  }
-  return { token: null, reason: `No GitHub token resolvable for ${owner}/${repo} (repo not found at company or project scope)` };
-}
 
 export async function resolveLinkedPullRequests(
   db: Db,
@@ -279,7 +210,10 @@ export async function publishApprovalStatus(
   const pr = linkedPRs[0]!;
   const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
   if (!isGitHubTokenResolution(tokenResult)) {
-    return { kind: "failed", message: `status:failed:auth_required: ${tokenResult.reason}` };
+    return {
+      kind: "failed",
+      message: `status:failed:auth_required: ${tokenResult.reason} (scope=null, secretName=null)`,
+    };
   }
   const token = tokenResult.token;
 
@@ -287,7 +221,10 @@ export async function publishApprovalStatus(
   if (!headShaResult.ok) {
     const { status, message } = headShaResult;
     if (status === 401 || status === 403) {
-      return { kind: "failed", message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""}` };
+      return {
+        kind: "failed",
+        message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""} (scope=${tokenResult.scope}, secretName=${tokenResult.secretName})`,
+      };
     }
     if (status === 404) {
       return { kind: "failed", message: `status:failed:pr_not_found: HTTP 404 ${message ?? ""}` };
@@ -486,7 +423,10 @@ export async function armMergeOnApproval(
 
   const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
   if (!isGitHubTokenResolution(tokenResult)) {
-    return { kind: "failed", message: `failed:auth_required: ${tokenResult.reason}` };
+    return {
+      kind: "failed",
+      message: `failed:auth_required: ${tokenResult.reason} (scope=null, secretName=null)`,
+    };
   }
   const token = tokenResult.token;
 

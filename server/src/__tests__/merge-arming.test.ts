@@ -482,7 +482,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
       expect(result.kind).toBe("failed");
       expect(result.message).toBe(
-        "failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope)",
+        "failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope) (scope=null, secretName=null)",
       );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
@@ -499,7 +499,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
       expect(result.kind).toBe("failed");
       expect(result.message).toBe(
-        "failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope)",
+        "failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope) (scope=null, secretName=null)",
       );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
@@ -922,7 +922,7 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
       expect(result.message).toBe(
-        "status:failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope)",
+        "status:failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope) (scope=null, secretName=null)",
       );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
@@ -937,7 +937,7 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
       expect(result.message).toBe(
-        "status:failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope)",
+        "status:failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope) (scope=null, secretName=null)",
       );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
@@ -1043,7 +1043,7 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
 
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
-      expect(result.message).toBe("status:failed:pr_auth: HTTP 401 Bad credentials");
+      expect(result.message).toBe("status:failed:pr_auth: HTTP 401 Bad credentials (scope=company, secretName=GITHUB_TOKEN)");
       expect(mockGhFetch).toHaveBeenCalledTimes(1);
     });
 
@@ -1058,7 +1058,7 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
 
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("failed");
-      expect(result.message).toBe("status:failed:pr_auth: HTTP 403 Forbidden");
+      expect(result.message).toBe("status:failed:pr_auth: HTTP 403 Forbidden (scope=company, secretName=GITHUB_TOKEN)");
       expect(mockGhFetch).toHaveBeenCalledTimes(1);
     });
 
@@ -1253,7 +1253,8 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
     expect(result.token).toBe("ghp_tsp_token_value");
-    expect(result.source).toBe("GITHUB_TOKEN");
+    expect(result.scope).toBe("project_env");
+    expect(result.secretName).toBe("GITHUB_TOKEN");
     expect(mockResolveSecretValue).toHaveBeenCalledWith(companyId, "secret-tsp", "latest");
   });
 
@@ -1300,7 +1301,8 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
     expect(result.token).toBe("ghp_tsp_token_value");
-    expect(result.source).toBe("GITHUB_TOKEN");
+    expect(result.scope).toBe("project_env");
+    expect(result.secretName).toBe("GITHUB_TOKEN");
   });
 
   it("falls back to company-scoped token when project env has no GitHub token binding", async () => {
@@ -1337,7 +1339,8 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
     expect(result.token).toBe("ghp_company_token");
-    expect(result.source).toBe("company-scoped");
+    expect(result.scope).toBe("company");
+    expect(result.secretName).toBe("GITHUB_TOKEN");
   });
 
   it("returns failure naming the project when no binding and no company token", async () => {
