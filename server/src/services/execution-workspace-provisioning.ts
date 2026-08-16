@@ -13,6 +13,7 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 import { logger } from "../middleware/logger.js";
+import { unprocessable } from "../errors.js";
 import {
   assertGitWorktreeBaseWorkspaceReady,
   assertProjectPrimaryBaseWorkspaceReady,
@@ -45,8 +46,12 @@ import {
   executionWorkspaceService,
 } from "./execution-workspaces.js";
 import {
+  hasExplicitIssueExecutionWorkspaceOverride,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   resolveEffectiveWorkspaceStrategyType,
+  WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE,
+  WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_MESSAGE,
+  WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION,
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { issueService } from "./issues.js";
@@ -220,6 +225,20 @@ export async function provisionIssueExecutionWorkspace(
   const agent = input.agent;
   const issueId = input.issueId;
   const issueRef = input.issueRef;
+
+  if (
+    input.projectExecutionWorkspacePolicy?.allowIssueOverride === false &&
+    hasExplicitIssueExecutionWorkspaceOverride({
+      executionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
+      executionWorkspaceId: issueRef?.executionWorkspaceId ?? null,
+    })
+  ) {
+    throw unprocessable(WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_MESSAGE, {
+      code: WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE,
+      remediation: WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION,
+      field: "executionWorkspacePolicy.allowIssueOverride",
+    });
+  }
 
   const issuesSvc = issueService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);

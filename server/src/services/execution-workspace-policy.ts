@@ -22,6 +22,12 @@ export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION =
 export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE =
   `executionWorkspacePreference: "reuse_existing" requires executionWorkspaceId, and none was supplied or inherited. ${WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION}`;
 
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE = "workspace_issue_override_disallowed";
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION =
+  "Remove the issue's executionWorkspacePreference/executionWorkspaceId override, or set the project's executionWorkspacePolicy.allowIssueOverride to true.";
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_MESSAGE =
+  `This issue supplies an execution-workspace override, but the project's executionWorkspacePolicy.allowIssueOverride is false. ${WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION}`;
+
 type WorkspaceStrategyType = ExecutionWorkspaceStrategy["type"];
 
 export type UnrunnableWorktreeIssueRef = {
@@ -89,6 +95,15 @@ export function resolvePinnedIssueWorkspaceStrategyType(input: {
 
 export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIssueRef): boolean {
   return Boolean(issue.executionWorkspaceId && issue.executionWorkspacePreference === "reuse_existing");
+}
+
+export function hasExplicitIssueExecutionWorkspaceOverride(input: {
+  executionWorkspacePreference: string | null | undefined;
+  executionWorkspaceId: string | null | undefined;
+}): boolean {
+  if (input.executionWorkspaceId) return true;
+  const preference = input.executionWorkspacePreference;
+  return Boolean(preference && preference !== "inherit");
 }
 
 export function isUnrunnableWorktreeCombo(input: {

@@ -22,7 +22,7 @@ import {
 } from "../__tests__/helpers/embedded-postgres.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { provisionIssueExecutionWorkspace } from "./execution-workspace-provisioning.js";
-import type { Environment } from "@paperclipai/shared";
+import type { Environment, ProjectExecutionWorkspacePolicy } from "@paperclipai/shared";
 import type { TrustPresetResolution } from "./trust-preset-resolver.js";
 import type {
   ExecutionWorkspaceProvisioningIssueRef,
@@ -718,5 +718,91 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
 
     expect(result.kind).toBe("deferred");
     expect(lifecycleCalled).toBe(true);
+  });
+});
+
+describe("allowIssueOverride enforcement", () => {
+  const overrideIssueRef: ExecutionWorkspaceProvisioningIssueRef = {
+    id: "issue-override",
+    identifier: "TEST-1",
+    title: "Override",
+    status: "in_progress",
+    priority: "medium",
+    workMode: "standard",
+    description: null,
+    projectId: "project-1",
+    projectWorkspaceId: null,
+    executionWorkspaceId: "workspace-1",
+    executionWorkspacePreference: "reuse_existing",
+  };
+
+  function buildInput(projectPolicy: ProjectExecutionWorkspacePolicy | null) {
+    return {
+      db: {},
+      run: {},
+      agent: {},
+      issueId: "issue-override",
+      issueRef: overrideIssueRef,
+      runId: "run-1",
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+      trustPreset: standardTrustResolution(),
+      isolatedWorkspacesEnabled: true,
+      selectedEnvironmentId: null,
+      selectedEnvironmentForConfig: null,
+      localEnvironment: {} as Environment,
+      environmentSelectionSource: "local",
+      configSnapshot: null,
+      secretManifest: [],
+      projectExecutionWorkspacePolicy: projectPolicy,
+      issueExecutionWorkspaceSettings: null,
+      executionProjectId: "project-1",
+      resolvedInstanceSettings: {
+        experimental: {
+          enableWorkspaceBranchReconcileForward: false,
+          enableWorkspaceDirtyQuarantineRepair: false,
+        },
+      },
+      mergedConfig: {},
+      executionPolicy: { executionMode: "standard" },
+      context: {},
+      resolveWorkspace: async () => buildResolvedWorkspace(),
+      resolveSessionConfig: async () => ({
+        previousSessionParams: null,
+        resetTaskSession: true,
+        sessionResetReason: null,
+        sessionConfigFreshness: {
+          reset: true,
+          reasons: ["initial"],
+          changedCategories: [],
+          nextFingerprint: null,
+          storedFingerprint: null,
+        },
+        sessionConfigMetadata: buildTestSessionConfigMetadata(),
+      }),
+      runLifecycle: {
+        onExecutionWorkspaceOccupied: async () => {
+          throw new Error("should not be called");
+        },
+      },
+    } as unknown as Parameters<typeof provisionIssueExecutionWorkspace>[0];
+  }
+
+  it("rejects an issue-level workspace override when allowIssueOverride is false", async () => {
+    await expect(
+      provisionIssueExecutionWorkspace(
+        buildInput({ enabled: true, defaultMode: "shared_workspace", allowIssueOverride: false }),
+      ),
+    ).rejects.toThrow(/allowIssueOverride/);
+  });
+
+  it("honours the issue-level override when allowIssueOverride is true or omitted", async () => {
+    for (const policy of [
+      { enabled: true, defaultMode: "shared_workspace", allowIssueOverride: true },
+      { enabled: true, defaultMode: "shared_workspace" },
+    ] as ProjectExecutionWorkspacePolicy[]) {
+      await expect(
+        provisionIssueExecutionWorkspace(buildInput(policy)),
+      ).rejects.not.toThrow(/allowIssueOverride/);
+    }
   });
 });
