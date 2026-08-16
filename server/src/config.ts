@@ -78,6 +78,7 @@ export interface Config {
   secretsProvider: SecretProvider;
   secretsStrictMode: boolean;
   secretsMasterKeyFilePath: string;
+  secretsDirWatchIntervalMs: number;
   storageProvider: StorageProvider;
   storageLocalDiskBaseDir: string;
   storageS3Bucket: string;
@@ -354,6 +355,10 @@ export function loadConfig(): Config {
           fileSecrets?.localEncrypted.keyFilePath ??
           resolveDefaultSecretsKeyFilePath(),
       ),
+    secretsDirWatchIntervalMs: Math.max(
+      30_000,
+      Number(process.env.PAPERCLIP_SECRETS_DIR_WATCH_INTERVAL_MS) || 5 * 60 * 1000,
+    ),
     storageProvider,
     storageLocalDiskBaseDir,
     storageS3Bucket,
