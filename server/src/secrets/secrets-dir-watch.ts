@@ -274,6 +274,14 @@ export async function runSecretsDirectoryWatch(db: Db): Promise<SecretDirScanRes
   return result;
 }
 
+/** Floor for the periodic scan so a missing/bogus interval cannot spin the scan hot. */
+export const MIN_SECRETS_DIR_WATCH_INTERVAL_MS = 30_000;
+
+function resolveDelayMs(candidate: number | undefined, fallbackMs: number): number {
+  if (candidate == null || !Number.isFinite(candidate)) return fallbackMs;
+  return Math.max(MIN_SECRETS_DIR_WATCH_INTERVAL_MS, candidate);
+}
+
 /**
  * Start a periodic secrets-directory watch. Returns a stop function. The first
  * tick fires after `initialDelayMs` (default: one interval) so boot already
@@ -285,6 +293,8 @@ export function startSecretsDirectoryWatch(
 ): () => void {
   let inFlight = false;
   let stopped = false;
+  const intervalMs = resolveDelayMs(opts.intervalMs, MIN_SECRETS_DIR_WATCH_INTERVAL_MS);
+  const initialDelayMs = resolveDelayMs(opts.initialDelayMs, intervalMs);
 
   const tick = () => {
     if (stopped) return;
@@ -299,9 +309,9 @@ export function startSecretsDirectoryWatch(
       });
   };
 
-  const initialTimer = setTimeout(tick, opts.initialDelayMs ?? opts.intervalMs);
+  const initialTimer = setTimeout(tick, initialDelayMs);
   initialTimer.unref?.();
-  const timer = setInterval(tick, opts.intervalMs);
+  const timer = setInterval(tick, intervalMs);
   timer.unref?.();
 
   return () => {
