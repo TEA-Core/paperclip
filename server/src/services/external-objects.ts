@@ -978,6 +978,14 @@ export function externalObjectService(
     input: RefreshObjectInput,
   ) {
     const now = input.now ?? new Date();
+    const refreshKey = `${input.companyId}:${objectId}`;
+    // Join an in-flight refresh before reading the row. The read is an awaited
+    // round trip, so checking only afterwards leaves a window in which the
+    // in-flight refresh completes and drops its entry, and this caller then
+    // starts a second resolve for work that was already done.
+    const runningRefresh = objectRefreshesInFlight.get(refreshKey);
+    if (runningRefresh) return runningRefresh;
+
     const object = await db
       .select()
       .from(externalObjects)
@@ -988,7 +996,6 @@ export function externalObjectService(
       return { object: toObjectPayload(object, now), refreshed: false, reason: "backoff" as const };
     }
 
-    const refreshKey = `${object.companyId}:${object.id}`;
     const existingRefresh = objectRefreshesInFlight.get(refreshKey);
     if (existingRefresh) return existingRefresh;
 
