@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -9,6 +9,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -49,6 +50,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
     await db.delete(issueComments);
     await db.delete(issueRecoveryActions);
     await db.delete(issues);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -528,6 +530,67 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
     expect(comments.some((c) => (c.body ?? "").includes("exhausted its attempt ceiling"))).toBe(true);
     expect(comments.some((c) => (c.body ?? "").includes("escalated to the board"))).toBe(true);
     expect(comments.some((c) => (c.body ?? "").includes("source issue has been blocked"))).toBe(false);
+  });
+
+  it("keeps board_escalation dead when every candidate lacks the required workspace strategy", async () => {
+    const { companyId, ctoId, coderId } = await seedCompany();
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree" },
+      },
+    });
+    const sourceIssueId = await seedSourceIssue(companyId, coderId);
+    await db
+      .update(issues)
+      .set({
+        projectId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree" },
+        },
+      })
+      .where(eq(issues.id, sourceIssueId));
+    await db
+      .update(agents)
+      .set({ adapterConfig: {} })
+      .where(inArray(agents.id, [ctoId, coderId]));
+
+    const actionId = await seedRecoveryAction({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      wakePolicy: { type: "board_escalation" },
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
+
+    expect(result.rerouted).toBe(0);
+    expect(result.reFired).toBe(0);
+    expect(result.nonWakeableSkipped).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const updated = await db
+      .select({
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+        wakePolicy: issueRecoveryActions.wakePolicy,
+        attemptCount: issueRecoveryActions.attemptCount,
+      })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId))
+      .then((rows) => rows[0]);
+    expect(updated?.ownerAgentId).toBeNull();
+    expect(updated?.wakePolicy).toMatchObject({ type: "board_escalation" });
+    expect(updated?.attemptCount).toBe(1);
   });
 
 });

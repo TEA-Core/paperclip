@@ -153,24 +153,31 @@ export function canAgentSatisfyIssueWorkspaceSettings(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   reusableExecutionWorkspaceAvailable?: boolean | null;
   hasResolvablePriorSessionWorkspace?: boolean | null;
+  agentConfig?: Record<string, unknown> | null;
 }): boolean {
   const settings = parseIssueExecutionWorkspaceSettings(input.executionWorkspaceSettings);
   const mode = settings?.mode;
   if (mode !== "isolated_workspace" && mode !== "operator_branch") return true;
 
   const resolvedMode = mode as ParsedExecutionWorkspaceMode;
-  const workspaceConfig = buildExecutionWorkspaceAdapterConfig({
+  const issueWorkspaceConfig = buildExecutionWorkspaceAdapterConfig({
     agentConfig: {},
     projectPolicy: input.projectPolicy,
     issueSettings: settings,
     mode: resolvedMode,
     legacyUseProjectWorkspace: null,
   });
-  const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, workspaceConfig);
+  const issueStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, issueWorkspaceConfig);
+
+  if (input.agentConfig != null) {
+    const candidateStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, input.agentConfig);
+    if (candidateStrategy !== issueStrategy) return false;
+  }
+
   return !isUnrunnableWorktreeCombo({
     issue: input.issue,
     resolvedMode,
-    resolvedStrategy,
+    resolvedStrategy: issueStrategy,
     reusableExecutionWorkspaceAvailable: input.reusableExecutionWorkspaceAvailable,
     hasResolvablePriorSessionWorkspace: input.hasResolvablePriorSessionWorkspace,
   });

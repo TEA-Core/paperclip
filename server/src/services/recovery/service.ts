@@ -2986,6 +2986,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
         executionWorkspaceSettings: issue.executionWorkspaceSettings,
         projectPolicy: parsedProjectPolicy,
+        agentConfig: candidate.adapterConfig,
       })) continue;
       if ((await isAgentInvokable(candidate)) && !budgetBlock) return candidate.id;
     }

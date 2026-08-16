@@ -163,4 +163,63 @@ describe("recovery stranded-owner workspace capability filter", () => {
       }),
     ).toBe(true);
   });
+
+  it("rejects agent_home/project_primary candidate when issue requires git_worktree (SUP-12986 live case)", () => {
+    const issue = {
+      projectId: "project-1",
+      projectWorkspaceId: "ws-1",
+      executionWorkspaceId: "exec-1",
+      executionWorkspacePreference: "reuse_existing" as const,
+    };
+    const executionWorkspaceSettings = {
+      mode: "isolated_workspace" as const,
+      workspaceStrategy: { type: "git_worktree" as const },
+    };
+    const projectPolicy = {
+      enabled: true,
+      defaultMode: "isolated_workspace" as const,
+      workspaceStrategy: { type: "git_worktree" as const },
+      allowIssueOverride: true,
+    };
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue,
+        executionWorkspaceSettings,
+        projectPolicy,
+        agentConfig: {},
+      }),
+    ).toBe(false);
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue,
+        executionWorkspaceSettings,
+        projectPolicy,
+        agentConfig: { workspaceStrategy: { type: "project_primary" } },
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps a project-bound git_worktree candidate for an isolated git_worktree issue", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: "project-1",
+          projectWorkspaceId: "ws-1",
+          executionWorkspaceId: "exec-1",
+          executionWorkspacePreference: "reuse_existing",
+        },
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree" },
+        },
+        projectPolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree" },
+          allowIssueOverride: true,
+        },
+        agentConfig: { workspaceStrategy: { type: "git_worktree" } },
+      }),
+    ).toBe(true);
+  });
 });
