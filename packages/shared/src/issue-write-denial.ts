@@ -273,8 +273,8 @@ export function describeIssueWriteDenial(
         code,
         status: 403,
         tone: "boundary",
-         boundary: "Heartbeat run context",
-         title: "Cross-issue writes need a live run to attribute them to",
+        boundary: "Heartbeat run context",
+        title: "Cross-issue writes need a live run to attribute them to",
         description:
           `Every agent comment and task update is attributed to a heartbeat run so the ` +
           `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
@@ -285,7 +285,6 @@ export function describeIssueWriteDenial(
           `Verify the \`X-Paperclip-Run-Id\` header carries the exact run id of your ` +
           `current live run (a UUID matching a heartbeat run for your company and agent), ` +
           `then retry.`,
-
       };
 
     case "issue_write_attribution_spoof_rejected":

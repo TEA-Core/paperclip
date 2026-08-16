@@ -80,7 +80,7 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.description).not.toContain("attempt");
   });
 
-   it("gives the run-context denial a copy-pasteable fix", () => {
+  it("gives the run-context denial a copy-pasteable fix", () => {
     const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required");
     expect(copy.sanctionedPath).toContain("X-Paperclip-Run-Id");
     expect(copy.sanctionedPath).toContain("live run");
