@@ -2531,7 +2531,8 @@ async function resolveAuthoritativeBaseRef(
     return { baseRef: detected, warnings, refreshed: false };
   }
 
-  if (parseRemoteTrackingRef(configured)) {
+  const remoteTracking = parseRemoteTrackingRef(configured);
+  if (remoteTracking && (await remoteExists(repoRoot, remoteTracking.remote))) {
     return { baseRef: configured, warnings, refreshed: false };
   }
 
@@ -3903,7 +3904,7 @@ export async function realizeExecutionWorkspace(input: {
       strategy: "git_worktree" as const,
       cwd: reusablePath,
       branchName: effectiveBranchName,
-       worktreePath: reusablePath,
+      worktreePath: reusablePath,
       warnings: [...extraWarnings, ...baseRepoHygiene.warnings, ...baseDrift.warnings],
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,

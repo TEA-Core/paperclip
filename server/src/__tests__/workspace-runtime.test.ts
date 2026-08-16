@@ -36,10 +36,10 @@ import {
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
   listConfiguredRuntimeServiceEntries,
-   normalizeAdapterManagedRuntimeServices,
-   preserveUnpushedWorktreeCommits,
-   prepareBaseRepoForWorkspace,
-   reconcilePersistedRuntimeServicesOnStartup,
+  normalizeAdapterManagedRuntimeServices,
+  preserveUnpushedWorktreeCommits,
+  prepareBaseRepoForWorkspace,
+  reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
   refreshRemoteTrackingBaseRef,
   releaseRuntimeServicesForRun,
@@ -300,6 +300,27 @@ async function advanceRemoteMaster(sourceRepo: string, remotePath: string, fileN
   await runGit(sourceRepo, ["commit", "-m", `Add ${fileName}`]);
   await runGit(sourceRepo, ["push", remotePath, "master"]);
   return readGit(sourceRepo, ["rev-parse", "master"]);
+}
+
+async function advanceRemoteBranch(
+  sourceRepo: string,
+  remotePath: string,
+  branch: string,
+  fileName: string,
+) {
+  const branchExists = await runGit(sourceRepo, ["rev-parse", `--verify`, branch])
+    .then(() => true)
+    .catch(() => false);
+  if (!branchExists) {
+    await runGit(sourceRepo, ["checkout", "-b", branch]);
+  } else {
+    await runGit(sourceRepo, ["checkout", branch]);
+  }
+  await fs.writeFile(path.join(sourceRepo, fileName), `${fileName}\n`, "utf8");
+  await runGit(sourceRepo, ["add", fileName]);
+  await runGit(sourceRepo, ["commit", "-m", `Add ${fileName}`]);
+  await runGit(sourceRepo, ["push", remotePath, branch]);
+  return readGit(sourceRepo, ["rev-parse", branch]);
 }
 
 function realizeWorktreeForTest(repoRoot: string, repoRef: string | null) {
@@ -9008,8 +9029,14 @@ describe("ensurePersistedExecutionWorkspaceAvailable base repo hygiene", () => {
     expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(aheadHead);
   }, 15_000);
 
-  it("passes a bare fold/... base ref through to prepareBaseRepoForWorkspace on the reuse path", async () => {
+  it("resolves a bare fold/... base ref to origin/fold/... and fast-forwards on the reuse path", async () => {
     const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const slashBranch = "fold/tea-patches-v2026.722.0";
+    await runGit(sourceRepo, ["checkout", "-b", slashBranch]);
+    await runGit(sourceRepo, ["push", "-u", remotePath, slashBranch]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+    await runGit(repoRoot, ["checkout", slashBranch]);
+
     const branchName = "PAP-463-reuse-bare-ref";
     const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
     await fs.mkdir(path.dirname(worktreePath), { recursive: true });
@@ -9017,7 +9044,7 @@ describe("ensurePersistedExecutionWorkspaceAvailable base repo hygiene", () => {
     await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
 
     const initialHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
-    const advancedHead = await advanceRemoteMaster(sourceRepo, remotePath, "bare-ref-fix.txt");
+    const advancedHead = await advanceRemoteBranch(sourceRepo, remotePath, slashBranch, "bare-ref-fix.txt");
     expect(advancedHead).not.toBe(initialHead);
 
     const reused = await ensurePersistedExecutionWorkspaceAvailable({
@@ -9027,7 +9054,7 @@ describe("ensurePersistedExecutionWorkspaceAvailable base repo hygiene", () => {
         projectId: "project-1",
         workspaceId: "workspace-1",
         repoUrl: null,
-        repoRef: "fold/tea-patches-v2026.722.0",
+        repoRef: slashBranch,
       },
       workspace: {
         id: "execution-workspace-4",
@@ -9038,7 +9065,7 @@ describe("ensurePersistedExecutionWorkspaceAvailable base repo hygiene", () => {
         projectId: "project-1",
         projectWorkspaceId: "workspace-1",
         repoUrl: null,
-        baseRef: "fold/tea-patches-v2026.722.0",
+        baseRef: slashBranch,
         branchName,
         metadata: { baseRefSnapshot: { resolvedSha: initialHead } },
       },
@@ -9055,10 +9082,10 @@ describe("ensurePersistedExecutionWorkspaceAvailable base repo hygiene", () => {
     });
 
     expect(reused).not.toBeNull();
-    expect(reused!.repoRef).toBe("fold/tea-patches-v2026.722.0");
     expect(reused!.warnings).toEqual(
-      expect.arrayContaining([expect.stringContaining("Could not resolve base ref")]),
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
     );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
   }, 15_000);
 
   it("prepares the base repo before git worktree add on the restore-missing path", async () => {
@@ -9116,18 +9143,28 @@ describe("ensurePersistedExecutionWorkspaceAvailable base repo hygiene", () => {
 });
 
 describe("prepareBaseRepoForWorkspace", () => {
-  it("passes a bare fold/... ref through to the base ref without resolution", async () => {
-    const { repoRoot } = await createClonedRepoWithRemote();
+  it("resolves a bare fold/... base ref to origin/fold/... and fast-forwards", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const slashBranch = "fold/tea-patches-v2026.722.0";
+    await runGit(sourceRepo, ["checkout", "-b", slashBranch]);
+    await runGit(sourceRepo, ["push", "-u", remotePath, slashBranch]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+    await runGit(repoRoot, ["checkout", slashBranch]);
+
+    const initialHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const advancedHead = await advanceRemoteBranch(sourceRepo, remotePath, slashBranch, "bare-ref-fix.txt");
+    expect(advancedHead).not.toBe(initialHead);
 
     const result = await prepareBaseRepoForWorkspace({
       repoRoot,
-      configuredBaseRef: "fold/tea-patches-v2026.722.0",
+      configuredBaseRef: slashBranch,
     });
 
-    expect(result.baseRef).toBe("fold/tea-patches-v2026.722.0");
+    expect(result.baseRef).toBe("origin/fold/tea-patches-v2026.722.0");
     expect(result.warnings).toEqual(
-      expect.arrayContaining([expect.stringContaining("could not restore base repo")]),
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
     );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
   }, 15_000);
 
   it("returns ok warnings (no action) when the base repo is clean and on the default ref", async () => {
