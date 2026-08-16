@@ -160,24 +160,25 @@ export function canAgentSatisfyIssueWorkspaceSettings(input: {
   if (mode !== "isolated_workspace" && mode !== "operator_branch") return true;
 
   const resolvedMode = mode as ParsedExecutionWorkspaceMode;
-  const issueWorkspaceConfig = buildExecutionWorkspaceAdapterConfig({
-    agentConfig: {},
+  // Resolve the candidate's effective strategy exactly the way dispatch does: the agent's
+  // adapterConfig is the LOWEST-precedence input, below the issue settings and the project
+  // policy. Comparing the candidate's raw adapterConfig against the issue strategy instead
+  // would reject every agent whose config does not restate the strategy — including the
+  // common `adapterConfig: {}` agent, which dispatch resolves to the issue/project strategy
+  // and runs without complaint.
+  const candidateWorkspaceConfig = buildExecutionWorkspaceAdapterConfig({
+    agentConfig: input.agentConfig ?? {},
     projectPolicy: input.projectPolicy,
     issueSettings: settings,
     mode: resolvedMode,
     legacyUseProjectWorkspace: null,
   });
-  const issueStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, issueWorkspaceConfig);
-
-  if (input.agentConfig != null) {
-    const candidateStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, input.agentConfig);
-    if (candidateStrategy !== issueStrategy) return false;
-  }
+  const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, candidateWorkspaceConfig);
 
   return !isUnrunnableWorktreeCombo({
     issue: input.issue,
     resolvedMode,
-    resolvedStrategy: issueStrategy,
+    resolvedStrategy,
     reusableExecutionWorkspaceAvailable: input.reusableExecutionWorkspaceAvailable,
     hasResolvablePriorSessionWorkspace: input.hasResolvablePriorSessionWorkspace,
   });

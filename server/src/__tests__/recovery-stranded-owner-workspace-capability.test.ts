@@ -164,7 +164,12 @@ describe("recovery stranded-owner workspace capability filter", () => {
     ).toBe(true);
   });
 
-  it("rejects agent_home/project_primary candidate when issue requires git_worktree (SUP-12986 live case)", () => {
+  it("keeps a candidate whose adapterConfig does not restate the issue git_worktree strategy", () => {
+    // Dispatch resolves the workspace strategy with buildExecutionWorkspaceAdapterConfig, which
+    // puts the agent adapterConfig BELOW the issue settings and the project policy. An empty or
+    // project_primary adapterConfig therefore still resolves to the issue's git_worktree strategy
+    // and runs, so it must not disqualify the candidate — rejecting on a raw-config mismatch
+    // would strand every project-bound worktree issue at board escalation.
     const issue = {
       projectId: "project-1",
       projectWorkspaceId: "ws-1",
@@ -188,7 +193,7 @@ describe("recovery stranded-owner workspace capability filter", () => {
         projectPolicy,
         agentConfig: {},
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       canAgentSatisfyIssueWorkspaceSettings({
         issue,
@@ -196,7 +201,36 @@ describe("recovery stranded-owner workspace capability filter", () => {
         projectPolicy,
         agentConfig: { workspaceStrategy: { type: "project_primary" } },
       }),
+    ).toBe(true);
+  });
+
+  it("lets the agent adapterConfig decide the strategy only when neither issue nor project pins one", () => {
+    const issue = {
+      projectId: null,
+      projectWorkspaceId: null,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+    };
+    // Nothing pins a strategy, so isolated_workspace defaults to git_worktree with no project
+    // and no reusable workspace to base it on: the same combination dispatch refuses.
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue,
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: null,
+        agentConfig: {},
+      }),
     ).toBe(false);
+    // The candidate pins a non-worktree strategy at the lowest precedence level, so the
+    // git_worktree refusal cannot fire and the candidate stays on the ladder.
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue,
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: null,
+        agentConfig: { workspaceStrategy: { type: "adapter_managed" } },
+      }),
+    ).toBe(true);
   });
 
   it("keeps a project-bound git_worktree candidate for an isolated git_worktree issue", () => {
