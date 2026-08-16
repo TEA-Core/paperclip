@@ -94,6 +94,7 @@ const DEFAULT_REFRESH_TTL_SECONDS = 300;
 const DEFAULT_RETRY_AFTER_SECONDS = 300;
 const DEFAULT_REFRESH_LEASE_SECONDS = 300;
 const REFRESH_LEASE_RENEW_INTERVAL_MS = 60_000;
+const NO_RESOLVER_BACKOFF_SECONDS = 30 * 24 * 60 * 60;
 
 function sourceWhere(input: ExternalObjectSourceContext) {
   const conditions = [
@@ -807,11 +808,20 @@ export function externalObjectService(
     const pluginResult = await resolveViaPluginProvider(db, opts.pluginWorkerManager, object);
     const resolver = pluginResult ? null : resolverRegistry.find(object);
     if (!pluginResult && !resolver) {
+      logger.warn(
+        {
+          companyId: object.companyId,
+          objectId: object.id,
+          providerKey: object.providerKey,
+          objectType: object.objectType,
+        },
+        "external object has no resolver; skipping refresh and backing off",
+      );
       const [updated] = await db
         .update(externalObjects)
         .set({
           liveness: visibleLiveness(object, now) === "fresh" ? "stale" : object.liveness,
-          nextRefreshAt: addSeconds(now, DEFAULT_RETRY_AFTER_SECONDS),
+          nextRefreshAt: addSeconds(now, NO_RESOLVER_BACKOFF_SECONDS),
           refreshStartedAt: null,
           refreshToken: null,
           updatedAt: now,
