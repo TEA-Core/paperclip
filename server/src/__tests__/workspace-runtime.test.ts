@@ -1241,7 +1241,7 @@ describe("realizeExecutionWorkspace", () => {
       }
     });
 
-    it("returns ok when ahead (not behind)", () => {
+    it("returns ok when ahead/behind counts are unknown", () => {
       const decision = resolveBaseRepoHygieneDecision({
         currentBranch: "main",
         defaultRef: "main",
@@ -1250,6 +1250,43 @@ describe("realizeExecutionWorkspace", () => {
         headSha: "abc123",
         baseRefSha: "def456",
         headBehindBaseRef: false,
+      });
+      expect(decision).toEqual({ action: "ok" });
+    });
+
+    it("returns diverged when ahead and behind counts are both positive", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "a",
+        baseRefSha: "b",
+        headBehindBaseRef: false,
+        aheadCount: 1,
+        behindCount: 85,
+        aheadCommitSubjects: ["docs(...)"],
+      });
+      expect(decision).toEqual({
+        action: "diverged",
+        aheadCount: 1,
+        behindCount: 85,
+        aheadCommitSubjects: ["docs(...)"],
+      });
+    });
+
+    it("returns ok (silent) when ahead-only with behind=0", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "a",
+        baseRefSha: "b",
+        headBehindBaseRef: false,
+        aheadCount: 3,
+        behindCount: 0,
+        aheadCommitSubjects: ["feat: something"],
       });
       expect(decision).toEqual({ action: "ok" });
     });
