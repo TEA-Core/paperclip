@@ -22,6 +22,12 @@ export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION =
 export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE =
   `executionWorkspacePreference: "reuse_existing" requires executionWorkspaceId, and none was supplied or inherited. ${WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION}`;
 
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE = "workspace_issue_override_disallowed";
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION =
+  "Remove the issue's executionWorkspacePreference/executionWorkspaceId override, or set the project's executionWorkspacePolicy.allowIssueOverride to true.";
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_MESSAGE =
+  `This issue supplies an execution-workspace override, but the project's executionWorkspacePolicy.allowIssueOverride is false. ${WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION}`;
+
 type WorkspaceStrategyType = ExecutionWorkspaceStrategy["type"];
 
 export type UnrunnableWorktreeIssueRef = {
@@ -89,6 +95,40 @@ export function resolvePinnedIssueWorkspaceStrategyType(input: {
 
 export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIssueRef): boolean {
   return Boolean(issue.executionWorkspaceId && issue.executionWorkspacePreference === "reuse_existing");
+}
+
+/**
+ * Does THIS write supply an issue-level execution-workspace override?
+ *
+ * The question is about the fields THIS write carries — NOT about the issue's
+ * persisted state. `provisionIssueExecutionWorkspace` writes
+ * `executionWorkspaceId` back onto every issue it provisions, and
+ * `executionWorkspacePreference: "reuse_existing"` for isolated/operator_branch
+ * modes, so after one run every issue carries a binding that is
+ * indistinguishable from an operator override if you only look at the row. A
+ * predicate reading persisted state rejects the SECOND run of every issue in an
+ * `allowIssueOverride: false` project, even though the project's own
+ * `defaultMode` produced the binding.
+ *
+ * Only the write boundary can tell the two apart: there, an operator supplying
+ * the field is observable, and provisioning's system write-back opts out via
+ * `systemWorkspaceBinding`.
+ *
+ * `null` counts as NOT supplying an override, for two reasons. Clearing an
+ * override is not itself an override, so refusing it would trap an issue in the
+ * very state the project forbids. And several callers normalize with `?? null`
+ * (routines `dispatchRoutineRun`, pipeline stage-entry automations), so the key
+ * is present-but-null on every routine-created issue even when nothing was
+ * configured — keying on presence alone would reject all of them.
+ */
+export function suppliesIssueExecutionWorkspaceOverride(input: {
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceId?: string | null;
+}): boolean {
+  if (input.executionWorkspaceId) return true;
+  const preference = input.executionWorkspacePreference;
+  // "inherit" explicitly defers to the project policy — the opposite of an override.
+  return Boolean(preference && preference !== "inherit");
 }
 
 export function isUnrunnableWorktreeCombo(input: {
