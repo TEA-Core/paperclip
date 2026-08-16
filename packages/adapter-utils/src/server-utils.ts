@@ -2245,9 +2245,17 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
 // ahead of the `PAPERCLIP_` prefix guard below so that unprefixed keys are
 // covered too: `BETTER_AUTH_SECRET` forges authenticated sessions and
 // `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` forges signed tool actions, which
-// bypasses the approval gate.
+// bypasses the approval gate. `PAPERCLIP_DECISION_SIGNING_SECRET` forges signed
+// decision records.
+//
+// Membership here is load-bearing beyond `sanitizeInheritedPaperclipEnv`: the
+// acpx spawn boundary builds its `envUnset` list from this set (plus a
+// `PAPERCLIP_SECRETS_*` prefix scan and the DATABASE_* pair) and applies NO
+// general `PAPERCLIP_` prefix guard, so a `PAPERCLIP_`-prefixed secret that is
+// missing here is still inherited by the agent process.
 export const SECRET_ENV_KEYS = new Set([
   "BETTER_AUTH_SECRET",
+  "PAPERCLIP_DECISION_SIGNING_SECRET",
   "PAPERCLIP_SECRETS_MASTER_KEY",
   "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
   "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
