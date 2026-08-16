@@ -1111,6 +1111,8 @@ describe("worktree config repair", () => {
     const envPath = path.join(paperclipDir, ".env");
     const sharedRoot = path.join(tempRoot, ".paperclip", "instances", "default");
     const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const instanceId = "pap-13011-key-isolation";
+    const instanceRoot = path.join(isolatedHome, "instances", instanceId);
 
     await fs.mkdir(paperclipDir, { recursive: true });
     await fs.writeFile(configPath, JSON.stringify(buildLegacyConfig(sharedRoot), null, 2) + "\n", "utf8");
@@ -1139,14 +1141,32 @@ describe("worktree config repair", () => {
     expect(result.repairedConfig).toBe(true);
 
     const repairedConfig = JSON.parse(await fs.readFile(configPath, "utf8"));
-    const expectedKeyPath = path.join("/etc/paperclip/worktrees", "pap-13011-key-isolation", "master.key");
+    const expectedKeyPath = path.join("/etc/paperclip/worktrees", instanceId, "master.key");
     expect(repairedConfig.secrets.localEncrypted.keyFilePath).toBe(expectedKeyPath);
 
     const previousMasterKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
     const previousMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
     const previousAllowKeyGeneration = process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const preFixKeyPath = path.join(instanceRoot, "secrets", "master.key");
 
     try {
+      process.env.PAPERCLIP_HOME = isolatedHome;
+
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = preFixKeyPath;
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+
+      const preFixNoEnvKey = await localEncryptedProvider.healthCheck();
+      expect(preFixNoEnvKey.status).toBe("error");
+      expect(preFixNoEnvKey.message).toMatch(/Security violation/);
+
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY = randomBytes(32).toString("base64");
+
+      const preFixEnvKey = await localEncryptedProvider.healthCheck();
+      expect(preFixEnvKey.status).toBe("error");
+      expect(preFixEnvKey.message).toMatch(/Security violation/);
+
       process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = expectedKeyPath;
       delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
       delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
@@ -1176,6 +1196,11 @@ describe("worktree config repair", () => {
         delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
       } else {
         process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = previousAllowKeyGeneration;
+      }
+      if (previousPaperclipHome === undefined) {
+        delete process.env.PAPERCLIP_HOME;
+      } else {
+        process.env.PAPERCLIP_HOME = previousPaperclipHome;
       }
     }
   });
