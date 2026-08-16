@@ -1,6 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import { and, eq, ilike } from "drizzle-orm";
 import { externalObjectMentions, externalObjects, issues, projectWorkspaces, projects } from "@paperclipai/db";
+import type { SecretVersionSelector } from "@paperclipai/shared";
 import { secretService } from "./secrets.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 
@@ -98,11 +99,8 @@ export async function resolveGitHubTokenForRepo(
       const ref = binding as { type?: unknown; secretId?: unknown; version?: unknown };
       if (ref.type !== "secret_ref") continue;
       if (typeof ref.secretId !== "string") continue;
-      const token = await secrets.resolveSecretValue(
-        companyId,
-        ref.secretId,
-        ref.version ?? "latest",
-      );
+      const version: SecretVersionSelector = typeof ref.version === "number" ? ref.version : "latest";
+      const token = await secrets.resolveSecretValue(companyId, ref.secretId, version);
       const trimmed = token.trim();
       if (trimmed) return { token: trimmed, source: key };
     }
