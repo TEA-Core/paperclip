@@ -26,6 +26,7 @@ import { canonicalizeExternalObjectUrl } from "@paperclipai/shared/external-obje
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { createGitHubExternalObjectProvider } from "../services/github-external-object-provider.js";
+import { logger } from "../middleware/logger.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1052,6 +1053,45 @@ describeEmbeddedPostgres("externalObjectService", () => {
     const result2 = await svc.refreshDueObjectsForAllCompanies(50);
     expect(result2.companies).toBe(2);
     expect(result2.refreshed).toBe(1);
+  });
+
+  it("surfaces a no_resolver warning and backs off far into the future", async () => {
+    const { companyId, issueId } = await createIssue();
+    const svc = externalObjectService(db, { github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+
+    const refreshed = await svc.refreshObject(object.id, { companyId, force: true });
+
+    expect(refreshed.reason).toBe("no_resolver");
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        companyId,
+        objectId: object.id,
+        providerKey: "url",
+        objectType: "link",
+      }),
+      expect.any(String),
+    );
+
+    const updated = await db.select().from(externalObjects).then((rows) => rows[0]!);
+    const expectedBackoff = 30 * 24 * 60 * 60 * 1000;
+    expect(updated.nextRefreshAt.getTime() - Date.now()).toBeGreaterThanOrEqual(expectedBackoff * 0.9);
+  });
+
+  it("does not re-sweep a no_resolver object on the next due pass", async () => {
+    const { companyId, issueId } = await createIssue();
+    const svc = externalObjectService(db, { github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    await svc.refreshObject(object.id, { companyId, force: true });
+
+    const refreshed = await svc.refreshDueObjects(companyId, 50, new Date(Date.now() + 1_000));
+    expect(refreshed).toEqual([]);
   });
 });
 
