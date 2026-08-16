@@ -2967,6 +2967,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       : null;
     const parsedProjectPolicy = parseProjectExecutionWorkspacePolicy(projectPolicy);
 
+    // SUP-13100: when the issue has a reuse_existing binding, prefer the
+    // strategyType persisted on the execution_workspaces row over the strategy
+    // derived from executionWorkspaceSettings.
+    const boundWorkspaceStrategyType =
+      issue.executionWorkspaceId && issue.executionWorkspacePreference === "reuse_existing"
+        ? await db
+            .select({ strategyType: executionWorkspaces.strategyType })
+            .from(executionWorkspaces)
+            .where(
+              and(
+                eq(executionWorkspaces.id, issue.executionWorkspaceId),
+                eq(executionWorkspaces.companyId, issue.companyId),
+              ),
+            )
+            .then((rows) => rows[0]?.strategyType ?? null)
+        : null;
+
     const seen = new Set<string>();
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
@@ -2987,6 +3004,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         executionWorkspaceSettings: issue.executionWorkspaceSettings,
         projectPolicy: parsedProjectPolicy,
         agentConfig: candidate.adapterConfig,
+        boundWorkspaceStrategyType,
       })) continue;
       if ((await isAgentInvokable(candidate)) && !budgetBlock) return candidate.id;
     }

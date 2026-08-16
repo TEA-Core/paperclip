@@ -154,6 +154,7 @@ export function canAgentSatisfyIssueWorkspaceSettings(input: {
   reusableExecutionWorkspaceAvailable?: boolean | null;
   hasResolvablePriorSessionWorkspace?: boolean | null;
   agentConfig?: Record<string, unknown> | null;
+  boundWorkspaceStrategyType?: string | null;
 }): boolean {
   const settings = parseIssueExecutionWorkspaceSettings(input.executionWorkspaceSettings);
   const mode = settings?.mode;
@@ -173,7 +174,16 @@ export function canAgentSatisfyIssueWorkspaceSettings(input: {
     mode: resolvedMode,
     legacyUseProjectWorkspace: null,
   });
-  const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, candidateWorkspaceConfig);
+  const derivedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, candidateWorkspaceConfig);
+
+  // SUP-13100: when the issue supplies a reuse_existing binding, prefer the
+  // strategyType persisted on the execution_workspaces row over the strategy
+  // derived from executionWorkspaceSettings. Fall back to the derivation when
+  // there is no bound row, the row is not found, or its strategyType is absent.
+  const resolvedStrategy =
+    hasReusableExecutionWorkspaceBinding(input.issue) && input.boundWorkspaceStrategyType
+      ? input.boundWorkspaceStrategyType
+      : derivedStrategy;
 
   return !isUnrunnableWorktreeCombo({
     issue: input.issue,

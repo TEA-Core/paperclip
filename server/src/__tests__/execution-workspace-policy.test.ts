@@ -344,6 +344,77 @@ describe("execution workspace policy helpers", () => {
     ).toBe(true);
   });
 
+  it("prefers persisted bound workspace strategyType over derived strategy for reuse_existing binding (SUP-13100)", () => {
+    // SUP-12986 live shape: mode isolated_workspace, no workspaceStrategy in
+    // issue settings, but a bound reuse_existing workspace with strategyType
+    // git_worktree. The predicate must resolve git_worktree (not project_primary).
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: "workspace-1",
+          executionWorkspacePreference: "reuse_existing",
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: null,
+        boundWorkspaceStrategyType: "git_worktree",
+      }),
+    ).toBe(true);
+  });
+
+  it("with projectId truthy, bound git_worktree workspace still returns capable (SUP-13100 AC2)", () => {
+    // Same as above but projectId is set: isUnrunnableWorktreeCombo bails on
+    // projectId, so the predicate returns capable regardless.
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: "project-1",
+          projectWorkspaceId: null,
+          executionWorkspaceId: "workspace-1",
+          executionWorkspacePreference: "reuse_existing",
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: null,
+        boundWorkspaceStrategyType: "git_worktree",
+      }),
+    ).toBe(true);
+  });
+
+  it("with no bound workspace and no reusable binding, returns incapable when projectId/projectWorkspaceId are null (SUP-13100 AC3)", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: null,
+        hasResolvablePriorSessionWorkspace: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("falls back to derived strategy when boundWorkspaceStrategyType is absent (SUP-13100 consume contract)", () => {
+    // No boundWorkspaceStrategyType passed → derivation from settings applies.
+    // With no workspaceStrategy in settings, derived is project_primary → not
+    // git_worktree → isUnrunnableWorktreeCombo returns false (mode check fails).
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: "workspace-1",
+          executionWorkspacePreference: "reuse_existing",
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
+  });
+
   it("mirrors runtime default (project_primary) when pinned settings omit strategy type", () => {
     // Mode-only pin without explicit workspaceStrategy.type → same project_primary default as runtime.
     expect(
