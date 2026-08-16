@@ -6469,9 +6469,10 @@ export function issueRoutes(
       trigger: "read_projection",
       actor: getActorInfo(req),
     });
+    const all = await recoveryActionsSvc.listAllForIssue(issue.companyId, issue.id);
     res.json({
       active,
-      actions: active ? [active] : [],
+      actions: all,
     });
   });
 

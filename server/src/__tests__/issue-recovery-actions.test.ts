@@ -1699,6 +1699,42 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const list = await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).expect(200);
     expect(list.body.active).toMatchObject({ id: action.id });
     expect(list.body.actions).toHaveLength(1);
+    expect(list.body.actions[0].id).toBe(action.id);
+  });
+
+  it("lists retired recovery actions on the issue read API so exhaustion is visible", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:fingerprint",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    await recoveryActionSvc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      actionId: action.id,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "Resolved.",
+    });
+    const app = createApp();
+
+    const list = await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).expect(200);
+    expect(list.body.active).toBeNull();
+    expect(list.body.actions).toHaveLength(1);
+    expect(list.body.actions[0]).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "restored",
+    });
   });
 
   it("projects recovery action metadata into the structured wake payload", async () => {
@@ -2728,5 +2764,114 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     const [issueRow] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(issueRow?.status).toBe("todo");
+  });
+
+  it("preserves attemptCount across resolve-then-re-mint cycles so the sweep ceiling is reachable", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint = "stranded:fingerprint";
+    const baseInput = {
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue" as const,
+      ownerType: "agent" as const,
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" as const },
+    };
+
+    for (let cycle = 1; cycle <= 5; cycle++) {
+      const action = await svc.upsertSourceScoped(baseInput);
+      expect(action.status).toBe("active");
+      expect(action.attemptCount).toBe(cycle);
+
+      await svc.resolveActiveForIssue({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        fingerprint,
+        status: "resolved",
+        outcome: "false_positive",
+        resolutionNote: `Cycle ${cycle} resolved.`,
+      });
+
+      const resolved = await svc.getActiveForIssue(companyId, sourceIssueId);
+      expect(resolved).toBeNull();
+    }
+
+    const active = await svc.upsertSourceScoped(baseInput);
+    expect(active.status).toBe("active");
+    expect(active.attemptCount).toBe(6);
+
+    const all = await svc.listAllForIssue(companyId, sourceIssueId);
+    expect(all).toHaveLength(6);
+    expect(all[0].id).toBe(active.id);
+    expect(all[0].status).toBe("active");
+    expect(all[0].attemptCount).toBe(6);
+    expect(all[5].attemptCount).toBe(1);
+    expect(all[5].status).toBe("resolved");
+
+    // Backdate so the stale-wake sweep selects the action, then prove the sweep
+    // ceiling turns the 6th re-mint into an escalated/exhausted action.
+    const staleAt = new Date(Date.now() - 10 * 60_000);
+    await db
+      .update(issueRecoveryActions)
+      .set({ lastAttemptAt: staleAt })
+      .where(eq(issueRecoveryActions.id, active.id));
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const sweepResult = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 0 });
+    expect(sweepResult.maxAttemptsReached).toBe(1);
+
+    const [escalated] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, active.id));
+    expect(escalated?.status).toBe("escalated");
+    expect(escalated?.outcome).toBe("exhausted");
+    expect(escalated?.attemptCount).toBe(6);
+  });
+
+  it("does not reset an exhausted escalated action to active on re-mint", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint = "stranded:exhausted:fingerprint";
+    const baseInput = {
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue" as const,
+      ownerType: "agent" as const,
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" as const },
+    };
+
+    const action = await svc.upsertSourceScoped(baseInput);
+    expect(action.status).toBe("active");
+    expect(action.attemptCount).toBe(1);
+
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        attemptCount: 5,
+        status: "escalated",
+        outcome: "exhausted",
+        ownerType: "board",
+        ownerAgentId: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(issueRecoveryActions.id, action.id));
+
+    const reminted = await svc.upsertSourceScoped(baseInput);
+    expect(reminted.id).toBe(action.id);
+    expect(reminted.status).toBe("escalated");
+    expect(reminted.outcome).toBe("exhausted");
+    expect(reminted.attemptCount).toBe(5);
+
+    const active = await svc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).toMatchObject({ id: action.id, status: "escalated", outcome: "exhausted" });
   });
 });
