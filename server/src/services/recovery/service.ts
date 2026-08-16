@@ -48,6 +48,7 @@ import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
+import { authorizationService } from "../authorization.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import {
@@ -915,6 +916,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
   const instanceSettings = instanceSettingsService(db);
+  const authz = authorizationService(db);
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
 
@@ -2934,6 +2936,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
   }
 
+  async function candidateCanWriteSourceIssue(
+    issue: typeof issues.$inferSelect,
+    agentId: string,
+  ): Promise<boolean> {
+    const decision = await authz.decide({
+      actor: { type: "agent", agentId, companyId: issue.companyId },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: issue.companyId,
+        issueId: issue.id,
+        projectId: issue.projectId,
+        parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+        status: issue.status,
+        createdByAgentId: issue.createdByAgentId,
+      },
+    });
+    return decision.allowed;
+  }
+
   async function resolveStrandedIssueRecoveryOwnerAgentId(
     issue: typeof issues.$inferSelect,
     preferredOwnerAgentId?: string | null,
@@ -2988,7 +3012,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         projectPolicy: parsedProjectPolicy,
         agentConfig: candidate.adapterConfig,
       })) continue;
-      if ((await isAgentInvokable(candidate)) && !budgetBlock) return candidate.id;
+      if (
+        (await isAgentInvokable(candidate)) &&
+        !budgetBlock &&
+        (await candidateCanWriteSourceIssue(issue, candidate.id))
+      )
+        return candidate.id;
     }
 
     return null;
@@ -3005,7 +3034,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       issueId: issue.id,
       projectId: issue.projectId,
     });
-    return (await isAgentInvokable(candidate)) && !budgetBlock ? candidate.id : null;
+    return (await isAgentInvokable(candidate)) && !budgetBlock && (await candidateCanWriteSourceIssue(issue, candidate.id)) ? candidate.id : null;
   }
 
   async function resolveStrandedRecoveryRouting(input: {
@@ -3022,10 +3051,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (input.recoveryCause === "provider_quota") {
       const retryAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId);
       if (!retryAgentId) {
+        const ladderOwner = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
+        const computedReturnOwner = originalAgentId;
+        if (computedReturnOwner && (await candidateCanWriteSourceIssue(input.issue, computedReturnOwner))) {
+          return {
+            ownerAgentId: ladderOwner,
+            returnOwnerAgentId: computedReturnOwner,
+            routingFallbackReason: "The original assignee is not invokable; quota recovery fell through to the manager ladder.",
+          };
+        }
         return {
-          ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue),
-          returnOwnerAgentId: originalAgentId,
-          routingFallbackReason: "The original assignee is not invokable; quota recovery fell through to the manager ladder.",
+          ownerAgentId: ladderOwner,
+          returnOwnerAgentId: null,
+          routingFallbackReason: "Computed return owner lacks a write grant on the source issue; fell through to board ownership.",
         };
       }
       return {
@@ -3039,19 +3077,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (ownerAgentId) {
         return { ownerAgentId, returnOwnerAgentId: originalAgentId, routingFallbackReason: null };
       }
+      const ladderOwner = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
+      const computedReturnOwner = originalAgentId;
+      if (computedReturnOwner && (await candidateCanWriteSourceIssue(input.issue, computedReturnOwner))) {
+        return {
+          ownerAgentId: ladderOwner,
+          returnOwnerAgentId: computedReturnOwner,
+          routingFallbackReason: "The original assignee is not invokable; recovery fell through to the manager ladder.",
+        };
+      }
       return {
-        ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue),
-        returnOwnerAgentId: originalAgentId,
-        routingFallbackReason: "The original assignee is not invokable; recovery fell through to the manager ladder.",
+        ownerAgentId: ladderOwner,
+        returnOwnerAgentId: null,
+        routingFallbackReason: "Computed return owner lacks a write grant on the source issue; fell through to board ownership.",
+      };
+    }
+    const ladderOwner = await resolveStrandedIssueRecoveryOwnerAgentId(
+      input.issue,
+      input.preferredOwnerAgentId,
+    );
+    const computedReturnOwner = returnOwnerAgentId;
+    if (computedReturnOwner && (await candidateCanWriteSourceIssue(input.issue, computedReturnOwner))) {
+      return {
+        ownerAgentId: ladderOwner,
+        returnOwnerAgentId: computedReturnOwner,
+        routingFallbackReason: null,
       };
     }
     return {
-      ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(
-        input.issue,
-        input.preferredOwnerAgentId,
-      ),
-      returnOwnerAgentId,
-      routingFallbackReason: null,
+      ownerAgentId: ladderOwner,
+      returnOwnerAgentId: null,
+      routingFallbackReason: "Computed return owner lacks a write grant on the source issue; fell through to board ownership.",
     };
   }
 
