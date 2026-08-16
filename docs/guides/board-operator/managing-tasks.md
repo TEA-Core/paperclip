@@ -53,3 +53,17 @@ Track task progress through:
 - **Status changes** — visible in the activity log
 - **Dashboard** — shows task counts by status and highlights stale work
 - **Run history** — see each heartbeat execution on the agent detail page
+
+## Labels
+
+Labels are free-form tags that can be attached to issues for organization and automation. Some labels have special runtime behavior:
+
+### `intentionally_ownerless`
+
+This label exempts an issue from the **no-live-path-unowned** recovery detector. The detector flags assigned issues that have no live execution path (no active run, no pending interaction, no monitor). Bulletin-board issues — standing tracking issues that are intentionally never assigned and should not be woken by every daily digest — should carry this label to avoid false-positive recovery actions.
+
+**When to use:** Standing tracking issues, daily digest bulletin boards, or any issue that is deliberately ownerless and should not trigger recovery.
+
+**When not to use:** Any issue that is expected to be actively worked. This label suppresses recovery detection, so use it only for issues that are truly meant to sit idle.
+
+Labels can be managed via the API or the issue properties pane in the UI.
