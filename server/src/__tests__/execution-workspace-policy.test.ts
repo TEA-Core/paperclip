@@ -67,6 +67,37 @@ describe("execution workspace policy helpers", () => {
     expect(resolveSharedWorkspaceConcurrency({ projectPolicy: null, issueSettings: null })).toBe("auto");
   });
 
+  it("respects allowIssueOverride=false: project shared-workspace concurrency wins over the issue value", () => {
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "serialize", allowIssueOverride: false },
+        issueSettings: { sharedWorkspaceConcurrency: "allow" },
+      }),
+    ).toBe("serialize");
+    // A disabled project policy contributes no value, so the gated issue value falls through to "auto".
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: false, sharedWorkspaceConcurrency: "serialize", allowIssueOverride: false },
+        issueSettings: { sharedWorkspaceConcurrency: "allow" },
+      }),
+    ).toBe("auto");
+  });
+
+  it("respects allowIssueOverride=true/omitted: issue shared-workspace concurrency still wins", () => {
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "serialize", allowIssueOverride: true },
+        issueSettings: { sharedWorkspaceConcurrency: "allow" },
+      }),
+    ).toBe("allow");
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "serialize" },
+        issueSettings: { sharedWorkspaceConcurrency: "allow" },
+      }),
+    ).toBe("allow");
+  });
+
   it("validates the shared-workspace concurrency enum on project and issue settings", () => {
     expect(projectExecutionWorkspacePolicySchema.parse({
       enabled: true,

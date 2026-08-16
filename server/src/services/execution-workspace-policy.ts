@@ -329,7 +329,8 @@ export function resolveSharedWorkspaceConcurrency(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
 }): SharedWorkspaceConcurrency {
-  return input.issueSettings?.sharedWorkspaceConcurrency
+  const effectiveIssueSettings = input.projectPolicy?.allowIssueOverride === false ? null : input.issueSettings;
+  return effectiveIssueSettings?.sharedWorkspaceConcurrency
     ?? (input.projectPolicy?.enabled ? input.projectPolicy.sharedWorkspaceConcurrency : undefined)
     ?? "auto";
 }
