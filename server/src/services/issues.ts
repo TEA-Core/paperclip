@@ -80,6 +80,10 @@ import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
+  suppliesIssueExecutionWorkspaceOverride,
+  WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE,
+  WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_MESSAGE,
+  WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION,
   WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_CODE,
   WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE,
   WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION,
@@ -252,6 +256,43 @@ function assertReusableExecutionWorkspaceBound(input: {
     code: WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_CODE,
     remediation: WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION,
     field: "executionWorkspaceId",
+  });
+}
+
+/**
+ * SUP-13058: `executionWorkspacePolicy.allowIssueOverride` was parsed, persisted
+ * and rendered, but nothing ever branched on it — an operator who set it to
+ * `false` got no enforcement at all.
+ *
+ * It is enforced HERE, at the issue write boundary, because this is the only
+ * place an operator-supplied override is distinguishable from the workspace
+ * binding the system persists on its own: `provisionIssueExecutionWorkspace`
+ * writes `executionWorkspaceId`/`executionWorkspacePreference` back after every
+ * run, so a check against persisted issue state would reject the second run of
+ * every issue in a `false` project. Provisioning's write-back opts out with
+ * `systemWorkspaceBinding: true`.
+ *
+ * Absent policy, or `allowIssueOverride` absent/`true`, is unchanged behaviour —
+ * the default stays `true`.
+ */
+function assertIssueExecutionWorkspaceOverrideAllowed(input: {
+  projectPolicy: ReturnType<typeof parseProjectExecutionWorkspacePolicy> | undefined;
+  suppliedExecutionWorkspaceId: string | null | undefined;
+  suppliedExecutionWorkspacePreference: string | null | undefined;
+}) {
+  if (input.projectPolicy?.allowIssueOverride !== false) return;
+  if (
+    !suppliesIssueExecutionWorkspaceOverride({
+      executionWorkspaceId: input.suppliedExecutionWorkspaceId,
+      executionWorkspacePreference: input.suppliedExecutionWorkspacePreference,
+    })
+  ) {
+    return;
+  }
+  throw unprocessable(WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_MESSAGE, {
+    code: WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE,
+    remediation: WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION,
+    field: "executionWorkspacePolicy.allowIssueOverride",
   });
 }
 
@@ -7530,6 +7571,19 @@ export function issueService(db: Db) {
           executionWorkspaceId,
           executionWorkspacePreference,
         });
+        if (isolatedWorkspacesEnabled) {
+          // Key off the RAW request fields, not the resolved locals: inheritance
+          // (parentId / inheritExecutionWorkspaceFromIssueId) assigns them above
+          // without the caller ever naming a workspace, and that is not an override.
+          assertIssueExecutionWorkspaceOverrideAllowed({
+            projectPolicy: gateProjectExecutionWorkspacePolicy(
+              await loadProjectPolicyOnce(),
+              isolatedWorkspacesEnabled,
+            ),
+            suppliedExecutionWorkspaceId: data.executionWorkspaceId,
+            suppliedExecutionWorkspacePreference: data.executionWorkspacePreference,
+          });
+        }
         if (isolatedWorkspacesEnabled && issueData.executionWorkspaceSettings !== undefined) {
           assertExplicitPinnedWorktreeIssueRunnable({
             projectId: issueData.projectId ?? null,
@@ -7920,6 +7974,14 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        /**
+         * Internal only. Set by `provisionIssueExecutionWorkspace` when it writes
+         * back the workspace the project's own policy just produced, so that
+         * system-persisted binding is not mistaken for an operator override and
+         * refused by `allowIssueOverride: false` (SUP-13058). Never accept this
+         * from a request body.
+         */
+        systemWorkspaceBinding?: boolean;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -7938,6 +8000,7 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        systemWorkspaceBinding,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -8134,6 +8197,27 @@ export function issueService(db: Db) {
         assertReusableExecutionWorkspaceBound({
           executionWorkspaceId: nextExecutionWorkspaceId ?? null,
           executionWorkspacePreference: nextExecutionWorkspacePreference ?? null,
+        });
+      }
+      if (
+        isolatedWorkspacesEnabled &&
+        !systemWorkspaceBinding &&
+        nextProjectId &&
+        (issueData.executionWorkspaceId !== undefined ||
+          issueData.executionWorkspacePreference !== undefined)
+      ) {
+        const projectRow = await dbOrTx
+          .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+          .from(projects)
+          .where(and(eq(projects.id, nextProjectId), eq(projects.companyId, existing.companyId)))
+          .then((rows: Array<{ executionWorkspacePolicy: unknown }>) => rows[0] ?? null);
+        assertIssueExecutionWorkspaceOverrideAllowed({
+          projectPolicy: gateProjectExecutionWorkspacePolicy(
+            parseProjectExecutionWorkspacePolicy(projectRow?.executionWorkspacePolicy),
+            isolatedWorkspacesEnabled,
+          ),
+          suppliedExecutionWorkspaceId: issueData.executionWorkspaceId,
+          suppliedExecutionWorkspacePreference: issueData.executionWorkspacePreference,
         });
       }
       if (isolatedWorkspacesEnabled && issueData.executionWorkspaceSettings !== undefined) {
