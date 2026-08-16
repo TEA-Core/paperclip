@@ -1306,6 +1306,79 @@ describe("realizeExecutionWorkspace", () => {
     });
   });
 
+  it("warns when the base repo is ahead of the base ref (clean, not behind)", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "ahead.txt"), "ahead\n", "utf8");
+    await runGit(repoRoot, ["add", "ahead.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Ahead commit"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const aheadWarning = workspace.warnings.find((w) =>
+      w.includes("is ahead of") && w.includes("commit(s) ahead"),
+    );
+    expect(aheadWarning).toBeDefined();
+    expect(aheadWarning).toContain(repoRoot);
+    expect(aheadWarning).toContain("1 commit(s) ahead");
+    expect(aheadWarning).toContain("Ahead commits: Ahead commit");
+  });
+
+  it("warns when the base repo has diverged from the base ref (ahead and behind)", async () => {
+    const { repoRoot, remotePath } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "ahead.txt"), "ahead\n", "utf8");
+    await runGit(repoRoot, ["add", "ahead.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Ahead commit"]);
+    await runGit(repoRoot, ["push", remotePath, "master"]);
+
+    await runGit(repoRoot, ["reset", "--hard", "HEAD~1"]);
+    await fs.writeFile(path.join(repoRoot, "diverged.txt"), "diverged\n", "utf8");
+    await runGit(repoRoot, ["add", "diverged.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Diverged commit"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const divergedWarning = workspace.warnings.find((w) =>
+      w.includes("has diverged from") && w.includes("behind"),
+    );
+    expect(divergedWarning).toBeDefined();
+    expect(divergedWarning).toContain(repoRoot);
+    expect(divergedWarning).toContain("1 ahead");
+    expect(divergedWarning).toContain("1 behind");
+    expect(divergedWarning).toContain("Ahead commits: Diverged commit");
+  });
+
+  it("does not emit an ahead/diverged warning when the base repo is clean and in sync", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const aheadWarning = workspace.warnings.find((w) => w.includes("is ahead of"));
+    expect(aheadWarning).toBeUndefined();
+  });
+
+  it("does not emit an ahead/diverged warning when the base repo is clean and behind (fastForward)", async () => {
+    const { repoRoot, remotePath } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "remote.txt"), "remote\n", "utf8");
+    await runGit(repoRoot, ["add", "remote.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Remote commit"]);
+    await runGit(repoRoot, ["push", remotePath, "master"]);
+    await runGit(repoRoot, ["reset", "--hard", "HEAD~1"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    expect(workspace.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    const aheadWarning = workspace.warnings.find((w) => w.includes("is ahead of"));
+    expect(aheadWarning).toBeUndefined();
+  });
+
+  it("does not emit an ahead/diverged warning when the base repo is dirty (restore)", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "README.md"), "dirty\n", "utf8");
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    expect(workspace.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+    const aheadWarning = workspace.warnings.find((w) => w.includes("is ahead of"));
+    expect(aheadWarning).toBeUndefined();
+  });
+
   it("does not restore a base repo already at the base ref on a second dispatch (detached HEAD case)", async () => {
     // F1: when the default branch is held by an agent worktree, the first dispatch
     // detaches at the base ref. The second dispatch must see HEAD === baseRefSha and

@@ -3793,6 +3793,26 @@ export async function realizeExecutionWorkspace(input: {
           `Ahead commits: ${subjects}. Local commits preserved — no reset performed.`;
         baseRepoHygieneWarnings.push(message);
         logger.warn(message);
+      } else if (decision.action === "ok") {
+        if (headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
+          const revList = await runGit(
+            ["rev-list", "--left-right", "--count", `HEAD...${baseRef}`],
+            repoRoot,
+          ).catch(() => null);
+          if (revList) {
+            const [aheadStr, behindStr] = revList.split("\t");
+            const ahead = Number(aheadStr);
+            const behind = Number(behindStr);
+            const subjects = await runGit(
+              ["log", "--format=%s", `${baseRef}..HEAD`],
+              repoRoot,
+            ).catch(() => "");
+            const subjectList = subjects ? subjects.split("\n") : [];
+            baseRepoHygieneWarnings.push(
+              `Base repository at ${repoRoot} is ahead of ${baseRef}: ${ahead} commit(s) ahead, ${behind} commit(s) behind. Ahead commits: ${subjectList.join(", ")}`,
+            );
+          }
+        }
       }
     }
   } catch (err) {
