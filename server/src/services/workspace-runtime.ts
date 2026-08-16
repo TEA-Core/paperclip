@@ -39,6 +39,7 @@ import {
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig, type ExecutionWorkspaceBranchReconcileMode } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import {
   cleanupWorktreeInstanceArtifacts,
@@ -713,7 +714,7 @@ export async function inspectExecutionWorkspaceBaseDrift(input: {
 
   if (branchBaseRefSha !== currentBaseRefSha) {
     const behindCountRaw = await runGit(["rev-list", "--count", `HEAD..${baseRef}`], input.worktreePath).catch(() => "");
-    const behindCount = Number.parseInt(behindCountRaw, 10);
+    const behindCount = parseInt(behindCountRaw, 10);
     const behindText = Number.isFinite(behindCount) && behindCount > 0
       ? `${behindCount} commit${behindCount === 1 ? "" : "s"}`
       : "newer commits";
@@ -2582,7 +2583,7 @@ async function refreshUnstartedWorktreeToBase(input: {
     ["rev-list", "--count", `${input.currentBaseRefSha}..HEAD`],
     input.worktreePath,
   ).catch(() => null);
-  const commitsPastBase = commitsPastBaseRaw === null ? null : Number.parseInt(commitsPastBaseRaw, 10);
+  const commitsPastBase = commitsPastBaseRaw === null ? null : parseInt(commitsPastBaseRaw, 10);
   if (commitsPastBase === null || !Number.isFinite(commitsPastBase) || commitsPastBase > 0) {
     return { refreshed: false, baseRefSha: null };
   }
@@ -3266,7 +3267,8 @@ async function provisionExecutionWorktree(input: {
 export type BaseRepoHygieneDecision =
   | { action: "ok" }
   | { action: "fastForward" }
-  | { action: "restore"; reasons: string[]; snapshotTrackedChanges: boolean };
+  | { action: "restore"; reasons: string[]; snapshotTrackedChanges: boolean }
+  | { action: "diverged"; aheadCount: number; behindCount: number; aheadCommitSubjects: string[] };
 
 /**
  * SUP-11285: should the base repo be put back before we cut a worktree from it?
@@ -3303,6 +3305,21 @@ export function resolveBaseRepoHygieneDecision(input: {
    * reasons, so dirty/unmerged/wrong-branch repos still return `restore`.
    */
   headBehindBaseRef?: boolean;
+  /**
+   * Number of commits the base repo's HEAD is ahead of the base ref.
+   * Best-effort; may be undefined when unavailable.
+   */
+  aheadCount?: number;
+  /**
+   * Number of commits the base repo's HEAD is behind the base ref.
+   * Best-effort; may be undefined when unavailable.
+   */
+  behindCount?: number;
+  /**
+   * Subject lines of commits the base repo's HEAD is ahead of the base ref.
+   * Best-effort; may be undefined when unavailable.
+   */
+  aheadCommitSubjects?: string[];
 }): BaseRepoHygieneDecision {
   const reasons: string[] = [];
   const defaultRef = input.defaultRef?.replace(/^origin\//, "") ?? null;
@@ -3324,7 +3341,18 @@ export function resolveBaseRepoHygieneDecision(input: {
     reasons.push(`base repo has ${input.dirtyTrackedPathCount} modified tracked path(s)`);
   }
   if (reasons.length === 0) {
-    return input.headBehindBaseRef ? { action: "fastForward" } : { action: "ok" };
+    if (input.headBehindBaseRef) {
+      return { action: "fastForward" };
+    }
+    if (input.aheadCount && input.aheadCount > 0 && input.behindCount && input.behindCount > 0) {
+      return {
+        action: "diverged",
+        aheadCount: input.aheadCount,
+        behindCount: input.behindCount,
+        aheadCommitSubjects: input.aheadCommitSubjects ?? [],
+      };
+    }
+    return { action: "ok" };
   }
   return {
     action: "restore",
@@ -3643,6 +3671,29 @@ export async function realizeExecutionWorkspace(input: {
         ? await runGit(["merge-base", "--is-ancestor", headSha!, currentBaseRefSha!], repoRoot)
             .then(() => true).catch(() => false)
         : false;
+      let aheadCount: number | undefined;
+      let behindCount: number | undefined;
+      let aheadCommitSubjects: string[] | undefined;
+      if (!headBehindBaseRef && headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
+        const revList = await runGit(["rev-list", "--left-right", "--count", baseRef + "...HEAD"], repoRoot)
+          .then((value) => {
+            const tokens = value.trim().split(/\s+/);
+            if (tokens.length >= 2) {
+              return { behind: parseInt(tokens[0], 10), ahead: parseInt(tokens[1], 10) };
+            }
+            return null;
+          })
+          .catch(() => null);
+        if (revList) {
+          behindCount = revList.behind;
+          aheadCount = revList.ahead;
+          if (aheadCount > 0) {
+            aheadCommitSubjects = await runGit(["log", "--format=%s", baseRef + "..HEAD"], repoRoot)
+              .then((value) => value.trim().split("\n").filter((line) => line.length > 0))
+              .catch(() => []);
+          }
+        }
+      }
       const decision = resolveBaseRepoHygieneDecision({
         currentBranch: hygiene.currentBranch,
         defaultRef: baseRef,
@@ -3651,6 +3702,9 @@ export async function realizeExecutionWorkspace(input: {
         headSha,
         baseRefSha: currentBaseRefSha,
         headBehindBaseRef,
+        aheadCount,
+        behindCount,
+        aheadCommitSubjects,
       });
       if (decision.action === "restore") {
         const result = await restoreBaseRepoToDefaultRef({
@@ -3678,6 +3732,16 @@ export async function realizeExecutionWorkspace(input: {
             ? `Base repository at ${repoRoot} was fast-forwarded to ${baseRef}.`
             : `Could not fast-forward base repository at ${repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
         );
+      } else if (decision.action === "diverged") {
+        const subjects = decision.aheadCommitSubjects.length > 0
+          ? decision.aheadCommitSubjects.join(", ")
+          : "(no subjects)";
+        const message =
+          `Base repository at ${repoRoot} has diverged from ${baseRef}: ` +
+          `${decision.aheadCount} ahead, ${decision.behindCount} behind. ` +
+          `Ahead commits: ${subjects}. Local commits preserved — no reset performed.`;
+        baseRepoHygieneWarnings.push(message);
+        logger.warn(message);
       }
     }
   } catch (err) {
@@ -5820,7 +5884,7 @@ async function stopRuntimeService(serviceId: string) {
       processGroupId: record.processGroupId ?? record.child.pid,
     });
   } else if (record.providerRef) {
-    const pid = Number.parseInt(record.providerRef, 10);
+    const pid = parseInt(record.providerRef, 10);
     if (Number.isInteger(pid) && pid > 0) {
       await terminateLocalService({
         pid,
