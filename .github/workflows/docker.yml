@@ -421,6 +421,41 @@ jobs:
           fi
           echo "PASS: no raw \${{ github.repository }} in cache refs"
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      # The image runs `pnpm install --frozen-lockfile` in its deps stage, so it
+      # needs the same refreshed lockfile the publishing jobs above build with.
+      # Without this the assert job died in the deps stage with
+      # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH whenever the committed lockfile lagged
+      # the manifests, before any hardening assertion below could run.
+      - name: Refresh lockfile for Docker build context
+        run: |
+          set -euo pipefail
+          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+
+          changed="$(git status --porcelain)"
+          if [ -z "$changed" ]; then
+            echo "Lockfile already matches package metadata."
+            exit 0
+          fi
+
+          if printf '%s\n' "$changed" | grep -Fvq ' pnpm-lock.yaml'; then
+            echo "Unexpected files changed during lockfile refresh:"
+            echo "$changed"
+            exit 1
+          fi
+
+          echo "Using refreshed pnpm-lock.yaml in the Docker build context."
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -484,3 +519,29 @@ jobs:
               || { echo "FAIL: bundled skill helper lost its executable bit"; exit 1; }
             echo "PASS: executable bits preserved under /app"
           '
+
+      - name: Assert /etc/paperclip/secrets is root-owned
+        run: |
+          docker run --rm paperclip:pr sh -c '
+            set -e
+            ls -ld /etc/paperclip/secrets
+            [ "$(stat -c "%U:%G %a" /etc/paperclip/secrets)" = "root:root 700" ] || { echo "FAIL: /etc/paperclip/secrets is $(stat -c "%U:%G %a" /etc/paperclip/secrets), want root:root 700"; exit 1; }
+            echo "PASS: /etc/paperclip/secrets is root:root 0700"
+          '
+
+      # The secrets probes deliberately do NOT use `-u 1000:1000`: with a non-root
+      # uid the entrypoint takes its unprivileged branch, never creates
+      # /etc/paperclip/secrets, and the probes then measure ENOENT instead of
+      # EACCES — `touch` "passes" for the wrong reason and `rm -f` on a missing
+      # path exits 0, failing the step on a container that was never hardened.
+      # scripts/assert-secrets-hardening.sh instead runs one container that starts
+      # as root, seeds the pre-fix node-owned state, hands over to the real
+      # entrypoint, and probes read/list/write/unlink plus the env handoff from
+      # uid 1000 after the gosu drop.
+      - name: Assert entrypoint hardens secrets against uid 1000 (EACCES + key handoff)
+        run: |
+          docker run --rm \
+            --entrypoint /bin/sh \
+            -e EXPECTED_KEY=ci-assert-master-key \
+            -v "$PWD/scripts/assert-secrets-hardening.sh:/probe.sh:ro" \
+            paperclip:pr /probe.sh
