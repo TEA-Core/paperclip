@@ -81,6 +81,36 @@ describe("execution workspace policy helpers", () => {
     }).success).toBe(false);
   });
 
+  it("respects allowIssueOverride=false: project defaultMode wins over issue mode", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "shared_workspace", allowIssueOverride: false },
+        issueSettings: { mode: "isolated_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("shared_workspace");
+  });
+
+  it("respects allowIssueOverride=true: issue mode still wins", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "shared_workspace", allowIssueOverride: true },
+        issueSettings: { mode: "isolated_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("isolated_workspace");
+  });
+
+  it("respects allowIssueOverride omitted: issue mode still wins (byte-identical to today)", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "shared_workspace" },
+        issueSettings: { mode: "isolated_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("isolated_workspace");
+  });
+
   it("centralizes unrunnable isolated worktree detection", () => {
     expect(
       isUnrunnableWorktreeCombo({
@@ -243,6 +273,43 @@ describe("execution workspace policy helpers", () => {
       baseRef: "origin/main",
       provisionCommand: "bash ./scripts/provision-worktree.sh",
       runtimeProvisionCommand: "bash ./scripts/provision-runtime.sh",
+    });
+    expect(result.workspaceRuntime).toEqual({
+      services: [{ name: "web", command: "pnpm dev" }],
+    });
+  });
+
+  it("respects allowIssueOverride=false: project strategy/runtime win over issue overrides", () => {
+    const result = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: {
+        workspaceStrategy: { type: "project_primary" },
+      },
+      projectPolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        allowIssueOverride: false,
+        workspaceStrategy: {
+          type: "git_worktree",
+          baseRef: "origin/main",
+          provisionCommand: "bash ./scripts/provision-worktree.sh",
+        },
+        workspaceRuntime: {
+          services: [{ name: "web", command: "pnpm dev" }],
+        },
+      },
+      issueSettings: {
+        mode: "isolated_workspace",
+        workspaceStrategy: { type: "cloud_sandbox" },
+        workspaceRuntime: { services: [{ name: "api", command: "pnpm start" }] },
+      },
+      mode: "isolated_workspace",
+      legacyUseProjectWorkspace: null,
+    });
+
+    expect(result.workspaceStrategy).toEqual({
+      type: "git_worktree",
+      baseRef: "origin/main",
+      provisionCommand: "bash ./scripts/provision-worktree.sh",
     });
     expect(result.workspaceRuntime).toEqual({
       services: [{ name: "web", command: "pnpm dev" }],
