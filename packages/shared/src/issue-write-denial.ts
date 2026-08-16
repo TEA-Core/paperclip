@@ -273,16 +273,18 @@ export function describeIssueWriteDenial(
         code,
         status: 403,
         tone: "boundary",
-        boundary: "Heartbeat run context",
-        title: "Cross-issue writes need a run to attribute them to",
+         boundary: "Heartbeat run context",
+         title: "Cross-issue writes need a live run to attribute them to",
         description:
           `Every agent comment and task update is attributed to a heartbeat run so the ` +
           `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
-          `This request arrived without a valid run, so it could not be contained.`,
-        whoCanAct: `${actor}, once the request carries its own run id.`,
+          `The run id on this request is malformed or does not resolve to a live run for ` +
+          `this company and agent, so the write could not be attributed.`,
+        whoCanAct: `${actor}, once it sends the run id of its own live heartbeat run.`,
         sanctionedPath:
-          `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
-          `and retry.`,
+          `Verify the \`X-Paperclip-Run-Id\` header carries the exact run id of your ` +
+          `current live run (a UUID matching a heartbeat run for your company and agent), ` +
+          `then retry.`,
 
       };
 
