@@ -119,6 +119,23 @@ jobs:
         with:
           node-version: 24
 
+      - name: Block overrides change without lockfile update
+        # `pnpm.overrides` lives in the root package.json and changes dependency
+        # resolution. A PR that edits it without also updating pnpm-lock.yaml
+        # merges a base whose committed lockfile no longer matches its manifests,
+        # so every later `pnpm install --frozen-lockfile` on the deployed line —
+        # and every merge-queue entry — fails with
+        # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH. The `regen_lockfile` step below would
+        # paper over that by regenerating a throwaway artifact for this PR's own
+        # checks, leaving the merged base broken. Fail here instead so the author
+        # updates the lockfile before merge.
+        #
+        # Only meaningful for a pull_request: a merge_group entry is built on the
+        # current base and its own diff already passed this guard at PR time, so
+        # the queue is not a place to author a lockfile edit.
+        if: github.event_name == 'pull_request'
+        run: node ./scripts/check-overrides-lockfile.mjs
+
       - name: Validate Dockerfile deps stage
         run: node ./scripts/check-docker-deps-stage.mjs
 
@@ -127,6 +144,9 @@ jobs:
 
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
+
+      - name: Test overrides lockfile guard
+        run: node --test ./scripts/check-overrides-lockfile.test.mjs
 
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
@@ -139,6 +159,9 @@ jobs:
 
       - name: Test merge queue workflow wiring
         run: node --test ./scripts/__tests__/pr-workflow-merge-group.test.mjs
+
+      - name: Test overrides lockfile guard wiring
+        run: node --test ./scripts/__tests__/pr-overrides-guard.test.mjs
 
       - name: Test standalone package build concurrency
         run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
@@ -220,9 +243,9 @@ jobs:
         with:
           version: 9.15.4
 
-      - name: Restore regenerated PR lockfile (if policy uploaded one)
+      - name: Restore regenerated PR lockfile (when policy regenerated one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -307,9 +330,9 @@ jobs:
         with:
           version: 9.15.4
 
-      - name: Restore regenerated PR lockfile (if policy uploaded one)
+      - name: Restore regenerated PR lockfile (when policy regenerated one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -369,9 +392,9 @@ jobs:
         with:
           version: 9.15.4
 
-      - name: Restore regenerated PR lockfile (if policy uploaded one)
+      - name: Restore regenerated PR lockfile (when policy regenerated one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -426,9 +449,9 @@ jobs:
         with:
           version: 9.15.4
 
-      - name: Restore regenerated PR lockfile (if policy uploaded one)
+      - name: Restore regenerated PR lockfile (when policy regenerated one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -466,9 +489,9 @@ jobs:
         with:
           version: 9.15.4
 
-      - name: Restore regenerated PR lockfile (if policy uploaded one)
+      - name: Restore regenerated PR lockfile (when policy regenerated one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -541,9 +564,9 @@ jobs:
         with:
           version: 9.15.4
 
-      - name: Restore regenerated PR lockfile (if policy uploaded one)
+      - name: Restore regenerated PR lockfile (when policy regenerated one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
