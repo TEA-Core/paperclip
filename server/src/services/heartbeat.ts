@@ -1814,17 +1814,28 @@ export async function resolveAdditionalProjectWorkspace(
 type WorkspaceValidationFailureLike = WorkspaceValidationFailure | {
   code: typeof WORKSPACE_VALIDATION_FAILURE_CODE;
   resultJson: Record<string, unknown>;
+  reason: string;
 };
 
 function isWorkspaceValidationFailure(error: unknown): error is WorkspaceValidationFailureLike {
   if (error instanceof WorkspaceValidationFailure) return true;
   const maybe = error as { code?: unknown; resultJson?: unknown } | null;
+  const resultJson = maybe?.resultJson;
+  const isObject =
+    resultJson && typeof resultJson === "object" && !Array.isArray(resultJson);
+  const reason =
+    isObject &&
+    typeof (resultJson as Record<string, unknown>).workspaceValidation === "object" &&
+    !Array.isArray((resultJson as Record<string, unknown>).workspaceValidation)
+      ? readNonEmptyString(
+          ((resultJson as Record<string, unknown>).workspaceValidation as Record<string, unknown>).reason,
+        )
+      : null;
   return Boolean(
     maybe &&
       maybe.code === WORKSPACE_VALIDATION_FAILURE_CODE &&
-      maybe.resultJson &&
-      typeof maybe.resultJson === "object" &&
-      !Array.isArray(maybe.resultJson),
+      isObject &&
+      reason,
   );
 }
 
@@ -11592,7 +11603,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             workspaceValidationRecovery: {
               strategy: "quarantine_failed_workspace_and_retry_clean",
               sourceRunId: run.id,
-              reason: readNonEmptyString(workspaceValidationRetryPayload?.reason) ?? WORKSPACE_VALIDATION_FAILURE_CODE,
+              reason: readNonEmptyString(workspaceValidationRetryPayload?.reason) ?? null,
               fingerprint: readNonEmptyString(workspaceValidationRetryPayload?.fingerprint),
               failedExecutionWorkspaceId: readNonEmptyString(workspaceValidationRetryPayload?.executionWorkspaceId),
             },
