@@ -204,6 +204,15 @@ export function issueRecoveryActionService(db: Db) {
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
+      // An action the sweep already escalated at its attempt ceiling
+      // (`escalated` + `outcome: "exhausted"`) is terminal until a board
+      // resolution or a genuinely new action supersedes it. Returning it as-is
+      // refuses to resurrect it to `active`, bump `attemptCount` past the
+      // ceiling, or erase its exhaustion record — which is what re-triggered the
+      // per-sweep exhaustion comment forever.
+      if (existing.status === "escalated" && (existing.outcome as string | null) === "exhausted") {
+        return existing;
+      }
       const [updated] = await db
         .update(issueRecoveryActions)
         .set({
