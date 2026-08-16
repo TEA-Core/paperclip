@@ -162,7 +162,7 @@ export function scanSecretsDirectory(): SecretDirScanResult {
         uid = st.uid;
         gid = st.gid;
         size = st.size;
-        mtimeMs = st.mtimeMs;
+        mtimeMs = Math.trunc(st.mtimeMs);
         if (attribution.containerStartTimeMs != null) {
           filePredatesContainerStart = mtimeMs < attribution.containerStartTimeMs;
         }

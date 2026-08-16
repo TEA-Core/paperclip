@@ -83,6 +83,7 @@ describe("secrets-dir-watch", () => {
     expect(observation.classification).toBe("unexpected");
     expect(observation.sha256FingerprintPrefix).toBe(fingerprintPrefix(secret));
     expect(observation.sha256FingerprintPrefix).toMatch(/^[0-9a-f]{12}$/);
+    expect(Number.isInteger(observation.mtimeMs)).toBe(true);
 
     logUnexpectedObservations(result);
     expect(warnSpy).toHaveBeenCalledTimes(1);
@@ -97,6 +98,7 @@ describe("secrets-dir-watch", () => {
     const row = inserted[0][0] as Record<string, unknown>;
     expect(row.observedFileName).toBe("rogue.key");
     expect(row.classification).toBe("unexpected");
+    expect(Number.isInteger(row.mtimeMs)).toBe(true);
     expect(row.sha256FingerprintPrefix).toBe(fingerprintPrefix(secret));
   });
 
