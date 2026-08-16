@@ -3266,6 +3266,33 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+// ─── Diagnostics ─────────────────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/diagnostics/github-credential",
+  tags: ["diagnostics"],
+  summary: "Check GitHub credential resolution for a company",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: {
+    200: r.ok(z.object({
+      resolved: z.boolean(),
+      scope: z.enum(["project_env", "company"]).nullable(),
+      secretName: z.string().nullable(),
+      reason: z.string().optional(),
+      probe: z.object({
+        attempted: z.boolean(),
+        status: z.number().int().optional(),
+        ok: z.boolean().optional(),
+        rateLimitLimit: z.number().int().optional(),
+      }),
+      checkedAt: z.string().datetime(),
+    })),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
 // ─── Activity ────────────────────────────────────────────────────────────────
 
 registry.registerPath({
