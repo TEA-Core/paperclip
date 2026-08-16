@@ -43,6 +43,7 @@ import {
   refreshRemoteTrackingBaseRef,
   releaseRuntimeServicesForRun,
   resolveBaseRepoHygieneDecision,
+  resolvePnpmLockfileMismatchRetryCommand,
   resetRuntimeServicesForTests,
   resolveRuntimeProvisionCommand,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
@@ -3273,6 +3274,143 @@ describe("realizeExecutionWorkspace", () => {
     const actualHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: initial.cwd })).stdout.trim();
     expect(actualHead).toBe(expectedHead);
   }, 15_000);
+
+  // SUP-13090: SUP-12986 and SUP-12996 failed EVERY dispatch in ~8s because their reused
+  // execution workspaces run the inline provisionCommand
+  // `corepack enable && pnpm install --frozen-lockfile --prefer-offline`, which never reaches
+  // scripts/provision-worktree.sh and so never inherited SUP-12984's lockfile-mismatch retry.
+  describe("pnpm lockfile-mismatch provision retry (SUP-13090)", () => {
+    it("rewrites the frozen flag for both pnpm lockfile-mismatch codes and nothing else", () => {
+      const command = "corepack enable && pnpm install --frozen-lockfile --prefer-offline";
+      const expected = "corepack enable && pnpm install --no-frozen-lockfile --prefer-offline";
+
+      expect(resolvePnpmLockfileMismatchRetryCommand(command, "x ERR_PNPM_LOCKFILE_CONFIG_MISMATCH y")).toBe(expected);
+      expect(resolvePnpmLockfileMismatchRetryCommand(command, "x ERR_PNPM_OUTDATED_LOCKFILE y")).toBe(expected);
+
+      // Not a lockfile mismatch — must not be retried.
+      expect(resolvePnpmLockfileMismatchRetryCommand(command, "ERR_PNPM_FETCH_404 Not Found")).toBeNull();
+      // Nothing to rewrite: retrying would re-run the identical command forever.
+      expect(
+        resolvePnpmLockfileMismatchRetryCommand("pnpm install --no-frozen-lockfile", "ERR_PNPM_OUTDATED_LOCKFILE"),
+      ).toBeNull();
+      expect(
+        resolvePnpmLockfileMismatchRetryCommand("pnpm install --frozen-lockfile=false", "ERR_PNPM_OUTDATED_LOCKFILE"),
+      ).toBeNull();
+    });
+
+    async function setUpReusableWorkspaceWithProvisionScript(input: {
+      identifier: string;
+      scriptBody: string[];
+    }) {
+      const repoRoot = await createTempRepo();
+      const scriptPath = path.join(repoRoot, "..", `paperclip-fake-install-${randomUUID()}.sh`);
+      await fs.writeFile(scriptPath, ["#!/usr/bin/env bash", ...input.scriptBody].join("\n"), "utf8");
+      await fs.chmod(scriptPath, 0o755);
+
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+        },
+        issue: { id: "issue-1", identifier: input.identifier, title: "Reuse with provision command" },
+        agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      });
+
+      const reuse = (provisionCommand: string, recorder: WorkspaceOperationRecorder) =>
+        ensurePersistedExecutionWorkspaceAvailable({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-1",
+            workspaceId: "workspace-1",
+            repoUrl: null,
+            repoRef: "HEAD",
+          },
+          workspace: {
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            cwd: workspace.cwd,
+            providerRef: workspace.worktreePath,
+            projectId: "project-1",
+            projectWorkspaceId: "workspace-1",
+            repoUrl: null,
+            baseRef: "HEAD",
+            branchName: workspace.branchName,
+            config: { provisionCommand },
+          },
+          issue: { id: "issue-1", identifier: input.identifier, title: "Reuse with provision command" },
+          agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+          recorder,
+        });
+
+      return { repoRoot, workspace, scriptPath, reuse };
+    }
+
+    it("retries the reuse provision command without --frozen-lockfile on ERR_PNPM_LOCKFILE_CONFIG_MISMATCH", async () => {
+      const { workspace, scriptPath, reuse } = await setUpReusableWorkspaceWithProvisionScript({
+        identifier: "PAP-13090",
+        scriptBody: [
+          "set -uo pipefail",
+          'printf "%s\\n" "$*" >> .provision-attempts',
+          'for arg in "$@"; do',
+          '  if [[ "$arg" == "--no-frozen-lockfile" ]]; then',
+          '    printf "installed\\n" > .provision-succeeded',
+          "    exit 0",
+          "  fi",
+          "done",
+          'printf "%s\\n" " ERR_PNPM_LOCKFILE_CONFIG_MISMATCH  Cannot proceed with the frozen installation. The current \\"overrides\\" configuration doesn\'t match the value found in the lockfile" >&2',
+          "exit 1",
+        ],
+      });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+      const restored = await reuse(`bash ${scriptPath} --frozen-lockfile --prefer-offline`, recorder);
+
+      expect(restored).not.toBeNull();
+      await expect(fs.readFile(path.join(workspace.cwd, ".provision-succeeded"), "utf8")).resolves.toBe("installed\n");
+      // Both attempts ran, in order, and only the second dropped the frozen flag.
+      await expect(fs.readFile(path.join(workspace.cwd, ".provision-attempts"), "utf8")).resolves.toBe(
+        ["--frozen-lockfile --prefer-offline", "--no-frozen-lockfile --prefer-offline", ""].join("\n"),
+      );
+      const provisionOps = operations.filter((op) => op.phase === "workspace_provision");
+      expect(provisionOps).toHaveLength(2);
+      expect(provisionOps[0]?.result.status).toBe("failed");
+      expect(provisionOps[0]?.metadata?.lockfileMismatchRetry).toBeUndefined();
+      expect(provisionOps[1]?.result.status).toBe("succeeded");
+      expect(provisionOps[1]?.metadata?.lockfileMismatchRetry).toBe(true);
+    }, 15_000);
+
+    // Negative control: a provision failure that is NOT a lockfile mismatch must still fail the
+    // dispatch. A blanket retry would mask registry 404s, EACCES, and missing peers.
+    it("does not retry a provision failure that is not a lockfile mismatch", async () => {
+      const { workspace, scriptPath, reuse } = await setUpReusableWorkspaceWithProvisionScript({
+        identifier: "PAP-13091",
+        scriptBody: [
+          "set -uo pipefail",
+          'printf "%s\\n" "$*" >> .provision-attempts',
+          'printf "%s\\n" " ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/nope: Not Found" >&2',
+          "exit 1",
+        ],
+      });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+      await expect(reuse(`bash ${scriptPath} --frozen-lockfile --prefer-offline`, recorder)).rejects.toThrow(
+        /ERR_PNPM_FETCH_404/,
+      );
+
+      await expect(fs.readFile(path.join(workspace.cwd, ".provision-attempts"), "utf8")).resolves.toBe(
+        "--frozen-lockfile --prefer-offline\n",
+      );
+      expect(operations.filter((op) => op.phase === "workspace_provision")).toHaveLength(1);
+    }, 15_000);
+  });
 
   it("repairs a clean persisted git worktree branch mismatch when both branches point at the same commit", async () => {
     const repoRoot = await createTempRepo();

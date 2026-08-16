@@ -1932,8 +1932,75 @@ describe("effective run execution workspace config freshness", () => {
     // heartbeat keeps the agent idle instead of flipping the whole agent to error.
     expect(error).toBeInstanceOf(WorkspaceValidationFailure);
     expect((error as WorkspaceValidationFailure).code).toBe("workspace_validation_failed");
-    expect((error as WorkspaceValidationFailure).resultJson).toEqual({});
     expect(realizeWorkspace).not.toHaveBeenCalled();
+  });
+
+  // SUP-13090: the concrete reuse failure reason must be readable from the run's
+  // resultJson, not swallowed into an empty payload. Recovery reads
+  // `resultJson.workspaceValidation` to build `evidence`; an empty object left
+  // agents with only the "withheld" placeholder and no way to diagnose the cause
+  // (e.g. ERR_PNPM_LOCKFILE_CONFIG_MISMATCH) from the API alone.
+  it("surfaces the reuse failure reason in the workspace validation resultJson", async () => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
+      nextMetadata: metadata,
+    });
+    const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] as string[] }));
+
+    const error = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceId: "workspace-old",
+      issueRef: { id: "issue-1", identifier: "PAP-42" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace: async () => {
+        throw new Error("Execution workspace provision command failed: ERR_PNPM_LOCKFILE_CONFIG_MISMATCH");
+      },
+      realizeWorkspace,
+    }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    expect(error).toBeInstanceOf(WorkspaceValidationFailure);
+    const resultJson = (error as WorkspaceValidationFailure).resultJson;
+    expect(resultJson.workspaceValidation).toEqual({
+      reason: "inherited_workspace_reuse_failed",
+      executionWorkspaceId: "workspace-old",
+      cause: "Execution workspace provision command failed: ERR_PNPM_LOCKFILE_CONFIG_MISMATCH",
+    });
+  });
+
+  it("surfaces an unavailable-reuse reason when restore returns no workspace", async () => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
+      nextMetadata: metadata,
+    });
+    const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] as string[] }));
+
+    const error = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceId: "workspace-old",
+      issueRef: { id: "issue-1", identifier: "PAP-42" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace: async () => null,
+      realizeWorkspace,
+    }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    expect(error).toBeInstanceOf(WorkspaceValidationFailure);
+    expect((error as WorkspaceValidationFailure).resultJson.workspaceValidation).toEqual({
+      reason: "inherited_workspace_reuse_unavailable",
+      executionWorkspaceId: "workspace-old",
+      cause: null,
+    });
   });
 
   it("formats a safe workspace operation payload for config drift decisions", () => {
