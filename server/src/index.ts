@@ -79,7 +79,7 @@ import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
-import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
+import { ensureDecisionSigningSecret, assertDecisionSigningKeyPathAtBoot, countStaleSignedDecisions } from "./services/decision-signing.js";
 import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
 import {
   coordinateHeartbeatSchedulerShutdown,
@@ -140,6 +140,7 @@ export async function startServer(): Promise<StartedServer> {
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
   ensureDecisionSigningSecret();
+  assertDecisionSigningKeyPathAtBoot();
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
@@ -589,6 +590,13 @@ export async function startServer(): Promise<StartedServer> {
     .sweepSupersededPendingRequestConfirmations();
   if (confirmationSweep.expired > 0) {
     logger.info(confirmationSweep, "Expired pending confirmations superseded by newer agent requests");
+  }
+  const staleSignedDecisions = await countStaleSignedDecisions(db as any);
+  if (staleSignedDecisions) {
+    logger.info(
+      { count: staleSignedDecisions.count, containerStart: staleSignedDecisions.containerStart.toISOString() },
+      `SUP-13017: ${staleSignedDecisions.count} decisions with signedSpec older than current container start — their signatures cannot be verified if the signing key was regenerated`,
+    );
   }
   if (config.deploymentMode === "authenticated") {
     const {
