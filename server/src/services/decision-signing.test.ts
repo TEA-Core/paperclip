@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -128,12 +128,24 @@ describe("decision-signing", () => {
       const spec = { id: "test-decision", options: [{ id: "opt1", effects: [] }] };
       const signature = signDecisionSpec(spec);
 
-      const result = verifyDecisionSpec(spec, signature);
-      expect(result.ok).toBe(true);
-    });
-  });
+       const result = verifyDecisionSpec(spec, signature);
+       expect(result.ok).toBe(true);
+     });
 
-  describe("assertDecisionSigningKeyPathAtBoot (SUP-13017)", () => {
+     it("verifies a legacy v1 signature produced by the same key", async () => {
+       const secret = "a".repeat(60);
+       process.env.PAPERCLIP_DECISION_SIGNING_SECRET = secret;
+       const { verifyDecisionSpec } = await import("./decision-signing.js");
+       const spec = "legacy-scalar-value";
+       const mac = createHmac("sha256", secret)
+         .update(`decision-spec-v1:${JSON.stringify(spec)}`)
+         .digest("hex");
+       const result = verifyDecisionSpec(spec, `decision-spec-v1.${mac}`);
+       expect(result.ok).toBe(true);
+     });
+   });
+
+   describe("assertDecisionSigningKeyPathAtBoot (SUP-13017)", () => {
     it("logs the resolved key path and fingerprints", async () => {
       process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

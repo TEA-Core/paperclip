@@ -287,7 +287,7 @@ export function verifyDecisionSpec(value: unknown, signature: string) {
     .update(`decision-spec-v1:${canonical(value)}`)
     .digest("hex");
   const expected = Buffer.from(expectedMac);
-  const actual = Buffer.from(signature);
+  const actual = Buffer.from(parts[1] ?? "");
   if (expected.length === actual.length && timingSafeEqual(expected, actual)) {
     return { ok: true };
   }
