@@ -34,6 +34,7 @@ import {
   issueLabels,
   issues,
   labels,
+  projects,
   unWakeableArchives,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
@@ -100,6 +101,10 @@ import {
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { loadConfig } from "../../config.js";
+import {
+  canAgentSatisfyIssueWorkspaceSettings,
+  parseProjectExecutionWorkspacePolicy,
+} from "../execution-workspace-policy.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -2953,6 +2958,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     candidateIds.push(...roleCandidates.map((agent) => agent.id));
     if (issue.assigneeAgentId) candidateIds.push(issue.assigneeAgentId);
 
+    const projectPolicy = issue.projectId
+      ? await db
+          .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+          .from(projects)
+          .where(and(eq(projects.id, issue.projectId), eq(projects.companyId, issue.companyId)))
+          .then((rows) => rows[0]?.executionWorkspacePolicy ?? null)
+      : null;
+    const parsedProjectPolicy = parseProjectExecutionWorkspacePolicy(projectPolicy);
+
     const seen = new Set<string>();
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
@@ -2963,6 +2977,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issueId: issue.id,
         projectId: issue.projectId,
       });
+      if (!canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: issue.projectId,
+          projectWorkspaceId: issue.projectWorkspaceId,
+          executionWorkspaceId: issue.executionWorkspaceId,
+          executionWorkspacePreference: issue.executionWorkspacePreference,
+        },
+        executionWorkspaceSettings: issue.executionWorkspaceSettings,
+        projectPolicy: parsedProjectPolicy,
+      })) continue;
       if ((await isAgentInvokable(candidate)) && !budgetBlock) return candidate.id;
     }
 

@@ -147,6 +147,35 @@ export function isUnrunnableWorktreeCombo(input: {
   return input.hasResolvablePriorSessionWorkspace !== true;
 }
 
+export function canAgentSatisfyIssueWorkspaceSettings(input: {
+  issue: UnrunnableWorktreeIssueRef;
+  executionWorkspaceSettings: unknown;
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  reusableExecutionWorkspaceAvailable?: boolean | null;
+  hasResolvablePriorSessionWorkspace?: boolean | null;
+}): boolean {
+  const settings = parseIssueExecutionWorkspaceSettings(input.executionWorkspaceSettings);
+  const mode = settings?.mode;
+  if (mode !== "isolated_workspace" && mode !== "operator_branch") return true;
+
+  const resolvedMode = mode as ParsedExecutionWorkspaceMode;
+  const workspaceConfig = buildExecutionWorkspaceAdapterConfig({
+    agentConfig: {},
+    projectPolicy: input.projectPolicy,
+    issueSettings: settings,
+    mode: resolvedMode,
+    legacyUseProjectWorkspace: null,
+  });
+  const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, workspaceConfig);
+  return !isUnrunnableWorktreeCombo({
+    issue: input.issue,
+    resolvedMode,
+    resolvedStrategy,
+    reusableExecutionWorkspaceAvailable: input.reusableExecutionWorkspaceAvailable,
+    hasResolvablePriorSessionWorkspace: input.hasResolvablePriorSessionWorkspace,
+  });
+}
+
 export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecutionWorkspacePolicy | null {
   const parsed = parseObject(raw);
   if (Object.keys(parsed).length === 0) return null;
