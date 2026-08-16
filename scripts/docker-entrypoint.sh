@@ -71,6 +71,25 @@ fi
 # so the key is handed to the server via the environment (exported below) BEFORE
 # privileges drop to node.
 install -d -m 0700 -o root -g root /etc/paperclip/secrets
+
+# First-boot key bootstrap: when no key file exists and the operator has
+# explicitly opted in via PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1, generate
+# 32 random bytes base64 as root and write master.key with root:root 0600.
+# This runs in the root phase so the write succeeds — the directory is
+# root-owned 0700, and uid-1000 agent runs (which share the server's UID)
+# cannot create or replace the key themselves. The server's own generation
+# path (local-encrypted-provider.ts) is unreachable after the gosu drop
+# because the directory is unwritable by uid 1000.
+#
+# Format must match the provider: randomBytes(32).toString("base64"),
+# which decodeMasterKey trims + base64-decodes + requires to be 32 bytes.
+# `head -c 32 /dev/urandom | base64` produces the same shape.
+if [ ! -f /etc/paperclip/secrets/master.key ] && [ "${PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION:-0}" = "1" ]; then
+    head -c 32 /dev/urandom | base64 > /etc/paperclip/secrets/master.key
+    chown root:root /etc/paperclip/secrets/master.key
+    chmod 0600 /etc/paperclip/secrets/master.key
+fi
+
 if [ -f /etc/paperclip/secrets/master.key ]; then
     chown root:root /etc/paperclip/secrets/master.key
     chmod 0600 /etc/paperclip/secrets/master.key
