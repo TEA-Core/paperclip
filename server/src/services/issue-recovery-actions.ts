@@ -162,6 +162,27 @@ export function issueRecoveryActionService(db: Db) {
     return row ? toReadModel(row) : null;
   }
 
+  async function getLatestForFingerprint(
+    companyId: string,
+    sourceIssueId: string,
+    fingerprint: string,
+  ): Promise<IssueRecoveryAction | null> {
+    const row = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          eq(issueRecoveryActions.fingerprint, fingerprint),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return row ? toReadModel(row) : null;
+  }
+
   async function listActiveForIssues(companyId: string, sourceIssueIds: string[]) {
     if (sourceIssueIds.length === 0) return new Map<string, IssueRecoveryAction>();
     const rows = await db
@@ -180,6 +201,20 @@ export function issueRecoveryActionService(db: Db) {
       if (!result.has(row.sourceIssueId)) result.set(row.sourceIssueId, toReadModel(row));
     }
     return result;
+  }
+
+  async function listAllForIssue(companyId: string, sourceIssueId: string): Promise<IssueRecoveryAction[]> {
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt));
+    return rows.map(toReadModel);
   }
 
   async function retryUpsertSourceScoped(
@@ -253,6 +288,11 @@ export function issueRecoveryActionService(db: Db) {
     }
 
     try {
+      const prev = await getLatestForFingerprint(
+        input.companyId,
+        input.sourceIssueId,
+        input.fingerprint,
+      );
       const [created] = await db
         .insert(issueRecoveryActions)
         .values({
@@ -272,7 +312,7 @@ export function issueRecoveryActionService(db: Db) {
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: 1,
+          attemptCount: (prev?.attemptCount ?? 0) + 1,
           maxAttempts: input.maxAttempts ?? null,
           timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
@@ -333,7 +373,9 @@ export function issueRecoveryActionService(db: Db) {
   return {
     getActiveForIssue,
     getLatestResolvedForIssue,
+    getLatestForFingerprint,
     listActiveForIssues,
+    listAllForIssue,
     resolveActiveForIssue,
     upsertSourceScoped,
   };
