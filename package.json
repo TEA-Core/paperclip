@@ -105,7 +105,8 @@
       "@lexical/react": "0.46.0",
       "@lexical/rich-text": "0.46.0",
       "@lexical/selection": "0.46.0",
-      "@lexical/utils": "0.46.0"
+      "@lexical/utils": "0.46.0",
+      "sup13002-repro": "1.0.0"
     }
   }
 }
