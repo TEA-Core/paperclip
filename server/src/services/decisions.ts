@@ -8,6 +8,7 @@ import { conflict, forbidden, notFound, tooManyRequests, unprocessable } from ".
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { signDecisionSpec, verifyDecisionSpec } from "./decision-signing.js";
+import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
 import { decisionRetentionService, hashAttentionArchiveManifest } from "./decision-retention.js";
 
@@ -538,12 +539,13 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     const run = await db.select({ responsibleUserId: heartbeatRuns.responsibleUserId }).from(heartbeatRuns).where(eq(heartbeatRuns.id, decision.originRunId)).then((rows) => rows[0] ?? null);
     const metadata = decision.metadata as Record<string, unknown>;
     if (metadata.kind === "attention_archive_proposal") {
-      if (!verifyDecisionSpec(spec({
+      const verification = verifyDecisionSpec(spec({
         id: decision.id,
         options: decision.options,
         targetSnapshots: decision.targetSnapshots as Record<string, Snapshot>,
-      }), decision.signedSpec)) {
-        await db.update(decisions).set({ executionStatus: "failed", updatedAt: new Date(), metadata: { ...metadata, archiveProposalError: "invalid_signature" } })
+      }), decision.signedSpec);
+      if (!verification.ok) {
+        await db.update(decisions).set({ executionStatus: "failed", updatedAt: new Date(), metadata: { ...metadata, archiveProposalError: verification.reason === "key_rotation" ? "invalid_signature_rotated_key" : "invalid_signature" } })
           .where(eq(decisions.id, decision.id));
         return outcome(decision.id);
       }
@@ -627,7 +629,13 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     userActor: AuthorizationActor; dismissed?: boolean; dismissReason?: string | null }) {
     const current = await get(input.id); if (!current) throw notFound("Decision not found");
     const metadata = current.metadata as Record<string, unknown>;
-    if (!verifyDecisionSpec(spec({ id: current.id, options: current.options, targetSnapshots: current.targetSnapshots as Record<string, Snapshot> }), current.signedSpec)) throw forbidden("Decision signature verification failed");
+    const verification = verifyDecisionSpec(spec({ id: current.id, options: current.options, targetSnapshots: current.targetSnapshots as Record<string, Snapshot> }), current.signedSpec);
+    if (!verification.ok) {
+      if (verification.reason === "key_rotation") {
+        logger.warn({ decisionId: current.id, reason: "key_rotation" }, verification.message);
+      }
+      throw forbidden(verification.message);
+    }
     if (current.status === "decided" && input.idempotencyKey && metadata.decideIdempotencyKey === input.idempotencyKey) {
       if (current.decidedByUserId !== input.decidedByUserId) throw forbidden("Decision replay belongs to a different user");
       return resumeDecision(current, input.userActor);
@@ -684,7 +692,13 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
 
   async function dismiss(id: string, userId: string, userActor: AuthorizationActor, reason?: string | null) {
     const current = await get(id); if (!current) throw notFound("Decision not found");
-    if (!verifyDecisionSpec(spec({ id: current.id, options: current.options, targetSnapshots: current.targetSnapshots as Record<string, Snapshot> }), current.signedSpec)) throw forbidden("Decision signature verification failed");
+    const verification = verifyDecisionSpec(spec({ id: current.id, options: current.options, targetSnapshots: current.targetSnapshots as Record<string, Snapshot> }), current.signedSpec);
+    if (!verification.ok) {
+      if (verification.reason === "key_rotation") {
+        logger.warn({ decisionId: current.id, reason: "key_rotation" }, verification.message);
+      }
+      throw forbidden(verification.message);
+    }
     const empty = current.options.find((option) => option.effects.length === 0);
     if (empty) return decide({ id, optionId: empty.id, decidedByUserId: userId, userActor, dismissed: true, dismissReason: reason });
     const [updated] = await db.update(decisions).set({ status: "decided", executionStatus: "succeeded", chosenOptionId: "dismissed", decidedByUserId: userId,

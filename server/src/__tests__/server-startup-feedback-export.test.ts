@@ -427,6 +427,7 @@ describe("startServer feedback export wiring", () => {
   it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {
     const { keyPath, cleanup } = useIsolatedSecretsDir("paperclip-decision-key-");
     delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
+    process.env.PAPERCLIP_DECISION_SIGNING_ALLOW_KEY_GENERATION = "1";
     try {
       const started = await startServer();
       expect(started.server).toBe(fakeServer);
