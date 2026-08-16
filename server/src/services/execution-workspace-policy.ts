@@ -154,7 +154,6 @@ export function canAgentSatisfyIssueWorkspaceSettings(input: {
   reusableExecutionWorkspaceAvailable?: boolean | null;
   hasResolvablePriorSessionWorkspace?: boolean | null;
   agentConfig?: Record<string, unknown> | null;
-  boundWorkspaceStrategyType?: string | null;
 }): boolean {
   const settings = parseIssueExecutionWorkspaceSettings(input.executionWorkspaceSettings);
   const mode = settings?.mode;
@@ -174,16 +173,17 @@ export function canAgentSatisfyIssueWorkspaceSettings(input: {
     mode: resolvedMode,
     legacyUseProjectWorkspace: null,
   });
-  const derivedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, candidateWorkspaceConfig);
-
-  // SUP-13100: when the issue supplies a reuse_existing binding, prefer the
-  // strategyType persisted on the execution_workspaces row over the strategy
-  // derived from executionWorkspaceSettings. Fall back to the derivation when
-  // there is no bound row, the row is not found, or its strategyType is absent.
-  const resolvedStrategy =
-    hasReusableExecutionWorkspaceBinding(input.issue) && input.boundWorkspaceStrategyType
-      ? input.boundWorkspaceStrategyType
-      : derivedStrategy;
+  // SUP-13100 (reverted, ruling in SUP-13100 round-4): a previous revision preferred the
+  // strategyType persisted on the bound `execution_workspaces` row over this derivation.
+  // That override was provably dead code. It only engaged when
+  // `hasReusableExecutionWorkspaceBinding(issue)` was true, and for exactly those inputs
+  // `isUnrunnableWorktreeCombo` already short-circuits to "capable" on its reusable-workspace
+  // check — the ladder (recovery/service.ts) passes no `reusableExecutionWorkspaceAvailable`,
+  // so that check falls back to the same binding predicate. Measured: 540 ladder-reachable
+  // input combinations × 4 bound strategyType values produced zero divergence in the return
+  // value. Do not reintroduce it without first making the call site pass an explicit
+  // `reusableExecutionWorkspaceAvailable`.
+  const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, candidateWorkspaceConfig);
 
   return !isUnrunnableWorktreeCombo({
     issue: input.issue,

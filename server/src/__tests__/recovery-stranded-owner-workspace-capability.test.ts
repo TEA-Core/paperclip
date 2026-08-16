@@ -257,9 +257,44 @@ describe("recovery stranded-owner workspace capability filter", () => {
     ).toBe(true);
   });
 
-  it("AC1: bound reuse_existing workspace with strategyType git_worktree resolves git_worktree (not project_primary) when issue settings omit workspaceStrategy", () => {
-    // SUP-12986 live shape: mode isolated_workspace, no workspaceStrategy in
-    // issue settings, bound reuse_existing workspace with strategyType git_worktree.
+  it("a bound reuse_existing issue is capable on every ladder-reachable input (SUP-12986 live shape)", () => {
+    // SUP-12986's real shape: mode isolated_workspace, NO workspaceStrategy in issue
+    // settings, bound reuse_existing workspace. Dispatch precedence
+    // (buildExecutionWorkspaceAdapterConfig) resolves the strategy to git_worktree here —
+    // not project_primary — but the ladder's call site passes no
+    // `reusableExecutionWorkspaceAvailable`, so isUnrunnableWorktreeCombo short-circuits to
+    // "capable" on the binding itself, whatever the strategy is.
+    //
+    // This is the reason the reverted bound-workspace strategyType override was inert: on a
+    // bound issue the predicate's answer does not depend on the strategy at all. Asserted
+    // across the full matrix so a future strategy-sourcing change cannot claim an effect here
+    // without this test changing.
+    for (const projectId of [null, "project-1"]) {
+      for (const settings of [
+        { mode: "isolated_workspace" },
+        { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree" } },
+        { mode: "isolated_workspace", workspaceStrategy: { type: "project_primary" } },
+      ]) {
+        expect(
+          canAgentSatisfyIssueWorkspaceSettings({
+            issue: {
+              projectId,
+              projectWorkspaceId: null,
+              executionWorkspaceId: "18b48d3c",
+              executionWorkspacePreference: "reuse_existing",
+            },
+            executionWorkspaceSettings: settings,
+            projectPolicy: null,
+          }),
+        ).toBe(true);
+      }
+    }
+  });
+
+  it("an explicit reusableExecutionWorkspaceAvailable: false disarms the binding short-circuit (the only shape where strategy is observable)", () => {
+    // Polarity control for the test above: the binding short-circuit — not some unconditional
+    // `true` — is what makes a bound issue capable. No production caller passes this flag
+    // today; if one ever does, the strategy becomes load-bearing and this arm goes red first.
     expect(
       canAgentSatisfyIssueWorkspaceSettings({
         issue: {
@@ -270,25 +305,10 @@ describe("recovery stranded-owner workspace capability filter", () => {
         },
         executionWorkspaceSettings: { mode: "isolated_workspace" },
         projectPolicy: null,
-        boundWorkspaceStrategyType: "git_worktree",
+        reusableExecutionWorkspaceAvailable: false,
+        hasResolvablePriorSessionWorkspace: false,
       }),
-    ).toBe(true);
-  });
-
-  it("AC2: with projectId truthy, bound git_worktree workspace still returns capable", () => {
-    expect(
-      canAgentSatisfyIssueWorkspaceSettings({
-        issue: {
-          projectId: "project-1",
-          projectWorkspaceId: null,
-          executionWorkspaceId: "18b48d3c",
-          executionWorkspacePreference: "reuse_existing",
-        },
-        executionWorkspaceSettings: { mode: "isolated_workspace" },
-        projectPolicy: null,
-        boundWorkspaceStrategyType: "git_worktree",
-      }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("AC3: no bound workspace, projectId/projectWorkspaceId null, hasResolvablePriorSessionWorkspace false → incapable", () => {
@@ -307,51 +327,4 @@ describe("recovery stranded-owner workspace capability filter", () => {
     ).toBe(false);
   });
 
-  it("AC4 polarity: bound workspace strategyType is preferred over derived strategy", () => {
-    // Polarity proof: with a reuse_existing binding, the predicate must consult
-    // the bound workspace's strategyType, not the strategy derived from
-    // executionWorkspaceSettings. We prove this by showing that a bound
-    // strategyType of "project_primary" short-circuits isUnrunnableWorktreeCombo
-    // (which only fires for "git_worktree"), while the derived strategy for
-    // isolated_workspace with no workspaceStrategy is "project_primary" — so
-    // without the fix, the derived strategy is also "project_primary" and the
-    // result is the same. The polarity is proven by the fact that boundWorkspaceStrategyType
-    // "git_worktree" makes the predicate resolve "git_worktree" (AC1), while
-    // boundWorkspaceStrategyType "project_primary" makes it resolve "project_primary"
-    // (short-circuit). Both are capable because of the reusable binding, but the
-    // strategy resolution differs — proven by AC1 and the isUnrunnableWorktreeCombo
-    // tests above.
-    //
-    // Bound "project_primary": isUnrunnableWorktreeCombo short-circuits at the
-    // strategy check (project_primary !== git_worktree) → capable.
-    expect(
-      canAgentSatisfyIssueWorkspaceSettings({
-        issue: {
-          projectId: null,
-          projectWorkspaceId: null,
-          executionWorkspaceId: "18b48d3c",
-          executionWorkspacePreference: "reuse_existing",
-        },
-        executionWorkspaceSettings: { mode: "isolated_workspace" },
-        projectPolicy: null,
-        boundWorkspaceStrategyType: "project_primary",
-      }),
-    ).toBe(true);
-
-    // Bound "git_worktree": isUnrunnableWorktreeCombo proceeds past the strategy
-    // check, but the reusable binding makes it capable → capable.
-    expect(
-      canAgentSatisfyIssueWorkspaceSettings({
-        issue: {
-          projectId: null,
-          projectWorkspaceId: null,
-          executionWorkspaceId: "18b48d3c",
-          executionWorkspacePreference: "reuse_existing",
-        },
-        executionWorkspaceSettings: { mode: "isolated_workspace" },
-        projectPolicy: null,
-        boundWorkspaceStrategyType: "git_worktree",
-      }),
-    ).toBe(true);
-  });
 });

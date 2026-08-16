@@ -13,6 +13,7 @@ import {
   parseProjectExecutionWorkspacePolicy,
   resolveExecutionWorkspaceEnvironmentId,
   resolvePinnedIssueWorkspaceStrategyType,
+  resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceMode,
   resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
@@ -344,41 +345,29 @@ describe("execution workspace policy helpers", () => {
     ).toBe(true);
   });
 
-  it("prefers persisted bound workspace strategyType over derived strategy for reuse_existing binding (SUP-13100)", () => {
-    // SUP-12986 live shape: mode isolated_workspace, no workspaceStrategy in
-    // issue settings, but a bound reuse_existing workspace with strategyType
-    // git_worktree. The predicate must resolve git_worktree (not project_primary).
+  it("dispatch precedence resolves an isolated_workspace issue with no explicit strategy to git_worktree", () => {
+    // Pins the fact that falsified SUP-13105's premise: buildExecutionWorkspaceAdapterConfig
+    // supplies { type: "git_worktree" } as its final fallback whenever hasWorkspaceControl is
+    // true, and `mode` alone sets issueHasWorkspaceOverrides. So the strategy the predicate
+    // derives for SUP-12986's `{"mode":"isolated_workspace"}` is git_worktree — it was never
+    // "blind to git_worktree", which is why sourcing the strategy from the bound workspace row
+    // instead could not change any outcome.
+    const config = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: {},
+      projectPolicy: null,
+      issueSettings: { mode: "isolated_workspace" },
+      mode: "isolated_workspace",
+      legacyUseProjectWorkspace: null,
+    });
+    expect(resolveEffectiveWorkspaceStrategyType("isolated_workspace", config)).toBe("git_worktree");
+    // The same input through resolvePinnedIssueWorkspaceStrategyType — the resolver the
+    // predicate does NOT use — returns project_primary. That divergence is the trap.
     expect(
-      canAgentSatisfyIssueWorkspaceSettings({
-        issue: {
-          projectId: null,
-          projectWorkspaceId: null,
-          executionWorkspaceId: "workspace-1",
-          executionWorkspacePreference: "reuse_existing",
-        },
-        executionWorkspaceSettings: { mode: "isolated_workspace" },
-        projectPolicy: null,
-        boundWorkspaceStrategyType: "git_worktree",
+      resolvePinnedIssueWorkspaceStrategyType({
+        mode: "isolated_workspace",
+        issueSettings: { mode: "isolated_workspace" },
       }),
-    ).toBe(true);
-  });
-
-  it("with projectId truthy, bound git_worktree workspace still returns capable (SUP-13100 AC2)", () => {
-    // Same as above but projectId is set: isUnrunnableWorktreeCombo bails on
-    // projectId, so the predicate returns capable regardless.
-    expect(
-      canAgentSatisfyIssueWorkspaceSettings({
-        issue: {
-          projectId: "project-1",
-          projectWorkspaceId: null,
-          executionWorkspaceId: "workspace-1",
-          executionWorkspacePreference: "reuse_existing",
-        },
-        executionWorkspaceSettings: { mode: "isolated_workspace" },
-        projectPolicy: null,
-        boundWorkspaceStrategyType: "git_worktree",
-      }),
-    ).toBe(true);
+    ).toBe("project_primary");
   });
 
   it("with no bound workspace and no reusable binding, returns incapable when projectId/projectWorkspaceId are null (SUP-13100 AC3)", () => {
@@ -397,10 +386,11 @@ describe("execution workspace policy helpers", () => {
     ).toBe(false);
   });
 
-  it("falls back to derived strategy when boundWorkspaceStrategyType is absent (SUP-13100 consume contract)", () => {
-    // No boundWorkspaceStrategyType passed → derivation from settings applies.
-    // With no workspaceStrategy in settings, derived is project_primary → not
-    // git_worktree → isUnrunnableWorktreeCombo returns false (mode check fails).
+  it("a bound reuse_existing binding alone makes the issue capable (SUP-13100 consume contract)", () => {
+    // The derived strategy here IS git_worktree (see the dispatch-precedence test above) and
+    // projectId/projectWorkspaceId are both null, so isUnrunnableWorktreeCombo reaches its
+    // reusable-workspace check — and the binding short-circuits it to capable. That
+    // short-circuit, not the strategy, is what decides every bound issue.
     expect(
       canAgentSatisfyIssueWorkspaceSettings({
         issue: {
