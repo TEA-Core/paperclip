@@ -378,24 +378,33 @@ describePg("decisionService", () => {
     const created = await createCommentDecision();
     const secrets = useIsolatedSecretsDir("paperclip-decision-rotate-");
     delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
+    // The isolated secrets dir holds no key, so the opt-in makes the fork
+    // generate a fresh one. That is exactly the container-replacement case:
+    // verification must report key rotation instead of silently succeeding.
+    process.env.PAPERCLIP_DECISION_SIGNING_ALLOW_KEY_GENERATION = "1";
     process.env.PAPERCLIP_AGENT_JWT_SECRET = "agent-jwt-secret-must-not-sign-decisions";
     try {
       await expect(service().decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() }))
-        .rejects.toThrow("Decision signature verification failed");
+        .rejects.toThrow(/Decision signature verification failed: the signing key was rotated/);
       expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(0);
     } finally {
+      delete process.env.PAPERCLIP_DECISION_SIGNING_ALLOW_KEY_GENERATION;
       secrets.cleanup();
     }
   });
 
-  it("signs and verifies with an auto-generated key when no secret is configured", async () => {
+  it("signs and verifies with an auto-generated key when no secret is configured and generation is allowed", async () => {
     const secrets = useIsolatedSecretsDir("paperclip-decision-generated-");
     delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
+    // Key generation is opt-in: without the flag the fork refuses to create a
+    // key at all, which decision-signing.test.ts covers.
+    process.env.PAPERCLIP_DECISION_SIGNING_ALLOW_KEY_GENERATION = "1";
     try {
       const created = await createCommentDecision();
       const result = await service().decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
       expect(result.executionStatus).toBe("succeeded");
     } finally {
+      delete process.env.PAPERCLIP_DECISION_SIGNING_ALLOW_KEY_GENERATION;
       secrets.cleanup();
     }
   });
