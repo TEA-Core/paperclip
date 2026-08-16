@@ -1484,6 +1484,78 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     );
   });
 
+  // SUP-13090: SUP-12986/SUP-12996 minted a fresh workspace_validation action every ~8s for
+  // hours while `evidence.failureSummary` read only the "withheld" placeholder, so the real
+  // cause (ERR_PNPM_LOCKFILE_CONFIG_MISMATCH) was unreadable from the API.
+  it("surfaces the workspace validation reason and cause in evidence.failureSummary", async () => {
+    const { sourceIssue, coderId, prefix, companyId } = await seedCompany();
+    await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const cause =
+      'Execution workspace provision command "corepack enable && pnpm install --frozen-lockfile --prefer-offline" failed:  ERR_PNPM_LOCKFILE_CONFIG_MISMATCH  Cannot proceed with the frozen installation.';
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "workspace reuse failed",
+        errorCode: "workspace_validation_failed",
+        contextSnapshot: {},
+        livenessState: "failed",
+        resultJson: {
+          workspaceValidation: {
+            reason: "inherited_workspace_reuse_failed",
+            executionWorkspaceId: "execution-workspace-1",
+            cause,
+          },
+        },
+      },
+      comment: "Workspace failed validation.",
+      recoveryCause: "workspace_validation_failed",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    const failureSummary = (action?.evidence as Record<string, unknown> | null)?.failureSummary;
+    expect(failureSummary).toBe(`inherited_workspace_reuse_failed: ${cause}`);
+    expect(failureSummary).not.toMatch(/withheld/);
+  });
+
+  // Control: with no structured payload the placeholder must survive — it is what keeps
+  // agent transcript content out of the issue thread.
+  it("keeps the withheld placeholder when the run recorded no workspace validation payload", async () => {
+    const { sourceIssue, coderId, prefix, companyId } = await seedCompany();
+    await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "adapter died",
+        errorCode: "adapter_failed",
+        contextSnapshot: {},
+        livenessState: "failed",
+        resultJson: {},
+      },
+      comment: "Run failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect((action?.evidence as Record<string, unknown> | null)?.failureSummary).toMatch(/withheld/);
+  });
+
   it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {
     const { companyId, managerId, coderId, sourceIssue, prefix } = await seedCompany();
     await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });

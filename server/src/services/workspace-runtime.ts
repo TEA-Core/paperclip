@@ -3222,6 +3222,44 @@ export async function assertWorktreeWritableByProcessUser(worktreePath: string):
 
 import { ensureSharedGroupOwnership } from "./shared-group-ownership.js";
 
+/**
+ * SUP-13090: pnpm refuses a frozen install when the committed lockfile disagrees
+ * with the branch's manifests, under two codes — ERR_PNPM_OUTDATED_LOCKFILE (a
+ * changed dependency version) and ERR_PNPM_LOCKFILE_CONFIG_MISMATCH (a changed
+ * pnpm setting inside package.json: overrides, patchedDependencies,
+ * packageExtensions).
+ *
+ * SUP-12984 taught `scripts/provision-worktree.sh` to retry without
+ * `--frozen-lockfile`, but a project can configure any `provisionCommand`, and
+ * this project's execution workspaces carry the inline
+ * `corepack enable && pnpm install --frozen-lockfile --prefer-offline`. That
+ * command never reaches the script, so it had no retry: SUP-12986 and SUP-12996
+ * failed EVERY dispatch in ~8s with `workspace_validation_failed`, agent- and
+ * adapter-independent, because their reused worktrees carry an `overrides` change
+ * whose lockfile has not been regenerated.
+ *
+ * The retry belongs here, at the layer that executes whatever provisionCommand a
+ * project configured, so both the fresh-provision and the reuse path are covered.
+ * Returns the command to retry with, or null when this failure is not a lockfile
+ * mismatch (registry 404, EACCES, missing peer) — those must still fail the
+ * dispatch rather than be silently re-run.
+ */
+const PNPM_LOCKFILE_MISMATCH_ERROR_CODES = [
+  "ERR_PNPM_OUTDATED_LOCKFILE",
+  "ERR_PNPM_LOCKFILE_CONFIG_MISMATCH",
+] as const;
+
+export function resolvePnpmLockfileMismatchRetryCommand(
+  command: string,
+  failureOutput: string,
+): string | null {
+  if (!PNPM_LOCKFILE_MISMATCH_ERROR_CODES.some((code) => failureOutput.includes(code))) return null;
+  // Leave `--frozen-lockfile=false` and an existing `--no-frozen-lockfile` alone:
+  // neither can produce this error, and rewriting them would be a no-op retry loop.
+  const retryCommand = command.replace(/--frozen-lockfile(?![=\w-])/g, "--no-frozen-lockfile");
+  return retryCommand === command ? null : retryCommand;
+}
+
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -3236,32 +3274,45 @@ async function provisionExecutionWorktree(input: {
   await assertWorktreeWritableByProcessUser(input.worktreePath);
   const provisionCommand = asString(input.strategy.provisionCommand, "").trim();
   if (!provisionCommand) return;
-  const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
 
-  await recordWorkspaceCommandOperation(input.recorder, {
-    phase: "workspace_provision",
-    command: provisionCommand,
-    resolvedCommand: resolvedProvisionCommand,
-    cwd: input.worktreePath,
-    env: buildWorkspaceCommandEnv({
-      base: input.base,
-      repoRoot: input.repoRoot,
-      worktreePath: input.worktreePath,
-      branchName: input.branchName,
-      issue: input.issue,
-      agent: input.agent,
-      created: input.created,
-    }),
-    label: `Execution workspace provision command "${provisionCommand}"`,
-    metadata: {
-      repoRoot: input.repoRoot,
-      worktreePath: input.worktreePath,
-      branchName: input.branchName,
-      created: input.created,
-      resolvedCommand: resolvedProvisionCommand === provisionCommand ? null : resolvedProvisionCommand,
-    },
-    successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
+  const env = buildWorkspaceCommandEnv({
+    base: input.base,
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    branchName: input.branchName,
+    issue: input.issue,
+    agent: input.agent,
+    created: input.created,
   });
+  const runProvisionCommand = async (command: string, lockfileMismatchRetry: boolean) => {
+    const resolvedCommand = resolveRepoManagedWorkspaceCommand(command, input.repoRoot);
+    await recordWorkspaceCommandOperation(input.recorder, {
+      phase: "workspace_provision",
+      command,
+      resolvedCommand,
+      cwd: input.worktreePath,
+      env,
+      label: `Execution workspace provision command "${command}"`,
+      metadata: {
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        branchName: input.branchName,
+        created: input.created,
+        resolvedCommand: resolvedCommand === command ? null : resolvedCommand,
+        ...(lockfileMismatchRetry ? { lockfileMismatchRetry: true, originalCommand: provisionCommand } : {}),
+      },
+      successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
+    });
+  };
+
+  try {
+    await runProvisionCommand(provisionCommand, false);
+  } catch (error) {
+    const failureOutput = error instanceof Error ? error.message : String(error);
+    const retryCommand = resolvePnpmLockfileMismatchRetryCommand(provisionCommand, failureOutput);
+    if (!retryCommand) throw error;
+    await runProvisionCommand(retryCommand, true);
+  }
 }
 
 export type BaseRepoHygieneDecision =
