@@ -1,8 +1,8 @@
 import { timingSafeEqual } from "node:crypto";
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
-import { and, count, eq, gt, inArray, isNull, sql } from "drizzle-orm";
-import { heartbeatRuns, instanceUserRoles, invites } from "@paperclipai/db";
+import { and, count, desc, eq, gt, gte, inArray, isNull, sql } from "drizzle-orm";
+import { heartbeatRuns, instanceUserRoles, invites, secretsDirectoryObservations } from "@paperclipai/db";
 import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 import { readPersistedDevServerStatus, toDevServerHealthStatus, writeDevServerRestartRequest } from "../dev-server-status.js";
 import { logger } from "../middleware/logger.js";
@@ -259,6 +259,43 @@ export function healthRoutes(
       return;
     }
 
+    const secretsDirectory = await (async () => {
+      try {
+        const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const unexpectedCount = await db
+          .select({ count: count() })
+          .from(secretsDirectoryObservations)
+          .where(
+            and(
+              eq(secretsDirectoryObservations.classification, "unexpected"),
+              gte(secretsDirectoryObservations.createdAt, since),
+            ),
+          )
+          .then((rows) => Number(rows[0]?.count ?? 0));
+        const latestUnexpected = await db
+          .select({
+            fileName: secretsDirectoryObservations.observedFileName,
+            sha256FingerprintPrefix: secretsDirectoryObservations.sha256FingerprintPrefix,
+            mode: secretsDirectoryObservations.mode,
+            uid: secretsDirectoryObservations.uid,
+            gid: secretsDirectoryObservations.gid,
+            size: secretsDirectoryObservations.size,
+            mtimeMs: secretsDirectoryObservations.mtimeMs,
+            observedAt: secretsDirectoryObservations.createdAt,
+          })
+          .from(secretsDirectoryObservations)
+          .where(eq(secretsDirectoryObservations.classification, "unexpected"))
+          .orderBy(desc(secretsDirectoryObservations.createdAt))
+          .limit(5);
+        return { unexpectedCount24h: unexpectedCount, latestUnexpected };
+      } catch (err) {
+        // The table may not exist yet if the migration is pending on an
+        // embedded database; omit the summary rather than fail the probe.
+        logger.warn({ err }, "secrets directory health summary unavailable");
+        return null;
+      }
+    })();
+
     res.json({
       status: "ok",
       version: serverVersion,
@@ -277,6 +314,7 @@ export function healthRoutes(
       ...(warnings ? { warnings } : {}),
       ...(devServer ? { devServer } : {}),
       ...(cloud ? { cloud } : {}),
+      ...(secretsDirectory ? { secretsDirectory } : {}),
     });
   });
 

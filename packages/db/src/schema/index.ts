@@ -123,6 +123,7 @@ export { companySecretBindings } from "./company_secret_bindings.js";
 export { companySecretProposals } from "./company_secret_proposals.js";
 export { userSecretDeclarations } from "./user_secret_declarations.js";
 export { secretAccessEvents } from "./secret_access_events.js";
+export { secretsDirectoryObservations } from "./secrets_directory_observations.js";
 export {
   toolApplications,
   toolConnections,

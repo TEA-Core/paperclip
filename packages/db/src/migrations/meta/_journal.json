@@ -1520,6 +1520,13 @@
       "when": 1785930076830,
       "tag": "0218_board_api_key_scope",
       "breakpoints": true
+    },
+    {
+      "idx": 217,
+      "version": "7",
+      "when": 1785930077830,
+      "tag": "0219_secrets_directory_observations",
+      "breakpoints": true
     }
   ]
 }

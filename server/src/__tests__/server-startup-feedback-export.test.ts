@@ -161,6 +161,8 @@ const {
   };
 });
 
+const HEARTBEAT_SCHEDULER_INTERVAL_MS = 30000;
+
 function buildTestConfig(overrides: Record<string, unknown> = {}) {
   return {
     deploymentMode: "authenticated",
@@ -186,6 +188,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     secretsProvider: "local_encrypted",
     secretsStrictMode: false,
     secretsMasterKeyFilePath: "/tmp/paperclip-master.key",
+    secretsDirWatchIntervalMs: 300000,
     storageProvider: "local_disk",
     storageLocalDiskBaseDir: "/tmp/paperclip-storage",
     storageS3Bucket: "paperclip-test",
@@ -196,7 +199,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     feedbackExportBackendUrl: "https://telemetry.example.com",
     feedbackExportBackendToken: "telemetry-token",
     heartbeatSchedulerEnabled: false,
-    heartbeatSchedulerIntervalMs: 30000,
+    heartbeatSchedulerIntervalMs: HEARTBEAT_SCHEDULER_INTERVAL_MS,
     resolvedDependencyWakeRearmWindowMs: 6 * 60 * 60 * 1000,
     resolvedDependencyWakeRearmMaxCount: 3,
     companyDeletionEnabled: false,
@@ -349,6 +352,19 @@ vi.mock("../startup-banner.js", () => ({
   printStartupBanner: vi.fn(),
 }));
 
+// The secrets-directory watch scans the real on-disk secrets directory and
+// writes observation rows; neither belongs in this startup-wiring test, and its
+// own periodic timer would otherwise register an extra interval here.
+vi.mock("../secrets/secrets-dir-watch.js", () => ({
+  runSecretsDirectoryWatch: vi.fn(async () => ({
+    dir: "/tmp/paperclip-secrets",
+    observedAtMs: 0,
+    files: [],
+    unexpected: [],
+  })),
+  startSecretsDirectoryWatch: vi.fn(() => vi.fn()),
+}));
+
 vi.mock("../board-claim.js", () => ({
   getBoardClaimWarningUrl: vi.fn(() => null),
   initializeBoardClaimChallenge: vi.fn(async () => undefined),
@@ -489,7 +505,7 @@ describe("startServer feedback export wiring", () => {
   it("keeps routine ticks and setup cleanup active when heartbeat scheduling is suppressed", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
-      heartbeatSchedulerIntervalMs: 30000,
+      heartbeatSchedulerIntervalMs: HEARTBEAT_SCHEDULER_INTERVAL_MS,
     }));
     resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
       suppressed: true,
@@ -498,8 +514,10 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delayMs?: number) => {
+        // Capture only the heartbeat scheduler interval so unrelated startup
+        // timers registered later cannot shadow it.
+        if (delayMs === HEARTBEAT_SCHEDULER_INTERVAL_MS) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -529,13 +547,15 @@ describe("startServer feedback export wiring", () => {
   it("keeps external object refresh active when heartbeat scheduling is disabled", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: false,
-      heartbeatSchedulerIntervalMs: 30000,
+      heartbeatSchedulerIntervalMs: HEARTBEAT_SCHEDULER_INTERVAL_MS,
     }));
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delayMs?: number) => {
+        // Capture only the heartbeat scheduler interval so unrelated startup
+        // timers registered later cannot shadow it.
+        if (delayMs === HEARTBEAT_SCHEDULER_INTERVAL_MS) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -559,7 +579,7 @@ describe("startServer feedback export wiring", () => {
   it("does not replay hot-restart adoption when the orphan reaper retries", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
-      heartbeatSchedulerIntervalMs: 30000,
+      heartbeatSchedulerIntervalMs: HEARTBEAT_SCHEDULER_INTERVAL_MS,
     }));
     heartbeatServiceMock.reconcileHotRestartAdoption.mockRejectedValueOnce(new Error("partial adoption"));
     heartbeatServiceMock.reapOrphanedRuns

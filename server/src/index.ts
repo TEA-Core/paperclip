@@ -1492,6 +1492,20 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
 
+  // SUP-13018: detect + attribute unexpected files in the secrets directory.
+  // The boot scan is immediate (runs once migrations are applied and the DB is
+  // ready); the interval keeps a mid-lifetime drop bounded to the stated window.
+  {
+    const { runSecretsDirectoryWatch, startSecretsDirectoryWatch } = await import("./secrets/secrets-dir-watch.js");
+    void runSecretsDirectoryWatch(db).catch((err) => {
+      logger.error({ err }, "secrets directory watch failed at boot");
+    });
+    startSecretsDirectoryWatch(db, {
+      intervalMs: config.secretsDirWatchIntervalMs,
+      initialDelayMs: config.secretsDirWatchIntervalMs,
+    });
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
