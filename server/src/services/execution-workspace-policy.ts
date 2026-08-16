@@ -147,6 +147,53 @@ export function isUnrunnableWorktreeCombo(input: {
   return input.hasResolvablePriorSessionWorkspace !== true;
 }
 
+export function canAgentSatisfyIssueWorkspaceSettings(input: {
+  issue: UnrunnableWorktreeIssueRef;
+  executionWorkspaceSettings: unknown;
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  reusableExecutionWorkspaceAvailable?: boolean | null;
+  hasResolvablePriorSessionWorkspace?: boolean | null;
+  agentConfig?: Record<string, unknown> | null;
+}): boolean {
+  const settings = parseIssueExecutionWorkspaceSettings(input.executionWorkspaceSettings);
+  const mode = settings?.mode;
+  if (mode !== "isolated_workspace" && mode !== "operator_branch") return true;
+
+  const resolvedMode = mode as ParsedExecutionWorkspaceMode;
+  // Resolve the candidate's effective strategy exactly the way dispatch does: the agent's
+  // adapterConfig is the LOWEST-precedence input, below the issue settings and the project
+  // policy. Comparing the candidate's raw adapterConfig against the issue strategy instead
+  // would reject every agent whose config does not restate the strategy — including the
+  // common `adapterConfig: {}` agent, which dispatch resolves to the issue/project strategy
+  // and runs without complaint.
+  const candidateWorkspaceConfig = buildExecutionWorkspaceAdapterConfig({
+    agentConfig: input.agentConfig ?? {},
+    projectPolicy: input.projectPolicy,
+    issueSettings: settings,
+    mode: resolvedMode,
+    legacyUseProjectWorkspace: null,
+  });
+  // SUP-13100 (reverted, ruling in SUP-13100 round-4): a previous revision preferred the
+  // strategyType persisted on the bound `execution_workspaces` row over this derivation.
+  // That override was provably dead code. It only engaged when
+  // `hasReusableExecutionWorkspaceBinding(issue)` was true, and for exactly those inputs
+  // `isUnrunnableWorktreeCombo` already short-circuits to "capable" on its reusable-workspace
+  // check — the ladder (recovery/service.ts) passes no `reusableExecutionWorkspaceAvailable`,
+  // so that check falls back to the same binding predicate. Measured: 540 ladder-reachable
+  // input combinations × 4 bound strategyType values produced zero divergence in the return
+  // value. Do not reintroduce it without first making the call site pass an explicit
+  // `reusableExecutionWorkspaceAvailable`.
+  const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, candidateWorkspaceConfig);
+
+  return !isUnrunnableWorktreeCombo({
+    issue: input.issue,
+    resolvedMode,
+    resolvedStrategy,
+    reusableExecutionWorkspaceAvailable: input.reusableExecutionWorkspaceAvailable,
+    hasResolvablePriorSessionWorkspace: input.hasResolvablePriorSessionWorkspace,
+  });
+}
+
 export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecutionWorkspacePolicy | null {
   const parsed = parseObject(raw);
   if (Object.keys(parsed).length === 0) return null;
