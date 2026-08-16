@@ -18,6 +18,8 @@ on:
     paths:
       - "Dockerfile"
       - ".github/workflows/docker.yml"
+      - "scripts/docker-entrypoint.sh"
+      - "scripts/assert-secrets-hardening.sh"
 
 permissions:
   contents: read

@@ -84,6 +84,46 @@ if [ "$key_state" != "0 0 600" ]; then
 fi
 echo "PASS: entrypoint repaired node-owned secrets to root:root 0700 directory / 0600 key"
 
+# Absent-key arm: when no master.key exists and the operator has opted in via
+# PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1, the entrypoint's root phase must
+# generate one as root:root 0600 — not leave it absent, and not create it as
+# node. This is the first-boot bootstrap that SUP-12904's root-ownership
+# change removed from the server's reach.
+#
+# We remove the existing key, run the entrypoint with the flag, and verify
+# generation. Then we remove the key again and run without the flag to verify
+# no generation occurs. Finally we restore the expected key for the probe
+# phase below.
+rm -f "$KEY"
+PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1 \
+    docker-entrypoint.sh true 2>/dev/null || true
+
+if [ ! -f "$KEY" ]; then
+    echo "FAIL: entrypoint did not generate master.key with ALLOW_KEY_GENERATION=1"
+    exit 1
+fi
+absent_key_state="$(stat -c '%u %g %a' "$KEY")"
+if [ "$absent_key_state" != "0 0 600" ]; then
+    echo "FAIL: generated $KEY is '$absent_key_state' (uid gid mode), want '0 0 600'"
+    exit 1
+fi
+echo "PASS: entrypoint generated master.key as root:root 0600 on first boot with ALLOW_KEY_GENERATION=1"
+
+# Flag-unset case: no key file, no generation. The entrypoint must leave the
+# directory keyless and not export anything.
+rm -f "$KEY"
+docker-entrypoint.sh true 2>/dev/null || true
+if [ -f "$KEY" ]; then
+    echo "FAIL: entrypoint generated master.key without ALLOW_KEY_GENERATION=1"
+    exit 1
+fi
+echo "PASS: entrypoint did not generate master.key when ALLOW_KEY_GENERATION is unset"
+
+# Restore the expected key for the probe phase.
+printf '%s' "$EXPECTED_KEY" > "$KEY"
+chown root:root "$KEY"
+chmod 0600 "$KEY"
+
 # Hand over to the real entrypoint so the probe phase runs as node (uid 1000),
 # with the key exported the way the server receives it. `/bin/sh "$0"` keeps this
 # working when the script is bind-mounted without an executable bit.

@@ -66,19 +66,37 @@ test("entrypoint does not echo the master key", () => {
   );
 });
 
-test("entrypoint guards the key-absent case (no generation path)", () => {
+test("entrypoint guards the key-absent case with a gated generation path", () => {
   // The export must be conditional on the file existing; when absent, nothing
   // is exported and the existing ALLOW_KEY_GENERATION guard in the server
-  // behaves exactly as before.
+  // behaves exactly as before. When the operator has explicitly opted in via
+  // PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1, the entrypoint's root phase must
+  // generate the key as root:root 0600 — not leave it absent, and not create it
+  // as node.
   assert.match(
     entrypoint,
     /if \[ -f \/etc\/paperclip\/secrets\/master\.key \]/,
     "must only export the key when the file exists",
   );
-  assert.doesNotMatch(
+  assert.match(
     entrypoint,
-    /PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION|generate.*key|openssl/gi,
-    "must not introduce a key-generation path in the entrypoint",
+    /PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION/,
+    "must reference the opt-in flag for the generation gate",
+  );
+  assert.match(
+    entrypoint,
+    /head -c 32 \/dev\/urandom \| base64/,
+    "must generate 32 random bytes base64 to match the provider's key format",
+  );
+  assert.match(
+    entrypoint,
+    /chown root:root \/etc\/paperclip\/secrets\/master\.key/,
+    "must write the generated key as root:root",
+  );
+  assert.match(
+    entrypoint,
+    /chmod 0600 \/etc\/paperclip\/secrets\/master\.key/,
+    "must write the generated key with mode 0600",
   );
 });
 
@@ -174,5 +192,23 @@ test("the probe asserts the hardened state, the denials, and the key handoff", (
     probe,
     /echo[^\n]*\$\{?PAPERCLIP_SECRETS_MASTER_KEY|echo[^\n]*\$\{?EXPECTED_KEY/,
     "must never echo the key value",
+  );
+});
+
+test("the probe covers the absent-key generation arm", () => {
+  assert.match(
+    probe,
+    /PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1/,
+    "must run the entrypoint with the opt-in flag to test the generation arm",
+  );
+  assert.match(
+    probe,
+    /did not generate master\.key with ALLOW_KEY_GENERATION=1/,
+    "must assert the key was generated when the flag is set",
+  );
+  assert.match(
+    probe,
+    /did not generate master\.key when ALLOW_KEY_GENERATION is unset/,
+    "must assert no key was generated when the flag is absent",
   );
 });
