@@ -1,5 +1,6 @@
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +9,7 @@ import {
   maybePersistWorktreeRuntimePorts,
   maybeRepairLegacyWorktreeConfigAndEnvFiles,
 } from "../worktree-config.js";
+import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 
 const ORIGINAL_ENV = { ...process.env };
 const ORIGINAL_CWD = process.cwd();
@@ -97,6 +99,7 @@ function buildLegacyConfig(sharedRoot: string, publicBaseUrl = "http://127.0.0.1
 
 function buildIsolatedConfig(instanceRoot: string, serverPort: number, databasePort: number) {
   const config = buildLegacyConfig(instanceRoot, `http://127.0.0.1:${serverPort}`);
+  const instanceId = path.basename(instanceRoot);
   return {
     ...config,
     database: {
@@ -110,6 +113,13 @@ function buildIsolatedConfig(instanceRoot: string, serverPort: number, databaseP
     server: {
       ...config.server,
       port: serverPort,
+    },
+    secrets: {
+      ...config.secrets,
+      localEncrypted: {
+        ...config.secrets.localEncrypted,
+        keyFilePath: path.join("/etc/paperclip/worktrees", instanceId, "master.key"),
+      },
     },
   };
 }
@@ -164,7 +174,7 @@ describe("worktree config repair", () => {
     expect(repairedConfig.database.backup.dir).toBe(path.join(instanceRoot, "data", "backups"));
     expect(repairedConfig.logging.logDir).toBe(path.join(instanceRoot, "logs"));
     expect(repairedConfig.storage.localDisk.baseDir).toBe(path.join(instanceRoot, "data", "storage"));
-    expect(repairedConfig.secrets.localEncrypted.keyFilePath).toBe(path.join(instanceRoot, "secrets", "master.key"));
+    expect(repairedConfig.secrets.localEncrypted.keyFilePath).toBe(path.join("/etc/paperclip/worktrees", "pap-884-ai-commits-component", "master.key"));
     expect(repairedEnv).toContain(`PAPERCLIP_HOME=${JSON.stringify(isolatedHome)}`);
     expect(repairedEnv).toContain('PAPERCLIP_INSTANCE_ID="pap-884-ai-commits-component"');
     expect(repairedEnv).toContain(`PAPERCLIP_CONFIG=${JSON.stringify(await fs.realpath(configPath))}`);
@@ -562,7 +572,7 @@ describe("worktree config repair", () => {
       repairedEnv: true,
     });
     expect(repairedConfig.database.embeddedPostgresDataDir).toBe(path.join(instanceRoot, "db"));
-    expect(repairedConfig.secrets.localEncrypted.keyFilePath).toBe(path.join(instanceRoot, "secrets", "master.key"));
+    expect(repairedConfig.secrets.localEncrypted.keyFilePath).toBe(path.join("/etc/paperclip/worktrees", "pap-9940-what-can-we-learn", "master.key"));
     expect(repairedEnv).toContain(`PAPERCLIP_HOME=${JSON.stringify(isolatedHome)}`);
     expect(repairedEnv).toContain(`PAPERCLIP_CONFIG=${JSON.stringify(configPath)}`);
     expect(repairedEnv).not.toContain("/old/home");
@@ -668,7 +678,7 @@ describe("worktree config repair", () => {
     expect(repairedConfig.logging.logDir).toBe(path.join(stableInstanceRoot, "logs"));
     expect(repairedConfig.storage.localDisk.baseDir).toBe(path.join(stableInstanceRoot, "data", "storage"));
     expect(repairedConfig.secrets.localEncrypted.keyFilePath).toBe(
-      path.join(stableInstanceRoot, "secrets", "master.key"),
+      path.join("/etc/paperclip/worktrees", instanceId, "master.key"),
     );
     expect(repairedEnv).toContain(`PAPERCLIP_HOME=${JSON.stringify(isolatedHome)}`);
     expect(repairedEnv).toContain('PAPERCLIP_DB_BACKUP_ENABLED="false"');
@@ -1091,5 +1101,82 @@ describe("worktree config repair", () => {
     expect(config.server.port).toBe(3100);
     expect(config.database.embeddedPostgresPort).toBe(54340);
     expect(config.auth.publicBaseUrl).toBe("https://paperclip.example");
+  });
+
+  it("repaired secrets key file path passes key path isolation via healthCheck", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-key-isolation-"));
+    const worktreeRoot = path.join(tempRoot, "PAP-13011-key-isolation");
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const configPath = path.join(paperclipDir, "config.json");
+    const envPath = path.join(paperclipDir, ".env");
+    const sharedRoot = path.join(tempRoot, ".paperclip", "instances", "default");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(buildLegacyConfig(sharedRoot), null, 2) + "\n", "utf8");
+    await fs.writeFile(
+      envPath,
+      [
+        "# Paperclip environment variables",
+        "PAPERCLIP_IN_WORKTREE=true",
+        "PAPERCLIP_WORKTREE_NAME=PAP-13011-key-isolation",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREE_NAME = "PAP-13011-key-isolation";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONFIG;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+    expect(result.repairedConfig).toBe(true);
+
+    const repairedConfig = JSON.parse(await fs.readFile(configPath, "utf8"));
+    const expectedKeyPath = path.join("/etc/paperclip/worktrees", "pap-13011-key-isolation", "master.key");
+    expect(repairedConfig.secrets.localEncrypted.keyFilePath).toBe(expectedKeyPath);
+
+    const previousMasterKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    const previousMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    const previousAllowKeyGeneration = process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+
+    try {
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = expectedKeyPath;
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+
+      const healthNoEnvKey = await localEncryptedProvider.healthCheck();
+      expect(healthNoEnvKey.status).not.toBe("error");
+      expect(healthNoEnvKey.message).not.toContain("Security violation");
+
+      const validEnvKey = randomBytes(32).toString("base64");
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY = validEnvKey;
+
+      const healthEnvKey = await localEncryptedProvider.healthCheck();
+      expect(healthEnvKey.status).toBe("ok");
+      expect(healthEnvKey.details?.keySource).toBe("env");
+    } finally {
+      if (previousMasterKeyFile === undefined) {
+        delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      } else {
+        process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousMasterKeyFile;
+      }
+      if (previousMasterKey === undefined) {
+        delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      } else {
+        process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousMasterKey;
+      }
+      if (previousAllowKeyGeneration === undefined) {
+        delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+      } else {
+        process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = previousAllowKeyGeneration;
+      }
+    }
   });
 });

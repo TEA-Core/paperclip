@@ -248,7 +248,7 @@ function resolveWorktreeRuntimeContext(
     backupDir: path.resolve(instanceRoot, "data", "backups"),
     logDir: path.resolve(instanceRoot, "logs"),
     storageDir: path.resolve(instanceRoot, "data", "storage"),
-    secretsKeyFilePath: path.resolve(instanceRoot, "secrets", "master.key"),
+    secretsKeyFilePath: path.resolve("/etc/paperclip/worktrees", instanceId, "master.key"),
   };
 }
 
@@ -473,7 +473,7 @@ function needsWorktreeConfigRepair(
   if (!isPathInside(config.storage.localDisk.baseDir, context.instanceRoot)) {
     return true;
   }
-  if (!isPathInside(config.secrets.localEncrypted.keyFilePath, context.instanceRoot)) {
+  if (config.secrets.localEncrypted.keyFilePath !== context.secretsKeyFilePath) {
     return true;
   }
 
