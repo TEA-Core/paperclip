@@ -3265,6 +3265,7 @@ async function provisionExecutionWorktree(input: {
 
 export type BaseRepoHygieneDecision =
   | { action: "ok" }
+  | { action: "fastForward" }
   | { action: "restore"; reasons: string[]; snapshotTrackedChanges: boolean };
 
 /**
@@ -3296,6 +3297,12 @@ export function resolveBaseRepoHygieneDecision(input: {
   headSha: string | null;
   /** Resolved SHA of the base ref, or null when unresolvable. */
   baseRefSha: string | null;
+  /**
+   * True when the base repo's HEAD is a strict ancestor of the base ref (i.e.
+   * behind / fast-forwardable). Only consulted when there are no restore
+   * reasons, so dirty/unmerged/wrong-branch repos still return `restore`.
+   */
+  headBehindBaseRef?: boolean;
 }): BaseRepoHygieneDecision {
   const reasons: string[] = [];
   const defaultRef = input.defaultRef?.replace(/^origin\//, "") ?? null;
@@ -3316,7 +3323,9 @@ export function resolveBaseRepoHygieneDecision(input: {
   if (input.dirtyTrackedPathCount > 0) {
     reasons.push(`base repo has ${input.dirtyTrackedPathCount} modified tracked path(s)`);
   }
-  if (reasons.length === 0) return { action: "ok" };
+  if (reasons.length === 0) {
+    return input.headBehindBaseRef ? { action: "fastForward" } : { action: "ok" };
+  }
   return {
     action: "restore",
     reasons,
@@ -3454,6 +3463,47 @@ async function restoreBaseRepoToDefaultRef(input: {
   return { restored, warnings, rescueRefs };
 }
 
+/**
+ * Fast-forward a clean base repo to its default ref.
+ *
+ * Uses `git merge --ff-only`, which advances HEAD only when it is a strict
+ * ancestor of the target — i.e. exactly the "behind" predicate. It refuses
+ * (non-zero exit) when HEAD is ahead, diverged, or when an untracked file would
+ * be overwritten, which is the desired safety behavior: a refused fast-forward
+ * only warns and never blocks the dispatch (same SUP-11285 contract as restore).
+ *
+ * No rescue ref / snapshot is needed — a fast-forward is non-destructive (old
+ * HEAD remains an ancestor of the new tip). Never uses `git reset --hard`,
+ * `checkout -f`, `clean`, or `stash -u`: those could overwrite or remove
+ * untracked files, including the `.paperclip/worktrees` directory.
+ */
+async function fastForwardBaseRepoToDefaultRef(input: {
+  repoRoot: string;
+  baseRef: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ fastForwarded: boolean; warnings: string[] }> {
+  const warnings: string[] = [];
+  try {
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_prepare",
+      args: ["merge", "--ff-only", input.baseRef],
+      cwd: input.repoRoot,
+      metadata: {
+        baseRepoHygiene: true,
+        repoRoot: input.repoRoot,
+        baseRef: input.baseRef,
+        fastForwardOnly: true,
+      },
+      successMessage: `Fast-forwarded base repository at ${input.repoRoot} to ${input.baseRef}\n`,
+      failureLabel: `git merge --ff-only ${input.baseRef}`,
+    });
+    return { fastForwarded: true, warnings };
+  } catch (error) {
+    warnings.push(error instanceof Error ? error.message : String(error));
+    return { fastForwarded: false, warnings };
+  }
+}
+
 function buildExecutionWorkspaceCleanupEnv(input: {
   workspace: {
     cwd: string | null;
@@ -3589,6 +3639,10 @@ export async function realizeExecutionWorkspace(input: {
     const hygiene = await inspectBaseRepoHygiene(repoRoot);
     if (hygiene) {
       const headSha = await runGit(["rev-parse", "HEAD"], repoRoot).catch(() => null);
+      const headBehindBaseRef = Boolean(headSha && currentBaseRefSha && headSha !== currentBaseRefSha)
+        ? await runGit(["merge-base", "--is-ancestor", headSha!, currentBaseRefSha!], repoRoot)
+            .then(() => true).catch(() => false)
+        : false;
       const decision = resolveBaseRepoHygieneDecision({
         currentBranch: hygiene.currentBranch,
         defaultRef: baseRef,
@@ -3596,6 +3650,7 @@ export async function realizeExecutionWorkspace(input: {
         unmergedPathCount: hygiene.unmergedPathCount,
         headSha,
         baseRefSha: currentBaseRefSha,
+        headBehindBaseRef,
       });
       if (decision.action === "restore") {
         const result = await restoreBaseRepoToDefaultRef({
@@ -3611,6 +3666,17 @@ export async function realizeExecutionWorkspace(input: {
               ? ` Anything found there is preserved on ${result.rescueRefs.join(", ")}.`
               : ""),
           ...result.warnings,
+        );
+      } else if (decision.action === "fastForward") {
+        const result = await fastForwardBaseRepoToDefaultRef({
+          repoRoot,
+          baseRef,
+          recorder: input.recorder ?? null,
+        });
+        baseRepoHygieneWarnings.push(
+          result.fastForwarded
+            ? `Base repository at ${repoRoot} was fast-forwarded to ${baseRef}.`
+            : `Could not fast-forward base repository at ${repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
         );
       }
     }

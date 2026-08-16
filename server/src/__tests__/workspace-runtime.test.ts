@@ -1095,6 +1095,21 @@ describe("realizeExecutionWorkspace", () => {
     expect(existsSync(untracked)).toBe(true);
   });
 
+  it("fast-forwards a clean base repo that is behind the base ref", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const advancedHead = await advanceRemoteMaster(sourceRepo, remotePath, "advanced-file.txt");
+
+    const untracked = path.join(repoRoot, "untracked-keepme.txt");
+    await fs.writeFile(untracked, "not ours to delete\n", "utf8");
+
+    await realizeWorktreeForTest(repoRoot, "master");
+
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
+    expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(advancedHead);
+    expect(existsSync(untracked)).toBe(true);
+    expect(await readGit(repoRoot, ["symbolic-ref", "--short", "HEAD"])).toBe("master");
+  });
+
   describe("base repo hygiene decision", () => {
     it("returns ok when the base repo is cleanly detached at the base ref", () => {
       expect(
@@ -1192,6 +1207,64 @@ describe("realizeExecutionWorkspace", () => {
           expect.arrayContaining([expect.stringContaining("detached HEAD")]),
         );
       }
+    });
+
+    it("returns fastForward when clean, on default ref, and behind", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+        headBehindBaseRef: true,
+      });
+      expect(decision).toEqual({ action: "fastForward" });
+    });
+
+    it("still restores when dirty tracked and behind", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 1,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+        headBehindBaseRef: true,
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(
+          expect.arrayContaining([expect.stringContaining("1 modified tracked path(s)")]),
+        );
+        expect(decision.snapshotTrackedChanges).toBe(true);
+      }
+    });
+
+    it("returns ok when ahead (not behind)", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+        headBehindBaseRef: false,
+      });
+      expect(decision).toEqual({ action: "ok" });
+    });
+
+    it("returns ok when diverged (not behind)", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+        headBehindBaseRef: false,
+      });
+      expect(decision).toEqual({ action: "ok" });
     });
   });
 
@@ -1299,6 +1372,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(advancedHead);
     expect(reused.baseRefSha).toBe(advancedHead);
     expect(reused.warnings).toEqual([
+      expect.stringContaining("was fast-forwarded to"),
       expect.stringContaining("No baseRef configured"),
     ]);
   });
@@ -1319,6 +1393,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.created).toBe(false);
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(taskHead);
     expect(reused.warnings).toEqual([
+      expect.stringContaining("was fast-forwarded to"),
       expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
@@ -1341,6 +1416,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
+      expect.stringContaining("was fast-forwarded to"),
       expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
@@ -1367,6 +1443,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
+      expect.stringContaining("was fast-forwarded to"),
       expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
