@@ -2937,21 +2937,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   /**
-   * The recovery owner and return owner must be able to write the source issue
-   * *as it currently stands*. The live SUP-13091 failure was a full-trust
-   * exec-CTO denied `deny_missing_grant` on `POST /api/issues/{id}/comments`
-   * because it was neither assignee, creator, nor org-chain ancestor of the
-   * assignee. We therefore evaluate `issue:comment` against the source issue's
-   * REAL current assignment — not a reassigned one. This yields
-   * `allow_manager_chain` for a manager ancestor (AC4) and
-   * `deny_missing_grant` for a non-ancestor (AC3), which is exactly the
-   * predicate `decideIssueAccess` uses for the live 403. `issue:mutate` has no
-   * manager-chain allow path, so it would break AC4.
+   * A ladder-discovered owner and the computed return owner must be able to
+   * write the source issue *as it currently stands*. The live SUP-13091 failure
+   * was a full-trust exec-CTO denied `deny_missing_grant` on
+   * `POST /api/issues/{id}/comments` because it was neither assignee, creator,
+   * nor org-chain ancestor of the assignee. We therefore evaluate
+   * `issue:comment` against the source issue's REAL current assignment, not a
+   * reassigned one. This yields `allow_manager_chain` for a manager ancestor
+   * and `deny_missing_grant` for a non-ancestor, which is exactly the predicate
+   * `decideIssueAccess` uses for the live 403. `issue:mutate` has no
+   * manager-chain allow path, so it would reject every manager.
+   *
+   * The one exception is `evaluateAsAssignee`, used for the owner the recovery
+   * cause itself designates (`preferredOwnerAgentId`, e.g. the current
+   * execution-review participant). That agent is named by the issue's own
+   * execution state and the same escalation hands the issue to it
+   * (`assigneeAgentId = ownerAgentId`), so the grant question for it is whether
+   * it would still be denied once the issue is theirs. Policy-restricted,
+   * low-trust out-of-boundary, scoped-key, and inactive candidates stay denied
+   * under that evaluation; a legitimate review participant does not.
    */
   async function candidateCanWriteSourceIssue(
     issue: typeof issues.$inferSelect,
     agentId: string,
+    opts?: { evaluateAsAssignee?: boolean },
   ): Promise<boolean> {
+    const assigneeAgentId = opts?.evaluateAsAssignee ? agentId : issue.assigneeAgentId;
+    const assigneeUserId = opts?.evaluateAsAssignee ? null : issue.assigneeUserId;
     const decision = await authz.decide({
       actor: { type: "agent", agentId, companyId: issue.companyId },
       action: "issue:comment",
@@ -2961,8 +2973,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issueId: issue.id,
         projectId: issue.projectId,
         parentIssueId: issue.parentId,
-        assigneeAgentId: issue.assigneeAgentId,
-        assigneeUserId: issue.assigneeUserId,
+        assigneeAgentId,
+        assigneeUserId,
         status: issue.status,
         createdByAgentId: issue.createdByAgentId,
       },
@@ -2970,8 +2982,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issueId: issue.id,
         projectId: issue.projectId,
         parentIssueId: issue.parentId,
-        assigneeAgentId: issue.assigneeAgentId,
-        assigneeUserId: issue.assigneeUserId,
+        assigneeAgentId,
+        assigneeUserId,
         createdByAgentId: issue.createdByAgentId,
       },
     });
@@ -3035,7 +3047,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (
         (await isAgentInvokable(candidate)) &&
         !budgetBlock &&
-        (await candidateCanWriteSourceIssue(issue, candidate.id))
+        (await candidateCanWriteSourceIssue(issue, candidate.id, {
+          evaluateAsAssignee: candidate.id === preferredOwnerAgentId,
+        }))
       )
         return candidate.id;
     }
