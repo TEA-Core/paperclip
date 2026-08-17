@@ -246,8 +246,14 @@ export async function resolveGitHubTokenCandidatesForRepo(
   const repoUrl = `${owner}/${repo}`;
   const escapedRepoUrl = repoUrl.replace(/[\\%_]/g, (c) => `\\${c}`);
 
+  const candidates: GitHubTokenResolution[] = [];
+  const seenTokens = new Set<string>();
+
   const appResult = await resolveAppInstallationToken(companyId, secrets, owner, repo);
-  if (appResult) return appResult;
+  if (appResult) {
+    candidates.push(appResult);
+    seenTokens.add(appResult.token);
+  }
 
   const projectRows = await db
     .select({
@@ -264,9 +270,6 @@ export async function resolveGitHubTokenCandidatesForRepo(
         ilike(projectWorkspaces.repoUrl, `%${escapedRepoUrl}%`),
       ),
     );
-
-  const candidates: GitHubTokenResolution[] = [];
-  const seenTokens = new Set<string>();
 
   for (const row of projectRows) {
     const projectEnv = row.projectEnv as Record<string, unknown> | null;
