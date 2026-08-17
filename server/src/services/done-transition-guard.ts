@@ -464,7 +464,7 @@ export async function evaluateDoneTransitionGuard(
     owner: null,
     repo: null,
     skipped,
-    skipReason: skipReason ?? prSkipReason,
+    skipReason: skipReason && prSkipReason ? `${skipReason}; ${prSkipReason}` : (skipReason ?? prSkipReason),
   });
 
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {

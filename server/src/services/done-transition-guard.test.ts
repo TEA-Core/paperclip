@@ -137,6 +137,11 @@ vi.mock("./secrets.js", () => ({
   }),
 }));
 
+const mockResolveGitHubToken = vi.hoisted(() => vi.fn());
+vi.mock("./github-credential.js", () => ({
+  resolveGitHubToken: mockResolveGitHubToken,
+}));
+
 vi.mock("./activity-log.js", () => ({
   logActivity: vi.fn().mockResolvedValue(undefined),
 }));
@@ -156,6 +161,7 @@ vi.mock("./merge-arming.js", () => ({
 }));
 
 import { ghFetch } from "./github-fetch.js";
+import { resolveGitHubToken } from "./github-credential.js";
 
 const ghFetchMock = vi.mocked(ghFetch);
 
@@ -164,6 +170,8 @@ describe("evaluateDoneTransitionGuard", () => {
     ghFetchMock.mockReset();
     mockResolveLinkedPullRequestsWithState.mockReset();
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+    mockResolveGitHubToken.mockReset();
+    mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
     vi.mocked(logActivity).mockClear();
     setupDbMock({});
   });
@@ -692,6 +700,41 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(true);
       expect(result.skipped).toBe(true);
       expect(result.skipReason).not.toContain("auth_failed");
+    });
+  });
+
+  describe("unhydrated_linked_prs survives fail-open paths", () => {
+    it("preserves unhydrated_linked_prs:<n> alongside auth_failed:compare:401 on the fail-open path", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 279, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#279", cachedState: null },
+      ]);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipReason).toMatch(/unhydrated_linked_prs:1/);
+      expect(result.skipReason).toContain("auth_failed:compare:401");
+    });
+
+    it("preserves unhydrated_linked_prs:<n> alongside token_missing on the fail-open path", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 279, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#279", cachedState: null },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipReason).toMatch(/unhydrated_linked_prs:1/);
+      expect(result.skipReason).toContain("token_missing");
     });
   });
 
