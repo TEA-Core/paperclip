@@ -5,6 +5,7 @@ import {
   GitHubAuthError,
   type DoneTransitionOverride,
 } from "./done-transition-guard.js";
+import { logActivity } from "./activity-log.js";
 
 const mockDb = {
   select: vi.fn(),
@@ -149,6 +150,11 @@ vi.mock("../middleware/logger.js", () => ({
   },
 }));
 
+const mockResolveLinkedPullRequests = vi.hoisted(() => vi.fn());
+vi.mock("./merge-arming.js", () => ({
+  resolveLinkedPullRequests: mockResolveLinkedPullRequests,
+}));
+
 import { ghFetch } from "./github-fetch.js";
 
 const ghFetchMock = vi.mocked(ghFetch);
@@ -156,6 +162,9 @@ const ghFetchMock = vi.mocked(ghFetch);
 describe("evaluateDoneTransitionGuard", () => {
   beforeEach(() => {
     ghFetchMock.mockReset();
+    mockResolveLinkedPullRequests.mockReset();
+    mockResolveLinkedPullRequests.mockResolvedValue([]);
+    vi.mocked(logActivity).mockClear();
     setupDbMock({});
   });
 
@@ -191,6 +200,103 @@ describe("evaluateDoneTransitionGuard", () => {
       const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("deliver.sh");
+    });
+  });
+
+  describe("open linked PRs block", () => {
+    it("blocks transition when resolveLinkedPullRequests yields 1 PR, with no GitHub token configured (zero outbound fetch)", async () => {
+      mockResolveLinkedPullRequests.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip-agent-tools", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip-agent-tools#274", cachedState: "open" },
+      ]);
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+      expect(result.reason).toContain("doneTransitionOverride");
+      expect(result.reason).toContain("does not clear this block");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("blocks transition when resolveLinkedPullRequests yields multiple PRs", async () => {
+      mockResolveLinkedPullRequests.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip-agent-tools", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip-agent-tools#274", cachedState: "open" },
+        { id: "pr-2", owner: "TEA-Core", repo: "Trading-Signal-Platform", number: 3124, nodeId: null, headRefName: null, displayName: "TEA-Core/Trading-Signal-Platform#3124", cachedState: "open" },
+      ]);
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("2 open linked PRs");
+      expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+      expect(result.reason).toContain("TEA-Core/Trading-Signal-Platform#3124");
+    });
+
+    it("writes audit log with open_linked_prs:<n> reason and PR display names", async () => {
+      mockResolveLinkedPullRequests.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip-agent-tools", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip-agent-tools#274", cachedState: "open" },
+        { id: "pr-2", owner: "TEA-Core", repo: "Trading-Signal-Platform", number: 3124, nodeId: null, headRefName: null, displayName: "TEA-Core/Trading-Signal-Platform#3124", cachedState: "open" },
+      ]);
+      await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "open_linked_prs:2",
+            skipReason: "open_linked_prs:2",
+            prs: "TEA-Core/paperclip-agent-tools#274, TEA-Core/Trading-Signal-Platform#3124",
+          }),
+        }),
+      );
+    });
+
+    it("does NOT block on an unhydrated linked PR (cachedState null) — a bare URL mention must not freeze done under the 401", async () => {
+      // externalObjects rows are inserted from a URL mention with `data` NULL and are
+      // hydrated later by a GitHub API refresh — the same call that 401s under
+      // SUP-13038. If an unhydrated row counted as open, merely linking any PR
+      // (even an already-merged one) would permanently block `done`.
+      mockResolveLinkedPullRequests.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 279, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#279", cachedState: null },
+      ]);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 }));
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.reason).not.toContain("open linked PR");
+    });
+
+    it("blocks only the positively-open PRs when the linked set mixes hydrated and unhydrated rows", async () => {
+      mockResolveLinkedPullRequests.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 279, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#279", cachedState: null },
+        { id: "pr-2", owner: "TEA-Core", repo: "paperclip-agent-tools", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip-agent-tools#274", cachedState: "open" },
+      ]);
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+      expect(result.reason).not.toContain("#279");
+    });
+
+    it("allows transition when linked PR set is empty (existing green path)", async () => {
+      mockResolveLinkedPullRequests.mockResolvedValue([]);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 }));
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.aheadBy).toBe(0);
+    });
+
+    it("no-deliverable-head override still allows transition with open linked PRs present", async () => {
+      mockResolveLinkedPullRequests.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip-agent-tools", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip-agent-tools#274", cachedState: "open" },
+      ]);
+      const override: DoneTransitionOverride = { disposition: "upstream-equivalent-fix-no-deliverable-head", reason: "Tier 1" };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("upstream-equivalent-fix-no-deliverable-head");
     });
   });
 

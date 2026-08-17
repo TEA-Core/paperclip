@@ -7,6 +7,7 @@ import {
   type GitHubTokenScope,
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
+import { resolveLinkedPullRequests } from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
 
@@ -447,6 +448,38 @@ export async function evaluateDoneTransitionGuard(
     return {
       allowed: true,
       reason: `Override accepted: ${override.disposition}`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // Only PRs we can positively prove are open may block `done`. An external-object
+  // row is created from a mere URL mention with `data` NULL, and is hydrated later by
+  // a refresh that calls the GitHub API — the same call that 401s under SUP-13038.
+  // Treating an unhydrated row as open would block `done` on any issue that merely
+  // links a PR (including already-merged or unrelated ones) in exactly the
+  // credential-less configuration this guard is built for. Fail open on unknown.
+  const resolvedPrs = await resolveLinkedPullRequests(db, issue.companyId, issue.id);
+  const linkedPrs = resolvedPrs.filter((p) => p.cachedState === "open");
+  if (linkedPrs.length > 0) {
+    const prNames = linkedPrs.map((p) => p.displayName).join(", ");
+    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      reason: `open_linked_prs:${linkedPrs.length}`,
+      skipReason: `open_linked_prs:${linkedPrs.length}`,
+      prs: prNames,
+    });
+    return {
+      allowed: false,
+      reason:
+        `Issue has ${linkedPrs.length} open linked PR${linkedPrs.length === 1 ? "" : "s"} (${prNames}). ` +
+        "Land them (merge or close the PRs) before marking done, or set doneTransitionOverride to a " +
+        `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}). ` +
+        "A done-tier declaration alone does not clear this block — the tier check runs after this guard.",
       aheadBy: null,
       branch: null,
       defaultRef: null,
