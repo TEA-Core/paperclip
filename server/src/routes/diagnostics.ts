@@ -2,7 +2,7 @@ import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { assertAuthenticated, assertCompanyAccess } from "./authz.js";
 import { accessService } from "../services/index.js";
-import { resolveGitHubToken } from "../services/github-credential.js";
+import { resolveGitHubToken, type GitHubTokenScope } from "../services/github-credential.js";
 import { ghFetch } from "../services/github-fetch.js";
 import { logger } from "../middleware/logger.js";
 
@@ -22,6 +22,12 @@ export interface GitHubCredentialDiagnostics {
   checkedAt: string;
   reason?: string;
 }
+
+export const GITHUB_PROBE_URL_BY_SCOPE: Record<GitHubTokenScope, string> = {
+  app_installation: "https://api.github.com/installation/repositories?per_page=1",
+  project_env: "https://api.github.com/user",
+  company: "https://api.github.com/user",
+};
 
 export function diagnosticsRoutes(db: Db) {
   const router = Router();
@@ -74,7 +80,7 @@ export function diagnosticsRoutes(db: Db) {
 
     const probe: GitHubCredentialProbe = { attempted: true };
     try {
-      const response = await ghFetch("https://api.github.com/user", {
+      const response = await ghFetch(GITHUB_PROBE_URL_BY_SCOPE[tokenResult.scope], {
         headers: {
           accept: "application/vnd.github+json",
           "user-agent": "paperclip-diagnostics",

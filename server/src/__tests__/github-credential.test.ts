@@ -8,6 +8,7 @@ import {
   appTokenCache,
   GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
 } from "../services/github-credential.js";
+import { GITHUB_PROBE_URL_BY_SCOPE } from "../routes/diagnostics.js";
 import type { Server } from "node:http";
 
 const FIXTURE_TOKEN = "ghp_test_token_value_for_unit_tests_only";
@@ -799,6 +800,12 @@ describe("diagnostics route", () => {
         },
       });
       expect(res.body.checkedAt).toBeDefined();
+      expect(mockGhFetch.ghFetch).toHaveBeenCalledWith(
+        "https://api.github.com/user",
+        expect.objectContaining({
+          headers: expect.objectContaining({ authorization: `Bearer ${FIXTURE_TOKEN}` }),
+        }),
+      );
     } finally {
       await server.close();
     }
@@ -950,10 +957,12 @@ describe("diagnostics route", () => {
       },
     ]);
 
-    mockGhFetch.ghFetch.mockResolvedValue(new Response(JSON.stringify({ login: "test" }), {
-      status: 200,
-      headers: { "x-ratelimit-limit": "5000" },
-    }));
+    mockGhFetch.ghFetch.mockResolvedValue(
+      new Response(JSON.stringify({ total_count: 1, repositories: [] }), {
+        status: 200,
+        headers: { "x-ratelimit-limit": "15000" },
+      }),
+    );
 
     try {
       const app = await createApp();
@@ -967,13 +976,137 @@ describe("diagnostics route", () => {
           scope: "app_installation",
           secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
           installationId: FIXTURE_INSTALLATION_ID,
+          probe: {
+            attempted: true,
+            status: 200,
+            ok: true,
+            rateLimitLimit: 15000,
+          },
         });
         expect(res.body.token).toBeUndefined();
+        expect(mockGhFetch.ghFetch).toHaveBeenCalledWith(
+          "https://api.github.com/installation/repositories?per_page=1",
+          expect.objectContaining({
+            headers: expect.objectContaining({ authorization: `Bearer ${FIXTURE_APP_TOKEN}` }),
+          }),
+        );
       } finally {
         await server.close();
       }
     } finally {
       restoreFetch();
     }
+  });
+
+  it("reports probe ok=false for a rejected app_installation token (403)", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    const restoreFetch = mockAppFetchResponses([
+      {
+        url: "/app/installations",
+        response: [{ id: Number(FIXTURE_INSTALLATION_ID), account: { login: "tea-core" } }],
+      },
+      {
+        url: `/app/installations/${FIXTURE_INSTALLATION_ID}/access_tokens`,
+        response: {
+          token: FIXTURE_APP_TOKEN,
+          expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        },
+      },
+    ]);
+
+    mockGhFetch.ghFetch.mockResolvedValue(
+      new Response(JSON.stringify({ message: "Resource not accessible by integration" }), {
+        status: 403,
+        headers: { "x-ratelimit-limit": "15000" },
+      }),
+    );
+
+    try {
+      const app = await createApp();
+      const server = await startServer(app);
+      try {
+        const res = await httpRequest(server.url, "/api/companies/company-1/diagnostics/github-credential");
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({
+          resolved: true,
+          scope: "app_installation",
+          secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+          installationId: FIXTURE_INSTALLATION_ID,
+          probe: {
+            attempted: true,
+            status: 403,
+            ok: false,
+            rateLimitLimit: 15000,
+          },
+        });
+        expect(mockGhFetch.ghFetch).toHaveBeenCalledWith(
+          "https://api.github.com/installation/repositories?per_page=1",
+          expect.anything(),
+        );
+      } finally {
+        await server.close();
+      }
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it("probes /user for project_env scope", async () => {
+    const ghCredential = await import("../services/github-credential.js");
+    const resolveSpy = vi
+      .spyOn(ghCredential, "resolveGitHubToken")
+      .mockResolvedValue({ token: FIXTURE_TOKEN, scope: "project_env", secretName: "GITHUB_TOKEN" });
+
+    mockGhFetch.ghFetch.mockResolvedValue(
+      new Response(JSON.stringify({ login: "test" }), {
+        status: 200,
+        headers: { "x-ratelimit-limit": "5000" },
+      }),
+    );
+
+    try {
+      const app = await createApp();
+      const server = await startServer(app);
+      try {
+        const res = await httpRequest(server.url, "/api/companies/company-1/diagnostics/github-credential");
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({
+          resolved: true,
+          scope: "project_env",
+          secretName: "GITHUB_TOKEN",
+          probe: {
+            attempted: true,
+            status: 200,
+            ok: true,
+            rateLimitLimit: 5000,
+          },
+        });
+        expect(mockGhFetch.ghFetch).toHaveBeenCalledWith(
+          "https://api.github.com/user",
+          expect.objectContaining({
+            headers: expect.objectContaining({ authorization: `Bearer ${FIXTURE_TOKEN}` }),
+          }),
+        );
+      } finally {
+        await server.close();
+      }
+    } finally {
+      resolveSpy.mockRestore();
+    }
+  });
+
+  it("selects the probe URL by scope", () => {
+    expect(GITHUB_PROBE_URL_BY_SCOPE.app_installation).toBe("https://api.github.com/installation/repositories?per_page=1");
+    expect(GITHUB_PROBE_URL_BY_SCOPE.project_env).toBe("https://api.github.com/user");
+    expect(GITHUB_PROBE_URL_BY_SCOPE.company).toBe("https://api.github.com/user");
   });
 });
