@@ -546,7 +546,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     expect(statusRows[0]?.status).toBe("todo");
   });
 
-  it("Tier 1 declaration override allows done with open linked PRs present", async () => {
+  it("no-deliverable-head doneTransitionOverride allows done with open linked PRs present", async () => {
     const { companyId, agentId, issueId, identifier } = await seedIssue("TIER1PR");
     currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
 

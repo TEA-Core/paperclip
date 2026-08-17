@@ -468,7 +468,11 @@ export async function evaluateDoneTransitionGuard(
     });
     return {
       allowed: false,
-      reason: `Issue has ${linkedPrs.length} open linked PRs (${prNames}). Land them (or record a Tier 1 declaration) before marking done.`,
+      reason:
+        `Issue has ${linkedPrs.length} open linked PR${linkedPrs.length === 1 ? "" : "s"} (${prNames}). ` +
+        "Land them (merge or close the PRs) before marking done, or set doneTransitionOverride to a " +
+        `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}). ` +
+        "A done-tier declaration alone does not clear this block — the tier check runs after this guard.",
       aheadBy: null,
       branch: null,
       defaultRef: null,

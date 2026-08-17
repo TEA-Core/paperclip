@@ -211,9 +211,10 @@ describe("evaluateDoneTransitionGuard", () => {
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
       expect(result.allowed).toBe(false);
       expect(result.skipped).toBe(false);
-      expect(result.reason).toContain("1 open linked PRs");
+      expect(result.reason).toContain("1 open linked PR");
       expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
-      expect(result.reason).toContain("Tier 1 declaration");
+      expect(result.reason).toContain("doneTransitionOverride");
+      expect(result.reason).toContain("does not clear this block");
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
@@ -259,7 +260,7 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.aheadBy).toBe(0);
     });
 
-    it("Tier 1 declaration override still allows transition with open linked PRs present", async () => {
+    it("no-deliverable-head override still allows transition with open linked PRs present", async () => {
       mockResolveLinkedPullRequests.mockResolvedValue([
         { id: "pr-1", owner: "TEA-Core", repo: "paperclip-agent-tools", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip-agent-tools#274" },
       ]);
