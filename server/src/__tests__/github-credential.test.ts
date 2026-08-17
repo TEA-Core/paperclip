@@ -951,9 +951,9 @@ describe("diagnostics route", () => {
       },
     ]);
 
-    mockGhFetch.ghFetch.mockResolvedValue(new Response(JSON.stringify({ login: "test" }), {
+    mockGhFetch.ghFetch.mockResolvedValue(new Response(JSON.stringify({ total_count: 3, repositories: [] }), {
       status: 200,
-      headers: { "x-ratelimit-limit": "5000" },
+      headers: { "x-ratelimit-limit": "15000" },
     }));
 
     try {
@@ -975,6 +975,100 @@ describe("diagnostics route", () => {
       }
     } finally {
       restoreFetch();
+    }
+  });
+
+  // SUP-13038: an App installation token always gets 403 from /user, so probing
+  // /user under app_installation scope reported a permanent false red on the very
+  // endpoint this card's verification path depends on.
+  it("probes /installation/repositories (never /user) under app_installation scope", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    const restoreFetch = mockAppFetchResponses([
+      {
+        url: "/app/installations",
+        response: [{ id: Number(FIXTURE_INSTALLATION_ID), account: { login: "tea-core" } }],
+      },
+      {
+        url: `/app/installations/${FIXTURE_INSTALLATION_ID}/access_tokens`,
+        response: {
+          token: FIXTURE_APP_TOKEN,
+          expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        },
+      },
+    ]);
+
+    // URL-aware: /user answers exactly as real GitHub does for an installation
+    // token, so a regression back to /user fails this test instead of passing.
+    mockGhFetch.ghFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/installation/repositories")) {
+        return new Response(JSON.stringify({ total_count: 3, repositories: [] }), {
+          status: 200,
+          headers: { "x-ratelimit-limit": "15000" },
+        });
+      }
+      return new Response(JSON.stringify({ message: "Resource not accessible by integration" }), {
+        status: 403,
+        headers: { "x-ratelimit-limit": "15000" },
+      });
+    });
+
+    try {
+      const app = await createApp();
+      const server = await startServer(app);
+      try {
+        const res = await httpRequest(server.url, "/api/companies/company-1/diagnostics/github-credential");
+
+        expect(res.status).toBe(200);
+        expect(res.body.probe).toMatchObject({
+          attempted: true,
+          endpoint: "https://api.github.com/installation/repositories?per_page=1",
+          status: 200,
+          ok: true,
+          repositoryCount: 3,
+        });
+        const calledUrls = mockGhFetch.ghFetch.mock.calls.map((c: unknown[]) => c[0] as string);
+        expect(calledUrls.some((u) => u.includes("/installation/repositories"))).toBe(true);
+        expect(calledUrls.some((u) => u.endsWith("/user"))).toBe(false);
+      } finally {
+        await server.close();
+      }
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it("still probes /user at company (PAT) scope", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
+    mockGhFetch.ghFetch.mockResolvedValue(new Response(JSON.stringify({ login: "test" }), {
+      status: 200,
+      headers: { "x-ratelimit-limit": "5000" },
+    }));
+
+    const app = await createApp();
+    const server = await startServer(app);
+    try {
+      const res = await httpRequest(server.url, "/api/companies/company-1/diagnostics/github-credential");
+
+      expect(res.body.probe).toMatchObject({
+        endpoint: "https://api.github.com/user",
+        status: 200,
+        ok: true,
+      });
+      // repositoryCount is App-installation-only; a PAT probe must not invent it.
+      expect(res.body.probe.repositoryCount).toBeUndefined();
+    } finally {
+      await server.close();
     }
   });
 });
