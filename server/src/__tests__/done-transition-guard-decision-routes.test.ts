@@ -1,0 +1,435 @@
+import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { and, eq } from "drizzle-orm";
+import {
+  activityLog,
+  agents,
+  companies,
+  companyMemberships,
+  createDb,
+  executionWorkspaces,
+  heartbeatRuns,
+  issues,
+  projectWorkspaces,
+  projects,
+  type Db,
+} from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
+
+const mockResolveSecretValue = vi.hoisted(() => vi.fn());
+const mockGetByName = vi.hoisted(() => vi.fn());
+const mockGhFetch = vi.hoisted(() => vi.fn());
+
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => ({
+    getByName: mockGetByName,
+    resolveSecretValue: mockResolveSecretValue,
+  }),
+}));
+
+vi.mock("../services/github-fetch.js", () => ({
+  ghFetch: mockGhFetch,
+  gitHubApiBase: (hostname: string) =>
+    hostname === "github.com" || hostname === "www.github.com"
+      ? "https://api.github.com"
+      : `https://${hostname}/api/v3`,
+}));
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping done-transition decision route tests on this host: ${
+      embeddedPostgresSupport.reason ?? "unsupported environment"
+    }`,
+  );
+}
+
+/**
+ * SUP-13185: a `done` transition that carried an execution-policy decision (a board
+ * review approval) used to skip BOTH done-guards and every activity_log row, because
+ * the predicate was `requestedStatus === "done" && ... && !transition.decision`.
+ *
+ * Net effect: approval-closed cards went `done` regardless of whether their PR merged
+ * (SUP-13176/PR #285, SUP-13181/PR #286) and, because the path wrote nothing at all,
+ * they were invisible to the ghost-PASS census by construction — making the SUP-13140
+ * figure a floor rather than the population.
+ */
+describeEmbeddedPostgres("done-transition guards on decision-carrying transitions (SUP-13185)", () => {
+  let db!: Db;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let app!: express.Express;
+  let currentActor!: Express.Request["actor"];
+  let previousSchedulingSuppression: string | undefined;
+
+  beforeAll(async () => {
+    previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-done-transition-decision-");
+    db = createDb(tempDb.connectionString);
+    app = createApp();
+  }, 60_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+    if (previousSchedulingSuppression === undefined) {
+      delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    } else {
+      process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
+    }
+  });
+
+  beforeEach(() => {
+    mockGhFetch.mockReset();
+    mockGetByName.mockReset();
+    mockResolveSecretValue.mockReset();
+  });
+
+  function createApp() {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = currentActor;
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as any));
+    app.use(errorHandler);
+    return app;
+  }
+
+  /**
+   * Seeds an issue parked on a pending review stage, exactly as a card awaiting board
+   * review sits: status `in_review`, assignee = the reviewer, returnAssignee = the
+   * implementer. `stageCount: 2` leaves a second stage pending so an approval of the
+   * first stage advances to `in_review` instead of resolving to `done`.
+   */
+  async function seedIssueAwaitingReview(issuePrefix: string, opts: { stageCount?: 1 | 2 } = {}) {
+    const stageCount = opts.stageCount ?? 1;
+    const companyId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const implementerAgentId = randomUUID();
+    const secondReviewerAgentId = randomUUID();
+    const issueId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const firstStageId = randomUUID();
+    const secondStageId = randomUUID();
+    const identifier = `${issuePrefix}-1`;
+    const branchName = "SUP-13185-test-branch";
+    const repoUrl = "https://github.com/TEA-Core/paperclip";
+    const defaultRef = "fold/tea-patches-v2026.722.0";
+    const now = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "cloud-user-1",
+      status: "active",
+      membershipRole: "owner",
+      updatedAt: now,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Test Project",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: "/tmp/test",
+      isPrimary: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    for (const [agentId, name] of [
+      [reviewerAgentId, "Reviewer"],
+      [implementerAgentId, "Implementer"],
+      [secondReviewerAgentId, "SecondReviewer"],
+    ] as const) {
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name,
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId: null,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: branchName,
+      status: "active",
+      cwd: "/tmp/test",
+      repoUrl,
+      baseRef: defaultRef,
+      branchName,
+      providerType: "git_worktree",
+      providerRef: "/tmp/test",
+      lastUsedAt: now,
+      openedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const stages = [
+      {
+        id: firstStageId,
+        type: "review" as const,
+        approvalsNeeded: 1 as const,
+        participants: [{ type: "agent" as const, agentId: reviewerAgentId, userId: null }],
+      },
+      ...(stageCount === 2
+        ? [
+            {
+              id: secondStageId,
+              type: "review" as const,
+              approvalsNeeded: 1 as const,
+              participants: [{ type: "agent" as const, agentId: secondReviewerAgentId, userId: null }],
+            },
+          ]
+        : []),
+    ];
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier,
+      title: "Approval-closed card must still clear the delivery guard",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: reviewerAgentId,
+      createdByUserId: "cloud-user-1",
+      executionWorkspaceId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages,
+        returnAssigneeAgentId: implementerAgentId,
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: firstStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: implementerAgentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+        changesRequestedCount: 0,
+      },
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ sourceIssueId: issueId })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+
+    return { companyId, reviewerAgentId, implementerAgentId, issueId, identifier };
+  }
+
+  function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
+    return { type: "agent", agentId, companyId, source: "agent_key", runId };
+  }
+
+  async function seedRun(companyId: string, agentId: string, issueId: string) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+    return runId;
+  }
+
+  async function statusOf(issueId: string) {
+    const rows = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    return rows[0]?.status;
+  }
+
+  async function auditRows(companyId: string, issueId: string, action: string) {
+    return db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, issueId), eq(activityLog.action, action)));
+  }
+
+  /** Branch is ahead of the default ref with no merged PR: nothing landed. */
+  function mockUnmergedBranch() {
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+      if (url.includes("/pulls?")) return new Response(JSON.stringify([{ merged: false, merged_at: null }]), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+  }
+
+  /** Nothing left to land. */
+  function mockMergedBranch() {
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+  }
+
+  it("PATCH: a final-stage approval on an UNMERGED branch is now blocked (was: closed done silently)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185A");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockUnmergedBranch();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Looks good.\n\nkind: review\ndecision: approved" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("done_transition_missing_delivery");
+    // The remedy must address the *approver*, not tell them to run deliver.sh.
+    expect(res.body.details.decisionCarried).toBe(true);
+    expect(res.body.details.remedy).toContain("Merge the issue's pull request");
+    expect(res.body.details.aheadBy).toBe(3);
+
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("PATCH: a final-stage approval that skips the guard still writes an activity_log row (census visibility)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185B");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    // No credential at all -> the guard skips rather than blocks. Before this fix the
+    // decision path wrote nothing here, which is precisely why approval-closed cards
+    // never appeared in the SUP-13140 census.
+    mockGetByName.mockResolvedValue(null);
+    mockResolveSecretValue.mockResolvedValue(null);
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Looks good.\n\nkind: review\ndecision: approved" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+
+    const rows = await vi.waitFor(
+      async () => {
+        const found = await auditRows(companyId, issueId, "issue.done_transition_guard_skipped");
+        if (found.length === 0) throw new Error("waiting for audit row");
+        return found;
+      },
+      { timeout: 5000 },
+    );
+    expect(rows).toHaveLength(1);
+    expect((rows[0]?.details as Record<string, unknown>).decisionCarried).toBe(true);
+    expect((rows[0]?.details as Record<string, unknown>).skipReason).toBeTruthy();
+  });
+
+  it("PATCH: an approval comment carrying no tier declaration is logged, not rejected (no approval deadlock)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185C");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockMergedBranch();
+
+    // A reviewer's approval is a code-quality verdict; they cannot make the
+    // implementer's SUP-12693 liveness claim, so the tier guard must degrade to an
+    // audit row here instead of 409-ing the approval circuit shut.
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Looks good.\n\nkind: review\ndecision: approved" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+
+    const rows = await vi.waitFor(
+      async () => {
+        const found = await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped");
+        if (found.length === 0) throw new Error("waiting for tier audit row");
+        return found;
+      },
+      { timeout: 5000 },
+    );
+    expect(
+      rows.some((r) => (r.details as Record<string, unknown>).skipReason === "decision_carrying_transition"),
+    ).toBe(true);
+  });
+
+  it("PATCH: an approval that advances to a LATER stage resolves to in_review and is not delivery-guarded", async () => {
+    // Guards key on the status the transition RESOLVES to. A requested `done` that the
+    // policy redirects to `in_review` is not a close and must not be blocked by an
+    // unmerged branch — otherwise the fix would wedge every multi-stage review.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185D", {
+      stageCount: 2,
+    });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockUnmergedBranch();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Stage 1 approved.\n\nkind: review\ndecision: approved" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("in_review");
+    // No delivery probe should have been made at all for a non-closing transition.
+    expect(mockGhFetch).not.toHaveBeenCalled();
+  });
+
+  it("POST comment: the auto-approval door onto done is delivery-guarded too, and writes no comment on 409", async () => {
+    // The comment auto-approval path is a second route onto `done` that never ran either
+    // guard. A 409 must leave both the comment and the status change unwritten.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185E");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockUnmergedBranch();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: "## Review: APPROVED\n\nShip it." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("done_transition_missing_delivery");
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("POST comment: auto-approval still closes the card when the branch has landed", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185F");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockMergedBranch();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: "## Review: APPROVED\n\nShip it." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+  });
+});
