@@ -1,9 +1,10 @@
 import express from "express";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   resolveGitHubToken,
   resolveGitHubTokenForRepo,
+  resolveGitHubTokenCandidatesForRepo,
   isGitHubTokenResolution,
   appTokenCache,
   GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
@@ -975,5 +976,128 @@ describe("diagnostics route", () => {
     } finally {
       restoreFetch();
     }
+  });
+});
+
+describe("resolveGitHubTokenCandidatesForRepo", () => {
+  beforeEach(() => {
+    mockSecretService.getByName.mockReset();
+    mockSecretService.resolveSecretValue.mockReset();
+    mockDb.select.mockReset();
+  });
+
+  it("returns project_env candidate first, then company candidate", async () => {
+    const secretRef = { type: "secret_ref", secretId: "ref-secret-1", version: "latest" };
+    const projectEnv = { GITHUB_TOKEN: secretRef };
+
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([
+        { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv },
+      ]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
+      if (secretId === "secret-1") return "company-token-value";
+      return FIXTURE_TOKEN;
+    });
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "owner", "repo");
+    expect(result).toHaveLength(2);
+    expect(result[0]!.scope).toBe("project_env");
+    expect(result[0]!.secretName).toBe("GITHUB_TOKEN");
+    expect(result[0]!.token).toBe(FIXTURE_TOKEN);
+    expect(result[1]!.scope).toBe("company");
+    expect(result[1]!.secretName).toBe("GITHUB_TOKEN");
+    expect(result[1]!.token).toBe("company-token-value");
+  });
+
+  it("skips empty/whitespace-only secret values and dedupes identical token values", async () => {
+    const secretRef = { type: "secret_ref", secretId: "ref-secret-1", version: "latest" };
+    const projectEnv = { GITHUB_TOKEN: secretRef };
+
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([
+        { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv },
+      ]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    mockSecretService.resolveSecretValue
+      .mockResolvedValueOnce("   ")
+      .mockResolvedValueOnce(FIXTURE_TOKEN);
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "owner", "repo");
+    expect(result).toHaveLength(1);
+    expect(result[0]!.scope).toBe("company");
+    expect(result[0]!.secretName).toBe("GITHUB_TOKEN");
+  });
+
+  it("dedupes identical token values across project_env and company scopes", async () => {
+    const secretRef = { type: "secret_ref", secretId: "ref-secret-1", version: "latest" };
+    const projectEnv = { GITHUB_TOKEN: secretRef };
+
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([
+        { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv },
+      ]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "owner", "repo");
+    expect(result).toHaveLength(1);
+    expect(result[0]!.scope).toBe("project_env");
+    expect(result[0]!.secretName).toBe("GITHUB_TOKEN");
+  });
+
+  it("returns empty array when no token is resolvable at any scope", async () => {
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([
+        { id: "pw-1", projectId: "proj-1", repoUrl: "https://github.com/owner/repo", projectEnv: { GITHUB_TOKEN: { type: "secret_ref", secretId: "ref-1", version: "latest" } } },
+      ]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    mockSecretService.resolveSecretValue.mockResolvedValue("   ");
+    mockSecretService.getByName.mockResolvedValue(null);
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "owner", "repo");
+    expect(result).toHaveLength(0);
+  });
+
+  it("returns empty array when repo is not found at company or project scope", async () => {
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    mockSecretService.getByName.mockResolvedValue(null);
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "owner", "repo");
+    expect(result).toHaveLength(0);
   });
 });
