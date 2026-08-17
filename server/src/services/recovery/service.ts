@@ -2936,6 +2936,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
   }
 
+  /**
+   * Recovery hands the source issue to the routing owner: escalation writes
+   * `assigneeAgentId = ownerAgentId`, and the return owner receives the issue
+   * back the same way. So the grant question is not "can this agent write the
+   * issue while someone else still holds it" (no manager or reviewer can, which
+   * would reject the whole ladder), it is "would this agent still be denied
+   * `issue:mutate` even once the issue is theirs". Policy-restricted, low-trust
+   * out-of-boundary, scoped-key, and inactive-membership candidates stay denied
+   * under that evaluation, which is the SUP-13120 case; a plain manager or CTO
+   * that simply holds no grant on someone else's issue is not.
+   */
   async function candidateCanWriteSourceIssue(
     issue: typeof issues.$inferSelect,
     agentId: string,
@@ -2949,8 +2960,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issueId: issue.id,
         projectId: issue.projectId,
         parentIssueId: issue.parentId,
-        assigneeAgentId: issue.assigneeAgentId,
-        assigneeUserId: issue.assigneeUserId,
+        // Post-handover assignment state, per the note above.
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
         status: issue.status,
         createdByAgentId: issue.createdByAgentId,
       },

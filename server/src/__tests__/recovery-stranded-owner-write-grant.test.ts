@@ -10,6 +10,7 @@ import {
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
+import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -49,7 +50,7 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedCompany() {
+  async function seedCompany(options?: { ctoPermissions?: Record<string, unknown> }) {
     const companyId = randomUUID();
     const ctoId = randomUUID();
     const coderId = randomUUID();
@@ -70,7 +71,7 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
         adapterType: "codex_local",
         adapterConfig: {},
         runtimeConfig: {},
-        permissions: {},
+        permissions: options?.ctoPermissions ?? {},
       },
       {
         id: coderId,
@@ -106,8 +107,17 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
     return row!;
   }
 
-  it("rejects a CTO candidate that is invokable but lacks a write grant on the source issue (SUP-13091 shape)", async () => {
-    const { companyId, ctoId, coderId, prefix } = await seedCompany();
+  it("rejects a ladder candidate that stays denied issue:mutate even as the owner (SUP-13091 shape)", async () => {
+    // The CTO is invokable, but its low-trust boundary excludes the source
+    // issue, so it is denied issue:mutate even once the issue is handed to it.
+    const { companyId, ctoId, coderId, prefix } = await seedCompany({
+      ctoPermissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, projectIds: [randomUUID()] },
+        },
+      },
+    });
     const sourceIssue = await seedSourceIssue(companyId, coderId, prefix);
 
     const enqueueWakeup = vi.fn(async () => null);
@@ -136,10 +146,11 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
 
     expect(action).toBeDefined();
     expect(action.ownerAgentId).not.toBe(ctoId);
-    expect(action.returnOwnerAgentId).not.toBe(ctoId);
+    expect(action.ownerAgentId).toBe(coderId);
+    expect(action.returnOwnerAgentId).toBe(coderId);
   });
 
-  it("selects an invokable candidate that holds the write grant on the source issue (happy path)", async () => {
+  it("still escalates to the manager ladder when the candidate can hold the issue (happy path)", async () => {
     const { companyId, ctoId, coderId, prefix } = await seedCompany();
     const sourceIssue = await seedSourceIssue(companyId, coderId, prefix);
 
@@ -168,7 +179,61 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
 
     expect(action).toBeDefined();
+    expect(action.ownerAgentId).toBe(ctoId);
     expect(action.returnOwnerAgentId).toBe(coderId);
     expect(action.evidence.routingFallbackReason).toBeNull();
+  });
+
+  it("drops a return owner that stays denied issue:mutate even as the owner", async () => {
+    const { companyId, ctoId, coderId, prefix } = await seedCompany();
+    const sourceIssue = await seedSourceIssue(companyId, coderId, prefix);
+    // process_lost routes back to the agent that ran, which here is neither the
+    // assignee nor an agent that could hold the issue.
+    const reviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerId,
+      companyId,
+      name: "Reviewer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, projectIds: [randomUUID()] },
+        },
+      },
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: reviewerId,
+      status: "failed",
+      error: "process lost",
+      errorCode: "process_lost",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+
+    expect(action).toBeDefined();
+    expect(action.ownerAgentId).toBe(ctoId);
+    expect(action.returnOwnerAgentId).toBeNull();
+    expect(action.evidence.routingFallbackReason).toContain("lacks a write grant on the source issue");
   });
 });
