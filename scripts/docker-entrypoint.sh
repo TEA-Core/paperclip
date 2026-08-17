@@ -99,7 +99,7 @@ if [ -z "${PAPERCLIP_SECRETS_MASTER_KEY:-}" ] && [ -f /etc/paperclip/secrets/mas
     export PAPERCLIP_SECRETS_MASTER_KEY
 elif [ -n "${PAPERCLIP_SECRETS_MASTER_KEY:-}" ] && [ -f /etc/paperclip/secrets/master.key ]; then
     env_fp="$(printf '%s' "$PAPERCLIP_SECRETS_MASTER_KEY" | sha256sum | cut -c1-12)"
-    file_fp="$(sha256sum /etc/paperclip/secrets/master.key | cut -c1-12)"
+    file_fp="$(printf '%s' "$(cat /etc/paperclip/secrets/master.key)" | sha256sum | cut -c1-12)"
     if [ "$env_fp" != "$file_fp" ]; then
         echo "docker-entrypoint.sh: warning: PAPERCLIP_SECRETS_MASTER_KEY env key differs from master.key file (env=${env_fp} file=${file_fp}); using env key" >&2
     fi

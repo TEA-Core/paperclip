@@ -154,7 +154,7 @@ if ! printf '%s' "$case1_err" | grep -q "$ENV_FP"; then
     echo "FAIL: env-set + file-present — warning missing env fingerprint '$ENV_FP'"
     exit 1
 fi
-file_fp="$(sha256sum "$KEY" | cut -c1-12)"
+file_fp="$(printf '%s' "$(cat "$KEY")" | sha256sum | cut -c1-12)"
 if ! printf '%s' "$case1_err" | grep -q "$file_fp"; then
     echo "FAIL: env-set + file-present — warning missing file fingerprint '$file_fp'"
     exit 1
@@ -181,12 +181,31 @@ printf '%s' "$EXPECTED_KEY" > "$KEY"
 chown root:root "$KEY"
 chmod 0600 "$KEY"
 case3_out="$(docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>/dev/null | digest_of || true)"
-file_fp="$(sha256sum "$KEY" | cut -c1-12)"
+file_fp="$(printf '%s' "$(cat "$KEY")" | sha256sum | cut -c1-12)"
 if [ "$case3_out" != "$file_fp" ]; then
     echo "FAIL: no-env + file-present — server received digest '$case3_out', want file digest '$file_fp'"
     exit 1
 fi
 echo "PASS: no-env + file-present — server received file key"
+
+# Case 4: env set + file present, byte-identical key (file has trailing newline
+# from the generation arm's `head -c 32 /dev/urandom | base64` shape) — must NOT
+# warn. The entrypoint normalizes file_fp via `$(cat ...)` so the trailing
+# newline is stripped before hashing, matching env_fp.
+printf '%s\n' "$ENV_KEY" > "$KEY"
+chown root:root "$KEY"
+chmod 0600 "$KEY"
+case4_err="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>&1 >/dev/null || true)"
+case4_out="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>/dev/null | digest_of || true)"
+if [ "$case4_out" != "$ENV_FP" ]; then
+    echo "FAIL: env-set + file-present byte-identical — server received digest '$case4_out', want env digest '$ENV_FP'"
+    exit 1
+fi
+if printf '%s' "$case4_err" | grep -q "differs from master.key"; then
+    echo "FAIL: env-set + file-present byte-identical — false-positive disagreement warning fired for identical key (trailing newline)"
+    exit 1
+fi
+echo "PASS: env-set + file-present byte-identical — no false-positive warning (trailing newline normalized)"
 
 # Restore the expected key for the probe phase.
 printf '%s' "$EXPECTED_KEY" > "$KEY"

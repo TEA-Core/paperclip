@@ -154,6 +154,26 @@ test("entrypoint warns on env/file disagreement without echoing the key (SUP-131
   );
 });
 
+test("entrypoint normalizes file_fp via $(cat ...) so trailing newline does not cause false-positive (SUP-13137)", () => {
+  // The generation arm writes `head -c 32 /dev/urandom | base64 > master.key`,
+  // which produces a 44-char base64 + trailing newline. The export branch at
+  // line 98 already normalizes via `$(cat ...)`. The file_fp comparison path
+  // must do the same — otherwise a byte-identical key (differing only by the
+  // trailing newline) produces two different digests and a false warning.
+  assert.match(
+    entrypoint,
+    /file_fp="\$\(printf '%s' "\$\(cat \/etc\/paperclip\/secrets\/master\.key\)" \| sha256sum \| cut -c1-12\)"/,
+    "file_fp must be computed from $(cat ...) to strip the trailing newline, matching the export normalization",
+  );
+  // Must NOT compute file_fp from raw file bytes (which would include the
+  // trailing newline from base64 output).
+  assert.doesNotMatch(
+    entrypoint,
+    /file_fp="\$\(sha256sum \/etc\/paperclip\/secrets\/master\.key \| cut -c1-12\)"/,
+    "file_fp must NOT hash raw file bytes — that includes the trailing newline and causes false-positives",
+  );
+});
+
 test("entrypoint never runs under set -x (SUP-13129)", () => {
   const entrypointInstructions = entrypoint
     .split("\n")
@@ -259,6 +279,19 @@ test("the probe asserts the hardened state, the denials, and the key handoff", (
     /echo[^\n]*\$\{?PAPERCLIP_SECRETS_MASTER_KEY|echo[^\n]*\$\{?EXPECTED_KEY/,
     "must never echo the key value",
   );
+
+  // The probe's file_fp computations must match the entrypoint's normalization:
+  // $(cat "$KEY") strips the trailing newline, not raw sha256sum of the file.
+  assert.match(
+    probe,
+    /file_fp="\$\(printf '%s' "\$\(cat "\$KEY"\)" \| sha256sum \| cut -c1-12\)"/,
+    "probe file_fp must be computed from $(cat ...) to match the entrypoint's normalized output",
+  );
+  assert.doesNotMatch(
+    probe,
+    /file_fp="\$\(sha256sum "\$KEY" \| cut -c1-12\)"/,
+    "probe file_fp must NOT hash raw file bytes — that includes the trailing newline",
+  );
 });
 
 test("the probe covers the absent-key generation arm", () => {
@@ -320,6 +353,25 @@ test("the probe covers the env-wins matrix (SUP-13129)", () => {
     probe,
     /server received file key/,
     "must assert the server received the file key for row 3",
+  );
+
+  // Case 4: env set + file present, byte-identical key (trailing newline from
+  // the generation arm's base64 shape) — must NOT warn. The entrypoint
+  // normalizes file_fp via $(cat ...) so the trailing newline is stripped.
+  assert.match(
+    probe,
+    /env-set \+ file-present byte-identical/,
+    "must cover matrix row 4: env set + file present, byte-identical key (trailing newline)",
+  );
+  assert.match(
+    probe,
+    /no false-positive warning/,
+    "must assert no false-positive disagreement warning for byte-identical key",
+  );
+  assert.match(
+    probe,
+    /trailing newline normalized/,
+    "must assert the trailing newline is normalized in the comparison",
   );
 
   // The probe must print only digests, never key material.
