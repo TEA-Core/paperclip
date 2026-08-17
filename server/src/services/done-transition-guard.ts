@@ -2,10 +2,22 @@ import type { Db } from "@paperclipai/db";
 import { and, eq, inArray } from "drizzle-orm";
 import { executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
-import { resolveGitHubToken } from "./github-credential.js";
+import {
+  resolveGitHubToken,
+  type GitHubTokenScope,
+} from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
+
+export class GitHubAuthError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "GitHubAuthError";
+    this.status = status;
+  }
+}
 
 const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "upstream-equivalent-fix-no-deliverable-head",
@@ -148,6 +160,9 @@ async function githubCompareAheadBy(
     if (response.status === 404) {
       return null;
     }
+    if (response.status === 401 || response.status === 403) {
+      throw new GitHubAuthError(response.status, `GitHub compare API returned ${response.status}`);
+    }
     throw new Error(`GitHub compare API returned ${response.status}`);
   }
   const body = await response.json().catch(() => null);
@@ -173,6 +188,9 @@ async function githubBranchHasMergedPr(
   };
   const response = await ghFetch(url, { headers });
   if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new GitHubAuthError(response.status, `GitHub pulls API returned ${response.status}`);
+    }
     throw new Error(`GitHub pulls API returned ${response.status}`);
   }
   const body = await response.json().catch(() => null);
@@ -459,9 +477,15 @@ export async function evaluateDoneTransitionGuard(
   }
 
   let token: string | null;
+  let tokenScope: GitHubTokenScope | null = null;
+  let tokenSecretName: string | null = null;
   try {
     const tokenResult = await resolveGitHubToken(db, issue.companyId);
     token = tokenResult.token;
+    if (tokenResult.token !== null) {
+      tokenScope = tokenResult.scope;
+      tokenSecretName = tokenResult.secretName;
+    }
   } catch (err) {
     return fallback(
       "GitHub token resolution failed; transition allowed",
@@ -482,6 +506,13 @@ export async function evaluateDoneTransitionGuard(
   try {
     aheadBy = await githubCompareAheadBy(parsed.hostname, parsed.owner, parsed.repo, ctx.defaultRef, branch, token);
   } catch (err) {
+    if (err instanceof GitHubAuthError) {
+      return fallback(
+        `GitHub compare API rejected the credential (HTTP ${err.status}); transition allowed`,
+        true,
+        `auth_failed:compare:${err.status}:scope=${tokenScope ?? "unknown"}:secretName=${tokenSecretName ?? "unknown"}`,
+      );
+    }
     return fallback(
       "GitHub compare API call failed; transition allowed",
       true,
@@ -515,6 +546,13 @@ export async function evaluateDoneTransitionGuard(
   try {
     hasMergedPr = await githubBranchHasMergedPr(parsed.hostname, parsed.owner, parsed.repo, branch, token);
   } catch (err) {
+    if (err instanceof GitHubAuthError) {
+      return fallback(
+        `GitHub merged-PR lookup rejected the credential (HTTP ${err.status}); transition allowed`,
+        true,
+        `auth_failed:merged_pr:${err.status}:scope=${tokenScope ?? "unknown"}:secretName=${tokenSecretName ?? "unknown"}`,
+      );
+    }
     return fallback(
       "GitHub merged-PR lookup failed; transition allowed",
       true,
