@@ -119,6 +119,94 @@ if [ -f "$KEY" ]; then
 fi
 echo "PASS: entrypoint did not generate master.key when ALLOW_KEY_GENERATION is unset"
 
+# --- Env-wins matrix (SUP-13129) ---
+# Precedence: env key > file key > (opt-in) generated key.
+# Each case runs the entrypoint with a probe as "$@" that prints only the
+# sha256 digest of the key the server received — never the key material.
+#
+# The entrypoint also writes progress lines (the MCP package refresh) to stdout,
+# so the probe tags its digest line and each case keeps only the tagged line.
+ENV_KEY="env-master-key-do-not-mint"
+ENV_FP="$(printf '%s' "$ENV_KEY" | sha256sum | cut -c1-12)"
+KEY_DIGEST_PROBE='printf "DIGEST:%s\n" "$(printf "%s" "${PAPERCLIP_SECRETS_MASTER_KEY:-}" | sha256sum | cut -c1-12)"'
+
+# Reads the probe stdout and prints only the digest the probe tagged.
+digest_of() {
+    sed -n 's/^DIGEST://p' | tail -n 1
+}
+
+# Case 1: env set + file present, differing — server must receive env key;
+#         disagreement warning with two 12-hex fingerprints logged to stderr.
+printf '%s' "$EXPECTED_KEY" > "$KEY"
+chown root:root "$KEY"
+chmod 0600 "$KEY"
+case1_err="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>&1 >/dev/null || true)"
+case1_out="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>/dev/null | digest_of || true)"
+if [ "$case1_out" != "$ENV_FP" ]; then
+    echo "FAIL: env-set + file-present — server received digest '$case1_out', want env digest '$ENV_FP'"
+    exit 1
+fi
+if ! printf '%s' "$case1_err" | grep -q "differs from master.key"; then
+    echo "FAIL: env-set + file-present — no disagreement warning on stderr"
+    exit 1
+fi
+if ! printf '%s' "$case1_err" | grep -q "$ENV_FP"; then
+    echo "FAIL: env-set + file-present — warning missing env fingerprint '$ENV_FP'"
+    exit 1
+fi
+file_fp="$(printf '%s' "$(cat "$KEY")" | sha256sum | cut -c1-12)"
+if ! printf '%s' "$case1_err" | grep -q "$file_fp"; then
+    echo "FAIL: env-set + file-present — warning missing file fingerprint '$file_fp'"
+    exit 1
+fi
+echo "PASS: env-set + file-present — server received env key; disagreement warning with env=${ENV_FP} file=${file_fp}"
+
+# Case 2: env set + no file + ALLOW_KEY_GENERATION=1 — no file created;
+#         server receives env key.
+rm -f "$KEY"
+case2_out="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1 \
+    docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>/dev/null | digest_of || true)"
+if [ "$case2_out" != "$ENV_FP" ]; then
+    echo "FAIL: env-set + no-file + generation — server received digest '$case2_out', want env digest '$ENV_FP'"
+    exit 1
+fi
+if [ -f "$KEY" ]; then
+    echo "FAIL: env-set + no-file + generation — entrypoint created master.key despite env key being set"
+    exit 1
+fi
+echo "PASS: env-set + no-file + generation — no file created; server received env key"
+
+# Case 3: no env + file present — server receives file key (unchanged).
+printf '%s' "$EXPECTED_KEY" > "$KEY"
+chown root:root "$KEY"
+chmod 0600 "$KEY"
+case3_out="$(docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>/dev/null | digest_of || true)"
+file_fp="$(printf '%s' "$(cat "$KEY")" | sha256sum | cut -c1-12)"
+if [ "$case3_out" != "$file_fp" ]; then
+    echo "FAIL: no-env + file-present — server received digest '$case3_out', want file digest '$file_fp'"
+    exit 1
+fi
+echo "PASS: no-env + file-present — server received file key"
+
+# Case 4: env set + file present, byte-identical key (file has trailing newline
+# from the generation arm's `head -c 32 /dev/urandom | base64` shape) — must NOT
+# warn. The entrypoint normalizes file_fp via `$(cat ...)` so the trailing
+# newline is stripped before hashing, matching env_fp.
+printf '%s\n' "$ENV_KEY" > "$KEY"
+chown root:root "$KEY"
+chmod 0600 "$KEY"
+case4_err="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>&1 >/dev/null || true)"
+case4_out="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>/dev/null | digest_of || true)"
+if [ "$case4_out" != "$ENV_FP" ]; then
+    echo "FAIL: env-set + file-present byte-identical — server received digest '$case4_out', want env digest '$ENV_FP'"
+    exit 1
+fi
+if printf '%s' "$case4_err" | grep -q "differs from master.key"; then
+    echo "FAIL: env-set + file-present byte-identical — false-positive disagreement warning fired for identical key (trailing newline)"
+    exit 1
+fi
+echo "PASS: env-set + file-present byte-identical — no false-positive warning (trailing newline normalized)"
+
 # Restore the expected key for the probe phase.
 printf '%s' "$EXPECTED_KEY" > "$KEY"
 chown root:root "$KEY"
