@@ -322,6 +322,50 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
     expect(updated.attemptCount).toBe(3);
   });
 
+  it("persists the enforced default maxAttempts when escalating a null-maxAttempts action", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+
+    const staleAt = new Date(Date.now() - 10 * 60_000);
+    const action = await insertRecoveryAction({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: coderId,
+      cause: "stranded_assigned_issue",
+      attemptCount: 5,
+      maxAttempts: null,
+      lastAttemptAt: staleAt,
+      status: "active",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60_000 });
+
+    expect(result.checked).toBe(1);
+    expect(result.maxAttemptsReached).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [updated] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(updated.status).toBe("escalated");
+    expect(updated.outcome).toBe("exhausted");
+    expect(updated.maxAttempts).toBe(5);
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    const exhaustionComment = comments.find((c) =>
+      (c.body ?? "").includes("exhausted its attempt ceiling"),
+    );
+    expect(exhaustionComment).toBeDefined();
+    expect(exhaustionComment!.body).toContain(`(${action.attemptCount}/${updated.maxAttempts})`);
+  });
+
   it("does not re-fire for actions that are not stale", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
 

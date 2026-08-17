@@ -7539,6 +7539,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         outcome: "exhausted",
         ownerType: "board",
         ownerAgentId: null,
+        maxAttempts: effectiveMaxAttempts,
         updatedAt: now,
       })
       .where(
