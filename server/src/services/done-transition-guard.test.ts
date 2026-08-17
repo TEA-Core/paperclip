@@ -2,6 +2,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
+  GitHubAuthError,
   type DoneTransitionOverride,
 } from "./done-transition-guard.js";
 
@@ -301,6 +302,117 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(true);
       expect(result.skipped).toBe(true);
       expect(result.skipReason).toContain("merged_pr_lookup_failed");
+    });
+  });
+
+  describe("auth failure classification", () => {
+    it("allows transition and emits auth_failed:compare:401 when compare API returns 401", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("auth_failed:compare:401");
+      expect(result.skipReason).toContain("scope=company");
+      expect(result.skipReason).toContain("secretName=GITHUB_TOKEN");
+    });
+
+    it("allows transition and emits auth_failed:compare:403 when compare API returns 403", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Forbidden" }), { status: 403 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("auth_failed:compare:403");
+      expect(result.skipReason).toContain("scope=company");
+      expect(result.skipReason).toContain("secretName=GITHUB_TOKEN");
+    });
+
+    it("allows transition and emits auth_failed:merged_pr:401 when pulls API returns 401", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 1 }), { status: 200 });
+        }
+        if (url.includes("/pulls?")) {
+          return new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("auth_failed:merged_pr:401");
+      expect(result.skipReason).toContain("scope=company");
+      expect(result.skipReason).toContain("secretName=GITHUB_TOKEN");
+    });
+
+    it("allows transition and emits auth_failed:merged_pr:403 when pulls API returns 403", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 1 }), { status: 200 });
+        }
+        if (url.includes("/pulls?")) {
+          return new Response(JSON.stringify({ message: "Forbidden" }), { status: 403 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("auth_failed:merged_pr:403");
+    });
+
+    it("keeps compare_api_failed prefix for 502 (non-auth error)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Bad gateway" }), { status: 502 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("compare_api_failed");
+      expect(result.skipReason).not.toContain("auth_failed");
+    });
+
+    it("404 from compare API still returns null ahead_by (not auth_failed)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).not.toContain("auth_failed");
     });
   });
 

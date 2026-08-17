@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   agents,
@@ -10,6 +10,7 @@ import {
   createDb,
   executionWorkspaces,
   heartbeatRuns,
+  issueComments,
   issues,
   projectWorkspaces,
   projects,
@@ -25,6 +26,8 @@ import { issueRoutes } from "../routes/issues.js";
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
 const mockGhFetch = vi.hoisted(() => vi.fn());
+const mockAddComment = vi.hoisted(() => vi.fn());
+const realAddCommentRef = vi.hoisted(() => ({ current: null as ((...args: any[]) => any) | null }));
 
 vi.mock("../services/secrets.js", () => ({
   secretService: () => ({
@@ -40,6 +43,22 @@ vi.mock("../services/github-fetch.js", () => ({
       ? "https://api.github.com"
       : `https://${hostname}/api/v3`,
 }));
+
+vi.mock("../services/issues.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/issues.js")>();
+  return {
+    ...actual,
+    issueService: (db: Db) => {
+      const real = actual.issueService(db);
+      realAddCommentRef.current = real.addComment;
+      mockAddComment.mockImplementation(real.addComment);
+      return {
+        ...real,
+        addComment: mockAddComment,
+      };
+    },
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -74,6 +93,10 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     } else {
       process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
     }
+  });
+
+  beforeEach(() => {
+    mockAddComment.mockImplementation(realAddCommentRef.current!);
   });
 
   function createApp() {
@@ -254,5 +277,143 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .from(issues)
       .where(eq(issues.id, issueId));
     expect(statusRows[0]?.status).toBe("todo");
+  });
+
+  it("auth_failed:compare:401 skip posts exactly one system comment with HTTP status and operator remedy, no token leak", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("AU1");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) {
+        return new Response("", { status: 401 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
+
+    const comments = await vi.waitFor(
+      async () => {
+        const rows = await db
+          .select({
+            body: issueComments.body,
+            authorType: issueComments.authorType,
+          })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, issueId));
+        const systemComments = rows.filter((r) => r.authorType === "system");
+        if (systemComments.length === 0) throw new Error("waiting for system comment");
+        return systemComments;
+      },
+      { timeout: 5000 },
+    );
+
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("401");
+    expect(comments[0]?.body).toContain("SUP-13038");
+    expect(comments[0]?.body).not.toContain("test-token");
+  });
+
+  it("non-auth skip (502 from compare) posts zero system comments", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("AU2");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) {
+        return new Response(JSON.stringify({}), { status: 502 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
+
+    const comments = await db
+      .select({ body: issueComments.body, authorType: issueComments.authorType })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const systemComments = comments.filter((r) => r.authorType === "system");
+    expect(systemComments).toHaveLength(0);
+  });
+
+  it("rejecting addComment does not prevent the done transition (fail-open)", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("AU3");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) {
+        return new Response("", { status: 401 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    mockAddComment.mockImplementation(async (
+      _issueId: string,
+      _body: string,
+      _actor: object,
+      options?: { authorType?: string | null },
+    ) => {
+      if (options?.authorType === "system") {
+        throw new Error("boom");
+      }
+      return realAddCommentRef.current!(_issueId, _body, _actor, options);
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
+
+    const comments = await db
+      .select({ body: issueComments.body, authorType: issueComments.authorType })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const systemComments = comments.filter((r) => r.authorType === "system");
+    expect(systemComments).toHaveLength(0);
+    expect(comments.some((r) => r.body.includes("Tier 1"))).toBe(true);
   });
 });
