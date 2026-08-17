@@ -2746,6 +2746,23 @@ export function issueRoutes(
   const enqueueStalledReviewDecisionWakeup = opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
 
+  async function postAuthFailureComment(
+    issueSvc: ReturnType<typeof issueService>,
+    issueId: string,
+    skipReason: string,
+  ): Promise<void> {
+    const parts = skipReason.split(":");
+    const status = parts[2] ?? "unknown";
+    const scope = parts[3]?.split("=")[1] ?? "unknown";
+    const secretName = parts[4]?.split("=")[1] ?? "unknown";
+    const body =
+      `[Done-guard] Delivery verification was SKIPPED for this transition — the platform's\n` +
+      `GitHub credential was rejected (HTTP ${status}, ${scope}/${secretName}). This issue was marked\n` +
+      `done WITHOUT confirming its branch was merged. Operator: refresh the company-scope\n` +
+      `GitHub credential. See SUP-13038.`;
+    await issueSvc.addComment(issueId, body, {}, { authorType: "system" });
+  }
+
   // Every route that can resolve a blocker routes its dependent wake through these
   // two helpers: one builds the wake (deduping against an already-enqueued one),
   // the other emits the matching audit record once the enqueue resolves. Keeping
@@ -9437,6 +9454,11 @@ export function issueRoutes(
           owner: guardResult.owner,
           repo: guardResult.repo,
         });
+        if (guardResult.skipReason?.startsWith("auth_failed:")) {
+          void postAuthFailureComment(svc, existing.id, guardResult.skipReason).catch((err) => {
+            logger.warn({ err, issueId: existing.id }, "failed to post auth-failure done-guard comment");
+          });
+        }
       }
       if (!guardResult.allowed) {
         res.status(409).json({
