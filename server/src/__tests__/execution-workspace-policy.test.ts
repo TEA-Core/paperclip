@@ -13,9 +13,11 @@ import {
   parseProjectExecutionWorkspacePolicy,
   resolveExecutionWorkspaceEnvironmentId,
   resolvePinnedIssueWorkspaceStrategyType,
+  resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceMode,
   resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
+  canAgentSatisfyIssueWorkspaceSettings,
 } from "../services/execution-workspace-policy.ts";
 
 describe("execution workspace policy helpers", () => {
@@ -228,6 +230,179 @@ describe("execution workspace policy helpers", () => {
         hasResolvablePriorSessionWorkspace: true,
       }),
     ).toBe(false);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings rejects isolated git_worktree with no project or reusable workspace", () => {
+    // The exact live case from SUP-13078: isolated_workspace + git_worktree, no project,
+    // no project workspace, no reusable execution workspace → agent_home fallback → refusal.
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree" } },
+        projectPolicy: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings rejects isolated issue with project policy git_worktree but no project binding", () => {
+    // The issue's executionWorkspaceSettings has mode: isolated_workspace but no workspaceStrategy.
+    // The project policy specifies workspaceStrategy: { type: "git_worktree" }.
+    // The issue has no projectId, so no project workspace is available → agent_home fallback → refusal.
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree" },
+          allowIssueOverride: true,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings accepts isolated git_worktree when a project is bound", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: "project-1",
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree" } },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings accepts isolated git_worktree when a reusable workspace is bound", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: "workspace-1",
+          executionWorkspacePreference: "reuse_existing",
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree" } },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings accepts non-worktree modes unconditionally", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "shared_workspace" },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "agent_default" },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings accepts operator_branch with no project when a prior session workspace is resolvable", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "operator_branch", workspaceStrategy: { type: "git_worktree" } },
+        projectPolicy: null,
+        hasResolvablePriorSessionWorkspace: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("dispatch precedence resolves an isolated_workspace issue with no explicit strategy to git_worktree", () => {
+    // Pins the fact that falsified SUP-13105's premise: buildExecutionWorkspaceAdapterConfig
+    // supplies { type: "git_worktree" } as its final fallback whenever hasWorkspaceControl is
+    // true, and `mode` alone sets issueHasWorkspaceOverrides. So the strategy the predicate
+    // derives for SUP-12986's `{"mode":"isolated_workspace"}` is git_worktree — it was never
+    // "blind to git_worktree", which is why sourcing the strategy from the bound workspace row
+    // instead could not change any outcome.
+    const config = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: {},
+      projectPolicy: null,
+      issueSettings: { mode: "isolated_workspace" },
+      mode: "isolated_workspace",
+      legacyUseProjectWorkspace: null,
+    });
+    expect(resolveEffectiveWorkspaceStrategyType("isolated_workspace", config)).toBe("git_worktree");
+    // The same input through resolvePinnedIssueWorkspaceStrategyType — the resolver the
+    // predicate does NOT use — returns project_primary. That divergence is the trap.
+    expect(
+      resolvePinnedIssueWorkspaceStrategyType({
+        mode: "isolated_workspace",
+        issueSettings: { mode: "isolated_workspace" },
+      }),
+    ).toBe("project_primary");
+  });
+
+  it("with no bound workspace and no reusable binding, returns incapable when projectId/projectWorkspaceId are null (SUP-13100 AC3)", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: null,
+        hasResolvablePriorSessionWorkspace: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("a bound reuse_existing binding alone makes the issue capable (SUP-13100 consume contract)", () => {
+    // The derived strategy here IS git_worktree (see the dispatch-precedence test above) and
+    // projectId/projectWorkspaceId are both null, so isUnrunnableWorktreeCombo reaches its
+    // reusable-workspace check — and the binding short-circuits it to capable. That
+    // short-circuit, not the strategy, is what decides every bound issue.
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: "workspace-1",
+          executionWorkspacePreference: "reuse_existing",
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
   });
 
   it("mirrors runtime default (project_primary) when pinned settings omit strategy type", () => {

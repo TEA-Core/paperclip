@@ -436,7 +436,29 @@ describe("diagnostics route", () => {
       expect(serialized).not.toContain(FIXTURE_TOKEN);
       expect(serialized).not.toContain(FIXTURE_TOKEN.slice(0, 4));
       expect(serialized).not.toContain(FIXTURE_TOKEN.slice(-4));
-      expect(serialized).not.toContain(FIXTURE_TOKEN.length.toString());
+      // `checkedAt` is a wall-clock ISO timestamp, so its digits coincidentally
+      // contain the token length often enough to make a raw substring check
+      // flaky. Assert the length leak against the body without that timestamp.
+      const withoutCheckedAt = { ...(res.body as Record<string, unknown>) };
+      delete withoutCheckedAt.checkedAt;
+      expect(JSON.stringify(withoutCheckedAt)).not.toContain(FIXTURE_TOKEN.length.toString());
+
+      // The token length must also not leak as a value anywhere in the body.
+      const leafValues: unknown[] = [];
+      const collectLeafValues = (value: unknown): void => {
+        if (Array.isArray(value)) {
+          for (const item of value) collectLeafValues(item);
+          return;
+        }
+        if (value !== null && typeof value === "object") {
+          for (const item of Object.values(value)) collectLeafValues(item);
+          return;
+        }
+        leafValues.push(value);
+      };
+      collectLeafValues(res.body);
+      expect(leafValues).not.toContain(FIXTURE_TOKEN.length);
+      expect(leafValues).not.toContain(FIXTURE_TOKEN.length.toString());
     } finally {
       await server.close();
     }

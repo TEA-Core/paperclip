@@ -181,6 +181,9 @@ jobs:
       - name: Test /app runtime tree ownership invariants
         run: node --test ./scripts/__tests__/dockerfile-app-root-owned.test.mjs
 
+      - name: Test secrets key directory ownership invariants
+        run: node --test ./scripts/__tests__/dockerfile-secrets-root-owned.test.mjs
+
       - name: Test docker image build cache ref casing
         run: node --test ./scripts/__tests__/docker-workflow-cache-refs.test.mjs
 
@@ -189,6 +192,9 @@ jobs:
 
       - name: Test lockfile refresh PR token wiring
         run: node --test ./scripts/__tests__/refresh-lockfile-pr-token.test.mjs
+
+      - name: Test CI lockfile drift handling
+        run: node --test ./scripts/__tests__/ci-lockfile-drift.test.mjs
 
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
@@ -199,26 +205,33 @@ jobs:
           PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="$BASE_SHA" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
-      - name: Validate dependency resolution when manifests change
+      - name: Validate dependency resolution against the committed lockfile
         id: regen_lockfile
         run: |
-          changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
-          # Patch files count as manifests: editing one changes the
-          # `patchedDependencies` hash recorded in pnpm-lock.yaml, so a frozen
-          # install fails with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH unless the
-          # lockfile is regenerated here.
-          manifest_pattern='(^|/)package\.json$|^pnpm-workspace\.yaml$|^\.npmrc$|^pnpmfile\.(cjs|js|mjs)$|^patches/'
-          if printf '%s\n' "$changed" | grep -Eq "$manifest_pattern"; then
-            pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
-            echo "regenerated=1" >> "$GITHUB_OUTPUT"
-          else
+          # Ask pnpm whether the committed lockfile can satisfy a frozen install of
+          # this merge ref's manifests, instead of guessing from the files the PR
+          # changed. Manifest edits in the PR (a package.json dependency, a
+          # pnpm-workspace.yaml change, or a patch file, whose contents feed the
+          # `patchedDependencies` hash) fail this check, and so does drift that
+          # arrived on the base branch: a base commit that edits pnpm settings in
+          # package.json without refreshing pnpm-lock.yaml made every downstream
+          # `pnpm install --frozen-lockfile` fail with
+          # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH while the old changed-file heuristic
+          # reported nothing to regenerate, so no lockfile was uploaded and every
+          # PR touching no manifest was unbuildable until base was refreshed.
+          # When the lockfile is already up to date pnpm skips resolution, so the
+          # check costs little.
+          if pnpm install --lockfile-only --ignore-scripts --frozen-lockfile; then
             echo "regenerated=0" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+          echo "regenerated=1" >> "$GITHUB_OUTPUT"
 
-      # Manifest-only PRs (where pnpm-lock.yaml stays at base because the policy
-      # job above blocks committing it) need the regenerated lockfile for the
-      # downstream `pnpm install --frozen-lockfile` steps. Upload it here so
-      # every job consumes the same hash without recomputing.
+      # pnpm-lock.yaml always stays at base here, because the policy job above
+      # blocks committing it, so whenever the probe had to regenerate one the
+      # downstream `pnpm install --frozen-lockfile` steps need that copy. Upload it
+      # here so every job consumes the same hash without recomputing.
       - name: Upload regenerated lockfile for downstream jobs
         if: steps.regen_lockfile.outputs.regenerated == '1'
         uses: actions/upload-artifact@v7

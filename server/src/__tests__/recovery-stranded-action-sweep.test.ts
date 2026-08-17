@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -9,6 +9,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -49,6 +50,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
     await db.delete(issueComments);
     await db.delete(issueRecoveryActions);
     await db.delete(issues);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -528,6 +530,124 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
     expect(comments.some((c) => (c.body ?? "").includes("exhausted its attempt ceiling"))).toBe(true);
     expect(comments.some((c) => (c.body ?? "").includes("escalated to the board"))).toBe(true);
     expect(comments.some((c) => (c.body ?? "").includes("source issue has been blocked"))).toBe(false);
+  });
+
+  // SUP-13078: the ladder must not reroute to an owner that cannot run the issue. Here the issue
+  // asks for an isolated git_worktree with no project, no project workspace, and no reusable
+  // execution workspace, which is the combination dispatch refuses with
+  // git_worktree_base_agent_home — so no candidate is capable and the action stays at the board.
+  it("keeps board_escalation dead when no candidate can satisfy the issue workspace settings", async () => {
+    const { companyId, ctoId, coderId } = await seedCompany();
+    const sourceIssueId = await seedSourceIssue(companyId, coderId);
+    await db
+      .update(issues)
+      .set({
+        projectId: null,
+        projectWorkspaceId: null,
+        executionWorkspaceId: null,
+        executionWorkspacePreference: null,
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree" },
+        },
+      })
+      .where(eq(issues.id, sourceIssueId));
+    await db
+      .update(agents)
+      .set({ adapterConfig: {} })
+      .where(inArray(agents.id, [ctoId, coderId]));
+
+    const actionId = await seedRecoveryAction({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      wakePolicy: { type: "board_escalation" },
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
+
+    expect(result.rerouted).toBe(0);
+    expect(result.reFired).toBe(0);
+    expect(result.nonWakeableSkipped).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const updated = await db
+      .select({
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+        wakePolicy: issueRecoveryActions.wakePolicy,
+        attemptCount: issueRecoveryActions.attemptCount,
+      })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId))
+      .then((rows) => rows[0]);
+    expect(updated?.ownerAgentId).toBeNull();
+    expect(updated?.wakePolicy).toMatchObject({ type: "board_escalation" });
+    expect(updated?.attemptCount).toBe(1);
+  });
+
+  // The capability filter must not swallow candidates dispatch would accept. Agents carry an
+  // empty adapterConfig here, exactly like the live fleet: dispatch resolves the strategy from
+  // the issue settings and project policy, so a project-bound worktree issue is runnable and the
+  // ladder must still hand it to a capable owner instead of parking it at the board.
+  it("re-routes a project-bound git_worktree issue to a candidate with an empty adapterConfig", async () => {
+    const { companyId, ctoId, coderId } = await seedCompany();
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree" },
+      },
+    });
+    const sourceIssueId = await seedSourceIssue(companyId, coderId);
+    await db
+      .update(issues)
+      .set({
+        projectId,
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree" },
+        },
+      })
+      .where(eq(issues.id, sourceIssueId));
+    await db
+      .update(agents)
+      .set({ adapterConfig: {} })
+      .where(inArray(agents.id, [ctoId, coderId]));
+
+    const actionId = await seedRecoveryAction({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      wakePolicy: { type: "board_escalation" },
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
+
+    expect(result.rerouted).toBe(1);
+    expect(result.nonWakeableSkipped).toBe(0);
+    expect(result.actionIds).toEqual([actionId]);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+
+    const updated = await db
+      .select({
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+        wakePolicy: issueRecoveryActions.wakePolicy,
+      })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId))
+      .then((rows) => rows[0]);
+    expect(updated?.ownerAgentId).toBe(coderId);
+    expect(updated?.wakePolicy).toMatchObject({ type: "wake_owner" });
   });
 
 });

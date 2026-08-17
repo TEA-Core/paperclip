@@ -1814,17 +1814,28 @@ export async function resolveAdditionalProjectWorkspace(
 type WorkspaceValidationFailureLike = WorkspaceValidationFailure | {
   code: typeof WORKSPACE_VALIDATION_FAILURE_CODE;
   resultJson: Record<string, unknown>;
+  reason: string;
 };
 
 function isWorkspaceValidationFailure(error: unknown): error is WorkspaceValidationFailureLike {
   if (error instanceof WorkspaceValidationFailure) return true;
   const maybe = error as { code?: unknown; resultJson?: unknown } | null;
+  const resultJson = maybe?.resultJson;
+  const isObject =
+    resultJson && typeof resultJson === "object" && !Array.isArray(resultJson);
+  const reason =
+    isObject &&
+    typeof (resultJson as Record<string, unknown>).workspaceValidation === "object" &&
+    !Array.isArray((resultJson as Record<string, unknown>).workspaceValidation)
+      ? readNonEmptyString(
+          ((resultJson as Record<string, unknown>).workspaceValidation as Record<string, unknown>).reason,
+        )
+      : null;
   return Boolean(
     maybe &&
       maybe.code === WORKSPACE_VALIDATION_FAILURE_CODE &&
-      maybe.resultJson &&
-      typeof maybe.resultJson === "object" &&
-      !Array.isArray(maybe.resultJson),
+      isObject &&
+      reason,
   );
 }
 
@@ -4704,12 +4715,16 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T extends 
 
   let restored: T | null = null;
   let reuseFailure: string | null = null;
+  let reuseFailureReason: "inherited_workspace_reuse_failed" | "inherited_workspace_reuse_unavailable" | null = null;
+  let reuseFailureCause: unknown = null;
   try {
     restored = (await input.restoreExistingWorkspace?.()) ?? null;
   } catch (error) {
     if (isWorkspaceValidationFailure(error)) {
       throw error;
     }
+    reuseFailureCause = error;
+    reuseFailureReason = "inherited_workspace_reuse_failed";
     reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
       reason: "inherited_workspace_reuse_failed",
       issueRef: input.issueRef,
@@ -4721,18 +4736,42 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T extends 
   }
 
   if (!restored) {
-    reuseFailure = reuseFailure ?? formatInheritedExecutionWorkspaceReuseFailure({
-      reason: "inherited_workspace_reuse_unavailable",
-      issueRef: input.issueRef,
-      runId: input.runId,
-      executionWorkspaceId: input.existingExecutionWorkspaceId,
-      workspaceConfigFreshness: input.workspaceConfigFreshness,
-    });
+    if (!reuseFailure) {
+      reuseFailureReason = "inherited_workspace_reuse_unavailable";
+      reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
+        reason: "inherited_workspace_reuse_unavailable",
+        issueRef: input.issueRef,
+        runId: input.runId,
+        executionWorkspaceId: input.existingExecutionWorkspaceId,
+        workspaceConfigFreshness: input.workspaceConfigFreshness,
+      });
+    }
   }
 
-  if (reuseFailure) throw new WorkspaceValidationFailure(reuseFailure, {});
+  if (reuseFailure) {
+    // SUP-13090: the concrete reuse failure must land in `resultJson`, not only in the
+    // message string. The prior empty `{}` payload meant `resultJson.workspaceValidation`
+    // was absent, so recovery assembled `evidence` with the "withheld" placeholder and no
+    // agent could read the actual cause (e.g. ERR_PNPM_LOCKFILE_CONFIG_MISMATCH) from the API.
+    throw new WorkspaceValidationFailure(reuseFailure, {
+      workspaceValidation: {
+        reason: reuseFailureReason,
+        executionWorkspaceId: input.existingExecutionWorkspaceId ?? null,
+        cause: reuseFailureCause instanceof Error
+          ? reuseFailureCause.message
+          : reuseFailureCause != null
+            ? String(reuseFailureCause)
+            : null,
+      },
+    });
+  }
   if (!restored) {
-    throw new WorkspaceValidationFailure("Expected restored execution workspace after reuse fallback handling", {});
+    throw new WorkspaceValidationFailure("Expected restored execution workspace after reuse fallback handling", {
+      workspaceValidation: {
+        reason: "inherited_workspace_reuse_unavailable",
+        executionWorkspaceId: input.existingExecutionWorkspaceId ?? null,
+      },
+    });
   }
 
   return {
@@ -11592,7 +11631,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             workspaceValidationRecovery: {
               strategy: "quarantine_failed_workspace_and_retry_clean",
               sourceRunId: run.id,
-              reason: readNonEmptyString(workspaceValidationRetryPayload?.reason) ?? WORKSPACE_VALIDATION_FAILURE_CODE,
+              reason: readNonEmptyString(workspaceValidationRetryPayload?.reason) ?? null,
               fingerprint: readNonEmptyString(workspaceValidationRetryPayload?.fingerprint),
               failedExecutionWorkspaceId: readNonEmptyString(workspaceValidationRetryPayload?.executionWorkspaceId),
             },

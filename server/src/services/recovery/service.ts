@@ -34,6 +34,7 @@ import {
   issueLabels,
   issues,
   labels,
+  projects,
   unWakeableArchives,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
@@ -100,6 +101,10 @@ import {
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { loadConfig } from "../../config.js";
+import {
+  canAgentSatisfyIssueWorkspaceSettings,
+  parseProjectExecutionWorkspacePolicy,
+} from "../execution-workspace-policy.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -368,6 +373,28 @@ function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
     return " Latest retry failure details were withheld from the issue thread; inspect the linked run for evidence.";
   }
   return null;
+}
+
+/**
+ * SUP-13090: the recovery action's `evidence.failureSummary` is API-readable state,
+ * not issue-thread prose, and the "withheld" placeholder made every
+ * `workspace_validation_failed` loop undiagnosable from the API alone — SUP-12986 and
+ * SUP-12996 minted a fresh action every ~8s for hours with no readable cause anywhere.
+ *
+ * `resultJson.workspaceValidation` is server-authored structured state (a reason code
+ * plus the provision command's own error), never agent transcript content, so surfacing
+ * it here does not reopen what the placeholder was protecting. Fall back to the
+ * placeholder whenever no structured payload was recorded.
+ */
+function summarizeRunFailureForRecoveryEvidence(
+  run: LatestIssueRun,
+  workspaceValidation: Record<string, unknown> | null,
+) {
+  const reason = readNonEmptyString(workspaceValidation?.reason);
+  if (!reason) return summarizeRunFailureForIssueComment(run)?.trim() ?? null;
+
+  const cause = readNonEmptyString(workspaceValidation?.cause);
+  return cause ? `${reason}: ${cause.trim()}` : reason;
 }
 
 
@@ -2931,6 +2958,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     candidateIds.push(...roleCandidates.map((agent) => agent.id));
     if (issue.assigneeAgentId) candidateIds.push(issue.assigneeAgentId);
 
+    const projectPolicy = issue.projectId
+      ? await db
+          .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+          .from(projects)
+          .where(and(eq(projects.id, issue.projectId), eq(projects.companyId, issue.companyId)))
+          .then((rows) => rows[0]?.executionWorkspacePolicy ?? null)
+      : null;
+    const parsedProjectPolicy = parseProjectExecutionWorkspacePolicy(projectPolicy);
+
     const seen = new Set<string>();
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
@@ -2941,6 +2977,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issueId: issue.id,
         projectId: issue.projectId,
       });
+      if (!canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: issue.projectId,
+          projectWorkspaceId: issue.projectWorkspaceId,
+          executionWorkspaceId: issue.executionWorkspaceId,
+          executionWorkspacePreference: issue.executionWorkspacePreference,
+        },
+        executionWorkspaceSettings: issue.executionWorkspaceSettings,
+        projectPolicy: parsedProjectPolicy,
+        agentConfig: candidate.adapterConfig,
+      })) continue;
       if ((await isAgentInvokable(candidate)) && !budgetBlock) return candidate.id;
     }
 
@@ -3295,7 +3342,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
           agentInvokability: input.agentInvokability,
         }),
-        failureSummary: summarizeRunFailureForIssueComment(input.latestRun)?.trim() ?? null,
+        failureSummary: summarizeRunFailureForRecoveryEvidence(
+          input.latestRun,
+          recoveryCause === "workspace_validation_failed"
+            ? readWorkspaceValidationPayload(input.latestRun)
+            : null,
+        ),
         routingFallbackReason: routing.routingFallbackReason,
       },
       nextAction: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON

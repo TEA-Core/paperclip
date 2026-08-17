@@ -92,6 +92,7 @@ type ExternalObjectMentionRecord = typeof externalObjectMentions.$inferSelect;
 
 const DEFAULT_REFRESH_TTL_SECONDS = 300;
 const DEFAULT_RETRY_AFTER_SECONDS = 300;
+const NO_RESOLVER_BACKOFF_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_REFRESH_LEASE_SECONDS = 300;
 const REFRESH_LEASE_RENEW_INTERVAL_MS = 60_000;
 
@@ -807,11 +808,20 @@ export function externalObjectService(
     const pluginResult = await resolveViaPluginProvider(db, opts.pluginWorkerManager, object);
     const resolver = pluginResult ? null : resolverRegistry.find(object);
     if (!pluginResult && !resolver) {
+      logger.warn(
+        {
+          companyId: object.companyId,
+          objectId: object.id,
+          providerKey: object.providerKey,
+          objectType: object.objectType,
+        },
+        "external object has no resolver; skipping refresh and backing off",
+      );
       const [updated] = await db
         .update(externalObjects)
         .set({
           liveness: visibleLiveness(object, now) === "fresh" ? "stale" : object.liveness,
-          nextRefreshAt: addSeconds(now, DEFAULT_RETRY_AFTER_SECONDS),
+          nextRefreshAt: addSeconds(now, NO_RESOLVER_BACKOFF_SECONDS),
           refreshStartedAt: null,
           refreshToken: null,
           updatedAt: now,
@@ -968,6 +978,14 @@ export function externalObjectService(
     input: RefreshObjectInput,
   ) {
     const now = input.now ?? new Date();
+    const refreshKey = `${input.companyId}:${objectId}`;
+    // Join an in-flight refresh before reading the row. The read is an awaited
+    // round trip, so checking only afterwards leaves a window in which the
+    // in-flight refresh completes and drops its entry, and this caller then
+    // starts a second resolve for work that was already done.
+    const runningRefresh = objectRefreshesInFlight.get(refreshKey);
+    if (runningRefresh) return runningRefresh;
+
     const object = await db
       .select()
       .from(externalObjects)
@@ -978,7 +996,6 @@ export function externalObjectService(
       return { object: toObjectPayload(object, now), refreshed: false, reason: "backoff" as const };
     }
 
-    const refreshKey = `${object.companyId}:${object.id}`;
     const existingRefresh = objectRefreshesInFlight.get(refreshKey);
     if (existingRefresh) return existingRefresh;
 

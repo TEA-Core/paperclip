@@ -38,11 +38,13 @@ import {
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   preserveUnpushedWorktreeCommits,
+  prepareBaseRepoForWorkspace,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
   refreshRemoteTrackingBaseRef,
   releaseRuntimeServicesForRun,
   resolveBaseRepoHygieneDecision,
+  resolvePnpmLockfileMismatchRetryCommand,
   resetRuntimeServicesForTests,
   resolveRuntimeProvisionCommand,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
@@ -298,6 +300,27 @@ async function advanceRemoteMaster(sourceRepo: string, remotePath: string, fileN
   await runGit(sourceRepo, ["commit", "-m", `Add ${fileName}`]);
   await runGit(sourceRepo, ["push", remotePath, "master"]);
   return readGit(sourceRepo, ["rev-parse", "master"]);
+}
+
+async function advanceRemoteBranch(
+  sourceRepo: string,
+  remotePath: string,
+  branch: string,
+  fileName: string,
+) {
+  const branchExists = await runGit(sourceRepo, ["rev-parse", `--verify`, branch])
+    .then(() => true)
+    .catch(() => false);
+  if (!branchExists) {
+    await runGit(sourceRepo, ["checkout", "-b", branch]);
+  } else {
+    await runGit(sourceRepo, ["checkout", branch]);
+  }
+  await fs.writeFile(path.join(sourceRepo, fileName), `${fileName}\n`, "utf8");
+  await runGit(sourceRepo, ["add", fileName]);
+  await runGit(sourceRepo, ["commit", "-m", `Add ${fileName}`]);
+  await runGit(sourceRepo, ["push", remotePath, branch]);
+  return readGit(sourceRepo, ["rev-parse", branch]);
 }
 
 function realizeWorktreeForTest(repoRoot: string, repoRef: string | null) {
@@ -1303,6 +1326,79 @@ describe("realizeExecutionWorkspace", () => {
       });
       expect(decision).toEqual({ action: "ok" });
     });
+  });
+
+  it("warns when the base repo is ahead of the base ref (clean, not behind)", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "ahead.txt"), "ahead\n", "utf8");
+    await runGit(repoRoot, ["add", "ahead.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Ahead commit"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const aheadWarning = workspace.warnings.find((w) =>
+      w.includes("is ahead of") && w.includes("commit(s) ahead"),
+    );
+    expect(aheadWarning).toBeDefined();
+    expect(aheadWarning).toContain(repoRoot);
+    expect(aheadWarning).toContain("1 commit(s) ahead");
+    expect(aheadWarning).toContain("Ahead commits: Ahead commit");
+  });
+
+  it("warns when the base repo has diverged from the base ref (ahead and behind)", async () => {
+    const { repoRoot, remotePath } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "ahead.txt"), "ahead\n", "utf8");
+    await runGit(repoRoot, ["add", "ahead.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Ahead commit"]);
+    await runGit(repoRoot, ["push", remotePath, "master"]);
+
+    await runGit(repoRoot, ["reset", "--hard", "HEAD~1"]);
+    await fs.writeFile(path.join(repoRoot, "diverged.txt"), "diverged\n", "utf8");
+    await runGit(repoRoot, ["add", "diverged.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Diverged commit"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const divergedWarning = workspace.warnings.find((w) =>
+      w.includes("has diverged from") && w.includes("behind"),
+    );
+    expect(divergedWarning).toBeDefined();
+    expect(divergedWarning).toContain(repoRoot);
+    expect(divergedWarning).toContain("1 ahead");
+    expect(divergedWarning).toContain("1 behind");
+    expect(divergedWarning).toContain("Ahead commits: Diverged commit");
+  });
+
+  it("does not emit an ahead/diverged warning when the base repo is clean and in sync", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const aheadWarning = workspace.warnings.find((w) => w.includes("is ahead of"));
+    expect(aheadWarning).toBeUndefined();
+  });
+
+  it("does not emit an ahead/diverged warning when the base repo is clean and behind (fastForward)", async () => {
+    const { repoRoot, remotePath } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "remote.txt"), "remote\n", "utf8");
+    await runGit(repoRoot, ["add", "remote.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Remote commit"]);
+    await runGit(repoRoot, ["push", remotePath, "master"]);
+    await runGit(repoRoot, ["reset", "--hard", "HEAD~1"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    expect(workspace.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    const aheadWarning = workspace.warnings.find((w) => w.includes("is ahead of"));
+    expect(aheadWarning).toBeUndefined();
+  });
+
+  it("does not emit an ahead/diverged warning when the base repo is dirty (restore)", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "README.md"), "dirty\n", "utf8");
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    expect(workspace.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+    const aheadWarning = workspace.warnings.find((w) => w.includes("is ahead of"));
+    expect(aheadWarning).toBeUndefined();
   });
 
   it("does not restore a base repo already at the base ref on a second dispatch (detached HEAD case)", async () => {
@@ -3273,6 +3369,143 @@ describe("realizeExecutionWorkspace", () => {
     const actualHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: initial.cwd })).stdout.trim();
     expect(actualHead).toBe(expectedHead);
   }, 15_000);
+
+  // SUP-13090: SUP-12986 and SUP-12996 failed EVERY dispatch in ~8s because their reused
+  // execution workspaces run the inline provisionCommand
+  // `corepack enable && pnpm install --frozen-lockfile --prefer-offline`, which never reaches
+  // scripts/provision-worktree.sh and so never inherited SUP-12984's lockfile-mismatch retry.
+  describe("pnpm lockfile-mismatch provision retry (SUP-13090)", () => {
+    it("rewrites the frozen flag for both pnpm lockfile-mismatch codes and nothing else", () => {
+      const command = "corepack enable && pnpm install --frozen-lockfile --prefer-offline";
+      const expected = "corepack enable && pnpm install --no-frozen-lockfile --prefer-offline";
+
+      expect(resolvePnpmLockfileMismatchRetryCommand(command, "x ERR_PNPM_LOCKFILE_CONFIG_MISMATCH y")).toBe(expected);
+      expect(resolvePnpmLockfileMismatchRetryCommand(command, "x ERR_PNPM_OUTDATED_LOCKFILE y")).toBe(expected);
+
+      // Not a lockfile mismatch — must not be retried.
+      expect(resolvePnpmLockfileMismatchRetryCommand(command, "ERR_PNPM_FETCH_404 Not Found")).toBeNull();
+      // Nothing to rewrite: retrying would re-run the identical command forever.
+      expect(
+        resolvePnpmLockfileMismatchRetryCommand("pnpm install --no-frozen-lockfile", "ERR_PNPM_OUTDATED_LOCKFILE"),
+      ).toBeNull();
+      expect(
+        resolvePnpmLockfileMismatchRetryCommand("pnpm install --frozen-lockfile=false", "ERR_PNPM_OUTDATED_LOCKFILE"),
+      ).toBeNull();
+    });
+
+    async function setUpReusableWorkspaceWithProvisionScript(input: {
+      identifier: string;
+      scriptBody: string[];
+    }) {
+      const repoRoot = await createTempRepo();
+      const scriptPath = path.join(repoRoot, "..", `paperclip-fake-install-${randomUUID()}.sh`);
+      await fs.writeFile(scriptPath, ["#!/usr/bin/env bash", ...input.scriptBody].join("\n"), "utf8");
+      await fs.chmod(scriptPath, 0o755);
+
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+        },
+        issue: { id: "issue-1", identifier: input.identifier, title: "Reuse with provision command" },
+        agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      });
+
+      const reuse = (provisionCommand: string, recorder: WorkspaceOperationRecorder) =>
+        ensurePersistedExecutionWorkspaceAvailable({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-1",
+            workspaceId: "workspace-1",
+            repoUrl: null,
+            repoRef: "HEAD",
+          },
+          workspace: {
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            cwd: workspace.cwd,
+            providerRef: workspace.worktreePath,
+            projectId: "project-1",
+            projectWorkspaceId: "workspace-1",
+            repoUrl: null,
+            baseRef: "HEAD",
+            branchName: workspace.branchName,
+            config: { provisionCommand },
+          },
+          issue: { id: "issue-1", identifier: input.identifier, title: "Reuse with provision command" },
+          agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+          recorder,
+        });
+
+      return { repoRoot, workspace, scriptPath, reuse };
+    }
+
+    it("retries the reuse provision command without --frozen-lockfile on ERR_PNPM_LOCKFILE_CONFIG_MISMATCH", async () => {
+      const { workspace, scriptPath, reuse } = await setUpReusableWorkspaceWithProvisionScript({
+        identifier: "PAP-13090",
+        scriptBody: [
+          "set -uo pipefail",
+          'printf "%s\\n" "$*" >> .provision-attempts',
+          'for arg in "$@"; do',
+          '  if [[ "$arg" == "--no-frozen-lockfile" ]]; then',
+          '    printf "installed\\n" > .provision-succeeded',
+          "    exit 0",
+          "  fi",
+          "done",
+          'printf "%s\\n" " ERR_PNPM_LOCKFILE_CONFIG_MISMATCH  Cannot proceed with the frozen installation. The current \\"overrides\\" configuration doesn\'t match the value found in the lockfile" >&2',
+          "exit 1",
+        ],
+      });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+      const restored = await reuse(`bash ${scriptPath} --frozen-lockfile --prefer-offline`, recorder);
+
+      expect(restored).not.toBeNull();
+      await expect(fs.readFile(path.join(workspace.cwd, ".provision-succeeded"), "utf8")).resolves.toBe("installed\n");
+      // Both attempts ran, in order, and only the second dropped the frozen flag.
+      await expect(fs.readFile(path.join(workspace.cwd, ".provision-attempts"), "utf8")).resolves.toBe(
+        ["--frozen-lockfile --prefer-offline", "--no-frozen-lockfile --prefer-offline", ""].join("\n"),
+      );
+      const provisionOps = operations.filter((op) => op.phase === "workspace_provision");
+      expect(provisionOps).toHaveLength(2);
+      expect(provisionOps[0]?.result.status).toBe("failed");
+      expect(provisionOps[0]?.metadata?.lockfileMismatchRetry).toBeUndefined();
+      expect(provisionOps[1]?.result.status).toBe("succeeded");
+      expect(provisionOps[1]?.metadata?.lockfileMismatchRetry).toBe(true);
+    }, 15_000);
+
+    // Negative control: a provision failure that is NOT a lockfile mismatch must still fail the
+    // dispatch. A blanket retry would mask registry 404s, EACCES, and missing peers.
+    it("does not retry a provision failure that is not a lockfile mismatch", async () => {
+      const { workspace, scriptPath, reuse } = await setUpReusableWorkspaceWithProvisionScript({
+        identifier: "PAP-13091",
+        scriptBody: [
+          "set -uo pipefail",
+          'printf "%s\\n" "$*" >> .provision-attempts',
+          'printf "%s\\n" " ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/nope: Not Found" >&2',
+          "exit 1",
+        ],
+      });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+      await expect(reuse(`bash ${scriptPath} --frozen-lockfile --prefer-offline`, recorder)).rejects.toThrow(
+        /ERR_PNPM_FETCH_404/,
+      );
+
+      await expect(fs.readFile(path.join(workspace.cwd, ".provision-attempts"), "utf8")).resolves.toBe(
+        "--frozen-lockfile --prefer-offline\n",
+      );
+      expect(operations.filter((op) => op.phase === "workspace_provision")).toHaveLength(1);
+    }, 15_000);
+  });
 
   it("repairs a clean persisted git worktree branch mismatch when both branches point at the same commit", async () => {
     const repoRoot = await createTempRepo();
@@ -8632,6 +8865,337 @@ describe("preserveUnpushedWorktreeCommits", () => {
 
     await runGit(repoRoot, ["worktree", "remove", "--force", worktreePath]);
   });
+});
+
+describe("ensurePersistedExecutionWorkspaceAvailable base repo hygiene", () => {
+  it("fast-forwards a clean, behind base repo on the reuse path before provisioning", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const branchName = "PAP-460-reuse-fast-forward";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", branchName]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+
+    const initialHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const advancedHead = await advanceRemoteMaster(sourceRepo, remotePath, "fast-forward-fix.txt");
+    expect(advancedHead).not.toBe(initialHead);
+
+    const reused = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/master",
+      },
+      workspace: {
+        id: "execution-workspace-1",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "origin/master",
+        branchName,
+        metadata: { baseRefSnapshot: { resolvedSha: initialHead } },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-460",
+        title: "Reuse path fast-forward",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(reused).not.toBeNull();
+    expect(reused!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
+    expect(reused!.baseRefSha).toBe(advancedHead);
+  }, 15_000);
+
+  it("does not fast-forward a dirty base repo on the reuse path (restore instead)", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const branchName = "PAP-461-reuse-dirty";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", branchName]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+
+    await fs.writeFile(path.join(repoRoot, "README.md"), "dirty modification\n", "utf8");
+
+    const reused = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/master",
+      },
+      workspace: {
+        id: "execution-workspace-2",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "origin/master",
+        branchName,
+      },
+      issue: {
+        id: "issue-2",
+        identifier: "PAP-461",
+        title: "Reuse path dirty restore",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(reused).not.toBeNull();
+    expect(reused!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+    const fastForwardWarning = reused!.warnings.find((w) => w.includes("was fast-forwarded to"));
+    expect(fastForwardWarning).toBeUndefined();
+  }, 15_000);
+
+  it("warns (diverged) on an ahead/diverged base repo on the reuse path without reset", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const branchName = "PAP-462-reuse-diverged";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", branchName]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+
+    await fs.writeFile(path.join(repoRoot, "ahead.txt"), "ahead\n", "utf8");
+    await runGit(repoRoot, ["add", "ahead.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Ahead commit on base repo"]);
+    const aheadHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+
+    const behindHead = await advanceRemoteMaster(sourceRepo, remotePath, "behind-fix.txt");
+    expect(behindHead).not.toBe(aheadHead);
+
+    const reused = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/master",
+      },
+      workspace: {
+        id: "execution-workspace-3",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "origin/master",
+        branchName,
+      },
+      issue: {
+        id: "issue-3",
+        identifier: "PAP-462",
+        title: "Reuse path diverged",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(reused).not.toBeNull();
+    expect(reused!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("has diverged from")]),
+    );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(aheadHead);
+  }, 15_000);
+
+  it("resolves a bare fold/... base ref to origin/fold/... and fast-forwards on the reuse path", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const slashBranch = "fold/tea-patches-v2026.722.0";
+    await runGit(sourceRepo, ["checkout", "-b", slashBranch]);
+    await runGit(sourceRepo, ["push", "-u", remotePath, slashBranch]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+    await runGit(repoRoot, ["checkout", slashBranch]);
+
+    const branchName = "PAP-463-reuse-bare-ref";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", branchName]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+
+    const initialHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const advancedHead = await advanceRemoteBranch(sourceRepo, remotePath, slashBranch, "bare-ref-fix.txt");
+    expect(advancedHead).not.toBe(initialHead);
+
+    const reused = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: slashBranch,
+      },
+      workspace: {
+        id: "execution-workspace-4",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: slashBranch,
+        branchName,
+        metadata: { baseRefSnapshot: { resolvedSha: initialHead } },
+      },
+      issue: {
+        id: "issue-4",
+        identifier: "PAP-463",
+        title: "Reuse path bare fold ref",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(reused).not.toBeNull();
+    expect(reused!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
+  }, 15_000);
+
+  it("prepares the base repo before git worktree add on the restore-missing path", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const branchName = "PAP-464-restore-missing";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+
+    const initialHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const advancedHead = await advanceRemoteMaster(sourceRepo, remotePath, "restore-missing-fix.txt");
+    expect(advancedHead).not.toBe(initialHead);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/master",
+      },
+      workspace: {
+        id: "execution-workspace-5",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "origin/master",
+        branchName,
+        metadata: { baseRefSnapshot: { resolvedSha: initialHead } },
+      },
+      issue: {
+        id: "issue-5",
+        identifier: "PAP-464",
+        title: "Restore missing worktree hygiene",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(restored).not.toBeNull();
+    expect(restored!.created).toBe(true);
+    expect(restored!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
+    expect(await readGit(restored!.cwd, ["rev-parse", "HEAD"])).toBe(advancedHead);
+  }, 15_000);
+});
+
+describe("prepareBaseRepoForWorkspace", () => {
+  it("resolves a bare fold/... base ref to origin/fold/... and fast-forwards", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const slashBranch = "fold/tea-patches-v2026.722.0";
+    await runGit(sourceRepo, ["checkout", "-b", slashBranch]);
+    await runGit(sourceRepo, ["push", "-u", remotePath, slashBranch]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+    await runGit(repoRoot, ["checkout", slashBranch]);
+
+    const initialHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const advancedHead = await advanceRemoteBranch(sourceRepo, remotePath, slashBranch, "bare-ref-fix.txt");
+    expect(advancedHead).not.toBe(initialHead);
+
+    const result = await prepareBaseRepoForWorkspace({
+      repoRoot,
+      configuredBaseRef: slashBranch,
+    });
+
+    expect(result.baseRef).toBe("origin/fold/tea-patches-v2026.722.0");
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
+  }, 15_000);
+
+  it("returns ok warnings (no action) when the base repo is clean and on the default ref", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const result = await prepareBaseRepoForWorkspace({
+      repoRoot,
+      configuredBaseRef: "origin/master",
+    });
+
+    expect(result.baseRef).toBe("origin/master");
+    expect(result.warnings).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    expect(result.warnings).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+  }, 15_000);
+
+  it("restores a dirty base repo and warns", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "README.md"), "dirty\n", "utf8");
+
+    const result = await prepareBaseRepoForWorkspace({
+      repoRoot,
+      configuredBaseRef: "origin/master",
+    });
+
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+  }, 15_000);
 });
 
 describe("workspace realization request additionalSources", () => {

@@ -18,10 +18,10 @@ const execFileAsync = promisify(execFile);
  *    container starts non-root, where neither the remap nor gosu can work,
  *    so the command must be exec'd directly (with a warning on mismatch).
  *
- * The system commands (id, usermod, groupmod, chown, mkdir, stat, find, gosu) are stubbed
- * via PATH so the branching logic runs unmodified on any host. mkdir is stubbed
- * because the root path creates /etc/paperclip/secrets, which an unprivileged
- * test host cannot write.
+ * The system commands (id, usermod, groupmod, chown, mkdir, install, stat, find,
+ * gosu) are stubbed via PATH so the branching logic runs unmodified on any host.
+ * `install` is stubbed because the root path creates /etc/paperclip/secrets as
+ * root:root, which an unprivileged test host can neither create nor chown.
  */
 
 const ENTRYPOINT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "scripts", "docker-entrypoint.sh");
@@ -52,7 +52,7 @@ function installStubs(ids: {
       `else echo 0; fi`,
     ].join("\n"),
   );
-  for (const cmd of ["usermod", "groupmod", "chown", "mkdir"]) {
+  for (const cmd of ["usermod", "groupmod", "chown", "mkdir", "install"]) {
     writeStub(cmd, `echo "${cmd} $*" >> "${logFile}"`);
   }
   // The ownership probe is a single stat of the app home ROOT -- deliberately
@@ -95,14 +95,20 @@ describe("docker-entrypoint.sh", () => {
     expect(calls).not.toContain("chown -R node:node /paperclip");
   });
 
-  it("pre-creates the secrets key directory outside the paperclip volume when root", async () => {
+  it("root-owns the secrets key directory outside the paperclip volume when root", async () => {
+    // SUP-12989: the server and every agent run share uid 1000, so DAC cannot
+    // tell them apart. The key directory must therefore be root:root 0700 and
+    // the key handed to the server through the environment before the gosu
+    // drop -- chowning it to node would re-open the read/write/unlink path for
+    // agent runs. The static shape is pinned in
+    // scripts/__tests__/dockerfile-secrets-root-owned.test.mjs.
     installStubs({ uid: 0, gid: 0 });
 
     const { stdout, calls } = await runEntrypoint();
 
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
-    expect(calls).toContain("mkdir -p /etc/paperclip/secrets");
-    expect(calls).toContain("chown node:node /etc/paperclip/secrets");
+    expect(calls).toContain("install -d -m 0700 -o root -g root /etc/paperclip/secrets");
+    expect(calls).not.toContain("chown node:node /etc/paperclip/secrets");
   });
 
   it("remaps the node user and repairs the home root before gosu when root requests a different UID/GID", async () => {
@@ -166,7 +172,7 @@ describe("docker-entrypoint.sh", () => {
     const { calls } = await runEntrypoint({ PAPERCLIP_HOME: stubDir });
 
     // Scoped to the app home. The fork's unconditional single-directory
-    // `chown node:node /etc/paperclip/secrets` is a different guard (see the
+    // `install -d ... /etc/paperclip/secrets` is a different guard (see the
     // secrets-key-directory test above) and costs nothing per boot.
     expect(calls).not.toContain(`chown node ${stubDir}`);
     expect(calls).not.toContain("chown -R");

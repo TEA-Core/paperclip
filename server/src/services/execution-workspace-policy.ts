@@ -22,6 +22,12 @@ export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION =
 export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE =
   `executionWorkspacePreference: "reuse_existing" requires executionWorkspaceId, and none was supplied or inherited. ${WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION}`;
 
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE = "workspace_issue_override_disallowed";
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION =
+  "Remove the issue's executionWorkspacePreference/executionWorkspaceId override, or set the project's executionWorkspacePolicy.allowIssueOverride to true.";
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_MESSAGE =
+  `This issue supplies an execution-workspace override, but the project's executionWorkspacePolicy.allowIssueOverride is false. ${WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION}`;
+
 type WorkspaceStrategyType = ExecutionWorkspaceStrategy["type"];
 
 export type UnrunnableWorktreeIssueRef = {
@@ -91,6 +97,40 @@ export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIs
   return Boolean(issue.executionWorkspaceId && issue.executionWorkspacePreference === "reuse_existing");
 }
 
+/**
+ * Does THIS write supply an issue-level execution-workspace override?
+ *
+ * The question is about the fields THIS write carries — NOT about the issue's
+ * persisted state. `provisionIssueExecutionWorkspace` writes
+ * `executionWorkspaceId` back onto every issue it provisions, and
+ * `executionWorkspacePreference: "reuse_existing"` for isolated/operator_branch
+ * modes, so after one run every issue carries a binding that is
+ * indistinguishable from an operator override if you only look at the row. A
+ * predicate reading persisted state rejects the SECOND run of every issue in an
+ * `allowIssueOverride: false` project, even though the project's own
+ * `defaultMode` produced the binding.
+ *
+ * Only the write boundary can tell the two apart: there, an operator supplying
+ * the field is observable, and provisioning's system write-back opts out via
+ * `systemWorkspaceBinding`.
+ *
+ * `null` counts as NOT supplying an override, for two reasons. Clearing an
+ * override is not itself an override, so refusing it would trap an issue in the
+ * very state the project forbids. And several callers normalize with `?? null`
+ * (routines `dispatchRoutineRun`, pipeline stage-entry automations), so the key
+ * is present-but-null on every routine-created issue even when nothing was
+ * configured — keying on presence alone would reject all of them.
+ */
+export function suppliesIssueExecutionWorkspaceOverride(input: {
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceId?: string | null;
+}): boolean {
+  if (input.executionWorkspaceId) return true;
+  const preference = input.executionWorkspacePreference;
+  // "inherit" explicitly defers to the project policy — the opposite of an override.
+  return Boolean(preference && preference !== "inherit");
+}
+
 export function isUnrunnableWorktreeCombo(input: {
   issue: UnrunnableWorktreeIssueRef;
   resolvedMode: ParsedExecutionWorkspaceMode;
@@ -105,6 +145,53 @@ export function isUnrunnableWorktreeCombo(input: {
     input.reusableExecutionWorkspaceAvailable ?? hasReusableExecutionWorkspaceBinding(input.issue);
   if (hasReusableWorkspace) return false;
   return input.hasResolvablePriorSessionWorkspace !== true;
+}
+
+export function canAgentSatisfyIssueWorkspaceSettings(input: {
+  issue: UnrunnableWorktreeIssueRef;
+  executionWorkspaceSettings: unknown;
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  reusableExecutionWorkspaceAvailable?: boolean | null;
+  hasResolvablePriorSessionWorkspace?: boolean | null;
+  agentConfig?: Record<string, unknown> | null;
+}): boolean {
+  const settings = parseIssueExecutionWorkspaceSettings(input.executionWorkspaceSettings);
+  const mode = settings?.mode;
+  if (mode !== "isolated_workspace" && mode !== "operator_branch") return true;
+
+  const resolvedMode = mode as ParsedExecutionWorkspaceMode;
+  // Resolve the candidate's effective strategy exactly the way dispatch does: the agent's
+  // adapterConfig is the LOWEST-precedence input, below the issue settings and the project
+  // policy. Comparing the candidate's raw adapterConfig against the issue strategy instead
+  // would reject every agent whose config does not restate the strategy — including the
+  // common `adapterConfig: {}` agent, which dispatch resolves to the issue/project strategy
+  // and runs without complaint.
+  const candidateWorkspaceConfig = buildExecutionWorkspaceAdapterConfig({
+    agentConfig: input.agentConfig ?? {},
+    projectPolicy: input.projectPolicy,
+    issueSettings: settings,
+    mode: resolvedMode,
+    legacyUseProjectWorkspace: null,
+  });
+  // SUP-13100 (reverted, ruling in SUP-13100 round-4): a previous revision preferred the
+  // strategyType persisted on the bound `execution_workspaces` row over this derivation.
+  // That override was provably dead code. It only engaged when
+  // `hasReusableExecutionWorkspaceBinding(issue)` was true, and for exactly those inputs
+  // `isUnrunnableWorktreeCombo` already short-circuits to "capable" on its reusable-workspace
+  // check — the ladder (recovery/service.ts) passes no `reusableExecutionWorkspaceAvailable`,
+  // so that check falls back to the same binding predicate. Measured: 540 ladder-reachable
+  // input combinations × 4 bound strategyType values produced zero divergence in the return
+  // value. Do not reintroduce it without first making the call site pass an explicit
+  // `reusableExecutionWorkspaceAvailable`.
+  const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, candidateWorkspaceConfig);
+
+  return !isUnrunnableWorktreeCombo({
+    issue: input.issue,
+    resolvedMode,
+    resolvedStrategy,
+    reusableExecutionWorkspaceAvailable: input.reusableExecutionWorkspaceAvailable,
+    hasResolvablePriorSessionWorkspace: input.hasResolvablePriorSessionWorkspace,
+  });
 }
 
 export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecutionWorkspacePolicy | null {

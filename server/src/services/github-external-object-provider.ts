@@ -402,6 +402,21 @@ export function createGitHubExternalObjectProvider(
           };
         }
 
+        // A 401 means the credential we sent was rejected outright (an absent
+        // credential yields 200 for public repos and 404 for private ones). A
+        // stale or revoked secret would therefore make public objects strictly
+        // less resolvable than sending nothing, so fall back to an anonymous
+        // read once before surfacing the auth failure.
+        if (response.status === 401 && token) {
+          const { authorization: _dropped, ...anonymousHeaders } = headers;
+          try {
+            const anonymous = await fetchImpl(url, { headers: anonymousHeaders });
+            if (anonymous.ok) response = anonymous;
+          } catch {
+            // Keep the original 401 response and let it map to auth_required.
+          }
+        }
+
         const etag = response.headers.get("etag");
         if (response.status === 404) {
           return { ok: true, snapshot: notFoundSnapshot(identity, etag) };

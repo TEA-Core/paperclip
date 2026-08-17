@@ -767,7 +767,11 @@ export async function provisionIssueExecutionWorkspace(
       };
     }
     if (Object.keys(nextIssuePatch).length > 0) {
-      await issuesSvc.update(issueId, nextIssuePatch);
+      // This binding is produced BY the project's own policy, not supplied by an
+      // operator, so it must not trip the allowIssueOverride guard — otherwise an
+      // `allowIssueOverride: false` project could never provision any issue at all
+      // (SUP-13058).
+      await issuesSvc.update(issueId, { ...nextIssuePatch, systemWorkspaceBinding: true });
     }
   }
 

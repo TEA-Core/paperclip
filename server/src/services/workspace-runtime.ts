@@ -2531,7 +2531,8 @@ async function resolveAuthoritativeBaseRef(
     return { baseRef: detected, warnings, refreshed: false };
   }
 
-  if (parseRemoteTrackingRef(configured)) {
+  const remoteTracking = parseRemoteTrackingRef(configured);
+  if (remoteTracking && (await remoteExists(repoRoot, remoteTracking.remote))) {
     return { baseRef: configured, warnings, refreshed: false };
   }
 
@@ -3222,6 +3223,44 @@ export async function assertWorktreeWritableByProcessUser(worktreePath: string):
 
 import { ensureSharedGroupOwnership } from "./shared-group-ownership.js";
 
+/**
+ * SUP-13090: pnpm refuses a frozen install when the committed lockfile disagrees
+ * with the branch's manifests, under two codes — ERR_PNPM_OUTDATED_LOCKFILE (a
+ * changed dependency version) and ERR_PNPM_LOCKFILE_CONFIG_MISMATCH (a changed
+ * pnpm setting inside package.json: overrides, patchedDependencies,
+ * packageExtensions).
+ *
+ * SUP-12984 taught `scripts/provision-worktree.sh` to retry without
+ * `--frozen-lockfile`, but a project can configure any `provisionCommand`, and
+ * this project's execution workspaces carry the inline
+ * `corepack enable && pnpm install --frozen-lockfile --prefer-offline`. That
+ * command never reaches the script, so it had no retry: SUP-12986 and SUP-12996
+ * failed EVERY dispatch in ~8s with `workspace_validation_failed`, agent- and
+ * adapter-independent, because their reused worktrees carry an `overrides` change
+ * whose lockfile has not been regenerated.
+ *
+ * The retry belongs here, at the layer that executes whatever provisionCommand a
+ * project configured, so both the fresh-provision and the reuse path are covered.
+ * Returns the command to retry with, or null when this failure is not a lockfile
+ * mismatch (registry 404, EACCES, missing peer) — those must still fail the
+ * dispatch rather than be silently re-run.
+ */
+const PNPM_LOCKFILE_MISMATCH_ERROR_CODES = [
+  "ERR_PNPM_OUTDATED_LOCKFILE",
+  "ERR_PNPM_LOCKFILE_CONFIG_MISMATCH",
+] as const;
+
+export function resolvePnpmLockfileMismatchRetryCommand(
+  command: string,
+  failureOutput: string,
+): string | null {
+  if (!PNPM_LOCKFILE_MISMATCH_ERROR_CODES.some((code) => failureOutput.includes(code))) return null;
+  // Leave `--frozen-lockfile=false` and an existing `--no-frozen-lockfile` alone:
+  // neither can produce this error, and rewriting them would be a no-op retry loop.
+  const retryCommand = command.replace(/--frozen-lockfile(?![=\w-])/g, "--no-frozen-lockfile");
+  return retryCommand === command ? null : retryCommand;
+}
+
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -3236,32 +3275,45 @@ async function provisionExecutionWorktree(input: {
   await assertWorktreeWritableByProcessUser(input.worktreePath);
   const provisionCommand = asString(input.strategy.provisionCommand, "").trim();
   if (!provisionCommand) return;
-  const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
 
-  await recordWorkspaceCommandOperation(input.recorder, {
-    phase: "workspace_provision",
-    command: provisionCommand,
-    resolvedCommand: resolvedProvisionCommand,
-    cwd: input.worktreePath,
-    env: buildWorkspaceCommandEnv({
-      base: input.base,
-      repoRoot: input.repoRoot,
-      worktreePath: input.worktreePath,
-      branchName: input.branchName,
-      issue: input.issue,
-      agent: input.agent,
-      created: input.created,
-    }),
-    label: `Execution workspace provision command "${provisionCommand}"`,
-    metadata: {
-      repoRoot: input.repoRoot,
-      worktreePath: input.worktreePath,
-      branchName: input.branchName,
-      created: input.created,
-      resolvedCommand: resolvedProvisionCommand === provisionCommand ? null : resolvedProvisionCommand,
-    },
-    successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
+  const env = buildWorkspaceCommandEnv({
+    base: input.base,
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    branchName: input.branchName,
+    issue: input.issue,
+    agent: input.agent,
+    created: input.created,
   });
+  const runProvisionCommand = async (command: string, lockfileMismatchRetry: boolean) => {
+    const resolvedCommand = resolveRepoManagedWorkspaceCommand(command, input.repoRoot);
+    await recordWorkspaceCommandOperation(input.recorder, {
+      phase: "workspace_provision",
+      command,
+      resolvedCommand,
+      cwd: input.worktreePath,
+      env,
+      label: `Execution workspace provision command "${command}"`,
+      metadata: {
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        branchName: input.branchName,
+        created: input.created,
+        resolvedCommand: resolvedCommand === command ? null : resolvedCommand,
+        ...(lockfileMismatchRetry ? { lockfileMismatchRetry: true, originalCommand: provisionCommand } : {}),
+      },
+      successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
+    });
+  };
+
+  try {
+    await runProvisionCommand(provisionCommand, false);
+  } catch (error) {
+    const failureOutput = error instanceof Error ? error.message : String(error);
+    const retryCommand = resolvePnpmLockfileMismatchRetryCommand(provisionCommand, failureOutput);
+    if (!retryCommand) throw error;
+    await runProvisionCommand(retryCommand, true);
+  }
 }
 
 export type BaseRepoHygieneDecision =
@@ -3581,6 +3633,141 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+export async function prepareBaseRepoForWorkspace(input: {
+  repoRoot: string;
+  configuredBaseRef: string | null;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ baseRef: string; baseRefSha: string | null; warnings: string[] }> {
+  const {
+    baseRef,
+    warnings: baseRefResolutionWarnings,
+    refreshed: baseRefAlreadyRefreshed,
+  } = await resolveAuthoritativeBaseRef(input.repoRoot, input.configuredBaseRef, input.resolveGitAuth);
+  const baseRefreshWarnings = [
+    ...baseRefResolutionWarnings,
+    ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(input.repoRoot, baseRef, input.resolveGitAuth)),
+  ];
+  const currentBaseRefSha = await resolveBaseRefSha(input.repoRoot, baseRef);
+
+  // SUP-11285: tidy the base repo before cutting from it. Strictly best-effort —
+  // the dispatch proceeds whatever happens here, because the issue being run did
+  // not cause the mess and must not be held hostage to it.
+  const baseRepoHygieneWarnings: string[] = [];
+  try {
+    const hygiene = await inspectBaseRepoHygiene(input.repoRoot);
+    if (hygiene) {
+      const headSha = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
+      const headBehindBaseRef = Boolean(headSha && currentBaseRefSha && headSha !== currentBaseRefSha)
+        ? await runGit(["merge-base", "--is-ancestor", headSha!, currentBaseRefSha!], input.repoRoot)
+            .then(() => true).catch(() => false)
+        : false;
+      let aheadCount: number | undefined;
+      let behindCount: number | undefined;
+      let aheadCommitSubjects: string[] | undefined;
+      if (!headBehindBaseRef && headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
+        const revList = await runGit(["rev-list", "--left-right", "--count", baseRef + "...HEAD"], input.repoRoot)
+          .then((value) => {
+            const tokens = value.trim().split(/\s+/);
+            if (tokens.length >= 2) {
+              return { behind: parseInt(tokens[0], 10), ahead: parseInt(tokens[1], 10) };
+            }
+            return null;
+          })
+          .catch(() => null);
+        if (revList) {
+          behindCount = revList.behind;
+          aheadCount = revList.ahead;
+          if (aheadCount > 0) {
+            aheadCommitSubjects = await runGit(["log", "--format=%s", baseRef + "..HEAD"], input.repoRoot)
+              .then((value) => value.trim().split("\n").filter((line) => line.length > 0))
+              .catch(() => []);
+          }
+        }
+      }
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: hygiene.currentBranch,
+        defaultRef: baseRef,
+        dirtyTrackedPathCount: hygiene.dirtyTrackedPathCount,
+        unmergedPathCount: hygiene.unmergedPathCount,
+        headSha,
+        baseRefSha: currentBaseRefSha,
+        headBehindBaseRef,
+        aheadCount,
+        behindCount,
+        aheadCommitSubjects,
+      });
+      if (decision.action === "restore") {
+        const result = await restoreBaseRepoToDefaultRef({
+          repoRoot: input.repoRoot,
+          baseRef,
+          decision,
+          timestamp: new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"),
+          recorder: input.recorder ?? null,
+        });
+        baseRepoHygieneWarnings.push(
+          `Base repository at ${input.repoRoot} was restored to ${baseRef}: ${decision.reasons.join("; ")}.` +
+            (result.rescueRefs.length > 0
+              ? ` Anything found there is preserved on ${result.rescueRefs.join(", ")}.`
+              : ""),
+          ...result.warnings,
+        );
+      } else if (decision.action === "fastForward") {
+        const result = await fastForwardBaseRepoToDefaultRef({
+          repoRoot: input.repoRoot,
+          baseRef,
+          recorder: input.recorder ?? null,
+        });
+        baseRepoHygieneWarnings.push(
+          result.fastForwarded
+            ? `Base repository at ${input.repoRoot} was fast-forwarded to ${baseRef}.`
+            : `Could not fast-forward base repository at ${input.repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
+        );
+      } else if (decision.action === "diverged") {
+        const subjects = decision.aheadCommitSubjects.length > 0
+          ? decision.aheadCommitSubjects.join(", ")
+          : "(no subjects)";
+        const message =
+          `Base repository at ${input.repoRoot} has diverged from ${baseRef}: ` +
+          `${decision.aheadCount} ahead, ${decision.behindCount} behind. ` +
+          `Ahead commits: ${subjects}. Local commits preserved — no reset performed.`;
+        baseRepoHygieneWarnings.push(message);
+        logger.warn(message);
+      } else if (decision.action === "ok") {
+        if (headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
+          const revList = await runGit(
+            ["rev-list", "--left-right", "--count", `HEAD...${baseRef}`],
+            input.repoRoot,
+          ).catch(() => null);
+          if (revList) {
+            const [aheadStr, behindStr] = revList.split("\t");
+            const ahead = Number(aheadStr);
+            const behind = Number(behindStr);
+            const subjects = await runGit(
+              ["log", "--format=%s", `${baseRef}..HEAD`],
+              input.repoRoot,
+            ).catch(() => "");
+            const subjectList = subjects ? subjects.split("\n") : [];
+            baseRepoHygieneWarnings.push(
+              `Base repository at ${input.repoRoot} is ahead of ${baseRef}: ${ahead} commit(s) ahead, ${behind} commit(s) behind. Ahead commits: ${subjectList.join(", ")}`,
+            );
+          }
+        }
+      }
+    }
+  } catch (err) {
+    baseRepoHygieneWarnings.push(
+      `Base repository hygiene check failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  return {
+    baseRef,
+    baseRefSha: currentBaseRefSha,
+    warnings: [...baseRepoHygieneWarnings, ...baseRefreshWarnings],
+  };
+}
+
 export async function realizeExecutionWorkspace(input: {
   db?: Db | null;
   base: ExecutionWorkspaceInput;
@@ -3648,107 +3835,14 @@ export async function realizeExecutionWorkspace(input: {
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
     : input.base.repoRef ?? null;
-  const {
-    baseRef,
-    warnings: baseRefResolutionWarnings,
-    refreshed: baseRefAlreadyRefreshed,
-  } = await resolveAuthoritativeBaseRef(repoRoot, configuredBaseRef, input.resolveGitAuth);
-  const baseRefreshWarnings = [
-    ...baseRefResolutionWarnings,
-    ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(repoRoot, baseRef, input.resolveGitAuth)),
-  ];
-  const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
-
-  // SUP-11285: tidy the base repo before cutting from it. Strictly best-effort —
-  // the dispatch proceeds whatever happens here, because the issue being run did
-  // not cause the mess and must not be held hostage to it.
-  const baseRepoHygieneWarnings: string[] = [];
-  try {
-    const hygiene = await inspectBaseRepoHygiene(repoRoot);
-    if (hygiene) {
-      const headSha = await runGit(["rev-parse", "HEAD"], repoRoot).catch(() => null);
-      const headBehindBaseRef = Boolean(headSha && currentBaseRefSha && headSha !== currentBaseRefSha)
-        ? await runGit(["merge-base", "--is-ancestor", headSha!, currentBaseRefSha!], repoRoot)
-            .then(() => true).catch(() => false)
-        : false;
-      let aheadCount: number | undefined;
-      let behindCount: number | undefined;
-      let aheadCommitSubjects: string[] | undefined;
-      if (!headBehindBaseRef && headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
-        const revList = await runGit(["rev-list", "--left-right", "--count", baseRef + "...HEAD"], repoRoot)
-          .then((value) => {
-            const tokens = value.trim().split(/\s+/);
-            if (tokens.length >= 2) {
-              return { behind: parseInt(tokens[0], 10), ahead: parseInt(tokens[1], 10) };
-            }
-            return null;
-          })
-          .catch(() => null);
-        if (revList) {
-          behindCount = revList.behind;
-          aheadCount = revList.ahead;
-          if (aheadCount > 0) {
-            aheadCommitSubjects = await runGit(["log", "--format=%s", baseRef + "..HEAD"], repoRoot)
-              .then((value) => value.trim().split("\n").filter((line) => line.length > 0))
-              .catch(() => []);
-          }
-        }
-      }
-      const decision = resolveBaseRepoHygieneDecision({
-        currentBranch: hygiene.currentBranch,
-        defaultRef: baseRef,
-        dirtyTrackedPathCount: hygiene.dirtyTrackedPathCount,
-        unmergedPathCount: hygiene.unmergedPathCount,
-        headSha,
-        baseRefSha: currentBaseRefSha,
-        headBehindBaseRef,
-        aheadCount,
-        behindCount,
-        aheadCommitSubjects,
-      });
-      if (decision.action === "restore") {
-        const result = await restoreBaseRepoToDefaultRef({
-          repoRoot,
-          baseRef,
-          decision,
-          timestamp: new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"),
-          recorder: input.recorder ?? null,
-        });
-        baseRepoHygieneWarnings.push(
-          `Base repository at ${repoRoot} was restored to ${baseRef}: ${decision.reasons.join("; ")}.` +
-            (result.rescueRefs.length > 0
-              ? ` Anything found there is preserved on ${result.rescueRefs.join(", ")}.`
-              : ""),
-          ...result.warnings,
-        );
-      } else if (decision.action === "fastForward") {
-        const result = await fastForwardBaseRepoToDefaultRef({
-          repoRoot,
-          baseRef,
-          recorder: input.recorder ?? null,
-        });
-        baseRepoHygieneWarnings.push(
-          result.fastForwarded
-            ? `Base repository at ${repoRoot} was fast-forwarded to ${baseRef}.`
-            : `Could not fast-forward base repository at ${repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
-        );
-      } else if (decision.action === "diverged") {
-        const subjects = decision.aheadCommitSubjects.length > 0
-          ? decision.aheadCommitSubjects.join(", ")
-          : "(no subjects)";
-        const message =
-          `Base repository at ${repoRoot} has diverged from ${baseRef}: ` +
-          `${decision.aheadCount} ahead, ${decision.behindCount} behind. ` +
-          `Ahead commits: ${subjects}. Local commits preserved — no reset performed.`;
-        baseRepoHygieneWarnings.push(message);
-        logger.warn(message);
-      }
-    }
-  } catch (err) {
-    baseRepoHygieneWarnings.push(
-      `Base repository hygiene check failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
+  const baseRepoHygiene = await prepareBaseRepoForWorkspace({
+    repoRoot,
+    configuredBaseRef,
+    resolveGitAuth: input.resolveGitAuth ?? null,
+    recorder: input.recorder ?? null,
+  });
+  const baseRef = baseRepoHygiene.baseRef;
+  const currentBaseRefSha = baseRepoHygiene.baseRefSha;
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
   await ensureSharedGroupOwnership(worktreeParentDir);
@@ -3811,7 +3905,7 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       branchName: effectiveBranchName,
       worktreePath: reusablePath,
-      warnings: [...extraWarnings, ...baseRepoHygieneWarnings, ...baseRefreshWarnings, ...baseDrift.warnings],
+      warnings: [...extraWarnings, ...baseRepoHygiene.warnings, ...baseDrift.warnings],
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
@@ -3960,7 +4054,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: [...baseRepoHygieneWarnings, ...baseRefreshWarnings],
+    warnings: baseRepoHygiene.warnings,
     created: true,
     baseRefSha: currentBaseRefSha,
   };
@@ -4025,7 +4119,6 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
   if (await directoryExists(cwd)) {
-    const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
     const reuseWorktreePath = realized.worktreePath ?? cwd;
     const repairWarnings: string[] = [];
     if (await isGitCheckout(reuseWorktreePath)) {
@@ -4069,16 +4162,22 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         },
       );
     }
-    const baseRefreshWarnings = reuseBaseRef
-      ? await refreshRemoteTrackingBaseRef(repoRoot, reuseBaseRef, input.resolveGitAuth)
-      : [];
-    const currentBaseRefSha = reuseBaseRef ? await resolveBaseRefSha(repoRoot, reuseBaseRef) : null;
-    const refresh = reuseBaseRef && currentBaseRefSha
+    const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
+    const baseRepoHygiene = reuseBaseRef
+      ? await prepareBaseRepoForWorkspace({
+          repoRoot,
+          configuredBaseRef: reuseBaseRef,
+          resolveGitAuth: input.resolveGitAuth ?? null,
+          recorder: input.recorder ?? null,
+        })
+      : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [] };
+    const currentBaseRefSha = baseRepoHygiene.baseRefSha;
+    const refresh = currentBaseRefSha
       ? await refreshUnstartedWorktreeToBase({
           repoRoot,
           worktreePath: reuseWorktreePath,
           branchName: realized.branchName,
-          baseRef: reuseBaseRef,
+          baseRef: baseRepoHygiene.baseRef,
           currentBaseRefSha,
           recorder: input.recorder ?? null,
         })
@@ -4087,11 +4186,11 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       repoRoot,
       worktreePath: reuseWorktreePath,
       branchName: realized.branchName,
-      baseRef: reuseBaseRef,
+      baseRef: baseRepoHygiene.baseRef,
       recordedBaseRefSha,
       skipRefresh: true,
     });
-    realized.warnings = [...repairWarnings, ...baseRefreshWarnings, ...baseDrift.warnings];
+    realized.warnings = [...repairWarnings, ...baseRepoHygiene.warnings, ...baseDrift.warnings];
     realized.baseRefSha = refresh.baseRefSha ?? recordedBaseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha;
     if (provisionCommand) {
       await provisionExecutionWorktree({
@@ -4122,10 +4221,15 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   await ensureSharedGroupOwnership(path.dirname(worktreePath));
   await runGit(["worktree", "prune"], repoRoot).catch(() => {});
   const restoreBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
-  const restoreRefreshWarnings = restoreBaseRef
-    ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef, input.resolveGitAuth)
-    : [];
-  const restoreCurrentBaseRefSha = restoreBaseRef ? await resolveBaseRefSha(repoRoot, restoreBaseRef) : null;
+  const baseRepoHygiene = restoreBaseRef
+    ? await prepareBaseRepoForWorkspace({
+        repoRoot,
+        configuredBaseRef: restoreBaseRef,
+        resolveGitAuth: input.resolveGitAuth ?? null,
+        recorder: input.recorder ?? null,
+      })
+    : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [] };
+  const restoreCurrentBaseRefSha = baseRepoHygiene.baseRefSha;
 
   let created = false;
   try {
@@ -4137,7 +4241,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         repoRoot,
         worktreePath,
         branchName,
-        baseRef: input.workspace.baseRef ?? input.base.repoRef ?? null,
+        baseRef: baseRepoHygiene.baseRef,
         currentBaseRefSha: restoreCurrentBaseRefSha,
         created: false,
         restored: true,
@@ -4154,7 +4258,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ) {
       throw error;
     }
-    const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
+    const baseRef = baseRepoHygiene.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
     const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
@@ -4180,7 +4284,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     repoRoot,
     worktreePath,
     branchName,
-    baseRef: input.workspace.baseRef ?? input.base.repoRef ?? null,
+    baseRef: baseRepoHygiene.baseRef,
     recordedBaseRefSha,
     skipRefresh: true,
   });
@@ -4204,7 +4308,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ...realized,
     cwd: worktreePath,
     worktreePath,
-    warnings: [...restoreRefreshWarnings, ...baseDrift.warnings],
+    warnings: [...baseRepoHygiene.warnings, ...baseDrift.warnings],
     created,
     baseRefSha:
       recordedBaseRefSha
