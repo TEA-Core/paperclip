@@ -15,8 +15,9 @@ export interface GitHubCredentialProbe {
 
 export interface GitHubCredentialDiagnostics {
   resolved: boolean;
-  scope: "project_env" | "company" | null;
+  scope: "app_installation" | "project_env" | "company" | null;
   secretName: string | null;
+  installationId?: string | null;
   probe: GitHubCredentialProbe;
   checkedAt: string;
   reason?: string;
@@ -97,6 +98,7 @@ export function diagnosticsRoutes(db: Db) {
       resolved: true,
       scope: tokenResult.scope,
       secretName: tokenResult.secretName,
+      installationId: tokenResult.installationId ?? null,
       probe,
       checkedAt,
     });

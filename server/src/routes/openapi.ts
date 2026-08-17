@@ -3277,8 +3277,9 @@ registry.registerPath({
   responses: {
     200: r.ok(z.object({
       resolved: z.boolean(),
-      scope: z.enum(["project_env", "company"]).nullable(),
+      scope: z.enum(["app_installation", "project_env", "company"]).nullable(),
       secretName: z.string().nullable(),
+      installationId: z.string().nullable().optional(),
       reason: z.string().optional(),
       probe: z.object({
         attempted: z.boolean(),
