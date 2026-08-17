@@ -48,7 +48,21 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
   then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
     Promise.resolve([]).then(onFulfilled, onRejected),
 })));
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
+// The done-transition guard resolves linked pull requests with a joined
+// select. These route tests only need that lookup to answer "no linked PRs".
+const mockDbSelectJoined = vi.hoisted(() => () => {
+  const query: any = {};
+  query.innerJoin = () => query;
+  query.leftJoin = () => query;
+  query.where = () => query;
+  query.orderBy = () => query;
+  query.then = (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+    Promise.resolve([]).then(onFulfilled, onRejected);
+  return query;
+});
+const mockDbSelectFrom = vi.hoisted(() =>
+  vi.fn(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectJoined })),
+);
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
@@ -323,7 +337,7 @@ describe.sequential("issue comment reopen routes", () => {
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
         Promise.resolve([]).then(onFulfilled, onRejected),
     }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectJoined }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDb.transaction.mockImplementation(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx));
     mockHeartbeatService.wakeup.mockResolvedValue(undefined);

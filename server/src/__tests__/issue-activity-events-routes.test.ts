@@ -560,6 +560,9 @@ describe("issue activity event routes", () => {
           where: () => ({
             orderBy: async () => [handoffActivityRow],
           }),
+          // The done-transition guard resolves linked pull requests with a
+          // joined select. This issue has none.
+          innerJoin: () => ({ where: async () => [] }),
         }),
       }),
     };
