@@ -9,6 +9,8 @@ import {
   companyMemberships,
   createDb,
   executionWorkspaces,
+  externalObjectMentions,
+  externalObjects,
   heartbeatRuns,
   issueComments,
   issues,
@@ -96,6 +98,9 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
   });
 
   beforeEach(() => {
+    mockGhFetch.mockReset();
+    mockGetByName.mockReset();
+    mockResolveSecretValue.mockReset();
     mockAddComment.mockImplementation(realAddCommentRef.current!);
   });
 
@@ -214,6 +219,49 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
 
     return { companyId, agentId, issueId, identifier, branchName, repoUrl, defaultRef };
+  }
+
+  async function seedLinkedPrs(
+    companyId: string,
+    issueId: string,
+    prs: Array<{ owner: string; repo: string; number: number; state: string; draft: boolean }>,
+  ) {
+    for (const pr of prs) {
+      const externalId = `${pr.owner}/${pr.repo}#pull/${pr.number}`;
+      const [obj] = await db
+        .insert(externalObjects)
+        .values({
+          companyId,
+          providerKey: "github",
+          objectType: "pull_request",
+          externalId,
+          sanitizedCanonicalUrl: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`,
+          canonicalIdentityHash: `gh-pr-${pr.owner}/${pr.repo}/${pr.number}`,
+          displayKey: externalId,
+          displayTitle: `PR #${pr.number}`,
+          data: {
+            state: pr.state,
+            draft: pr.draft,
+            node_id: `PR_${pr.owner}_${pr.repo}_${pr.number}`,
+            head: { ref: `SUP-${pr.number}-branch` },
+            headRefName: `SUP-${pr.number}-branch`,
+          },
+        })
+        .returning();
+      await db.insert(externalObjectMentions).values({
+        companyId,
+        sourceIssueId: issueId,
+        sourceKind: "description",
+        matchedTextRedacted: externalId,
+        sanitizedDisplayUrl: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`,
+        canonicalIdentityHash: `gh-pr-${pr.owner}/${pr.repo}/${pr.number}`,
+        canonicalIdentity: { url: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}` },
+        objectId: obj!.id,
+        providerKey: "github",
+        detectorKey: "github_pr",
+        objectType: "pull_request",
+      });
+    }
   }
 
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
@@ -415,5 +463,141 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     const systemComments = comments.filter((r) => r.authorType === "system");
     expect(systemComments).toHaveLength(0);
     expect(comments.some((r) => r.body.includes("Tier 1"))).toBe(true);
+  });
+
+  it("SUP-13152 fixture: 5 open linked PRs block done with 409 even when GitHub token is 401 (token_missing path)", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("SUP13152");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    await seedLinkedPrs(companyId, issueId, [
+      { owner: "TEA-Core", repo: "paperclip", number: 274, state: "open", draft: false },
+      { owner: "TEA-Core", repo: "paperclip", number: 275, state: "open", draft: false },
+      { owner: "TEA-Core", repo: "Trading-Signal-Platform", number: 3124, state: "open", draft: false },
+      { owner: "TEA-Core", repo: "Trading-Signal-Platform", number: 3125, state: "open", draft: false },
+      { owner: "TEA-Core", repo: "Trading-Signal-Platform", number: 3126, state: "open", draft: false },
+    ]);
+
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) {
+        return new Response("", { status: 401 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("done_transition_missing_delivery");
+    expect(res.body.error).toContain("5 open linked PRs");
+    expect(mockGhFetch).not.toHaveBeenCalled();
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("todo");
+  });
+
+  it("SUP-13152 fixture: 5 open linked PRs block done on auth_failed:compare:401 path (not skipped)", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("SUP13152B");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    await seedLinkedPrs(companyId, issueId, [
+      { owner: "TEA-Core", repo: "paperclip", number: 274, state: "open", draft: false },
+      { owner: "TEA-Core", repo: "paperclip", number: 275, state: "open", draft: false },
+      { owner: "TEA-Core", repo: "Trading-Signal-Platform", number: 3124, state: "open", draft: false },
+      { owner: "TEA-Core", repo: "Trading-Signal-Platform", number: 3125, state: "open", draft: false },
+      { owner: "TEA-Core", repo: "Trading-Signal-Platform", number: 3126, state: "open", draft: false },
+    ]);
+
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) {
+        return new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): guard skipped on auth failure. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("done_transition_missing_delivery");
+    expect(res.body.error).toContain("5 open linked PRs");
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("todo");
+  });
+
+  it("Tier 1 declaration override allows done with open linked PRs present", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("TIER1PR");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    await seedLinkedPrs(companyId, issueId, [
+      { owner: "TEA-Core", repo: "paperclip", number: 274, state: "open", draft: false },
+    ]);
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        doneTransitionOverride: { disposition: "upstream-equivalent-fix-no-deliverable-head", reason: "Tier 1" },
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): override path. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
+  });
+
+  it("no linked PRs allows done transition to proceed to tier declaration check (green path)", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("NOPR");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) {
+        return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Closed at Tier 2 (live): probe confirms fix.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
   });
 });

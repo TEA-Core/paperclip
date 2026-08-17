@@ -7,6 +7,7 @@ import {
   type GitHubTokenScope,
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
+import { resolveLinkedPullRequests } from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
 
@@ -447,6 +448,27 @@ export async function evaluateDoneTransitionGuard(
     return {
       allowed: true,
       reason: `Override accepted: ${override.disposition}`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  const linkedPrs = await resolveLinkedPullRequests(db, issue.companyId, issue.id);
+  if (linkedPrs.length > 0) {
+    const prNames = linkedPrs.map((p) => p.displayName).join(", ");
+    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      reason: `open_linked_prs:${linkedPrs.length}`,
+      skipReason: `open_linked_prs:${linkedPrs.length}`,
+      prs: prNames,
+    });
+    return {
+      allowed: false,
+      reason: `Issue has ${linkedPrs.length} open linked PRs (${prNames}). Land them (or record a Tier 1 declaration) before marking done.`,
       aheadBy: null,
       branch: null,
       defaultRef: null,
