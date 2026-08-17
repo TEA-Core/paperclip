@@ -224,7 +224,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
   async function seedLinkedPrs(
     companyId: string,
     issueId: string,
-    prs: Array<{ owner: string; repo: string; number: number; state: string; draft: boolean }>,
+    prs: Array<{ owner: string; repo: string; number: number; state?: string; draft?: boolean; unhydrated?: boolean }>,
   ) {
     for (const pr of prs) {
       const externalId = `${pr.owner}/${pr.repo}#pull/${pr.number}`;
@@ -239,13 +239,18 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
           canonicalIdentityHash: `gh-pr-${pr.owner}/${pr.repo}/${pr.number}`,
           displayKey: externalId,
           displayTitle: `PR #${pr.number}`,
-          data: {
-            state: pr.state,
-            draft: pr.draft,
-            node_id: `PR_${pr.owner}_${pr.repo}_${pr.number}`,
-            head: { ref: `SUP-${pr.number}-branch` },
-            headRefName: `SUP-${pr.number}-branch`,
-          },
+          // `unhydrated` reproduces the row shape upsertObjectFromDetection actually
+          // writes for a bare URL mention: it omits `data`, so the column takes its
+          // `{}` default until a provider refresh fills it in.
+          data: pr.unhydrated
+            ? {}
+            : {
+                state: pr.state,
+                draft: pr.draft,
+                node_id: `PR_${pr.owner}_${pr.repo}_${pr.number}`,
+                head: { ref: `SUP-${pr.number}-branch` },
+                headRefName: `SUP-${pr.number}-branch`,
+              },
         })
         .returning();
       await db.insert(externalObjectMentions).values({
@@ -544,6 +549,46 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .from(issues)
       .where(eq(issues.id, issueId));
     expect(statusRows[0]?.status).toBe("todo");
+  });
+
+  it("an unhydrated linked-PR mention (data {}) does NOT block done — no company-wide freeze under the 401", async () => {
+    // Regression for the fail-closed hole: externalObjects rows are created from a
+    // bare URL mention with `data` defaulting to `{}` and hydrated later by a GitHub
+    // API refresh, which is exactly what 401s under SUP-13038. If `{}` counted as
+    // open (state === undefined), merely
+    // linking any PR — including an already-merged or unrelated one — would block
+    // `done` forever, and the Tier 1 declaration cannot clear this guard.
+    const { companyId, agentId, issueId, identifier } = await seedIssue("SUP13155U");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    await seedLinkedPrs(companyId, issueId, [
+      { owner: "TEA-Core", repo: "paperclip", number: 279, unhydrated: true },
+    ]);
+
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) {
+        return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
   });
 
   it("no-deliverable-head doneTransitionOverride allows done with open linked PRs present", async () => {

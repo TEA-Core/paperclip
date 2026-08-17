@@ -42,6 +42,13 @@ export interface LinkedPullRequest {
   nodeId: string | null;
   headRefName: string | null;
   displayName: string;
+  /**
+   * The `state` recorded on the cached external-object payload, or null when the
+   * object has never been hydrated from the provider. Callers that need positive
+   * evidence a PR is open (rather than "not known to be closed") must check for
+   * the literal "open" — an unhydrated row carries null, not "open".
+   */
+  cachedState: string | null;
 }
 
 const GITHUB_GRAPHQL_URL = "https://api.github.com/graphql";
@@ -100,6 +107,7 @@ export async function resolveLinkedPullRequests(
       nodeId: nodeId ?? null,
       headRefName: headRefName ?? null,
       displayName: `${owner}/${repo}#${number}`,
+      cachedState: state ?? null,
     });
   }
 

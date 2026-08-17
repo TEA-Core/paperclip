@@ -458,7 +458,14 @@ export async function evaluateDoneTransitionGuard(
     };
   }
 
-  const linkedPrs = await resolveLinkedPullRequests(db, issue.companyId, issue.id);
+  // Only PRs we can positively prove are open may block `done`. An external-object
+  // row is created from a mere URL mention with `data` NULL, and is hydrated later by
+  // a refresh that calls the GitHub API — the same call that 401s under SUP-13038.
+  // Treating an unhydrated row as open would block `done` on any issue that merely
+  // links a PR (including already-merged or unrelated ones) in exactly the
+  // credential-less configuration this guard is built for. Fail open on unknown.
+  const resolvedPrs = await resolveLinkedPullRequests(db, issue.companyId, issue.id);
+  const linkedPrs = resolvedPrs.filter((p) => p.cachedState === "open");
   if (linkedPrs.length > 0) {
     const prNames = linkedPrs.map((p) => p.displayName).join(", ");
     void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
