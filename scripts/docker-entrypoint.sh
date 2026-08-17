@@ -84,19 +84,33 @@ install -d -m 0700 -o root -g root /etc/paperclip/secrets
 # Format must match the provider: randomBytes(32).toString("base64"),
 # which decodeMasterKey trims + base64-decodes + requires to be 32 bytes.
 # `head -c 32 /dev/urandom | base64` produces the same shape.
-if [ ! -f /etc/paperclip/secrets/master.key ] && [ "${PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION:-0}" = "1" ]; then
+#
+# Precedence: env key > file key > (opt-in) generated key. Never mint a key
+# when the operator already supplied one via PAPERCLIP_SECRETS_MASTER_KEY.
+if [ -z "${PAPERCLIP_SECRETS_MASTER_KEY:-}" ] \
+   && [ ! -f /etc/paperclip/secrets/master.key ] \
+   && [ "${PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION:-0}" = "1" ]; then
     head -c 32 /dev/urandom | base64 > /etc/paperclip/secrets/master.key
     chown root:root /etc/paperclip/secrets/master.key
     chmod 0600 /etc/paperclip/secrets/master.key
 fi
 
-if [ -f /etc/paperclip/secrets/master.key ]; then
+if [ -z "${PAPERCLIP_SECRETS_MASTER_KEY:-}" ] && [ -f /etc/paperclip/secrets/master.key ]; then
     chown root:root /etc/paperclip/secrets/master.key
     chmod 0600 /etc/paperclip/secrets/master.key
     # Hand the master key to the server before the gosu drop. NEVER echo it;
     # this entrypoint must never run under `set -x`.
     PAPERCLIP_SECRETS_MASTER_KEY="$(cat /etc/paperclip/secrets/master.key)"
     export PAPERCLIP_SECRETS_MASTER_KEY
+elif [ -n "${PAPERCLIP_SECRETS_MASTER_KEY:-}" ] && [ -f /etc/paperclip/secrets/master.key ]; then
+    # The operator supplied a key via the environment AND a key file exists.
+    # The env key always wins. If they disagree, emit ONE warning line with
+    # only the first 12 hex of each key's sha256 — never the material.
+    env_fp="$(printf '%s' "$PAPERCLIP_SECRETS_MASTER_KEY" | sha256sum | cut -c1-12)"
+    file_fp="$(sha256sum /etc/paperclip/secrets/master.key | cut -c1-12)"
+    if [ "$env_fp" != "$file_fp" ]; then
+        echo "docker-entrypoint.sh: WARNING — PAPERCLIP_SECRETS_MASTER_KEY (sha256 ${env_fp}…) disagrees with /etc/paperclip/secrets/master.key (sha256 ${file_fp}…); using the env key" >&2
+    fi
 fi
 
 # Populate the npm-global volume with the self-contained MCP server tree.

@@ -84,6 +84,69 @@ if [ "$key_state" != "0 0 600" ]; then
 fi
 echo "PASS: entrypoint repaired node-owned secrets to root:root 0700 directory / 0600 key"
 
+# Env-wins case 1: env key set + file present (differing).
+# The env key must win; the file key must NOT be exported. A disagreement
+# warning with two 12-hex sha256 fingerprints must be logged to stderr.
+# We use a probe as "$@" that prints only digests — never key material.
+DIFFERING_ENV_KEY="differing-env-key-value-for-testing-1234567890"
+rm -f "$KEY"
+printf '%s' "$EXPECTED_KEY" > "$KEY"
+chown root:root "$KEY"
+chmod 0600 "$KEY"
+env_warn="$(PAPERCLIP_SECRETS_MASTER_KEY="$DIFFERING_ENV_KEY" \
+    docker-entrypoint.sh /bin/sh -c 'printf "%s" "$PAPERCLIP_SECRETS_MASTER_KEY" | sha256sum | cut -c1-12' 2>&1 >/dev/null || true)"
+if printf '%s' "$env_warn" | grep -q "disagrees with"; then
+    echo "PASS: disagreement warning emitted when env key differs from file key"
+else
+    echo "FAIL: expected disagreement warning, got: $env_warn"
+    exit 1
+fi
+env_fp="$(printf '%s' "$DIFFERING_ENV_KEY" | sha256sum | cut -c1-12)"
+if printf '%s' "$env_warn" | grep -q "$env_fp"; then
+    echo "PASS: warning carries the env key fingerprint ($env_fp)"
+else
+    echo "FAIL: warning does not carry the env key fingerprint ($env_fp)"
+    exit 1
+fi
+if printf '%s' "$env_warn" | grep -q "$EXPECTED_KEY"; then
+    echo "FAIL: warning leaked key material"
+    exit 1
+fi
+echo "PASS: disagreement warning carries no key material"
+
+# Env-wins case 2: env key set + no file + ALLOW_KEY_GENERATION=1.
+# No file must be created; the server must receive the env key.
+rm -f "$KEY"
+PAPERCLIP_SECRETS_MASTER_KEY="$DIFFERING_ENV_KEY" \
+    PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1 \
+    docker-entrypoint.sh /bin/sh -c 'printf "%s" "$PAPERCLIP_SECRETS_MASTER_KEY" | sha256sum | cut -c1-12' 2>/dev/null > "$PAPERCLIP_RUN_SCRATCH_DIR/env_fp.txt" || true
+if [ -f "$KEY" ]; then
+    echo "FAIL: entrypoint created master.key despite env key being set"
+    exit 1
+fi
+echo "PASS: entrypoint did not create master.key when env key is set"
+if [ "$(cat "$PAPERCLIP_RUN_SCRATCH_DIR/env_fp.txt" 2>/dev/null)" != "$env_fp" ]; then
+    echo "FAIL: server did not receive the env key"
+    exit 1
+fi
+echo "PASS: server received the env key when no file exists"
+
+# Env-wins case 3: no env key + file present.
+# The server must receive the file key (unchanged behavior). This is the
+# same as the existing seed/probe flow, so we just verify the file key
+# is exported.
+rm -f "$KEY"
+printf '%s' "$EXPECTED_KEY" > "$KEY"
+chown root:root "$KEY"
+chmod 0600 "$KEY"
+file_fp="$(docker-entrypoint.sh /bin/sh -c 'printf "%s" "$PAPERCLIP_SECRETS_MASTER_KEY" | sha256sum | cut -c1-12' 2>/dev/null || true)"
+expected_fp="$(printf '%s' "$EXPECTED_KEY" | sha256sum | cut -c1-12)"
+if [ "$file_fp" != "$expected_fp" ]; then
+    echo "FAIL: server did not receive the file key (got $file_fp, want $expected_fp)"
+    exit 1
+fi
+echo "PASS: server received the file key when no env key is set"
+
 # Absent-key arm: when no master.key exists and the operator has opted in via
 # PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1, the entrypoint's root phase must
 # generate one as root:root 0600 — not leave it absent, and not create it as

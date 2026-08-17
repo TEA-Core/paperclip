@@ -75,8 +75,8 @@ test("entrypoint guards the key-absent case with a gated generation path", () =>
   // as node.
   assert.match(
     entrypoint,
-    /if \[ -f \/etc\/paperclip\/secrets\/master\.key \]/,
-    "must only export the key when the file exists",
+    /if \[ -z "\$\{PAPERCLIP_SECRETS_MASTER_KEY:-\}" \] && \[ -f \/etc\/paperclip\/secrets\/master\.key \]/,
+    "must only export the key when the file exists and env key is empty",
   );
   assert.match(
     entrypoint,
@@ -97,6 +97,68 @@ test("entrypoint guards the key-absent case with a gated generation path", () =>
     entrypoint,
     /chmod 0600 \/etc\/paperclip\/secrets\/master\.key/,
     "must write the generated key with mode 0600",
+  );
+});
+
+test("generation block requires env-empty conjunct before minting", () => {
+  // The generation `if` must carry a third conjunct: never mint a key when
+  // the operator already supplied one via PAPERCLIP_SECRETS_MASTER_KEY.
+  assert.match(
+    entrypoint,
+    /if \[ -z "\$\{PAPERCLIP_SECRETS_MASTER_KEY:-\}" \]/,
+    "generation block must require PAPERCLIP_SECRETS_MASTER_KEY to be empty before minting",
+  );
+  assert.match(
+    entrypoint,
+    /\[ ! -f \/etc\/paperclip\/secrets\/master\.key \]/,
+    "generation block must require no existing key file",
+  );
+  assert.match(
+    entrypoint,
+    /ALLOW_KEY_GENERATION.*= "1"/,
+    "generation block must require ALLOW_KEY_GENERATION=1",
+  );
+});
+
+test("export block fires only when PAPERCLIP_SECRETS_MASTER_KEY is empty", () => {
+  // The export `if` must additionally require the env key to be empty —
+  // an explicitly-provided env key always wins over the file.
+  assert.match(
+    entrypoint,
+    /if \[ -z "\$\{PAPERCLIP_SECRETS_MASTER_KEY:-\}" \] && \[ -f \/etc\/paperclip\/secrets\/master\.key \]/,
+    "export block must fire only when PAPERCLIP_SECRETS_MASTER_KEY is empty",
+  );
+});
+
+test("disagreement warning path exists and never echoes the key", () => {
+  // When both the env key is set AND the file exists AND they differ, the
+  // entrypoint must emit ONE warning line to stderr carrying only the first
+  // 12 hex of sha256 of each — never the material.
+  assert.match(
+    entrypoint,
+    /disagrees with/,
+    "must emit a disagreement warning when env key and file key differ",
+  );
+  assert.match(
+    entrypoint,
+    /sha256/,
+    "warning must reference sha256 fingerprints",
+  );
+  assert.match(
+    entrypoint,
+    /cut -c1-12/,
+    "warning must truncate fingerprints to 12 hex chars",
+  );
+  // The warning must never echo the key value.
+  assert.doesNotMatch(
+    entrypoint,
+    /echo.*\$\{?PAPERCLIP_SECRETS_MASTER_KEY.*\}/,
+    "must never echo the env key value in the warning",
+  );
+  assert.doesNotMatch(
+    entrypoint,
+    /echo.*\$\{?EXPECTED_KEY/,
+    "must never echo the file key value in the warning",
   );
 });
 
@@ -210,5 +272,47 @@ test("the probe covers the absent-key generation arm", () => {
     probe,
     /did not generate master\.key when ALLOW_KEY_GENERATION is unset/,
     "must assert no key was generated when the flag is absent",
+  );
+});
+
+test("the probe covers the env-wins matrix", () => {
+  // Env-wins case 1: env key set + file present (differing).
+  // The env key must win; the file key must NOT be exported. A disagreement
+  // warning with two 12-hex sha256 fingerprints must be logged.
+  assert.match(
+    probe,
+    /disagrees with/,
+    "must assert the disagreement warning is emitted when env key differs from file key",
+  );
+  assert.match(
+    probe,
+    /env key fingerprint/,
+    "must assert the warning carries the env key fingerprint",
+  );
+  assert.match(
+    probe,
+    /warning carries no key material/,
+    "must assert the warning carries no key material",
+  );
+
+  // Env-wins case 2: env key set + no file + ALLOW_KEY_GENERATION=1.
+  // No file must be created; the server must receive the env key.
+  assert.match(
+    probe,
+    /entrypoint created master\.key despite env key being set/,
+    "must assert no file is created when env key is set",
+  );
+  assert.match(
+    probe,
+    /server received the env key when no file exists/,
+    "must assert the server received the env key when no file exists",
+  );
+
+  // Env-wins case 3: no env key + file present.
+  // The server must receive the file key (unchanged behavior).
+  assert.match(
+    probe,
+    /server received the file key when no env key is set/,
+    "must assert the server received the file key when no env key is set",
   );
 });
