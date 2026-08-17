@@ -157,6 +157,8 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issues);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
     await db.delete(companies);
 
     const companyRows = await db
@@ -188,6 +190,8 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issues);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
     await db.delete(companies);
   });
 
@@ -236,6 +240,35 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       providerKey: obj.providerKey,
     });
     return externalObj;
+  }
+
+  async function insertProjectWithGitHubToken(
+    owner: string,
+    repo: string,
+    projectSecretId: string,
+  ) {
+    const [projectRow] = await db
+      .insert(projects)
+      .values({
+        id: randomUUID(),
+        companyId,
+        name: `${owner}/${repo}`,
+        urlKey: `${owner}-${repo}`,
+        status: "in_progress",
+        env: {
+          GITHUB_TOKEN: { type: "secret_ref", secretId: projectSecretId, version: "latest" },
+        },
+      })
+      .returning();
+
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId,
+      projectId: projectRow!.id,
+      name: repo,
+      repoUrl: `https://github.com/${owner}/${repo}`,
+      isPrimary: true,
+    });
   }
 
   describe("guard: only approved decisions arm", () => {
@@ -696,6 +729,226 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       expect(result.message).not.toContain("ghp_");
     });
   });
+
+  describe("token fall-through on 401/403 (SUP-13184)", () => {
+    it("falls through to second candidate on 401 and arms", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+      await insertProjectWithGitHubToken("TEA-Core", "paperclip", "secret-tsp");
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
+        if (secretId === "secret-company") return Promise.resolve("ghp_company_token");
+        return Promise.resolve("ghp_tsp_token_value");
+      });
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse(
+            { errors: [{ message: "Bad credentials" }] },
+            false,
+            401,
+          ),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+        );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("armed");
+      expect(result.message).toBe("armed: Auto-merge enabled for TEA-Core/paperclip#42");
+
+      expect(mockGhFetch).toHaveBeenCalledTimes(2);
+      expect(mockGhFetch.mock.calls[0]![1]).toMatchObject({
+        headers: { authorization: `Bearer ghp_tsp_token_value` },
+      });
+      expect(mockGhFetch.mock.calls[1]![1]).toMatchObject({
+        headers: { authorization: `Bearer ghp_company_token` },
+      });
+    });
+
+    it("falls through to second candidate on 403 and arms", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+      await insertProjectWithGitHubToken("TEA-Core", "paperclip", "secret-tsp");
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
+        if (secretId === "secret-company") return Promise.resolve("ghp_company_token");
+        return Promise.resolve("ghp_tsp_token_value");
+      });
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse(
+            { errors: [{ message: "Forbidden" }] },
+            false,
+            403,
+          ),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+        );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("armed");
+      expect(result.message).toBe("armed: Auto-merge enabled for TEA-Core/paperclip#42");
+    });
+
+    it("falls through on 401 from node_id REST call and arms", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 7, {
+          node_id: undefined,
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+      await insertProjectWithGitHubToken("TEA-Core", "paperclip", "secret-tsp");
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
+        if (secretId === "secret-company") return Promise.resolve("ghp_company_token");
+        return Promise.resolve("ghp_tsp_token_value");
+      });
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({ message: "Bad credentials" }, false, 401),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({ node_id: NODE_ID, html_url: "https://github.com/TEA-Core/paperclip/pull/7" }),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+        );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("armed");
+      expect(result.message).toBe("armed: Auto-merge enabled for TEA-Core/paperclip#7");
+
+      expect(mockGhFetch).toHaveBeenCalledTimes(3);
+      expect(mockGhFetch.mock.calls[0]![1]).toMatchObject({
+        headers: { authorization: `Bearer ghp_tsp_token_value` },
+      });
+      expect(mockGhFetch.mock.calls[1]![1]).toMatchObject({
+        headers: { authorization: `Bearer ghp_company_token` },
+      });
+    });
+
+    it("returns multi-candidate pr_auth message when all candidates return 401", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+      await insertProjectWithGitHubToken("TEA-Core", "paperclip", "secret-tsp");
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
+        if (secretId === "secret-company") return Promise.resolve("ghp_company_token");
+        return Promise.resolve("ghp_tsp_token_value");
+      });
+
+      mockGhFetch.mockResolvedValue(
+        createMockResponse(
+          { errors: [{ message: "Bad credentials" }] },
+          false,
+          401,
+        ),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe(
+        "failed:pr_auth: HTTP 401 Bad credentials (tried: project_env/GITHUB_TOKEN, company/GITHUB_TOKEN)",
+      );
+    });
+
+    it("returns single-candidate pr_auth message when only one candidate returns 401", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockResolvedValue("ghp_company_token");
+
+      mockGhFetch.mockResolvedValue(
+        createMockResponse(
+          { errors: [{ message: "Bad credentials" }] },
+          false,
+          401,
+        ),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe(
+        "failed:pr_auth: HTTP 401 Bad credentials (scope=company, secretName=GITHUB_TOKEN)",
+      );
+    });
+
+    it("does not fall through on 404 — stops with node_id_missing", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 7, {
+          node_id: undefined,
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+      await insertProjectWithGitHubToken("TEA-Core", "paperclip", "secret-tsp");
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
+        if (secretId === "secret-company") return Promise.resolve("ghp_company_token");
+        return Promise.resolve("ghp_tsp_token_value");
+      });
+
+      mockGhFetch.mockResolvedValue(
+        createMockResponse({}, false, 404),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe("failed:node_id_missing: Could not resolve GitHub node ID for linked PR (HTTP 404)");
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 
 describeEmbeddedPostgres("publishApprovalStatus", () => {
@@ -781,6 +1034,35 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       providerKey: obj.providerKey,
     });
     return externalObj;
+  }
+
+  async function insertProjectWithGitHubToken(
+    owner: string,
+    repo: string,
+    projectSecretId: string,
+  ) {
+    const [projectRow] = await db
+      .insert(projects)
+      .values({
+        id: randomUUID(),
+        companyId,
+        name: `${owner}/${repo}`,
+        urlKey: `${owner}-${repo}`,
+        status: "in_progress",
+        env: {
+          GITHUB_TOKEN: { type: "secret_ref", secretId: projectSecretId, version: "latest" },
+        },
+      })
+      .returning();
+
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId,
+      projectId: projectRow!.id,
+      name: repo,
+      repoUrl: `https://github.com/${owner}/${repo}`,
+      isPrimary: true,
+    });
   }
 
   describe("status:published", () => {
@@ -1225,6 +1507,157 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       expect(result.message).toContain("status:published");
       expect(result.message).toContain("paperclip#268");
       expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("token fall-through on 401/403 (SUP-13184)", () => {
+    it("falls through to second candidate on 401 and succeeds", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+      await insertProjectWithGitHubToken("TEA-Core", "paperclip", "secret-tsp");
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
+        if (secretId === "secret-company") return Promise.resolve("ghp_company_token");
+        return Promise.resolve("ghp_tsp_token_value");
+      });
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({ message: "Bad credentials" }, false, 401),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/42" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("armed");
+      expect(result.message).toContain("status:published");
+
+      expect(mockGhFetch).toHaveBeenCalledTimes(3);
+      expect(mockGhFetch.mock.calls[0]![1]).toMatchObject({
+        headers: { authorization: `Bearer ghp_tsp_token_value` },
+      });
+      expect(mockGhFetch.mock.calls[1]![1]).toMatchObject({
+        headers: { authorization: `Bearer ghp_company_token` },
+      });
+    });
+
+    it("falls through to second candidate on 403 and succeeds", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+      await insertProjectWithGitHubToken("TEA-Core", "paperclip", "secret-tsp");
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
+        if (secretId === "secret-company") return Promise.resolve("ghp_company_token");
+        return Promise.resolve("ghp_tsp_token_value");
+      });
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({ message: "Forbidden" }, false, 403),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/42" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("armed");
+      expect(result.message).toContain("status:published");
+    });
+
+    it("returns multi-candidate pr_auth message when all candidates return 401", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+      await insertProjectWithGitHubToken("TEA-Core", "paperclip", "secret-tsp");
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
+        if (secretId === "secret-company") return Promise.resolve("ghp_company_token");
+        return Promise.resolve("ghp_tsp_token_value");
+      });
+
+      mockGhFetch.mockResolvedValue(
+        createMockResponse({ message: "Bad credentials" }, false, 401),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe(
+        "status:failed:pr_auth: HTTP 401 Bad credentials (tried: project_env/GITHUB_TOKEN, company/GITHUB_TOKEN)",
+      );
+    });
+
+    it("returns single-candidate pr_auth message when only one candidate returns 401", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockResolvedValue("ghp_company_token");
+
+      mockGhFetch.mockResolvedValue(
+        createMockResponse({ message: "Bad credentials" }, false, 401),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe(
+        "status:failed:pr_auth: HTTP 401 Bad credentials (scope=company, secretName=GITHUB_TOKEN)",
+      );
+    });
+
+    it("does not fall through on 404 — stops with pr_not_found", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+      await insertProjectWithGitHubToken("TEA-Core", "paperclip", "secret-tsp");
+
+      mockGetByName.mockImplementation((_companyId: string, name: string) => {
+        if (name === "GITHUB_TOKEN") {
+          return Promise.resolve({ id: "secret-company", name: "GITHUB_TOKEN" });
+        }
+        return Promise.resolve(null);
+      });
+      mockResolveSecretValue.mockImplementation((_companyId: string, secretId: string) => {
+        if (secretId === "secret-company") return Promise.resolve("ghp_company_token");
+        return Promise.resolve("ghp_tsp_token_value");
+      });
+
+      mockGhFetch.mockResolvedValue(
+        createMockResponse({ message: "Not Found" }, false, 404),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe("status:failed:pr_not_found: HTTP 404 Not Found");
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
     });
   });
 });

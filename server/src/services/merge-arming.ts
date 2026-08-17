@@ -4,11 +4,13 @@ import { externalObjectMentions, externalObjects, issues } from "@paperclipai/db
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   isGitHubTokenResolution,
+  resolveGitHubTokenCandidatesForRepo,
   resolveGitHubTokenForRepo,
 } from "./github-credential.js";
 
 export {
   isGitHubTokenResolution,
+  resolveGitHubTokenCandidatesForRepo,
   resolveGitHubTokenForRepo,
   type GitHubTokenResolution,
   type GitHubTokenResolutionFailure,
@@ -221,7 +223,7 @@ async function fetchGitHubNodeId(
 async function enableAutoMerge(
   token: string,
   nodeId: string,
-): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null }> {
+): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> {
   const query = `mutation { enablePullRequestAutoMerge(input: { pullRequestId: "${nodeId}" }) { clientMutationId } }`;
 
   try {
@@ -239,9 +241,9 @@ async function enableAutoMerge(
       const errors = body?.errors as Array<{ message?: string }> | undefined;
       const firstError = errors?.[0]?.message ?? "";
       if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
-        return { success: true, alreadyQueued: true, error: null };
+        return { success: true, alreadyQueued: true, error: null, status: response.status };
       }
-      return { success: false, alreadyQueued: false, error: firstError || `HTTP ${response.status}` };
+      return { success: false, alreadyQueued: false, error: firstError || `HTTP ${response.status}`, status: response.status };
     }
 
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
@@ -249,14 +251,14 @@ async function enableAutoMerge(
     if (errors && errors.length > 0) {
       const firstError = errors[0]?.message ?? "";
       if (firstError.toLowerCase().includes("already") && firstError.toLowerCase().includes("merge")) {
-        return { success: true, alreadyQueued: true, error: null };
+        return { success: true, alreadyQueued: true, error: null, status: response.status };
       }
-      return { success: false, alreadyQueued: false, error: firstError };
+      return { success: false, alreadyQueued: false, error: firstError, status: response.status };
     }
 
-    return { success: true, alreadyQueued: false, error: null };
+    return { success: true, alreadyQueued: false, error: null, status: response.status };
   } catch {
-    return { success: false, alreadyQueued: false, error: "network_error" };
+    return { success: false, alreadyQueued: false, error: "network_error", status: 0 };
   }
 }
 
@@ -281,48 +283,69 @@ export async function publishApprovalStatus(
   }
 
   const pr = linkedPRs[0]!;
-  const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
-  if (!isGitHubTokenResolution(tokenResult)) {
-    return {
-      kind: "failed",
-      message: `status:failed:auth_required: ${tokenResult.reason} (scope=null, secretName=null)`,
-    };
-  }
-  const token = tokenResult.token;
-
-  const headShaResult = await fetchPullRequestHeadSha(token, pr.owner, pr.repo, pr.number);
-  if (!headShaResult.ok) {
-    const { status, message } = headShaResult;
-    if (status === 401 || status === 403) {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
+  if (candidates.length === 0) {
+    const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
+    if (!isGitHubTokenResolution(tokenResult)) {
       return {
         kind: "failed",
-        message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""} (scope=${tokenResult.scope}, secretName=${tokenResult.secretName})`,
+        message: `status:failed:auth_required: ${tokenResult.reason} (scope=null, secretName=null)`,
       };
     }
-    if (status === 404) {
-      return { kind: "failed", message: `status:failed:pr_not_found: HTTP 404 ${message ?? ""}` };
-    }
-    if (status === 429) {
-      return { kind: "failed", message: `status:failed:pr_rate_limited: HTTP 429 ${message ?? ""}` };
-    }
-    if (status === 0) {
-      return { kind: "failed", message: `status:failed:pr_network: ${message ?? "network_error"}` };
-    }
-    return { kind: "failed", message: `status:failed:pr_error: HTTP ${status} ${message ?? ""}` };
-  }
-
-  const headSha = headShaResult.headSha;
-  const result = await writeCommitStatus(token, pr.owner, pr.repo, headSha, issueIdentifier);
-  if (result.success) {
     return {
-      kind: "armed",
-      message: `status:published: paperclip/approved status written to ${pr.displayName} head ${headSha.slice(0, 7)}`,
+      kind: "failed",
+      message: `status:failed:auth_required: No GitHub token resolvable for ${pr.owner}/${pr.repo} (scope=null, secretName=null)`,
     };
   }
 
-  const safeError = result.error ?? "unknown_error";
-  const truncated = safeError.length > 200 ? safeError.slice(0, 200) + "..." : safeError;
-  return { kind: "failed", message: `status:failed:${truncated}` };
+  for (const candidate of candidates) {
+    const token = candidate.token;
+    const headShaResult = await fetchPullRequestHeadSha(token, pr.owner, pr.repo, pr.number);
+    if (!headShaResult.ok) {
+      const { status, message } = headShaResult;
+      if (status === 401 || status === 403) {
+        if (candidate === candidates[candidates.length - 1]) {
+          if (candidates.length === 1) {
+            return {
+              kind: "failed",
+              message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""} (scope=${candidate.scope}, secretName=${candidate.secretName})`,
+            };
+          }
+          const tried = candidates.map((c) => `${c.scope}/${c.secretName}`).join(", ");
+          return {
+            kind: "failed",
+            message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""} (tried: ${tried})`,
+          };
+        }
+        continue;
+      }
+      if (status === 404) {
+        return { kind: "failed", message: `status:failed:pr_not_found: HTTP 404 ${message ?? ""}` };
+      }
+      if (status === 429) {
+        return { kind: "failed", message: `status:failed:pr_rate_limited: HTTP 429 ${message ?? ""}` };
+      }
+      if (status === 0) {
+        return { kind: "failed", message: `status:failed:pr_network: ${message ?? "network_error"}` };
+      }
+      return { kind: "failed", message: `status:failed:pr_error: HTTP ${status} ${message ?? ""}` };
+    }
+
+    const headSha = headShaResult.headSha;
+    const result = await writeCommitStatus(token, pr.owner, pr.repo, headSha, issueIdentifier);
+    if (result.success) {
+      return {
+        kind: "armed",
+        message: `status:published: paperclip/approved status written to ${pr.displayName} head ${headSha.slice(0, 7)}`,
+      };
+    }
+
+    const safeError = result.error ?? "unknown_error";
+    const truncated = safeError.length > 200 ? safeError.slice(0, 200) + "..." : safeError;
+    return { kind: "failed", message: `status:failed:${truncated}` };
+  }
+
+  return { kind: "failed", message: "status:failed:internal: exhausted GitHub token candidates" };
 }
 
 export interface HeadShaSuccess extends GitHubFetchResult {
@@ -494,39 +517,84 @@ export async function armMergeOnApproval(
     };
   }
 
-  const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
-  if (!isGitHubTokenResolution(tokenResult)) {
-    return {
-      kind: "failed",
-      message: `failed:auth_required: ${tokenResult.reason} (scope=null, secretName=null)`,
-    };
-  }
-  const token = tokenResult.token;
-
-  let nodeId = pr.nodeId;
-  if (!nodeId) {
-    const nodeIdResult = await fetchGitHubNodeId(token, pr.owner, pr.repo, pr.number);
-    if (!nodeIdResult.ok || !nodeIdResult.nodeId) {
-      return { kind: "failed", message: `failed:node_id_missing: Could not resolve GitHub node ID for linked PR (HTTP ${nodeIdResult.status})` };
-    }
-    nodeId = nodeIdResult.nodeId;
-  }
-
-  const result = await enableAutoMerge(token, nodeId);
-  if (result.success) {
-    if (result.alreadyQueued) {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
+  if (candidates.length === 0) {
+    const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
+    if (!isGitHubTokenResolution(tokenResult)) {
       return {
-        kind: "skipped",
-        message: `skipped:already-queued: ${pr.displayName} already queued to merge`,
+        kind: "failed",
+        message: `failed:auth_required: ${tokenResult.reason} (scope=null, secretName=null)`,
       };
     }
     return {
-      kind: "armed",
-      message: `armed: Auto-merge enabled for ${pr.displayName}`,
+      kind: "failed",
+      message: `failed:auth_required: No GitHub token resolvable for ${pr.owner}/${pr.repo} (scope=null, secretName=null)`,
     };
   }
 
-  const safeError = result.error ?? "unknown_error";
-  const truncated = safeError.length > 200 ? safeError.slice(0, 200) + "..." : safeError;
-  return { kind: "failed", message: `failed:${truncated}` };
+  for (const candidate of candidates) {
+    const token = candidate.token;
+
+    let nodeId = pr.nodeId;
+    if (!nodeId) {
+      const nodeIdResult = await fetchGitHubNodeId(token, pr.owner, pr.repo, pr.number);
+      if (!nodeIdResult.ok || !nodeIdResult.nodeId) {
+        if (nodeIdResult.status === 401 || nodeIdResult.status === 403) {
+          if (candidate === candidates[candidates.length - 1]) {
+            if (candidates.length === 1) {
+              return {
+                kind: "failed",
+                message: `failed:pr_auth: HTTP ${nodeIdResult.status} ${nodeIdResult.message ?? ""} (scope=${candidate.scope}, secretName=${candidate.secretName})`,
+              };
+            }
+            const tried = candidates.map((c) => `${c.scope}/${c.secretName}`).join(", ");
+            return {
+              kind: "failed",
+              message: `failed:pr_auth: HTTP ${nodeIdResult.status} ${nodeIdResult.message ?? ""} (tried: ${tried})`,
+            };
+          }
+          continue;
+        }
+        return { kind: "failed", message: `failed:node_id_missing: Could not resolve GitHub node ID for linked PR (HTTP ${nodeIdResult.status})` };
+      }
+      nodeId = nodeIdResult.nodeId;
+    }
+
+    const result = await enableAutoMerge(token, nodeId);
+    if (result.success) {
+      if (result.alreadyQueued) {
+        return {
+          kind: "skipped",
+          message: `skipped:already-queued: ${pr.displayName} already queued to merge`,
+        };
+      }
+      return {
+        kind: "armed",
+        message: `armed: Auto-merge enabled for ${pr.displayName}`,
+      };
+    }
+
+    if (result.status === 401 || result.status === 403) {
+      if (candidate === candidates[candidates.length - 1]) {
+        if (candidates.length === 1) {
+          return {
+            kind: "failed",
+            message: `failed:pr_auth: HTTP ${result.status} ${result.error ?? ""} (scope=${candidate.scope}, secretName=${candidate.secretName})`,
+          };
+        }
+        const tried = candidates.map((c) => `${c.scope}/${c.secretName}`).join(", ");
+        return {
+          kind: "failed",
+          message: `failed:pr_auth: HTTP ${result.status} ${result.error ?? ""} (tried: ${tried})`,
+        };
+      }
+      continue;
+    }
+
+    const safeError = result.error ?? "unknown_error";
+    const truncated = safeError.length > 200 ? safeError.slice(0, 200) + "..." : safeError;
+    return { kind: "failed", message: `failed:${truncated}` };
+  }
+
+  return { kind: "failed", message: "failed:internal: exhausted GitHub token candidates" };
 }

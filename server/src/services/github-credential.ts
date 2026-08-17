@@ -236,18 +236,24 @@ export async function resolveGitHubToken(
   return { token: null, reason: `No GitHub token resolvable for company ${companyId}` };
 }
 
-export async function resolveGitHubTokenForRepo(
+export async function resolveGitHubTokenCandidatesForRepo(
   db: Db,
   companyId: string,
   owner: string,
   repo: string,
-): Promise<GitHubTokenResult> {
+): Promise<GitHubTokenResolution[]> {
   const secrets = secretService(db);
   const repoUrl = `${owner}/${repo}`;
   const escapedRepoUrl = repoUrl.replace(/[\\%_]/g, (c) => `\\${c}`);
 
+  const candidates: GitHubTokenResolution[] = [];
+  const seenTokens = new Set<string>();
+
   const appResult = await resolveAppInstallationToken(companyId, secrets, owner, repo);
-  if (appResult) return appResult;
+  if (appResult) {
+    candidates.push(appResult);
+    seenTokens.add(appResult.token);
+  }
 
   const projectRows = await db
     .select({
@@ -277,14 +283,50 @@ export async function resolveGitHubTokenForRepo(
       const version: SecretVersionSelector = typeof ref.version === "number" ? ref.version : "latest";
       const token = await secrets.resolveSecretValue(companyId, ref.secretId, version);
       const trimmed = token.trim();
-      if (trimmed) return { token: trimmed, scope: "project_env", secretName: key };
+      if (!trimmed) continue;
+      if (seenTokens.has(trimmed)) continue;
+      seenTokens.add(trimmed);
+      candidates.push({ token: trimmed, scope: "project_env", secretName: key });
     }
   }
 
-  const companyResult = await resolveGitHubToken(db, companyId);
-  if (isGitHubTokenResolution(companyResult)) {
-    return companyResult;
+  for (const secretName of GITHUB_TOKEN_SECRET_NAMES) {
+    const secret = await secrets.getByName(companyId, secretName);
+    if (!secret) continue;
+    const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
+    const trimmed = token.trim();
+    if (!trimmed) continue;
+    if (seenTokens.has(trimmed)) continue;
+    seenTokens.add(trimmed);
+    candidates.push({ token: trimmed, scope: "company", secretName });
   }
+
+  return candidates;
+}
+
+export async function resolveGitHubTokenForRepo(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+): Promise<GitHubTokenResult> {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
+  if (candidates.length > 0) {
+    return candidates[0]!;
+  }
+
+  const repoUrl = `${owner}/${repo}`;
+  const escapedRepoUrl = repoUrl.replace(/[\\%_]/g, (c) => `\\${c}`);
+  const projectRows = await db
+    .select({ id: projectWorkspaces.id })
+    .from(projectWorkspaces)
+    .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId))
+    .where(
+      and(
+        eq(projectWorkspaces.companyId, companyId),
+        ilike(projectWorkspaces.repoUrl, `%${escapedRepoUrl}%`),
+      ),
+    );
 
   if (projectRows.length > 0) {
     return { token: null, reason: `No GitHub token bound to project for ${owner}/${repo}` };
