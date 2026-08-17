@@ -1,9 +1,23 @@
 import express from "express";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveGitHubToken, resolveGitHubTokenForRepo, isGitHubTokenResolution } from "../services/github-credential.js";
+import { generateKeyPairSync } from "node:crypto";
+import {
+  resolveGitHubToken,
+  resolveGitHubTokenForRepo,
+  isGitHubTokenResolution,
+  appTokenCache,
+  GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+} from "../services/github-credential.js";
 import type { Server } from "node:http";
 
 const FIXTURE_TOKEN = "ghp_test_token_value_for_unit_tests_only";
+const FIXTURE_APP_TOKEN = "ghs_test_installation_token_for_unit_tests_only";
+const FIXTURE_INSTALLATION_ID = "12345678";
+
+const { privateKey: FIXTURE_PRIVATE_KEY_PEM } = generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+});
+const FIXTURE_PRIVATE_KEY = FIXTURE_PRIVATE_KEY_PEM.export({ type: "pkcs1", format: "pem" }, "utf8");
 
 const mockDb = {
   select: vi.fn(),
@@ -92,11 +106,52 @@ async function httpRequest(url: string, path: string): Promise<{ status: number;
   });
 }
 
+function mockAppFetchResponse(url: string, response: any) {
+  const originalFetch = global.fetch;
+  global.fetch = vi.fn((input: string | URL, _init?: RequestInit) => {
+    const target = typeof input === "string" ? input : input.toString();
+    if (target.includes(url)) {
+      return Promise.resolve(
+        new Response(JSON.stringify(response), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    return Promise.resolve(new Response(null, { status: 404 }));
+  }) as any;
+  return () => {
+    global.fetch = originalFetch;
+  };
+}
+
+function mockAppFetchResponses(responses: Array<{ url: string; response: any; status?: number }>) {
+  const sorted = [...responses].sort((a, b) => b.url.length - a.url.length);
+  const originalFetch = global.fetch;
+  global.fetch = vi.fn((input: string | URL, _init?: RequestInit) => {
+    const target = typeof input === "string" ? input : input.toString();
+    const match = sorted.find((r) => target.includes(r.url));
+    if (match) {
+      return Promise.resolve(
+        new Response(JSON.stringify(match.response), {
+          status: match.status ?? 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    return Promise.resolve(new Response(null, { status: 404 }));
+  }) as any;
+  return () => {
+    global.fetch = originalFetch;
+  };
+}
+
 describe("resolveGitHubToken", () => {
   beforeEach(() => {
     mockSecretService.getByName.mockReset();
     mockSecretService.resolveSecretValue.mockReset();
     mockDb.select.mockReset();
+    appTokenCache.clear();
   });
 
   it("resolves at company scope when GITHUB_TOKEN exists", async () => {
@@ -170,11 +225,375 @@ describe("resolveGitHubToken", () => {
   });
 });
 
+describe("resolveGitHubToken — App installation token", () => {
+  beforeEach(() => {
+    mockSecretService.getByName.mockReset();
+    mockSecretService.resolveSecretValue.mockReset();
+    mockDb.select.mockReset();
+    appTokenCache.clear();
+  });
+
+  it("returns app_installation scope when App private key secret is present and mintable", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    const restoreFetch = mockAppFetchResponses([
+      {
+        url: "/app/installations",
+        response: [{ id: Number(FIXTURE_INSTALLATION_ID), account: { login: "tea-core" } }],
+      },
+      {
+        url: `/app/installations/${FIXTURE_INSTALLATION_ID}/access_tokens`,
+        response: {
+          token: FIXTURE_APP_TOKEN,
+          expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        },
+      },
+    ]);
+
+    try {
+      const result = await resolveGitHubToken(mockDb, "company-1");
+      expect(isGitHubTokenResolution(result)).toBe(true);
+      if (isGitHubTokenResolution(result)) {
+        expect(result.token).toBe(FIXTURE_APP_TOKEN);
+        expect(result.scope).toBe("app_installation");
+        expect(result.secretName).toBe(GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+        expect(result.installationId).toBe(FIXTURE_INSTALLATION_ID);
+      }
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it("falls back to PAT when App private key secret is absent (byte-for-byte PAT behaviour)", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
+
+    const result = await resolveGitHubToken(mockDb, "company-1");
+    expect(isGitHubTokenResolution(result)).toBe(true);
+    if (isGitHubTokenResolution(result)) {
+      expect(result.token).toBe(FIXTURE_TOKEN);
+      expect(result.scope).toBe("company");
+      expect(result.secretName).toBe("GITHUB_TOKEN");
+      expect(result.installationId).toBeUndefined();
+    }
+  });
+
+  it("falls back to PAT when App private key secret resolves to empty value", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
+      if (secretId === "app-key-1") return Promise.resolve("   ");
+      return Promise.resolve(FIXTURE_TOKEN);
+    });
+
+    const result = await resolveGitHubToken(mockDb, "company-1");
+    expect(isGitHubTokenResolution(result)).toBe(true);
+    if (isGitHubTokenResolution(result)) {
+      expect(result.scope).toBe("company");
+      expect(result.secretName).toBe("GITHUB_TOKEN");
+    }
+  });
+
+  it("falls back to PAT when JWT generation fails (malformed PEM)", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
+      if (secretId === "app-key-1") return Promise.resolve("not-a-valid-pem-key");
+      return Promise.resolve(FIXTURE_TOKEN);
+    });
+
+    const result = await resolveGitHubToken(mockDb, "company-1");
+    expect(isGitHubTokenResolution(result)).toBe(true);
+    if (isGitHubTokenResolution(result)) {
+      expect(result.scope).toBe("company");
+      expect(result.secretName).toBe("GITHUB_TOKEN");
+    }
+  });
+
+  it("falls back to PAT when GitHub returns non-2xx on installation token mint", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
+      if (secretId === "app-key-1") return Promise.resolve(FIXTURE_PRIVATE_KEY);
+      return Promise.resolve(FIXTURE_TOKEN);
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn((input: string | URL) => {
+      const target = typeof input === "string" ? input : input.toString();
+      if (target.includes("/app/installations")) {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ id: Number(FIXTURE_INSTALLATION_ID) }]), { status: 200 }),
+        );
+      }
+      if (target.includes("/access_tokens")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }) as any;
+
+    try {
+      const result = await resolveGitHubToken(mockDb, "company-1");
+      expect(isGitHubTokenResolution(result)).toBe(true);
+      if (isGitHubTokenResolution(result)) {
+        expect(result.scope).toBe("company");
+        expect(result.secretName).toBe("GITHUB_TOKEN");
+      }
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("falls back to PAT when GitHub returns non-2xx on installation resolution", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
+      if (secretId === "app-key-1") return Promise.resolve(FIXTURE_PRIVATE_KEY);
+      return Promise.resolve(FIXTURE_TOKEN);
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn((input: string | URL) => {
+      const target = typeof input === "string" ? input : input.toString();
+      if (target.includes("/app/installations")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ message: "Unauthorized" }), { status: 401 }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }) as any;
+
+    try {
+      const result = await resolveGitHubToken(mockDb, "company-1");
+      expect(isGitHubTokenResolution(result)).toBe(true);
+      if (isGitHubTokenResolution(result)) {
+        expect(result.scope).toBe("company");
+        expect(result.secretName).toBe("GITHUB_TOKEN");
+      }
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("never throws on minting failure — falls through to PAT", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
+      if (secretId === "app-key-1") return Promise.resolve(FIXTURE_PRIVATE_KEY);
+      return Promise.resolve(FIXTURE_TOKEN);
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn(() => Promise.reject(new Error("network failure"))) as any;
+
+    try {
+      const result = await resolveGitHubToken(mockDb, "company-1");
+      expect(isGitHubTokenResolution(result)).toBe(true);
+      if (isGitHubTokenResolution(result)) {
+        expect(result.scope).toBe("company");
+      }
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("does not include private key or token in error/log messages on failure", async () => {
+    const loggerModule = await import("../middleware/logger.js");
+    const loggerWarn = vi.mocked(loggerModule.logger.warn);
+
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
+      if (secretId === "app-key-1") return Promise.resolve(FIXTURE_PRIVATE_KEY);
+      return Promise.resolve(FIXTURE_TOKEN);
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn(() => Promise.reject(new Error("network failure"))) as any;
+
+    try {
+      await resolveGitHubToken(mockDb, "company-1");
+      const allCalls = loggerWarn.mock.calls;
+      expect(allCalls.length).toBeGreaterThan(0);
+      for (const call of allCalls) {
+        const serialized = JSON.stringify(call);
+        expect(serialized).not.toContain(FIXTURE_PRIVATE_KEY);
+        expect(serialized).not.toContain(FIXTURE_APP_TOKEN);
+        expect(serialized).not.toContain(FIXTURE_TOKEN);
+      }
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("caches the minted token and reuses it within its lifetime", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-17T12:00:00Z"));
+
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    const fetchCallCount = { count: 0 };
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn((input: string | URL) => {
+      const target = typeof input === "string" ? input : input.toString();
+      fetchCallCount.count++;
+      if (target.includes("/app/installations") && !target.includes("access_tokens")) {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ id: Number(FIXTURE_INSTALLATION_ID) }]), { status: 200 }),
+        );
+      }
+      if (target.includes("/access_tokens")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              token: FIXTURE_APP_TOKEN,
+              expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }) as any;
+
+    try {
+      const result1 = await resolveGitHubToken(mockDb, "company-1");
+      expect(isGitHubTokenResolution(result1)).toBe(true);
+      if (isGitHubTokenResolution(result1)) {
+        expect(result1.token).toBe(FIXTURE_APP_TOKEN);
+        expect(result1.scope).toBe("app_installation");
+      }
+
+      const firstFetchCount = fetchCallCount.count;
+
+      const result2 = await resolveGitHubToken(mockDb, "company-1");
+      expect(isGitHubTokenResolution(result2)).toBe(true);
+      if (isGitHubTokenResolution(result2)) {
+        expect(result2.token).toBe(FIXTURE_APP_TOKEN);
+      }
+
+      expect(fetchCallCount.count).toBe(firstFetchCount);
+    } finally {
+      global.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-mints after expiry (safety margin) — proven by injected clock, not sleep", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-17T12:00:00Z"));
+
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    let mintCount = 0;
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn((input: string | URL) => {
+      const target = typeof input === "string" ? input : input.toString();
+      if (target.includes("/app/installations") && !target.includes("access_tokens")) {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ id: Number(FIXTURE_INSTALLATION_ID) }]), { status: 200 }),
+        );
+      }
+      if (target.includes("/access_tokens")) {
+        mintCount++;
+        const token = `ghs_token_mint_${mintCount}`;
+        const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+        return Promise.resolve(
+          new Response(JSON.stringify({ token, expires_at: expiresAt }), { status: 200 }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }) as any;
+
+    try {
+      const result1 = await resolveGitHubToken(mockDb, "company-1");
+      expect(isGitHubTokenResolution(result1)).toBe(true);
+      if (isGitHubTokenResolution(result1)) {
+        expect(result1.token).toBe("ghs_token_mint_1");
+      }
+      expect(mintCount).toBe(1);
+
+      const result2 = await resolveGitHubToken(mockDb, "company-1");
+      expect(isGitHubTokenResolution(result2)).toBe(true);
+      if (isGitHubTokenResolution(result2)) {
+        expect(result2.token).toBe("ghs_token_mint_1");
+      }
+      expect(mintCount).toBe(1);
+
+      vi.setSystemTime(new Date("2026-08-17T12:55:00Z"));
+
+      const result3 = await resolveGitHubToken(mockDb, "company-1");
+      expect(isGitHubTokenResolution(result3)).toBe(true);
+      if (isGitHubTokenResolution(result3)) {
+        expect(result3.token).toBe("ghs_token_mint_2");
+      }
+      expect(mintCount).toBe(2);
+    } finally {
+      global.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("resolveGitHubTokenForRepo", () => {
   beforeEach(() => {
     mockSecretService.getByName.mockReset();
     mockSecretService.resolveSecretValue.mockReset();
     mockDb.select.mockReset();
+    appTokenCache.clear();
   });
 
   it("resolves via projects.env secret_ref at project_env scope", async () => {
@@ -261,6 +680,49 @@ describe("resolveGitHubTokenForRepo", () => {
     expect(result.token).toBeNull();
     expect(result.reason).toContain("repo not found");
   });
+
+  it("resolves app_installation token with repo context for resolveGitHubTokenForRepo", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    const restoreFetch = mockAppFetchResponses([
+      {
+        url: `/repos/owner/repo/installation`,
+        response: { id: Number(FIXTURE_INSTALLATION_ID), account: { login: "owner" } },
+      },
+      {
+        url: `/app/installations/${FIXTURE_INSTALLATION_ID}/access_tokens`,
+        response: {
+          token: FIXTURE_APP_TOKEN,
+          expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        },
+      },
+    ]);
+
+    try {
+      const result = await resolveGitHubTokenForRepo(mockDb, "company-1", "owner", "repo");
+      expect(isGitHubTokenResolution(result)).toBe(true);
+      if (isGitHubTokenResolution(result)) {
+        expect(result.token).toBe(FIXTURE_APP_TOKEN);
+        expect(result.scope).toBe("app_installation");
+        expect(result.installationId).toBe(FIXTURE_INSTALLATION_ID);
+      }
+    } finally {
+      restoreFetch();
+    }
+  });
 });
 
 describe("diagnostics route", () => {
@@ -301,6 +763,7 @@ describe("diagnostics route", () => {
     mockSecretService.resolveSecretValue.mockReset();
     mockDb.select.mockReset();
     mockGhFetch.ghFetch.mockReset();
+    appTokenCache.clear();
   });
 
   afterEach(() => {
@@ -461,6 +924,56 @@ describe("diagnostics route", () => {
       expect(leafValues).not.toContain(FIXTURE_TOKEN.length.toString());
     } finally {
       await server.close();
+    }
+  });
+
+  it("reports app_installation scope in diagnostics when App token is used", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    const restoreFetch = mockAppFetchResponses([
+      {
+        url: "/app/installations",
+        response: [{ id: Number(FIXTURE_INSTALLATION_ID), account: { login: "tea-core" } }],
+      },
+      {
+        url: `/app/installations/${FIXTURE_INSTALLATION_ID}/access_tokens`,
+        response: {
+          token: FIXTURE_APP_TOKEN,
+          expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        },
+      },
+    ]);
+
+    mockGhFetch.ghFetch.mockResolvedValue(new Response(JSON.stringify({ login: "test" }), {
+      status: 200,
+      headers: { "x-ratelimit-limit": "5000" },
+    }));
+
+    try {
+      const app = await createApp();
+      const server = await startServer(app);
+      try {
+        const res = await httpRequest(server.url, "/api/companies/company-1/diagnostics/github-credential");
+
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({
+          resolved: true,
+          scope: "app_installation",
+          secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+          installationId: FIXTURE_INSTALLATION_ID,
+        });
+        expect(res.body.token).toBeUndefined();
+      } finally {
+        await server.close();
+      }
+    } finally {
+      restoreFetch();
     }
   });
 });
