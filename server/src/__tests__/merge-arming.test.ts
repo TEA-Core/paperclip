@@ -1179,6 +1179,53 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       expect(result.message).toContain("TEA-Core/paperclip#2");
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
+
+    it("publishes when the same PR is linked twice", async () => {
+      const externalObj = await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 268),
+      );
+      await db.insert(externalObjectMentions).values({
+        companyId,
+        sourceIssueId: issueId,
+        sourceKind: "issue_comment",
+        objectId: externalObj.id,
+        objectType: "pull_request",
+        providerKey: "github",
+      });
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/268" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("armed");
+      expect(result.message).toContain("status:published");
+      expect(result.message).toContain("TEA-Core/paperclip#268");
+      expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("publishes when duplicate mentions differ only by owner/repo casing", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "tea-core", "paperclip", 268),
+      );
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 268),
+      );
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/268" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("armed");
+      expect(result.message).toContain("status:published");
+      expect(result.message).toContain("paperclip#268");
+      expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    });
   });
 });
 

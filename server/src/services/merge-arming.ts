@@ -70,6 +70,7 @@ export async function resolveLinkedPullRequests(
     );
 
   const results: LinkedPullRequest[] = [];
+  const seen = new Set<string>();
   for (const row of rows) {
     const state = row.data?.state as string | undefined;
     const draft = row.data?.draft as boolean | undefined;
@@ -82,6 +83,10 @@ export async function resolveLinkedPullRequests(
     const owner = match[1]!;
     const repo = match[2]!;
     const number = Number(match[4]);
+    const key = `${owner.toLowerCase()}/${repo.toLowerCase()}#${number}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
     const nodeId = row.data?.node_id as string | undefined | null;
     const headRefName =
       (row.data?.head as Record<string, unknown> | undefined | null)?.ref as string | undefined ??
