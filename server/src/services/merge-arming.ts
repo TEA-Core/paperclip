@@ -1,8 +1,20 @@
 import type { Db } from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { and, eq, ilike } from "drizzle-orm";
 import { externalObjectMentions, externalObjects, issues } from "@paperclipai/db";
-import { secretService } from "./secrets.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import {
+  isGitHubTokenResolution,
+  resolveGitHubTokenForRepo,
+} from "./github-credential.js";
+
+export {
+  isGitHubTokenResolution,
+  resolveGitHubTokenForRepo,
+  type GitHubTokenResolution,
+  type GitHubTokenResolutionFailure,
+  type GitHubTokenResult,
+  type GitHubTokenScope,
+} from "./github-credential.js";
 
 export interface MergeArmingDecision {
   stageId: string;
@@ -30,22 +42,16 @@ export interface LinkedPullRequest {
   nodeId: string | null;
   headRefName: string | null;
   displayName: string;
+  /**
+   * The `state` recorded on the cached external-object payload, or null when the
+   * object has never been hydrated from the provider. Callers that need positive
+   * evidence a PR is open (rather than "not known to be closed") must check for
+   * the literal "open" — an unhydrated row carries null, not "open".
+   */
+  cachedState: string | null;
 }
 
 const GITHUB_GRAPHQL_URL = "https://api.github.com/graphql";
-const GITHUB_TOKEN_SECRET_NAMES = ["GITHUB_TOKEN", "GH_TOKEN", "PAPERCLIP_GITHUB_TOKEN"] as const;
-
-async function resolveGitHubToken(db: Db, companyId: string): Promise<string | null> {
-  const secrets = secretService(db);
-  for (const secretName of GITHUB_TOKEN_SECRET_NAMES) {
-    const secret = await secrets.getByName(companyId, secretName);
-    if (!secret) continue;
-    const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
-    const trimmed = token.trim();
-    if (trimmed) return trimmed;
-  }
-  return null;
-}
 
 export async function resolveLinkedPullRequests(
   db: Db,
@@ -71,10 +77,12 @@ export async function resolveLinkedPullRequests(
     );
 
   const results: LinkedPullRequest[] = [];
+  const seen = new Set<string>();
   for (const row of rows) {
     const state = row.data?.state as string | undefined;
     const draft = row.data?.draft as boolean | undefined;
-    if (state !== "open" || draft === true) continue;
+    if (draft === true) continue;
+    if (state !== undefined && state !== "open") continue;
 
     const match = /^([^/]+)\/([^/]+)#(pull|issues)\/([1-9][0-9]*)$/.exec(row.externalId);
     if (!match) continue;
@@ -82,6 +90,10 @@ export async function resolveLinkedPullRequests(
     const owner = match[1]!;
     const repo = match[2]!;
     const number = Number(match[4]);
+    const key = `${owner.toLowerCase()}/${repo.toLowerCase()}#${number}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
     const nodeId = row.data?.node_id as string | undefined | null;
     const headRefName =
       (row.data?.head as Record<string, unknown> | undefined | null)?.ref as string | undefined ??
@@ -95,10 +107,21 @@ export async function resolveLinkedPullRequests(
       nodeId: nodeId ?? null,
       headRefName: headRefName ?? null,
       displayName: `${owner}/${repo}#${number}`,
+      cachedState: state ?? null,
     });
   }
 
   return results;
+}
+
+export interface GitHubFetchResult {
+  ok: boolean;
+  status: number;
+  message: string | null;
+}
+
+export interface GitHubNodeIdResult extends GitHubFetchResult {
+  nodeId: string | null;
 }
 
 async function fetchGitHubNodeId(
@@ -106,7 +129,7 @@ async function fetchGitHubNodeId(
   owner: string,
   repo: string,
   number: number,
-): Promise<string | null> {
+): Promise<GitHubNodeIdResult> {
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
@@ -119,15 +142,20 @@ async function fetchGitHubNodeId(
   try {
     response = await ghFetch(url, { headers });
   } catch {
-    return null;
+    return { ok: false, status: 0, message: "network_error", nodeId: null };
   }
 
-  if (!response.ok) return null;
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const message = body?.message as string | undefined;
+    return { ok: false, status: response.status, message: message ?? null, nodeId: null };
+  }
 
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
-  if (!body) return null;
+  if (!body) return { ok: false, status: response.status, message: "empty_response", nodeId: null };
 
-  return typeof body.node_id === "string" ? body.node_id : null;
+  const nodeId = typeof body.node_id === "string" ? body.node_id : null;
+  return { ok: true, status: response.status, message: null, nodeId };
 }
 
 async function enableAutoMerge(
@@ -193,16 +221,37 @@ export async function publishApprovalStatus(
   }
 
   const pr = linkedPRs[0]!;
-  const token = await resolveGitHubToken(db, companyId);
-  if (!token) {
-    return { kind: "failed", message: "status:failed:auth_required: GitHub authentication failed" };
+  const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
+  if (!isGitHubTokenResolution(tokenResult)) {
+    return {
+      kind: "failed",
+      message: `status:failed:auth_required: ${tokenResult.reason} (scope=null, secretName=null)`,
+    };
+  }
+  const token = tokenResult.token;
+
+  const headShaResult = await fetchPullRequestHeadSha(token, pr.owner, pr.repo, pr.number);
+  if (!headShaResult.ok) {
+    const { status, message } = headShaResult;
+    if (status === 401 || status === 403) {
+      return {
+        kind: "failed",
+        message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""} (scope=${tokenResult.scope}, secretName=${tokenResult.secretName})`,
+      };
+    }
+    if (status === 404) {
+      return { kind: "failed", message: `status:failed:pr_not_found: HTTP 404 ${message ?? ""}` };
+    }
+    if (status === 429) {
+      return { kind: "failed", message: `status:failed:pr_rate_limited: HTTP 429 ${message ?? ""}` };
+    }
+    if (status === 0) {
+      return { kind: "failed", message: `status:failed:pr_network: ${message ?? "network_error"}` };
+    }
+    return { kind: "failed", message: `status:failed:pr_error: HTTP ${status} ${message ?? ""}` };
   }
 
-  const headSha = await fetchPullRequestHeadSha(token, pr.owner, pr.repo, pr.number);
-  if (!headSha) {
-    return { kind: "failed", message: "status:failed:pr_not_found: Could not resolve PR head SHA" };
-  }
-
+  const headSha = headShaResult.headSha;
   const result = await writeCommitStatus(token, pr.owner, pr.repo, headSha, issueIdentifier);
   if (result.success) {
     return {
@@ -216,12 +265,24 @@ export async function publishApprovalStatus(
   return { kind: "failed", message: `status:failed:${truncated}` };
 }
 
+export interface HeadShaSuccess extends GitHubFetchResult {
+  ok: true;
+  headSha: string;
+}
+
+export interface HeadShaFailure extends GitHubFetchResult {
+  ok: false;
+  headSha: null;
+}
+
+export type HeadShaResult = HeadShaSuccess | HeadShaFailure;
+
 async function fetchPullRequestHeadSha(
   token: string,
   owner: string,
   repo: string,
   number: number,
-): Promise<string | null> {
+): Promise<HeadShaResult> {
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
@@ -234,17 +295,24 @@ async function fetchPullRequestHeadSha(
   try {
     response = await ghFetch(url, { headers });
   } catch {
-    return null;
+    return { ok: false, status: 0, message: "network_error", headSha: null };
   }
 
-  if (!response.ok) return null;
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const message = body?.message as string | undefined;
+    return { ok: false, status: response.status, message: message ?? null, headSha: null };
+  }
 
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
-  if (!body) return null;
+  if (!body) return { ok: false, status: response.status, message: "empty_response", headSha: null };
 
   const head = body.head as Record<string, unknown> | undefined;
   const sha = head?.sha as string | undefined;
-  return typeof sha === "string" && sha.length > 0 ? sha : null;
+  if (typeof sha === "string" && sha.length > 0) {
+    return { ok: true, status: response.status, message: null, headSha: sha };
+  }
+  return { ok: false, status: response.status, message: "head.sha missing from response", headSha: null };
 }
 
 async function writeCommitStatus(
@@ -289,7 +357,7 @@ async function writeCommitStatus(
 
   if (response.status === 403 || response.status === 422) {
     const detail = message ?? "";
-    return { success: false, error: `scope_missing: ${detail}` };
+    return { success: false, error: `scope_missing: HTTP ${response.status} ${detail}` };
   }
 
   return { success: false, error: message ?? `HTTP ${response.status}` };
@@ -366,17 +434,22 @@ export async function armMergeOnApproval(
     };
   }
 
-  const token = await resolveGitHubToken(db, companyId);
-  if (!token) {
-    return { kind: "failed", message: "failed:auth_required: GitHub authentication failed" };
+  const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
+  if (!isGitHubTokenResolution(tokenResult)) {
+    return {
+      kind: "failed",
+      message: `failed:auth_required: ${tokenResult.reason} (scope=null, secretName=null)`,
+    };
   }
+  const token = tokenResult.token;
 
   let nodeId = pr.nodeId;
   if (!nodeId) {
-    nodeId = await fetchGitHubNodeId(token, pr.owner, pr.repo, pr.number);
-    if (!nodeId) {
-      return { kind: "failed", message: "failed:node_id_missing: Could not resolve GitHub node ID for linked PR" };
+    const nodeIdResult = await fetchGitHubNodeId(token, pr.owner, pr.repo, pr.number);
+    if (!nodeIdResult.ok || !nodeIdResult.nodeId) {
+      return { kind: "failed", message: `failed:node_id_missing: Could not resolve GitHub node ID for linked PR (HTTP ${nodeIdResult.status})` };
     }
+    nodeId = nodeIdResult.nodeId;
   }
 
   const result = await enableAutoMerge(token, nodeId);

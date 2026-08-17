@@ -328,6 +328,73 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
+  it("registers a configured model missing from the catalog on its provider", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: { model: "openrouter/openai/gpt-oss-120b:nitro" },
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as { provider?: Record<string, { models?: Record<string, unknown> }> };
+    expect(runtimeConfig.provider?.openrouter?.models).toEqual({
+      "openai/gpt-oss-120b:nitro": {},
+    });
+    expect(prepared.notes).toContain(
+      "Registered configured model openrouter/openai/gpt-oss-120b:nitro in the runtime OpenCode config.",
+    );
+    await prepared.cleanup();
+  });
+
+  it("does not clobber an explicit model definition when registering the configured model", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const providers = {
+      openrouter: {
+        models: {
+          "openai/gpt-oss-120b:nitro": { name: "GPT-OSS 120B (nitro)" },
+          "example/other": {},
+        },
+      },
+    };
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: {
+        XDG_CONFIG_HOME: configHome,
+        PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify(providers),
+      },
+      config: { model: "openrouter/openai/gpt-oss-120b:nitro" },
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as { provider?: Record<string, { models?: Record<string, unknown> }> };
+    expect(runtimeConfig.provider?.openrouter?.models).toEqual(providers.openrouter.models);
+    expect(
+      prepared.notes.some((note) => note.startsWith("Registered configured model")),
+    ).toBe(false);
+    await prepared.cleanup();
+  });
+
+  it("skips model registration when the configured model is not provider/model shaped", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: { model: "not-a-provider-model" },
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(runtimeConfig.provider).toBeUndefined();
+    await prepared.cleanup();
+  });
+
+  // Upstream's copy of this test lived here. It is the same assertion as
+  // "respects explicit opt-out of the headless permission grant" above, but
+  // relied on `makeConfigHome()` defaulting to a permission/theme block — a
+  // default this fork moved to the call sites. Two identical tests disagreeing
+  // only about a helper default is noise, so the explicit one is kept.
+
   // SUP-11164: the snapshot disable sat behind the permission opt-out's early
   // return, so an agent configured with dangerouslySkipPermissions: false got no
   // runtime config at all — and therefore kept leaking a full `tmp_pack_*` per

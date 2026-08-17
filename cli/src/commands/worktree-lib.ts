@@ -6,6 +6,9 @@ import { resolveDefaultSecretsKeyFilePath } from "@paperclipai/shared/home-paths
 
 export const DEFAULT_WORKTREE_HOME = "~/.paperclip-worktrees";
 export const WORKTREE_SEED_MODES = ["minimal", "full"] as const;
+export const WORKTREE_SEED_PENDING_MARKER = "seed-pending";
+export const WORKTREE_SEED_COMPLETE_MARKER = "seed-complete";
+export const WORKTREE_SEED_LOCK_MARKER = "seed.lock";
 
 export type WorktreeSeedMode = (typeof WORKTREE_SEED_MODES)[number];
 
@@ -50,6 +53,21 @@ export type WorktreeUiBranding = {
   name: string;
   color: string;
 };
+
+export type WorktreeSeedMarkerPaths = {
+  pending: string;
+  complete: string;
+  lock: string;
+};
+
+export function resolveWorktreeSeedMarkerPaths(configPath: string): WorktreeSeedMarkerPaths {
+  const configDir = path.dirname(path.resolve(configPath));
+  return {
+    pending: path.resolve(configDir, WORKTREE_SEED_PENDING_MARKER),
+    complete: path.resolve(configDir, WORKTREE_SEED_COMPLETE_MARKER),
+    lock: path.resolve(configDir, WORKTREE_SEED_LOCK_MARKER),
+  };
+}
 
 export function isWorktreeSeedMode(value: string): value is WorktreeSeedMode {
   return (WORKTREE_SEED_MODES as readonly string[]).includes(value);
@@ -198,7 +216,7 @@ export function buildWorktreeConfig(input: {
       embeddedPostgresDataDir: paths.embeddedPostgresDataDir,
       embeddedPostgresPort: databasePort,
       backup: {
-        enabled: source?.database.backup.enabled ?? true,
+        enabled: false,
         intervalMinutes: source?.database.backup.intervalMinutes ?? 60,
         retentionDays: source?.database.backup.retentionDays ?? 30,
         dir: paths.backupDir,
@@ -259,6 +277,7 @@ export function buildWorktreeEnvEntries(
     PAPERCLIP_CONFIG: paths.configPath,
     PAPERCLIP_CONTEXT: paths.contextPath,
     PAPERCLIP_IN_WORKTREE: "true",
+    PAPERCLIP_DB_BACKUP_ENABLED: "false",
     ...(branding?.name ? { PAPERCLIP_WORKTREE_NAME: branding.name } : {}),
     ...(branding?.color ? { PAPERCLIP_WORKTREE_COLOR: branding.color } : {}),
   };

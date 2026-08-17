@@ -1,4 +1,5 @@
 import { pgTable, uuid, text, timestamp, index, uniqueIndex } from "drizzle-orm/pg-core";
+import type { BoardApiKeyScope } from "@paperclipai/shared";
 import { authUsers } from "./auth.js";
 
 export const boardApiKeys = pgTable(
@@ -8,6 +9,7 @@ export const boardApiKeys = pgTable(
     userId: text("user_id").notNull().references(() => authUsers.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
     keyHash: text("key_hash").notNull(),
+    scope: text("scope").$type<BoardApiKeyScope>().notNull().default("all_access"),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     expiresAt: timestamp("expires_at", { withTimezone: true }),

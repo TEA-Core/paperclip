@@ -9,6 +9,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRuns,
   issueComments,
   issues,
 } from "@paperclipai/db";
@@ -18,7 +19,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
-import { logActivityInTransaction } from "../services/activity-log.js";
+import { logActivity, logActivityInTransaction } from "../services/activity-log.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -145,6 +146,28 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
     return randomUUID();
   }
 
+  /**
+   * A run this instance can resolve, anchored on the issue under test.
+   *
+   * Agent writes pass through the cross-issue influence guard, which loads the
+   * run row and fails closed when it is missing — so an agent presenting an
+   * unresolvable run never reaches the audit write at all. Anchoring the run on
+   * the same issue also keeps the write *not* cross-issue, so the guard returns
+   * before it records its own activity row (which the poisoned table would
+   * reject for unrelated reasons).
+   */
+  async function seedRun(companyId: string, agentId: string, issueId: string) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+    return runId;
+  }
+
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
     return {
       type: "agent",
@@ -203,13 +226,9 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
       .then((rows) => rows[0]?.status ?? null);
   }
 
-  it.each([
-    { label: "agent", issuePrefix: "BEA" },
-    { label: "board", issuePrefix: "BEB" },
-  ])("records a $label comment without a run id when the run is unknown here", async ({ label, issuePrefix }) => {
-    const { companyId, agentId, issueId, identifier } = await seedIssue(issuePrefix);
-    const runId = unresolvableRunId();
-    currentActor = label === "agent" ? agentActor(companyId, agentId, runId) : boardActor(companyId, runId);
+  it("records a board comment without a run id when the run is unknown here", async () => {
+    const { companyId, issueId, identifier } = await seedIssue("BEB");
+    currentActor = boardActor(companyId, unresolvableRunId());
 
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
@@ -225,15 +244,13 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
     expect(activity.every((row) => row.runId === null)).toBe(true);
   });
 
-  it.each([
-    { label: "agent", issuePrefix: "BEC" },
-    { label: "board", issuePrefix: "BED" },
-  ])("records a $label status change without a run id when the run is unknown here", async ({ label, issuePrefix }) => {
-    const { companyId, agentId, issueId, identifier } = await seedIssue(issuePrefix);
-    const runId = unresolvableRunId();
-    currentActor = label === "agent" ? agentActor(companyId, agentId, runId) : boardActor(companyId, runId);
+  it("records a board status change without a run id when the run is unknown here", async () => {
+    const { companyId, issueId, identifier } = await seedIssue("BED");
+    currentActor = boardActor(companyId, unresolvableRunId());
 
-    const res = await request(app).patch(`/api/issues/${identifier}`).send({ status: "done" });
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Closed at Tier 2 (live): best-effort audit path exercised." });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await readStatus(issueId)).toBe("done");
@@ -244,12 +261,37 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
   });
 
   it.each([
+    { label: "comment", issuePrefix: "BEA", send: (identifier: string) =>
+      request(app).post(`/api/issues/${identifier}/comments`).send({ body: "no run to attribute this to" }) },
+    { label: "status change", issuePrefix: "BEC", send: (identifier: string) =>
+      request(app).patch(`/api/issues/${identifier}`).send({ status: "done", comment: "no run to attribute this to" }) },
+  ])(
+    // The audit path is not reached at all here: agent writes are contained per
+    // heartbeat run, and a run this instance cannot resolve fails closed before
+    // the mutation. Board actors carry no such requirement, which is why the two
+    // tests above still exercise the unknown-run audit behaviour.
+    "refuses an agent $label when the run cannot be resolved here",
+    async ({ issuePrefix, send }) => {
+      const { companyId, agentId, issueId, identifier } = await seedIssue(issuePrefix);
+      currentActor = agentActor(companyId, agentId, unresolvableRunId());
+
+      const res = await send(identifier);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.code).toBe("cross_issue_influence_run_context_required");
+      expect(await listComments(issueId)).toEqual([]);
+      expect(await readStatus(issueId)).toBe("todo");
+      expect(await countCompanyActivity(companyId)).toBe(0);
+    },
+  );
+
+  it.each([
     { label: "agent", issuePrefix: "BEE" },
     { label: "board", issuePrefix: "BEF" },
   ])("keeps a $label comment committed when the audit insert fails", async ({ label, issuePrefix }) => {
     const { companyId, agentId, issueId, identifier } = await seedIssue(issuePrefix);
     currentActor = label === "agent"
-      ? agentActor(companyId, agentId, unresolvableRunId())
+      ? agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId))
       : boardActor(companyId, unresolvableRunId());
     await rejectActivityLogInserts();
 
@@ -265,19 +307,26 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
   });
 
   it.each([
-    { label: "agent", issuePrefix: "BEG" },
-    { label: "board", issuePrefix: "BEH" },
-  ])("keeps a $label status change committed when the audit insert fails", async ({ label, issuePrefix }) => {
+    // A human completion is deliberately excluded: it archives the responsible
+    // user's inbox, and that archive shares a fate with its audit row inside the
+    // same transaction (see issues.ts and `inbox-archive-routes`). Best-effort
+    // covers the audits that run *after* their mutation has committed, which is
+    // every other one on this route.
+    { label: "agent", issuePrefix: "BEG", nextStatus: "done", comment: "Closed at Tier 2 (live): best-effort audit path exercised." },
+    { label: "board", issuePrefix: "BEH", nextStatus: "in_progress", comment: "Picked up: best-effort audit path exercised." },
+  ])("keeps a $label status change committed when the audit insert fails", async ({ label, issuePrefix, nextStatus, comment }) => {
     const { companyId, agentId, issueId, identifier } = await seedIssue(issuePrefix);
     currentActor = label === "agent"
-      ? agentActor(companyId, agentId, unresolvableRunId())
+      ? agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId))
       : boardActor(companyId, unresolvableRunId());
     await rejectActivityLogInserts();
 
-    const res = await request(app).patch(`/api/issues/${identifier}`).send({ status: "done" });
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: nextStatus, comment });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(await readStatus(issueId)).toBe("done");
+    expect(await readStatus(issueId)).toBe(nextStatus);
     expect(await countCompanyActivity(companyId)).toBe(0);
   });
 

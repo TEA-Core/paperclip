@@ -56,15 +56,34 @@ For production, use a hosted provider like [Supabase](https://supabase.com/).
 
 Use the **direct connection** (port 5432) for migrations and the **pooled connection** (port 6543) for the application.
 
-If using connection pooling, disable prepared statements:
+If using connection pooling (transaction mode), disable prepared statements via the environment — no source edits needed:
 
-```ts
-// packages/db/src/client.ts
-export function createDb(url: string) {
-  const sql = postgres(url, { prepare: false });
-  return drizzlePg(sql, { schema });
-}
+```sh
+DATABASE_PREPARED_STATEMENTS=false
 ```
+
+Related optional client tuning (driver defaults apply when unset): `DATABASE_POOL_MAX`, `DATABASE_IDLE_TIMEOUT_SECONDS`, `DATABASE_CONNECT_TIMEOUT_SECONDS`.
+
+## Least-Privilege Database Roles (Production)
+
+Paperclip separates runtime queries from DDL migrations using two database roles:
+
+- **`paperclip_serving`** — the least-privilege role used by `DATABASE_URL` for all runtime operations. It has `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables and `USAGE` on schemas, but cannot create or alter schema objects.
+- **Migration role** — a superuser (or equivalently privileged) role used by `DATABASE_MIGRATION_URL` for running migrations. Set `DATABASE_MIGRATION_URL` to this role's connection string.
+
+When `DATABASE_MIGRATION_URL` is unset, migrations fall back to `DATABASE_URL`.
+
+### Configuration
+
+```sh
+# Runtime connection — least-privilege paperclip_serving role
+DATABASE_URL=postgres://paperclip_serving:...@db.example.com:5432/paperclip
+
+# Migration connection — superuser for DDL
+DATABASE_MIGRATION_URL=postgres://paperclip_admin:...@db.example.com:5432/paperclip
+```
+
+The migration role must be able to `CREATE`/`ALTER`/`DROP` schema objects and to `GRANT` privileges to `paperclip_serving`. The `paperclip_serving` role must be able to read and write all tables and sequences in the `public` schema.
 
 ## Switching Between Modes
 

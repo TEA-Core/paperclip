@@ -20,31 +20,90 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Adjust the node user's UID/GID if they differ from the runtime request
-# and fix volume ownership only when a remap is needed
-changed=0
-
 if [ "$(id -u node)" -ne "$PUID" ]; then
     echo "Updating node UID to $PUID"
     usermod -o -u "$PUID" node
-    changed=1
 fi
 
 if [ "$(id -g node)" -ne "$PGID" ]; then
     echo "Updating node GID to $PGID"
     groupmod -o -g "$PGID" node
     usermod -g "$PGID" node
-    changed=1
 fi
 
-if [ "$changed" = "1" ]; then
-    chown -R node:node /paperclip
+# Ensure the app home is owned by the runtime user BEFORE dropping
+# privileges -- not only after a UID/GID remap. A freshly mounted volume
+# (Docker named volume, Railway volume, Kubernetes PV) arrives root-owned
+# and shadows the image's build-time chown, so with the default UID the old
+# remap-only condition dropped privileges onto an unwritable home and the
+# server crashed on its first mkdir.
+#
+# FORK DIVERGENCE -- do not re-adopt upstream's whole-tree repair on merge.
+# Upstream probes the WHOLE tree for `! -user node -o ! -group node` and then
+# runs `chown -R node:node "$home_dir"`. That is right for a plain volume and
+# wrong here, because this fork's PAPERCLIP_HOME deliberately contains:
+#
+#   - read-only bind mounts (vaults, skills-lib). chown returns non-zero on
+#     them and, under `set -e`, kills the entrypoint before the server ever
+#     listens -- a total outage, not a degraded boot. Measured 2026-08-15:
+#     the deploy of fold-de08d947e never reached /api/health and was rolled
+#     back at gate 2 for exactly this reason;
+#   - directories group-owned by `agents` (see shared-group-ownership.ts).
+#     `chown -R node:node` strips that group fork-wide and silently dismantles
+#     shared agent access. The probe trips on those directories in ~5s, so this
+#     fires on every boot, not in some rare edge case;
+#   - a root-owned shared toolchain (/paperclip/toolchain) that agents read but
+#     must NOT be able to write. Chowning it to node makes it agent-writable;
+#   - a large host-managed workspaces bind, where a recursive walk is costly.
+#
+# A freshly mounted volume is empty, so repairing the home root alone is
+# sufficient: everything beneath it is created by the server as node. That is
+# one stat instead of a full-tree walk, and it touches nothing that the fork
+# owns deliberately.
+home_dir="${PAPERCLIP_HOME:-/paperclip}"
+if [ -d "$home_dir" ] && [ "$(stat -c %u "$home_dir")" != "$(id -u node)" ]; then
+    echo "docker-entrypoint.sh: repairing ownership of $home_dir root"
+    chown node "$home_dir"
 fi
 
-# Pre-create the secrets key directory with paperclip-user ownership.
-# The server's local-encrypted provider writes /etc/paperclip/secrets/master.key
-# at startup; this directory is outside the agent-visible volume and must exist.
-mkdir -p /etc/paperclip/secrets
-chown node:node /etc/paperclip/secrets
+# Root-own the secrets directory so agent runs (uid 1000) can neither read nor
+# write it. DAC cannot distinguish the server from agents — both run uid 1000 —
+# so the key is handed to the server via the environment (exported below) BEFORE
+# privileges drop to node.
+install -d -m 0700 -o root -g root /etc/paperclip/secrets
+
+# First-boot key bootstrap: when no key file exists and the operator has
+# explicitly opted in via PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1, generate
+# 32 random bytes base64 as root and write master.key with root:root 0600.
+# This runs in the root phase so the write succeeds — the directory is
+# root-owned 0700, and uid-1000 agent runs (which share the server's UID)
+# cannot create or replace the key themselves. The server's own generation
+# path (local-encrypted-provider.ts) is unreachable after the gosu drop
+# because the directory is unwritable by uid 1000.
+#
+# Format must match the provider: randomBytes(32).toString("base64"),
+# which decodeMasterKey trims + base64-decodes + requires to be 32 bytes.
+# `head -c 32 /dev/urandom | base64` produces the same shape.
+if [ ! -f /etc/paperclip/secrets/master.key ] && [ "${PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION:-0}" = "1" ] && [ -z "${PAPERCLIP_SECRETS_MASTER_KEY:-}" ]; then
+    head -c 32 /dev/urandom | base64 > /etc/paperclip/secrets/master.key
+    chown root:root /etc/paperclip/secrets/master.key
+    chmod 0600 /etc/paperclip/secrets/master.key
+fi
+
+if [ -z "${PAPERCLIP_SECRETS_MASTER_KEY:-}" ] && [ -f /etc/paperclip/secrets/master.key ]; then
+    chown root:root /etc/paperclip/secrets/master.key
+    chmod 0600 /etc/paperclip/secrets/master.key
+    # Hand the master key to the server before the gosu drop. NEVER echo it;
+    # this entrypoint must never run under `set -x`.
+    PAPERCLIP_SECRETS_MASTER_KEY="$(cat /etc/paperclip/secrets/master.key)"
+    export PAPERCLIP_SECRETS_MASTER_KEY
+elif [ -n "${PAPERCLIP_SECRETS_MASTER_KEY:-}" ] && [ -f /etc/paperclip/secrets/master.key ]; then
+    env_fp="$(printf '%s' "$PAPERCLIP_SECRETS_MASTER_KEY" | sha256sum | cut -c1-12)"
+    file_fp="$(printf '%s' "$(cat /etc/paperclip/secrets/master.key)" | sha256sum | cut -c1-12)"
+    if [ "$env_fp" != "$file_fp" ]; then
+        echo "docker-entrypoint.sh: warning: PAPERCLIP_SECRETS_MASTER_KEY env key differs from master.key file (env=${env_fp} file=${file_fp}); using env key" >&2
+    fi
+fi
 
 # Populate the npm-global volume with the self-contained MCP server tree.
 # The build stage (Dockerfile) ran `npm pack` + `npm install --global --omit=dev

@@ -84,7 +84,7 @@ vi.mock("../services/index.js", () => ({
     listForIssue: vi.fn(async () => []),
     expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
     expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
-    expirePendingInteractionsOnTerminalIssueStatus: vi.fn(async () => []),
+    expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   }),
   issueService: () => mockIssueService,
   logActivity: mockLogActivity,
@@ -99,6 +99,29 @@ vi.mock("../services/index.js", () => ({
     listForIssue: vi.fn(async () => []),
   }),
 }));
+
+/**
+ * Rows the route's own queries resolve to.
+ *
+ * The `enteringBlocked` guard reads the database directly (unresolved blockers,
+ * pending interaction, pending approval), so `{}` is no longer a usable db here.
+ * Each test only needs one of two answers from that guard — "found something" or
+ * "found nothing" — so one row set for every query is enough.
+ */
+let stubRows: unknown[] = [];
+
+function createStubDb() {
+  const query: any = {
+    from: () => query,
+    innerJoin: () => query,
+    where: () => query,
+    limit: () => query,
+    orderBy: () => query,
+    then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve(stubRows).then(onFulfilled, onRejected),
+  };
+  return { select: () => query };
+}
 
 async function createApp() {
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
@@ -117,7 +140,7 @@ async function createApp() {
     };
     next();
   });
-  app.use("/api", issueRoutes({} as any, {} as any));
+  app.use("/api", issueRoutes(createStubDb() as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -167,6 +190,7 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     vi.clearAllMocks();
+    stubRows = [];
     mockIssueService.getAncestors.mockResolvedValue([]);
     mockIssueService.getComment.mockResolvedValue(null);
     mockIssueService.getCommentCursor.mockResolvedValue({
@@ -192,9 +216,11 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
     mockIssueService.getById.mockResolvedValue(issueFixture({ status: "todo" }));
     mockIssueService.update.mockResolvedValue(issueFixture({ status: "blocked" }));
 
-    const res = await request(await createApp()).patch("/api/issues/issue-1").send({ status: "blocked" });
+    const res = await request(await createApp())
+      .patch("/api/issues/issue-1")
+      .send({ status: "blocked", unblockDescriptor: { owner: "board", action: "Decide the next step" } });
 
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.status).toBe("blocked");
     expect(blockedWithoutBlockersWrites()).toHaveLength(1);
     const input = blockedWithoutBlockersWrites()[0];
@@ -247,11 +273,13 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
       isDependencyReady: false,
     });
 
+    stubRows = [{ id: blockerId }];
+
     const res = await request(await createApp())
       .patch("/api/issues/issue-1")
       .send({ status: "blocked", blockedByIssueIds: [blockerId] });
 
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.status).toBe("blocked");
     expect(res.body.blockedBy).toEqual([{ id: blockerId }]);
     expect(blockedWithoutBlockersWrites()).toHaveLength(0);

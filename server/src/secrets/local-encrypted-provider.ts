@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path, { resolve } from "node:path";
-import { resolveDefaultSecretsKeyFilePath } from "../home-paths.js";
+import { resolveSecretsMasterKeyFilePath } from "../home-paths.js";
 import { resolvePaperclipHomeDir } from "@paperclipai/shared/home-paths";
 import type {
   PreparedSecretVersion,
@@ -11,6 +11,7 @@ import type {
   StoredSecretVersionMaterial,
 } from "./types.js";
 import { badRequest } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 
 function isPathInside(candidatePath: string, rootPath: string): boolean {
   const candidate = resolve(candidatePath);
@@ -19,9 +20,6 @@ function isPathInside(candidatePath: string, rootPath: string): boolean {
 }
 
 function enforceKeyPathIsolation(keyPath: string): void {
-  if (process.env.PAPERCLIP_SECRETS_MASTER_KEY && process.env.PAPERCLIP_SECRETS_MASTER_KEY.trim().length > 0) {
-    return;
-  }
   const paperclipHome = resolvePaperclipHomeDir();
   if (isPathInside(keyPath, paperclipHome)) {
     throw new Error(
@@ -29,6 +27,56 @@ function enforceKeyPathIsolation(keyPath: string): void {
         `Key path ${keyPath} is inside the Paperclip home volume. ` +
         `Move the key file outside the agent-visible volume (e.g. /etc/paperclip/secrets/master.key) ` +
         `or set PAPERCLIP_SECRETS_MASTER_KEY_FILE to an isolated path.`,
+    );
+  }
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+export function assertKeyPathAtBoot(): void {
+  const keyPath = resolveMasterKeyFilePath();
+  const paperclipHome = resolvePaperclipHomeDir();
+  const insideHome = isPathInside(keyPath, paperclipHome);
+  const envKeyRaw = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+  const hasEnvKey = envKeyRaw && envKeyRaw.trim().length > 0;
+  const envKeyFingerprint = hasEnvKey ? sha256Hex(envKeyRaw.trim()).slice(0, 12) : null;
+
+  let fileKeyFingerprint: string | null = null;
+  if (existsSync(keyPath)) {
+    try {
+      const raw = readFileSync(keyPath, "utf8");
+      const decoded = decodeMasterKey(raw);
+      if (decoded) {
+        fileKeyFingerprint = sha256Hex(decoded.toString("hex")).slice(0, 12);
+      }
+    } catch {
+      // best effort; health check surfaces persistent read problems.
+    }
+  }
+
+  logger.info(
+    {
+      keyPath,
+      keySource: hasEnvKey ? "env" : "file",
+      insidePaperclipHome: insideHome,
+      paperclipHome,
+      envKeyFingerprint,
+      fileKeyFingerprint,
+    },
+    "secrets master key path resolved at boot",
+  );
+
+  if (insideHome && hasEnvKey) {
+    logger.warn(
+      {
+        keyPath,
+        paperclipHome,
+      },
+      "secrets master key file resolves inside PAPERCLIP_HOME while PAPERCLIP_SECRETS_MASTER_KEY is set; " +
+        "the isolated key path is not configured. Set PAPERCLIP_SECRETS_MASTER_KEY_FILE to an isolated path outside " +
+        "PAPERCLIP_HOME (e.g. /etc/paperclip/secrets/master.key).",
     );
   }
 }
@@ -41,9 +89,7 @@ interface LocalEncryptedMaterial extends StoredSecretVersionMaterial {
 }
 
 function resolveMasterKeyFilePath() {
-  const fromEnv = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
-  if (fromEnv && fromEnv.trim().length > 0) return resolve(fromEnv.trim());
-  return resolveDefaultSecretsKeyFilePath();
+  return resolveSecretsMasterKeyFilePath();
 }
 
 function decodeMasterKey(raw: string): Buffer | null {
@@ -69,6 +115,8 @@ function decodeMasterKey(raw: string): Buffer | null {
 
 function loadOrCreateMasterKey(): Buffer {
   const envKeyRaw = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+  const keyPath = resolveMasterKeyFilePath();
+  enforceKeyPathIsolation(keyPath);
   if (envKeyRaw && envKeyRaw.trim().length > 0) {
     const fromEnv = decodeMasterKey(envKeyRaw);
     if (!fromEnv) {
@@ -76,11 +124,33 @@ function loadOrCreateMasterKey(): Buffer {
         "Invalid PAPERCLIP_SECRETS_MASTER_KEY (expected 32-byte base64, 64-char hex, or raw 32-char string)",
       );
     }
+
+    if (existsSync(keyPath)) {
+      enforceKeyFilePermissionsBestEffort(keyPath);
+      try {
+        const fileRaw = readFileSync(keyPath, "utf8");
+        const fromFile = decodeMasterKey(fileRaw);
+        if (fromFile && !fromFile.equals(fromEnv)) {
+          const envFingerprint = sha256Hex(envKeyRaw.trim()).slice(0, 12);
+          const fileFingerprint = sha256Hex(fromFile.toString("hex")).slice(0, 12);
+          throw badRequest(
+            `Refusing to start: the master key file at ${keyPath} disagrees with PAPERCLIP_SECRETS_MASTER_KEY. ` +
+              `The env key fingerprint (sha256:${envFingerprint}) does not match the file key fingerprint (sha256:${fileFingerprint}). ` +
+              `Remove the stray key file, or set PAPERCLIP_SECRETS_MASTER_KEY to the key that matches the file. ` +
+              `Loading the wrong key would silently corrupt all existing encrypted secrets.`,
+          );
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("Refusing to start")) {
+          throw err;
+        }
+        throw badRequest(`Could not read secrets master key file at ${keyPath}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     return fromEnv;
   }
 
-  const keyPath = resolveMasterKeyFilePath();
-  enforceKeyPathIsolation(keyPath);
   if (existsSync(keyPath)) {
     enforceKeyFilePermissionsBestEffort(keyPath);
     const raw = readFileSync(keyPath, "utf8");
@@ -123,10 +193,6 @@ function enforceKeyFilePermissionsBestEffort(keyPath: string) {
   }
 }
 
-function sha256Hex(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
 function prepareManagedVersion(value: string): PreparedSecretVersion {
   const masterKey = loadOrCreateMasterKey();
   const valueSha256 = sha256Hex(value);
@@ -149,6 +215,46 @@ async function inspectLocalEncryptedHealth(): Promise<SecretProviderHealthCheck>
           "PAPERCLIP_SECRETS_MASTER_KEY is invalid; expected 32-byte base64, 64-char hex, or raw 32-char string",
       };
     }
+
+    const keyPath = resolveMasterKeyFilePath();
+    try {
+      enforceKeyPathIsolation(keyPath);
+    } catch (err) {
+      return {
+        provider: "local_encrypted",
+        status: "error",
+        message: err instanceof Error ? err.message : String(err),
+        details: { keySource: "env", keyFilePath: keyPath },
+      };
+    }
+    if (existsSync(keyPath)) {
+      try {
+        const fileRaw = readFileSync(keyPath, "utf8");
+        const fromFile = decodeMasterKey(fileRaw);
+        const fromEnv = decodeMasterKey(envKeyRaw);
+        if (fromFile && fromEnv && !fromFile.equals(fromEnv)) {
+          const envFingerprint = sha256Hex(envKeyRaw.trim()).slice(0, 12);
+          const fileFingerprint = sha256Hex(fromFile.toString("hex")).slice(0, 12);
+          return {
+            provider: "local_encrypted",
+            status: "error",
+            message:
+              `Master key file at ${keyPath} disagrees with PAPERCLIP_SECRETS_MASTER_KEY ` +
+              `(env sha256:${envFingerprint} vs file sha256:${fileFingerprint}). ` +
+              `Remove the stray key file or align PAPERCLIP_SECRETS_MASTER_KEY with the file.`,
+            details: { keySource: "env", keyFilePath: keyPath, envKeyFingerprint: envFingerprint, fileKeyFingerprint: fileFingerprint },
+          };
+        }
+      } catch (err) {
+        return {
+          provider: "local_encrypted",
+          status: "error",
+          message: `Could not read secrets master key file at ${keyPath}: ${err instanceof Error ? err.message : String(err)}`,
+          details: { keySource: "env", keyFilePath: keyPath },
+        };
+      }
+    }
+
     return {
       provider: "local_encrypted",
       status: "ok",
@@ -157,7 +263,7 @@ async function inspectLocalEncryptedHealth(): Promise<SecretProviderHealthCheck>
         "Back up the configured master key separately from the database.",
         "A restore needs both the database metadata and the same master key.",
       ],
-      details: { keySource: "env" },
+      details: { keySource: "env", keyFilePath: existsSync(keyPath) ? keyPath : null },
     };
   }
 

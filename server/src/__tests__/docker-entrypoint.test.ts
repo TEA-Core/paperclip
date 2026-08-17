@@ -18,10 +18,10 @@ const execFileAsync = promisify(execFile);
  *    container starts non-root, where neither the remap nor gosu can work,
  *    so the command must be exec'd directly (with a warning on mismatch).
  *
- * The system commands (id, usermod, groupmod, chown, mkdir, gosu) are stubbed
- * via PATH so the branching logic runs unmodified on any host. mkdir is stubbed
- * because the root path creates /etc/paperclip/secrets, which an unprivileged
- * test host cannot write.
+ * The system commands (id, usermod, groupmod, chown, mkdir, install, stat, find,
+ * gosu) are stubbed via PATH so the branching logic runs unmodified on any host.
+ * `install` is stubbed because the root path creates /etc/paperclip/secrets as
+ * root:root, which an unprivileged test host can neither create nor chown.
  */
 
 const ENTRYPOINT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "scripts", "docker-entrypoint.sh");
@@ -34,7 +34,14 @@ function writeStub(name: string, body: string) {
   writeFileSync(path, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
 }
 
-function installStubs(ids: { uid: number; gid: number; nodeUid?: number; nodeGid?: number }) {
+function installStubs(ids: {
+  uid: number;
+  gid: number;
+  nodeUid?: number;
+  nodeGid?: number;
+  /** Owner uid of the app home ROOT. Defaults to node (already correct). */
+  homeRootUid?: number;
+}) {
   writeStub(
     "id",
     [
@@ -45,9 +52,17 @@ function installStubs(ids: { uid: number; gid: number; nodeUid?: number; nodeGid
       `else echo 0; fi`,
     ].join("\n"),
   );
-  for (const cmd of ["usermod", "groupmod", "chown", "mkdir"]) {
+  for (const cmd of ["usermod", "groupmod", "chown", "mkdir", "install"]) {
     writeStub(cmd, `echo "${cmd} $*" >> "${logFile}"`);
   }
+  // The ownership probe is a single stat of the app home ROOT -- deliberately
+  // not a tree walk. `find` is stubbed to log its invocation AND report a
+  // mismatch, so reintroducing upstream's whole-tree probe both trips the
+  // "does not walk the home tree" assertion and drives the recursive chown
+  // that "never recursively chowns" forbids. A stub that stayed silent would
+  // let the recursive path pass vacuously.
+  writeStub("find", `echo "find $*" >> "${logFile}"\necho "$1/mismatched-entry"`);
+  writeStub("stat", `echo ${ids.homeRootUid ?? 1000}`);
   writeStub("gosu", `echo "gosu $*" >> "${logFile}"\nshift\nexec "$@"`);
 }
 
@@ -80,26 +95,109 @@ describe("docker-entrypoint.sh", () => {
     expect(calls).not.toContain("chown -R node:node /paperclip");
   });
 
-  it("pre-creates the secrets key directory outside the paperclip volume when root", async () => {
+  it("root-owns the secrets key directory outside the paperclip volume when root", async () => {
+    // SUP-12989: the server and every agent run share uid 1000, so DAC cannot
+    // tell them apart. The key directory must therefore be root:root 0700 and
+    // the key handed to the server through the environment before the gosu
+    // drop -- chowning it to node would re-open the read/write/unlink path for
+    // agent runs. The static shape is pinned in
+    // scripts/__tests__/dockerfile-secrets-root-owned.test.mjs.
     installStubs({ uid: 0, gid: 0 });
 
     const { stdout, calls } = await runEntrypoint();
 
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
-    expect(calls).toContain("mkdir -p /etc/paperclip/secrets");
-    expect(calls).toContain("chown node:node /etc/paperclip/secrets");
+    expect(calls).toContain("install -d -m 0700 -o root -g root /etc/paperclip/secrets");
+    expect(calls).not.toContain("chown node:node /etc/paperclip/secrets");
   });
 
-  it("remaps the node user and chowns /paperclip before gosu when root requests a different UID/GID", async () => {
-    installStubs({ uid: 0, gid: 0 });
+  it("remaps the node user and repairs the home root before gosu when root requests a different UID/GID", async () => {
+    // The stubbed node uid stays 1000 while the stat probe reports root
+    // ownership of the home root, modelling the mismatch that must be repaired.
+    installStubs({ uid: 0, gid: 0, homeRootUid: 0 });
 
-    const { stdout, calls } = await runEntrypoint({ USER_UID: "1001", USER_GID: "1001" });
+    const { stdout, calls } = await runEntrypoint({ USER_UID: "1001", USER_GID: "1001", PAPERCLIP_HOME: stubDir });
 
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(calls).toContain("usermod -o -u 1001 node");
     expect(calls).toContain("groupmod -o -g 1001 node");
-    expect(calls).toContain("chown -R node:node /paperclip");
+    expect(calls).toContain(`chown node ${stubDir}`);
     expect(calls).toContain("gosu node echo ENTRYPOINT-CMD-RAN");
+  });
+
+  it("chowns a root-owned home root before gosu even with the default UID/GID (fresh volume mount)", async () => {
+    // A freshly mounted volume arrives root-owned and shadows the image's
+    // build-time chown; with no remap requested the old entrypoint dropped
+    // privileges onto an unwritable home and the server crashed on its
+    // first mkdir. A fresh volume is empty, so repairing the root is enough.
+    installStubs({ uid: 0, gid: 0, homeRootUid: 0 });
+
+    const { stdout, calls } = await runEntrypoint({ PAPERCLIP_HOME: stubDir });
+
+    expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
+    expect(calls).toContain(`chown node ${stubDir}`);
+    expect(calls).not.toContain("usermod");
+    expect(calls).toContain("gosu node echo ENTRYPOINT-CMD-RAN");
+  });
+
+  it("never recursively chowns the app home, even when the root needs repair", async () => {
+    // FORK INVARIANT. PAPERCLIP_HOME contains read-only bind mounts (vaults,
+    // skills-lib), directories group-owned by `agents`, and a root-owned shared
+    // toolchain. `chown -R` returns non-zero on the read-only mounts and, under
+    // `set -e`, kills the entrypoint before the server ever listens -- the
+    // 2026-08-15 fold-de08d947e deploy failed gate 2 for exactly this reason.
+    // It would also strip the `agents` group fork-wide and make the shared
+    // toolchain agent-writable.
+    installStubs({ uid: 0, gid: 0, homeRootUid: 0 });
+
+    const { calls } = await runEntrypoint({ PAPERCLIP_HOME: stubDir });
+
+    expect(calls).not.toContain("chown -R");
+  });
+
+  it("does not walk the home tree to decide whether to repair ownership", async () => {
+    // The probe must stay a single stat of the home root. A tree walk is both
+    // costly on a large workspaces bind and the trigger for the recursive
+    // chown this fork must never perform.
+    installStubs({ uid: 0, gid: 0, homeRootUid: 0 });
+
+    const { calls } = await runEntrypoint({ PAPERCLIP_HOME: stubDir });
+
+    expect(calls).not.toContain("find ");
+  });
+
+  it("leaves a node-owned home root untouched (no per-boot chown of the volume)", async () => {
+    installStubs({ uid: 0, gid: 0, homeRootUid: 1000 });
+
+    const { calls } = await runEntrypoint({ PAPERCLIP_HOME: stubDir });
+
+    // Scoped to the app home. The fork's unconditional single-directory
+    // `install -d ... /etc/paperclip/secrets` is a different guard (see the
+    // secrets-key-directory test above) and costs nothing per boot.
+    expect(calls).not.toContain(`chown node ${stubDir}`);
+    expect(calls).not.toContain("chown -R");
+    expect(calls).toContain("gosu node echo ENTRYPOINT-CMD-RAN");
+  });
+
+  it("does not repair the home root on a GID-only remap when the owner already matches", async () => {
+    // Divergence from upstream, which repaired descendants recursively here.
+    // The fork's `agents` group ownership is deliberate, so a group difference
+    // is not damage and must not trigger a chown.
+    installStubs({ uid: 0, gid: 0, homeRootUid: 1000 });
+
+    const { calls } = await runEntrypoint({ USER_GID: "1001", PAPERCLIP_HOME: stubDir });
+
+    expect(calls).toContain("groupmod -o -g 1001 node");
+    expect(calls).not.toContain("chown -R");
+    expect(calls).not.toContain(`chown node ${stubDir}`);
+  });
+
+  it("honours PAPERCLIP_HOME for the ownership probe", async () => {
+    installStubs({ uid: 0, gid: 0, homeRootUid: 0 });
+
+    const { calls } = await runEntrypoint({ PAPERCLIP_HOME: stubDir });
+
+    expect(calls).toContain(`chown node ${stubDir}`);
   });
 
   it("execs directly and silently when already running as the requested user (restricted PodSecurity)", async () => {

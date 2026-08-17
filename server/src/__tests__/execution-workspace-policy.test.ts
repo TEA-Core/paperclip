@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  issueExecutionWorkspaceSettingsSchema,
+  projectExecutionWorkspacePolicySchema,
+} from "@paperclipai/shared";
+import {
   buildExecutionWorkspaceAdapterConfig,
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
@@ -9,7 +13,11 @@ import {
   parseProjectExecutionWorkspacePolicy,
   resolveExecutionWorkspaceEnvironmentId,
   resolvePinnedIssueWorkspaceStrategyType,
+  resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceMode,
+  resolveSharedWorkspaceConcurrency,
+  selectEnvironmentExecutionWorkspaceSettings,
+  canAgentSatisfyIssueWorkspaceSettings,
 } from "../services/execution-workspace-policy.ts";
 
 describe("execution workspace policy helpers", () => {
@@ -35,6 +43,103 @@ describe("execution workspace policy helpers", () => {
         projectPolicy: { enabled: true, defaultMode: "shared_workspace" },
         issueSettings: { mode: "isolated_workspace" },
         legacyUseProjectWorkspace: false,
+      }),
+    ).toBe("isolated_workspace");
+  });
+
+  it("resolves shared-workspace concurrency from issue override, project policy, then auto", () => {
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "serialize" },
+        issueSettings: { sharedWorkspaceConcurrency: "allow" },
+      }),
+    ).toBe("allow");
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "serialize" },
+        issueSettings: null,
+      }),
+    ).toBe("serialize");
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: false, sharedWorkspaceConcurrency: "serialize" },
+        issueSettings: null,
+      }),
+    ).toBe("auto");
+    expect(resolveSharedWorkspaceConcurrency({ projectPolicy: null, issueSettings: null })).toBe("auto");
+  });
+
+  it("respects allowIssueOverride=false: project shared-workspace concurrency wins over the issue value", () => {
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "serialize", allowIssueOverride: false },
+        issueSettings: { sharedWorkspaceConcurrency: "allow" },
+      }),
+    ).toBe("serialize");
+    // A disabled project policy contributes no value, so the gated issue value falls through to "auto".
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: false, sharedWorkspaceConcurrency: "serialize", allowIssueOverride: false },
+        issueSettings: { sharedWorkspaceConcurrency: "allow" },
+      }),
+    ).toBe("auto");
+  });
+
+  it("respects allowIssueOverride=true/omitted: issue shared-workspace concurrency still wins", () => {
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "serialize", allowIssueOverride: true },
+        issueSettings: { sharedWorkspaceConcurrency: "allow" },
+      }),
+    ).toBe("allow");
+    expect(
+      resolveSharedWorkspaceConcurrency({
+        projectPolicy: { enabled: true, sharedWorkspaceConcurrency: "serialize" },
+        issueSettings: { sharedWorkspaceConcurrency: "allow" },
+      }),
+    ).toBe("allow");
+  });
+
+  it("validates the shared-workspace concurrency enum on project and issue settings", () => {
+    expect(projectExecutionWorkspacePolicySchema.parse({
+      enabled: true,
+      sharedWorkspaceConcurrency: "auto",
+    }).sharedWorkspaceConcurrency).toBe("auto");
+    expect(issueExecutionWorkspaceSettingsSchema.parse({
+      sharedWorkspaceConcurrency: "allow",
+    }).sharedWorkspaceConcurrency).toBe("allow");
+    expect(projectExecutionWorkspacePolicySchema.safeParse({
+      enabled: true,
+      sharedWorkspaceConcurrency: "parallel",
+    }).success).toBe(false);
+  });
+
+  it("respects allowIssueOverride=false: project defaultMode wins over issue mode", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "shared_workspace", allowIssueOverride: false },
+        issueSettings: { mode: "isolated_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("shared_workspace");
+  });
+
+  it("respects allowIssueOverride=true: issue mode still wins", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "shared_workspace", allowIssueOverride: true },
+        issueSettings: { mode: "isolated_workspace" },
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("isolated_workspace");
+  });
+
+  it("respects allowIssueOverride omitted: issue mode still wins (byte-identical to today)", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "shared_workspace" },
+        issueSettings: { mode: "isolated_workspace" },
+        legacyUseProjectWorkspace: null,
       }),
     ).toBe("isolated_workspace");
   });
@@ -127,6 +232,179 @@ describe("execution workspace policy helpers", () => {
     ).toBe(false);
   });
 
+  it("canAgentSatisfyIssueWorkspaceSettings rejects isolated git_worktree with no project or reusable workspace", () => {
+    // The exact live case from SUP-13078: isolated_workspace + git_worktree, no project,
+    // no project workspace, no reusable execution workspace → agent_home fallback → refusal.
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree" } },
+        projectPolicy: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings rejects isolated issue with project policy git_worktree but no project binding", () => {
+    // The issue's executionWorkspaceSettings has mode: isolated_workspace but no workspaceStrategy.
+    // The project policy specifies workspaceStrategy: { type: "git_worktree" }.
+    // The issue has no projectId, so no project workspace is available → agent_home fallback → refusal.
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree" },
+          allowIssueOverride: true,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings accepts isolated git_worktree when a project is bound", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: "project-1",
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree" } },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings accepts isolated git_worktree when a reusable workspace is bound", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: "workspace-1",
+          executionWorkspacePreference: "reuse_existing",
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace", workspaceStrategy: { type: "git_worktree" } },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings accepts non-worktree modes unconditionally", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "shared_workspace" },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "agent_default" },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("canAgentSatisfyIssueWorkspaceSettings accepts operator_branch with no project when a prior session workspace is resolvable", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "operator_branch", workspaceStrategy: { type: "git_worktree" } },
+        projectPolicy: null,
+        hasResolvablePriorSessionWorkspace: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("dispatch precedence resolves an isolated_workspace issue with no explicit strategy to git_worktree", () => {
+    // Pins the fact that falsified SUP-13105's premise: buildExecutionWorkspaceAdapterConfig
+    // supplies { type: "git_worktree" } as its final fallback whenever hasWorkspaceControl is
+    // true, and `mode` alone sets issueHasWorkspaceOverrides. So the strategy the predicate
+    // derives for SUP-12986's `{"mode":"isolated_workspace"}` is git_worktree — it was never
+    // "blind to git_worktree", which is why sourcing the strategy from the bound workspace row
+    // instead could not change any outcome.
+    const config = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: {},
+      projectPolicy: null,
+      issueSettings: { mode: "isolated_workspace" },
+      mode: "isolated_workspace",
+      legacyUseProjectWorkspace: null,
+    });
+    expect(resolveEffectiveWorkspaceStrategyType("isolated_workspace", config)).toBe("git_worktree");
+    // The same input through resolvePinnedIssueWorkspaceStrategyType — the resolver the
+    // predicate does NOT use — returns project_primary. That divergence is the trap.
+    expect(
+      resolvePinnedIssueWorkspaceStrategyType({
+        mode: "isolated_workspace",
+        issueSettings: { mode: "isolated_workspace" },
+      }),
+    ).toBe("project_primary");
+  });
+
+  it("with no bound workspace and no reusable binding, returns incapable when projectId/projectWorkspaceId are null (SUP-13100 AC3)", () => {
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: null,
+          executionWorkspacePreference: null,
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: null,
+        hasResolvablePriorSessionWorkspace: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("a bound reuse_existing binding alone makes the issue capable (SUP-13100 consume contract)", () => {
+    // The derived strategy here IS git_worktree (see the dispatch-precedence test above) and
+    // projectId/projectWorkspaceId are both null, so isUnrunnableWorktreeCombo reaches its
+    // reusable-workspace check — and the binding short-circuits it to capable. That
+    // short-circuit, not the strategy, is what decides every bound issue.
+    expect(
+      canAgentSatisfyIssueWorkspaceSettings({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: "workspace-1",
+          executionWorkspacePreference: "reuse_existing",
+        },
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        projectPolicy: null,
+      }),
+    ).toBe(true);
+  });
+
   it("mirrors runtime default (project_primary) when pinned settings omit strategy type", () => {
     // Mode-only pin without explicit workspaceStrategy.type → same project_primary default as runtime.
     expect(
@@ -185,12 +463,51 @@ describe("execution workspace policy helpers", () => {
           type: "git_worktree",
           baseRef: "origin/main",
           provisionCommand: "bash ./scripts/provision-worktree.sh",
+          runtimeProvisionCommand: "bash ./scripts/provision-runtime.sh",
         },
         workspaceRuntime: {
           services: [{ name: "web", command: "pnpm dev" }],
         },
       },
       issueSettings: null,
+      mode: "isolated_workspace",
+      legacyUseProjectWorkspace: null,
+    });
+
+    expect(result.workspaceStrategy).toEqual({
+      type: "git_worktree",
+      baseRef: "origin/main",
+      provisionCommand: "bash ./scripts/provision-worktree.sh",
+      runtimeProvisionCommand: "bash ./scripts/provision-runtime.sh",
+    });
+    expect(result.workspaceRuntime).toEqual({
+      services: [{ name: "web", command: "pnpm dev" }],
+    });
+  });
+
+  it("respects allowIssueOverride=false: project strategy/runtime win over issue overrides", () => {
+    const result = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: {
+        workspaceStrategy: { type: "project_primary" },
+      },
+      projectPolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        allowIssueOverride: false,
+        workspaceStrategy: {
+          type: "git_worktree",
+          baseRef: "origin/main",
+          provisionCommand: "bash ./scripts/provision-worktree.sh",
+        },
+        workspaceRuntime: {
+          services: [{ name: "web", command: "pnpm dev" }],
+        },
+      },
+      issueSettings: {
+        mode: "isolated_workspace",
+        workspaceStrategy: { type: "cloud_sandbox" },
+        workspaceRuntime: { services: [{ name: "api", command: "pnpm start" }] },
+      },
       mode: "isolated_workspace",
       legacyUseProjectWorkspace: null,
     });
@@ -253,21 +570,25 @@ describe("execution workspace policy helpers", () => {
     expect(
       parseProjectExecutionWorkspacePolicy({
         enabled: true,
+        sharedWorkspaceConcurrency: "serialize",
         defaultMode: "isolated",
         workspaceStrategy: {
           type: "git_worktree",
           worktreeParentDir: ".paperclip/worktrees",
           provisionCommand: "bash ./scripts/provision-worktree.sh",
+          runtimeProvisionCommand: "bash ./scripts/provision-runtime.sh",
           teardownCommand: "bash ./scripts/teardown-worktree.sh",
         },
       }),
     ).toEqual({
       enabled: true,
+      sharedWorkspaceConcurrency: "serialize",
       defaultMode: "isolated_workspace",
       workspaceStrategy: {
         type: "git_worktree",
         worktreeParentDir: ".paperclip/worktrees",
         provisionCommand: "bash ./scripts/provision-worktree.sh",
+        runtimeProvisionCommand: "bash ./scripts/provision-runtime.sh",
         teardownCommand: "bash ./scripts/teardown-worktree.sh",
       },
     });
@@ -291,6 +612,40 @@ describe("execution workspace policy helpers", () => {
       mode: "shared_workspace",
       environmentId: "11111111-1111-4111-8111-111111111111",
     });
+    expect(
+      parseIssueExecutionWorkspaceSettings({
+        mode: "isolated_workspace",
+        sharedWorkspaceConcurrency: "allow",
+        networkEgress: {
+          allowFqdns: ["github.com", "pypi.org"],
+          allowCidrs: ["203.0.113.0/24"],
+        },
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      sharedWorkspaceConcurrency: "allow",
+      networkEgress: {
+        allowFqdns: ["github.com", "pypi.org"],
+        allowCidrs: ["203.0.113.0/24"],
+      },
+    });
+  });
+
+  it("keeps egress grants independent from isolated workspace mode", () => {
+    const parsedSettings = {
+      mode: "isolated_workspace" as const,
+      workspaceRuntime: { image: "example/image" },
+      networkEgress: {
+        allowFqdns: ["github.com"],
+        allowCidrs: ["203.0.113.0/24"],
+      },
+    };
+
+    expect(selectEnvironmentExecutionWorkspaceSettings(parsedSettings, false)).toEqual({
+      networkEgress: parsedSettings.networkEgress,
+    });
+    expect(selectEnvironmentExecutionWorkspaceSettings(parsedSettings, true)).toEqual(parsedSettings);
+    expect(selectEnvironmentExecutionWorkspaceSettings({ mode: "isolated_workspace" }, false)).toBeNull();
   });
 
   it("prefers the agent default environment", () => {

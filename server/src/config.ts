@@ -78,6 +78,7 @@ export interface Config {
   secretsProvider: SecretProvider;
   secretsStrictMode: boolean;
   secretsMasterKeyFilePath: string;
+  secretsDirWatchIntervalMs: number;
   storageProvider: StorageProvider;
   storageLocalDiskBaseDir: string;
   storageS3Bucket: string;
@@ -96,6 +97,7 @@ export interface Config {
   pendingReviewRearmMaxCount: number;
   recoveryActionWakeIntervalMs: number;
   companyDeletionEnabled: boolean;
+  externalObjectRefreshIntervalMs: number;
   telemetryEnabled: boolean;
 }
 
@@ -353,6 +355,10 @@ export function loadConfig(): Config {
           fileSecrets?.localEncrypted.keyFilePath ??
           resolveDefaultSecretsKeyFilePath(),
       ),
+    secretsDirWatchIntervalMs: Math.max(
+      30_000,
+      Number(process.env.PAPERCLIP_SECRETS_DIR_WATCH_INTERVAL_MS) || 5 * 60 * 1000,
+    ),
     storageProvider,
     storageLocalDiskBaseDir,
     storageS3Bucket,
@@ -371,6 +377,7 @@ export function loadConfig(): Config {
     pendingReviewRearmWindowMs: Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_REARM_WINDOW_MS) || 30 * 60 * 1000),
     pendingReviewRearmMaxCount: Math.max(1, Number(process.env.PENDING_REVIEW_REARM_MAX_COUNT) || 3),
     companyDeletionEnabled,
+    externalObjectRefreshIntervalMs: Math.max(60000, Number(process.env.EXTERNAL_OBJECT_REFRESH_INTERVAL_MS) || 60_000),
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }

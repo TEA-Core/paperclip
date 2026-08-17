@@ -51,10 +51,27 @@ jobs:
             exit 1
           fi
 
+      - name: Generate commitperclip token
+        id: bot-token
+        env:
+          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+        run: |
+          TOKEN=""
+          if [ -n "$COMMITPERCLIP_KEY" ]; then
+            if ! TOKEN="$(node .github/scripts/get-bot-token.mjs)"; then
+              echo "::warning::Failed to generate the commitperclip bot token; PR creation will be skipped."
+              TOKEN=""
+            fi
+          fi
+          if [ -n "$TOKEN" ]; then
+            echo "::add-mask::$TOKEN"
+          fi
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
       - name: Create or update pull request
         id: upsert-pr
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           if git diff --quiet -- pnpm-lock.yaml; then
@@ -75,6 +92,20 @@ jobs:
           git commit -m "chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}"
           git push --force origin "$BRANCH"
 
+          # The exact command a human runs to open the PR by hand. Emitted in the
+          # ::error:: remediation below so the pushed branch is never left unpointed.
+          PR_CMD="gh pr create --head \"${BRANCH}\" --base \"${BASE_REF}\" --title \"chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}\" --body \"Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml.\""
+
+          # The default GITHUB_TOKEN cannot create PRs in this org ("GitHub Actions
+          # is not permitted to create or approve pull requests"), so the bot token
+          # (commitperclip app installation) is required. Fail loudly rather than
+          # leaving an orphan branch with no pointer.
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error title=Lockfile PR not created::No bot token (COMMITPERCLIP_KEY) is available to open the PR. The refreshed lockfile was pushed to branch '${BRANCH}' but no PR was created. Open it manually with: ${PR_CMD}"
+            echo "pr_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Only reuse an open PR from this repository owner, not a fork with the same branch name.
           pr_url="$(
             gh pr list --state open --head "$BRANCH" --json url,headRepositoryOwner \
@@ -82,11 +113,16 @@ jobs:
             head -n 1
           )"
           if [ -z "$pr_url" ]; then
-            pr_url="$(gh pr create \
+            if ! gh pr create \
               --head "$BRANCH" \
               --base "$BASE_REF" \
               --title "chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}" \
-              --body "Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml.")"
+              --body "Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml." > "$RUNNER_TEMP/pr-create.out"; then
+              echo "::error title=Lockfile PR not created::Failed to open a PR for pushed branch '${BRANCH}'. Open it manually with: ${PR_CMD}"
+              echo "pr_url=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            pr_url="$(cat "$RUNNER_TEMP/pr-create.out")"
             echo "Created new PR: $pr_url"
           else
             echo "PR already exists: $pr_url"
@@ -94,7 +130,12 @@ jobs:
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
 
       - name: Enable auto-merge for lockfile PR
-        if: steps.upsert-pr.outputs.pr_url != '' && github.ref_name == 'master'
+        # The fold branch is the deployed line, so its regenerated lockfile must
+        # land without a manual merge too; otherwise the PR sits open and the
+        # branch becomes unbuildable (`Dockerfile` installs --frozen-lockfile).
+        if: >-
+          steps.upsert-pr.outputs.pr_url != '' &&
+          (github.ref_name == 'master' || startsWith(github.ref_name, 'fold/'))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -10,6 +10,7 @@ import {
   instanceUserRoles,
 } from "@paperclipai/db";
 import { conflict, forbidden, notFound } from "../errors.js";
+import type { BoardApiKeyScope } from "@paperclipai/shared";
 
 export const BOARD_API_KEY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const CLI_AUTH_CHALLENGE_TTL_MS = 10 * 60 * 1000;
@@ -164,6 +165,7 @@ export function boardAuthService(db: Db) {
     userId: string;
     name: string;
     expiresAt?: Date | null;
+    scope?: BoardApiKeyScope;
   }) {
     const token = createBoardApiToken();
     const created = await db
@@ -173,6 +175,7 @@ export function boardAuthService(db: Db) {
         name: input.name.trim(),
         keyHash: hashBearerToken(token),
         expiresAt: input.expiresAt === undefined ? boardApiKeyExpiresAt() : input.expiresAt,
+        scope: input.scope ?? "all_access",
       })
       .returning()
       .then((rows) => rows[0]);
@@ -185,6 +188,7 @@ export function boardAuthService(db: Db) {
       lastUsedAt: created.lastUsedAt,
       revokedAt: created.revokedAt,
       expiresAt: created.expiresAt,
+      scope: created.scope,
     };
   }
 
@@ -211,6 +215,7 @@ export function boardAuthService(db: Db) {
         lastUsedAt: boardApiKeys.lastUsedAt,
         revokedAt: boardApiKeys.revokedAt,
         expiresAt: boardApiKeys.expiresAt,
+        scope: boardApiKeys.scope,
       })
       .from(boardApiKeys)
       .where(and(...conditions))
@@ -227,6 +232,7 @@ export function boardAuthService(db: Db) {
         lastUsedAt: boardApiKeys.lastUsedAt,
         revokedAt: boardApiKeys.revokedAt,
         expiresAt: boardApiKeys.expiresAt,
+        scope: boardApiKeys.scope,
       })
       .from(boardApiKeys)
       .where(and(eq(boardApiKeys.id, keyId), eq(boardApiKeys.userId, userId)))

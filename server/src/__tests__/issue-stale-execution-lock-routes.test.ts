@@ -111,6 +111,22 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     return { companyId, agentId, failedRunId, currentRunId };
   }
 
+  /**
+   * Anchor the actor's run on the issue it is about to write to.
+   *
+   * Agent writes are contained per heartbeat run, and that guard fails closed on
+   * a run whose contextSnapshot names no issue — it cannot tell whether the
+   * write is cross-issue, so it refuses rather than leave the cap uncountable.
+   * The runs here are seeded before their issue exists, so they are stamped
+   * afterwards, which is also what a real run working the issue looks like.
+   */
+  async function anchorRunToIssue(runId: string, issueId: string) {
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, runId));
+  }
+
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
     return {
       type: "agent",
@@ -147,6 +163,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
     });
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
 
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)
@@ -261,6 +280,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
     });
+    await anchorRunToIssue(currentRunId, issueId);
 
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)
@@ -414,6 +434,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
     });
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
 
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)
@@ -769,6 +792,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
     });
+    await anchorRunToIssue(currentRunId, issueId);
 
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)

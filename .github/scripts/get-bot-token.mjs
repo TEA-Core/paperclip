@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * get-bot-token.mjs
- * Generates a short-lived GitHub installation token for the commitperclip app.
+ * Generates a short-lived GitHub installation token for the tea-core app (APP_ID 4595159).
  * Reads COMMITPERCLIP_KEY env var (PEM content of private key).
  * Prints the token to stdout.
  *
@@ -11,7 +11,9 @@
 import { createSign } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const APP_ID = '3718661';
+// tea-core app id (board-ratified on SUP-13003); COMMITPERCLIP_KEY holds the
+// tea-core private key despite the legacy env-var name.
+const APP_ID = '4595159';
 const OWNER_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 const REPO_PATTERN = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
 
@@ -72,7 +74,7 @@ export async function resolveInstallationId(fetchInstallation, token, repo, owne
   const installations = await fetchInstallation('/app/installations', token);
   if (!installations.length) {
     throw new Error(
-      'ERROR: No installations found for commitperclip. Install URL: https://github.com/apps/commitperclip/installations/new'
+      'ERROR: No installations found for tea-core. Install URL: https://github.com/apps/tea-core/installations/new'
     );
   }
 
@@ -95,15 +97,16 @@ export async function resolveInstallationId(fetchInstallation, token, repo, owne
   }
 
   throw new Error(
-    'ERROR: Multiple commitperclip installations found. Set GH_REPO or GITHUB_REPOSITORY so the correct installation can be selected.'
+    'ERROR: Multiple tea-core installations found. Set GH_REPO or GITHUB_REPOSITORY so the correct installation can be selected.'
   );
 }
 
 async function main() {
+  // COMMITPERCLIP_KEY is the board-ratified secret name; it holds the tea-core app key.
   const privateKey = process.env.COMMITPERCLIP_KEY;
   if (!privateKey) {
     console.error('ERROR: COMMITPERCLIP_KEY env var not set.');
-    console.error('Add to ~/.bash_profile: export COMMITPERCLIP_KEY="$(cat ~/.config/commitperclip/private-key.pem)"');
+    console.error('Add to ~/.bash_profile: export COMMITPERCLIP_KEY="$(cat ~/.config/tea-core/private-key.pem)"');
     process.exit(1);
   }
 

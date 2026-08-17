@@ -21,6 +21,7 @@ import {
   issues,
   projectWorkspaces,
   projects,
+  workspaceOperations,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
@@ -37,11 +38,15 @@ import {
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   preserveUnpushedWorktreeCommits,
+  prepareBaseRepoForWorkspace,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
+  refreshRemoteTrackingBaseRef,
   releaseRuntimeServicesForRun,
   resolveBaseRepoHygieneDecision,
+  resolvePnpmLockfileMismatchRetryCommand,
   resetRuntimeServicesForTests,
+  resolveRuntimeProvisionCommand,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
@@ -57,9 +62,16 @@ import {
   readLocalServicePortOwner,
   writeLocalServiceRegistryRecord,
 } from "../services/local-service-supervisor.ts";
+import {
+  buildWorkspaceRealizationRecord,
+  buildWorkspaceRealizationRequest,
+  readWorkspaceRealizationRequest,
+} from "../services/workspace-realization.ts";
+import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { resolvePaperclipConfigPath } from "../paths.ts";
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.ts";
+import { deriveWorktreeInstanceId } from "../services/workspace-instance-cleanup.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -288,6 +300,27 @@ async function advanceRemoteMaster(sourceRepo: string, remotePath: string, fileN
   await runGit(sourceRepo, ["commit", "-m", `Add ${fileName}`]);
   await runGit(sourceRepo, ["push", remotePath, "master"]);
   return readGit(sourceRepo, ["rev-parse", "master"]);
+}
+
+async function advanceRemoteBranch(
+  sourceRepo: string,
+  remotePath: string,
+  branch: string,
+  fileName: string,
+) {
+  const branchExists = await runGit(sourceRepo, ["rev-parse", `--verify`, branch])
+    .then(() => true)
+    .catch(() => false);
+  if (!branchExists) {
+    await runGit(sourceRepo, ["checkout", "-b", branch]);
+  } else {
+    await runGit(sourceRepo, ["checkout", branch]);
+  }
+  await fs.writeFile(path.join(sourceRepo, fileName), `${fileName}\n`, "utf8");
+  await runGit(sourceRepo, ["add", fileName]);
+  await runGit(sourceRepo, ["commit", "-m", `Add ${fileName}`]);
+  await runGit(sourceRepo, ["push", remotePath, branch]);
+  return readGit(sourceRepo, ["rev-parse", branch]);
 }
 
 function realizeWorktreeForTest(repoRoot: string, repoRef: string | null) {
@@ -647,6 +680,77 @@ describe("sanitizeRuntimeServiceBaseEnv", () => {
     expect(sanitized.npm_config_tailscale_auth).toBeUndefined();
     expect(sanitized.npm_config_authenticated_private).toBeUndefined();
     expect(sanitized.HOST).toBe("0.0.0.0");
+  });
+});
+
+describe("resolveRuntimeProvisionCommand", () => {
+  it("backfills deferred seeding for legacy managed git worktrees", async () => {
+    const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-"));
+    const cwd = path.join(baseCwd, "worktree");
+    try {
+      await fs.mkdir(path.join(baseCwd, "scripts"), { recursive: true });
+      await fs.writeFile(
+        path.join(baseCwd, "scripts", "provision-worktree-runtime.sh"),
+        "#!/usr/bin/env bash\n",
+      );
+      await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+      await fs.writeFile(path.join(cwd, ".paperclip", "seed-pending"), "{}\n");
+      const workspace = {
+        ...buildWorkspace(cwd),
+        baseCwd,
+        strategy: "git_worktree" as const,
+        worktreePath: cwd,
+      };
+
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
+      expect(resolveRuntimeProvisionCommand({
+        config: { runtimeProvisionCommand: "./custom-provision.sh" },
+        workspace,
+      })).toBe("./custom-provision.sh");
+
+      await fs.writeFile(path.join(cwd, ".paperclip", "seed-complete"), "{}\n");
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+    } finally {
+      await fs.rm(baseCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("refreshRemoteTrackingBaseRef git auth", () => {
+  it("offers the remote URL to the provider and keeps ambient behavior when it returns null", async () => {
+    const { remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const offeredUrls: string[] = [];
+    const warnings = await refreshRemoteTrackingBaseRef(repoRoot, "origin/master", async (remoteUrl) => {
+      offeredUrls.push(remoteUrl);
+      return null;
+    });
+    expect(warnings).toEqual([]);
+    expect(offeredUrls).toEqual([remotePath]);
+  });
+
+  it("attributes a failed authenticated fetch to the credential that was used", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await runGit(repoRoot, ["remote", "set-url", "origin", path.join(os.tmpdir(), "paperclip-missing-remote", "repo.git")]);
+    const warnings = await refreshRemoteTrackingBaseRef(repoRoot, "origin/master", async () => ({
+      configArgs: [],
+      env: { GIT_TERMINAL_PROMPT: "0" },
+      source: "company_secret",
+      secretName: "GH_TOKEN",
+    }));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("Could not refresh base ref origin/master");
+    expect(warnings[0]).toContain("the GH_TOKEN company-secret GitHub credential");
+  });
+
+  it("keeps the unauthenticated failure warning credential-free without a provider", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await runGit(repoRoot, ["remote", "set-url", "origin", path.join(os.tmpdir(), "paperclip-missing-remote", "repo.git")]);
+    const warnings = await refreshRemoteTrackingBaseRef(repoRoot, "origin/master");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("Could not refresh base ref origin/master");
+    expect(warnings[0]).not.toContain("GitHub credential");
   });
 });
 
@@ -1014,6 +1118,21 @@ describe("realizeExecutionWorkspace", () => {
     expect(existsSync(untracked)).toBe(true);
   });
 
+  it("fast-forwards a clean base repo that is behind the base ref", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const advancedHead = await advanceRemoteMaster(sourceRepo, remotePath, "advanced-file.txt");
+
+    const untracked = path.join(repoRoot, "untracked-keepme.txt");
+    await fs.writeFile(untracked, "not ours to delete\n", "utf8");
+
+    await realizeWorktreeForTest(repoRoot, "master");
+
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
+    expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(advancedHead);
+    expect(existsSync(untracked)).toBe(true);
+    expect(await readGit(repoRoot, ["symbolic-ref", "--short", "HEAD"])).toBe("master");
+  });
+
   describe("base repo hygiene decision", () => {
     it("returns ok when the base repo is cleanly detached at the base ref", () => {
       expect(
@@ -1112,6 +1231,174 @@ describe("realizeExecutionWorkspace", () => {
         );
       }
     });
+
+    it("returns fastForward when clean, on default ref, and behind", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+        headBehindBaseRef: true,
+      });
+      expect(decision).toEqual({ action: "fastForward" });
+    });
+
+    it("still restores when dirty tracked and behind", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 1,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+        headBehindBaseRef: true,
+      });
+      expect(decision.action).toBe("restore");
+      if (decision.action === "restore") {
+        expect(decision.reasons).toEqual(
+          expect.arrayContaining([expect.stringContaining("1 modified tracked path(s)")]),
+        );
+        expect(decision.snapshotTrackedChanges).toBe(true);
+      }
+    });
+
+    it("returns ok when ahead/behind counts are unknown", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+        headBehindBaseRef: false,
+      });
+      expect(decision).toEqual({ action: "ok" });
+    });
+
+    it("returns diverged when ahead and behind counts are both positive", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "a",
+        baseRefSha: "b",
+        headBehindBaseRef: false,
+        aheadCount: 1,
+        behindCount: 85,
+        aheadCommitSubjects: ["docs(...)"],
+      });
+      expect(decision).toEqual({
+        action: "diverged",
+        aheadCount: 1,
+        behindCount: 85,
+        aheadCommitSubjects: ["docs(...)"],
+      });
+    });
+
+    it("returns ok (silent) when ahead-only with behind=0", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "a",
+        baseRefSha: "b",
+        headBehindBaseRef: false,
+        aheadCount: 3,
+        behindCount: 0,
+        aheadCommitSubjects: ["feat: something"],
+      });
+      expect(decision).toEqual({ action: "ok" });
+    });
+
+    it("returns ok when diverged (not behind)", () => {
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: "main",
+        defaultRef: "main",
+        dirtyTrackedPathCount: 0,
+        unmergedPathCount: 0,
+        headSha: "abc123",
+        baseRefSha: "def456",
+        headBehindBaseRef: false,
+      });
+      expect(decision).toEqual({ action: "ok" });
+    });
+  });
+
+  it("warns when the base repo is ahead of the base ref (clean, not behind)", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "ahead.txt"), "ahead\n", "utf8");
+    await runGit(repoRoot, ["add", "ahead.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Ahead commit"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const aheadWarning = workspace.warnings.find((w) =>
+      w.includes("is ahead of") && w.includes("commit(s) ahead"),
+    );
+    expect(aheadWarning).toBeDefined();
+    expect(aheadWarning).toContain(repoRoot);
+    expect(aheadWarning).toContain("1 commit(s) ahead");
+    expect(aheadWarning).toContain("Ahead commits: Ahead commit");
+  });
+
+  it("warns when the base repo has diverged from the base ref (ahead and behind)", async () => {
+    const { repoRoot, remotePath } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "ahead.txt"), "ahead\n", "utf8");
+    await runGit(repoRoot, ["add", "ahead.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Ahead commit"]);
+    await runGit(repoRoot, ["push", remotePath, "master"]);
+
+    await runGit(repoRoot, ["reset", "--hard", "HEAD~1"]);
+    await fs.writeFile(path.join(repoRoot, "diverged.txt"), "diverged\n", "utf8");
+    await runGit(repoRoot, ["add", "diverged.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Diverged commit"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const divergedWarning = workspace.warnings.find((w) =>
+      w.includes("has diverged from") && w.includes("behind"),
+    );
+    expect(divergedWarning).toBeDefined();
+    expect(divergedWarning).toContain(repoRoot);
+    expect(divergedWarning).toContain("1 ahead");
+    expect(divergedWarning).toContain("1 behind");
+    expect(divergedWarning).toContain("Ahead commits: Diverged commit");
+  });
+
+  it("does not emit an ahead/diverged warning when the base repo is clean and in sync", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const aheadWarning = workspace.warnings.find((w) => w.includes("is ahead of"));
+    expect(aheadWarning).toBeUndefined();
+  });
+
+  it("does not emit an ahead/diverged warning when the base repo is clean and behind (fastForward)", async () => {
+    const { repoRoot, remotePath } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "remote.txt"), "remote\n", "utf8");
+    await runGit(repoRoot, ["add", "remote.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Remote commit"]);
+    await runGit(repoRoot, ["push", remotePath, "master"]);
+    await runGit(repoRoot, ["reset", "--hard", "HEAD~1"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    expect(workspace.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    const aheadWarning = workspace.warnings.find((w) => w.includes("is ahead of"));
+    expect(aheadWarning).toBeUndefined();
+  });
+
+  it("does not emit an ahead/diverged warning when the base repo is dirty (restore)", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "README.md"), "dirty\n", "utf8");
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    expect(workspace.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+    const aheadWarning = workspace.warnings.find((w) => w.includes("is ahead of"));
+    expect(aheadWarning).toBeUndefined();
   });
 
   it("does not restore a base repo already at the base ref on a second dispatch (detached HEAD case)", async () => {
@@ -1218,6 +1505,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(advancedHead);
     expect(reused.baseRefSha).toBe(advancedHead);
     expect(reused.warnings).toEqual([
+      expect.stringContaining("was fast-forwarded to"),
       expect.stringContaining("No baseRef configured"),
     ]);
   });
@@ -1238,6 +1526,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.created).toBe(false);
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(taskHead);
     expect(reused.warnings).toEqual([
+      expect.stringContaining("was fast-forwarded to"),
       expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
@@ -1260,6 +1549,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
+      expect.stringContaining("was fast-forwarded to"),
       expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
@@ -1286,6 +1576,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
+      expect.stringContaining("was fast-forwarded to"),
       expect.stringContaining("No baseRef configured"),
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
@@ -2008,7 +2299,7 @@ describe("realizeExecutionWorkspace", () => {
       const envContents = await fs.readFile(envPath, "utf8");
       const configContents = JSON.parse(await fs.readFile(configPath, "utf8"));
       const configStats = await fs.lstat(configPath);
-      const expectedInstanceId = "pap-885-show-worktree-banner";
+      const expectedInstanceId = deriveWorktreeInstanceId(workspace.cwd);
       const expectedInstanceRoot = path.join(
         isolatedWorktreeHome,
         "instances",
@@ -2562,6 +2853,169 @@ describe("realizeExecutionWorkspace", () => {
     }
   });
 
+  // SUP-12984: a branch that only edits pnpm settings inside package.json (overrides,
+  // patchedDependencies) fails the frozen install with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH,
+  // not ERR_PNPM_OUTDATED_LOCKFILE. The retry above matched only the latter, so those
+  // branches were unprovisionable and no agent run could launch on them.
+  it("retries worktree-local pnpm install when the lockfile config mismatches the branch manifests", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-lockfile-config-mismatch-"));
+    const baseRoot = path.join(tempRoot, "base");
+    const worktreeRoot = path.join(tempRoot, "worktree");
+    const fakeBin = path.join(tempRoot, "bin");
+    const fakePnpmPath = path.join(fakeBin, "pnpm");
+    const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
+
+    try {
+      await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
+      await fs.mkdir(worktreeRoot, { recursive: true });
+      await fs.mkdir(fakeBin, { recursive: true });
+      await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
+      await fs.chmod(scriptPath, 0o755);
+      await fs.writeFile(
+        path.join(worktreeRoot, "package.json"),
+        JSON.stringify(
+          {
+            name: "workspace-root",
+            private: true,
+            packageManager: "pnpm@9.15.4",
+            pnpm: { overrides: { undici: "5.29.0" } },
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(worktreeRoot, "pnpm-lock.yaml"),
+        ["lockfileVersion: '9.0'", "", "importers:", "  .: {}", ""].join("\n"),
+        "utf8",
+      );
+      await fs.writeFile(
+        fakePnpmPath,
+        [
+          "#!/bin/sh",
+          "if [ \"$1\" = \"paperclipai\" ] && [ \"$2\" = \"--help\" ]; then",
+          "  exit 1",
+          "fi",
+          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--frozen-lockfile\" ]; then",
+          "  echo \" ERR_PNPM_LOCKFILE_CONFIG_MISMATCH  Cannot proceed with the frozen installation.\" >&2",
+          "  exit 1",
+          "fi",
+          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--no-frozen-lockfile\" ]; then",
+          "  mkdir -p \"$PWD/node_modules\"",
+          "  : > \"$PWD/node_modules/.retry-success\"",
+          "  exit 0",
+          "fi",
+          "exit 0",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await fs.chmod(fakePnpmPath, 0o755);
+
+      const result = await execFileAsync(scriptPath, [], {
+        cwd: worktreeRoot,
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
+          PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
+        },
+      });
+
+      expect(result.stderr).toContain("retrying install without --frozen-lockfile");
+      await expect(fs.readFile(path.join(worktreeRoot, "node_modules", ".retry-success"), "utf8")).resolves.toBe("");
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  // SUP-12984 negative control: the retry must be scoped to lockfile-vs-manifest
+  // disagreement. An unrelated install failure (registry fetch, missing peer, EACCES)
+  // must NOT be silently re-run with --no-frozen-lockfile -- that would rewrite the
+  // lockfile in the worktree and mask a real breakage as a provisioning success.
+  it("does not retry worktree-local pnpm install without a frozen lockfile on an unrelated failure", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-unrelated-install-failure-"));
+    const baseRoot = path.join(tempRoot, "base");
+    const worktreeRoot = path.join(tempRoot, "worktree");
+    const fakeBin = path.join(tempRoot, "bin");
+    const fakePnpmPath = path.join(fakeBin, "pnpm");
+    const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
+
+    try {
+      await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
+      await fs.mkdir(worktreeRoot, { recursive: true });
+      await fs.mkdir(fakeBin, { recursive: true });
+      await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
+      await fs.chmod(scriptPath, 0o755);
+      await fs.writeFile(
+        path.join(worktreeRoot, "package.json"),
+        JSON.stringify(
+          {
+            name: "workspace-root",
+            private: true,
+            packageManager: "pnpm@9.15.4",
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(worktreeRoot, "pnpm-lock.yaml"),
+        ["lockfileVersion: '9.0'", "", "importers:", "  .: {}", ""].join("\n"),
+        "utf8",
+      );
+      await fs.writeFile(
+        fakePnpmPath,
+        [
+          "#!/bin/sh",
+          "if [ \"$1\" = \"paperclipai\" ] && [ \"$2\" = \"--help\" ]; then",
+          "  exit 1",
+          "fi",
+          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--frozen-lockfile\" ]; then",
+          "  echo \" ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/nope: Not Found - 404\" >&2",
+          "  exit 1",
+          "fi",
+          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--no-frozen-lockfile\" ]; then",
+          "  mkdir -p \"$PWD/node_modules\"",
+          "  : > \"$PWD/node_modules/.retry-success\"",
+          "  exit 0",
+          "fi",
+          "exit 0",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await fs.chmod(fakePnpmPath, 0o755);
+
+      const failure = await execFileAsync(scriptPath, [], {
+        cwd: worktreeRoot,
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
+          PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
+        },
+      }).then(
+        () => null,
+        (error: Error & { code?: number; stderr?: string }) => error,
+      );
+
+      // The script must surface the original failure, not swallow it.
+      expect(failure).not.toBeNull();
+      expect(failure?.code).toBe(1);
+      expect(failure?.stderr ?? "").toContain("ERR_PNPM_FETCH_404");
+      expect(failure?.stderr ?? "").not.toContain("retrying install without --frozen-lockfile");
+      // The --no-frozen-lockfile branch of the fake pnpm was never reached.
+      await expect(fs.readFile(path.join(worktreeRoot, "node_modules", ".retry-success"), "utf8")).rejects.toThrow(
+        /ENOENT/,
+      );
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it(
     "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
     async () => {
@@ -2915,6 +3369,143 @@ describe("realizeExecutionWorkspace", () => {
     const actualHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: initial.cwd })).stdout.trim();
     expect(actualHead).toBe(expectedHead);
   }, 15_000);
+
+  // SUP-13090: SUP-12986 and SUP-12996 failed EVERY dispatch in ~8s because their reused
+  // execution workspaces run the inline provisionCommand
+  // `corepack enable && pnpm install --frozen-lockfile --prefer-offline`, which never reaches
+  // scripts/provision-worktree.sh and so never inherited SUP-12984's lockfile-mismatch retry.
+  describe("pnpm lockfile-mismatch provision retry (SUP-13090)", () => {
+    it("rewrites the frozen flag for both pnpm lockfile-mismatch codes and nothing else", () => {
+      const command = "corepack enable && pnpm install --frozen-lockfile --prefer-offline";
+      const expected = "corepack enable && pnpm install --no-frozen-lockfile --prefer-offline";
+
+      expect(resolvePnpmLockfileMismatchRetryCommand(command, "x ERR_PNPM_LOCKFILE_CONFIG_MISMATCH y")).toBe(expected);
+      expect(resolvePnpmLockfileMismatchRetryCommand(command, "x ERR_PNPM_OUTDATED_LOCKFILE y")).toBe(expected);
+
+      // Not a lockfile mismatch — must not be retried.
+      expect(resolvePnpmLockfileMismatchRetryCommand(command, "ERR_PNPM_FETCH_404 Not Found")).toBeNull();
+      // Nothing to rewrite: retrying would re-run the identical command forever.
+      expect(
+        resolvePnpmLockfileMismatchRetryCommand("pnpm install --no-frozen-lockfile", "ERR_PNPM_OUTDATED_LOCKFILE"),
+      ).toBeNull();
+      expect(
+        resolvePnpmLockfileMismatchRetryCommand("pnpm install --frozen-lockfile=false", "ERR_PNPM_OUTDATED_LOCKFILE"),
+      ).toBeNull();
+    });
+
+    async function setUpReusableWorkspaceWithProvisionScript(input: {
+      identifier: string;
+      scriptBody: string[];
+    }) {
+      const repoRoot = await createTempRepo();
+      const scriptPath = path.join(repoRoot, "..", `paperclip-fake-install-${randomUUID()}.sh`);
+      await fs.writeFile(scriptPath, ["#!/usr/bin/env bash", ...input.scriptBody].join("\n"), "utf8");
+      await fs.chmod(scriptPath, 0o755);
+
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+        },
+        issue: { id: "issue-1", identifier: input.identifier, title: "Reuse with provision command" },
+        agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      });
+
+      const reuse = (provisionCommand: string, recorder: WorkspaceOperationRecorder) =>
+        ensurePersistedExecutionWorkspaceAvailable({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-1",
+            workspaceId: "workspace-1",
+            repoUrl: null,
+            repoRef: "HEAD",
+          },
+          workspace: {
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            cwd: workspace.cwd,
+            providerRef: workspace.worktreePath,
+            projectId: "project-1",
+            projectWorkspaceId: "workspace-1",
+            repoUrl: null,
+            baseRef: "HEAD",
+            branchName: workspace.branchName,
+            config: { provisionCommand },
+          },
+          issue: { id: "issue-1", identifier: input.identifier, title: "Reuse with provision command" },
+          agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+          recorder,
+        });
+
+      return { repoRoot, workspace, scriptPath, reuse };
+    }
+
+    it("retries the reuse provision command without --frozen-lockfile on ERR_PNPM_LOCKFILE_CONFIG_MISMATCH", async () => {
+      const { workspace, scriptPath, reuse } = await setUpReusableWorkspaceWithProvisionScript({
+        identifier: "PAP-13090",
+        scriptBody: [
+          "set -uo pipefail",
+          'printf "%s\\n" "$*" >> .provision-attempts',
+          'for arg in "$@"; do',
+          '  if [[ "$arg" == "--no-frozen-lockfile" ]]; then',
+          '    printf "installed\\n" > .provision-succeeded',
+          "    exit 0",
+          "  fi",
+          "done",
+          'printf "%s\\n" " ERR_PNPM_LOCKFILE_CONFIG_MISMATCH  Cannot proceed with the frozen installation. The current \\"overrides\\" configuration doesn\'t match the value found in the lockfile" >&2',
+          "exit 1",
+        ],
+      });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+      const restored = await reuse(`bash ${scriptPath} --frozen-lockfile --prefer-offline`, recorder);
+
+      expect(restored).not.toBeNull();
+      await expect(fs.readFile(path.join(workspace.cwd, ".provision-succeeded"), "utf8")).resolves.toBe("installed\n");
+      // Both attempts ran, in order, and only the second dropped the frozen flag.
+      await expect(fs.readFile(path.join(workspace.cwd, ".provision-attempts"), "utf8")).resolves.toBe(
+        ["--frozen-lockfile --prefer-offline", "--no-frozen-lockfile --prefer-offline", ""].join("\n"),
+      );
+      const provisionOps = operations.filter((op) => op.phase === "workspace_provision");
+      expect(provisionOps).toHaveLength(2);
+      expect(provisionOps[0]?.result.status).toBe("failed");
+      expect(provisionOps[0]?.metadata?.lockfileMismatchRetry).toBeUndefined();
+      expect(provisionOps[1]?.result.status).toBe("succeeded");
+      expect(provisionOps[1]?.metadata?.lockfileMismatchRetry).toBe(true);
+    }, 15_000);
+
+    // Negative control: a provision failure that is NOT a lockfile mismatch must still fail the
+    // dispatch. A blanket retry would mask registry 404s, EACCES, and missing peers.
+    it("does not retry a provision failure that is not a lockfile mismatch", async () => {
+      const { workspace, scriptPath, reuse } = await setUpReusableWorkspaceWithProvisionScript({
+        identifier: "PAP-13091",
+        scriptBody: [
+          "set -uo pipefail",
+          'printf "%s\\n" "$*" >> .provision-attempts',
+          'printf "%s\\n" " ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/nope: Not Found" >&2',
+          "exit 1",
+        ],
+      });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+      await expect(reuse(`bash ${scriptPath} --frozen-lockfile --prefer-offline`, recorder)).rejects.toThrow(
+        /ERR_PNPM_FETCH_404/,
+      );
+
+      await expect(fs.readFile(path.join(workspace.cwd, ".provision-attempts"), "utf8")).resolves.toBe(
+        "--frozen-lockfile --prefer-offline\n",
+      );
+      expect(operations.filter((op) => op.phase === "workspace_provision")).toHaveLength(1);
+    }, 15_000);
+  });
 
   it("repairs a clean persisted git worktree branch mismatch when both branches point at the same commit", async () => {
     const repoRoot = await createTempRepo();
@@ -3348,7 +3939,7 @@ describe("realizeExecutionWorkspace", () => {
       .resolves.toBe("Add actual branch work");
   }, 15_000);
 
-  it("classifies persisted git worktree branch incoherence as unknown when the recorded branch was deleted", async () => {
+  it("routes a deleted recorded branch with a clean worktree to forward adoption when reconcile-forward is enabled", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-458-deleted-recorded-branch";
     const actualBranch = "PAP-458-actual-work";
@@ -3398,6 +3989,8 @@ describe("realizeExecutionWorkspace", () => {
       error = err;
     }
 
+    // Without a database the adoption cannot be audited, so it still fails closed —
+    // but through the forward-adoption path rather than "expected branch does not exist".
     expect(error).toMatchObject({
       code: "workspace_validation_failed",
       resultJson: {
@@ -3416,6 +4009,76 @@ describe("realizeExecutionWorkspace", () => {
             sameHead: false,
             ancestryVerdict: "unknown",
             plainLanguageReason: expect.stringContaining("missing a resolvable HEAD commit"),
+          }),
+          safeRepair: expect.objectContaining({
+            attempted: false,
+            succeeded: false,
+            reason: "forward reconciliation adoption requires database access to audit after workspace realization",
+          }),
+        }),
+      },
+    });
+  }, 15_000);
+
+  it("keeps a deleted recorded branch fail-closed when reconcile-forward is disabled", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-458-deleted-recorded-branch-flag-off";
+    const actualBranch = "PAP-458-actual-work-flag-off";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+
+    let error: unknown = null;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          id: "execution-workspace-deleted-branch-flag-off",
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: worktreePath,
+          providerRef: worktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-1",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName: expectedBranch,
+        },
+        issue: {
+          id: "issue-deleted-branch-flag-off",
+          identifier: "PAP-458",
+          title: "Classify deleted branch ancestry",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+        enableWorkspaceBranchReconcileForward: false,
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          provenance: expect.objectContaining({
+            expectedBranchExists: false,
+            actualBranchExists: true,
+            ancestryVerdict: "unknown",
           }),
           safeRepair: expect.objectContaining({
             eligible: false,
@@ -3473,7 +4136,12 @@ describe("realizeExecutionWorkspace", () => {
         name: "Codex Coder",
         companyId: "company-1",
       },
-      enableWorkspaceBranchReconcileForward: true,
+      // Reconcile-forward off on purpose. With it on, a missing recorded branch over a
+      // clean registered branch is handled by forward adoption, which shadows this
+      // narrower default-branch rebind and needs a database to audit itself with; that
+      // path is covered by the deleted-branch adoption test above. Off, the rebind this
+      // test exists for is the code that runs, and it still needs no database.
+      enableWorkspaceBranchReconcileForward: false,
     });
 
     expect(result.branchName).toBe("main");
@@ -3582,7 +4250,13 @@ describe("realizeExecutionWorkspace", () => {
       issueId: "issue-unrelated-deleted",
       executionWorkspaceId: "execution-workspace-unrelated-deleted",
       expectedAncestryVerdict: "unknown",
-      expectedReason: "expected branch does not exist",
+      // Same shape as the sibling deleted-branch case above: the recorded branch is
+      // gone and the worktree is clean on its registered branch, so this now enters
+      // the forward-adoption path, which fails closed here because there is no
+      // database to audit the adoption with. The refusal itself is unchanged
+      // (eligible/attempted/succeeded stay false), and the flag-off test still pins
+      // the "expected branch does not exist" refusal.
+      expectedReason: "forward reconciliation adoption requires database access to audit after workspace realization",
     });
   }, 15_000);
 
@@ -4272,6 +4946,70 @@ describe("realizeExecutionWorkspace", () => {
     });
   });
 
+  it("keeps a runtime-created branch when its tip changes after guarded worktree removal", async () => {
+    const repoRoot = await createTempRepo();
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-450",
+        title: "Race branch cleanup",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+    const expectedHeadSha = await readGit(workspace.cwd, ["rev-parse", "HEAD"]);
+    await fs.writeFile(path.join(repoRoot, "raced.txt"), "new work\n", "utf8");
+    await runGit(repoRoot, ["add", "raced.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Raced branch update"]);
+    const racedHeadSha = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: workspace.cwd,
+        providerType: "git_worktree",
+        providerRef: workspace.worktreePath,
+        branchName: workspace.branchName,
+        repoUrl: workspace.repoUrl,
+        baseRef: workspace.repoRef,
+        projectId: workspace.projectId,
+        projectWorkspaceId: workspace.workspaceId,
+        sourceIssueId: "issue-1",
+        metadata: { createdByRuntime: true },
+      },
+      projectWorkspace: {
+        cwd: repoRoot,
+        cleanupCommand: null,
+      },
+      expectedBranchHeadSha: expectedHeadSha,
+      beforeBranchDelete: async () => {
+        await runGit(repoRoot, ["update-ref", `refs/heads/${workspace.branchName}`, racedHeadSha]);
+      },
+    });
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.warnings).toHaveLength(1);
+    expect(cleanup.warnings[0]).toContain(`Skipped deleting branch "${workspace.branchName}"`);
+    expect(await readGit(repoRoot, ["rev-parse", `refs/heads/${workspace.branchName}`])).toBe(racedHeadSha);
+  });
+
   it("keeps an unmerged runtime-created branch and warns instead of force deleting it", async () => {
     const repoRoot = await createTempRepo();
 
@@ -4502,6 +5240,18 @@ describe("realizeExecutionWorkspace", () => {
       },
     });
 
+    const worktreesDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cleanup-instances-"));
+    const instanceId = deriveWorktreeInstanceId(workspace.cwd);
+    const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+    await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
+    await fs.mkdir(path.join(workspace.cwd, ".paperclip"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspace.cwd, ".paperclip", ".env"),
+      `PAPERCLIP_HOME=${JSON.stringify(worktreesDir)}\nPAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}\n`,
+      "utf8",
+    );
+    process.env.PAPERCLIP_WORKTREES_DIR = worktreesDir;
+
     await cleanupExecutionWorkspaceArtifacts({
       workspace: {
         id: "execution-workspace-1",
@@ -4516,6 +5266,7 @@ describe("realizeExecutionWorkspace", () => {
         sourceIssueId: "issue-1",
         metadata: {
           createdByRuntime: true,
+          worktreeInstanceRoot: instanceRoot,
         },
       },
       projectWorkspace: {
@@ -4527,16 +5278,29 @@ describe("realizeExecutionWorkspace", () => {
 
     expect(operations.map((operation) => operation.phase)).toEqual([
       "workspace_teardown",
+      "workspace_teardown",
+      "worktree_cleanup",
       "worktree_cleanup",
       "worktree_cleanup",
     ]);
     expect(operations[0]?.command).toBe("printf 'cleanup ok\\n'");
     expect(operations[1]?.metadata).toMatchObject({
+      cleanupAction: "remove_worktree_instance",
+      instanceRoot,
+    });
+    // The `.paperclip/.env` written above leaves the worktree dirty, so cleanup
+    // now rescues that uncommitted work on a rescue ref before removing it.
+    expect(operations[2]?.metadata).toMatchObject({
+      cleanupAction: "preserve_uncommitted_work",
+    });
+    expect(operations[3]?.metadata).toMatchObject({
       cleanupAction: "worktree_remove",
     });
-    expect(operations[2]?.metadata).toMatchObject({
+    expect(operations[4]?.metadata).toMatchObject({
       cleanupAction: "branch_delete",
     });
+    await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    await fs.rm(worktreesDir, { recursive: true, force: true });
   });
 
   describe("default branch guard", () => {
@@ -4644,6 +5408,190 @@ describe("realizeExecutionWorkspace", () => {
 });
 
 describe("ensureRuntimeServicesForRun", () => {
+  function configureRuntimeProvisionTestHome(workspaceRoot: string, suffix: string) {
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = workspaceRoot;
+    process.env.PAPERCLIP_INSTANCE_ID = `${suffix}-${randomUUID()}`;
+    return () => {
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+    };
+  }
+
+  function runtimeProvisionTestConfig(input: {
+    provisionCommand?: string;
+    serviceCommand?: string;
+  }) {
+    return {
+      ...(input.provisionCommand
+        ? { runtimeProvisionCommand: input.provisionCommand }
+        : {}),
+      workspaceRuntime: {
+        services: [
+          {
+            name: "web",
+            command:
+              input.serviceCommand
+              ?? `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setInterval(() => {}, 1000)")}`,
+            lifecycle: "shared",
+            reuseScope: "execution_workspace",
+            stopPolicy: { type: "manual" },
+          },
+        ],
+      },
+    };
+  }
+
+  function runtimeProvisionStartInput(input: {
+    workspace: RealizedExecutionWorkspace;
+    config: Record<string, unknown>;
+    recorder?: WorkspaceOperationRecorder;
+    onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  }) {
+    return {
+      invocationId: randomUUID(),
+      actor: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-16073",
+        title: "Lazy runtime provision",
+      },
+      workspace: input.workspace,
+      executionWorkspaceId: "execution-workspace-1",
+      config: input.config,
+      adapterEnv: {},
+      recorder: input.recorder,
+      onLog: input.onLog,
+    };
+  }
+
+  it("runs runtime provisioning once when service starts race for the same workspace", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-race-"));
+    const restorePaperclipEnv = configureRuntimeProvisionTestHome(workspaceRoot, "runtime-provision-race");
+    const counterPath = path.join(workspaceRoot, "runtime-provision-count.txt");
+    const provisionScript = [
+      "const fs = require('node:fs');",
+      `fs.appendFileSync(${JSON.stringify(counterPath)}, 'run\\n');`,
+      "setTimeout(() => {}, 250);",
+    ].join(" ");
+    const config = runtimeProvisionTestConfig({
+      provisionCommand: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(provisionScript)}`,
+    });
+    const workspace = buildWorkspace(workspaceRoot);
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    try {
+      const [first, second] = await Promise.all([
+        startRuntimeServicesForWorkspaceControl(runtimeProvisionStartInput({ workspace, config, recorder })),
+        startRuntimeServicesForWorkspaceControl(runtimeProvisionStartInput({ workspace, config, recorder })),
+      ]);
+
+      expect(first).toHaveLength(1);
+      expect(second).toHaveLength(1);
+      expect((await fs.readFile(counterPath, "utf8")).trim().split("\n")).toEqual(["run"]);
+      expect(operations.filter((operation) => operation.phase === "workspace_runtime_provision")).toHaveLength(1);
+
+      await stopRuntimeServicesForExecutionWorkspace({
+        executionWorkspaceId: "execution-workspace-1",
+        workspaceCwd: workspaceRoot,
+      });
+      await startRuntimeServicesForWorkspaceControl(
+        runtimeProvisionStartInput({ workspace, config, recorder }),
+      );
+      expect((await fs.readFile(counterPath, "utf8")).trim().split("\n")).toEqual(["run", "run"]);
+      expect(operations.filter((operation) => operation.phase === "workspace_runtime_provision")).toHaveLength(2);
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({
+        executionWorkspaceId: "execution-workspace-1",
+        workspaceCwd: workspaceRoot,
+      });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+      restorePaperclipEnv();
+    }
+  });
+
+  it("logs runtime provisioning failure and retries it on the next service start", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-retry-"));
+    const restorePaperclipEnv = configureRuntimeProvisionTestHome(workspaceRoot, "runtime-provision-retry");
+    const attemptPath = path.join(workspaceRoot, "runtime-provision-attempt.txt");
+    const provisionScript = [
+      "const fs = require('node:fs');",
+      `const attemptPath = ${JSON.stringify(attemptPath)};`,
+      "const attempt = fs.existsSync(attemptPath) ? Number(fs.readFileSync(attemptPath, 'utf8')) : 0;",
+      "fs.writeFileSync(attemptPath, String(attempt + 1));",
+      "if (attempt === 0) { console.error('runtime seed exploded'); process.exit(7); }",
+    ].join(" ");
+    const config = runtimeProvisionTestConfig({
+      provisionCommand: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(provisionScript)}`,
+    });
+    const workspace = buildWorkspace(workspaceRoot);
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+      logs.push({ stream, chunk });
+    };
+
+    try {
+      await expect(
+        startRuntimeServicesForWorkspaceControl(
+          runtimeProvisionStartInput({ workspace, config, recorder, onLog }),
+        ),
+      ).rejects.toThrow(/runtime seed exploded/);
+
+      const services = await startRuntimeServicesForWorkspaceControl(
+        runtimeProvisionStartInput({ workspace, config, recorder, onLog }),
+      );
+      expect(services).toHaveLength(1);
+      expect(await fs.readFile(attemptPath, "utf8")).toBe("2");
+      expect(logs).toContainEqual(expect.objectContaining({
+        stream: "stderr",
+        chunk: expect.stringContaining("runtime seed exploded"),
+      }));
+      expect(
+        operations
+          .filter((operation) => operation.phase === "workspace_runtime_provision")
+          .map((operation) => operation.result.status),
+      ).toEqual(["failed", "succeeded"]);
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({
+        executionWorkspaceId: "execution-workspace-1",
+        workspaceCwd: workspaceRoot,
+      });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+      restorePaperclipEnv();
+    }
+  });
+
+  it("does not create a runtime provision operation when the command is absent", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-noop-"));
+    const restorePaperclipEnv = configureRuntimeProvisionTestHome(workspaceRoot, "runtime-provision-noop");
+    const workspace = buildWorkspace(workspaceRoot);
+    const config = runtimeProvisionTestConfig({});
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    try {
+      const services = await startRuntimeServicesForWorkspaceControl(
+        runtimeProvisionStartInput({ workspace, config, recorder }),
+      );
+      expect(services).toHaveLength(1);
+      expect(operations).toEqual([]);
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({
+        executionWorkspaceId: "execution-workspace-1",
+        workspaceCwd: workspaceRoot,
+      });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+      restorePaperclipEnv();
+    }
+  });
+
   it("leaves manual runtime services untouched during agent runs", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-manual-"));
     const workspace = buildWorkspace(workspaceRoot);
@@ -6547,7 +7495,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     await db.delete(companies);
   });
 
-  it("commits a starting service row before waiting for slow readiness", async () => {
+  it("persists provisioning before starting and excludes provision time from readiness timeout", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-slow-control-"));
     const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-control-home-"));
     const previousPaperclipHome = process.env.PAPERCLIP_HOME;
@@ -6560,14 +7508,21 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const projectWorkspaceId = randomUUID();
     const issueId = randomUUID();
     const executionWorkspaceId = randomUUID();
+    const provisionMarkerPath = path.join(workspaceRoot, "runtime-provisioning.marker");
     const markerPath = path.join(workspaceRoot, "runtime-spawned.marker");
+    const provisionScript = [
+      `require("node:fs").writeFileSync(${JSON.stringify(provisionMarkerPath)}, "provisioning");`,
+      "setTimeout(() => {}, 1200);",
+    ].join(" ");
+    const runtimeProvisionCommand =
+      `${JSON.stringify(process.execPath)} -e ${JSON.stringify(provisionScript)}`;
     const serverScript = [
       `require("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "spawned");`,
       "setTimeout(() => {",
       "  require(\"node:http\")",
       "    .createServer((_req, res) => { res.end(\"ok\"); })",
       "    .listen(Number(process.env.PORT), \"127.0.0.1\");",
-      "}, 700);",
+      "}, 100);",
       "setInterval(() => {}, 1000);",
     ].join(" ");
     const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(serverScript)}`;
@@ -6618,10 +7573,10 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       baseRef: "main",
     });
 
-    const waitForMarker = async () => {
+    const waitForMarker = async (filePath: string) => {
       const deadline = Date.now() + 5_000;
       while (Date.now() < deadline) {
-        if (existsSync(markerPath)) return;
+        if (existsSync(filePath)) return;
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
       throw new Error("Timed out waiting for runtime service process marker");
@@ -6669,6 +7624,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       },
       executionWorkspaceId,
       config: {
+        runtimeProvisionCommand,
         workspaceRuntime: {
           services: [
             {
@@ -6678,7 +7634,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
               reuseScope: "execution_workspace",
               port: { type: "auto", envKey: "PORT" },
               expose: { urlTemplate: "http://127.0.0.1:{{port}}" },
-              readiness: { type: "http", intervalMs: 50, timeoutSec: 10 },
+              readiness: { type: "http", intervalMs: 50, timeoutSec: 1 },
               stopPolicy: { type: "manual" },
             },
           ],
@@ -6689,7 +7645,17 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     startPromise.catch(() => undefined);
 
     try {
-      await waitForMarker();
+      await waitForMarker(provisionMarkerPath);
+      const provisioningRow = await waitForPersistedStatus("provisioning");
+      expect(provisioningRow).toMatchObject({
+        executionWorkspaceId,
+        serviceName: "web",
+        status: "provisioning",
+        providerRef: null,
+      });
+      expect(existsSync(markerPath)).toBe(false);
+
+      await waitForMarker(markerPath);
       const startingRow = await waitForPersistedStatus("starting");
       expect(startingRow).toMatchObject({
         companyId,
@@ -6715,6 +7681,17 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       const runningRow = await waitForPersistedStatus("running");
       expect(runningRow.id).toBe(startingRow.id);
       await expect(fetch(services[0]!.url!)).resolves.toMatchObject({ ok: true });
+      const runtimeProvisionOperations = await db
+        .select()
+        .from(workspaceOperations)
+        .where(eq(workspaceOperations.executionWorkspaceId, executionWorkspaceId));
+      expect(runtimeProvisionOperations).toEqual([
+        expect.objectContaining({
+          phase: "workspace_runtime_provision",
+          status: "succeeded",
+          command: runtimeProvisionCommand,
+        }),
+      ]);
     } finally {
       await startPromise.catch(() => undefined);
       await stopRuntimeServicesForExecutionWorkspace({
@@ -7887,5 +8864,525 @@ describe("preserveUnpushedWorktreeCommits", () => {
     expect(preservedCommit).toBe(worktreeHead);
 
     await runGit(repoRoot, ["worktree", "remove", "--force", worktreePath]);
+  });
+});
+
+describe("ensurePersistedExecutionWorkspaceAvailable base repo hygiene", () => {
+  it("fast-forwards a clean, behind base repo on the reuse path before provisioning", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const branchName = "PAP-460-reuse-fast-forward";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", branchName]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+
+    const initialHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const advancedHead = await advanceRemoteMaster(sourceRepo, remotePath, "fast-forward-fix.txt");
+    expect(advancedHead).not.toBe(initialHead);
+
+    const reused = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/master",
+      },
+      workspace: {
+        id: "execution-workspace-1",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "origin/master",
+        branchName,
+        metadata: { baseRefSnapshot: { resolvedSha: initialHead } },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-460",
+        title: "Reuse path fast-forward",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(reused).not.toBeNull();
+    expect(reused!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
+    expect(reused!.baseRefSha).toBe(advancedHead);
+  }, 15_000);
+
+  it("does not fast-forward a dirty base repo on the reuse path (restore instead)", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const branchName = "PAP-461-reuse-dirty";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", branchName]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+
+    await fs.writeFile(path.join(repoRoot, "README.md"), "dirty modification\n", "utf8");
+
+    const reused = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/master",
+      },
+      workspace: {
+        id: "execution-workspace-2",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "origin/master",
+        branchName,
+      },
+      issue: {
+        id: "issue-2",
+        identifier: "PAP-461",
+        title: "Reuse path dirty restore",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(reused).not.toBeNull();
+    expect(reused!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+    const fastForwardWarning = reused!.warnings.find((w) => w.includes("was fast-forwarded to"));
+    expect(fastForwardWarning).toBeUndefined();
+  }, 15_000);
+
+  it("warns (diverged) on an ahead/diverged base repo on the reuse path without reset", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const branchName = "PAP-462-reuse-diverged";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", branchName]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+
+    await fs.writeFile(path.join(repoRoot, "ahead.txt"), "ahead\n", "utf8");
+    await runGit(repoRoot, ["add", "ahead.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Ahead commit on base repo"]);
+    const aheadHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+
+    const behindHead = await advanceRemoteMaster(sourceRepo, remotePath, "behind-fix.txt");
+    expect(behindHead).not.toBe(aheadHead);
+
+    const reused = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/master",
+      },
+      workspace: {
+        id: "execution-workspace-3",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "origin/master",
+        branchName,
+      },
+      issue: {
+        id: "issue-3",
+        identifier: "PAP-462",
+        title: "Reuse path diverged",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(reused).not.toBeNull();
+    expect(reused!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("has diverged from")]),
+    );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(aheadHead);
+  }, 15_000);
+
+  it("resolves a bare fold/... base ref to origin/fold/... and fast-forwards on the reuse path", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const slashBranch = "fold/tea-patches-v2026.722.0";
+    await runGit(sourceRepo, ["checkout", "-b", slashBranch]);
+    await runGit(sourceRepo, ["push", "-u", remotePath, slashBranch]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+    await runGit(repoRoot, ["checkout", slashBranch]);
+
+    const branchName = "PAP-463-reuse-bare-ref";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", branchName]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, branchName]);
+
+    const initialHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const advancedHead = await advanceRemoteBranch(sourceRepo, remotePath, slashBranch, "bare-ref-fix.txt");
+    expect(advancedHead).not.toBe(initialHead);
+
+    const reused = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: slashBranch,
+      },
+      workspace: {
+        id: "execution-workspace-4",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: slashBranch,
+        branchName,
+        metadata: { baseRefSnapshot: { resolvedSha: initialHead } },
+      },
+      issue: {
+        id: "issue-4",
+        identifier: "PAP-463",
+        title: "Reuse path bare fold ref",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(reused).not.toBeNull();
+    expect(reused!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
+  }, 15_000);
+
+  it("prepares the base repo before git worktree add on the restore-missing path", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const branchName = "PAP-464-restore-missing";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+
+    const initialHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const advancedHead = await advanceRemoteMaster(sourceRepo, remotePath, "restore-missing-fix.txt");
+    expect(advancedHead).not.toBe(initialHead);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "origin/master",
+      },
+      workspace: {
+        id: "execution-workspace-5",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: worktreePath,
+        providerRef: worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "origin/master",
+        branchName,
+        metadata: { baseRefSnapshot: { resolvedSha: initialHead } },
+      },
+      issue: {
+        id: "issue-5",
+        identifier: "PAP-464",
+        title: "Restore missing worktree hygiene",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(restored).not.toBeNull();
+    expect(restored!.created).toBe(true);
+    expect(restored!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
+    expect(await readGit(restored!.cwd, ["rev-parse", "HEAD"])).toBe(advancedHead);
+  }, 15_000);
+});
+
+describe("prepareBaseRepoForWorkspace", () => {
+  it("resolves a bare fold/... base ref to origin/fold/... and fast-forwards", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const slashBranch = "fold/tea-patches-v2026.722.0";
+    await runGit(sourceRepo, ["checkout", "-b", slashBranch]);
+    await runGit(sourceRepo, ["push", "-u", remotePath, slashBranch]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+    await runGit(repoRoot, ["checkout", slashBranch]);
+
+    const initialHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const advancedHead = await advanceRemoteBranch(sourceRepo, remotePath, slashBranch, "bare-ref-fix.txt");
+    expect(advancedHead).not.toBe(initialHead);
+
+    const result = await prepareBaseRepoForWorkspace({
+      repoRoot,
+      configuredBaseRef: slashBranch,
+    });
+
+    expect(result.baseRef).toBe("origin/fold/tea-patches-v2026.722.0");
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(advancedHead);
+  }, 15_000);
+
+  it("returns ok warnings (no action) when the base repo is clean and on the default ref", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const result = await prepareBaseRepoForWorkspace({
+      repoRoot,
+      configuredBaseRef: "origin/master",
+    });
+
+    expect(result.baseRef).toBe("origin/master");
+    expect(result.warnings).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("was fast-forwarded to")]),
+    );
+    expect(result.warnings).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+  }, 15_000);
+
+  it("restores a dirty base repo and warns", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await fs.writeFile(path.join(repoRoot, "README.md"), "dirty\n", "utf8");
+
+    const result = await prepareBaseRepoForWorkspace({
+      repoRoot,
+      configuredBaseRef: "origin/master",
+    });
+
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("was restored to")]),
+    );
+  }, 15_000);
+});
+
+describe("workspace realization request additionalSources", () => {
+  function buildRealizedWorkspace(
+    overrides: Partial<RealizedExecutionWorkspace> = {},
+  ): RealizedExecutionWorkspace {
+    return {
+      baseCwd: "/anchor",
+      source: "project_primary",
+      projectId: "project-anchor",
+      workspaceId: "workspace-anchor",
+      repoUrl: "https://example.test/anchor.git",
+      repoRef: "main",
+      strategy: "project_primary",
+      cwd: "/anchor",
+      branchName: null,
+      worktreePath: null,
+      warnings: [],
+      created: false,
+      ...overrides,
+    };
+  }
+
+  it("round-trips additionalSources and runtime provisioning through build/read realization request", () => {
+    const workspace = buildRealizedWorkspace({
+      additionalWorkspaces: [
+        {
+          cwd: "/managed/project-b",
+          projectId: "project-b",
+          workspaceId: "workspace-b",
+          repoUrl: "https://example.test/b.git",
+          repoRef: "release",
+        },
+      ],
+    });
+
+    const request = buildWorkspaceRealizationRequest({
+      adapterType: "codex",
+      companyId: "company-1",
+      environmentId: "environment-1",
+      executionWorkspaceId: "execution-workspace-1",
+      issueId: "issue-1",
+      heartbeatRunId: "run-1",
+      requestedMode: "shared_workspace",
+      workspace,
+      workspaceConfig: {
+        provisionCommand: null,
+        runtimeProvisionCommand: "bash ./scripts/provision-runtime.sh",
+        teardownCommand: null,
+        cleanupCommand: null,
+        workspaceRuntime: null,
+        desiredState: null,
+        serviceStates: null,
+      },
+    });
+
+    expect(request.additionalSources).toEqual([
+      {
+        localPath: "/managed/project-b",
+        projectId: "project-b",
+        projectWorkspaceId: "workspace-b",
+        repoUrl: "https://example.test/b.git",
+        repoRef: "release",
+      },
+    ]);
+    // The anchor source stays scalar and unchanged alongside the new plural field.
+    expect(request.source.localPath).toBe("/anchor");
+
+    // A serialize/deserialize round-trip preserves additionalSources.
+    const roundTripped = readWorkspaceRealizationRequest(
+      JSON.parse(JSON.stringify(request)),
+    );
+    expect(roundTripped?.additionalSources).toEqual(request.additionalSources);
+    expect(roundTripped?.runtimeOverlay.runtimeProvisionCommand).toBe(
+      "bash ./scripts/provision-runtime.sh",
+    );
+  });
+
+  it("exposes additionalSources on the realization record so targets receive the paths", () => {
+    const workspace = buildRealizedWorkspace({
+      additionalWorkspaces: [
+        {
+          cwd: "/managed/project-b",
+          projectId: "project-b",
+          workspaceId: "workspace-b",
+          repoUrl: "https://example.test/b.git",
+          repoRef: "release",
+        },
+      ],
+    });
+
+    const request = buildWorkspaceRealizationRequest({
+      adapterType: "codex",
+      companyId: "company-1",
+      environmentId: "environment-1",
+      executionWorkspaceId: "execution-workspace-1",
+      issueId: "issue-1",
+      heartbeatRunId: "run-1",
+      requestedMode: "shared_workspace",
+      workspace,
+      workspaceConfig: null,
+    });
+
+    const now = new Date(0);
+    const environment: Environment = {
+      id: "environment-1",
+      name: "local",
+      description: null,
+      driver: "local",
+      status: "active",
+      config: {},
+      envVars: {},
+      metadata: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const lease: EnvironmentLease = {
+      id: "lease-1",
+      companyId: "company-1",
+      environmentId: "environment-1",
+      executionWorkspaceId: "execution-workspace-1",
+      issueId: "issue-1",
+      heartbeatRunId: "run-1",
+      status: "active",
+      leasePolicy: "ephemeral",
+      provider: "local",
+      providerLeaseId: null,
+      acquiredAt: now,
+      lastUsedAt: now,
+      expiresAt: null,
+      releasedAt: null,
+      failureReason: null,
+      cleanupStatus: null,
+      metadata: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const record = buildWorkspaceRealizationRecord({ environment, lease, request });
+
+    // The record carries the resolved referenced-project path so the execution target can expose it.
+    expect(record.additional).toEqual([
+      {
+        path: "/managed/project-b",
+        projectId: "project-b",
+        projectWorkspaceId: "workspace-b",
+        repoUrl: "https://example.test/b.git",
+        repoRef: "release",
+      },
+    ]);
+    // The anchor stays scalar and unchanged alongside the new plural field.
+    expect(record.local.path).toBe("/anchor");
+  });
+
+  it("reads a legacy request without additionalSources as an empty array", () => {
+    const legacyRequest = {
+      version: 1,
+      adapterType: "codex",
+      companyId: "company-1",
+      environmentId: "environment-1",
+      executionWorkspaceId: null,
+      issueId: null,
+      heartbeatRunId: "run-1",
+      requestedMode: null,
+      source: {
+        kind: "project_primary",
+        localPath: "/anchor",
+        projectId: null,
+        projectWorkspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+        strategy: "project_primary",
+        branchName: null,
+        worktreePath: null,
+      },
+      runtimeOverlay: {
+        provisionCommand: null,
+        teardownCommand: null,
+        cleanupCommand: null,
+        workspaceRuntime: null,
+      },
+    };
+
+    const parsed = readWorkspaceRealizationRequest(legacyRequest);
+
+    expect(parsed).not.toBeNull();
+    expect(parsed?.additionalSources).toEqual([]);
+    expect(parsed?.runtimeOverlay.runtimeProvisionCommand).toBeNull();
   });
 });

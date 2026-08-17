@@ -20,7 +20,7 @@ export const TARGET_BOUND_INTERACTION_KINDS = [
 ] as const;
 
 /**
- * Every kind that `expirePendingInteractionsOnTerminalIssueStatus` resolves to
+ * Every kind that `expirePendingInteractionsForTerminalIssue` resolves to
  * `expired` / `expired_issue_terminal` when its issue reaches a terminal status.
  */
 export const USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS = [

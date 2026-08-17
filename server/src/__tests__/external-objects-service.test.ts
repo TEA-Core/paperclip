@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   companies,
@@ -19,12 +19,14 @@ import {
   createExternalObjectDetectorRegistry,
   createExternalObjectResolverRegistry,
   externalObjectService,
+  startExternalObjectRefreshSweep,
   type ExternalObjectResolver,
 } from "../services/external-objects.js";
 import { canonicalizeExternalObjectUrl } from "@paperclipai/shared/external-objects-server";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { createGitHubExternalObjectProvider } from "../services/github-external-object-provider.js";
+import { logger } from "../middleware/logger.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -314,6 +316,64 @@ describe("GitHub external object provider", () => {
     expect(JSON.stringify(result)).not.toContain("ghp_secret");
   });
 
+  it("does not retry anonymously when no token was configured", async () => {
+    const fetch = vi.fn(async () => new Response("{}", { status: 401, headers: { "content-type": "application/json" } }));
+    const provider = createGitHubExternalObjectProvider({} as any, { fetch, tokenProvider: null });
+    const resolver = provider.resolvers.find((entry) => entry.objectType === "pull_request")!;
+
+    const result = await resolver.resolve({
+      companyId: "company-1",
+      object: githubObject("pull/42", "pull_request"),
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ ok: false, errorCode: "github_auth_required" });
+  });
+
+  it("keeps the auth failure when the anonymous retry is also unauthorized", async () => {
+    const fetch = vi.fn(async () => new Response("{}", { status: 401, headers: { "content-type": "application/json" } }));
+    const provider = createGitHubExternalObjectProvider({} as any, {
+      fetch,
+      tokenProvider: async () => "ghp_stale",
+    });
+    const resolver = provider.resolvers.find((entry) => entry.objectType === "pull_request")!;
+
+    const result = await resolver.resolve({
+      companyId: "company-1",
+      object: githubObject("pull/42", "pull_request"),
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ ok: false, liveness: "auth_required", errorCode: "github_auth_required" });
+    expect(JSON.stringify(result)).not.toContain("ghp_stale");
+  });
+
+  it("does not mask a rejected token as not-found when the anonymous retry returns 404", async () => {
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      if (headers.authorization) {
+        return new Response(JSON.stringify({ message: "Bad credentials" }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("", { status: 404, headers: { etag: '"missing"' } });
+    });
+    const provider = createGitHubExternalObjectProvider({} as any, {
+      fetch,
+      tokenProvider: async () => "ghp_stale",
+    });
+    const resolver = provider.resolvers.find((entry) => entry.objectType === "pull_request")!;
+
+    const result = await resolver.resolve({
+      companyId: "company-1",
+      object: githubObject("pull/42", "pull_request"),
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ ok: false, liveness: "auth_required", errorCode: "github_auth_required" });
+  });
+
   it.each([
     [
       "auth-required",
@@ -529,6 +589,207 @@ describeEmbeddedPostgres("externalObjectService", () => {
     expect(resolve).toHaveBeenCalledTimes(1);
   });
 
+  it("coalesces automatic and manual refreshes for the same object", async () => {
+    const { companyId, issueId } = await createIssue();
+    let markResolverStarted!: () => void;
+    const resolverStarted = new Promise<void>((resolve) => {
+      markResolverStarted = resolve;
+    });
+    let finishResolver!: () => void;
+    const resolverCanFinish = new Promise<void>((resolve) => {
+      finishResolver = resolve;
+    });
+    const resolve = vi.fn(async () => {
+      markResolverStarted();
+      await resolverCanFinish;
+      return {
+        ok: true as const,
+        snapshot: {
+          statusCategory: "open" as const,
+          statusTone: "info" as const,
+          statusKey: "open",
+          statusLabel: "Open",
+          ttlSeconds: 300,
+        },
+      };
+    });
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    const dueRefresh = svc.refreshDueObjects(companyId, 50, new Date(Date.now() + 1_000));
+    await resolverStarted;
+    const manualRefresh = svc.refreshObject(object.id, { companyId, force: true });
+    finishResolver();
+
+    const [dueResults, manualResult] = await Promise.all([dueRefresh, manualRefresh]);
+
+    expect(dueResults).toHaveLength(1);
+    expect(dueResults[0]?.refreshed).toBe(true);
+    expect(manualResult.refreshed).toBe(true);
+    expect(manualResult.object.statusLabel).toBe("Open");
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("prevents duplicate refreshes across service instances", async () => {
+    const { companyId, issueId } = await createIssue();
+    let markResolverStarted!: () => void;
+    const resolverStarted = new Promise<void>((resolve) => {
+      markResolverStarted = resolve;
+    });
+    let finishResolver!: () => void;
+    const resolverCanFinish = new Promise<void>((resolve) => {
+      finishResolver = resolve;
+    });
+    const resolve = vi.fn(async () => {
+      markResolverStarted();
+      await resolverCanFinish;
+      return {
+        ok: true as const,
+        snapshot: {
+          statusCategory: "open" as const,
+          statusTone: "info" as const,
+          statusKey: "open",
+          statusLabel: "Open",
+          ttlSeconds: 300,
+        },
+      };
+    });
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const scheduledService = externalObjectService(db, { resolvers: [resolver], github: false });
+    const manualService = externalObjectService(db, { resolvers: [resolver], github: false });
+    await scheduledService.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    const dueRefresh = scheduledService.refreshDueObjects(companyId, 50, new Date(Date.now() + 1_000));
+    await resolverStarted;
+    const manualRefresh = await manualService.refreshObject(object.id, { companyId, force: true });
+    finishResolver();
+    const dueResults = await dueRefresh;
+
+    expect(dueResults).toHaveLength(1);
+    expect(dueResults[0]?.refreshed).toBe(true);
+    expect(manualRefresh.refreshed).toBe(false);
+    expect(manualRefresh.reason).toBe("refresh_in_progress");
+    expect(manualRefresh.object).not.toHaveProperty("refreshToken");
+    expect(resolve).toHaveBeenCalledTimes(1);
+    await expect(
+      db.select().from(externalObjects).then((rows) => rows[0]?.refreshStartedAt ?? null),
+    ).resolves.toBeNull();
+  });
+
+  it("does not let a stale refresh overwrite a replacement claimant", async () => {
+    const { companyId, issueId } = await createIssue();
+    let markResolverStarted!: () => void;
+    const resolverStarted = new Promise<void>((resolve) => {
+      markResolverStarted = resolve;
+    });
+    let finishResolver!: () => void;
+    const resolverCanFinish = new Promise<void>((resolve) => {
+      finishResolver = resolve;
+    });
+    const slowResolve = vi.fn(async () => {
+      markResolverStarted();
+      await resolverCanFinish;
+      return {
+        ok: true as const,
+        snapshot: {
+          statusCategory: "open" as const,
+          statusTone: "info" as const,
+          statusKey: "open",
+          statusLabel: "Open",
+          ttlSeconds: 300,
+        },
+      };
+    });
+    const replacementResolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "closed" as const,
+        statusTone: "muted" as const,
+        statusKey: "closed",
+        statusLabel: "Closed",
+        ttlSeconds: 300,
+      },
+    }));
+    const scheduledService = externalObjectService(db, {
+      resolvers: [{ providerKey: "url", objectType: "link", resolve: slowResolve }],
+      github: false,
+    });
+    const replacementService = externalObjectService(db, {
+      resolvers: [{ providerKey: "url", objectType: "link", resolve: replacementResolve }],
+      github: false,
+    });
+    await scheduledService.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+    const claimedAt = new Date(Date.now() + 1_000);
+
+    const dueRefresh = scheduledService.refreshDueObjects(companyId, 50, claimedAt);
+    await resolverStarted;
+    const replacementResult = await replacementService.refreshObject(object.id, {
+      companyId,
+      force: true,
+      now: new Date(claimedAt.getTime() + 301_000),
+    });
+    finishResolver();
+    const dueResults = await dueRefresh;
+    const finalObject = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    expect(replacementResult.refreshed).toBe(true);
+    expect(dueResults[0]).toMatchObject({ refreshed: false, reason: "refresh_superseded" });
+    expect(finalObject.statusLabel).toBe("Closed");
+    expect(finalObject.refreshStartedAt).toBeNull();
+    expect(finalObject.refreshToken).toBeNull();
+    expect(slowResolve).toHaveBeenCalledTimes(1);
+    expect(replacementResolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes due objects for active companies only", async () => {
+    const active = await createIssue();
+    const paused = await createIssue();
+    await db
+      .update(companies)
+      .set({ status: "paused" })
+      .where(eq(companies.id, paused.companyId));
+    const resolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "open" as const,
+        statusTone: "info" as const,
+        statusKey: "open",
+        statusLabel: "Open",
+        ttlSeconds: 300,
+      },
+    }));
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(active.issueId);
+    await svc.syncIssue(paused.issueId);
+
+    const result = await svc.refreshDueObjectsForActiveCompanies(50, new Date(Date.now() + 1_000));
+
+    expect(result).toEqual({ companies: 1, checked: 1, refreshed: 1 });
+    expect(resolve).toHaveBeenCalledTimes(1);
+    const rows = await db.select().from(externalObjects);
+    const activeObject = rows.find((row) => row.companyId === active.companyId);
+    const pausedObject = rows.find((row) => row.companyId === paused.companyId);
+    expect(activeObject?.statusLabel).toBe("Open");
+    expect(pausedObject?.statusLabel).toBeNull();
+  });
+
   it("removes comment mentions when a synced comment is hard-deleted", async () => {
     const { companyId, issueId } = await createIssue();
     const commentId = randomUUID();
@@ -583,6 +844,49 @@ describeEmbeddedPostgres("externalObjectService", () => {
 
     expect(refreshed).toEqual([]);
     expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes due objects in nextRefreshAt order so the backlog is not starved", async () => {
+    const { companyId, issueId } = await createIssue();
+    const resolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "open" as const,
+        statusTone: "info" as const,
+        statusKey: "open",
+        statusLabel: "Open",
+        ttlSeconds: 300,
+      },
+    }));
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(issueId);
+
+    const rows = await db.select().from(externalObjects);
+    const [first] = rows;
+    const second = { ...first, id: randomUUID(), externalId: "acme/app#pull/43", sanitizedCanonicalUrl: "https://github.com/acme/app/pull/43", canonicalIdentityHash: "hash43" };
+    const third = { ...first, id: randomUUID(), externalId: "acme/app#pull/44", sanitizedCanonicalUrl: "https://github.com/acme/app/pull/44", canonicalIdentityHash: "hash44" };
+    await db.insert(externalObjects).values([
+      { ...second, nextRefreshAt: new Date(0) },
+      { ...third, nextRefreshAt: new Date(1) },
+    ]);
+    await db
+      .update(externalObjects)
+      .set({ nextRefreshAt: new Date(2) })
+      .where(eq(externalObjects.id, first.id));
+
+    const refreshed = await svc.refreshDueObjects(companyId, 2, new Date(Date.now() + 1_000));
+
+    const refreshedIds = refreshed.map((r) => r.object.id);
+    expect(refreshedIds).toHaveLength(2);
+    expect(refreshedIds).toEqual(
+      expect.arrayContaining([second.id, third.id]),
+    );
+    expect(refreshedIds).not.toContain(first.id);
   });
 
   it("keeps external object identities company-scoped for duplicate urls", async () => {
@@ -702,4 +1006,284 @@ describeEmbeddedPostgres("externalObjectService", () => {
       liveness: "fresh",
     });
   });
+
+  it("refreshDueObjectsForAllCompanies refreshes due objects across companies", async () => {
+    const first = await createIssue();
+    const second = await createIssue();
+    const resolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "open" as const,
+        statusTone: "info" as const,
+        statusKey: "open",
+        statusLabel: "Open",
+        ttlSeconds: 300,
+      },
+    }));
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(first.issueId);
+    await svc.syncIssue(second.issueId);
+
+    const result = await svc.refreshDueObjectsForAllCompanies(50);
+    expect(result.companies).toBe(2);
+    expect(result.refreshed).toBe(2);
+    expect(resolve).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshDueObjectsForAllCompanies returns zero when external objects are disabled", async () => {
+    const { companyId, issueId } = await createIssue();
+    const svc = externalObjectService(db, { enabled: false });
+    await svc.syncIssue(issueId);
+
+    const result = await svc.refreshDueObjectsForAllCompanies(50);
+    expect(result.companies).toBe(0);
+    expect(result.refreshed).toBe(0);
+  });
+
+  it("refreshDueObjects survives a throwing object and continues the rest of the company", async () => {
+    const { companyId, issueId } = await createIssue();
+    const resolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "open" as const,
+        statusTone: "info" as const,
+        statusKey: "open",
+        statusLabel: "Open",
+        ttlSeconds: 300,
+      },
+    }));
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(issueId);
+
+    resolve.mockImplementationOnce(async () => {
+      throw new Error("resolver exploded");
+    });
+
+    const results = await svc.refreshDueObjects(companyId, 50);
+    expect(results).toHaveLength(0);
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshDueObjectsForAllCompanies isolates per-company: a throwing company does not abort the tick", async () => {
+    const first = await createIssue();
+    const second = await createIssue();
+    const resolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "open" as const,
+        statusTone: "info" as const,
+        statusKey: "open",
+        statusLabel: "Open",
+        ttlSeconds: 300,
+      },
+    }));
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(first.issueId);
+    await svc.syncIssue(second.issueId);
+
+    const result = await svc.refreshDueObjectsForAllCompanies(50);
+    expect(result.companies).toBe(2);
+    expect(result.refreshed).toBe(2);
+    expect(resolve).toHaveBeenCalledTimes(2);
+
+    await db.update(externalObjects).set({ nextRefreshAt: new Date() });
+
+    resolve.mockReset();
+    resolve.mockImplementationOnce(async () => {
+      throw new Error("company A threw");
+    });
+
+    const result2 = await svc.refreshDueObjectsForAllCompanies(50);
+    expect(result2.companies).toBe(2);
+    expect(result2.refreshed).toBe(1);
+  });
+
+  it("surfaces a no_resolver warning and backs off far into the future", async () => {
+    const { companyId, issueId } = await createIssue();
+    const svc = externalObjectService(db, { github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+
+    const refreshed = await svc.refreshObject(object.id, { companyId, force: true });
+
+    expect(refreshed.reason).toBe("no_resolver");
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        companyId,
+        objectId: object.id,
+        providerKey: "url",
+        objectType: "link",
+      }),
+      expect.any(String),
+    );
+
+    const updated = await db.select().from(externalObjects).then((rows) => rows[0]!);
+    const expectedBackoff = 30 * 24 * 60 * 60 * 1000;
+    expect(updated.nextRefreshAt.getTime() - Date.now()).toBeGreaterThanOrEqual(expectedBackoff * 0.9);
+  });
+
+  it("does not re-sweep a no_resolver object on the next due pass", async () => {
+    const { companyId, issueId } = await createIssue();
+    const svc = externalObjectService(db, { github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    await svc.refreshObject(object.id, { companyId, force: true });
+
+    const refreshed = await svc.refreshDueObjects(companyId, 50, new Date(Date.now() + 1_000));
+    expect(refreshed).toEqual([]);
+  });
+
+  it("hydrates a public object anonymously when the configured token is rejected", async () => {
+    const { companyId, issueId } = await createIssue();
+    const seen: Array<Record<string, string>> = [];
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      seen.push(headers);
+      if (headers.authorization) {
+        return new Response(JSON.stringify({ message: "Bad credentials" }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ state: "open", draft: false, merged: false, title: "Public PR" }), {
+        status: 200,
+        headers: { "content-type": "application/json", etag: '"etag-1"' },
+      });
+    });
+    const svc = externalObjectService(db, {
+      github: { fetch, tokenProvider: async () => "ghp_stale" },
+    });
+
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    const refreshed = await svc.refreshObject(object.id, { companyId, force: true });
+
+    // First attempt carries the stale credential, second drops it.
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toHaveProperty("authorization", "Bearer ghp_stale");
+    expect(seen[1]).not.toHaveProperty("authorization");
+    expect(refreshed.object).toMatchObject({
+      liveness: "fresh",
+      statusKey: "open",
+      statusCategory: "open",
+      lastErrorCode: null,
+    });
+    expect(JSON.stringify(refreshed)).not.toContain("ghp_stale");
+  });
 });
+
+describe("startExternalObjectRefreshSweep", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("runs the sweep on an interval and stop() halts further invocations", async () => {
+    const db = {
+      select: () => ({
+        from: () => ({
+          then: (resolve: (rows: Array<{ id: string }>) => void) => resolve([]),
+        }),
+      }),
+    } as any;
+    const runSweep = vi.fn(async () => ({ companies: 0, refreshed: 0 }));
+    const stop = startExternalObjectRefreshSweep(
+      db,
+      { github: false },
+      { intervalMs: 1000, initialDelayMs: 500, runSweep },
+    );
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(runSweep).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(runSweep).toHaveBeenCalledTimes(2);
+
+    stop();
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(runSweep).toHaveBeenCalledTimes(2);
+  });
+
+  it("survives a throwing sweep: later ticks still run", async () => {
+    const db = {
+      select: () => ({
+        from: () => ({
+          then: (resolve: (rows: Array<{ id: string }>) => void) => resolve([]),
+        }),
+      }),
+    } as any;
+    let callCount = 0;
+    const runSweep = vi.fn(async () => {
+      callCount++;
+      if (callCount === 1) {
+        throw new Error("sweep exploded");
+      }
+      return { companies: 0, refreshed: 0 };
+    });
+    const stop = startExternalObjectRefreshSweep(
+      db,
+      { github: false },
+      { intervalMs: 1000, initialDelayMs: 500, runSweep },
+    );
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(runSweep).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(runSweep).toHaveBeenCalledTimes(2);
+
+    stop();
+  });
+
+  it("skips overlapping sweeps", async () => {
+    const db = {
+      select: () => ({
+        from: () => ({
+          then: (resolve: (rows: Array<{ id: string }>) => void) => resolve([]),
+        }),
+      }),
+    } as any;
+    let resolveSweep: () => void;
+    const runSweep = vi.fn(async () => {
+      await new Promise((resolve) => {
+        resolveSweep = resolve;
+      });
+      return { companies: 0, refreshed: 0 };
+    });
+    const stop = startExternalObjectRefreshSweep(
+      db,
+      { github: false },
+      { intervalMs: 1000, initialDelayMs: 500, runSweep },
+    );
+    await vi.advanceTimersByTimeAsync(500);
+    expect(runSweep).toHaveBeenCalledTimes(1);
+    resolveSweep!();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(runSweep).toHaveBeenCalledTimes(2);
+    stop();
+  });
+ });

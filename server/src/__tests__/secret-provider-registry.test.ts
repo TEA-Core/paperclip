@@ -188,4 +188,50 @@ describe("secret provider registry", () => {
     });
     expect(local?.warnings?.join("\n")).toContain("PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION is enabled");
   });
+
+  it("rejects PAPERCLIP_SECRETS_MASTER_KEY when the resolved key path is inside the Paperclip home dir (SUP-12990)", async () => {
+    const insideHome = path.join(resolvePaperclipHomeDir(), "secrets", "master.key");
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = insideHome;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = "12345678901234567890123456789012";
+
+    const checks = await checkSecretProviders();
+    const local = checks.find((check) => check.provider === "local_encrypted");
+
+    expect(local).toMatchObject({
+      status: "error",
+      details: { keySource: "env", keyFilePath: insideHome },
+    });
+    expect(local?.message).toContain("Security violation");
+  });
+
+  it("accepts PAPERCLIP_SECRETS_MASTER_KEY when the resolved key path is outside the Paperclip home dir", async () => {
+    const dir = path.join(os.tmpdir(), `paperclip-secret-provider-${randomBytes(6).toString("hex")}`);
+    tmpDirs.push(dir);
+    mkdirSync(dir, { recursive: true });
+    const outsideKey = path.join(dir, "master.key");
+    writeFileSync(outsideKey, "12345678901234567890123456789012", { encoding: "utf8", mode: 0o600 });
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = outsideKey;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = "12345678901234567890123456789012";
+
+    const checks = await checkSecretProviders();
+    const local = checks.find((check) => check.provider === "local_encrypted");
+
+    expect(local).toMatchObject({
+      status: "ok",
+      details: { keySource: "env", keyFilePath: outsideKey },
+    });
+  });
+
+  it("accepts PAPERCLIP_SECRETS_MASTER_KEY when no key file is configured and the default path is outside the Paperclip home dir (SUP-12990)", async () => {
+    delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = "12345678901234567890123456789012";
+
+    const checks = await checkSecretProviders();
+    const local = checks.find((check) => check.provider === "local_encrypted");
+
+    expect(local).toMatchObject({
+      status: "ok",
+      details: { keySource: "env" },
+    });
+  });
 });

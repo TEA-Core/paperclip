@@ -21,6 +21,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { issueService } from "./issues.js";
 import { provisionIssueExecutionWorkspace } from "./execution-workspace-provisioning.js";
 import type { Environment } from "@paperclipai/shared";
 import type { TrustPresetResolution } from "./trust-preset-resolver.js";
@@ -120,6 +121,10 @@ function buildResolvedWorkspace(overrides: Partial<ResolvedWorkspaceForRun> = {}
     repoRef: null,
     workspaceHints: [],
     warnings: [],
+    baseCwdFallback: false,
+    materializationFailures: [],
+    additionalWorkspaces: [],
+    referencedProjectFailures: [],
     ...overrides,
   };
 }
@@ -715,4 +720,446 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
     expect(result.kind).toBe("deferred");
     expect(lifecycleCalled).toBe(true);
   });
+});
+
+/**
+ * SUP-13058: `executionWorkspacePolicy.allowIssueOverride` was parsed, persisted and
+ * rendered but never read, so setting it to `false` enforced nothing.
+ *
+ * Enforcement lives at the issue write boundary (`issueService.create` / `.update`),
+ * which is the only place an operator-supplied override is distinguishable from the
+ * binding `provisionIssueExecutionWorkspace` persists on its own after every run.
+ * The re-run test below is the negative control for that distinction: a guard that
+ * reads the issue's persisted state instead of the supplied fields passes every other
+ * test here and still rejects the second run of every issue.
+ */
+describeEmbeddedPostgres("allowIssueOverride enforcement (SUP-13058)", () => {
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let db: Db;
+  let tempRoots: string[] = [];
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-allow-issue-override-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    for (const root of tempRoots.splice(0)) {
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+    await db.delete(heartbeatRuns);
+    await db.delete(issues);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(executionWorkspaces);
+    await db.delete(environments);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await db.$client.end();
+    await tempDb?.cleanup();
+  }, 60_000);
+
+  async function seed(allowIssueOverride: boolean | undefined) {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const now = new Date("2026-08-16T00:00:00.000Z");
+
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-allow-override-test-"));
+    tempRoots.push(tempRoot);
+    initTempGitRepo(tempRoot);
+
+    await instanceSettingsService(db).updateExperimental({
+      enableIsolatedWorkspaces: true,
+      enableWorkspaceBranchReconcileForward: false,
+      enableWorkspaceDirtyQuarantineRepair: false,
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Acme",
+      issuePrefix,
+      status: "active",
+      defaultResponsibleUserId: "responsible-user",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "allowIssueOverride test",
+      status: "active",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        // `undefined` exercises the "field absent" arm: the default stays `true`.
+        ...(allowIssueOverride === undefined ? {} : { allowIssueOverride }),
+        workspaceStrategy: {
+          type: "git_worktree",
+          provisionCommand: "echo provision",
+        },
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: tempRoot,
+      isPrimary: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "OverrideAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const existingWorkspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: existingWorkspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: null,
+      name: "Pre-existing workspace",
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      status: "idle",
+      cwd: tempRoot,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    return { companyId, projectId, projectWorkspaceId, agentId, existingWorkspaceId, tempRoot, now };
+  }
+
+  // Acceptance 1: the false arm is rejected, and the error names the project setting.
+  it("rejects an operator-supplied issue workspace override when allowIssueOverride is false", async () => {
+    const { companyId, projectId, existingWorkspaceId } = await seed(false);
+    const svc = issueService(db);
+
+    await expect(
+      svc.create(companyId, {
+        title: "Override attempt",
+        status: "todo",
+        priority: "medium",
+        workMode: "standard",
+        projectId,
+        executionWorkspaceId: existingWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+      } as Parameters<typeof svc.create>[1]),
+    ).rejects.toThrow(/allowIssueOverride/);
+  });
+
+  it("names the project setting in the rejection payload", async () => {
+    const { companyId, projectId, existingWorkspaceId } = await seed(false);
+    const svc = issueService(db);
+
+    const err = await svc.create(companyId, {
+      title: "Override attempt",
+      status: "todo",
+      priority: "medium",
+      workMode: "standard",
+      projectId,
+      executionWorkspaceId: existingWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    } as Parameters<typeof svc.create>[1]).then(
+      () => null,
+      (e: unknown) => e as { message?: string; details?: Record<string, unknown> },
+    );
+
+    expect(err).not.toBeNull();
+    expect(err!.message).toContain("executionWorkspacePolicy.allowIssueOverride");
+    expect(err!.details).toMatchObject({
+      code: "workspace_issue_override_disallowed",
+      field: "executionWorkspacePolicy.allowIssueOverride",
+    });
+  });
+
+  // Acceptance 2: true and absent behave exactly as they do today.
+  it.each([
+    ["true", true],
+    ["absent", undefined],
+  ] as const)("honours an issue workspace override when allowIssueOverride is %s", async (_label, flag) => {
+    const { companyId, projectId, existingWorkspaceId } = await seed(flag);
+    const svc = issueService(db);
+
+    const created = await svc.create(companyId, {
+      title: "Override allowed",
+      status: "todo",
+      priority: "medium",
+      workMode: "standard",
+      projectId,
+      executionWorkspaceId: existingWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    } as Parameters<typeof svc.create>[1]);
+
+    expect(created.executionWorkspaceId).toBe(existingWorkspaceId);
+    expect(created.executionWorkspacePreference).toBe("reuse_existing");
+  });
+
+  it("allows an issue with no workspace override under allowIssueOverride: false", async () => {
+    const { companyId, projectId } = await seed(false);
+    const svc = issueService(db);
+
+    const created = await svc.create(companyId, {
+      title: "No override",
+      status: "todo",
+      priority: "medium",
+      workMode: "standard",
+      projectId,
+    } as Parameters<typeof svc.create>[1]);
+
+    expect(created.id).toEqual(expect.any(String));
+    expect(created.executionWorkspaceId).toBeNull();
+  });
+
+  /**
+   * `dispatchRoutineRun` (routines.ts) and pipeline stage-entry automations
+   * normalize with `?? null`, so these keys are PRESENT and null on every
+   * routine-created issue even when nothing was configured. Keying the guard on
+   * key-presence alone would reject all of them under `allowIssueOverride: false`.
+   */
+  it("accepts present-but-null workspace fields under allowIssueOverride: false", async () => {
+    const { companyId, projectId } = await seed(false);
+    const svc = issueService(db);
+
+    const created = await svc.create(companyId, {
+      title: "Routine-shaped create",
+      status: "todo",
+      priority: "medium",
+      workMode: "standard",
+      projectId,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      executionWorkspaceSettings: null,
+    } as Parameters<typeof svc.create>[1]);
+
+    expect(created.executionWorkspaceId).toBeNull();
+  });
+
+  it("accepts clearing an override under allowIssueOverride: false", async () => {
+    const { companyId, projectId } = await seed(false);
+    const svc = issueService(db);
+
+    const created = await svc.create(companyId, {
+      title: "Clearable",
+      status: "todo",
+      priority: "medium",
+      workMode: "standard",
+      projectId,
+    } as Parameters<typeof svc.create>[1]);
+
+    // Clearing is not itself an override — refusing it would trap the issue in
+    // exactly the state the project forbids.
+    const cleared = await svc.update(created.id, {
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+    });
+    expect(cleared!.executionWorkspaceId).toBeNull();
+  });
+
+  it("rejects an override supplied through update when allowIssueOverride is false", async () => {
+    const { companyId, projectId, existingWorkspaceId } = await seed(false);
+    const svc = issueService(db);
+
+    const created = await svc.create(companyId, {
+      title: "Update override",
+      status: "todo",
+      priority: "medium",
+      workMode: "standard",
+      projectId,
+    } as Parameters<typeof svc.create>[1]);
+
+    await expect(
+      svc.update(created.id, {
+        executionWorkspaceId: existingWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+      }),
+    ).rejects.toThrow(/allowIssueOverride/);
+
+    // A non-workspace update on the same issue is untouched by the guard.
+    const renamed = await svc.update(created.id, { title: "Renamed" });
+    expect(renamed!.title).toBe("Renamed");
+  });
+
+  /**
+   * The regression the first implementation failed: `provisionIssueExecutionWorkspace`
+   * writes `executionWorkspaceId` (and `executionWorkspacePreference: "reuse_existing"`
+   * for isolated/operator_branch) back onto the issue after every run. A guard keyed on
+   * the issue's persisted state therefore rejects the SECOND run of every issue in an
+   * `allowIssueOverride: false` project, even though the project's own defaultMode
+   * produced that binding and no operator supplied anything.
+   */
+  it("provisions the same issue twice under allowIssueOverride: false (system binding is not an override)", async () => {
+    const { companyId, projectId, projectWorkspaceId, agentId, tempRoot, now } = await seed(false);
+    const svc = issueService(db);
+
+    const created = await svc.create(companyId, {
+      title: "Re-run issue",
+      status: "in_progress",
+      priority: "medium",
+      workMode: "standard",
+      projectId,
+      projectWorkspaceId,
+      assigneeAgentId: agentId,
+    } as Parameters<typeof svc.create>[1]);
+    const issueId = created.id;
+
+    // The issue starts unbound — no operator ever supplied a workspace.
+    expect(created.executionWorkspaceId).toBeNull();
+
+    const localEnvironment: Environment = {
+      id: "local-env",
+      name: "Local",
+      description: null,
+      driver: "local",
+      status: "active",
+      config: {},
+      envVars: {},
+      metadata: null,
+      createdAt: now,
+      updatedAt: now,
+    } as unknown as Environment;
+
+    const agent = await db.query.agents.findFirst({ where: eq(agents.id, agentId) });
+
+    async function provisionOnce(runId: string) {
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        responsibleUserId: "responsible-user",
+        createdAt: now,
+        updatedAt: now,
+      });
+      const run = await db.query.heartbeatRuns.findFirst({ where: eq(heartbeatRuns.id, runId) });
+
+      // issueRef mirrors heartbeat.ts:14524-14525 — it carries whatever the issue row
+      // currently holds, which after run 1 includes the system-persisted binding.
+      const row = await db
+        .select({
+          executionWorkspaceId: issues.executionWorkspaceId,
+          executionWorkspacePreference: issues.executionWorkspacePreference,
+          identifier: issues.identifier,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!);
+
+      const issueRef: ExecutionWorkspaceProvisioningIssueRef = {
+        id: issueId,
+        identifier: row.identifier!,
+        title: "Re-run issue",
+        status: "in_progress",
+        priority: "medium",
+        workMode: "standard",
+        description: null,
+        projectId,
+        projectWorkspaceId,
+        executionWorkspaceId: row.executionWorkspaceId,
+        executionWorkspacePreference: row.executionWorkspacePreference,
+      };
+
+      return provisionIssueExecutionWorkspace({
+        db,
+        run: run!,
+        agent: agent!,
+        issueId,
+        issueRef,
+        runId,
+        effectiveExecutionWorkspaceMode: "isolated_workspace",
+        trustPreset: standardTrustResolution(),
+        isolatedWorkspacesEnabled: true,
+        selectedEnvironmentId: null,
+        selectedEnvironmentForConfig: null,
+        localEnvironment,
+        environmentSelectionSource: "local",
+        configSnapshot: null,
+        secretManifest: [],
+        projectExecutionWorkspacePolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: false,
+          workspaceStrategy: { type: "git_worktree", provisionCommand: "echo provision" },
+        },
+        issueExecutionWorkspaceSettings: { mode: "isolated_workspace" },
+        executionProjectId: projectId,
+        resolvedInstanceSettings: {
+          experimental: {
+            enableWorkspaceBranchReconcileForward: false,
+            enableWorkspaceDirtyQuarantineRepair: false,
+          },
+        },
+        mergedConfig: {},
+        executionPolicy: { executionMode: "standard" },
+        context: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        resolveWorkspace: async () =>
+          buildResolvedWorkspace({
+            cwd: tempRoot,
+            source: "project_primary",
+            projectId,
+            workspaceId: projectWorkspaceId,
+            repoUrl: null,
+            repoRef: null,
+          }),
+        resolveSessionConfig: async () => ({
+          previousSessionParams: null,
+          resetTaskSession: true,
+          sessionResetReason: null,
+          sessionConfigFreshness: {
+            reset: true,
+            reasons: ["initial"],
+            changedCategories: [],
+            nextFingerprint: null,
+            storedFingerprint: null,
+          },
+          sessionConfigMetadata: buildTestSessionConfigMetadata(),
+        }),
+        runLifecycle: { onExecutionWorkspaceOccupied: async () => undefined },
+      } as unknown as Parameters<typeof provisionIssueExecutionWorkspace>[0]);
+    }
+
+    const first = await provisionOnce(randomUUID());
+    expect(first.kind).toBe("provisioned");
+
+    // Run 1 persisted the binding that a state-based guard would misread as an override.
+    const afterFirst = await db
+      .select({
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    expect(afterFirst.executionWorkspaceId).not.toBeNull();
+    expect(afterFirst.executionWorkspacePreference).toBe("reuse_existing");
+
+    // Run 2 must NOT be rejected. This is the arm the first implementation failed.
+    const second = await provisionOnce(randomUUID());
+    expect(second.kind).toBe("provisioned");
+  }, 60_000);
 });

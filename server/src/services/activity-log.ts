@@ -69,6 +69,27 @@ export interface LogActivityInput {
   agentApiKeyId?: string | null;
   issueId?: string | null;
   details?: Record<string, unknown> | null;
+  responsibleUserIdOverride?: string | null;
+}
+
+export interface ActivityPublication {
+  companyId: string;
+  payload: Record<string, unknown>;
+  pluginEvent: PluginEvent | null;
+}
+
+export async function createActivityDetailsRedactor(db: Db) {
+  const currentUserRedactionOptions = {
+    enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
+  };
+  return (details: Record<string, unknown> | null) => (
+    details ? redactCurrentUserValue(sanitizeRecord(details), currentUserRedactionOptions) : null
+  );
+}
+
+export async function redactActivityDetails(db: Db, details: Record<string, unknown> | null) {
+  if (!details) return null;
+  return (await createActivityDetailsRedactor(db))(details);
 }
 
 function readNonEmptyString(value: unknown) {
@@ -142,22 +163,30 @@ async function resolveResponsibleUserIdWithRun(
 }
 
 export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActivityInput) {
+  if (input.responsibleUserIdOverride !== undefined) {
+    return readNonEmptyString(input.responsibleUserIdOverride);
+  }
   if (input.actorType === "user") return readNonEmptyString(input.actorId);
   return resolveResponsibleUserIdWithRun(db, input, await lookupActivityRun(db, input));
 }
 
-async function writeActivity(db: Db, input: LogActivityInput) {
-  const currentUserRedactionOptions = {
-    enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
-  };
-  const sanitizedDetails = input.details ? sanitizeRecord(input.details) : null;
-  const redactedDetails = sanitizedDetails
-    ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
-    : null;
+export function publishActivity(publication: ActivityPublication) {
+  publishLiveEvent({
+    companyId: publication.companyId,
+    type: "activity.logged",
+    payload: publication.payload,
+  });
+  if (publication.pluginEvent) publishPluginDomainEvent(publication.pluginEvent);
+}
+
+export async function persistActivity(db: Db, input: LogActivityInput) {
+  const redactedDetails = await redactActivityDetails(db, input.details ?? null);
   const run = await lookupActivityRun(db, input);
-  const responsibleUserId = input.actorType === "user"
-    ? readNonEmptyString(input.actorId)
-    : await resolveResponsibleUserIdWithRun(db, input, run);
+  const responsibleUserId = input.responsibleUserIdOverride !== undefined
+    ? readNonEmptyString(input.responsibleUserIdOverride)
+    : input.actorType === "user"
+      ? readNonEmptyString(input.actorId)
+      : await resolveResponsibleUserIdWithRun(db, input, run);
   // Only stamp run_id when the run actually exists here; a dangling reference would trip the
   // `activity_log_run_id_heartbeat_runs_id_fk` foreign key and cost us the whole audit row.
   const runId = run?.row ? run.runId : null;
@@ -173,7 +202,7 @@ async function writeActivity(db: Db, input: LogActivityInput) {
       "activity log references an unknown run; recording the entry without a run id",
     );
   }
-  await db.insert(activityLog).values({
+  const [activity] = await db.insert(activityLog).values({
     companyId: input.companyId,
     actorType: input.actorType,
     actorId: input.actorId,
@@ -184,44 +213,47 @@ async function writeActivity(db: Db, input: LogActivityInput) {
     runId,
     responsibleUserId,
     details: redactedDetails,
-  });
+  }).returning({ id: activityLog.id });
 
-  publishLiveEvent({
-    companyId: input.companyId,
-    type: "activity.logged",
-    payload: {
-      actorType: input.actorType,
-      actorId: input.actorId,
-      action: input.action,
-      entityType: input.entityType,
-      entityId: input.entityId,
-      agentId: input.agentId ?? null,
-      runId,
-      responsibleUserId,
-      details: redactedDetails,
-    },
-  });
-
+  const payload = {
+    actorType: input.actorType,
+    actorId: input.actorId,
+    action: input.action,
+    entityType: input.entityType,
+    entityId: input.entityId,
+    agentId: input.agentId ?? null,
+    runId,
+    responsibleUserId,
+    details: redactedDetails,
+  };
   const pluginEventType = eventTypeForActivityAction(input.action);
-  if (pluginEventType) {
-    const event: PluginEvent = {
-      eventId: randomUUID(),
-      eventType: pluginEventType,
-      occurredAt: new Date().toISOString(),
-      actorId: input.actorId,
-      actorType: input.actorType,
-      entityId: input.entityId,
-      entityType: input.entityType,
+  const pluginEvent: PluginEvent | null = pluginEventType
+    ? {
+        eventId: randomUUID(),
+        eventType: pluginEventType,
+        occurredAt: new Date().toISOString(),
+        actorId: input.actorId,
+        actorType: input.actorType,
+        entityId: input.entityId,
+        entityType: input.entityType,
+        companyId: input.companyId,
+        payload: {
+          ...redactedDetails,
+          agentId: input.agentId ?? null,
+          runId,
+          responsibleUserId,
+        },
+      }
+    : null;
+
+  return {
+    activity,
+    publication: {
       companyId: input.companyId,
-      payload: {
-        ...redactedDetails,
-        agentId: input.agentId ?? null,
-        runId,
-        responsibleUserId,
-      },
-    };
-    publishPluginDomainEvent(event);
-  }
+      payload,
+      pluginEvent,
+    } satisfies ActivityPublication,
+  };
 }
 
 /**
@@ -231,10 +263,24 @@ async function writeActivity(db: Db, input: LogActivityInput) {
  * audit write is logged with the entity it belonged to instead (SUP-9856).
  *
  * Callers running inside a transaction must use {@link logActivityInTransaction}.
+ *
+ * `postCommitPublications` defers the realtime/plugin publication instead of firing it inline:
+ * a caller that is still mid-write collects the publications and drains them once its write
+ * has actually landed, so subscribers never see an activity for a mutation that rolled back.
  */
-export async function logActivity(db: Db, input: LogActivityInput) {
+export async function logActivity(
+  db: Db,
+  input: LogActivityInput,
+  postCommitPublications?: ActivityPublication[],
+) {
   try {
-    await writeActivity(db, input);
+    const { activity, publication } = await persistActivity(db, input);
+    if (postCommitPublications) {
+      postCommitPublications.push(publication);
+    } else {
+      publishActivity(publication);
+    }
+    return activity;
   } catch (err) {
     logger.error(
       {
@@ -260,6 +306,16 @@ export async function logActivity(db: Db, input: LogActivityInput) {
  * statement fails anyway with a far less useful error. Here the audit entry and the mutation
  * share a fate, which is exactly the guarantee a caller opens a transaction for.
  */
-export async function logActivityInTransaction(tx: Db, input: LogActivityInput) {
-  await writeActivity(tx, input);
+export async function logActivityInTransaction(
+  tx: Db,
+  input: LogActivityInput,
+  postCommitPublications?: ActivityPublication[],
+) {
+  const { activity, publication } = await persistActivity(tx, input);
+  if (postCommitPublications) {
+    postCommitPublications.push(publication);
+  } else {
+    publishActivity(publication);
+  }
+  return activity;
 }

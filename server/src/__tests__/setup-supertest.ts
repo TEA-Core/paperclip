@@ -37,6 +37,20 @@ if (process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION === undefined) {
   process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = "1";
 }
 
+// Keep auto-generated key material inside a throwaway directory owned by this
+// suite. The fork resolves every persisted key file from the master key's
+// location (PAPERCLIP_SECRETS_MASTER_KEY_FILE, defaulting to
+// /etc/paperclip/secrets), so a suite that creates a secret without pinning
+// this path writes a real key file at the shared default. That file then
+// outlives the suite and is visible to every later suite on the same runner,
+// which makes secret-provider-registry.test.ts (it asserts the default-path
+// behavior with no key file present) pass or fail purely on suite ordering.
+// Suites that need their own directory still override this value.
+if (process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE === undefined) {
+  const secretsDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-secrets-"));
+  process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsDir, "master.key");
+}
+
 if (!SupertestTest.prototype.__paperclipLoopbackPatched) {
   SupertestTest.prototype.serverAddress = function serverAddress(app, path) {
     const addr = app.address();

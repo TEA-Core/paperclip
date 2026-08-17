@@ -4,6 +4,7 @@ import type {
   IssueExecutionWorkspaceSettings,
   ProjectExecutionWorkspaceDefaultMode,
   ProjectExecutionWorkspacePolicy,
+  SharedWorkspaceConcurrency,
 } from "@paperclipai/shared";
 import { asString, parseObject } from "../adapters/utils.js";
 
@@ -20,6 +21,12 @@ export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION =
   "Pass executionWorkspaceId with the workspace to reuse, pass inheritExecutionWorkspaceFromIssueId (or parentId) to inherit one, or drop executionWorkspacePreference: \"reuse_existing\".";
 export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE =
   `executionWorkspacePreference: "reuse_existing" requires executionWorkspaceId, and none was supplied or inherited. ${WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION}`;
+
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE = "workspace_issue_override_disallowed";
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION =
+  "Remove the issue's executionWorkspacePreference/executionWorkspaceId override, or set the project's executionWorkspacePolicy.allowIssueOverride to true.";
+export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_MESSAGE =
+  `This issue supplies an execution-workspace override, but the project's executionWorkspacePolicy.allowIssueOverride is false. ${WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION}`;
 
 type WorkspaceStrategyType = ExecutionWorkspaceStrategy["type"];
 
@@ -47,6 +54,9 @@ function parseExecutionWorkspaceStrategy(raw: unknown): ExecutionWorkspaceStrate
     ...(typeof parsed.branchTemplate === "string" ? { branchTemplate: parsed.branchTemplate } : {}),
     ...(typeof parsed.worktreeParentDir === "string" ? { worktreeParentDir: parsed.worktreeParentDir } : {}),
     ...(typeof parsed.provisionCommand === "string" ? { provisionCommand: parsed.provisionCommand } : {}),
+    ...(typeof parsed.runtimeProvisionCommand === "string"
+      ? { runtimeProvisionCommand: parsed.runtimeProvisionCommand }
+      : {}),
     ...(typeof parsed.teardownCommand === "string" ? { teardownCommand: parsed.teardownCommand } : {}),
   };
 }
@@ -87,6 +97,40 @@ export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIs
   return Boolean(issue.executionWorkspaceId && issue.executionWorkspacePreference === "reuse_existing");
 }
 
+/**
+ * Does THIS write supply an issue-level execution-workspace override?
+ *
+ * The question is about the fields THIS write carries — NOT about the issue's
+ * persisted state. `provisionIssueExecutionWorkspace` writes
+ * `executionWorkspaceId` back onto every issue it provisions, and
+ * `executionWorkspacePreference: "reuse_existing"` for isolated/operator_branch
+ * modes, so after one run every issue carries a binding that is
+ * indistinguishable from an operator override if you only look at the row. A
+ * predicate reading persisted state rejects the SECOND run of every issue in an
+ * `allowIssueOverride: false` project, even though the project's own
+ * `defaultMode` produced the binding.
+ *
+ * Only the write boundary can tell the two apart: there, an operator supplying
+ * the field is observable, and provisioning's system write-back opts out via
+ * `systemWorkspaceBinding`.
+ *
+ * `null` counts as NOT supplying an override, for two reasons. Clearing an
+ * override is not itself an override, so refusing it would trap an issue in the
+ * very state the project forbids. And several callers normalize with `?? null`
+ * (routines `dispatchRoutineRun`, pipeline stage-entry automations), so the key
+ * is present-but-null on every routine-created issue even when nothing was
+ * configured — keying on presence alone would reject all of them.
+ */
+export function suppliesIssueExecutionWorkspaceOverride(input: {
+  executionWorkspacePreference?: string | null;
+  executionWorkspaceId?: string | null;
+}): boolean {
+  if (input.executionWorkspaceId) return true;
+  const preference = input.executionWorkspacePreference;
+  // "inherit" explicitly defers to the project policy — the opposite of an override.
+  return Boolean(preference && preference !== "inherit");
+}
+
 export function isUnrunnableWorktreeCombo(input: {
   issue: UnrunnableWorktreeIssueRef;
   resolvedMode: ParsedExecutionWorkspaceMode;
@@ -103,6 +147,53 @@ export function isUnrunnableWorktreeCombo(input: {
   return input.hasResolvablePriorSessionWorkspace !== true;
 }
 
+export function canAgentSatisfyIssueWorkspaceSettings(input: {
+  issue: UnrunnableWorktreeIssueRef;
+  executionWorkspaceSettings: unknown;
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  reusableExecutionWorkspaceAvailable?: boolean | null;
+  hasResolvablePriorSessionWorkspace?: boolean | null;
+  agentConfig?: Record<string, unknown> | null;
+}): boolean {
+  const settings = parseIssueExecutionWorkspaceSettings(input.executionWorkspaceSettings);
+  const mode = settings?.mode;
+  if (mode !== "isolated_workspace" && mode !== "operator_branch") return true;
+
+  const resolvedMode = mode as ParsedExecutionWorkspaceMode;
+  // Resolve the candidate's effective strategy exactly the way dispatch does: the agent's
+  // adapterConfig is the LOWEST-precedence input, below the issue settings and the project
+  // policy. Comparing the candidate's raw adapterConfig against the issue strategy instead
+  // would reject every agent whose config does not restate the strategy — including the
+  // common `adapterConfig: {}` agent, which dispatch resolves to the issue/project strategy
+  // and runs without complaint.
+  const candidateWorkspaceConfig = buildExecutionWorkspaceAdapterConfig({
+    agentConfig: input.agentConfig ?? {},
+    projectPolicy: input.projectPolicy,
+    issueSettings: settings,
+    mode: resolvedMode,
+    legacyUseProjectWorkspace: null,
+  });
+  // SUP-13100 (reverted, ruling in SUP-13100 round-4): a previous revision preferred the
+  // strategyType persisted on the bound `execution_workspaces` row over this derivation.
+  // That override was provably dead code. It only engaged when
+  // `hasReusableExecutionWorkspaceBinding(issue)` was true, and for exactly those inputs
+  // `isUnrunnableWorktreeCombo` already short-circuits to "capable" on its reusable-workspace
+  // check — the ladder (recovery/service.ts) passes no `reusableExecutionWorkspaceAvailable`,
+  // so that check falls back to the same binding predicate. Measured: 540 ladder-reachable
+  // input combinations × 4 bound strategyType values produced zero divergence in the return
+  // value. Do not reintroduce it without first making the call site pass an explicit
+  // `reusableExecutionWorkspaceAvailable`.
+  const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, candidateWorkspaceConfig);
+
+  return !isUnrunnableWorktreeCombo({
+    issue: input.issue,
+    resolvedMode,
+    resolvedStrategy,
+    reusableExecutionWorkspaceAvailable: input.reusableExecutionWorkspaceAvailable,
+    hasResolvablePriorSessionWorkspace: input.hasResolvablePriorSessionWorkspace,
+  });
+}
+
 export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecutionWorkspacePolicy | null {
   const parsed = parseObject(raw);
   if (Object.keys(parsed).length === 0) return null;
@@ -113,6 +204,7 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
     typeof parsed.defaultProjectWorkspaceId === "string" ? parsed.defaultProjectWorkspaceId : undefined;
   const allowIssueOverride =
     typeof parsed.allowIssueOverride === "boolean" ? parsed.allowIssueOverride : undefined;
+  const sharedWorkspaceConcurrency = parseSharedWorkspaceConcurrency(parsed.sharedWorkspaceConcurrency);
   const normalizedDefaultMode = (() => {
     if (
       defaultMode === "shared_workspace" ||
@@ -128,6 +220,7 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
   })();
   return {
     enabled,
+    ...(sharedWorkspaceConcurrency ? { sharedWorkspaceConcurrency } : {}),
     ...(normalizedDefaultMode ? { defaultMode: normalizedDefaultMode } : {}),
     ...(allowIssueOverride !== undefined ? { allowIssueOverride } : {}),
     ...(defaultProjectWorkspaceId ? { defaultProjectWorkspaceId } : {}),
@@ -172,6 +265,7 @@ export function parseIssueExecutionWorkspaceSettings(
   const parsed = parseObject(raw);
   if (Object.keys(parsed).length === 0) return null;
   const workspaceStrategy = parseExecutionWorkspaceStrategy(parsed.workspaceStrategy);
+  const sharedWorkspaceConcurrency = parseSharedWorkspaceConcurrency(parsed.sharedWorkspaceConcurrency);
   const mode = asString(parsed.mode, "");
   const normalizedMode = (() => {
     if (
@@ -188,10 +282,22 @@ export function parseIssueExecutionWorkspaceSettings(
     if (mode === "isolated") return "isolated_workspace";
     return "";
   })();
+  const networkEgress = parseObject(parsed.networkEgress);
+  const allowFqdns = Array.isArray(networkEgress.allowFqdns)
+    ? networkEgress.allowFqdns
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .map((value) => value.trim().toLowerCase())
+    : [];
+  const allowCidrs = Array.isArray(networkEgress.allowCidrs)
+    ? networkEgress.allowCidrs
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .map((value) => value.trim())
+    : [];
   return {
     ...(normalizedMode
       ? { mode: normalizedMode as IssueExecutionWorkspaceSettings["mode"] }
       : {}),
+    ...(sharedWorkspaceConcurrency ? { sharedWorkspaceConcurrency } : {}),
     ...(options.includeEnvironmentId && (typeof parsed.environmentId === "string" || parsed.environmentId === null)
       ? { environmentId: parsed.environmentId }
       : {}),
@@ -199,7 +305,21 @@ export function parseIssueExecutionWorkspaceSettings(
     ...(parsed.workspaceRuntime && typeof parsed.workspaceRuntime === "object" && !Array.isArray(parsed.workspaceRuntime)
       ? { workspaceRuntime: { ...(parsed.workspaceRuntime as Record<string, unknown>) } }
       : {}),
+    ...(allowFqdns.length > 0 || allowCidrs.length > 0
+      ? { networkEgress: { allowFqdns, allowCidrs } }
+      : {}),
   };
+}
+
+export function selectEnvironmentExecutionWorkspaceSettings(
+  parsedSettings: IssueExecutionWorkspaceSettings | null,
+  isolatedWorkspacesEnabled: boolean,
+): IssueExecutionWorkspaceSettings | null {
+  if (!parsedSettings) return null;
+  if (isolatedWorkspacesEnabled) return parsedSettings;
+  return parsedSettings.networkEgress
+    ? { networkEgress: parsedSettings.networkEgress }
+    : null;
 }
 
 export type ExecutionWorkspaceEnvironmentSource =
@@ -271,7 +391,8 @@ export function resolveExecutionWorkspaceMode(input: {
   issueSettings: IssueExecutionWorkspaceSettings | null;
   legacyUseProjectWorkspace: boolean | null;
 }): ParsedExecutionWorkspaceMode {
-  const issueMode = input.issueSettings?.mode;
+  const effectiveIssueSettings = input.projectPolicy?.allowIssueOverride === false ? null : input.issueSettings;
+  const issueMode = effectiveIssueSettings?.mode;
   if (issueMode && issueMode !== "inherit" && issueMode !== "reuse_existing") {
     return issueMode;
   }
@@ -287,6 +408,20 @@ export function resolveExecutionWorkspaceMode(input: {
   return "shared_workspace";
 }
 
+function parseSharedWorkspaceConcurrency(raw: unknown): SharedWorkspaceConcurrency | undefined {
+  return raw === "auto" || raw === "serialize" || raw === "allow" ? raw : undefined;
+}
+
+export function resolveSharedWorkspaceConcurrency(input: {
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  issueSettings: IssueExecutionWorkspaceSettings | null;
+}): SharedWorkspaceConcurrency {
+  const effectiveIssueSettings = input.projectPolicy?.allowIssueOverride === false ? null : input.issueSettings;
+  return effectiveIssueSettings?.sharedWorkspaceConcurrency
+    ?? (input.projectPolicy?.enabled ? input.projectPolicy.sharedWorkspaceConcurrency : undefined)
+    ?? "auto";
+}
+
 export function buildExecutionWorkspaceAdapterConfig(input: {
   agentConfig: Record<string, unknown>;
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
@@ -295,18 +430,19 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
   legacyUseProjectWorkspace: boolean | null;
 }): Record<string, unknown> {
   const nextConfig = { ...input.agentConfig };
+  const effectiveIssueSettings = input.projectPolicy?.allowIssueOverride === false ? null : input.issueSettings;
   const projectHasPolicy = Boolean(input.projectPolicy?.enabled);
   const issueHasWorkspaceOverrides = Boolean(
-    input.issueSettings?.mode ||
-    input.issueSettings?.workspaceStrategy ||
-    input.issueSettings?.workspaceRuntime,
+    effectiveIssueSettings?.mode ||
+    effectiveIssueSettings?.workspaceStrategy ||
+    effectiveIssueSettings?.workspaceRuntime,
   );
   const hasWorkspaceControl = projectHasPolicy || issueHasWorkspaceOverrides || input.legacyUseProjectWorkspace === false;
 
   if (hasWorkspaceControl) {
     if (input.mode === "isolated_workspace") {
       const strategy =
-        input.issueSettings?.workspaceStrategy ??
+        effectiveIssueSettings?.workspaceStrategy ??
         input.projectPolicy?.workspaceStrategy ??
         parseExecutionWorkspaceStrategy(nextConfig.workspaceStrategy) ??
         ({ type: "git_worktree" } satisfies ExecutionWorkspaceStrategy);
@@ -317,8 +453,8 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
 
     if (input.mode === "agent_default") {
       delete nextConfig.workspaceRuntime;
-    } else if (input.issueSettings?.workspaceRuntime) {
-      nextConfig.workspaceRuntime = cloneRecord(input.issueSettings.workspaceRuntime) ?? undefined;
+    } else if (effectiveIssueSettings?.workspaceRuntime) {
+      nextConfig.workspaceRuntime = cloneRecord(effectiveIssueSettings.workspaceRuntime) ?? undefined;
     } else if (input.projectPolicy?.workspaceRuntime) {
       nextConfig.workspaceRuntime = cloneRecord(input.projectPolicy.workspaceRuntime) ?? undefined;
     }

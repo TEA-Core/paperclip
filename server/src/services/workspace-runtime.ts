@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
+import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -14,6 +15,8 @@ import {
   type GitWorktreeBranchAncestryVerdict,
   type GitWorktreeBranchIncoherenceEvidence as SharedGitWorktreeBranchIncoherenceEvidence,
   type GitWorktreeInProgressOperation,
+  type IssueCommentMetadata,
+  type IssueCommentPresentation,
   type WorkspaceOperationPhase,
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
@@ -33,10 +36,18 @@ import {
   touchLocalServiceRegistryRecord,
   writeLocalServiceRegistryRecord,
 } from "./local-service-supervisor.js";
-import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
+import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig, type ExecutionWorkspaceBranchReconcileMode } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+import {
+  cleanupWorktreeInstanceArtifacts,
+  deriveWorktreeInstanceId,
+  readWorktreeInstancePointer,
+  WORKTREE_INSTANCE_ROOT_METADATA_KEY,
+  type WorktreeInstancePointer,
+} from "./workspace-instance-cleanup.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -48,6 +59,19 @@ export function resolveShell(): string {
   return shell;
 }
 
+/**
+ * A read-only referenced (mentioned) project workspace carried alongside the anchor. Additive and
+ * backward-compatible: it defaults to an empty array. Additional workspaces never get git-worktree
+ * realization; the anchor keeps the single scalar realization path.
+ */
+export interface ExecutionWorkspaceAdditionalInput {
+  cwd: string;
+  projectId: string;
+  workspaceId: string | null;
+  repoUrl: string | null;
+  repoRef: string | null;
+}
+
 export interface ExecutionWorkspaceInput {
   baseCwd: string;
   source: "project_primary" | "task_session" | "agent_home";
@@ -55,7 +79,23 @@ export interface ExecutionWorkspaceInput {
   workspaceId: string | null;
   repoUrl: string | null;
   repoRef: string | null;
+  additionalWorkspaces?: ExecutionWorkspaceAdditionalInput[];
 }
+
+/**
+ * A prepared credential-bearing git invocation for one remote URL, or null to keep ambient
+ * behavior. Structurally compatible with the provider built by `git-credentials.ts` — this
+ * module deliberately takes prepared invocations rather than tokens, so it never imports the
+ * secrets layer and test fakes stay trivial.
+ */
+export type GitRemoteAuthInvocation = {
+  configArgs: string[];
+  env: Record<string, string>;
+  source?: string;
+  secretName?: string | null;
+};
+
+export type GitRemoteAuthProvider = (remoteUrl: string) => Promise<GitRemoteAuthInvocation | null>;
 
 export interface ExecutionWorkspaceIssueRef {
   id: string;
@@ -100,7 +140,7 @@ export interface RuntimeServiceRef {
   executionWorkspaceId: string | null;
   issueId: string | null;
   serviceName: string;
-  status: "starting" | "running" | "stopped" | "failed";
+  status: "provisioning" | "starting" | "running" | "stopped" | "failed";
   lifecycle: "shared" | "ephemeral";
   scopeType: "project_workspace" | "execution_workspace" | "run" | "agent";
   scopeId: string | null;
@@ -145,6 +185,7 @@ type StoppedRuntimeServiceReuseCandidate = {
 const runtimeServicesById = new Map<string, RuntimeServiceRecord>();
 const runtimeServicesByReuseKey = new Map<string, string>();
 const runtimeServiceLeasesByRun = new Map<string, string[]>();
+const runtimeProvisionByWorkspace = new Map<string, Promise<void>>();
 const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
 
 type ProcessOutputCapture = {
@@ -179,6 +220,7 @@ export async function resetRuntimeServicesForTests(options?: { keepProcessesRunn
   runtimeServicesById.clear();
   runtimeServicesByReuseKey.clear();
   runtimeServiceLeasesByRun.clear();
+  runtimeProvisionByWorkspace.clear();
 }
 
 function stableStringify(value: unknown): string {
@@ -554,11 +596,12 @@ async function executeProcess(input: {
   };
 }
 
-async function runGit(args: string[], cwd: string): Promise<string> {
+async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv }): Promise<string> {
   const proc = await executeProcess({
     command: "git",
     args,
     cwd,
+    env: opts?.env,
   });
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
@@ -589,26 +632,40 @@ function parseRemoteTrackingRef(ref: string): { remote: string; branch: string }
   return { remote, branch };
 }
 
-async function refreshRemoteTrackingBaseRef(repoRoot: string, baseRef: string): Promise<string[]> {
+export async function refreshRemoteTrackingBaseRef(
+  repoRoot: string,
+  baseRef: string,
+  resolveGitAuth?: GitRemoteAuthProvider | null,
+): Promise<string[]> {
   const remoteTracking = parseRemoteTrackingRef(baseRef);
   if (!remoteTracking) return [];
 
-  const remoteExists = await runGit(["remote", "get-url", remoteTracking.remote], repoRoot)
-    .then(() => true)
-    .catch(() => false);
-  if (!remoteExists) return [];
+  const remoteUrl = await runGit(["remote", "get-url", remoteTracking.remote], repoRoot)
+    .then((value) => value.trim() || null)
+    .catch(() => null);
+  if (!remoteUrl) return [];
 
+  const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl).catch(() => null) : null;
   try {
     await runGit([
+      ...(auth?.configArgs ?? []),
       "fetch",
       "--prune",
       remoteTracking.remote,
       `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
-    ], repoRoot);
+    ], repoRoot, auth ? { env: { ...process.env, ...auth.env } } : undefined);
     return [];
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return [`Could not refresh base ref ${baseRef} before preparing the execution workspace: ${message}`];
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    // Mask URL userinfo (any scheme) and whole URL query strings before the message rides
+    // warnings that reach run logs.
+    const message = rawMessage
+      .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1***@")
+      .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s"'?]*)\?[^\s"']*/gi, "$1?***");
+    const authNote = auth
+      ? ` The fetch authenticated with ${auth.secretName ? `the ${auth.secretName} company-secret GitHub credential` : "the server-environment GitHub credential"}, which may have been rejected.`
+      : "";
+    return [`Could not refresh base ref ${baseRef} before preparing the execution workspace: ${message}${authNote}`];
   }
 }
 
@@ -629,6 +686,7 @@ export async function inspectExecutionWorkspaceBaseDrift(input: {
   baseRef: string | null;
   recordedBaseRefSha?: string | null;
   skipRefresh?: boolean;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<{
   warnings: string[];
   currentBaseRefSha: string | null;
@@ -639,7 +697,9 @@ export async function inspectExecutionWorkspaceBaseDrift(input: {
     return { warnings: [], currentBaseRefSha: null, branchBaseRefSha: null };
   }
 
-  const warnings = input.skipRefresh ? [] : await refreshRemoteTrackingBaseRef(input.repoRoot, baseRef);
+  const warnings = input.skipRefresh
+    ? []
+    : await refreshRemoteTrackingBaseRef(input.repoRoot, baseRef, input.resolveGitAuth);
   const currentBaseRefSha = await resolveBaseRefSha(input.repoRoot, baseRef);
   if (!currentBaseRefSha) {
     warnings.push(`Could not resolve base ref ${baseRef} while checking execution workspace freshness.`);
@@ -654,7 +714,7 @@ export async function inspectExecutionWorkspaceBaseDrift(input: {
 
   if (branchBaseRefSha !== currentBaseRefSha) {
     const behindCountRaw = await runGit(["rev-list", "--count", `HEAD..${baseRef}`], input.worktreePath).catch(() => "");
-    const behindCount = Number.parseInt(behindCountRaw, 10);
+    const behindCount = parseInt(behindCountRaw, 10);
     const behindText = Number.isFinite(behindCount) && behindCount > 0
       ? `${behindCount} commit${behindCount === 1 ? "" : "s"}`
       : "newer commits";
@@ -2097,14 +2157,24 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     };
   }
 
+  // A recorded branch that no longer exists anywhere has no commits to lose, so
+  // adopting the clean checked-out branch is trivially forward-only. This is the
+  // steady state left behind when an agent renames its task branch (e.g. to a
+  // feat/* PR branch) and the recorded branch was never created or was deleted.
+  const recordedBranchMissingButAdoptable =
+    !evidence.provenance.expectedBranchExists &&
+    evidence.provenance.actualBranchExists === true &&
+    evidence.provenance.registeredBranchMatchesHead;
   if (
     input.enableWorkspaceBranchReconcileForward === true &&
-    evidence.provenance.ancestryVerdict === "ancestor" &&
-    !evidence.provenance.sameHead &&
     evidence.cleanliness === "clean" &&
-    currentBranch
+    currentBranch &&
+    ((evidence.provenance.ancestryVerdict === "ancestor" && !evidence.provenance.sameHead) ||
+      recordedBranchMissingButAdoptable)
   ) {
-    const reason = "Automatic forward reconciliation: recorded branch is an ancestor of the checked-out branch.";
+    const reason = evidence.provenance.expectedBranchExists
+      ? "Automatic forward reconciliation: recorded branch is an ancestor of the checked-out branch."
+      : "Automatic forward reconciliation: the recorded branch no longer exists, so Paperclip adopted the clean checked-out branch.";
     if (input.executionWorkspaceId && input.persistForwardReconcile !== false) {
       if (!input.db) {
         evidence.safeRepair.reason = "forward reconciliation requires database access to update the execution workspace record";
@@ -2447,9 +2517,10 @@ export async function ensureGitWorktreeBranchCoherent(input: {
 async function resolveAuthoritativeBaseRef(
   repoRoot: string,
   configuredBaseRef: string | null,
+  resolveGitAuth?: GitRemoteAuthProvider | null,
 ): Promise<{ baseRef: string; warnings: string[]; refreshed: boolean }> {
   const warnings: string[] = [];
-  const detectOrHead = async () => (await detectDefaultBranch(repoRoot)) ?? "HEAD";
+  const detectOrHead = async () => (await detectDefaultBranch(repoRoot, resolveGitAuth)) ?? "HEAD";
 
   const configured = configuredBaseRef?.trim();
   if (!configured || configured === "HEAD") {
@@ -2460,7 +2531,8 @@ async function resolveAuthoritativeBaseRef(
     return { baseRef: detected, warnings, refreshed: false };
   }
 
-  if (parseRemoteTrackingRef(configured)) {
+  const remoteTracking = parseRemoteTrackingRef(configured);
+  if (remoteTracking && (await remoteExists(repoRoot, remoteTracking.remote))) {
     return { baseRef: configured, warnings, refreshed: false };
   }
 
@@ -2468,7 +2540,7 @@ async function resolveAuthoritativeBaseRef(
     const remoteCandidate = `origin/${configured}`;
     // Refresh here and keep the warnings; the caller skips its own refresh of
     // the returned ref (see `refreshed`) so we never fetch the same ref twice.
-    warnings.push(...await refreshRemoteTrackingBaseRef(repoRoot, remoteCandidate));
+    warnings.push(...await refreshRemoteTrackingBaseRef(repoRoot, remoteCandidate, resolveGitAuth));
     if (await resolveBaseRefSha(repoRoot, remoteCandidate)) {
       return { baseRef: remoteCandidate, warnings, refreshed: true };
     }
@@ -2512,7 +2584,7 @@ async function refreshUnstartedWorktreeToBase(input: {
     ["rev-list", "--count", `${input.currentBaseRefSha}..HEAD`],
     input.worktreePath,
   ).catch(() => null);
-  const commitsPastBase = commitsPastBaseRaw === null ? null : Number.parseInt(commitsPastBaseRaw, 10);
+  const commitsPastBase = commitsPastBaseRaw === null ? null : parseInt(commitsPastBaseRaw, 10);
   if (commitsPastBase === null || !Number.isFinite(commitsPastBase) || commitsPastBase > 0) {
     return { refreshed: false, baseRefSha: null };
   }
@@ -2639,9 +2711,12 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
 }
 
-export async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
+export async function detectDefaultBranch(
+  repoRoot: string,
+  resolveGitAuth?: GitRemoteAuthProvider | null,
+): Promise<string | null> {
   const originMasterRef = "origin/master";
-  await refreshRemoteTrackingBaseRef(repoRoot, originMasterRef);
+  await refreshRemoteTrackingBaseRef(repoRoot, originMasterRef, resolveGitAuth);
   if (await resolveBaseRefSha(repoRoot, originMasterRef)) {
     return originMasterRef;
   }
@@ -2653,7 +2728,7 @@ export async function detectDefaultBranch(repoRoot: string): Promise<string | nu
       repoRoot,
     );
     if (remoteHead) {
-      await refreshRemoteTrackingBaseRef(repoRoot, remoteHead);
+      await refreshRemoteTrackingBaseRef(repoRoot, remoteHead, resolveGitAuth);
       if (await resolveBaseRefSha(repoRoot, remoteHead)) return remoteHead;
     }
   } catch {
@@ -2663,7 +2738,7 @@ export async function detectDefaultBranch(repoRoot: string): Promise<string | nu
   // Fallback: check for common default branch names on the remote
   for (const candidate of ["origin/master", "origin/main", "main", "master"]) {
     try {
-      await refreshRemoteTrackingBaseRef(repoRoot, candidate);
+      await refreshRemoteTrackingBaseRef(repoRoot, candidate, resolveGitAuth);
       await runGit(["rev-parse", "--verify", `${candidate}^{commit}`], repoRoot);
       return candidate;
     } catch {
@@ -2932,6 +3007,7 @@ async function runWorkspaceCommand(input: {
   cwd: string;
   env: NodeJS.ProcessEnv;
   label: string;
+  onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }) {
   const shell = resolveShell();
   const proc = await executeProcess({
@@ -2940,6 +3016,8 @@ async function runWorkspaceCommand(input: {
     cwd: input.cwd,
     env: input.env,
   });
+  if (proc.stdout && input.onLog) await input.onLog("stdout", `[runtime-provision] ${proc.stdout}`);
+  if (proc.stderr && input.onLog) await input.onLog("stderr", `[runtime-provision] ${proc.stderr}`);
   if (proc.code === 0) return;
 
   const details = [proc.stderr.trim(), proc.stdout.trim()].filter(Boolean).join("\n");
@@ -3015,7 +3093,7 @@ async function recordGitOperation(
 async function recordWorkspaceCommandOperation(
   recorder: WorkspaceOperationRecorder | null | undefined,
   input: {
-    phase: "workspace_provision" | "workspace_teardown";
+    phase: "workspace_provision" | "workspace_runtime_provision" | "workspace_teardown";
     command: string;
     resolvedCommand?: string;
     cwd: string;
@@ -3023,6 +3101,7 @@ async function recordWorkspaceCommandOperation(
     label: string;
     metadata?: Record<string, unknown> | null;
     successMessage?: string | null;
+    onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   },
 ) {
   if (!recorder) {
@@ -3049,6 +3128,8 @@ async function recordWorkspaceCommandOperation(
       stdout = result.stdout;
       stderr = result.stderr;
       code = result.code;
+      if (result.stdout && input.onLog) await input.onLog("stdout", `[runtime-provision] ${result.stdout}`);
+      if (result.stderr && input.onLog) await input.onLog("stderr", `[runtime-provision] ${result.stderr}`);
       return {
         status: result.code === 0 ? "succeeded" : "failed",
         exitCode: result.code,
@@ -3142,6 +3223,44 @@ export async function assertWorktreeWritableByProcessUser(worktreePath: string):
 
 import { ensureSharedGroupOwnership } from "./shared-group-ownership.js";
 
+/**
+ * SUP-13090: pnpm refuses a frozen install when the committed lockfile disagrees
+ * with the branch's manifests, under two codes — ERR_PNPM_OUTDATED_LOCKFILE (a
+ * changed dependency version) and ERR_PNPM_LOCKFILE_CONFIG_MISMATCH (a changed
+ * pnpm setting inside package.json: overrides, patchedDependencies,
+ * packageExtensions).
+ *
+ * SUP-12984 taught `scripts/provision-worktree.sh` to retry without
+ * `--frozen-lockfile`, but a project can configure any `provisionCommand`, and
+ * this project's execution workspaces carry the inline
+ * `corepack enable && pnpm install --frozen-lockfile --prefer-offline`. That
+ * command never reaches the script, so it had no retry: SUP-12986 and SUP-12996
+ * failed EVERY dispatch in ~8s with `workspace_validation_failed`, agent- and
+ * adapter-independent, because their reused worktrees carry an `overrides` change
+ * whose lockfile has not been regenerated.
+ *
+ * The retry belongs here, at the layer that executes whatever provisionCommand a
+ * project configured, so both the fresh-provision and the reuse path are covered.
+ * Returns the command to retry with, or null when this failure is not a lockfile
+ * mismatch (registry 404, EACCES, missing peer) — those must still fail the
+ * dispatch rather than be silently re-run.
+ */
+const PNPM_LOCKFILE_MISMATCH_ERROR_CODES = [
+  "ERR_PNPM_OUTDATED_LOCKFILE",
+  "ERR_PNPM_LOCKFILE_CONFIG_MISMATCH",
+] as const;
+
+export function resolvePnpmLockfileMismatchRetryCommand(
+  command: string,
+  failureOutput: string,
+): string | null {
+  if (!PNPM_LOCKFILE_MISMATCH_ERROR_CODES.some((code) => failureOutput.includes(code))) return null;
+  // Leave `--frozen-lockfile=false` and an existing `--no-frozen-lockfile` alone:
+  // neither can produce this error, and rewriting them would be a no-op retry loop.
+  const retryCommand = command.replace(/--frozen-lockfile(?![=\w-])/g, "--no-frozen-lockfile");
+  return retryCommand === command ? null : retryCommand;
+}
+
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -3156,37 +3275,52 @@ async function provisionExecutionWorktree(input: {
   await assertWorktreeWritableByProcessUser(input.worktreePath);
   const provisionCommand = asString(input.strategy.provisionCommand, "").trim();
   if (!provisionCommand) return;
-  const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
 
-  await recordWorkspaceCommandOperation(input.recorder, {
-    phase: "workspace_provision",
-    command: provisionCommand,
-    resolvedCommand: resolvedProvisionCommand,
-    cwd: input.worktreePath,
-    env: buildWorkspaceCommandEnv({
-      base: input.base,
-      repoRoot: input.repoRoot,
-      worktreePath: input.worktreePath,
-      branchName: input.branchName,
-      issue: input.issue,
-      agent: input.agent,
-      created: input.created,
-    }),
-    label: `Execution workspace provision command "${provisionCommand}"`,
-    metadata: {
-      repoRoot: input.repoRoot,
-      worktreePath: input.worktreePath,
-      branchName: input.branchName,
-      created: input.created,
-      resolvedCommand: resolvedProvisionCommand === provisionCommand ? null : resolvedProvisionCommand,
-    },
-    successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
+  const env = buildWorkspaceCommandEnv({
+    base: input.base,
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    branchName: input.branchName,
+    issue: input.issue,
+    agent: input.agent,
+    created: input.created,
   });
+  const runProvisionCommand = async (command: string, lockfileMismatchRetry: boolean) => {
+    const resolvedCommand = resolveRepoManagedWorkspaceCommand(command, input.repoRoot);
+    await recordWorkspaceCommandOperation(input.recorder, {
+      phase: "workspace_provision",
+      command,
+      resolvedCommand,
+      cwd: input.worktreePath,
+      env,
+      label: `Execution workspace provision command "${command}"`,
+      metadata: {
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        branchName: input.branchName,
+        created: input.created,
+        resolvedCommand: resolvedCommand === command ? null : resolvedCommand,
+        ...(lockfileMismatchRetry ? { lockfileMismatchRetry: true, originalCommand: provisionCommand } : {}),
+      },
+      successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
+    });
+  };
+
+  try {
+    await runProvisionCommand(provisionCommand, false);
+  } catch (error) {
+    const failureOutput = error instanceof Error ? error.message : String(error);
+    const retryCommand = resolvePnpmLockfileMismatchRetryCommand(provisionCommand, failureOutput);
+    if (!retryCommand) throw error;
+    await runProvisionCommand(retryCommand, true);
+  }
 }
 
 export type BaseRepoHygieneDecision =
   | { action: "ok" }
-  | { action: "restore"; reasons: string[]; snapshotTrackedChanges: boolean };
+  | { action: "fastForward" }
+  | { action: "restore"; reasons: string[]; snapshotTrackedChanges: boolean }
+  | { action: "diverged"; aheadCount: number; behindCount: number; aheadCommitSubjects: string[] };
 
 /**
  * SUP-11285: should the base repo be put back before we cut a worktree from it?
@@ -3217,6 +3351,27 @@ export function resolveBaseRepoHygieneDecision(input: {
   headSha: string | null;
   /** Resolved SHA of the base ref, or null when unresolvable. */
   baseRefSha: string | null;
+  /**
+   * True when the base repo's HEAD is a strict ancestor of the base ref (i.e.
+   * behind / fast-forwardable). Only consulted when there are no restore
+   * reasons, so dirty/unmerged/wrong-branch repos still return `restore`.
+   */
+  headBehindBaseRef?: boolean;
+  /**
+   * Number of commits the base repo's HEAD is ahead of the base ref.
+   * Best-effort; may be undefined when unavailable.
+   */
+  aheadCount?: number;
+  /**
+   * Number of commits the base repo's HEAD is behind the base ref.
+   * Best-effort; may be undefined when unavailable.
+   */
+  behindCount?: number;
+  /**
+   * Subject lines of commits the base repo's HEAD is ahead of the base ref.
+   * Best-effort; may be undefined when unavailable.
+   */
+  aheadCommitSubjects?: string[];
 }): BaseRepoHygieneDecision {
   const reasons: string[] = [];
   const defaultRef = input.defaultRef?.replace(/^origin\//, "") ?? null;
@@ -3237,7 +3392,20 @@ export function resolveBaseRepoHygieneDecision(input: {
   if (input.dirtyTrackedPathCount > 0) {
     reasons.push(`base repo has ${input.dirtyTrackedPathCount} modified tracked path(s)`);
   }
-  if (reasons.length === 0) return { action: "ok" };
+  if (reasons.length === 0) {
+    if (input.headBehindBaseRef) {
+      return { action: "fastForward" };
+    }
+    if (input.aheadCount && input.aheadCount > 0 && input.behindCount && input.behindCount > 0) {
+      return {
+        action: "diverged",
+        aheadCount: input.aheadCount,
+        behindCount: input.behindCount,
+        aheadCommitSubjects: input.aheadCommitSubjects ?? [],
+      };
+    }
+    return { action: "ok" };
+  }
   return {
     action: "restore",
     reasons,
@@ -3375,6 +3543,47 @@ async function restoreBaseRepoToDefaultRef(input: {
   return { restored, warnings, rescueRefs };
 }
 
+/**
+ * Fast-forward a clean base repo to its default ref.
+ *
+ * Uses `git merge --ff-only`, which advances HEAD only when it is a strict
+ * ancestor of the target — i.e. exactly the "behind" predicate. It refuses
+ * (non-zero exit) when HEAD is ahead, diverged, or when an untracked file would
+ * be overwritten, which is the desired safety behavior: a refused fast-forward
+ * only warns and never blocks the dispatch (same SUP-11285 contract as restore).
+ *
+ * No rescue ref / snapshot is needed — a fast-forward is non-destructive (old
+ * HEAD remains an ancestor of the new tip). Never uses `git reset --hard`,
+ * `checkout -f`, `clean`, or `stash -u`: those could overwrite or remove
+ * untracked files, including the `.paperclip/worktrees` directory.
+ */
+async function fastForwardBaseRepoToDefaultRef(input: {
+  repoRoot: string;
+  baseRef: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ fastForwarded: boolean; warnings: string[] }> {
+  const warnings: string[] = [];
+  try {
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_prepare",
+      args: ["merge", "--ff-only", input.baseRef],
+      cwd: input.repoRoot,
+      metadata: {
+        baseRepoHygiene: true,
+        repoRoot: input.repoRoot,
+        baseRef: input.baseRef,
+        fastForwardOnly: true,
+      },
+      successMessage: `Fast-forwarded base repository at ${input.repoRoot} to ${input.baseRef}\n`,
+      failureLabel: `git merge --ff-only ${input.baseRef}`,
+    });
+    return { fastForwarded: true, warnings };
+  } catch (error) {
+    warnings.push(error instanceof Error ? error.message : String(error));
+    return { fastForwarded: false, warnings };
+  }
+}
+
 function buildExecutionWorkspaceCleanupEnv(input: {
   workspace: {
     cwd: string | null;
@@ -3424,6 +3633,141 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+export async function prepareBaseRepoForWorkspace(input: {
+  repoRoot: string;
+  configuredBaseRef: string | null;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ baseRef: string; baseRefSha: string | null; warnings: string[] }> {
+  const {
+    baseRef,
+    warnings: baseRefResolutionWarnings,
+    refreshed: baseRefAlreadyRefreshed,
+  } = await resolveAuthoritativeBaseRef(input.repoRoot, input.configuredBaseRef, input.resolveGitAuth);
+  const baseRefreshWarnings = [
+    ...baseRefResolutionWarnings,
+    ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(input.repoRoot, baseRef, input.resolveGitAuth)),
+  ];
+  const currentBaseRefSha = await resolveBaseRefSha(input.repoRoot, baseRef);
+
+  // SUP-11285: tidy the base repo before cutting from it. Strictly best-effort —
+  // the dispatch proceeds whatever happens here, because the issue being run did
+  // not cause the mess and must not be held hostage to it.
+  const baseRepoHygieneWarnings: string[] = [];
+  try {
+    const hygiene = await inspectBaseRepoHygiene(input.repoRoot);
+    if (hygiene) {
+      const headSha = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
+      const headBehindBaseRef = Boolean(headSha && currentBaseRefSha && headSha !== currentBaseRefSha)
+        ? await runGit(["merge-base", "--is-ancestor", headSha!, currentBaseRefSha!], input.repoRoot)
+            .then(() => true).catch(() => false)
+        : false;
+      let aheadCount: number | undefined;
+      let behindCount: number | undefined;
+      let aheadCommitSubjects: string[] | undefined;
+      if (!headBehindBaseRef && headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
+        const revList = await runGit(["rev-list", "--left-right", "--count", baseRef + "...HEAD"], input.repoRoot)
+          .then((value) => {
+            const tokens = value.trim().split(/\s+/);
+            if (tokens.length >= 2) {
+              return { behind: parseInt(tokens[0], 10), ahead: parseInt(tokens[1], 10) };
+            }
+            return null;
+          })
+          .catch(() => null);
+        if (revList) {
+          behindCount = revList.behind;
+          aheadCount = revList.ahead;
+          if (aheadCount > 0) {
+            aheadCommitSubjects = await runGit(["log", "--format=%s", baseRef + "..HEAD"], input.repoRoot)
+              .then((value) => value.trim().split("\n").filter((line) => line.length > 0))
+              .catch(() => []);
+          }
+        }
+      }
+      const decision = resolveBaseRepoHygieneDecision({
+        currentBranch: hygiene.currentBranch,
+        defaultRef: baseRef,
+        dirtyTrackedPathCount: hygiene.dirtyTrackedPathCount,
+        unmergedPathCount: hygiene.unmergedPathCount,
+        headSha,
+        baseRefSha: currentBaseRefSha,
+        headBehindBaseRef,
+        aheadCount,
+        behindCount,
+        aheadCommitSubjects,
+      });
+      if (decision.action === "restore") {
+        const result = await restoreBaseRepoToDefaultRef({
+          repoRoot: input.repoRoot,
+          baseRef,
+          decision,
+          timestamp: new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"),
+          recorder: input.recorder ?? null,
+        });
+        baseRepoHygieneWarnings.push(
+          `Base repository at ${input.repoRoot} was restored to ${baseRef}: ${decision.reasons.join("; ")}.` +
+            (result.rescueRefs.length > 0
+              ? ` Anything found there is preserved on ${result.rescueRefs.join(", ")}.`
+              : ""),
+          ...result.warnings,
+        );
+      } else if (decision.action === "fastForward") {
+        const result = await fastForwardBaseRepoToDefaultRef({
+          repoRoot: input.repoRoot,
+          baseRef,
+          recorder: input.recorder ?? null,
+        });
+        baseRepoHygieneWarnings.push(
+          result.fastForwarded
+            ? `Base repository at ${input.repoRoot} was fast-forwarded to ${baseRef}.`
+            : `Could not fast-forward base repository at ${input.repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
+        );
+      } else if (decision.action === "diverged") {
+        const subjects = decision.aheadCommitSubjects.length > 0
+          ? decision.aheadCommitSubjects.join(", ")
+          : "(no subjects)";
+        const message =
+          `Base repository at ${input.repoRoot} has diverged from ${baseRef}: ` +
+          `${decision.aheadCount} ahead, ${decision.behindCount} behind. ` +
+          `Ahead commits: ${subjects}. Local commits preserved — no reset performed.`;
+        baseRepoHygieneWarnings.push(message);
+        logger.warn(message);
+      } else if (decision.action === "ok") {
+        if (headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
+          const revList = await runGit(
+            ["rev-list", "--left-right", "--count", `HEAD...${baseRef}`],
+            input.repoRoot,
+          ).catch(() => null);
+          if (revList) {
+            const [aheadStr, behindStr] = revList.split("\t");
+            const ahead = Number(aheadStr);
+            const behind = Number(behindStr);
+            const subjects = await runGit(
+              ["log", "--format=%s", `${baseRef}..HEAD`],
+              input.repoRoot,
+            ).catch(() => "");
+            const subjectList = subjects ? subjects.split("\n") : [];
+            baseRepoHygieneWarnings.push(
+              `Base repository at ${input.repoRoot} is ahead of ${baseRef}: ${ahead} commit(s) ahead, ${behind} commit(s) behind. Ahead commits: ${subjectList.join(", ")}`,
+            );
+          }
+        }
+      }
+    }
+  } catch (err) {
+    baseRepoHygieneWarnings.push(
+      `Base repository hygiene check failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  return {
+    baseRef,
+    baseRefSha: currentBaseRefSha,
+    warnings: [...baseRepoHygieneWarnings, ...baseRefreshWarnings],
+  };
+}
+
 export async function realizeExecutionWorkspace(input: {
   db?: Db | null;
   base: ExecutionWorkspaceInput;
@@ -3448,6 +3792,7 @@ export async function realizeExecutionWorkspace(input: {
   enableWorkspaceBranchReconcileForward?: boolean;
   enableWorkspaceDirtyQuarantineRepair?: boolean;
   recorder?: WorkspaceOperationRecorder | null;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<RealizedExecutionWorkspace> {
   const rawStrategy = parseObject(input.config.workspaceStrategy);
   const strategyType = asString(rawStrategy.type, "project_primary");
@@ -3490,55 +3835,14 @@ export async function realizeExecutionWorkspace(input: {
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
     : input.base.repoRef ?? null;
-  const {
-    baseRef,
-    warnings: baseRefResolutionWarnings,
-    refreshed: baseRefAlreadyRefreshed,
-  } = await resolveAuthoritativeBaseRef(repoRoot, configuredBaseRef);
-  const baseRefreshWarnings = [
-    ...baseRefResolutionWarnings,
-    ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(repoRoot, baseRef)),
-  ];
-  const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
-
-  // SUP-11285: tidy the base repo before cutting from it. Strictly best-effort —
-  // the dispatch proceeds whatever happens here, because the issue being run did
-  // not cause the mess and must not be held hostage to it.
-  const baseRepoHygieneWarnings: string[] = [];
-  try {
-    const hygiene = await inspectBaseRepoHygiene(repoRoot);
-    if (hygiene) {
-      const headSha = await runGit(["rev-parse", "HEAD"], repoRoot).catch(() => null);
-      const decision = resolveBaseRepoHygieneDecision({
-        currentBranch: hygiene.currentBranch,
-        defaultRef: baseRef,
-        dirtyTrackedPathCount: hygiene.dirtyTrackedPathCount,
-        unmergedPathCount: hygiene.unmergedPathCount,
-        headSha,
-        baseRefSha: currentBaseRefSha,
-      });
-      if (decision.action === "restore") {
-        const result = await restoreBaseRepoToDefaultRef({
-          repoRoot,
-          baseRef,
-          decision,
-          timestamp: new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"),
-          recorder: input.recorder ?? null,
-        });
-        baseRepoHygieneWarnings.push(
-          `Base repository at ${repoRoot} was restored to ${baseRef}: ${decision.reasons.join("; ")}.` +
-            (result.rescueRefs.length > 0
-              ? ` Anything found there is preserved on ${result.rescueRefs.join(", ")}.`
-              : ""),
-          ...result.warnings,
-        );
-      }
-    }
-  } catch (err) {
-    baseRepoHygieneWarnings.push(
-      `Base repository hygiene check failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
+  const baseRepoHygiene = await prepareBaseRepoForWorkspace({
+    repoRoot,
+    configuredBaseRef,
+    resolveGitAuth: input.resolveGitAuth ?? null,
+    recorder: input.recorder ?? null,
+  });
+  const baseRef = baseRepoHygiene.baseRef;
+  const currentBaseRefSha = baseRepoHygiene.baseRefSha;
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
   await ensureSharedGroupOwnership(worktreeParentDir);
@@ -3601,7 +3905,7 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       branchName: effectiveBranchName,
       worktreePath: reusablePath,
-      warnings: [...extraWarnings, ...baseRepoHygieneWarnings, ...baseRefreshWarnings, ...baseDrift.warnings],
+      warnings: [...extraWarnings, ...baseRepoHygiene.warnings, ...baseDrift.warnings],
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
@@ -3750,7 +4054,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: [...baseRepoHygieneWarnings, ...baseRefreshWarnings],
+    warnings: baseRepoHygiene.warnings,
     created: true,
     baseRefSha: currentBaseRefSha,
   };
@@ -3773,6 +4077,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     metadata?: Record<string, unknown> | null;
     config?: {
       provisionCommand?: string | null;
+      runtimeProvisionCommand?: string | null;
     } | null;
   };
   issue: ExecutionWorkspaceIssueRef | null;
@@ -3781,6 +4086,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   enableWorkspaceBranchReconcileForward?: boolean;
   enableWorkspaceDirtyQuarantineRepair?: boolean;
   recorder?: WorkspaceOperationRecorder | null;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<RealizedExecutionWorkspace | null> {
   const cwd = asString(input.workspace.cwd ?? input.workspace.providerRef, "").trim();
   if (!cwd) return null;
@@ -3793,6 +4099,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     workspaceId: input.workspace.projectWorkspaceId ?? input.base.workspaceId,
     repoUrl: input.workspace.repoUrl ?? input.base.repoUrl,
     repoRef: input.workspace.baseRef ?? input.base.repoRef,
+    additionalWorkspaces: input.base.additionalWorkspaces ?? [],
     strategy,
     cwd,
     branchName: input.workspace.branchName ?? null,
@@ -3812,7 +4119,6 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
   if (await directoryExists(cwd)) {
-    const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
     const reuseWorktreePath = realized.worktreePath ?? cwd;
     const repairWarnings: string[] = [];
     if (await isGitCheckout(reuseWorktreePath)) {
@@ -3856,16 +4162,22 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         },
       );
     }
-    const baseRefreshWarnings = reuseBaseRef
-      ? await refreshRemoteTrackingBaseRef(repoRoot, reuseBaseRef)
-      : [];
-    const currentBaseRefSha = reuseBaseRef ? await resolveBaseRefSha(repoRoot, reuseBaseRef) : null;
-    const refresh = reuseBaseRef && currentBaseRefSha
+    const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
+    const baseRepoHygiene = reuseBaseRef
+      ? await prepareBaseRepoForWorkspace({
+          repoRoot,
+          configuredBaseRef: reuseBaseRef,
+          resolveGitAuth: input.resolveGitAuth ?? null,
+          recorder: input.recorder ?? null,
+        })
+      : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [] };
+    const currentBaseRefSha = baseRepoHygiene.baseRefSha;
+    const refresh = currentBaseRefSha
       ? await refreshUnstartedWorktreeToBase({
           repoRoot,
           worktreePath: reuseWorktreePath,
           branchName: realized.branchName,
-          baseRef: reuseBaseRef,
+          baseRef: baseRepoHygiene.baseRef,
           currentBaseRefSha,
           recorder: input.recorder ?? null,
         })
@@ -3874,11 +4186,11 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       repoRoot,
       worktreePath: reuseWorktreePath,
       branchName: realized.branchName,
-      baseRef: reuseBaseRef,
+      baseRef: baseRepoHygiene.baseRef,
       recordedBaseRefSha,
       skipRefresh: true,
     });
-    realized.warnings = [...repairWarnings, ...baseRefreshWarnings, ...baseDrift.warnings];
+    realized.warnings = [...repairWarnings, ...baseRepoHygiene.warnings, ...baseDrift.warnings];
     realized.baseRefSha = refresh.baseRefSha ?? recordedBaseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha;
     if (provisionCommand) {
       await provisionExecutionWorktree({
@@ -3909,8 +4221,15 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   await ensureSharedGroupOwnership(path.dirname(worktreePath));
   await runGit(["worktree", "prune"], repoRoot).catch(() => {});
   const restoreBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
-  const restoreRefreshWarnings = restoreBaseRef ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef) : [];
-  const restoreCurrentBaseRefSha = restoreBaseRef ? await resolveBaseRefSha(repoRoot, restoreBaseRef) : null;
+  const baseRepoHygiene = restoreBaseRef
+    ? await prepareBaseRepoForWorkspace({
+        repoRoot,
+        configuredBaseRef: restoreBaseRef,
+        resolveGitAuth: input.resolveGitAuth ?? null,
+        recorder: input.recorder ?? null,
+      })
+    : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [] };
+  const restoreCurrentBaseRefSha = baseRepoHygiene.baseRefSha;
 
   let created = false;
   try {
@@ -3922,7 +4241,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         repoRoot,
         worktreePath,
         branchName,
-        baseRef: input.workspace.baseRef ?? input.base.repoRef ?? null,
+        baseRef: baseRepoHygiene.baseRef,
         currentBaseRefSha: restoreCurrentBaseRefSha,
         created: false,
         restored: true,
@@ -3939,7 +4258,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ) {
       throw error;
     }
-    const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
+    const baseRef = baseRepoHygiene.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
     const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
@@ -3965,7 +4284,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     repoRoot,
     worktreePath,
     branchName,
-    baseRef: input.workspace.baseRef ?? input.base.repoRef ?? null,
+    baseRef: baseRepoHygiene.baseRef,
     recordedBaseRefSha,
     skipRefresh: true,
   });
@@ -3989,7 +4308,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ...realized,
     cwd: worktreePath,
     worktreePath,
-    warnings: [...restoreRefreshWarnings, ...baseDrift.warnings],
+    warnings: [...baseRepoHygiene.warnings, ...baseDrift.warnings],
     created,
     baseRefSha:
       recordedBaseRefSha
@@ -4192,6 +4511,106 @@ async function preserveUncommittedWorktreeWork(input: {
   }
 }
 
+export async function acquireGitWorktreeCleanupLock(worktreePath: string) {
+  const branchRef = await runGit(["symbolic-ref", "--quiet", "HEAD"], worktreePath).catch(() => null);
+  const rawLocks = await Promise.all([
+    runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
+      .then((lockPath) => ({ kind: "index" as const, lockPath })),
+    runGit(["rev-parse", "--git-path", "HEAD.lock"], worktreePath)
+      .then((lockPath) => ({ kind: "head" as const, lockPath })),
+    ...(branchRef
+      ? [runGit(["rev-parse", "--git-path", `${branchRef}.lock`], worktreePath)
+          .then((lockPath) => ({ kind: "branch" as const, lockPath }))]
+      : []),
+  ]);
+  const locks = [...new Map(rawLocks.map(({ kind, lockPath }) => {
+    const resolvedLockPath = path.isAbsolute(lockPath)
+      ? lockPath
+      : path.resolve(worktreePath, lockPath);
+    return [resolvedLockPath, { kind, lockPath: resolvedLockPath }];
+  })).values()];
+  const lockHandles: Array<{
+    handle: fs.FileHandle;
+    kind: "index" | "head" | "branch";
+    lockPath: string;
+  }> = [];
+
+  async function releaseLocks(kind?: "branch") {
+    for (let index = lockHandles.length - 1; index >= 0; index -= 1) {
+      const lock = lockHandles[index];
+      if (!lock || (kind && lock.kind !== kind)) continue;
+      lockHandles.splice(index, 1);
+      await lock.handle.close().catch(() => {});
+      await fs.rm(lock.lockPath, { force: true }).catch(() => {});
+    }
+  }
+
+  try {
+    for (const lock of locks) {
+      lockHandles.push({
+        ...lock,
+        handle: await fs.open(lock.lockPath, "wx", 0o600),
+      });
+    }
+  } catch (error) {
+    await releaseLocks();
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error("git worktree cleanup lock is already held");
+    }
+    throw error;
+  }
+
+  return {
+    // Branch deletion must acquire this native ref lock itself. Callers release
+    // only that lock after the guarded worktree removal, while retaining the
+    // index and HEAD locks until the whole cleanup transaction finishes.
+    releaseBranchRefLock: () => releaseLocks("branch"),
+    release: () => releaseLocks(),
+  };
+}
+
+async function deleteGitBranchAtVerifiedTip(input: {
+  repoRoot: string;
+  branchName: string;
+  expectedHeadSha: string;
+  recorder?: WorkspaceOperationRecorder | null;
+  metadata: Record<string, unknown>;
+}) {
+  const commonDirRaw = await runGit(["rev-parse", "--git-common-dir"], input.repoRoot);
+  const commonDir = path.isAbsolute(commonDirRaw)
+    ? commonDirRaw
+    : path.resolve(input.repoRoot, commonDirRaw);
+  const detachedGitDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-branch-delete-"));
+  const detachedWorktree = `${detachedGitDir}-worktree`;
+
+  try {
+    // `git branch -d` refuses branches checked out by another worktree and its
+    // ref transaction fails if the tip changes concurrently. A detached HEAD
+    // at the delivered SHA additionally lets squash/cross-branch deliveries
+    // delete only the exact branch history that was verified before cleanup.
+    await Promise.all([
+      fs.writeFile(path.join(detachedGitDir, "HEAD"), `${input.expectedHeadSha}\n`, "utf8"),
+      fs.writeFile(path.join(detachedGitDir, "commondir"), `${commonDir}\n`, "utf8"),
+    ]);
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_cleanup",
+      args: [
+        `--git-dir=${detachedGitDir}`,
+        `--work-tree=${detachedWorktree}`,
+        "branch",
+        "-d",
+        input.branchName,
+      ],
+      cwd: input.repoRoot,
+      metadata: input.metadata,
+      successMessage: `Deleted branch ${input.branchName}\n`,
+      failureLabel: `git branch -d ${input.branchName}`,
+    });
+  } finally {
+    await fs.rm(detachedGitDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 export async function cleanupExecutionWorkspaceArtifacts(input: {
   workspace: {
     id: string;
@@ -4213,6 +4632,11 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   cleanupCommand?: string | null;
   teardownCommand?: string | null;
   recorder?: WorkspaceOperationRecorder | null;
+  assertSafeToCleanup?: (() => Promise<void>) | null;
+  beforeBranchDelete?: (() => Promise<void>) | null;
+  expectedBranchHeadSha?: string | null;
+  runCleanupCommands?: boolean;
+  forceWorktreeRemoval?: boolean;
 }) {
   const warnings: string[] = [];
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
@@ -4226,14 +4650,30 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     workspace: input.workspace,
     projectWorkspaceCwd: input.projectWorkspace?.cwd ?? null,
   });
+  // Callers can require the workspace to match an assessed snapshot before
+  // cleanup begins. Destructive paths recheck immediately before removal.
+  await input.assertSafeToCleanup?.();
+  let worktreeInstancePointer: WorktreeInstancePointer | null = null;
+  let expectedWorktreeInstanceId: string | null = null;
+  if (input.workspace.providerType === "git_worktree" && workspacePath) {
+    expectedWorktreeInstanceId = deriveWorktreeInstanceId(workspacePath);
+    try {
+      // Capture the pointer before custom cleanup commands can remove the repo-local env file.
+      worktreeInstancePointer = await readWorktreeInstancePointer(workspacePath);
+    } catch (err) {
+      warnings.push(`Could not read worktree instance pointer: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   const createdByRuntime = input.workspace.metadata?.createdByRuntime === true;
-  const cleanupCommands = [
-    input.cleanupCommand ?? null,
-    input.projectWorkspace?.cleanupCommand ?? null,
-    input.teardownCommand ?? null,
-  ]
-    .map((value) => asString(value, "").trim())
-    .filter(Boolean);
+  const cleanupCommands = input.runCleanupCommands === false
+    ? []
+    : [
+        input.cleanupCommand ?? null,
+        input.projectWorkspace?.cleanupCommand ?? null,
+        input.teardownCommand ?? null,
+      ]
+        .map((value) => asString(value, "").trim())
+        .filter(Boolean);
 
   for (const command of cleanupCommands) {
     try {
@@ -4261,6 +4701,25 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     }
   }
 
+  if (worktreeInstancePointer && workspacePath && expectedWorktreeInstanceId) {
+    try {
+      const result = await cleanupWorktreeInstanceArtifacts({
+        pointer: worktreeInstancePointer,
+        workspaceId: input.workspace.id,
+        workspacePath,
+        expectedInstanceId: expectedWorktreeInstanceId,
+        expectedInstanceRoot:
+          typeof input.workspace.metadata?.[WORKTREE_INSTANCE_ROOT_METADATA_KEY] === "string"
+            ? input.workspace.metadata[WORKTREE_INSTANCE_ROOT_METADATA_KEY]
+            : null,
+        recorder: input.recorder,
+      });
+      if (result.status === "refused") warnings.push(result.warning);
+    } catch (err) {
+      warnings.push(`Failed to clean worktree instance: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   if (input.workspace.providerType === "git_worktree" && workspacePath) {
     const worktreeExists = await directoryExists(workspacePath);
     if (worktreeExists) {
@@ -4279,9 +4738,15 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         warnings.push(`Could not resolve git repo root for "${workspacePath}".`);
       } else {
         try {
+          await input.assertSafeToCleanup?.();
           await recordGitOperation(input.recorder, {
             phase: "worktree_cleanup",
-            args: ["worktree", "remove", "--force", workspacePath],
+            args: [
+              "worktree",
+              "remove",
+              ...(input.forceWorktreeRemoval === false ? [] : ["--force"]),
+              workspacePath,
+            ],
             cwd: repoRoot,
             metadata: {
               workspaceId: input.workspace.id,
@@ -4302,19 +4767,31 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         warnings.push(`Could not resolve git repo root to delete branch "${input.workspace.branchName}".`);
       } else {
         try {
-          await recordGitOperation(input.recorder, {
-            phase: "worktree_cleanup",
-            args: ["branch", "-d", input.workspace.branchName],
-            cwd: repoRoot,
-            metadata: {
-              workspaceId: input.workspace.id,
-              workspacePath,
+          await input.beforeBranchDelete?.();
+          const metadata = {
+            workspaceId: input.workspace.id,
+            workspacePath,
+            branchName: input.workspace.branchName,
+            cleanupAction: "branch_delete",
+          };
+          if (input.expectedBranchHeadSha) {
+            await deleteGitBranchAtVerifiedTip({
+              repoRoot,
               branchName: input.workspace.branchName,
-              cleanupAction: "branch_delete",
-            },
-            successMessage: `Deleted branch ${input.workspace.branchName}\n`,
-            failureLabel: `git branch -d ${input.workspace.branchName}`,
-          });
+              expectedHeadSha: input.expectedBranchHeadSha,
+              recorder: input.recorder,
+              metadata,
+            });
+          } else {
+            await recordGitOperation(input.recorder, {
+              phase: "worktree_cleanup",
+              args: ["branch", "-d", input.workspace.branchName],
+              cwd: repoRoot,
+              metadata,
+              successMessage: `Deleted branch ${input.workspace.branchName}\n`,
+              failureLabel: `git branch -d ${input.workspace.branchName}`,
+            });
+          }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           warnings.push(`Skipped deleting branch "${input.workspace.branchName}": ${message}`);
@@ -4333,6 +4810,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     if (containsProjectWorkspace) {
       warnings.push(`Refusing to remove path "${workspacePath}" because it contains the project workspace.`);
     } else {
+      await input.assertSafeToCleanup?.();
       await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
       if (input.recorder) {
         await input.recorder.recordOperation({
@@ -4939,10 +5417,166 @@ type StartLocalRuntimeServiceInput = {
   adapterEnv: Record<string, string>;
   service: Record<string, unknown>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  runtimeProvisionCommand?: string | null;
+  recorder?: WorkspaceOperationRecorder | null;
+  provisionCoordinator?: RuntimeProvisionCoordinator;
+  preparedProvisioningRecord?: RuntimeServiceRecord | null;
+  runtimeServiceId?: string;
   reuseKey: string | null;
   scopeType: "project_workspace" | "execution_workspace" | "run" | "agent";
   scopeId: string | null;
 };
+
+type RuntimeProvisionCoordinator = {
+  promise: Promise<void> | null;
+};
+
+function createRuntimeProvisionCoordinator(): RuntimeProvisionCoordinator {
+  return { promise: null };
+}
+
+function readRuntimeProvisionCommand(config: Record<string, unknown>) {
+  const workspaceStrategy = parseObject(config.workspaceStrategy);
+  return asString(
+    config.runtimeProvisionCommand,
+    asString(workspaceStrategy.runtimeProvisionCommand, ""),
+  ).trim();
+}
+
+export function resolveRuntimeProvisionCommand(input: {
+  config: Record<string, unknown>;
+  workspace: RealizedExecutionWorkspace;
+}) {
+  const configuredCommand = readRuntimeProvisionCommand(input.config);
+  if (configuredCommand) return configuredCommand;
+
+  if (input.workspace.strategy !== "git_worktree") return "";
+
+  const stateDir = path.join(input.workspace.cwd, ".paperclip");
+  const pendingMarker = path.join(stateDir, "seed-pending");
+  const completeMarker = path.join(stateDir, "seed-complete");
+  const provisionScript = path.join(
+    input.workspace.baseCwd,
+    "scripts",
+    "provision-worktree-runtime.sh",
+  );
+  if (
+    !existsSync(pendingMarker)
+    || existsSync(completeMarker)
+    || !existsSync(provisionScript)
+  ) {
+    return "";
+  }
+
+  return "bash ./scripts/provision-worktree-runtime.sh";
+}
+
+function runtimeProvisionWorkspaceKey(input: StartLocalRuntimeServiceInput) {
+  return input.executionWorkspaceId
+    ? `execution-workspace:${input.executionWorkspaceId}`
+    : input.workspace.workspaceId
+      ? `project-workspace:${input.workspace.workspaceId}`
+      : `cwd:${path.resolve(input.workspace.cwd)}`;
+}
+
+async function runRuntimeProvisionWithWorkspaceMutex(input: StartLocalRuntimeServiceInput) {
+  const command = asString(input.runtimeProvisionCommand, "").trim();
+  if (!command) return;
+
+  const workspaceKey = runtimeProvisionWorkspaceKey(input);
+  const existing = runtimeProvisionByWorkspace.get(workspaceKey);
+  if (existing) {
+    await existing;
+    return;
+  }
+
+  const recorder = input.recorder ?? (input.db
+    ? workspaceOperationService(input.db).createRecorder({
+        companyId: input.agent.companyId,
+        heartbeatRunId: input.startedByRunId === undefined ? input.runId : input.startedByRunId,
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        issueId: input.issue?.id ?? null,
+      })
+    : null);
+  const resolvedCommand = resolveRepoManagedWorkspaceCommand(command, input.workspace.baseCwd);
+  const promise = recordWorkspaceCommandOperation(recorder, {
+    phase: "workspace_runtime_provision",
+    command,
+    resolvedCommand,
+    cwd: input.workspace.cwd,
+    env: buildWorkspaceCommandEnv({
+      base: input.workspace,
+      repoRoot: input.workspace.baseCwd,
+      worktreePath: input.workspace.cwd,
+      branchName: input.workspace.branchName ?? "",
+      issue: input.issue,
+      agent: input.agent,
+      created: input.workspace.created,
+    }),
+    label: `Runtime provision command "${command}"`,
+    metadata: {
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+      projectWorkspaceId: input.workspace.workspaceId,
+      serviceName: asString(input.service.name, "service"),
+      resolvedCommand: resolvedCommand === command ? null : resolvedCommand,
+    },
+    successMessage: `Provisioned runtime dependencies for ${input.workspace.cwd}\n`,
+    onLog: input.onLog,
+  }).then(() => undefined);
+
+  runtimeProvisionByWorkspace.set(workspaceKey, promise);
+  try {
+    await promise;
+  } finally {
+    if (runtimeProvisionByWorkspace.get(workspaceKey) === promise) {
+      runtimeProvisionByWorkspace.delete(workspaceKey);
+    }
+  }
+}
+
+function createProvisioningRuntimeServiceRecord(
+  input: StartLocalRuntimeServiceInput,
+  identity: ReturnType<typeof resolveRuntimeServiceReuseIdentity>,
+): RuntimeServiceRecord {
+  const nowIso = new Date().toISOString();
+  const id = input.runtimeServiceId ?? randomUUID();
+  return {
+    id,
+    companyId: input.agent.companyId,
+    projectId: input.workspace.projectId,
+    projectWorkspaceId: input.workspace.workspaceId,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    issueId: input.issue?.id ?? null,
+    serviceName: identity.serviceName,
+    status: "provisioning",
+    lifecycle: identity.lifecycle,
+    scopeType: input.scopeType,
+    scopeId: input.scopeId,
+    reuseKey: input.reuseKey,
+    command: identity.command,
+    cwd: identity.serviceCwd,
+    port: identity.identityPort,
+    url: null,
+    provider: "local_process",
+    providerRef: null,
+    ownerAgentId: input.agent.id ?? null,
+    startedByRunId: input.startedByRunId === undefined ? input.runId : input.startedByRunId,
+    lastUsedAt: nowIso,
+    startedAt: nowIso,
+    stoppedAt: null,
+    stopPolicy: parseObject(input.service.stopPolicy),
+    healthStatus: "unknown",
+    reused: false,
+    db: input.db,
+    child: null,
+    leaseRunIds: new Set(),
+    idleTimer: null,
+    envFingerprint: identity.envFingerprint,
+    serviceKey: `runtime-provision:${runtimeProvisionWorkspaceKey(input)}:${id}`,
+    profileKind: "workspace-runtime",
+    processGroupId: null,
+  };
+}
 
 async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): Promise<LocalRuntimeServiceStart> {
   const leaseRunId = input.leaseRunId === undefined ? input.runId : input.leaseRunId;
@@ -5140,7 +5774,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
 
   const nowIso = new Date().toISOString();
   const record: RuntimeServiceRecord = {
-    id: stoppedReuseCandidate?.id ?? randomUUID(),
+    id: input.runtimeServiceId ?? stoppedReuseCandidate?.id ?? randomUUID(),
     companyId: input.agent.companyId,
     projectId: input.workspace.projectId,
     projectWorkspaceId: input.workspace.workspaceId,
@@ -5232,10 +5866,98 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
   return { record, readiness: readinessPromise };
 }
 
-async function startLocalRuntimeService(input: StartLocalRuntimeServiceInput): Promise<RuntimeServiceRecord> {
-  const started = await spawnLocalRuntimeService(input);
-  await started.readiness;
-  return started.record;
+async function prepareRuntimeProvisioning(
+  input: StartLocalRuntimeServiceInput,
+): Promise<RuntimeServiceRecord | null> {
+  const runtimeProvisionCommand = asString(input.runtimeProvisionCommand, "").trim();
+  if (!runtimeProvisionCommand) return null;
+  const coordinator = input.provisionCoordinator ?? createRuntimeProvisionCoordinator();
+  if (coordinator.promise) {
+    await coordinator.promise;
+    return null;
+  }
+
+  const identity = resolveRuntimeServiceReuseIdentity({
+    service: input.service,
+    workspace: input.workspace,
+    agent: input.agent,
+    issue: input.issue,
+    adapterEnv: input.adapterEnv,
+    scopeType: input.scopeType,
+    scopeId: input.scopeId,
+  });
+  if (!identity.command) throw new Error(`Runtime service "${identity.serviceName}" is missing command`);
+  const provisioningRecord = createProvisioningRuntimeServiceRecord(input, identity);
+  await persistRuntimeServiceRecord(input.db, provisioningRecord);
+  if (input.onLog) {
+    await input.onLog(
+      "stdout",
+      `[service:${identity.serviceName}] provisioning runtime dependencies...\n`,
+    );
+  }
+
+  try {
+    coordinator.promise = runRuntimeProvisionWithWorkspaceMutex(input);
+    await coordinator.promise;
+    provisioningRecord.status = "starting";
+    provisioningRecord.lastUsedAt = new Date().toISOString();
+    await persistRuntimeServiceRecord(input.db, provisioningRecord);
+    return provisioningRecord;
+  } catch (error) {
+    const nowIso = new Date().toISOString();
+    provisioningRecord.status = "failed";
+    provisioningRecord.healthStatus = "unhealthy";
+    provisioningRecord.lastUsedAt = nowIso;
+    provisioningRecord.stoppedAt = nowIso;
+    await persistRuntimeServiceRecord(input.db, provisioningRecord).catch(() => undefined);
+    if (input.onLog) {
+      await input.onLog(
+        "stderr",
+        `[service:${provisioningRecord.serviceName}] runtime provisioning failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+    throw error;
+  }
+}
+
+async function startLocalRuntimeService(
+  input: StartLocalRuntimeServiceInput,
+  options?: { deferReadiness?: boolean },
+): Promise<LocalRuntimeServiceStart> {
+  const runtimeProvisionCommand = asString(input.runtimeProvisionCommand, "").trim();
+  const provisioningRecord = input.preparedProvisioningRecord === undefined
+    ? await prepareRuntimeProvisioning(input)
+    : input.preparedProvisioningRecord;
+  let started: LocalRuntimeServiceStart | null = null;
+
+  try {
+    started = await spawnLocalRuntimeService({
+      ...input,
+      runtimeServiceId: provisioningRecord?.id ?? input.runtimeServiceId,
+    });
+    if (runtimeProvisionCommand) {
+      await persistRuntimeServiceRecord(input.db, started.record);
+    }
+    if (provisioningRecord && started.record.id !== provisioningRecord.id && input.db) {
+      await input.db
+        .delete(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, provisioningRecord.id));
+    }
+    if (!options?.deferReadiness) {
+      await started.readiness;
+    }
+    return started;
+  } catch (error) {
+    if (!started && provisioningRecord && provisioningRecord.status === "starting") {
+      const nowIso = new Date().toISOString();
+      provisioningRecord.status = "failed";
+      provisioningRecord.healthStatus = "unhealthy";
+      provisioningRecord.lastUsedAt = nowIso;
+      provisioningRecord.stoppedAt = nowIso;
+      await persistRuntimeServiceRecord(input.db, provisioningRecord).catch(() => undefined);
+    }
+    throw error;
+  }
 }
 
 function scheduleIdleStop(record: RuntimeServiceRecord) {
@@ -5266,7 +5988,7 @@ async function stopRuntimeService(serviceId: string) {
       processGroupId: record.processGroupId ?? record.child.pid,
     });
   } else if (record.providerRef) {
-    const pid = Number.parseInt(record.providerRef, 10);
+    const pid = parseInt(record.providerRef, 10);
     if (Number.isInteger(pid) && pid > 0) {
       await terminateLocalService({
         pid,
@@ -5295,7 +6017,7 @@ async function markPersistedRuntimeServicesStoppedForExecutionWorkspace(input: {
     .where(
       and(
         eq(workspaceRuntimeServices.executionWorkspaceId, input.executionWorkspaceId),
-        inArray(workspaceRuntimeServices.status, ["starting", "running"]),
+        inArray(workspaceRuntimeServices.status, ["provisioning", "starting", "running"]),
       ),
     );
 }
@@ -5424,6 +6146,7 @@ export async function ensureRuntimeServicesForRun(input: {
   config: Record<string, unknown>;
   adapterEnv: Record<string, string>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  recorder?: WorkspaceOperationRecorder | null;
 }): Promise<RuntimeServiceRef[]> {
   const rawServices = selectRuntimeServiceEntries({
     config: input.config,
@@ -5433,6 +6156,8 @@ export async function ensureRuntimeServicesForRun(input: {
   });
   const acquiredServiceIds: string[] = [];
   const refs: RuntimeServiceRef[] = [];
+  const runtimeProvisionCommand = resolveRuntimeProvisionCommand(input);
+  const provisionCoordinator = createRuntimeProvisionCoordinator();
   runtimeServiceLeasesByRun.set(input.runId, acquiredServiceIds);
 
   try {
@@ -5474,7 +6199,7 @@ export async function ensureRuntimeServicesForRun(input: {
         }
       }
 
-      const record = await startLocalRuntimeService({
+      const started = await startLocalRuntimeService({
         db: input.db,
         runId: input.runId,
         agent: input.agent,
@@ -5484,10 +6209,14 @@ export async function ensureRuntimeServicesForRun(input: {
         adapterEnv: input.adapterEnv,
         service,
         onLog: input.onLog,
+        runtimeProvisionCommand,
+        recorder: input.recorder,
+        provisionCoordinator,
         reuseKey,
         scopeType,
         scopeId,
       });
+      const record = started.record;
       registerRuntimeService(input.db, record);
       await persistRuntimeServiceRecord(input.db, record);
       acquiredServiceIds.push(record.id);
@@ -5511,6 +6240,7 @@ type StartRuntimeServicesForWorkspaceControlInput = {
   config: Record<string, unknown>;
   adapterEnv: Record<string, string>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  recorder?: WorkspaceOperationRecorder | null;
   serviceIndex?: number | null;
   respectDesiredStates?: boolean;
 };
@@ -5527,7 +6257,15 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
   invocationId: string,
   persistenceDb = input.db,
   registryDb = input.db,
-  options?: { deferReadiness?: boolean },
+  options?: {
+    deferReadiness?: boolean;
+    runtimeProvisionCommand?: string;
+    provisionCoordinator?: RuntimeProvisionCoordinator;
+    preparedProvisioning?: {
+      service: Record<string, unknown>;
+      record: RuntimeServiceRecord;
+    } | null;
+  },
 ): Promise<WorkspaceControlStartBatch> {
   const refs: RuntimeServiceRef[] = [];
   const pendingReadiness: LocalRuntimeServiceStart[] = [];
@@ -5556,6 +6294,12 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
       const existingId = runtimeServicesByReuseKey.get(reuseKey);
       const existing = existingId ? runtimeServicesById.get(existingId) : null;
       if (existing && existing.status === "running") {
+        const prepared = options?.preparedProvisioning;
+        if (prepared?.service === service && prepared.record.id !== existing.id && persistenceDb) {
+          await persistenceDb
+            .delete(workspaceRuntimeServices)
+            .where(eq(workspaceRuntimeServices.id, prepared.record.id));
+        }
         existing.lastUsedAt = new Date().toISOString();
         existing.stoppedAt = null;
         clearIdleTimer(existing);
@@ -5581,6 +6325,13 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
       adapterEnv: input.adapterEnv,
       service,
       onLog: input.onLog,
+      runtimeProvisionCommand: options?.runtimeProvisionCommand,
+      recorder: input.recorder,
+      provisionCoordinator: options?.provisionCoordinator,
+      preparedProvisioningRecord:
+        options?.preparedProvisioning?.service === service
+          ? options.preparedProvisioning.record
+          : undefined,
       reuseKey,
       scopeType,
       scopeId,
@@ -5588,12 +6339,9 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
 
     // Manually controlled services are not tied to a heartbeat run lifecycle, so they do not
     // retain a run lease and never persist a startedByRunId foreign key.
-    const started = options?.deferReadiness
-      ? await spawnLocalRuntimeService(startInput)
-      : {
-          record: await startLocalRuntimeService(startInput),
-          readiness: Promise.resolve(),
-        };
+    const started = await startLocalRuntimeService(startInput, {
+      deferReadiness: options?.deferReadiness,
+    });
     registerRuntimeService(registryDb, started.record);
     await persistRuntimeServiceRecord(persistenceDb, started.record);
     refs.push(toRuntimeServiceRef(started.record));
@@ -5621,9 +6369,18 @@ export async function startRuntimeServicesForWorkspaceControl(
     serviceStates: readConfiguredServiceStates(input.config),
   });
   const invocationId = input.invocationId ?? randomUUID();
+  const runtimeProvisionCommand = resolveRuntimeProvisionCommand(input);
+  const provisionCoordinator = createRuntimeProvisionCoordinator();
 
   if (rawServices.length === 0 || !input.db || (!input.executionWorkspaceId && !input.workspace.workspaceId)) {
-    const batch = await startRuntimeServicesForWorkspaceControlUnlocked(input, rawServices, invocationId);
+    const batch = await startRuntimeServicesForWorkspaceControlUnlocked(
+      input,
+      rawServices,
+      invocationId,
+      input.db,
+      input.db,
+      { runtimeProvisionCommand, provisionCoordinator },
+    );
     return batch.refs;
   }
 
@@ -5632,7 +6389,58 @@ export async function startRuntimeServicesForWorkspaceControl(
     pendingReadiness: [],
     startedServiceIds: [],
   };
+  let preparedProvisioning: {
+    service: Record<string, unknown>;
+    record: RuntimeServiceRecord;
+  } | null = null;
   try {
+    if (runtimeProvisionCommand) {
+      for (const service of rawServices) {
+        const { scopeType, scopeId } = resolveServiceScopeId({
+          service,
+          workspace: input.workspace,
+          executionWorkspaceId: input.executionWorkspaceId,
+          issue: input.issue,
+          runId: invocationId,
+          agent: input.actor,
+        });
+        const reuseKey = resolveRuntimeServiceReuseIdentity({
+          service,
+          workspace: input.workspace,
+          agent: input.actor,
+          issue: input.issue,
+          adapterEnv: input.adapterEnv,
+          scopeType,
+          scopeId,
+        }).reuseKey;
+        const existingId = reuseKey ? runtimeServicesByReuseKey.get(reuseKey) : null;
+        const existing = existingId ? runtimeServicesById.get(existingId) : null;
+        if (existing?.status === "running") continue;
+
+        const record = await prepareRuntimeProvisioning({
+          db: input.db,
+          runId: invocationId,
+          leaseRunId: null,
+          startedByRunId: null,
+          agent: input.actor,
+          issue: input.issue,
+          workspace: input.workspace,
+          executionWorkspaceId: input.executionWorkspaceId,
+          adapterEnv: input.adapterEnv,
+          service,
+          onLog: input.onLog,
+          runtimeProvisionCommand,
+          recorder: input.recorder,
+          provisionCoordinator,
+          reuseKey,
+          scopeType,
+          scopeId,
+        });
+        if (record) preparedProvisioning = { service, record };
+        break;
+      }
+    }
+
     await input.db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
 
@@ -5673,7 +6481,12 @@ export async function startRuntimeServicesForWorkspaceControl(
         invocationId,
         txDb,
         input.db,
-        { deferReadiness: true },
+        {
+          deferReadiness: true,
+          runtimeProvisionCommand,
+          provisionCoordinator,
+          preparedProvisioning,
+        },
       );
     });
 
@@ -5694,6 +6507,14 @@ export async function startRuntimeServicesForWorkspaceControl(
   } catch (error) {
     for (const serviceId of startBatch.startedServiceIds) {
       await stopRuntimeService(serviceId).catch(() => undefined);
+    }
+    if (preparedProvisioning && startBatch.startedServiceIds.length === 0) {
+      const nowIso = new Date().toISOString();
+      preparedProvisioning.record.status = "failed";
+      preparedProvisioning.record.healthStatus = "unhealthy";
+      preparedProvisioning.record.lastUsedAt = nowIso;
+      preparedProvisioning.record.stoppedAt = nowIso;
+      await persistRuntimeServiceRecord(input.db, preparedProvisioning.record).catch(() => undefined);
     }
     throw error;
   }
@@ -5798,7 +6619,7 @@ export async function stopRuntimeServicesForProjectWorkspace(input: {
           : and(
               eq(workspaceRuntimeServices.projectWorkspaceId, input.projectWorkspaceId),
               eq(workspaceRuntimeServices.scopeType, "project_workspace"),
-              inArray(workspaceRuntimeServices.status, ["starting", "running"]),
+              inArray(workspaceRuntimeServices.status, ["provisioning", "starting", "running"]),
             ),
       );
   }
@@ -5839,7 +6660,7 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
     .where(
       and(
         eq(workspaceRuntimeServices.provider, "local_process"),
-        inArray(workspaceRuntimeServices.status, ["starting", "running", "stopped"]),
+        inArray(workspaceRuntimeServices.status, ["provisioning", "starting", "running", "stopped"]),
       ),
     );
 
@@ -6062,6 +6883,7 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
         executionWorkspaceId: row.id,
         config: {
           workspaceRuntime: effectiveRuntimeConfig,
+          runtimeProvisionCommand: config.runtimeProvisionCommand,
           desiredState: config.desiredState,
           serviceStates: config.serviceStates ?? null,
         },
@@ -6165,10 +6987,73 @@ export async function persistAdapterManagedRuntimeServices(input: {
   return refs;
 }
 
-export function buildWorkspaceReadyComment(input: {
+type WorkspaceReadyCommentInput = {
   workspace: RealizedExecutionWorkspace;
   runtimeServices: RuntimeServiceRef[];
-}) {
+};
+
+const COMMENT_METADATA_LABEL_MAX_LENGTH = 120;
+
+function workspaceReadyServiceLabel(serviceName: string): string {
+  const label = serviceName.trim() || "Service";
+  return label.length > COMMENT_METADATA_LABEL_MAX_LENGTH
+    ? `${label.slice(0, COMMENT_METADATA_LABEL_MAX_LENGTH - 1)}…`
+    : label;
+}
+
+export function buildWorkspaceReadyPresentation(
+  input: WorkspaceReadyCommentInput,
+): IssueCommentPresentation {
+  const workspaceLabel = input.workspace.branchName ?? input.workspace.strategy;
+  const title = `Workspace ready · ${workspaceLabel}`;
+  const hasWarnings = input.workspace.warnings.length > 0;
+
+  return {
+    kind: "system_notice",
+    tone: hasWarnings ? "warning" : "info",
+    title: title.length > 160 ? `${title.slice(0, 159)}…` : title,
+    density: "compact",
+    detailsDefaultOpen: hasWarnings,
+  };
+}
+
+export function buildWorkspaceReadyMetadata(
+  input: WorkspaceReadyCommentInput,
+): IssueCommentMetadata {
+  const workspaceRows: IssueCommentMetadata["sections"][number]["rows"] = [
+    { type: "key_value", label: "Strategy", value: input.workspace.strategy },
+    ...(input.workspace.branchName
+      ? [{ type: "key_value" as const, label: "Branch", value: input.workspace.branchName }]
+      : []),
+    { type: "key_value", label: "CWD", value: input.workspace.cwd },
+    ...(input.workspace.worktreePath && input.workspace.worktreePath !== input.workspace.cwd
+      ? [{ type: "key_value" as const, label: "Worktree", value: input.workspace.worktreePath }]
+      : []),
+  ];
+  const serviceRows: IssueCommentMetadata["sections"][number]["rows"] = input.runtimeServices.map(
+    (service) => ({
+      type: "key_value",
+      label: workspaceReadyServiceLabel(service.serviceName),
+      value: `${service.url ?? "running"}${service.reused ? " (reused)" : ""}`,
+    }),
+  );
+
+  return {
+    version: 1,
+    sections: [
+      { title: "Workspace", rows: workspaceRows },
+      ...(serviceRows.length > 0 ? [{ title: "Services", rows: serviceRows }] : []),
+      ...(input.workspace.warnings.length > 0
+        ? [{
+            title: "Warnings",
+            rows: input.workspace.warnings.map((warning) => ({ type: "text" as const, text: warning })),
+          }]
+        : []),
+    ],
+  };
+}
+
+export function buildWorkspaceReadyComment(input: WorkspaceReadyCommentInput) {
   const lines = ["## Workspace Ready", ""];
   lines.push(`- Strategy: \`${input.workspace.strategy}\``);
   if (input.workspace.branchName) lines.push(`- Branch: \`${input.workspace.branchName}\``);

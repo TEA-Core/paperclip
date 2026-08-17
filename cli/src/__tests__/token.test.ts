@@ -167,6 +167,7 @@ describe("token commands", () => {
       name: "external-admin",
       requestedCompanyId: COMPANY_ID,
       expiresAt: "2026-06-06T00:00:00.000Z",
+      scope: "all_access",
     });
     expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toMatchObject({
       key: {
@@ -207,6 +208,7 @@ describe("token commands", () => {
       name: "external-admin",
       requestedCompanyId: COMPANY_ID,
       expiresAt: null,
+      scope: "all_access",
     });
   });
 

@@ -16,13 +16,45 @@ const mockAgentService = vi.hoisted(() => ({
 const mockTrackAgentTaskCompleted = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
+  for: () => ({
+    then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve([{
+        id: "22222222-2222-4222-8222-222222222222",
+        companyId: "company-1",
+        agentId: "agent-1",
+        contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
+        permissions: null,
+      }]).then(onFulfilled, onRejected),
+  }),
   then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-    Promise.resolve([{ companyId: "company-1", permissions: null }]).then(onFulfilled, onRejected),
+    Promise.resolve([{
+      id: "22222222-2222-4222-8222-222222222222",
+      companyId: "company-1",
+      agentId: "agent-1",
+      contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
+      permissions: null,
+    }]).then(onFulfilled, onRejected),
 })));
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
+// The done-transition guard resolves linked pull requests with a joined
+// select. These route tests only need that lookup to answer "no linked PRs".
+const mockDbSelectJoined = vi.hoisted(() => () => {
+  const query: any = {};
+  query.innerJoin = () => query;
+  query.leftJoin = () => query;
+  query.where = () => query;
+  query.orderBy = () => query;
+  query.then = (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+    Promise.resolve([]).then(onFulfilled, onRejected);
+  return query;
+});
+const mockDbSelectFrom = vi.hoisted(() =>
+  vi.fn(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectJoined })),
+);
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
+  transaction: vi.fn(async (callback: (tx: { select: typeof mockDbSelect }) => Promise<unknown>) =>
+    callback({ select: mockDbSelect })),
 }));
 
 function registerModuleMocks() {
@@ -79,9 +111,9 @@ function registerModuleMocks() {
     }),
     issueThreadInteractionService: () => ({
       listForIssue: vi.fn(async () => []),
+      expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
       expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
       expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
-      expirePendingInteractionsOnTerminalIssueStatus: vi.fn(async () => []),
     }),
     issueRecoveryActionService: () => ({
       getActiveForIssue: vi.fn(async () => null),
@@ -146,10 +178,26 @@ describe("issue telemetry routes", () => {
       ...patch,
     }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectJoined }));
     mockDbSelectWhere.mockImplementation(() => ({
+      for: () => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([{
+            id: "22222222-2222-4222-8222-222222222222",
+            companyId: "company-1",
+            agentId: "agent-1",
+            contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
+            permissions: null,
+          }]).then(onFulfilled, onRejected),
+      }),
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve([{ companyId: "company-1", permissions: null }]).then(onFulfilled, onRejected),
+        Promise.resolve([{
+          id: "22222222-2222-4222-8222-222222222222",
+          companyId: "company-1",
+          agentId: "agent-1",
+          contextSnapshot: { issueId: "11111111-1111-4111-8111-111111111111" },
+          permissions: null,
+        }]).then(onFulfilled, onRejected),
     }));
   });
 
@@ -166,7 +214,7 @@ describe("issue telemetry routes", () => {
       type: "agent",
       agentId: "agent-1",
       companyId: "company-1",
-      runId: null,
+      runId: "22222222-2222-4222-8222-222222222222",
     });
     const res = await request(app)
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")

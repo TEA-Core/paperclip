@@ -21,6 +21,7 @@ import {
   mergeExecutionWorkspaceMetadataForPersistence,
   provisionExecutionWorkspaceForFreshnessDecision,
   readExecutionWorkspaceOccupancyDeferrals,
+  reconcileReusedExecutionWorkspaceProjectWorkspaceId,
   recordWorkspaceConfigFreshnessOperation,
   resolveExecutionWorkspaceConfigFreshness,
   resolveExecutionWorkspaceOccupancyDecision,
@@ -29,8 +30,14 @@ import {
   resolveTaskSessionConfigFreshness,
   resolveWorkspaceAfterLowTrustPreflight,
   stripHostWorkspaceProvisionForLowTrustSandbox,
+  type ResolvedWorkspaceForRun,
   type WorkspaceConfigFreshnessOperationInput,
 } from "./heartbeat.js";
+import { createGitRemoteAuthProvider } from "./git-credentials.js";
+import {
+  readManagedWorktreeInstanceOwnership,
+  WORKTREE_INSTANCE_ROOT_METADATA_KEY,
+} from "./workspace-instance-cleanup.js";
 import { environmentRuntimeService, type EnvironmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import {
@@ -147,22 +154,12 @@ export interface ExecutionWorkspaceProvisioningInput {
   runLifecycle: ExecutionWorkspaceProvisioningRunLifecycle;
 }
 
-export interface ResolvedWorkspaceForRun {
-  cwd: string;
-  source: "project_primary" | "task_session" | "agent_home";
-  projectId: string | null;
-  workspaceId: string | null;
-  repoUrl: string | null;
-  repoRef: string | null;
-  workspaceHints: Array<{
-    workspaceId: string;
-    cwd: string | null;
-    repoUrl: string | null;
-    repoRef: string | null;
-    defaultRef: string | null;
-  }>;
-  warnings: string[];
-}
+// Re-exported rather than redeclared. This module was extracted out of
+// heartbeat.ts, and a structural copy of the resolved-workspace shape silently
+// drifts every time upstream extends the original -- the 2026-08-14 fold added
+// `additionalWorkspaces` and `referencedProjectFailures` there, and a duplicate
+// would have dropped both without a type error at the seam.
+export type { ResolvedWorkspaceForRun };
 
 type WorkspaceReuseRequest = ReturnType<typeof resolveExecutionWorkspaceReuseRequestForIssue>;
 
@@ -181,6 +178,7 @@ type WorkspaceReuseProvisioningPolicy = ReturnType<
 export interface ProvisionedIssueExecutionWorkspace {
   kind: "provisioned";
   executionWorkspace: RealizedExecutionWorkspace;
+  resolvedWorkspace: ResolvedWorkspaceForRun;
   persistedExecutionWorkspace: ExecutionWorkspace | null;
   resolvedProjectId: string | null;
   resolvedProjectWorkspaceId: string | null;
@@ -392,6 +390,7 @@ export async function provisionIssueExecutionWorkspace(
     workspaceId: resolvedWorkspace.workspaceId,
     repoUrl: resolvedWorkspace.repoUrl,
     repoRef: resolvedWorkspace.repoRef,
+    additionalWorkspaces: resolvedWorkspace.additionalWorkspaces,
   } satisfies ExecutionWorkspaceInput;
 
   await assertGitWorktreeBaseWorkspaceReady({
@@ -399,6 +398,10 @@ export async function provisionIssueExecutionWorkspace(
     config: hostExecutionWorkspaceConfig,
     issue: issueRef,
     base: executionWorkspaceBase,
+    anchor: {
+      baseCwdFallback: resolvedWorkspace.baseCwdFallback,
+      materializationFailures: resolvedWorkspace.materializationFailures,
+    },
   });
   await assertProjectPrimaryBaseWorkspaceReady({
     requestedExecutionWorkspaceMode: input.effectiveExecutionWorkspaceMode,
@@ -492,6 +495,13 @@ export async function provisionIssueExecutionWorkspace(
       : null,
     issueId,
   });
+  // One credential provider per run: base-ref refreshes during workspace realization and
+  // restore authenticate against private GitHub remotes with the same company-secret token
+  // the managed clone uses.
+  const workspaceGitAuthProvider = createGitRemoteAuthProvider(db, agent.companyId, {
+    issueId,
+    heartbeatRunId: run.id,
+  });
   const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
     await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
       requestedShouldReuseExisting,
@@ -522,6 +532,11 @@ export async function provisionIssueExecutionWorkspace(
                     reusableExistingExecutionWorkspace.config?.provisionCommand ??
                     input.projectExecutionWorkspacePolicy?.workspaceStrategy?.provisionCommand ??
                     null,
+                  runtimeProvisionCommand:
+                    input.configSnapshot?.runtimeProvisionCommand ??
+                    reusableExistingExecutionWorkspace.config?.runtimeProvisionCommand ??
+                    input.projectExecutionWorkspacePolicy?.workspaceStrategy?.runtimeProvisionCommand ??
+                    null,
                 },
               },
               issue: issueRef,
@@ -536,6 +551,7 @@ export async function provisionIssueExecutionWorkspace(
               enableWorkspaceDirtyQuarantineRepair:
                 input.resolvedInstanceSettings.experimental.enableWorkspaceDirtyQuarantineRepair,
               recorder: workspaceOperationRecorder,
+              resolveGitAuth: workspaceGitAuthProvider,
             })
         : null,
   realizeWorkspace: () =>
@@ -556,6 +572,7 @@ export async function provisionIssueExecutionWorkspace(
       enableWorkspaceDirtyQuarantineRepair:
         input.resolvedInstanceSettings.experimental.enableWorkspaceDirtyQuarantineRepair,
       recorder: workspaceOperationRecorder,
+      resolveGitAuth: workspaceGitAuthProvider,
     }),
     });
 
@@ -563,7 +580,7 @@ export async function provisionIssueExecutionWorkspace(
     executionWorkspace.projectId ?? issueRef?.projectId ?? input.executionProjectId ?? null;
   const resolvedProjectWorkspaceId = issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId ?? null;
   let persistedExecutionWorkspace: ExecutionWorkspace | null = null;
-  const nextExecutionWorkspaceMetadata = mergeExecutionWorkspaceMetadataForPersistence({
+  const baseExecutionWorkspaceMetadata = mergeExecutionWorkspaceMetadataForPersistence({
     existingMetadata: resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
       ? reusableExistingExecutionWorkspace?.metadata ?? null
       : null,
@@ -578,6 +595,38 @@ export async function provisionIssueExecutionWorkspace(
     baseRef: executionWorkspace.repoRef,
     baseRefSha: executionWorkspace.baseRefSha ?? null,
   });
+  let persistedWorktreeInstanceRoot =
+    resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
+    && typeof reusableExistingExecutionWorkspace?.metadata?.[WORKTREE_INSTANCE_ROOT_METADATA_KEY] === "string"
+      ? reusableExistingExecutionWorkspace.metadata[WORKTREE_INSTANCE_ROOT_METADATA_KEY]
+      : null;
+  if (
+    !persistedWorktreeInstanceRoot
+    && executionWorkspace.strategy === "git_worktree"
+    && executionWorkspace.worktreePath
+  ) {
+    try {
+      persistedWorktreeInstanceRoot = (
+        await readManagedWorktreeInstanceOwnership(executionWorkspace.worktreePath)
+      )?.instanceRoot ?? null;
+    } catch (error) {
+      logger.warn(
+        {
+          runId: run.id,
+          issueId,
+          executionWorkspaceCwd: executionWorkspace.cwd,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "Could not record managed worktree instance ownership",
+      );
+    }
+  }
+  const nextExecutionWorkspaceMetadata = {
+    ...baseExecutionWorkspaceMetadata,
+    ...(persistedWorktreeInstanceRoot
+      ? { [WORKTREE_INSTANCE_ROOT_METADATA_KEY]: persistedWorktreeInstanceRoot }
+      : {}),
+  };
   const pendingForwardBranchReconcile = executionWorkspace.pendingForwardBranchReconcile ?? null;
   const branchNameForInitialPersistence =
     pendingForwardBranchReconcile?.recordedBranchName ?? executionWorkspace.branchName;
@@ -594,6 +643,10 @@ export async function provisionIssueExecutionWorkspace(
             status: "active",
             lastUsedAt: new Date(),
             metadata: nextExecutionWorkspaceMetadata,
+            projectWorkspaceId: reconcileReusedExecutionWorkspaceProjectWorkspaceId(
+              reusableExistingExecutionWorkspace.projectWorkspaceId,
+              resolvedProjectWorkspaceId,
+            ),
           })
         : resolvedProjectId
           ? await executionWorkspacesSvc.create({
@@ -642,10 +695,7 @@ export async function provisionIssueExecutionWorkspace(
             projectId: resolvedProjectId,
             projectWorkspaceId: resolvedProjectWorkspaceId,
             sourceIssueId: issueRef?.id ?? null,
-            metadata: {
-              createdByRuntime: true,
-              source: executionWorkspace.source,
-            },
+            metadata: nextExecutionWorkspaceMetadata,
           },
           projectWorkspace: {
             cwd: resolvedWorkspace.cwd,
@@ -717,7 +767,11 @@ export async function provisionIssueExecutionWorkspace(
       };
     }
     if (Object.keys(nextIssuePatch).length > 0) {
-      await issuesSvc.update(issueId, nextIssuePatch);
+      // This binding is produced BY the project's own policy, not supplied by an
+      // operator, so it must not trip the allowIssueOverride guard — otherwise an
+      // `allowIssueOverride: false` project could never provision any issue at all
+      // (SUP-13058).
+      await issuesSvc.update(issueId, { ...nextIssuePatch, systemWorkspaceBinding: true });
     }
   }
 
@@ -735,6 +789,11 @@ export async function provisionIssueExecutionWorkspace(
   return {
     kind: "provisioned",
     executionWorkspace,
+    // The full resolved anchor+referenced workspace, not just the realized
+    // execution workspace. Run preparation needs `workspaceHints` and the
+    // referenced-project set off this, and rebuilding it from
+    // `executionWorkspace` alone silently drops both.
+    resolvedWorkspace,
     persistedExecutionWorkspace,
     resolvedProjectId,
     resolvedProjectWorkspaceId,
