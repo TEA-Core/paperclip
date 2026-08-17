@@ -38,6 +38,30 @@ must_fail() {
     echo "PASS: $label denied as uid $(id -u): $out"
 }
 
+# Prints the first 12 hex of the sha256 of the key the server actually receives,
+# after running the entrypoint with the given `VAR=value` environment overrides.
+#
+# The digest is written from inside the command to a scratch file instead of
+# being read off stdout: the entrypoint prints its own progress lines (the MCP
+# package refresh) on stdout, so a command substitution around it captures those
+# lines too and never matches a bare fingerprint. Only the digest is ever
+# materialised — never the key itself.
+#
+# The overrides are applied with `env` rather than as an assignment prefix on the
+# function call, because a prefix on a function call persists in the caller's
+# environment in most shells and would leak the env key into later cases.
+FP_FILE=/tmp/master-key-fingerprint
+key_fingerprint_seen_by_server() {
+    : > "$FP_FILE"
+    # The command runs as node after the gosu drop, so the scratch file has to be
+    # writable by uid 1000.
+    chmod 0666 "$FP_FILE"
+    env "$@" docker-entrypoint.sh /bin/sh -c \
+        'printf "%s" "${PAPERCLIP_SECRETS_MASTER_KEY:-}" | sha256sum | cut -c1-12 > "$0"' \
+        "$FP_FILE" >/dev/null 2>&1 || true
+    cat "$FP_FILE"
+}
+
 if [ "${1:-seed}" = "probe" ]; then
     uid="$(id -u)"
     if [ "$uid" != "1000" ]; then
@@ -117,16 +141,16 @@ echo "PASS: disagreement warning carries no key material"
 # Env-wins case 2: env key set + no file + ALLOW_KEY_GENERATION=1.
 # No file must be created; the server must receive the env key.
 rm -f "$KEY"
-PAPERCLIP_SECRETS_MASTER_KEY="$DIFFERING_ENV_KEY" \
-    PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1 \
-    docker-entrypoint.sh /bin/sh -c 'printf "%s" "$PAPERCLIP_SECRETS_MASTER_KEY" | sha256sum | cut -c1-12' 2>/dev/null > "$PAPERCLIP_RUN_SCRATCH_DIR/env_fp.txt" || true
+env_seen_fp="$(key_fingerprint_seen_by_server \
+    PAPERCLIP_SECRETS_MASTER_KEY="$DIFFERING_ENV_KEY" \
+    PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1)"
 if [ -f "$KEY" ]; then
     echo "FAIL: entrypoint created master.key despite env key being set"
     exit 1
 fi
 echo "PASS: entrypoint did not create master.key when env key is set"
-if [ "$(cat "$PAPERCLIP_RUN_SCRATCH_DIR/env_fp.txt" 2>/dev/null)" != "$env_fp" ]; then
-    echo "FAIL: server did not receive the env key"
+if [ "$env_seen_fp" != "$env_fp" ]; then
+    echo "FAIL: server did not receive the env key (got '$env_seen_fp', want '$env_fp')"
     exit 1
 fi
 echo "PASS: server received the env key when no file exists"
@@ -139,7 +163,7 @@ rm -f "$KEY"
 printf '%s' "$EXPECTED_KEY" > "$KEY"
 chown root:root "$KEY"
 chmod 0600 "$KEY"
-file_fp="$(docker-entrypoint.sh /bin/sh -c 'printf "%s" "$PAPERCLIP_SECRETS_MASTER_KEY" | sha256sum | cut -c1-12' 2>/dev/null || true)"
+file_fp="$(key_fingerprint_seen_by_server)"
 expected_fp="$(printf '%s' "$EXPECTED_KEY" | sha256sum | cut -c1-12)"
 if [ "$file_fp" != "$expected_fp" ]; then
     echo "FAIL: server did not receive the file key (got $file_fp, want $expected_fp)"
