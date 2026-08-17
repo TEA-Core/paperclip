@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -262,6 +262,16 @@ async function waitForWakeup(assertion: () => void) {
 }
 
 describe.sequential("issue comment reopen routes", () => {
+  // `installActor` imports the route module lazily, so without this warm-up the
+  // first test pays the one-time transform cost of `routes/issues.js` and its
+  // import graph inside vitest's 5s testTimeout. On the loaded serial shard that
+  // single cold import alone can reach ~5s and time the first test out. The
+  // hooks get 30s (see server/vitest.config.ts), so warm the module cache here
+  // and keep every test measuring only its own work.
+  beforeAll(async () => {
+    await Promise.all([import("../routes/issues.js"), import("../middleware/index.js")]);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockReset();
