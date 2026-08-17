@@ -721,7 +721,7 @@ describe("worktree helpers", () => {
     }
   }, 20_000);
 
-  it("copies the source local_encrypted secrets key into the seeded worktree instance", () => {
+  it("returns the source local_encrypted secrets key without materializing a master.key under the target instance root", () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-secrets-"));
     const originalInlineMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
     const originalKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
@@ -730,21 +730,24 @@ describe("worktree helpers", () => {
       delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
       const sourceConfigPath = path.join(tempRoot, "source", "config.json");
       const sourceKeyPath = path.join(tempRoot, "source", "secrets", "master.key");
-      const targetKeyPath = path.join(tempRoot, "target", "secrets", "master.key");
+      const targetInstanceRoot = path.join(tempRoot, "target");
       fs.mkdirSync(path.dirname(sourceKeyPath), { recursive: true });
       fs.writeFileSync(sourceKeyPath, "source-master-key", "utf8");
 
       const sourceConfig = buildSourceConfig();
       sourceConfig.secrets.localEncrypted.keyFilePath = sourceKeyPath;
 
-      copySeededSecretsKey({
+      const result = copySeededSecretsKey({
         sourceConfigPath,
         sourceConfig,
         sourceEnvEntries: {},
-        targetKeyFilePath: targetKeyPath,
       });
 
-      expect(fs.readFileSync(targetKeyPath, "utf8")).toBe("source-master-key");
+      expect(result).toBe("source-master-key");
+      const targetKeyPath = path.join(targetInstanceRoot, "secrets", "master.key");
+      expect(fs.existsSync(targetKeyPath)).toBe(false);
+      const dottedAncestorKeyPath = path.join(targetInstanceRoot, ".secrets", "master.key");
+      expect(fs.existsSync(dottedAncestorKeyPath)).toBe(false);
     } finally {
       if (originalInlineMasterKey === undefined) {
         delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
@@ -760,23 +763,62 @@ describe("worktree helpers", () => {
     }
   });
 
-  it("writes the source inline secrets master key into the seeded worktree instance", () => {
+  it("returns the source inline secrets master key without materializing a master.key under the target instance root", () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-secrets-"));
     try {
       const sourceConfigPath = path.join(tempRoot, "source", "config.json");
-      const targetKeyPath = path.join(tempRoot, "target", "secrets", "master.key");
+      const targetInstanceRoot = path.join(tempRoot, "target");
 
-      copySeededSecretsKey({
+      const result = copySeededSecretsKey({
         sourceConfigPath,
         sourceConfig: buildSourceConfig(),
         sourceEnvEntries: {
           PAPERCLIP_SECRETS_MASTER_KEY: "inline-source-master-key",
         },
-        targetKeyFilePath: targetKeyPath,
       });
 
-      expect(fs.readFileSync(targetKeyPath, "utf8")).toBe("inline-source-master-key");
+      expect(result).toBe("inline-source-master-key");
+      const targetKeyPath = path.join(targetInstanceRoot, "secrets", "master.key");
+      expect(fs.existsSync(targetKeyPath)).toBe(false);
+      const dottedAncestorKeyPath = path.join(targetInstanceRoot, ".secrets", "master.key");
+      expect(fs.existsSync(dottedAncestorKeyPath)).toBe(false);
     } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("returns the process.env inline secrets master key for the current source config without materializing a master.key", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-secrets-"));
+    const originalConfig = process.env.PAPERCLIP_CONFIG;
+    const originalInlineMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    try {
+      const sourceConfigPath = path.join(tempRoot, "source", "config.json");
+      const targetInstanceRoot = path.join(tempRoot, "target");
+      process.env.PAPERCLIP_CONFIG = sourceConfigPath;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY = "process-env-master-key";
+
+      const result = copySeededSecretsKey({
+        sourceConfigPath,
+        sourceConfig: buildSourceConfig(),
+        sourceEnvEntries: {},
+      });
+
+      expect(result).toBe("process-env-master-key");
+      const targetKeyPath = path.join(targetInstanceRoot, "secrets", "master.key");
+      expect(fs.existsSync(targetKeyPath)).toBe(false);
+      const dottedAncestorKeyPath = path.join(targetInstanceRoot, ".secrets", "master.key");
+      expect(fs.existsSync(dottedAncestorKeyPath)).toBe(false);
+    } finally {
+      if (originalConfig === undefined) {
+        delete process.env.PAPERCLIP_CONFIG;
+      } else {
+        process.env.PAPERCLIP_CONFIG = originalConfig;
+      }
+      if (originalInlineMasterKey === undefined) {
+        delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      } else {
+        process.env.PAPERCLIP_SECRETS_MASTER_KEY = originalInlineMasterKey;
+      }
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });
@@ -1226,6 +1268,11 @@ describe("worktree helpers", () => {
       expect(rewrittenEnv).toContain(`PAPERCLIP_INSTANCE_ID=${currentInstanceId}`);
       expect(rewrittenEnv).toContain("PAPERCLIP_WORKTREE_NAME=existing-name");
       expect(rewrittenEnv).toContain("PAPERCLIP_WORKTREE_COLOR=\"#112233\"");
+      expect(rewrittenEnv).toContain("PAPERCLIP_SECRETS_MASTER_KEY=source-secret");
+      const targetKeyPath = path.join(currentPaths.instanceRoot, "secrets", "master.key");
+      expect(fs.existsSync(targetKeyPath)).toBe(false);
+      const dottedAncestorKeyPath = path.join(currentPaths.instanceRoot, ".secrets", "master.key");
+      expect(fs.existsSync(dottedAncestorKeyPath)).toBe(false);
     } finally {
       await currentDatabaseReservation.release();
       await sourceDatabaseReservation.release();
@@ -1309,6 +1356,10 @@ describe("worktree helpers", () => {
       expect(restoredConfig.database.embeddedPostgresPort).toBe(54341);
       expect(restoredEnv).toContain(`PAPERCLIP_INSTANCE_ID=${currentInstanceId}`);
       expect(restoredMarker).toBe("keep me");
+      const targetKeyPath = path.join(currentPaths.instanceRoot, "secrets", "master.key");
+      expect(fs.existsSync(targetKeyPath)).toBe(false);
+      const dottedAncestorKeyPath = path.join(currentPaths.instanceRoot, ".secrets", "master.key");
+      expect(fs.existsSync(dottedAncestorKeyPath)).toBe(false);
     } finally {
       process.chdir(originalCwd);
       if (originalPaperclipConfig === undefined) {
