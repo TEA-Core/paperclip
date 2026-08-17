@@ -2763,6 +2763,128 @@ export function issueRoutes(
     await issueSvc.addComment(issueId, body, {}, { authorType: "system" });
   }
 
+  type DoneTransitionGuardOutcome =
+    | { ok: true }
+    | { ok: false; status: number; body: Record<string, unknown> };
+
+  // Single evaluator for BOTH done-transition guards, shared by every route that can
+  // land an issue on `done`: the status PATCH and the comment auto-approval path.
+  //
+  // These guards used to live inline in the PATCH handler behind a `!transition.decision`
+  // clause, which meant a decision-carrying transition (a board review approval) skipped
+  // the delivery guard, the tier declaration AND the activity_log rows entirely — so
+  // approval-closed cards closed without merge verification and were invisible to the
+  // ghost-PASS census by construction (SUP-13185). The comment auto-approval path never
+  // ran them at all.
+  async function evaluateDoneTransitionGuards(input: {
+    issue: Parameters<typeof evaluateDoneTransitionGuard>[1] & { id: string; identifier: string | null };
+    override: DoneTransitionOverride | null;
+    commentBody: string | null;
+    runId: string | null;
+    // A review approval decides *code quality*, not merge/land state, so the delivery
+    // guard applies in full on decision-carrying transitions. The tier declaration is
+    // the implementer's obligation under SUP-12693 — a reviewer cannot make a liveness
+    // claim on the implementer's behalf, and the approval comment is a verdict, not a
+    // close-out — so there it degrades to an audit row rather than a 409 that would
+    // deadlock the approval circuit. Either way the transition becomes auditable.
+    decisionCarried: boolean;
+  }): Promise<DoneTransitionGuardOutcome> {
+    const { issue, override, commentBody, runId, decisionCarried } = input;
+
+    const guardResult = await evaluateDoneTransitionGuard(db, issue, override);
+    if (guardResult.skipped) {
+      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        reason: guardResult.reason,
+        skipReason: guardResult.skipReason,
+        branch: guardResult.branch,
+        defaultRef: guardResult.defaultRef,
+        owner: guardResult.owner,
+        repo: guardResult.repo,
+        decisionCarried,
+      });
+      if (guardResult.skipReason?.startsWith("auth_failed:")) {
+        void postAuthFailureComment(svc, issue.id, guardResult.skipReason).catch((err) => {
+          logger.warn({ err, issueId: issue.id }, "failed to post auth-failure done-guard comment");
+        });
+      }
+    }
+    if (!guardResult.allowed) {
+      return {
+        ok: false,
+        status: 409,
+        body: {
+          error: guardResult.reason,
+          code: "done_transition_missing_delivery",
+          details: {
+            issueId: issue.id,
+            identifier: issue.identifier ?? null,
+            branch: guardResult.branch,
+            defaultRef: guardResult.defaultRef,
+            aheadBy: guardResult.aheadBy,
+            owner: guardResult.owner,
+            repo: guardResult.repo,
+            decisionCarried,
+            remedy: decisionCarried
+              ? "Merge the issue's pull request before approving this review stage — a review approval decides code quality, not merge/land state. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
+              : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition.",
+          },
+        },
+      };
+    }
+
+    const tierResult = await evaluateDoneTierDeclaration(
+      db,
+      issue,
+      commentBody,
+      runId,
+      (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
+    );
+    if (tierResult.skipped) {
+      void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
+        reason: tierResult.reason,
+        skipReason: tierResult.skipReason,
+        decisionCarried,
+      });
+    }
+    if (!tierResult.allowed) {
+      if (decisionCarried) {
+        // Log-only on the approval path: record the missing declaration so the card is
+        // still countable in the ghost-PASS census, but let the approval through.
+        void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
+          reason: tierResult.reason,
+          skipReason: "decision_carrying_transition",
+          decisionCarried,
+        });
+        return { ok: true };
+      }
+      return {
+        ok: false,
+        status: 409,
+        body: {
+          error: tierResult.reason,
+          code: "done_transition_missing_tier_declaration",
+          details: {
+            issueId: issue.id,
+            identifier: issue.identifier ?? null,
+            remedy:
+              "Include a done-tier declaration in the close comment: " +
+              `"Closed at Tier 2 (live): <probe evidence>"` +
+              ` or ` +
+              `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+              ` — per SUP-12693.`,
+          },
+        },
+      };
+    }
+    if (tierResult.tier === "tier1") {
+      void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
+        reason: tierResult.reason,
+        decisionCarried,
+      });
+    }
+    return { ok: true };
+  }
+
   // Every route that can resolve a blocker routes its dependent wake through these
   // two helpers: one builds the wake (deduping against an already-enqueued one),
   // the other emits the matching audit record once the enqueue resolves. Keeping
@@ -9435,7 +9557,17 @@ export function issueRoutes(
     }
 
     const requestedStatus = typeof updateFields.status === "string" ? updateFields.status : undefined;
-    const isDoneRequest = requestedStatus === "done" && existing.status !== "done" && !transition.decision;
+    // Guard on the status the transition actually RESOLVES to, not on the raw request.
+    // An execution-policy transition may redirect a requested `done` to `in_review`
+    // (approved, but a later stage is still pending) or `in_progress` (changes
+    // requested) — those must NOT be guarded. Conversely a *final*-stage approval
+    // leaves the requested `done` in place and must be guarded like any other close.
+    // The previous `!transition.decision` clause conflated the two and skipped both
+    // guards plus every activity_log row for the whole decision-carrying family
+    // (SUP-13185).
+    const effectiveStatus =
+      typeof transition.patch.status === "string" ? transition.patch.status : requestedStatus;
+    const isDoneRequest = effectiveStatus === "done" && existing.status !== "done";
     if (isDoneRequest) {
       const override: DoneTransitionOverride | null =
         req.body.doneTransitionOverride && typeof req.body.doneTransitionOverride === "object"
@@ -9444,76 +9576,16 @@ export function issueRoutes(
               reason: (req.body.doneTransitionOverride as { reason?: string }).reason,
             }
           : null;
-      const guardResult = await evaluateDoneTransitionGuard(db, existing, override);
-      if (guardResult.skipped) {
-        void writeAuditLog(db, existing, "issue.done_transition_guard_skipped", {
-          reason: guardResult.reason,
-          skipReason: guardResult.skipReason,
-          branch: guardResult.branch,
-          defaultRef: guardResult.defaultRef,
-          owner: guardResult.owner,
-          repo: guardResult.repo,
-        });
-        if (guardResult.skipReason?.startsWith("auth_failed:")) {
-          void postAuthFailureComment(svc, existing.id, guardResult.skipReason).catch((err) => {
-            logger.warn({ err, issueId: existing.id }, "failed to post auth-failure done-guard comment");
-          });
-        }
-      }
-      if (!guardResult.allowed) {
-        res.status(409).json({
-          error: guardResult.reason,
-          code: "done_transition_missing_delivery",
-          details: {
-            issueId: existing.id,
-            identifier: existing.identifier ?? null,
-            branch: guardResult.branch,
-            defaultRef: guardResult.defaultRef,
-            aheadBy: guardResult.aheadBy,
-            owner: guardResult.owner,
-            repo: guardResult.repo,
-            remedy: "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition.",
-          },
-        });
+      const outcome = await evaluateDoneTransitionGuards({
+        issue: existing,
+        override,
+        commentBody: commentBody ?? null,
+        runId: actor.runId ?? null,
+        decisionCarried: !!transition.decision,
+      });
+      if (!outcome.ok) {
+        res.status(outcome.status).json(outcome.body);
         return;
-      }
-    }
-
-    if (isDoneRequest) {
-      const tierResult = await evaluateDoneTierDeclaration(
-        db,
-        existing,
-        commentBody ?? null,
-        actor.runId ?? null,
-        (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
-      );
-      if (tierResult.skipped) {
-        void writeAuditLog(db, existing, "issue.done_tier_declaration_skipped", {
-          reason: tierResult.reason,
-          skipReason: tierResult.skipReason,
-        });
-      }
-      if (!tierResult.allowed) {
-        res.status(409).json({
-          error: tierResult.reason,
-          code: "done_transition_missing_tier_declaration",
-          details: {
-            issueId: existing.id,
-            identifier: existing.identifier ?? null,
-            remedy:
-              "Include a done-tier declaration in the close comment: " +
-              `"Closed at Tier 2 (live): <probe evidence>"` +
-              ` or ` +
-              `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
-              ` — per SUP-12693.`,
-          },
-        });
-        return;
-      }
-      if (tierResult.tier === "tier1") {
-        void writeAuditLog(db, existing, "issue.done_transition_tier1_close", {
-          reason: tierResult.reason,
-        });
       }
     }
 
@@ -11928,6 +12000,28 @@ export function issueRoutes(
         },
         commentBody: req.body.body,
       });
+
+      // This route is a second door onto `done` and used to run neither done-guard, so
+      // an approval comment on a final review stage closed the card without any merge
+      // verification and without an activity_log row (SUP-13185, the SUP-13176/13181
+      // shape). Evaluate before the transaction: a 409 here must leave both the comment
+      // and the status change unwritten.
+      const autoApproveEffectiveStatus =
+        typeof transition.patch.status === "string" ? transition.patch.status : "done";
+      if (autoApproveEffectiveStatus === "done" && currentIssue.status !== "done") {
+        const outcome = await evaluateDoneTransitionGuards({
+          issue: currentIssue,
+          override: null,
+          commentBody: req.body.body ?? null,
+          runId: actor.runId ?? null,
+          decisionCarried: !!transition.decision,
+        });
+        if (!outcome.ok) {
+          res.status(outcome.status).json(outcome.body);
+          return;
+        }
+      }
+
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
