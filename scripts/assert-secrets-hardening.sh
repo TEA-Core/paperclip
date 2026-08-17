@@ -123,16 +123,25 @@ echo "PASS: entrypoint did not generate master.key when ALLOW_KEY_GENERATION is 
 # Precedence: env key > file key > (opt-in) generated key.
 # Each case runs the entrypoint with a probe as "$@" that prints only the
 # sha256 digest of the key the server received — never the key material.
+#
+# The entrypoint also writes progress lines (the MCP package refresh) to stdout,
+# so the probe tags its digest line and each case keeps only the tagged line.
 ENV_KEY="env-master-key-do-not-mint"
 ENV_FP="$(printf '%s' "$ENV_KEY" | sha256sum | cut -c1-12)"
+KEY_DIGEST_PROBE='printf "DIGEST:%s\n" "$(printf "%s" "${PAPERCLIP_SECRETS_MASTER_KEY:-}" | sha256sum | cut -c1-12)"'
+
+# Reads the probe stdout and prints only the digest the probe tagged.
+digest_of() {
+    sed -n 's/^DIGEST://p' | tail -n 1
+}
 
 # Case 1: env set + file present, differing — server must receive env key;
 #         disagreement warning with two 12-hex fingerprints logged to stderr.
 printf '%s' "$EXPECTED_KEY" > "$KEY"
 chown root:root "$KEY"
 chmod 0600 "$KEY"
-case1_err="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" docker-entrypoint.sh sh -c 'printf "%s" "${PAPERCLIP_SECRETS_MASTER_KEY:-}" | sha256sum | cut -c1-12' 2>&1 >/dev/null || true)"
-case1_out="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" docker-entrypoint.sh sh -c 'printf "%s" "${PAPERCLIP_SECRETS_MASTER_KEY:-}" | sha256sum | cut -c1-12' 2>/dev/null || true)"
+case1_err="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>&1 >/dev/null || true)"
+case1_out="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>/dev/null | digest_of || true)"
 if [ "$case1_out" != "$ENV_FP" ]; then
     echo "FAIL: env-set + file-present — server received digest '$case1_out', want env digest '$ENV_FP'"
     exit 1
@@ -156,7 +165,7 @@ echo "PASS: env-set + file-present — server received env key; disagreement war
 #         server receives env key.
 rm -f "$KEY"
 case2_out="$(PAPERCLIP_SECRETS_MASTER_KEY="$ENV_KEY" PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION=1 \
-    docker-entrypoint.sh sh -c 'printf "%s" "${PAPERCLIP_SECRETS_MASTER_KEY:-}" | sha256sum | cut -c1-12' 2>/dev/null || true)"
+    docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>/dev/null | digest_of || true)"
 if [ "$case2_out" != "$ENV_FP" ]; then
     echo "FAIL: env-set + no-file + generation — server received digest '$case2_out', want env digest '$ENV_FP'"
     exit 1
@@ -171,7 +180,7 @@ echo "PASS: env-set + no-file + generation — no file created; server received 
 printf '%s' "$EXPECTED_KEY" > "$KEY"
 chown root:root "$KEY"
 chmod 0600 "$KEY"
-case3_out="$(docker-entrypoint.sh sh -c 'printf "%s" "${PAPERCLIP_SECRETS_MASTER_KEY:-}" | sha256sum | cut -c1-12' 2>/dev/null || true)"
+case3_out="$(docker-entrypoint.sh sh -c "$KEY_DIGEST_PROBE" 2>/dev/null | digest_of || true)"
 file_fp="$(sha256sum "$KEY" | cut -c1-12)"
 if [ "$case3_out" != "$file_fp" ]; then
     echo "FAIL: no-env + file-present — server received digest '$case3_out', want file digest '$file_fp'"
