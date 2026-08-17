@@ -1039,29 +1039,17 @@ export function copySeededSecretsKey(input: {
   sourceConfigPath: string;
   sourceConfig: PaperclipConfig;
   sourceEnvEntries: Record<string, string>;
-  targetKeyFilePath: string;
-}): void {
+}): string | null {
   if (input.sourceConfig.secrets.provider !== "local_encrypted") {
-    return;
+    return null;
   }
-
-  mkdirSync(path.dirname(input.targetKeyFilePath), { recursive: true });
 
   const allowProcessEnvFallback = isCurrentSourceConfigPath(input.sourceConfigPath);
   const sourceInlineMasterKey =
     nonEmpty(input.sourceEnvEntries.PAPERCLIP_SECRETS_MASTER_KEY) ??
     (allowProcessEnvFallback ? nonEmpty(process.env.PAPERCLIP_SECRETS_MASTER_KEY) : null);
   if (sourceInlineMasterKey) {
-    writeFileSync(input.targetKeyFilePath, sourceInlineMasterKey, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    try {
-      chmodSync(input.targetKeyFilePath, 0o600);
-    } catch {
-      // best effort
-    }
-    return;
+    return sourceInlineMasterKey;
   }
 
   const sourceKeyFileOverride =
@@ -1076,12 +1064,7 @@ export function copySeededSecretsKey(input: {
     );
   }
 
-  copyFileSync(sourceKeyFilePath, input.targetKeyFilePath);
-  try {
-    chmodSync(input.targetKeyFilePath, 0o600);
-  } catch {
-    // best effort
-  }
+  return readFileSync(sourceKeyFilePath, "utf8");
 }
 
 async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): Promise<EmbeddedPostgresHandle> {
@@ -1320,12 +1303,14 @@ async function seedWorktreeDatabase(input: {
   const seedPlan = resolveWorktreeSeedPlan(input.seedMode);
   const sourceEnvFile = resolvePaperclipEnvFile(input.sourceConfigPath);
   const sourceEnvEntries = readPaperclipEnvEntries(sourceEnvFile);
-  copySeededSecretsKey({
+  const seededMasterKey = copySeededSecretsKey({
     sourceConfigPath: input.sourceConfigPath,
     sourceConfig: input.sourceConfig,
     sourceEnvEntries,
-    targetKeyFilePath: input.targetPaths.secretsKeyFilePath,
   });
+  if (seededMasterKey) {
+    mergePaperclipEnvEntries({ PAPERCLIP_SECRETS_MASTER_KEY: seededMasterKey }, input.targetPaths.envPath);
+  }
   let sourceHandle: EmbeddedPostgresHandle | null = null;
   let targetHandle: EmbeddedPostgresHandle | null = null;
 
