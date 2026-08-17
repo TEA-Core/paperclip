@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { PaperclipConfig } from "@paperclipai/shared";
 import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
+import { resolveDefaultSecretsKeyFilePath } from "./home-paths.js";
 
 function nonEmpty(value: string | null | undefined): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -243,7 +244,7 @@ function resolveWorktreeRuntimeContext(
     backupDir: path.resolve(instanceRoot, "data", "backups"),
     logDir: path.resolve(instanceRoot, "logs"),
     storageDir: path.resolve(instanceRoot, "data", "storage"),
-    secretsKeyFilePath: path.resolve(instanceRoot, "secrets", "master.key"),
+    secretsKeyFilePath: resolveDefaultSecretsKeyFilePath(),
   };
 }
 

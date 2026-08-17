@@ -2,6 +2,7 @@ import { randomInt } from "node:crypto";
 import path from "node:path";
 import type { PaperclipConfig } from "../config/schema.js";
 import { expandHomePrefix } from "../config/home.js";
+import { resolveDefaultSecretsKeyFilePath } from "@paperclipai/shared/home-paths";
 
 export const DEFAULT_WORKTREE_HOME = "~/.paperclip-worktrees";
 export const WORKTREE_SEED_MODES = ["minimal", "full"] as const;
@@ -154,7 +155,7 @@ export function resolveWorktreeLocalPaths(opts: {
     embeddedPostgresDataDir: path.resolve(instanceRoot, "db"),
     backupDir: path.resolve(instanceRoot, "data", "backups"),
     logDir: path.resolve(instanceRoot, "logs"),
-    secretsKeyFilePath: path.resolve(instanceRoot, "secrets", "master.key"),
+    secretsKeyFilePath: resolveDefaultSecretsKeyFilePath(),
     storageDir: path.resolve(instanceRoot, "data", "storage"),
   };
 }
