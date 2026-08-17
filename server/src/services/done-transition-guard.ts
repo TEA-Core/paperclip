@@ -7,7 +7,7 @@ import {
   type GitHubTokenScope,
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
-import { resolveLinkedPullRequests } from "./merge-arming.js";
+import { resolveLinkedPullRequestsWithState, type LinkedPullRequest } from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
 
@@ -230,6 +230,34 @@ async function writeAuditLog(
   }
 }
 
+async function hydrateLinkedPrState(
+  pr: LinkedPullRequest,
+  token: string,
+): Promise<LinkedPullRequest> {
+  const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}/pulls/${pr.number}`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-done-transition-guard",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+  try {
+    const response = await ghFetch(url, { headers });
+    if (!response.ok) {
+      return pr;
+    }
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body) return pr;
+    const state = body.state as string | undefined;
+    if (typeof state === "string") {
+      return { ...pr, cachedState: state };
+    }
+    return pr;
+  } catch {
+    return pr;
+  }
+}
+
 function parseTier2Declaration(body: string): { matched: boolean; evidence: string } {
   const lines = body.split(/\r?\n/);
   for (const line of lines) {
@@ -436,7 +464,7 @@ export async function evaluateDoneTransitionGuard(
     owner: null,
     repo: null,
     skipped,
-    skipReason,
+    skipReason: skipReason ?? prSkipReason,
   });
 
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
@@ -464,19 +492,46 @@ export async function evaluateDoneTransitionGuard(
   // Treating an unhydrated row as open would block `done` on any issue that merely
   // links a PR (including already-merged or unrelated ones) in exactly the
   // credential-less configuration this guard is built for. Fail open on unknown.
-  const resolvedPrs = await resolveLinkedPullRequests(db, issue.companyId, issue.id);
-  const linkedPrs = resolvedPrs.filter((p) => p.cachedState === "open");
-  if (linkedPrs.length > 0) {
-    const prNames = linkedPrs.map((p) => p.displayName).join(", ");
+  let resolvedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+
+  // Best-effort synchronous hydration: attempt to fetch current state from GitHub for
+  // any unhydrated (cachedState === null) rows. A thrown/failed hydration must NOT
+  // throw — degrade to the unhydrated branch. We only hydrate if a company token is
+  // available; if token resolution itself fails, we keep the cached states as-is.
+  let prSkipReason: string | null = null;
+  try {
+    const tokenResult = await resolveGitHubToken(db, issue.companyId);
+    if (tokenResult.token !== null) {
+      const unhydrated = resolvedPrs.filter((p) => p.cachedState === null);
+      if (unhydrated.length > 0) {
+        const hydrated = await Promise.all(
+          unhydrated.map((p) => hydrateLinkedPrState(p, tokenResult.token)),
+        );
+        const hydratedMap = new Map(hydrated.map((p) => [p.id, p] as const));
+        resolvedPrs = resolvedPrs.map((p) => hydratedMap.get(p.id) ?? p);
+      }
+    }
+  } catch {
+    // Token resolution failed — keep cached states, proceed to skipReason below.
+  }
+
+  const openPrs = resolvedPrs.filter((p) => p.cachedState === "open");
+  const unhydratedCount = resolvedPrs.filter((p) => p.cachedState === null).length;
+  if (unhydratedCount > 0) {
+    prSkipReason = `unhydrated_linked_prs:${unhydratedCount}`;
+  }
+
+  if (openPrs.length > 0) {
+    const prNames = openPrs.map((p) => p.displayName).join(", ");
     void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
-      reason: `open_linked_prs:${linkedPrs.length}`,
-      skipReason: `open_linked_prs:${linkedPrs.length}`,
+      reason: `open_linked_prs:${openPrs.length}`,
+      skipReason: `open_linked_prs:${openPrs.length}`,
       prs: prNames,
     });
     return {
       allowed: false,
       reason:
-        `Issue has ${linkedPrs.length} open linked PR${linkedPrs.length === 1 ? "" : "s"} (${prNames}). ` +
+        `Issue has ${openPrs.length} open linked PR${openPrs.length === 1 ? "" : "s"} (${prNames}). ` +
         "Land them (merge or close the PRs) before marking done, or set doneTransitionOverride to a " +
         `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}). ` +
         "A done-tier declaration alone does not clear this block — the tier check runs after this guard.",
@@ -571,7 +626,7 @@ export async function evaluateDoneTransitionGuard(
       owner: parsed.owner,
       repo: parsed.repo,
       skipped: false,
-      skipReason: null,
+      skipReason: prSkipReason,
     };
   }
 
@@ -603,7 +658,7 @@ export async function evaluateDoneTransitionGuard(
       owner: parsed.owner,
       repo: parsed.repo,
       skipped: false,
-      skipReason: null,
+      skipReason: prSkipReason,
     };
   }
 
@@ -616,7 +671,7 @@ export async function evaluateDoneTransitionGuard(
     owner: parsed.owner,
     repo: parsed.repo,
     skipped: false,
-    skipReason: null,
+    skipReason: prSkipReason,
   };
 }
 
