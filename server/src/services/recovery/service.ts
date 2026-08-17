@@ -2937,15 +2937,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   /**
-   * Recovery hands the source issue to the routing owner: escalation writes
-   * `assigneeAgentId = ownerAgentId`, and the return owner receives the issue
-   * back the same way. So the grant question is not "can this agent write the
-   * issue while someone else still holds it" (no manager or reviewer can, which
-   * would reject the whole ladder), it is "would this agent still be denied
-   * `issue:mutate` even once the issue is theirs". Policy-restricted, low-trust
-   * out-of-boundary, scoped-key, and inactive-membership candidates stay denied
-   * under that evaluation, which is the SUP-13120 case; a plain manager or CTO
-   * that simply holds no grant on someone else's issue is not.
+   * The recovery owner and return owner must be able to write the source issue
+   * *as it currently stands*. The live SUP-13091 failure was a full-trust
+   * exec-CTO denied `deny_missing_grant` on `POST /api/issues/{id}/comments`
+   * because it was neither assignee, creator, nor org-chain ancestor of the
+   * assignee. We therefore evaluate `issue:comment` against the source issue's
+   * REAL current assignment — not a reassigned one. This yields
+   * `allow_manager_chain` for a manager ancestor (AC4) and
+   * `deny_missing_grant` for a non-ancestor (AC3), which is exactly the
+   * predicate `decideIssueAccess` uses for the live 403. `issue:mutate` has no
+   * manager-chain allow path, so it would break AC4.
    */
   async function candidateCanWriteSourceIssue(
     issue: typeof issues.$inferSelect,
@@ -2953,17 +2954,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   ): Promise<boolean> {
     const decision = await authz.decide({
       actor: { type: "agent", agentId, companyId: issue.companyId },
-      action: "issue:mutate",
+      action: "issue:comment",
       resource: {
         type: "issue",
         companyId: issue.companyId,
         issueId: issue.id,
         projectId: issue.projectId,
         parentIssueId: issue.parentId,
-        // Post-handover assignment state, per the note above.
-        assigneeAgentId: agentId,
-        assigneeUserId: null,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
         status: issue.status,
+        createdByAgentId: issue.createdByAgentId,
+      },
+      scope: {
+        issueId: issue.id,
+        projectId: issue.projectId,
+        parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
         createdByAgentId: issue.createdByAgentId,
       },
     });

@@ -10,7 +10,6 @@ import {
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
-import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -50,7 +49,7 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedCompany(options?: { ctoPermissions?: Record<string, unknown> }) {
+  async function seedCompany(options?: { ctoReportsTo?: string | null; coderReportsTo?: string | null }) {
     const companyId = randomUUID();
     const ctoId = randomUUID();
     const coderId = randomUUID();
@@ -71,7 +70,8 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
         adapterType: "codex_local",
         adapterConfig: {},
         runtimeConfig: {},
-        permissions: options?.ctoPermissions ?? {},
+        permissions: {},
+        reportsTo: options?.ctoReportsTo ?? null,
       },
       {
         id: coderId,
@@ -79,7 +79,7 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
         name: "Coder",
         role: "engineer",
         status: "idle",
-        reportsTo: ctoId,
+        reportsTo: options?.coderReportsTo === undefined ? ctoId : options.coderReportsTo,
         adapterType: "codex_local",
         adapterConfig: {},
         runtimeConfig: {},
@@ -107,16 +107,14 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
     return row!;
   }
 
-  it("rejects a ladder candidate that stays denied issue:mutate even as the owner (SUP-13091 shape)", async () => {
-    // The CTO is invokable, but its low-trust boundary excludes the source
-    // issue, so it is denied issue:mutate even once the issue is handed to it.
+  it("rejects a ladder candidate that lacks a write grant on the source issue (SUP-13091 shape)", async () => {
+    // The CTO is invokable (standard trust, role=cto), but it is NOT the
+    // assignee's reportsTo ancestor (reportsTo: null) and did not create the
+    // source issue. Under issue:comment + actual assignment, the CTO is denied
+    // deny_missing_grant — the exact live failure — so it must NOT be selected.
     const { companyId, ctoId, coderId, prefix } = await seedCompany({
-      ctoPermissions: {
-        trustPreset: LOW_TRUST_REVIEW_PRESET,
-        authorizationPolicy: {
-          trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, projectIds: [randomUUID()] },
-        },
-      },
+      ctoReportsTo: null,
+      coderReportsTo: null,
     });
     const sourceIssue = await seedSourceIssue(companyId, coderId, prefix);
 
@@ -151,7 +149,10 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
   });
 
   it("still escalates to the manager ladder when the candidate can hold the issue (happy path)", async () => {
-    const { companyId, ctoId, coderId, prefix } = await seedCompany();
+    // The CTO IS the coder's reportsTo ancestor, so issue:comment + actual
+    // assignment passes via allow_manager_chain. The CTO is selected as owner,
+    // and the return owner is the coder (the original assignee).
+    const { companyId, ctoId, coderId, prefix } = await seedCompany({ ctoReportsTo: null });
     const sourceIssue = await seedSourceIssue(companyId, coderId, prefix);
 
     const enqueueWakeup = vi.fn(async () => null);
@@ -184,11 +185,13 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
     expect(action.evidence.routingFallbackReason).toBeNull();
   });
 
-  it("drops a return owner that stays denied issue:mutate even as the owner", async () => {
-    const { companyId, ctoId, coderId, prefix } = await seedCompany();
+  it("drops a return owner that lacks a write grant on the source issue", async () => {
+    // process_lost routes back to the agent that ran. Here the run agent is a
+    // standard-trust reviewer that is neither the assignee, creator, nor
+    // org-chain ancestor of the source issue — so it lacks a write grant and
+    // the return owner is dropped with a routingFallbackReason.
+    const { companyId, ctoId, coderId, prefix } = await seedCompany({ ctoReportsTo: null });
     const sourceIssue = await seedSourceIssue(companyId, coderId, prefix);
-    // process_lost routes back to the agent that ran, which here is neither the
-    // assignee nor an agent that could hold the issue.
     const reviewerId = randomUUID();
     await db.insert(agents).values({
       id: reviewerId,
@@ -196,15 +199,11 @@ describeEmbeddedPostgres("recovery stranded owner write-grant guard", () => {
       name: "Reviewer",
       role: "engineer",
       status: "idle",
+      reportsTo: null,
       adapterType: "codex_local",
       adapterConfig: {},
       runtimeConfig: {},
-      permissions: {
-        trustPreset: LOW_TRUST_REVIEW_PRESET,
-        authorizationPolicy: {
-          trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, projectIds: [randomUUID()] },
-        },
-      },
+      permissions: {},
     });
 
     const enqueueWakeup = vi.fn(async () => null);
