@@ -23,7 +23,8 @@ import {
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
-export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
+export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 2;
+export const PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_FULL_BUDGET_MS = 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS = 6;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS = 30;
@@ -48,7 +49,7 @@ type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 // result_json/context_snapshot for up to MAX_RUNS_FOR_STREAK runs per issue.
 type ProductivityRunSample = Pick<
   HeartbeatRunRow,
-  "id" | "agentId" | "status" | "livenessState" | "createdAt" | "nextAction" | "usageJson"
+  "id" | "agentId" | "status" | "livenessState" | "startedAt" | "finishedAt" | "createdAt" | "nextAction" | "usageJson"
 >;
 type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
 
@@ -122,6 +123,16 @@ function msToHuman(ms: number | null) {
   const days = Math.floor(hours / 24);
   if (days > 0) return `${days}d ${hours % 24}h`;
   return `${hours}h ${minutes % 60}m`;
+}
+
+function runBudgetWeight(run: Pick<HeartbeatRunRow, "startedAt" | "finishedAt">) {
+  if (!run.startedAt || !run.finishedAt) return 0;
+  const durationMs = Math.max(0, run.finishedAt.getTime() - run.startedAt.getTime());
+  return Math.min(1, durationMs / PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_FULL_BUDGET_MS);
+}
+
+function formatBudgetWeightedStreak(value: number) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(2);
 }
 
 function issueUiLink(issue: { identifier: string | null; id: string }, prefix: string) {
@@ -458,6 +469,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
         livenessState: heartbeatRuns.livenessState,
+        startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
         createdAt: heartbeatRuns.createdAt,
         nextAction: heartbeatRuns.nextAction,
         usageJson: heartbeatRuns.usageJson,
@@ -497,7 +510,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     let noCommentStreak = 0;
     for (const run of terminalRuns) {
       if (commentRunIds.has(run.id)) break;
-      noCommentStreak += 1;
+      noCommentStreak += runBudgetWeight(run);
     }
 
     const [
@@ -557,7 +570,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
-    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`);
+    if (noComment) triggerReasons.push(`${formatBudgetWeightedStreak(noCommentStreak)} budget-equivalent consecutive completed issue-linked runs had no run-created issue comment`);
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
     if (highChurn) {
       triggerReasons.push(
@@ -681,7 +694,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
-      `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
+      `- No-comment completed-run streak (budget-weighted): ${formatBudgetWeightedStreak(evidence.noCommentStreak)}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
@@ -690,7 +703,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "",
       "## Thresholds",
       "",
-      `- No-comment streak: ${evidence.thresholds.noCommentStreakRuns} completed runs`,
+      `- No-comment streak: ${evidence.thresholds.noCommentStreakRuns} budget-equivalent completed runs`,
       `- Long active duration: ${msToHuman(evidence.thresholds.longActiveMs)}`,
       `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee-run comments`,
       `- Resolved-review snooze: ${msToHuman(evidence.thresholds.resolvedSnoozeMs)}`,
@@ -722,7 +735,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Source issue: ${issueUiLink(evidence.sourceIssue, prefix)}`,
       `- Trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
-      `- No-comment streak: ${evidence.noCommentStreak}`,
+      `- No-comment streak: ${formatBudgetWeightedStreak(evidence.noCommentStreak)}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
