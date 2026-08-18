@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -94,6 +94,7 @@ describe("local-encrypted-provider", () => {
         mode: 0o600,
       });
       process.env.PAPERCLIP_SECRETS_MASTER_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+      process.env.PAPERCLIP_HOME = path.join(tmpDir, "isolated-home");
 
       const logger = await import("../middleware/logger.js");
       const spy = vi.spyOn(logger.logger, "info").mockImplementation(() => logger.logger);
@@ -167,6 +168,89 @@ describe("local-encrypted-provider", () => {
       assertKeyPathAtBoot();
 
       expect(warnSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("assertKeyPathAtBoot orphan sweep (SUP-13136)", () => {
+    const envKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    function writeOrphanUnderHome(homeDir: string, content: string): string {
+      const orphanPath = path.join(homeDir, ".paperclip", "instances", "default", "secrets", "master.key");
+      mkdirSync(path.dirname(orphanPath), { recursive: true });
+      writeFileSync(orphanPath, content, { encoding: "utf8", mode: 0o600 });
+      return orphanPath;
+    }
+
+    it("throws on a readable master.key under PAPERCLIP_HOME at a path different from the configured key path", async () => {
+      const homeDir = path.join(tmpDir, "orphan-home");
+      const configuredKeyPath = path.join(tmpDir, "configured", "master.key");
+      mkdirSync(path.dirname(configuredKeyPath), { recursive: true });
+      writeFileSync(configuredKeyPath, envKey, { encoding: "utf8", mode: 0o600 });
+      process.env.PAPERCLIP_HOME = homeDir;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = configuredKeyPath;
+      writeOrphanUnderHome(homeDir, envKey);
+
+      const { assertKeyPathAtBoot } = await import("./local-encrypted-provider.js");
+      expect(() => assertKeyPathAtBoot()).toThrow(/Security violation: readable master.key file/);
+    });
+
+    it("throws under the production configuration: env key set, configured path outside PAPERCLIP_HOME, orphan inside home", async () => {
+      const homeDir = path.join(tmpDir, "orphan-home-prod");
+      const configuredKeyPath = path.join(tmpDir, "configured-prod", "master.key");
+      mkdirSync(path.dirname(configuredKeyPath), { recursive: true });
+      writeFileSync(configuredKeyPath, envKey, { encoding: "utf8", mode: 0o600 });
+      process.env.PAPERCLIP_HOME = homeDir;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = configuredKeyPath;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY = envKey;
+      writeOrphanUnderHome(homeDir, envKey);
+
+      const { assertKeyPathAtBoot } = await import("./local-encrypted-provider.js");
+      let message = "";
+      try {
+        assertKeyPathAtBoot();
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      expect(message).toMatch(/Security violation: readable master.key file/);
+      const fingerprints = message.match(/sha256:[0-9a-f]{12}/g) ?? [];
+      expect(fingerprints.length).toBeGreaterThan(0);
+      expect(message).not.toContain(envKey);
+    });
+
+    it.skipIf(typeof process.getuid === "function" && process.getuid() === 0)(
+      "does not throw on a genuinely unreadable (EACCES) master.key under PAPERCLIP_HOME, and distinguishes it from the absent case",
+      async () => {
+        const homeDir = path.join(tmpDir, "orphan-home-eacces");
+        process.env.PAPERCLIP_HOME = homeDir;
+        const orphanPath = writeOrphanUnderHome(homeDir, envKey);
+        chmodSync(orphanPath, 0o000);
+
+        const logger = await import("../middleware/logger.js");
+        const warnSpy = vi.spyOn(logger.logger, "warn").mockImplementation(() => logger.logger);
+
+        try {
+          const { assertKeyPathAtBoot } = await import("./local-encrypted-provider.js");
+          expect(() => assertKeyPathAtBoot()).not.toThrow();
+
+          const unreadableWarns = warnSpy.mock.calls.filter(
+            (call) => typeof call[1] === "string" && call[1].includes("not readable by this uid"),
+          );
+          expect(unreadableWarns).toHaveLength(1);
+          expect(unreadableWarns[0][0]).toMatchObject({ keyPath: orphanPath });
+        } finally {
+          chmodSync(orphanPath, 0o600);
+        }
+      },
+    );
+
+    it("treats the configured key path under PAPERCLIP_HOME as the configured key, not an orphan", async () => {
+      const keyPath = path.join(tmpDir, "master.key");
+      writeFileSync(keyPath, envKey, { encoding: "utf8", mode: 0o600 });
+      process.env.PAPERCLIP_HOME = tmpDir;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY = envKey;
+
+      const { assertKeyPathAtBoot } = await import("./local-encrypted-provider.js");
+      expect(() => assertKeyPathAtBoot()).not.toThrow();
     });
   });
 

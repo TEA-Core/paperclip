@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import type { Dirent } from "node:fs";
 import path, { resolve } from "node:path";
 import { resolveSecretsMasterKeyFilePath } from "../home-paths.js";
 import { resolvePaperclipHomeDir } from "@paperclipai/shared/home-paths";
@@ -35,6 +36,38 @@ function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+// Bounded-depth traversal of PAPERCLIP_HOME for stray master.key files. The
+// sweep must descend into dot-directories (the SUP-12233 orphan lived under
+// /paperclip/.paperclip/...) — a dot-blind glob reproduces the original miss.
+const ORPHAN_KEY_SWEEP_MAX_DEPTH = 8;
+const ORPHAN_KEY_SWEEP_EXCLUDED_DIRS = new Set(["node_modules", ".git", "worktrees", "workspaces"]);
+
+function findMasterKeyFilesUnderHome(rootDir: string, configuredKeyPath: string): string[] {
+  const hits: string[] = [];
+  const stack: Array<[dir: string, depth: number]> = [[rootDir, 0]];
+  while (stack.length > 0) {
+    const [dir, depth] = stack.pop()!;
+    if (depth >= ORPHAN_KEY_SWEEP_MAX_DEPTH) continue;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (ORPHAN_KEY_SWEEP_EXCLUDED_DIRS.has(entry.name)) continue;
+        stack.push([fullPath, depth + 1]);
+      } else if (entry.name === "master.key") {
+        if (resolve(fullPath) === resolve(configuredKeyPath)) continue;
+        hits.push(fullPath);
+      }
+    }
+  }
+  return hits;
+}
+
 export function assertKeyPathAtBoot(): void {
   const keyPath = resolveMasterKeyFilePath();
   const paperclipHome = resolvePaperclipHomeDir();
@@ -67,6 +100,40 @@ export function assertKeyPathAtBoot(): void {
     },
     "secrets master key path resolved at boot",
   );
+
+  const orphanedKeyPaths = findMasterKeyFilesUnderHome(paperclipHome, keyPath);
+  const readableOrphans: Array<{ path: string; fingerprint: string }> = [];
+  for (const orphanPath of orphanedKeyPaths) {
+    let raw: string;
+    try {
+      raw = readFileSync(orphanPath, "utf8");
+    } catch {
+      logger.warn(
+        { keyPath: orphanPath },
+        "master.key found under PAPERCLIP_HOME at boot but is not readable by this uid; " +
+          "not failing closed on it, but the operator should remove it or root-own its directory",
+      );
+      continue;
+    }
+    const decoded = decodeMasterKey(raw);
+    const fingerprint = decoded ? sha256Hex(decoded.toString("hex")).slice(0, 12) : sha256Hex(raw).slice(0, 12);
+    readableOrphans.push({ path: orphanPath, fingerprint });
+    logger.warn(
+      { keyPath: orphanPath, fileKeyFingerprint: fingerprint },
+      "readable orphaned master.key found under PAPERCLIP_HOME at boot; failing closed",
+    );
+  }
+
+  if (readableOrphans.length > 0) {
+    const hits = readableOrphans
+      .map(({ path: orphanPath, fingerprint }) => `${orphanPath} (sha256:${fingerprint})`)
+      .join(", ");
+    throw new Error(
+      `Security violation: readable master.key file(s) found under PAPERCLIP_HOME outside the configured key path; ` +
+        `the agent uid can read: ${hits}. ` +
+        `Remove the orphaned key file(s) or make them unreadable to the agent uid (e.g. root-own the containing directory) before starting.`,
+    );
+  }
 
   if (insideHome && hasEnvKey) {
     logger.warn(
