@@ -2791,7 +2791,7 @@ export function issueRoutes(
   }): Promise<DoneTransitionGuardOutcome> {
     const { issue, override, commentBody, runId, decisionCarried } = input;
 
-    const guardResult = await evaluateDoneTransitionGuard(db, issue, override);
+    const guardResult = await evaluateDoneTransitionGuard(db, issue, override, decisionCarried);
     if (guardResult.skipped || guardResult.skipReason) {
       void writeAuditLog(
         db,

@@ -307,7 +307,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     });
   }
 
-  it("PATCH: a final-stage approval on an UNMERGED branch is now blocked (was: closed done silently)", async () => {
+  it("PATCH: a final-stage approval on an UNMERGED branch now goes through (decision-carrying carve-out, SUP-13290)", async () => {
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185A");
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
     mockUnmergedBranch();
@@ -316,13 +316,51 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .patch(`/api/issues/${identifier}`)
       .send({ status: "done", comment: "Looks good.\n\nkind: review\ndecision: approved" });
 
+    // The approval arms the merge (armMergeOnApproval); blocking it on the
+    // unmerged branch it is approving deadlocked the circuit (SUP-13207).
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+
+    const stateRows = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    expect((stateRows[0]?.executionState as { lastDecisionOutcome?: string } | null)?.lastDecisionOutcome).toBe("approved");
+
+    // The carve-out must be auditable: a skip row naming the exemption.
+    const rows = await vi.waitFor(
+      async () => {
+        const found = await auditRows(companyId, issueId, "issue.done_transition_guard_skipped");
+        if (found.length === 0) throw new Error("waiting for audit row");
+        return found;
+      },
+      { timeout: 5000 },
+    );
+    expect(
+      rows.some((r) => (r.details as Record<string, unknown>).skipReason === "ahead_by_no_merged_pr_decision_carried:3"),
+    ).toBe(true);
+  });
+
+  it("PATCH: a final-stage PLAIN close (no decision) on an UNMERGED branch is still blocked (SUP-13290)", async () => {
+    const { companyId, issueId, identifier } = await seedIssueAwaitingReview("D13185G");
+    // A board close carries no execution-policy decision, so the carve-out must
+    // not apply: the plain close still must land the branch first.
+    currentActor = {
+      type: "board",
+      userId: "cloud-user-1",
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+      source: "cloud_tenant",
+      isInstanceAdmin: false,
+      runId: randomUUID(),
+    };
+    mockUnmergedBranch();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Closed by the board, no decision attached." });
+
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body.code).toBe("done_transition_missing_delivery");
-    // The remedy must address the *approver*, not tell them to run deliver.sh.
-    expect(res.body.details.decisionCarried).toBe(true);
-    expect(res.body.details.remedy).toContain("Merge the issue's pull request");
+    expect(res.body.details.decisionCarried).toBe(false);
     expect(res.body.details.aheadBy).toBe(3);
-
     expect(await statusOf(issueId)).toBe("in_review");
   });
 
@@ -404,9 +442,10 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
 
-  it("POST comment: the auto-approval door onto done is delivery-guarded too, and writes no comment on 409", async () => {
-    // The comment auto-approval path is a second route onto `done` that never ran either
-    // guard. A 409 must leave both the comment and the status change unwritten.
+  it("POST comment: auto-approval onto done on an UNMERGED branch now goes through (decision-carrying carve-out, SUP-13290)", async () => {
+    // The comment auto-approval path is a second door onto `done` that runs the same
+    // guards with the same decision: it is the same decision-carrying approval as the
+    // PATCH door, so it gets the same carve-out (SUP-13207 direction B).
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185E");
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
     mockUnmergedBranch();
@@ -415,9 +454,8 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .post(`/api/issues/${identifier}/comments`)
       .send({ body: "## Review: APPROVED\n\nShip it." });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(409);
-    expect(res.body.code).toBe("done_transition_missing_delivery");
-    expect(await statusOf(issueId)).toBe("in_review");
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
   });
 
   it("POST comment: auto-approval still closes the card when the branch has landed", async () => {
