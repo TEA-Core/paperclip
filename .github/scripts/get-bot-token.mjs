@@ -2,7 +2,7 @@
 /**
  * get-bot-token.mjs
  * Generates a short-lived GitHub installation token for the tea-core app (APP_ID 4595159).
- * Reads COMMITPERCLIP_KEY env var (PEM content of private key).
+ * Reads TEA_CORE_APP_PRIVATE_KEY env var (PEM content of private key).
  * Prints the token to stdout.
  *
  * Also exports: generateJWT(privateKey), ghFetch(path, token, options)
@@ -11,8 +11,8 @@
 import { createSign } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-// tea-core app id (board-ratified on SUP-13003); COMMITPERCLIP_KEY holds the
-// tea-core private key despite the legacy env-var name.
+// tea-core app id (board-ratified on SUP-13003); TEA_CORE_APP_PRIVATE_KEY holds
+// the tea-core private key.
 const APP_ID = '4595159';
 const OWNER_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 const REPO_PATTERN = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
@@ -102,11 +102,11 @@ export async function resolveInstallationId(fetchInstallation, token, repo, owne
 }
 
 async function main() {
-  // COMMITPERCLIP_KEY is the board-ratified secret name; it holds the tea-core app key.
-  const privateKey = process.env.COMMITPERCLIP_KEY;
+  // TEA_CORE_APP_PRIVATE_KEY is the board-ratified secret name; it holds the tea-core app key.
+  const privateKey = process.env.TEA_CORE_APP_PRIVATE_KEY;
   if (!privateKey) {
-    console.error('ERROR: COMMITPERCLIP_KEY env var not set.');
-    console.error('Add to ~/.bash_profile: export COMMITPERCLIP_KEY="$(cat ~/.config/tea-core/private-key.pem)"');
+    console.error('ERROR: TEA_CORE_APP_PRIVATE_KEY env var not set.');
+    console.error('Add to ~/.bash_profile: export TEA_CORE_APP_PRIVATE_KEY="$(cat ~/.config/tea-core/private-key.pem)"');
     process.exit(1);
   }
 
