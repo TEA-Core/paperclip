@@ -578,6 +578,9 @@ describe("evaluateDoneTransitionGuard", () => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
         return new Response(JSON.stringify({}), { status: 200 });
       });
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
@@ -604,9 +607,91 @@ describe("evaluateDoneTransitionGuard", () => {
             repo: "paperclip",
             aheadCount: 5,
             attributableCommitCount: 1,
+            mergedPrCount: 0,
           }),
         }),
       );
+    });
+
+    it("allows transition when compare API returns 404 with issue-attributable commits but a merged PR references the identifier (carrier delivery)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 2, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_landed_via_merged_pr:SUP-12345:2");
+      expect(result.skipReason).not.toContain("compare_api_failed");
+    });
+
+    it("allows transition when compare API returns 404 with issue-attributable commits and the merged-PR probe is unmeasurable", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response("upstream error", { status: 502 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_merged_pr_probe_failed:SUP-12686-test-branch");
+    });
+
+    it("allows transition when compare API returns 404 with issue-attributable commits and the merged-PR probe throws", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          throw new Error("rate limited");
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_merged_pr_probe_failed:SUP-12686-test-branch");
+    });
+
+    it("does not call the merged-PR search when there are no issue-attributable commits", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "0");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_on_remote:SUP-12686-test-branch");
+      expect(ghFetchMock.mock.calls.some(([url]) => String(url).includes("/search/issues"))).toBe(false);
     });
 
     it("allows transition when compare API returns 404 and the worktree carries zero issue-attributable commits despite being several commits ahead (base drift only)", async () => {
