@@ -166,6 +166,11 @@ export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
 const DEFAULT_PAPERCLIP_INSTANCE_ID = "default";
 const PATH_SEGMENT_RE = /^[a-zA-Z0-9_-]+$/;
+/**
+ * How long before the hard kill the run log is marked. Capped at 20% of the
+ * budget so short runs do not get a warning that fires almost immediately.
+ */
+const RUN_DEADLINE_WARNING_SEC = 10 * 60;
 const SENSITIVE_ENV_KEY = /(key|token|secret|password|passwd|authorization|cookie)/i;
 const REDACTED_LOG_VALUE = "***REDACTED***";
 
@@ -494,6 +499,54 @@ export function joinPromptSections(
     .map((value) => (typeof value === "string" ? value.trim() : ""))
     .filter(Boolean)
     .join(separator);
+}
+
+/**
+ * A run that hits its timeout is SIGTERMed mid-turn with no warning, so work in
+ * flight (an uncommitted edit, an unpublished PR body, an unposted status) is
+ * simply lost. The wall is knowable in advance, so tell the agent where it is
+ * and let it land the plane on its own.
+ *
+ * Returns "" when no timeout is configured (`timeoutSec <= 0` means unbounded) —
+ * never invent a deadline that the runner will not actually enforce.
+ */
+export function renderRunDeadlineNotice(timeoutSec: number, deadlineEpochSec: number) {
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) return "";
+  const minutes = Math.floor(timeoutSec / 60);
+  const budget = minutes >= 1 ? `${minutes} minute${minutes === 1 ? "" : "s"}` : `${timeoutSec} seconds`;
+  return [
+    "## Run time budget",
+    "",
+    `This run is hard-killed after ${budget}. The kill is a SIGTERM mid-turn: anything`,
+    "uncommitted or unreported at that moment is lost, and the next run pays to rediscover it.",
+    "",
+    "Check remaining time whenever you are deciding what to start next:",
+    "",
+    "```bash",
+    'echo $(( PAPERCLIP_RUN_DEADLINE_EPOCH - $(date +%s) ))  # seconds left',
+    "```",
+    "",
+    `\`PAPERCLIP_RUN_DEADLINE_EPOCH\` is ${deadlineEpochSec} and \`PAPERCLIP_RUN_TIMEOUT_SEC\` is ${timeoutSec}.`,
+    "",
+    "With roughly 10 minutes left, stop opening new work and wrap up instead: commit or",
+    "stash what you have, push it, post a comment saying what is done and what is left,",
+    "and exit cleanly. A clean handoff that resumes next run beats a few more minutes of",
+    "progress that dies at the wall.",
+  ].join("\n");
+}
+
+/**
+ * Deadline env for a spawned run. Shared by every process adapter so the value
+ * the agent reads is the same one the runner enforces.
+ */
+export function buildRunDeadlineEnv(timeoutSec: number, nowMs = Date.now()): Record<string, string> {
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) return {};
+  const deadlineMs = nowMs + timeoutSec * 1000;
+  return {
+    PAPERCLIP_RUN_TIMEOUT_SEC: String(Math.floor(timeoutSec)),
+    PAPERCLIP_RUN_DEADLINE_EPOCH: String(Math.floor(deadlineMs / 1000)),
+    PAPERCLIP_RUN_DEADLINE_ISO: new Date(deadlineMs).toISOString(),
+  };
 }
 
 type PaperclipWakeIssue = {
@@ -3325,6 +3378,13 @@ export async function runChildProcess(
   return new Promise<RunProcessResult>((resolve, reject) => {
     const rawMerged: NodeJS.ProcessEnv = {
       ...sanitizeInheritedPaperclipEnv(process.env),
+      // Default deadline for every process adapter, so none of them silently
+      // spawn a run that cannot see its own wall. Deliberately spread BEFORE
+      // opts.env: an adapter that also puts the deadline in its prompt computes
+      // the value itself, and prompt and env must agree exactly, so the
+      // caller's copy wins. Computed before the kill timer arms, which makes it
+      // marginally EARLIER than the real wall — the safe direction to err.
+      ...buildRunDeadlineEnv(opts.timeoutSec),
       ...opts.env,
     };
 
@@ -3446,6 +3506,32 @@ export async function runChildProcess(
           }, graceMs);
         };
 
+        // Warn on the same wall clock the kill uses. A bare setTimeout would
+        // reintroduce exactly the drift scheduleWallClockDeadline exists to fix,
+        // so the warning would land at a different offset than it claims.
+        // Purely observational: it marks the transcript at the point a wrap-up
+        // should have started, so a run that still died at the wall can be told
+        // apart from one that never saw the warning. It does not signal the
+        // child, which learns its deadline from PAPERCLIP_RUN_DEADLINE_EPOCH.
+        const warnLeadSec =
+          opts.timeoutSec > 0 ? Math.min(RUN_DEADLINE_WARNING_SEC, opts.timeoutSec * 0.2) : 0;
+        const deadlineWarning =
+          warnLeadSec > 0
+            ? scheduleWallClockDeadline({
+                deadlineMs: Date.now() + (opts.timeoutSec - warnLeadSec) * 1000,
+                onDeadline: () => {
+                  logChain = logChain
+                    .then(() =>
+                      opts.onLog(
+                        "stdout",
+                        `[paperclip] Run time budget: ~${Math.round(warnLeadSec)}s left of ${opts.timeoutSec}s before SIGTERM. Wrap up and commit.\n`,
+                      ),
+                    )
+                    .catch((err) => onLogError(err, runId, "failed to append deadline warning"));
+                },
+              })
+            : null;
+
         // The adapter wall-clock budget is measured against Date.now(), not
         // against the event loop's monotonic clock. See
         // scheduleWallClockDeadline: a bare setTimeout(timeoutSec * 1000) is
@@ -3459,6 +3545,7 @@ export async function runChildProcess(
                 onDeadline: () => {
                   timedOut = true;
                   clearTerminalCleanupTimers();
+                  deadlineWarning?.cancel();
                   signalRunningProcess({ child, processGroupId }, "SIGTERM");
                   setTimeout(() => {
                     signalRunningProcess({ child, processGroupId }, "SIGKILL");
@@ -3510,6 +3597,7 @@ export async function runChildProcess(
 
         child.on("error", (err: Error) => {
           timeout?.cancel();
+          deadlineWarning?.cancel();
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
           void target.cleanup?.();
@@ -3528,6 +3616,7 @@ export async function runChildProcess(
 
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           timeout?.cancel();
+          deadlineWarning?.cancel();
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
           void logChain.finally(() => {

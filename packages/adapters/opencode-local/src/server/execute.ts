@@ -30,6 +30,8 @@ import {
   parseObject,
   buildPaperclipEnv,
   joinPromptSections,
+  renderRunDeadlineNotice,
+  buildRunDeadlineEnv,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
@@ -521,6 +523,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       asNumber(config.timeoutSec, 0),
     );
     const graceSec = asNumber(config.graceSec, 20);
+    // One deadline, shared by the child's env and the prompt's wrap-up guidance —
+    // two independently computed values would drift by the spawn latency between
+    // them and quietly contradict each other. Derived from the EFFECTIVE timeout,
+    // which a remote execution target may have capped below the configured one.
+    const deadlineEnv = buildRunDeadlineEnv(timeoutSec);
+    Object.assign(preparedRuntimeConfig.env, deadlineEnv);
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,
       target: executionTarget,
@@ -765,9 +773,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? ""
       : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+    const deadlineNotice = renderRunDeadlineNotice(
+      timeoutSec,
+      Number(deadlineEnv.PAPERCLIP_RUN_DEADLINE_EPOCH ?? 0),
+    );
     const prompt = joinPromptSections([
       instructionsPrefix,
       renderedBootstrapPrompt,
+      deadlineNotice,
       wakePrompt,
       sessionHandoffNote,
       renderedPrompt,
@@ -775,6 +788,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const promptMetrics = {
       promptChars: prompt.length,
       instructionsChars: instructionsPrefix.length,
+      deadlineNoticeChars: deadlineNotice.length,
       bootstrapPromptChars: renderedBootstrapPrompt.length,
       wakePromptChars: wakePrompt.length,
       sessionHandoffChars: sessionHandoffNote.length,
@@ -926,21 +940,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // exit status cannot express (currently: the database growth guard).
       errorMessageOverride: string | null = null,
     ): AdapterExecutionResult => {
-      if (attempt.proc.timedOut) {
-        return {
-          exitCode: attempt.proc.exitCode,
-          signal: attempt.proc.signal,
-          timedOut: true,
-          errorMessage: `Timed out after ${timeoutSec}s`,
-          errorCode: "timeout",
-          errorMeta: {
-            stderrTail: stderrTail(attempt.proc.stderr),
-            adapterSessionId: runtimeSessionId ?? runtime.sessionId ?? null,
-          },
-          clearSession: clearSessionOnMissingSession,
-        };
-      }
-
       const terminalBillingError = isOpenCodeTerminalBillingError(
         "",
         attempt.proc.stderr,
@@ -993,6 +992,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               : {}),
           } as Record<string, unknown>)
         : null;
+
+      // A timeout is a SIGTERM mid-turn, not a lost session: OpenCode already
+      // emitted its session id on stdout, and the session itself survives on
+      // disk. Hand the resolved session back so the next run resumes it instead
+      // of restarting cold and re-deriving the same context. Usage is carried
+      // too — the tokens were spent whether or not the run reached the wall.
+      if (attempt.proc.timedOut) {
+        return {
+          exitCode: attempt.proc.exitCode,
+          signal: attempt.proc.signal,
+          timedOut: true,
+          errorMessage: `Timed out after ${timeoutSec}s`,
+          errorCode: "timeout",
+          errorMeta: {
+            stderrTail: stderrTail(attempt.proc.stderr),
+            adapterSessionId: runtimeSessionId ?? runtime.sessionId ?? null,
+          },
+          finishReason: attempt.parsed.finalStepReason,
+          usage: {
+            inputTokens: attempt.parsed.usage.inputTokens,
+            outputTokens: attempt.parsed.usage.outputTokens,
+            cachedInputTokens: attempt.parsed.usage.cachedInputTokens,
+          },
+          sessionId: resolvedSessionId,
+          sessionParams: resolvedSessionParams,
+          sessionDisplayId: resolvedSessionId,
+          costUsd: attempt.parsed.costUsd,
+          clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
+        };
+      }
 
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
       // A stream that stopped early exits 0 and reports no error, so without this it reaches

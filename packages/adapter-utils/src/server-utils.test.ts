@@ -12,6 +12,8 @@ import {
   buildPersistentSkillSnapshot,
   buildRuntimeMountedSkillSnapshot,
   buildInvocationEnvForLogs,
+  buildRunDeadlineEnv,
+  renderRunDeadlineNotice,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   materializePaperclipSkillCopy,
   refreshPaperclipWorkspaceEnvForExecution,
@@ -595,6 +597,52 @@ describe("runChildProcess", () => {
     expect(result.exitCode).toBe(0);
     expect(result.timedOut).toBe(false);
     expect(result.stdout).toBe("done");
+  });
+
+  it("hands the child its own deadline so it can wrap up before the wall", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        "process.stdout.write(JSON.stringify({" +
+          "timeout: process.env.PAPERCLIP_RUN_TIMEOUT_SEC," +
+          "deadline: process.env.PAPERCLIP_RUN_DEADLINE_EPOCH," +
+          "iso: process.env.PAPERCLIP_RUN_DEADLINE_ISO}));",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 120,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    const seen = JSON.parse(result.stdout) as Record<string, string>;
+    expect(seen.timeout).toBe("120");
+    const remaining = Number(seen.deadline) - Math.floor(Date.now() / 1000);
+    // Computed before spawn, so the child's view is at most a beat early — never late.
+    expect(remaining).toBeGreaterThan(110);
+    expect(remaining).toBeLessThanOrEqual(120);
+    expect(new Date(seen.iso).getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it("leaves the deadline env unset when the run is unbounded", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.stdout.write(String(process.env.PAPERCLIP_RUN_DEADLINE_EPOCH ?? 'unset'));"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.stdout).toBe("unset");
   });
 
   it("waits for onSpawn before sending stdin to the child", async () => {
@@ -3225,5 +3273,35 @@ describe('resolveSpawnTarget setuid shim routing (SUP-12674)', () => {
     });
 
     expect(capturedCommand).toBe(bwrapPath);
+  });
+});
+
+describe("buildRunDeadlineEnv", () => {
+  it("derives the deadline from the timeout it is given", () => {
+    const now = 1_700_000_000_000;
+    expect(buildRunDeadlineEnv(5400, now)).toEqual({
+      PAPERCLIP_RUN_TIMEOUT_SEC: "5400",
+      PAPERCLIP_RUN_DEADLINE_EPOCH: String(now / 1000 + 5400),
+      PAPERCLIP_RUN_DEADLINE_ISO: new Date(now + 5400_000).toISOString(),
+    });
+  });
+
+  it("returns nothing for an unbounded run rather than inventing a deadline", () => {
+    expect(buildRunDeadlineEnv(0)).toEqual({});
+    expect(buildRunDeadlineEnv(-1)).toEqual({});
+    expect(buildRunDeadlineEnv(Number.NaN)).toEqual({});
+  });
+});
+
+describe("renderRunDeadlineNotice", () => {
+  it("states the budget and how to read the remaining time", () => {
+    const notice = renderRunDeadlineNotice(5400, 1_700_005_400);
+    expect(notice).toContain("90 minutes");
+    expect(notice).toContain("PAPERCLIP_RUN_DEADLINE_EPOCH");
+    expect(notice).toContain("1700005400");
+  });
+
+  it("says nothing when the run is unbounded", () => {
+    expect(renderRunDeadlineNotice(0, 0)).toBe("");
   });
 });
