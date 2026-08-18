@@ -2792,17 +2792,22 @@ export function issueRoutes(
     const { issue, override, commentBody, runId, decisionCarried } = input;
 
     const guardResult = await evaluateDoneTransitionGuard(db, issue, override);
-    if (guardResult.skipped) {
-      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
-        reason: guardResult.reason,
-        skipReason: guardResult.skipReason,
-        branch: guardResult.branch,
-        defaultRef: guardResult.defaultRef,
-        owner: guardResult.owner,
-        repo: guardResult.repo,
-        decisionCarried,
-      });
-      if (guardResult.skipReason?.startsWith("auth_failed:")) {
+    if (guardResult.skipped || guardResult.skipReason) {
+      void writeAuditLog(
+        db,
+        issue,
+        guardResult.skipped ? "issue.done_transition_guard_skipped" : "issue.done_transition_guard_note",
+        {
+          reason: guardResult.reason,
+          skipReason: guardResult.skipReason,
+          branch: guardResult.branch,
+          defaultRef: guardResult.defaultRef,
+          owner: guardResult.owner,
+          repo: guardResult.repo,
+          decisionCarried,
+        },
+      );
+      if (guardResult.skipped && guardResult.skipReason?.startsWith("auth_failed:")) {
         void postAuthFailureComment(svc, issue.id, guardResult.skipReason).catch((err) => {
           logger.warn({ err, issueId: issue.id }, "failed to post auth-failure done-guard comment");
         });

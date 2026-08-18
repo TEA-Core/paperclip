@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   companies,
   companyMemberships,
@@ -297,6 +298,20 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       contextSnapshot: { issueId },
     });
     return runId;
+  }
+
+  async function guardAuditRows(issueId: string) {
+    return db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
+      .then((rows) =>
+        rows.filter(
+          (r) =>
+            r.action === "issue.done_transition_guard_note" ||
+            r.action === "issue.done_transition_guard_skipped",
+        ),
+      );
   }
 
   it("Tier-0 409 (done_transition_missing_delivery) fires before tier declaration check on a branch-ahead/no-merged-PR issue with no declaration", async () => {
@@ -644,5 +659,154 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .from(issues)
       .where(eq(issues.id, issueId));
     expect(statusRows[0]?.status).toBe("done");
+  });
+
+  it("allowed not-skipped done with unhydrated linked PR records issue.done_transition_guard_note carrying unhydrated_linked_prs:<n>", async () => {
+    // SUP-13197: the common `done` allow (branch not ahead / merged) previously
+    // computed `unhydrated_linked_prs:<n>` and then discarded it, because the audit
+    // write was gated on `skipped` only. The not-skipped path now records a distinct
+    // `issue.done_transition_guard_note` action instead of the skipped one.
+    const { companyId, agentId, issueId, identifier } = await seedIssue("SUP13197N");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    mockAddComment.mockClear();
+
+    await seedLinkedPrs(companyId, issueId, [
+      { owner: "TEA-Core", repo: "paperclip", number: 283, unhydrated: true },
+    ]);
+
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) {
+        return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+      }
+      // PR fetch 404s, so the unhydrated row stays unhydrated.
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
+
+    const allRows = await vi.waitFor(async () => {
+      const rows = await guardAuditRows(issueId);
+      if (!rows.some((r) => r.action === "issue.done_transition_guard_note")) {
+        throw new Error("waiting for issue.done_transition_guard_note row");
+      }
+      return rows;
+    }, { timeout: 5000 });
+
+    const notes = allRows.filter((r) => r.action === "issue.done_transition_guard_note");
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.details.skipReason).toBe("unhydrated_linked_prs:1");
+    expect(notes[0]!.details.decisionCarried).toBe(false);
+    expect(allRows.every((r) => r.action !== "issue.done_transition_guard_skipped")).toBe(true);
+
+    // SUP-13197 acceptance #4: a not-skipped path with a non-auth skipReason must NOT
+    // post the auth-failure comment.
+    const comments = await db
+      .select({ body: issueComments.body, authorType: issueComments.authorType })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments.filter((r) => r.authorType === "system")).toHaveLength(0);
+    for (const call of mockAddComment.mock.calls) {
+      const body = typeof call[1] === "string" ? call[1] : null;
+      expect(body?.includes("Delivery verification was SKIPPED") ?? false).toBe(false);
+    }
+  });
+
+  it("allowed done with hydrated linked PR rows and skipReason null writes no guard audit row", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("SUP13197C");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    await seedLinkedPrs(companyId, issueId, [
+      { owner: "TEA-Core", repo: "paperclip", number: 283, state: "closed", draft: false },
+    ]);
+
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) {
+        return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
+
+    // The audit write is fire-and-forget; poll so a late (incorrect) write is caught.
+    for (let i = 0; i < 5; i++) {
+      const rows = await guardAuditRows(issueId);
+      expect(rows, `poll ${i}: expected no guard audit row on the ordinary path`).toHaveLength(0);
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  });
+
+  it("skipped: true (token_missing) still writes exactly one issue.done_transition_guard_skipped row, unchanged", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("SUP13197T");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    mockGetByName.mockResolvedValue(null);
+    mockResolveSecretValue.mockResolvedValue(null);
+    mockGhFetch.mockImplementation(async () => new Response(JSON.stringify({}), { status: 404 }));
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): guard skipped, no token. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
+
+    const skippedRows = await vi.waitFor(async () => {
+      const rows = await guardAuditRows(issueId).then((rs) =>
+        rs.filter((r) => r.action === "issue.done_transition_guard_skipped"),
+      );
+      if (rows.length === 0) throw new Error("waiting for issue.done_transition_guard_skipped row");
+      return rows;
+    }, { timeout: 5000 });
+
+    expect(skippedRows).toHaveLength(1);
+    expect(skippedRows[0]!.details.skipReason).toBe("token_missing");
+    expect(skippedRows[0]!.details.reason).toContain("GitHub token not configured");
+    expect(skippedRows[0]!.details.decisionCarried).toBe(false);
+
+    const allRows = await guardAuditRows(issueId);
+    expect(allRows.every((r) => r.action !== "issue.done_transition_guard_note")).toBe(true);
   });
 });
