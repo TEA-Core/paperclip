@@ -10,7 +10,7 @@ const workflow = readFileSync(path.join(repoRoot, ".github/workflows/refresh-loc
 // `Refresh Lockfile` opens its PR with the default `GITHUB_TOKEN`, which this org
 // blocks from creating pull requests ("GitHub Actions is not permitted to create
 // or approve pull requests"). The fix swaps to a commitperclip app installation
-// token (generated from COMMITPERCLIP_KEY) and, when PR creation is impossible,
+// token (generated from TEA_CORE_APP_PRIVATE_KEY) and, when PR creation is impossible,
 // emits an ::error:: naming the pushed branch and the exact `gh pr create` command
 // so the orphan branch is never left with no pointer. These tests pin that.
 
@@ -30,10 +30,10 @@ function stepBody(stepName) {
   return lines.slice(start, end);
 }
 
-test("the workflow generates a commitperclip bot token from COMMITPERCLIP_KEY", () => {
+test("the workflow generates a commitperclip bot token from TEA_CORE_APP_PRIVATE_KEY", () => {
   const body = stepBody("Generate commitperclip token").join("\n");
   assert.match(body, /node \.github\/scripts\/get-bot-token\.mjs/, "must invoke the bot-token generator");
-  assert.match(body, /secrets\.COMMITPERCLIP_KEY/, "must read the app private key secret");
+  assert.match(body, /secrets\.TEA_CORE_APP_PRIVATE_KEY/, "must read the app private key secret");
 });
 
 test("the PR step uses the bot token, not the blocked GITHUB_TOKEN", () => {

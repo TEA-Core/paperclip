@@ -54,10 +54,10 @@ jobs:
       - name: Generate commitperclip token
         id: bot-token
         env:
-          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          TEA_CORE_APP_PRIVATE_KEY: ${{ secrets.TEA_CORE_APP_PRIVATE_KEY }}
         run: |
           TOKEN=""
-          if [ -n "$COMMITPERCLIP_KEY" ]; then
+          if [ -n "$TEA_CORE_APP_PRIVATE_KEY" ]; then
             if ! TOKEN="$(node .github/scripts/get-bot-token.mjs)"; then
               echo "::warning::Failed to generate the commitperclip bot token; PR creation will be skipped."
               TOKEN=""
@@ -101,7 +101,7 @@ jobs:
           # (commitperclip app installation) is required. Fail loudly rather than
           # leaving an orphan branch with no pointer.
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error title=Lockfile PR not created::No bot token (COMMITPERCLIP_KEY) is available to open the PR. The refreshed lockfile was pushed to branch '${BRANCH}' but no PR was created. Open it manually with: ${PR_CMD}"
+            echo "::error title=Lockfile PR not created::No bot token (TEA_CORE_APP_PRIVATE_KEY) is available to open the PR. The refreshed lockfile was pushed to branch '${BRANCH}' but no PR was created. Open it manually with: ${PR_CMD}"
             echo "pr_url=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
