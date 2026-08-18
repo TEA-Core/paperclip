@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import type { Db } from "@paperclipai/db";
 import { and, eq, inArray } from "drizzle-orm";
 import { executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
@@ -17,6 +18,13 @@ export class GitHubAuthError extends Error {
     super(message);
     this.name = "GitHubAuthError";
     this.status = status;
+  }
+}
+
+export class GitHubBranchNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitHubBranchNotFoundError";
   }
 }
 
@@ -89,6 +97,8 @@ async function resolveIssueRepoContext(
   branch: string | null;
   defaultRef: string | null;
   repoUrl: string | null;
+  providerType: string | null;
+  worktreePath: string | null;
 } | null> {
   if (issue.executionWorkspaceId) {
     const row = await db
@@ -101,6 +111,8 @@ async function resolveIssueRepoContext(
         branch: row.branchName ?? null,
         defaultRef: row.baseRef ?? null,
         repoUrl: row.repoUrl ?? null,
+        providerType: row.providerType ?? null,
+        worktreePath: row.providerRef ?? row.cwd ?? null,
       };
     }
   }
@@ -116,6 +128,8 @@ async function resolveIssueRepoContext(
         branch: null,
         defaultRef: row.defaultRef ?? row.repoRef ?? null,
         repoUrl: row.repoUrl ?? null,
+        providerType: null,
+        worktreePath: null,
       };
     }
   }
@@ -137,6 +151,8 @@ async function resolveIssueRepoContext(
         branch: null,
         defaultRef: primaryWorkspace.defaultRef ?? primaryWorkspace.repoRef ?? null,
         repoUrl: primaryWorkspace.repoUrl ?? null,
+        providerType: null,
+        worktreePath: null,
       };
     }
   }
@@ -163,7 +179,9 @@ async function githubCompareAheadBy(
   const response = await ghFetch(url, { headers });
   if (!response.ok) {
     if (response.status === 404) {
-      return null;
+      throw new GitHubBranchNotFoundError(
+        `GitHub compare API returned 404 for ${owner}/${repo}; branch ${branch} absent on remote`,
+      );
     }
     if (response.status === 401 || response.status === 403) {
       throw new GitHubAuthError(response.status, `GitHub compare API returned ${response.status}`);
@@ -174,6 +192,83 @@ async function githubCompareAheadBy(
   const ahead = (body as Record<string, unknown> | null)?.ahead_by;
   if (typeof ahead === "number") return ahead;
   return null;
+}
+
+function runGit(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("git", ["-C", cwd, ...args], { maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+}
+
+/**
+ * Count commits ahead of the remote base ref that are attributable to the given
+ * issue identifier (subject or trailer match). Returns null when the probe is
+ * unreachable (missing worktree, git failure, unresolvable base ref) so callers
+ * can fail open instead of blocking on a signal they could not measure.
+ */
+async function countIssueAttributableCommits(
+  worktreePath: string,
+  defaultRef: string,
+  identifier: string | null,
+): Promise<{ aheadCount: number; attributableCount: number } | null> {
+  if (!identifier) return null;
+  try {
+    const range = `${defaultRef}..HEAD`;
+    const aheadRaw = await runGit(["rev-list", "--count", range], worktreePath);
+    const attributableRaw = await runGit(
+      ["rev-list", "--fixed-strings", "--count", "--grep", identifier, range],
+      worktreePath,
+    );
+    const aheadCount = Number.parseInt(aheadRaw.trim(), 10);
+    const attributableCount = Number.parseInt(attributableRaw.trim(), 10);
+    if (Number.isNaN(aheadCount) || Number.isNaN(attributableCount)) return null;
+    return { aheadCount, attributableCount };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Count merged PRs in the repo whose title or body references the issue identifier.
+ *
+ * This is the carrier-delivery discriminator: work is routinely landed on a shared
+ * carrier branch (or a differently-named head) while the issue's own execution
+ * branch is never pushed, so the compare call 404s even though the deliverable is
+ * merged and live. A merged PR naming the identifier is positive evidence the work
+ * landed, and must not be blocked.
+ *
+ * Returns null when the probe could not be measured (non-OK response, malformed
+ * body, transport failure) so callers fail open rather than blocking on an
+ * unmeasured signal.
+ */
+async function githubMergedPrCountForIdentifier(
+  hostname: string,
+  owner: string,
+  repo: string,
+  identifier: string,
+  token: string,
+): Promise<number | null> {
+  const apiBase = gitHubApiBase(hostname);
+  const query = `repo:${owner}/${repo} is:pr is:merged in:title,body "${identifier}"`;
+  const url = `${apiBase}/search/issues?q=${encodeURIComponent(query)}&per_page=1`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-done-transition-guard",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+  try {
+    const response = await ghFetch(url, { headers });
+    if (!response.ok) return null;
+    const body = await response.json().catch(() => null);
+    const total = (body as Record<string, unknown> | null)?.total_count;
+    return typeof total === "number" ? total : null;
+  } catch {
+    return null;
+  }
 }
 
 async function githubBranchHasMergedPr(
@@ -654,6 +749,84 @@ export async function evaluateDoneTransitionGuard(
         `GitHub compare API rejected the credential (HTTP ${err.status}); transition allowed`,
         true,
         `auth_failed:compare:${err.status}:scope=${tokenScope ?? "unknown"}:secretName=${tokenSecretName ?? "unknown"}`,
+      );
+    }
+    if (err instanceof GitHubBranchNotFoundError) {
+      // A 404 on the compare call means the branch does not exist on the remote.
+      // Block only when the local worktree carries at least one commit that is
+      // attributable to this issue: reachable from the workspace head, not
+      // reachable from the remote base ref, and whose subject or trailer
+      // references the issue identifier (matching the `fix(SUP-NNNNN):`
+      // convention deliver.sh emits). Base drift alone — a worktree several
+      // commits ahead of a stale local base with none attributable — must fail
+      // open, because that state is a property of the checkout mechanism, not of
+      // the issue's work (SUP-13205).
+      const attribution = ctx.worktreePath
+        ? await countIssueAttributableCommits(ctx.worktreePath, ctx.defaultRef, issue.identifier)
+        : null;
+      if (attribution && attribution.attributableCount > 0) {
+        // Carrier delivery: the deliverable is routinely merged from a shared
+        // carrier branch or a differently-named head while this issue's own
+        // execution branch is never pushed. The local worktree still carries the
+        // pre-merge, issue-attributable commits, so attribution alone would block
+        // work that is already merged and live. A merged PR naming the identifier
+        // is positive evidence of landing — fail open on it. An unmeasurable probe
+        // also fails open: never block on a signal we could not measure (SUP-13199).
+        const mergedPrCount = issue.identifier
+          ? await githubMergedPrCountForIdentifier(
+              parsed.hostname,
+              parsed.owner,
+              parsed.repo,
+              issue.identifier,
+              token,
+            )
+          : null;
+        if (mergedPrCount === null) {
+          return fallback(
+            `Branch ${branch} is absent from the remote and the merged-PR probe for ${issue.identifier ?? "the issue"} could not be measured; transition allowed`,
+            true,
+            `branch_absent_merged_pr_probe_failed:${branch}`,
+          );
+        }
+        if (mergedPrCount > 0) {
+          return fallback(
+            `Branch ${branch} is absent from the remote, but ${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} reference ${issue.identifier} (carrier delivery); transition allowed`,
+            true,
+            `branch_absent_landed_via_merged_pr:${issue.identifier}:${mergedPrCount}`,
+          );
+        }
+        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          reason: "branch_absent_on_remote",
+          branch,
+          defaultRef: ctx.defaultRef,
+          owner: parsed.owner,
+          repo: parsed.repo,
+          aheadCount: attribution.aheadCount,
+          attributableCommitCount: attribution.attributableCount,
+          mergedPrCount,
+        });
+        return {
+          allowed: false,
+          reason:
+            `Branch ${branch} does not exist on the remote (${parsed.owner}/${parsed.repo}) ` +
+            `while the execution workspace carries ${attribution.attributableCount} commit${attribution.attributableCount === 1 ? "" : "s"} ` +
+            `attributable to ${issue.identifier} (subject/trailer reference) not reachable from the remote base ${ctx.defaultRef}, ` +
+            `and no merged PR in ${parsed.owner}/${parsed.repo} references ${issue.identifier}. ` +
+            "Push the branch and deliver via deliver.sh, or set doneTransitionOverride to a " +
+            "sanctioned no-deliverable-head disposition.",
+          aheadBy: null,
+          branch,
+          defaultRef: ctx.defaultRef,
+          owner: parsed.owner,
+          repo: parsed.repo,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return fallback(
+        `Branch ${branch} is absent from the remote; transition allowed`,
+        true,
+        `branch_absent_on_remote:${branch}`,
       );
     }
     return fallback(

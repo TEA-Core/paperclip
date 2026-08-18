@@ -160,10 +160,31 @@ vi.mock("./merge-arming.js", () => ({
   resolveLinkedPullRequestsWithState: mockResolveLinkedPullRequestsWithState,
 }));
 
+const mockExecFile = vi.hoisted(() => vi.fn());
+vi.mock("node:child_process", () => ({
+  execFile: mockExecFile,
+}));
+
 import { ghFetch } from "./github-fetch.js";
 import { resolveGitHubToken } from "./github-credential.js";
 
 const ghFetchMock = vi.mocked(ghFetch);
+
+function mockGitProbe(aheadCount: string, attributableCount: string) {
+  mockExecFile.mockImplementation(
+    (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+      cb(null, args.includes("--grep") ? attributableCount : aheadCount);
+    },
+  );
+}
+
+function mockGitProbeUnavailable() {
+  mockExecFile.mockImplementation(
+    (_file: string, _args: string[], _opts: unknown, cb: (err: Error) => void) => {
+      cb(new Error("git not available"));
+    },
+  );
+}
 
 describe("evaluateDoneTransitionGuard", () => {
   beforeEach(() => {
@@ -173,6 +194,8 @@ describe("evaluateDoneTransitionGuard", () => {
     mockResolveGitHubToken.mockReset();
     mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
     vi.mocked(logActivity).mockClear();
+    mockExecFile.mockReset();
+    mockGitProbe("0", "0");
     setupDbMock({});
   });
 
@@ -735,9 +758,170 @@ describe("evaluateDoneTransitionGuard", () => {
   });
 
   describe("fail-open on errors", () => {
-    it("allows transition when compare API returns 404", async () => {
+    it("blocks transition when compare API returns 404 and the worktree carries >=1 issue-attributable commit", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.skipReason).toBeNull();
+      expect(result.aheadBy).toBeNull();
+      expect(result.branch).toBe("SUP-12686-test-branch");
+      expect(result.defaultRef).toBe("fold/tea-patches-v2026.722.0");
+      expect(result.reason).toContain("SUP-12686-test-branch");
+      expect(result.reason).toContain("does not exist on the remote");
+      expect(result.reason).toContain("attributable to SUP-12345");
+      expect(result.reason).toContain("deliver.sh");
+      expect(result.reason).not.toContain("deliveryState");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "branch_absent_on_remote",
+            branch: "SUP-12686-test-branch",
+            defaultRef: "fold/tea-patches-v2026.722.0",
+            owner: "TEA-Core",
+            repo: "paperclip",
+            aheadCount: 5,
+            attributableCommitCount: 1,
+            mergedPrCount: 0,
+          }),
+        }),
+      );
+    });
+
+    it("allows transition when compare API returns 404 with issue-attributable commits but a merged PR references the identifier (carrier delivery)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 2, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_landed_via_merged_pr:SUP-12345:2");
+      expect(result.skipReason).not.toContain("compare_api_failed");
+    });
+
+    it("allows transition when compare API returns 404 with issue-attributable commits and the merged-PR probe is unmeasurable", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response("upstream error", { status: 502 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_merged_pr_probe_failed:SUP-12686-test-branch");
+    });
+
+    it("allows transition when compare API returns 404 with issue-attributable commits and the merged-PR probe throws", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          throw new Error("rate limited");
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_merged_pr_probe_failed:SUP-12686-test-branch");
+    });
+
+    it("does not call the merged-PR search when there are no issue-attributable commits", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "0");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_on_remote:SUP-12686-test-branch");
+      expect(ghFetchMock.mock.calls.some(([url]) => String(url).includes("/search/issues"))).toBe(false);
+    });
+
+    it("allows transition when compare API returns 404 and the worktree carries zero issue-attributable commits despite being several commits ahead (base drift only)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "0");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_on_remote:SUP-12686-test-branch");
+      expect(result.skipReason).not.toContain("compare_api_failed");
+    });
+
+    it("allows transition when compare API returns 404 and the local worktree probe is unreachable", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbeUnavailable();
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_on_remote:SUP-12686-test-branch");
+      expect(result.skipReason).not.toContain("compare_api_failed");
+    });
+
+    it("allows transition when compare API returns 404 and the workspace has no local worktree path", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ providerType: "project_primary", providerRef: null, cwd: null })],
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
@@ -748,6 +932,8 @@ describe("evaluateDoneTransitionGuard", () => {
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
       expect(result.allowed).toBe(true);
       expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_on_remote:SUP-12686-test-branch");
+      expect(result.skipReason).not.toContain("compare_api_failed");
     });
 
     it("allows transition when compare API throws", async () => {
@@ -875,10 +1061,11 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.skipReason).not.toContain("auth_failed");
     });
 
-    it("404 from compare API still returns null ahead_by (not auth_failed)", async () => {
+    it("404 from compare API classifies as branch-absent (not auth_failed, not compare_api_failed), failing open with branch_absent_on_remote when no issue-attributable commits exist", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow()],
       });
+      mockGitProbe("5", "0");
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
@@ -888,7 +1075,9 @@ describe("evaluateDoneTransitionGuard", () => {
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
       expect(result.allowed).toBe(true);
       expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_on_remote:SUP-12686-test-branch");
       expect(result.skipReason).not.toContain("auth_failed");
+      expect(result.skipReason).not.toContain("compare_api_failed");
     });
   });
 
