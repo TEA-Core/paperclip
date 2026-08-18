@@ -2,6 +2,7 @@ import express from "express";
 import { generateKeyPairSync } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  normalizeRepoUrl,
   resolveGitHubToken,
   resolveGitHubTokenForRepo,
   resolveGitHubTokenCandidatesForRepo,
@@ -683,6 +684,24 @@ describe("resolveGitHubTokenForRepo", () => {
     expect(result.reason).toContain("repo not found");
   });
 
+  it("reports 'repo not found' (not a project-bound-token message) when only a substring-containing workspace matches", async () => {
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([
+        { repoUrl: "https://github.com/TEA-Core/paperclip-smart-router" },
+      ]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    mockSecretService.getByName.mockResolvedValue(null);
+
+    const result = await resolveGitHubTokenForRepo(mockDb, "company-1", "TEA-Core", "paperclip");
+    expect(result.token).toBeNull();
+    expect(result.reason).toContain("repo not found");
+    expect(result.reason).not.toContain("No GitHub token bound to project");
+  });
+
   it("resolves app_installation token with repo context for resolveGitHubTokenForRepo", async () => {
     mockSecretService.getByName.mockImplementation((_companyId, name) => {
       if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
@@ -1232,5 +1251,150 @@ describe("resolveGitHubTokenCandidatesForRepo", () => {
 
     const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "owner", "repo");
     expect(result).toHaveLength(0);
+  });
+
+  it("excludes substring-containing workspaces (SUP-13220 cross-project credential bleed)", async () => {
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([
+        {
+          id: "pw-smart-router",
+          projectId: "proj-smart-router",
+          repoUrl: "https://github.com/TEA-Core/paperclip-smart-router",
+          projectEnv: {
+            GITHUB_TOKEN: { type: "secret_ref", secretId: "sr-secret", version: "latest" },
+          },
+        },
+        {
+          id: "pw-paperclip",
+          projectId: "proj-paperclip",
+          repoUrl: "https://github.com/TEA-Core/paperclip",
+          projectEnv: {
+            GITHUB_TOKEN: { type: "secret_ref", secretId: "pc-secret", version: "latest" },
+          },
+        },
+      ]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
+      if (secretId === "sr-secret") return "smart-router-token-should-never-appear";
+      return "paperclip-project-token";
+    });
+    mockSecretService.getByName.mockResolvedValue(null);
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "TEA-Core", "paperclip");
+    expect(result).toHaveLength(1);
+    expect(result[0]!.scope).toBe("project_env");
+    expect(result[0]!.secretName).toBe("GITHUB_TOKEN");
+    expect(result[0]!.token).toBe("paperclip-project-token");
+    for (const candidate of result) {
+      expect(candidate.token).not.toContain("smart-router");
+    }
+  });
+
+  it("contributes a project_env candidate for an https-form workspace repoUrl", async () => {
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([
+        {
+          id: "pw-1",
+          projectId: "proj-1",
+          repoUrl: "https://github.com/TEA-Core/paperclip",
+          projectEnv: {
+            GITHUB_TOKEN: { type: "secret_ref", secretId: "ref-secret-1", version: "latest" },
+          },
+        },
+      ]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
+    mockSecretService.getByName.mockResolvedValue(null);
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "TEA-Core", "paperclip");
+    expect(result).toHaveLength(1);
+    expect(result[0]!.scope).toBe("project_env");
+    expect(result[0]!.token).toBe(FIXTURE_TOKEN);
+  });
+
+  it("contributes a project_env candidate for a .git-suffixed workspace repoUrl", async () => {
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([
+        {
+          id: "pw-1",
+          projectId: "proj-1",
+          repoUrl: "https://github.com/TEA-Core/paperclip.git",
+          projectEnv: {
+            GITHUB_TOKEN: { type: "secret_ref", secretId: "ref-secret-1", version: "latest" },
+          },
+        },
+      ]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
+    mockSecretService.getByName.mockResolvedValue(null);
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "TEA-Core", "paperclip");
+    expect(result).toHaveLength(1);
+    expect(result[0]!.scope).toBe("project_env");
+    expect(result[0]!.token).toBe(FIXTURE_TOKEN);
+  });
+
+  it("contributes a project_env candidate when owner/repo case differs from the workspace repoUrl", async () => {
+    const selectChain = {
+      from: vi.fn().mockReturnThis(),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([
+        {
+          id: "pw-1",
+          projectId: "proj-1",
+          repoUrl: "https://github.com/tea-core/paperclip",
+          projectEnv: {
+            GITHUB_TOKEN: { type: "secret_ref", secretId: "ref-secret-1", version: "latest" },
+          },
+        },
+      ]),
+    };
+    mockDb.select.mockReturnValue(selectChain);
+
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_TOKEN);
+    mockSecretService.getByName.mockResolvedValue(null);
+
+    const result = await resolveGitHubTokenCandidatesForRepo(mockDb, "company-1", "TEA-Core", "Paperclip");
+    expect(result).toHaveLength(1);
+    expect(result[0]!.scope).toBe("project_env");
+    expect(result[0]!.token).toBe(FIXTURE_TOKEN);
+  });
+});
+
+describe("normalizeRepoUrl", () => {
+  it("strips URL scheme + host, .git suffix, trailing slash, and lowercases", () => {
+    expect(normalizeRepoUrl("https://github.com/TEA-Core/paperclip")).toBe("tea-core/paperclip");
+    expect(normalizeRepoUrl("https://github.com/TEA-Core/paperclip.git")).toBe("tea-core/paperclip");
+    expect(normalizeRepoUrl("https://github.com/TEA-Core/paperclip/")).toBe("tea-core/paperclip");
+    expect(normalizeRepoUrl("https://github.com/TEA-Core/paperclip.git/")).toBe("tea-core/paperclip");
+    expect(normalizeRepoUrl("http://github.com/TEA-Core/paperclip")).toBe("tea-core/paperclip");
+    expect(normalizeRepoUrl("git@github.com:TEA-Core/paperclip.git")).toBe("tea-core/paperclip");
+    expect(normalizeRepoUrl("TEA-Core/paperclip")).toBe("tea-core/paperclip");
+  });
+
+  it("is case-insensitive", () => {
+    expect(normalizeRepoUrl("tea-core/Paperclip")).toBe("tea-core/paperclip");
+    expect(normalizeRepoUrl("TeA-cOrE/pApErClIp")).toBe("tea-core/paperclip");
+  });
+
+  it("does not conflate distinct repos that share a prefix", () => {
+    expect(normalizeRepoUrl("https://github.com/TEA-Core/paperclip-smart-router")).toBe(
+      "tea-core/paperclip-smart-router",
+    );
+    expect(normalizeRepoUrl("https://github.com/TEA-Core/paperclip-smart-router")).not.toBe(
+      normalizeRepoUrl("https://github.com/TEA-Core/paperclip"),
+    );
   });
 });

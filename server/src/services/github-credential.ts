@@ -1,6 +1,6 @@
 import { createSign } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { and, eq, ilike } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { projectWorkspaces, projects } from "@paperclipai/db";
 import type { SecretVersionSelector } from "@paperclipai/shared";
 import { secretService } from "./secrets.js";
@@ -236,6 +236,20 @@ export async function resolveGitHubToken(
   return { token: null, reason: `No GitHub token resolvable for company ${companyId}` };
 }
 
+/**
+ * Normalize a workspace repoUrl to lowercase `owner/repo` so rows can be
+ * compared exactly, regardless of URL scheme, host, `.git` suffix, trailing
+ * slash, or casing. GitHub owner/repo references are case-insensitive.
+ */
+export function normalizeRepoUrl(repoUrl: string): string {
+  let normalized = repoUrl.trim();
+  normalized = normalized.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+\//i, "");
+  normalized = normalized.replace(/^[\w.@-]+@[\w.-]+:/, "");
+  normalized = normalized.replace(/\/+$/, "");
+  normalized = normalized.replace(/\.git$/i, "");
+  return normalized.toLowerCase();
+}
+
 export async function resolveGitHubTokenCandidatesForRepo(
   db: Db,
   companyId: string,
@@ -243,8 +257,7 @@ export async function resolveGitHubTokenCandidatesForRepo(
   repo: string,
 ): Promise<GitHubTokenResolution[]> {
   const secrets = secretService(db);
-  const repoUrl = `${owner}/${repo}`;
-  const escapedRepoUrl = repoUrl.replace(/[\\%_]/g, (c) => `\\${c}`);
+  const normalizedRepo = normalizeRepoUrl(`${owner}/${repo}`);
 
   const candidates: GitHubTokenResolution[] = [];
   const seenTokens = new Set<string>();
@@ -264,14 +277,11 @@ export async function resolveGitHubTokenCandidatesForRepo(
     })
     .from(projectWorkspaces)
     .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId))
-    .where(
-      and(
-        eq(projectWorkspaces.companyId, companyId),
-        ilike(projectWorkspaces.repoUrl, `%${escapedRepoUrl}%`),
-      ),
-    );
+    .where(eq(projectWorkspaces.companyId, companyId));
 
   for (const row of projectRows) {
+    if (typeof row.repoUrl !== "string") continue;
+    if (normalizeRepoUrl(row.repoUrl) !== normalizedRepo) continue;
     const projectEnv = row.projectEnv as Record<string, unknown> | null;
     if (!projectEnv) continue;
     for (const key of GITHUB_TOKEN_SECRET_NAMES) {
@@ -315,20 +325,18 @@ export async function resolveGitHubTokenForRepo(
     return candidates[0]!;
   }
 
-  const repoUrl = `${owner}/${repo}`;
-  const escapedRepoUrl = repoUrl.replace(/[\\%_]/g, (c) => `\\${c}`);
+  const normalizedRepo = normalizeRepoUrl(`${owner}/${repo}`);
   const projectRows = await db
-    .select({ id: projectWorkspaces.id })
+    .select({ repoUrl: projectWorkspaces.repoUrl })
     .from(projectWorkspaces)
     .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId))
-    .where(
-      and(
-        eq(projectWorkspaces.companyId, companyId),
-        ilike(projectWorkspaces.repoUrl, `%${escapedRepoUrl}%`),
-      ),
-    );
+    .where(eq(projectWorkspaces.companyId, companyId));
 
-  if (projectRows.length > 0) {
+  const hasExactMatch = projectRows.some(
+    (row) => typeof row.repoUrl === "string" && normalizeRepoUrl(row.repoUrl) === normalizedRepo,
+  );
+
+  if (hasExactMatch) {
     return { token: null, reason: `No GitHub token bound to project for ${owner}/${repo}` };
   }
   return {
