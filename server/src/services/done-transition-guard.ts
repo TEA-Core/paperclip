@@ -20,6 +20,13 @@ export class GitHubAuthError extends Error {
   }
 }
 
+export class GitHubBranchNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitHubBranchNotFoundError";
+  }
+}
+
 const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "upstream-equivalent-fix-no-deliverable-head",
   "child-delivery-parent-close",
@@ -85,6 +92,7 @@ async function resolveIssueRepoContext(
   branch: string | null;
   defaultRef: string | null;
   repoUrl: string | null;
+  providerType: string | null;
 } | null> {
   if (issue.executionWorkspaceId) {
     const row = await db
@@ -97,6 +105,7 @@ async function resolveIssueRepoContext(
         branch: row.branchName ?? null,
         defaultRef: row.baseRef ?? null,
         repoUrl: row.repoUrl ?? null,
+        providerType: row.providerType ?? null,
       };
     }
   }
@@ -112,6 +121,7 @@ async function resolveIssueRepoContext(
         branch: null,
         defaultRef: row.defaultRef ?? row.repoRef ?? null,
         repoUrl: row.repoUrl ?? null,
+        providerType: null,
       };
     }
   }
@@ -133,6 +143,7 @@ async function resolveIssueRepoContext(
         branch: null,
         defaultRef: primaryWorkspace.defaultRef ?? primaryWorkspace.repoRef ?? null,
         repoUrl: primaryWorkspace.repoUrl ?? null,
+        providerType: null,
       };
     }
   }
@@ -159,7 +170,9 @@ async function githubCompareAheadBy(
   const response = await ghFetch(url, { headers });
   if (!response.ok) {
     if (response.status === 404) {
-      return null;
+      throw new GitHubBranchNotFoundError(
+        `GitHub compare API returned 404 for ${owner}/${repo}; branch ${branch} absent on remote`,
+      );
     }
     if (response.status === 401 || response.status === 403) {
       throw new GitHubAuthError(response.status, `GitHub compare API returned ${response.status}`);
@@ -599,6 +612,42 @@ export async function evaluateDoneTransitionGuard(
         `GitHub compare API rejected the credential (HTTP ${err.status}); transition allowed`,
         true,
         `auth_failed:compare:${err.status}:scope=${tokenScope ?? "unknown"}:secretName=${tokenSecretName ?? "unknown"}`,
+      );
+    }
+    if (err instanceof GitHubBranchNotFoundError) {
+      // A 404 on the compare call means the branch does not exist on the remote.
+      // Block only when the workspace row is non-vacuous: a git-worktree feature
+      // branch that differs from the base ref is unlanded local work. Everything
+      // else (non-worktree provider, or branch === baseRef) keeps failing open.
+      const nonVacuous = ctx.providerType === "git_worktree" && branch !== ctx.defaultRef;
+      if (nonVacuous) {
+        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          reason: "branch_absent_on_remote",
+          branch,
+          defaultRef: ctx.defaultRef,
+          owner: parsed.owner,
+          repo: parsed.repo,
+        });
+        return {
+          allowed: false,
+          reason:
+            `Branch ${branch} does not exist on the remote (${parsed.owner}/${parsed.repo}) ` +
+            "while the execution workspace has unlanded local work (deliveryState unmerged). " +
+            "Push the branch and deliver via deliver.sh, or set doneTransitionOverride to a " +
+            "sanctioned no-deliverable-head disposition.",
+          aheadBy: null,
+          branch,
+          defaultRef: ctx.defaultRef,
+          owner: parsed.owner,
+          repo: parsed.repo,
+          skipped: false,
+          skipReason: null,
+        };
+      }
+      return fallback(
+        `Branch ${branch} is absent from the remote; transition allowed`,
+        true,
+        `branch_absent_on_remote:${branch}`,
       );
     }
     return fallback(

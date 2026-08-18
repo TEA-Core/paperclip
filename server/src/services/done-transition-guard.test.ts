@@ -546,7 +546,7 @@ describe("evaluateDoneTransitionGuard", () => {
   });
 
   describe("fail-open on errors", () => {
-    it("allows transition when compare API returns 404", async () => {
+    it("blocks transition when compare API returns 404 and the workspace row is non-vacuous (git_worktree, branch != baseRef)", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow()],
       });
@@ -557,8 +557,64 @@ describe("evaluateDoneTransitionGuard", () => {
         return new Response(JSON.stringify({}), { status: 200 });
       });
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.skipReason).toBeNull();
+      expect(result.aheadBy).toBeNull();
+      expect(result.branch).toBe("SUP-12686-test-branch");
+      expect(result.defaultRef).toBe("fold/tea-patches-v2026.722.0");
+      expect(result.reason).toContain("SUP-12686-test-branch");
+      expect(result.reason).toContain("does not exist on the remote");
+      expect(result.reason).toContain("deliver.sh");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "branch_absent_on_remote",
+            branch: "SUP-12686-test-branch",
+            defaultRef: "fold/tea-patches-v2026.722.0",
+            owner: "TEA-Core",
+            repo: "paperclip",
+          }),
+        }),
+      );
+    });
+
+    it("allows transition when compare API returns 404 and the workspace row is vacuous (providerType not git_worktree)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ providerType: "project_primary" })],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
       expect(result.allowed).toBe(true);
       expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_on_remote:SUP-12686-test-branch");
+      expect(result.skipReason).not.toContain("compare_api_failed");
+    });
+
+    it("allows transition when compare API returns 404 and branchName equals baseRef (vacuous)", async () => {
+      setupDbMock({
+        executionWorkspaces: [
+          mockExecutionWorkspaceRow({ branchName: "fold/tea-patches-v2026.722.0" }),
+        ],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_on_remote:fold/tea-patches-v2026.722.0");
+      expect(result.skipReason).not.toContain("compare_api_failed");
     });
 
     it("allows transition when compare API throws", async () => {
@@ -686,7 +742,7 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.skipReason).not.toContain("auth_failed");
     });
 
-    it("404 from compare API still returns null ahead_by (not auth_failed)", async () => {
+    it("404 from compare API classifies as branch-absent (not auth_failed, not compare_api_failed)", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow()],
       });
@@ -697,9 +753,10 @@ describe("evaluateDoneTransitionGuard", () => {
         return new Response(JSON.stringify({}), { status: 200 });
       });
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
-      expect(result.allowed).toBe(true);
-      expect(result.skipped).toBe(true);
-      expect(result.skipReason).not.toContain("auth_failed");
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.skipReason).toBeNull();
+      expect(result.aheadBy).toBeNull();
     });
   });
 
