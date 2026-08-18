@@ -51,6 +51,14 @@ export interface LinkedPullRequest {
    * the literal "open" — an unhydrated row carries null, not "open".
    */
   cachedState: string | null;
+  /**
+   * The error code persisted by the last failed refresh of the external object
+   * (e.g. "github_auth_required" when the refresh 401'd under a missing company
+   * token), or null when the last refresh succeeded. A cached "open" whose last
+   * refresh errored "github_auth_required" could not be re-verified and is not
+   * positively proven open (SUP-13234).
+   */
+  lastErrorCode: string | null;
 }
 
 const GITHUB_GRAPHQL_URL = "https://api.github.com/graphql";
@@ -66,6 +74,7 @@ export async function resolveLinkedPullRequests(
       externalId: externalObjects.externalId,
       sanitizedCanonicalUrl: externalObjects.sanitizedCanonicalUrl,
       data: externalObjects.data,
+      lastErrorCode: externalObjects.lastErrorCode,
     })
     .from(externalObjectMentions)
     .innerJoin(externalObjects, eq(externalObjects.id, externalObjectMentions.objectId))
@@ -101,16 +110,17 @@ export async function resolveLinkedPullRequests(
       (row.data?.head as Record<string, unknown> | undefined | null)?.ref as string | undefined ??
       (row.data?.headRefName as string | undefined);
 
-    results.push({
-      id: row.id,
-      owner,
-      repo,
-      number,
-      nodeId: nodeId ?? null,
-      headRefName: headRefName ?? null,
-      displayName: `${owner}/${repo}#${number}`,
-      cachedState: state ?? null,
-    });
+      results.push({
+        id: row.id,
+        owner,
+        repo,
+        number,
+        nodeId: nodeId ?? null,
+        headRefName: headRefName ?? null,
+        displayName: `${owner}/${repo}#${number}`,
+        cachedState: state ?? null,
+        lastErrorCode: row.lastErrorCode ?? null,
+      });
   }
 
   return results;
@@ -127,6 +137,7 @@ export async function resolveLinkedPullRequestsWithState(
       externalId: externalObjects.externalId,
       sanitizedCanonicalUrl: externalObjects.sanitizedCanonicalUrl,
       data: externalObjects.data,
+      lastErrorCode: externalObjects.lastErrorCode,
     })
     .from(externalObjectMentions)
     .innerJoin(externalObjects, eq(externalObjects.id, externalObjectMentions.objectId))
@@ -161,16 +172,17 @@ export async function resolveLinkedPullRequestsWithState(
       (row.data?.head as Record<string, unknown> | undefined | null)?.ref as string | undefined ??
       (row.data?.headRefName as string | undefined);
 
-    results.push({
-      id: row.id,
-      owner,
-      repo,
-      number,
-      nodeId: nodeId ?? null,
-      headRefName: headRefName ?? null,
-      displayName: `${owner}/${repo}#${number}`,
-      cachedState: state ?? null,
-    });
+      results.push({
+        id: row.id,
+        owner,
+        repo,
+        number,
+        nodeId: nodeId ?? null,
+        headRefName: headRefName ?? null,
+        displayName: `${owner}/${repo}#${number}`,
+        cachedState: state ?? null,
+        lastErrorCode: row.lastErrorCode ?? null,
+      });
   }
 
   return results;

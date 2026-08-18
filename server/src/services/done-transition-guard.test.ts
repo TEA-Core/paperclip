@@ -212,10 +212,11 @@ describe("evaluateDoneTransitionGuard", () => {
   });
 
   describe("open linked PRs block", () => {
-    it("blocks transition when resolveLinkedPullRequests yields 1 PR, with no GitHub token configured (zero outbound fetch)", async () => {
+    it("blocks transition when a linked PR is cached open, no GitHub token configured, and the last refresh succeeded (zero outbound fetch)", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
-        { id: "pr-1", owner: "TEA-Core", repo: "paperclip-agent-tools", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip-agent-tools#274", cachedState: "open" },
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip-agent-tools", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip-agent-tools#274", cachedState: "open", lastErrorCode: null },
       ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
       expect(result.allowed).toBe(false);
       expect(result.skipped).toBe(false);
@@ -478,6 +479,135 @@ describe("evaluateDoneTransitionGuard", () => {
       const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
       expect(result.allowed).toBe(true);
       expect(result.reason).toContain("upstream-equivalent-fix-no-deliverable-head");
+    });
+  });
+
+  describe("stale cached 'open' under credential gap (SUP-13234)", () => {
+    it("fails open when no token is configured and the last refresh errored github_auth_required", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 300, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#300", cachedState: "open", lastErrorCode: "github_auth_required" },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("No resolvable");
+      expect(result.skipReason).toContain("stale_open_unverifiable:1");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("fails open when token resolution throws and the last refresh errored github_auth_required", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 300, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#300", cachedState: "open", lastErrorCode: "github_auth_required" },
+      ]);
+      mockResolveGitHubToken.mockRejectedValue(new Error("github_auth_required"));
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipReason).toContain("stale_open_unverifiable:1");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("still blocks a cached 'open' PR without a token when the last refresh succeeded (lastErrorCode null)", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 300, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#300", cachedState: "open", lastErrorCode: null },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("blocks only the re-verifiable open PR in a mixed set under a credential gap", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 300, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#300", cachedState: "open", lastErrorCode: "github_auth_required" },
+        { id: "pr-2", owner: "TEA-Core", repo: "paperclip-agent-tools", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip-agent-tools#274", cachedState: "open", lastErrorCode: null },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+      expect(result.reason).not.toContain("paperclip#300");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("writes issue.done_transition_guard_failed_open audit on the stale-open fail-open path", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 300, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#300", cachedState: "open", lastErrorCode: "github_auth_required" },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_failed_open",
+          details: expect.objectContaining({
+            reason: "stale_open_unverifiable:1",
+            prs: "TEA-Core/paperclip#300",
+          }),
+        }),
+      );
+    });
+  });
+
+  describe("stale 'open' re-hydration with token (SUP-13234)", () => {
+    it("unblocks when re-hydration shows the cached-'open' PR was merged since the last refresh", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 300, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#300", cachedState: "open", lastErrorCode: "github_auth_required" },
+      ]);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/repos/TEA-Core/paperclip/pulls/300")) {
+          return new Response(JSON.stringify({ state: "closed", merged: true }), { status: 200 });
+        }
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.aheadBy).toBe(0);
+      expect(result.reason).not.toContain("open linked PR");
+    });
+
+    it("keeps blocking when re-hydration confirms the PR is still open", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 300, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#300", cachedState: "open", lastErrorCode: null },
+      ]);
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/repos/TEA-Core/paperclip/pulls/300")) {
+          return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(result.reason).toContain("TEA-Core/paperclip#300");
+    });
+
+    it("fails open when re-hydration 401s and the last refresh errored github_auth_required", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 300, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#300", cachedState: "open", lastErrorCode: "github_auth_required" },
+      ]);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/repos/TEA-Core/paperclip/pulls/300")) {
+          return new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipReason).toContain("stale_open_unverifiable:1");
     });
   });
 
