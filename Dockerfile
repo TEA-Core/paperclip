@@ -15,6 +15,10 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends make g++ pkg-config \
   # Database clients: sqlite3 for local D1 state, psql for Supabase/Postgres.
   && apt-get install -y --no-install-recommends sqlite3 postgresql-client \
+  # pgTAP harness: `supabase test db` shells out to Docker, which agents do not
+  # have, so pg_prove is the only way they can run the repo's pgTAP suites
+  # against the local Supabase Postgres.
+  && apt-get install -y --no-install-recommends libtap-parser-sourcehandler-pgtap-perl \
   # Python tooling: python3 alone cannot install anything (PEP 668 on trixie).
   && apt-get install -y --no-install-recommends python3-pip python3-venv \
   && apt-get install -y --no-install-recommends shellcheck \
