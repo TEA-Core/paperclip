@@ -461,6 +461,7 @@ export async function evaluateDoneTransitionGuard(
     executionWorkspaceId: string | null;
   },
   override: DoneTransitionOverride | null,
+  decisionCarried: boolean = false,
 ): Promise<DoneTransitionGuardResult> {
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTransitionGuardResult => ({
     allowed: true,
@@ -552,6 +553,31 @@ export async function evaluateDoneTransitionGuard(
 
   if (openPrs.length > 0) {
     const prNames = openPrs.map((p) => p.displayName).join(", ");
+    if (decisionCarried) {
+      // A review approval is exactly what arms the merge (armMergeOnApproval):
+      // blocking the approval on the open PR it approves deadlocks the
+      // approval circuit (SUP-13207, board direction B). Plain (non-decision)
+      // closes must still land the PRs first.
+      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        reason: `open_linked_prs_decision_carried:${openPrs.length}`,
+        skipReason: `open_linked_prs_decision_carried:${openPrs.length}`,
+        prs: prNames,
+      });
+      return {
+        allowed: true,
+        reason:
+          `Decision-carrying transition exempted from the open-linked-PR block: ` +
+          `Issue has ${openPrs.length} open linked PR${openPrs.length === 1 ? "" : "s"} (${prNames}). ` +
+          "The approval arms the merge rather than closing the issue — the PR(s) stay open until the merge lands.",
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: prSkipReason,
+      };
+    }
     void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
       reason: `open_linked_prs:${openPrs.length}`,
       skipReason: `open_linked_prs:${openPrs.length}`,
@@ -681,6 +707,33 @@ export async function evaluateDoneTransitionGuard(
     return {
       allowed: true,
       reason: `Branch ${branch} has a merged PR; transition allowed`,
+      aheadBy,
+      branch,
+      defaultRef: ctx.defaultRef,
+      owner: parsed.owner,
+      repo: parsed.repo,
+      skipped: false,
+      skipReason: prSkipReason,
+    };
+  }
+
+  if (decisionCarried) {
+    // Same deadlock shape as the open-linked-PR block above, firing when the
+    // open PR is unlinked/unhydrated: the approval that arms the merge must
+    // not be blocked by the unmerged branch it is approving (SUP-13207).
+    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      reason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
+      skipReason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
+      branch,
+      defaultRef: ctx.defaultRef,
+      aheadBy,
+    });
+    return {
+      allowed: true,
+      reason:
+        `Decision-carrying transition exempted from the ahead-of-base-without-merged-PR block: ` +
+        `Branch ${branch} is ahead of ${ctx.defaultRef} by ${aheadBy} commits and has no merged PR. ` +
+        "The approval arms the merge rather than closing the issue — the branch stays unmerged until the PR lands.",
       aheadBy,
       branch,
       defaultRef: ctx.defaultRef,

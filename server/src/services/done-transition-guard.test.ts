@@ -258,6 +258,32 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
+    it("allows a DECISION-CARRYING transition past open linked PRs and writes the decision_carried exemption audit row (SUP-13290)", async () => {
+      // The review approval is exactly what arms the merge (armMergeOnApproval):
+      // blocking it on the open PR it approves deadlocks the approval circuit
+      // (SUP-13207, board direction B). The plain-close block below stays intact.
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip-agent-tools", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip-agent-tools#274", cachedState: "open", lastErrorCode: null },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("arms the merge");
+      expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "open_linked_prs_decision_carried:1",
+            skipReason: "open_linked_prs_decision_carried:1",
+            prs: "TEA-Core/paperclip-agent-tools#274",
+          }),
+        }),
+      );
+    });
+
     it("does NOT block on an unhydrated linked PR (cachedState null) — a bare URL mention must not freeze done under the 401", async () => {
       // externalObjects rows are inserted from a URL mention with `data` NULL and are
       // hydrated later by a GitHub API refresh — the same call that 401s under
@@ -672,6 +698,39 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.aheadBy).toBe(3);
       expect(result.reason).toContain("deliver.sh");
       expect(result.reason).toContain("3");
+    });
+
+    it("allows a DECISION-CARRYING transition past an ahead branch with no merged PR (SUP-13290)", async () => {
+      // Same deadlock shape as open linked PRs, firing when the open PR is
+      // unlinked/unhydrated: the approval that arms the merge must not be
+      // blocked by the unmerged branch it is approving.
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        if (url.includes("/pulls?")) {
+          return new Response(JSON.stringify([{ merged: false, merged_at: null }]), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.aheadBy).toBe(3);
+      expect(result.reason).toContain("arms the merge");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "ahead_by_no_merged_pr_decision_carried:3",
+            skipReason: "ahead_by_no_merged_pr_decision_carried:3",
+          }),
+        }),
+      );
     });
   });
 
