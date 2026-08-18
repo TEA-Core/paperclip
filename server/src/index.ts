@@ -50,7 +50,6 @@ import {
   decisionService,
   decisionRetentionService,
   externalObjectService,
-  startExternalObjectRefreshSweep,
   executionWorkspaceService,
   heartbeatService,
   issueThreadInteractionService,
@@ -941,7 +940,6 @@ export async function startServer(): Promise<StartedServer> {
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
-  let stopExternalObjectRefreshSweep: (() => void) | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1487,19 +1485,6 @@ export async function startServer(): Promise<StartedServer> {
     });
   }
 
-  if (config.heartbeatSchedulerEnabled) {
-    stopExternalObjectRefreshSweep = startExternalObjectRefreshSweep(
-      db,
-      {
-        pluginWorkerManager,
-        enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,
-      },
-      {
-        intervalMs: config.externalObjectRefreshIntervalMs,
-      },
-    );
-  }
-
   // SUP-13018: detect + attribute unexpected files in the secrets directory.
   // The boot scan is immediate (runs once migrations are applied and the DB is
   // ready); the interval keeps a mid-lifetime drop bounded to the stated window.
@@ -1604,8 +1589,6 @@ export async function startServer(): Promise<StartedServer> {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
       }
-      stopExternalObjectRefreshSweep?.();
-      stopExternalObjectRefreshSweep = null;
 
       // SUP-10309. Run children are detached, so they never receive the
       // container's signals -- only this handler can reach them, and only
