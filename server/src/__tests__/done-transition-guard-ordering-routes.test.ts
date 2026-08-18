@@ -31,6 +31,8 @@ const mockGetByName = vi.hoisted(() => vi.fn());
 const mockGhFetch = vi.hoisted(() => vi.fn());
 const mockAddComment = vi.hoisted(() => vi.fn());
 const realAddCommentRef = vi.hoisted(() => ({ current: null as ((...args: any[]) => any) | null }));
+const mockEvaluateDoneTransitionGuard = vi.hoisted(() => vi.fn());
+const realEvaluateGuardRef = vi.hoisted(() => ({ current: null as ((...args: any[]) => any) | null }));
 
 vi.mock("../services/secrets.js", () => ({
   secretService: () => ({
@@ -60,6 +62,16 @@ vi.mock("../services/issues.js", async (importOriginal) => {
         addComment: mockAddComment,
       };
     },
+  };
+});
+
+vi.mock("../services/done-transition-guard.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/done-transition-guard.js")>();
+  realEvaluateGuardRef.current = actual.evaluateDoneTransitionGuard;
+  mockEvaluateDoneTransitionGuard.mockImplementation(actual.evaluateDoneTransitionGuard);
+  return {
+    ...actual,
+    evaluateDoneTransitionGuard: mockEvaluateDoneTransitionGuard,
   };
 });
 
@@ -103,6 +115,8 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     mockGetByName.mockReset();
     mockResolveSecretValue.mockReset();
     mockAddComment.mockImplementation(realAddCommentRef.current!);
+    mockEvaluateDoneTransitionGuard.mockReset();
+    mockEvaluateDoneTransitionGuard.mockImplementation(realEvaluateGuardRef.current!);
   });
 
   function createApp() {
@@ -808,5 +822,77 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
 
     const allRows = await guardAuditRows(issueId);
     expect(allRows.every((r) => r.action !== "issue.done_transition_guard_note")).toBe(true);
+  });
+
+  it("allowed not-skipped done carrying an auth_failed skipReason records the note row and does NOT post the auth-failure comment (M3 detector)", async () => {
+    // SUP-13204 (redo of SUP-13197 F2): the real guard only ever emits
+    // `auth_failed:*` on `skipped:true` fallbacks, so no end-to-end test can make
+    // the removal of the `guardResult.skipped &&` conjunct on the
+    // postAuthFailureComment gate (issues.ts) detectable. This test drives the
+    // combination the real guard never produces — an allowed, NOT-skipped result
+    // that still carries an `auth_failed:` skipReason. With the conjunct intact,
+    // the widened `skipped || skipReason` gate records the not-skipped `note`
+    // audit row and the auth-failure comment must NOT be posted; if
+    // `guardResult.skipped &&` is dropped (mutation M3), the comment fires and
+    // this test goes red.
+    const { companyId, agentId, issueId, identifier } = await seedIssue("SUP13204M3");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    mockAddComment.mockClear();
+
+    mockEvaluateDoneTransitionGuard.mockResolvedValue({
+      allowed: true,
+      reason: "Branch SUP-12686-test-branch has a merged PR; transition allowed",
+      aheadBy: 0,
+      branch: "SUP-12686-test-branch",
+      defaultRef: "fold/tea-patches-v2026.722.0",
+      owner: "TEA-Core",
+      repo: "paperclip",
+      skipped: false,
+      skipReason: "auth_failed:compare:401:scope=repo:secretName=GITHUB_TOKEN",
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment:
+          "Closed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
+
+    const allRows = await vi.waitFor(async () => {
+      const rows = await guardAuditRows(issueId);
+      if (!rows.some((r) => r.action === "issue.done_transition_guard_note")) {
+        throw new Error("waiting for issue.done_transition_guard_note row");
+      }
+      return rows;
+    }, { timeout: 5000 });
+
+    const notes = allRows.filter((r) => r.action === "issue.done_transition_guard_note");
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.details.skipReason).toBe("auth_failed:compare:401:scope=repo:secretName=GITHUB_TOKEN");
+    expect(notes[0]!.details.decisionCarried).toBe(false);
+    expect(allRows.every((r) => r.action !== "issue.done_transition_guard_skipped")).toBe(true);
+
+    // Contract: postAuthFailureComment is reachable only when guardResult.skipped
+    // is true. A not-skipped result with an auth_failed skipReason must post zero
+    // system comments.
+    const comments = await db
+      .select({ body: issueComments.body, authorType: issueComments.authorType })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments.filter((r) => r.authorType === "system")).toHaveLength(0);
+    for (const call of mockAddComment.mock.calls) {
+      const body = typeof call[1] === "string" ? call[1] : null;
+      expect(body?.includes("Delivery verification was SKIPPED") ?? false).toBe(false);
+    }
   });
 });
