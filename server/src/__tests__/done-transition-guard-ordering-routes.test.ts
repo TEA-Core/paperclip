@@ -502,7 +502,13 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body.code).toBe("done_transition_missing_delivery");
     expect(res.body.error).toContain("5 open linked PRs");
-    expect(mockGhFetch).not.toHaveBeenCalled();
+    // SUP-13234: with a resolvable token the guard re-verifies the 5 cached-"open"
+    // PRs against the live API before blocking. Each re-hydration 404s in the mock,
+    // so the cached state stands and the block is preserved; compare is never reached.
+    expect(mockGhFetch).toHaveBeenCalledTimes(5);
+    for (const [url] of mockGhFetch.mock.calls) {
+      expect(String(url)).toContain("/pulls/");
+    }
 
     const statusRows = await db
       .select({ status: issues.status })

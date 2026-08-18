@@ -73,6 +73,10 @@ function parseRepoUrl(repoUrl: string | null): { hostname: string; owner: string
   return { hostname: url.hostname, owner, repo };
 }
 
+function appendSkipReason(current: string | null, piece: string): string {
+  return current ? `${current}; ${piece}` : piece;
+}
+
 async function resolveIssueRepoContext(
   db: Db,
   issue: {
@@ -250,7 +254,10 @@ async function hydrateLinkedPrState(
     if (!body) return pr;
     const state = body.state as string | undefined;
     if (typeof state === "string") {
-      return { ...pr, cachedState: state };
+      // The live call just succeeded: the persisted refresh error code (if any)
+      // no longer describes this object, and the PR state below is positively
+      // proven again.
+      return { ...pr, cachedState: state, lastErrorCode: null };
     }
     return pr;
   } catch {
@@ -495,17 +502,20 @@ export async function evaluateDoneTransitionGuard(
   let resolvedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
 
   // Best-effort synchronous hydration: attempt to fetch current state from GitHub for
-  // any unhydrated (cachedState === null) rows. A thrown/failed hydration must NOT
-  // throw — degrade to the unhydrated branch. We only hydrate if a company token is
-  // available; if token resolution itself fails, we keep the cached states as-is.
+  // any unhydrated (cachedState === null) rows and any cached-"open" rows. A cached
+  // "open" is positive proof only as of the last successful refresh; a PR merged
+  // since then (e.g. the merge→sweep-rehydration window) must not block `done` on
+  // stale state. A thrown/failed hydration must NOT throw — degrade to the cached
+  // state. We only hydrate if a company token is available; if token resolution
+  // itself fails, we keep the cached states as-is.
   let prSkipReason: string | null = null;
   try {
     const tokenResult = await resolveGitHubToken(db, issue.companyId);
     if (tokenResult.token !== null) {
-      const unhydrated = resolvedPrs.filter((p) => p.cachedState === null);
-      if (unhydrated.length > 0) {
+      const toHydrate = resolvedPrs.filter((p) => p.cachedState === null || p.cachedState === "open");
+      if (toHydrate.length > 0) {
         const hydrated = await Promise.all(
-          unhydrated.map((p) => hydrateLinkedPrState(p, tokenResult.token)),
+          toHydrate.map((p) => hydrateLinkedPrState(p, tokenResult.token)),
         );
         const hydratedMap = new Map(hydrated.map((p) => [p.id, p] as const));
         resolvedPrs = resolvedPrs.map((p) => hydratedMap.get(p.id) ?? p);
@@ -515,10 +525,29 @@ export async function evaluateDoneTransitionGuard(
     // Token resolution failed — keep cached states, proceed to skipReason below.
   }
 
-  const openPrs = resolvedPrs.filter((p) => p.cachedState === "open");
+  // Only positively-proven-open PRs may block `done`. A cached "open" whose last
+  // refresh errored github_auth_required could not be re-verified: the refresh path
+  // persists that code when the provider rejects the credential (missing company
+  // token, SUP-12987), and the guard above could not re-hydrate it either (no token,
+  // or the live call failed). It is not positive proof the PR is open now, so — like
+  // an unhydrated row — it fails open on unknown. A successful live re-hydration
+  // clears lastErrorCode, so only genuinely unverified rows are excluded.
+  const staleOpenUnverifiable = resolvedPrs.filter(
+    (p) => p.cachedState === "open" && p.lastErrorCode === "github_auth_required",
+  );
+  if (staleOpenUnverifiable.length > 0) {
+    prSkipReason = appendSkipReason(prSkipReason, `stale_open_unverifiable:${staleOpenUnverifiable.length}`);
+    void writeAuditLog(db, issue, "issue.done_transition_guard_failed_open", {
+      reason: `stale_open_unverifiable:${staleOpenUnverifiable.length}`,
+      prs: staleOpenUnverifiable.map((p) => p.displayName).join(", "),
+    });
+  }
+  const openPrs = resolvedPrs.filter(
+    (p) => p.cachedState === "open" && p.lastErrorCode !== "github_auth_required",
+  );
   const unhydratedCount = resolvedPrs.filter((p) => p.cachedState === null).length;
   if (unhydratedCount > 0) {
-    prSkipReason = `unhydrated_linked_prs:${unhydratedCount}`;
+    prSkipReason = appendSkipReason(prSkipReason, `unhydrated_linked_prs:${unhydratedCount}`);
   }
 
   if (openPrs.length > 0) {
