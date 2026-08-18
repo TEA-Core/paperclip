@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import type { Db } from "@paperclipai/db";
 import { and, eq, inArray } from "drizzle-orm";
 import { executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
@@ -93,6 +94,7 @@ async function resolveIssueRepoContext(
   defaultRef: string | null;
   repoUrl: string | null;
   providerType: string | null;
+  worktreePath: string | null;
 } | null> {
   if (issue.executionWorkspaceId) {
     const row = await db
@@ -106,6 +108,7 @@ async function resolveIssueRepoContext(
         defaultRef: row.baseRef ?? null,
         repoUrl: row.repoUrl ?? null,
         providerType: row.providerType ?? null,
+        worktreePath: row.providerRef ?? row.cwd ?? null,
       };
     }
   }
@@ -122,6 +125,7 @@ async function resolveIssueRepoContext(
         defaultRef: row.defaultRef ?? row.repoRef ?? null,
         repoUrl: row.repoUrl ?? null,
         providerType: null,
+        worktreePath: null,
       };
     }
   }
@@ -144,6 +148,7 @@ async function resolveIssueRepoContext(
         defaultRef: primaryWorkspace.defaultRef ?? primaryWorkspace.repoRef ?? null,
         repoUrl: primaryWorkspace.repoUrl ?? null,
         providerType: null,
+        worktreePath: null,
       };
     }
   }
@@ -183,6 +188,43 @@ async function githubCompareAheadBy(
   const ahead = (body as Record<string, unknown> | null)?.ahead_by;
   if (typeof ahead === "number") return ahead;
   return null;
+}
+
+function runGit(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("git", ["-C", cwd, ...args], { maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+}
+
+/**
+ * Count commits ahead of the remote base ref that are attributable to the given
+ * issue identifier (subject or trailer match). Returns null when the probe is
+ * unreachable (missing worktree, git failure, unresolvable base ref) so callers
+ * can fail open instead of blocking on a signal they could not measure.
+ */
+async function countIssueAttributableCommits(
+  worktreePath: string,
+  defaultRef: string,
+  identifier: string | null,
+): Promise<{ aheadCount: number; attributableCount: number } | null> {
+  if (!identifier) return null;
+  try {
+    const range = `${defaultRef}..HEAD`;
+    const aheadRaw = await runGit(["rev-list", "--count", range], worktreePath);
+    const attributableRaw = await runGit(
+      ["rev-list", "--fixed-strings", "--count", "--grep", identifier, range],
+      worktreePath,
+    );
+    const aheadCount = Number.parseInt(aheadRaw.trim(), 10);
+    const attributableCount = Number.parseInt(attributableRaw.trim(), 10);
+    if (Number.isNaN(aheadCount) || Number.isNaN(attributableCount)) return null;
+    return { aheadCount, attributableCount };
+  } catch {
+    return null;
+  }
 }
 
 async function githubBranchHasMergedPr(
@@ -616,23 +658,33 @@ export async function evaluateDoneTransitionGuard(
     }
     if (err instanceof GitHubBranchNotFoundError) {
       // A 404 on the compare call means the branch does not exist on the remote.
-      // Block only when the workspace row is non-vacuous: a git-worktree feature
-      // branch that differs from the base ref is unlanded local work. Everything
-      // else (non-worktree provider, or branch === baseRef) keeps failing open.
-      const nonVacuous = ctx.providerType === "git_worktree" && branch !== ctx.defaultRef;
-      if (nonVacuous) {
+      // Block only when the local worktree carries at least one commit that is
+      // attributable to this issue: reachable from the workspace head, not
+      // reachable from the remote base ref, and whose subject or trailer
+      // references the issue identifier (matching the `fix(SUP-NNNNN):`
+      // convention deliver.sh emits). Base drift alone — a worktree several
+      // commits ahead of a stale local base with none attributable — must fail
+      // open, because that state is a property of the checkout mechanism, not of
+      // the issue's work (SUP-13205).
+      const attribution = ctx.worktreePath
+        ? await countIssueAttributableCommits(ctx.worktreePath, ctx.defaultRef, issue.identifier)
+        : null;
+      if (attribution && attribution.attributableCount > 0) {
         void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
           reason: "branch_absent_on_remote",
           branch,
           defaultRef: ctx.defaultRef,
           owner: parsed.owner,
           repo: parsed.repo,
+          aheadCount: attribution.aheadCount,
+          attributableCommitCount: attribution.attributableCount,
         });
         return {
           allowed: false,
           reason:
             `Branch ${branch} does not exist on the remote (${parsed.owner}/${parsed.repo}) ` +
-            "while the execution workspace has unlanded local work (deliveryState unmerged). " +
+            `while the execution workspace carries ${attribution.attributableCount} commit${attribution.attributableCount === 1 ? "" : "s"} ` +
+            `attributable to ${issue.identifier} (subject/trailer reference) not reachable from the remote base ${ctx.defaultRef}. ` +
             "Push the branch and deliver via deliver.sh, or set doneTransitionOverride to a " +
             "sanctioned no-deliverable-head disposition.",
           aheadBy: null,
