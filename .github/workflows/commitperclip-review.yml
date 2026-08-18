@@ -4,6 +4,13 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
 
+
+# 647 runs over 17 days with no concurrency block at all, so no superseded run
+# was ever cancelled. Cancellation is scoped to pull requests; anything else
+# gets a unique group keyed on run_id and can never cancel itself.
+concurrency:
+  group: commitperclip-${{ github.event_name == 'pull_request' && github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 # Always runs from base branch context — never executes PR code.
 # pull_request_target gives access to secrets for untrusted fork PRs.
 
