@@ -1,8 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import type { ExternalObjectCanonicalUrl } from "@paperclipai/shared";
-import { DEFAULT_GITHUB_TOKEN_SECRET_NAMES } from "./git-credentials.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
-import { secretService } from "./secrets.js";
+import { isGitHubTokenResolution, resolveGitHubTokenForRepo } from "./github-credential.js";
 import type {
   ExternalObjectDetection,
   ExternalObjectDetector,
@@ -15,8 +14,11 @@ type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
 export interface GitHubExternalObjectProviderOptions {
   fetch?: FetchLike;
-  tokenProvider?: (companyId: string) => Promise<string | null> | string | null;
-  secretNames?: readonly string[];
+  tokenProvider?: (
+    companyId: string,
+    owner: string,
+    repo: string,
+  ) => Promise<string | null> | string | null;
 }
 
 interface GitHubObjectIdentity {
@@ -307,27 +309,15 @@ async function safeJson(response: Response) {
   }
 }
 
-async function defaultTokenProvider(db: Db, companyId: string, secretNames: readonly string[]) {
-  const secrets = secretService(db);
-  for (const secretName of secretNames) {
-    const secret = await secrets.getByName(companyId, secretName);
-    if (!secret) continue;
-    const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
-    const trimmed = token.trim();
-    if (trimmed) return trimmed;
-  }
-  return null;
-}
-
 export function createGitHubExternalObjectProvider(
   db: Db,
   opts: GitHubExternalObjectProviderOptions = {},
 ): { detector: ExternalObjectDetector; resolvers: ExternalObjectResolver[] } {
   const fetchImpl = opts.fetch ?? ghFetch;
-  const secretNames = opts.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
   const tokenProvider = Object.prototype.hasOwnProperty.call(opts, "tokenProvider") && opts.tokenProvider !== undefined
     ? opts.tokenProvider
-    : ((companyId: string) => defaultTokenProvider(db, companyId, secretNames));
+    : ((companyId: string, owner: string, repo: string) =>
+      resolveGitHubTokenForRepo(db, companyId, owner, repo));
 
   const detector: ExternalObjectDetector = {
     key: "github",
@@ -368,7 +358,15 @@ export function createGitHubExternalObjectProvider(
 
         let token: string | null = null;
         try {
-          token = typeof tokenProvider === "function" ? await tokenProvider(companyId) : tokenProvider;
+          const result =
+            typeof tokenProvider === "function"
+              ? await tokenProvider(companyId, identity.owner, identity.repo)
+              : tokenProvider;
+          if (typeof result === "string") {
+            token = result.trim() || null;
+          } else if (result !== null && isGitHubTokenResolution(result)) {
+            token = result.token.trim() || null;
+          }
         } catch {
           return {
             ok: false,
