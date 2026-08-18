@@ -198,7 +198,13 @@ jobs:
             PAPERCLIP_BUILD_VERSION=${{ steps.build-version.outputs.version }}
             PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
             CLI_TOOLS_CACHE_EPOCH=${{ steps.tools-epoch.outputs.epoch }}
-          platforms: linux/amd64,linux/arm64
+          # arm64 is built for RELEASE TAGS ONLY. Measured over the last 12 runs,
+          # the multi-arch build step takes ~31.9m against ~5.7m for the amd64-only
+          # cloud variant of the same image - QEMU emulation is ~26m of every run,
+          # and branch pushes (112 runs/17d) never needed an arm64 artifact.
+          # Releases keep multi-arch so any arm64 consumer of a tagged image is
+          # unaffected. Plan CI-COST item 6 / spec SS5.1 lever 4.
+          platforms: ${{ startsWith(github.ref, 'refs/tags/') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: true
           # Registry-backed BuildKit cache instead of type=gha: the Actions
           # cache is capped at 10GB per repo, and two multi-arch mode=max jobs
