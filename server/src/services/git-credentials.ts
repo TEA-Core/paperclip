@@ -1,13 +1,16 @@
 import type { Db } from "@paperclipai/db";
-import { isGitHubDotCom } from "./github-fetch.js";
+import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, resolveAppInstallationToken } from "./github-credential.js";
+import { ghFetch, isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
 
 /**
  * Server-side git credentials for managed project checkouts and execution-workspace base
- * refreshes. Operators store a GitHub token as a company secret under one of the well-known
- * names below (the same convention the GitHub external-object provider reads); this module
- * resolves it and turns it into a git invocation that authenticates clone/fetch against
- * github.com over HTTPS without ever placing the token in argv, URLs, or on disk.
+ * refreshes. Resolution prefers the GitHub App installation token scoped to the remote's
+ * owner/repo, then company secrets under the well-known names below (the same convention the
+ * GitHub external-object provider reads), falling through any candidate GitHub rejects
+ * (401/403), then the server env; the winner is turned into a git invocation that
+ * authenticates clone/fetch against github.com over HTTPS without ever placing the token in
+ * argv, URLs, or on disk.
  *
  * The provider factory is deliberately the single seam for future credential sources (for
  * example a brokered GitHub connection): swap the factory, keep every call site unchanged.
@@ -34,8 +37,8 @@ const GIT_CREDENTIAL_HELPER =
 
 export type GitCredential = {
   token: string;
-  source: "company_secret" | "server_env";
-  /** The company-secret name the token came from; null for a server-environment token. */
+  source: "app_installation" | "company_secret" | "server_env";
+  /** The secret name the token came from; null for a server-environment token. */
   secretName: string | null;
 };
 
@@ -123,9 +126,12 @@ export function describeGitAuthFailure(input: {
     return null;
   }
   if (input.used) {
-    const label = input.used.secretName
-      ? `the ${input.used.secretName} company-secret GitHub credential`
-      : "the server-environment GitHub credential";
+    const label =
+      input.used.source === "app_installation"
+        ? "the GitHub App installation credential"
+        : input.used.secretName
+          ? `the ${input.used.secretName} company-secret GitHub credential`
+          : "the server-environment GitHub credential";
     return `The operation authenticated with ${label}, which was rejected or lacks access to this repository.`;
   }
   return "No GitHub credential is configured — add a GITHUB_TOKEN or GH_TOKEN company secret in Settings → Secrets, or configure a local checkout cwd for this project workspace.";
@@ -142,11 +148,49 @@ type GitCredentialSecretsDeps = {
 };
 
 /**
- * Build the credential provider for one run. Resolution order: company secret by well-known
- * name, then the server process env (`GITHUB_TOKEN`/`GH_TOKEN`) for self-hosted operators,
- * then null. The lookup is memoized per provider instance so one run performs at most one
- * secret resolution (and writes at most one audit event) no matter how many git operations
- * it authenticates.
+ * Parse `owner`/`repo` from a github.com HTTPS remote URL (only called after
+ * `isGitHubHttpsRemoteUrl` has gated it): the first two pathname segments, trailing `.git`
+ * dropped. Null when the URL carries no owner/repo path.
+ */
+function parseOwnerRepo(remoteUrl: string): { owner: string; repo: string } | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(remoteUrl);
+  } catch {
+    return null;
+  }
+  const segments = parsed.pathname.split("/").filter((segment) => segment.length > 0);
+  let repo = segments[1] ?? "";
+  if (repo.endsWith(".git")) repo = repo.slice(0, -".git".length);
+  const owner = segments[0] ?? "";
+  return owner && repo ? { owner, repo } : null;
+}
+
+/**
+ * Probe whether a candidate token is usable for one repo via the GitHub API. Only an
+ * explicit 401/403 rejection counts: any other outcome (200/404/429/5xx) leaves the real
+ * decision to git itself.
+ */
+async function probeGitHubTokenUsable(token: string, owner: string, repo: string): Promise<boolean> {
+  const response = await ghFetch(`https://api.github.com/repos/${owner}/${repo}`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      "user-agent": "paperclip-workspace-git",
+      "x-github-api-version": "2022-11-28",
+      authorization: `Bearer ${token}`,
+    },
+  });
+  return response.status !== 401 && response.status !== 403;
+}
+
+/**
+ * Build the credential provider for one run. Resolution order: the GitHub App installation
+ * token scoped to the remote's owner/repo, then company secrets by well-known name, falling
+ * through any candidate GitHub rejects (401/403), then the server process env
+ * (`GITHUB_TOKEN`/`GH_TOKEN`) for self-hosted operators, then null. Resolution is memoized
+ * per provider instance and per owner/repo so one run performs at most one credential
+ * resolution (and writes at most one audit event) per repository no matter how many git
+ * operations it authenticates.
  */
 export function createGitRemoteAuthProvider(
   db: Db,
@@ -160,34 +204,57 @@ export function createGitRemoteAuthProvider(
     secrets?: GitCredentialSecretsDeps;
     env?: NodeJS.ProcessEnv;
     secretNames?: readonly string[];
+    /** Probe a candidate token against the repo; true = accept/usable. */
+    probeToken?: (token: string, owner: string, repo: string) => Promise<boolean>;
   },
 ): GitRemoteAuthProvider {
   const secrets: GitCredentialSecretsDeps = deps?.secrets ?? secretService(db);
   const env = deps?.env ?? process.env;
   const secretNames = deps?.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
-  let credentialPromise: Promise<GitCredential | null> | null = null;
+  const probeToken = deps?.probeToken ?? probeGitHubTokenUsable;
+  const accessContext = {
+    consumerType: "system",
+    consumerId: "workspace-git-credential",
+    actorType: "system",
+    issueId: context?.issueId ?? null,
+    heartbeatRunId: context?.heartbeatRunId ?? null,
+    responsibleUserId: context?.responsibleUserId ?? null,
+  } as const;
+  const credentialPromises = new Map<string, Promise<GitCredential | null>>();
 
-  const resolveCredential = async (): Promise<GitCredential | null> => {
+  const resolveCredential = async (owner?: string, repo?: string): Promise<GitCredential | null> => {
+    // Probe each candidate in order. Only an explicit GitHub rejection (401/403) moves on to
+    // the next candidate; any other outcome (200/404/429/5xx, or a probe that throws) accepts
+    // the candidate and lets git make the real decision.
+    const acceptIfUsable = async (token: string): Promise<boolean> =>
+      owner && repo ? probeToken(token, owner, repo).catch(() => true) : true;
+
+    // App installation first: a scoped installation token must beat any company PAT, so a
+    // dead company secret can no longer shadow a healthy installation.
+    const appResult = await resolveAppInstallationToken(companyId, secrets, owner, repo, accessContext).catch(
+      () => null,
+    );
+    if (appResult && (await acceptIfUsable(appResult.token))) {
+      return {
+        token: appResult.token,
+        source: "app_installation",
+        secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+      };
+    }
+
     for (const secretName of secretNames) {
       const secret = await Promise.resolve(secrets.getByName(companyId, secretName)).catch(() => null);
       if (!secret) continue;
       // A resolution failure (inactive secret, provider outage) records its own failure audit
       // event; fall through to the next source instead of failing the whole git operation here.
       const token = await secrets
-        .resolveSecretValue(companyId, secret.id, "latest", {
-          accessContext: {
-            consumerType: "system",
-            consumerId: "workspace-git-credential",
-            actorType: "system",
-            issueId: context?.issueId ?? null,
-            heartbeatRunId: context?.heartbeatRunId ?? null,
-            responsibleUserId: context?.responsibleUserId ?? null,
-          },
-        })
+        .resolveSecretValue(companyId, secret.id, "latest", { accessContext })
         .then((value) => value.trim())
         .catch(() => "");
-      if (token) return { token, source: "company_secret", secretName };
+      if (!token) continue;
+      if (await acceptIfUsable(token)) return { token, source: "company_secret", secretName };
     }
+
     const envToken = env.GITHUB_TOKEN?.trim() || env.GH_TOKEN?.trim() || "";
     if (envToken) return { token: envToken, source: "server_env", secretName: null };
     return null;
@@ -195,7 +262,13 @@ export function createGitRemoteAuthProvider(
 
   return async (remoteUrl: string) => {
     if (!isGitHubHttpsRemoteUrl(remoteUrl)) return null;
-    credentialPromise ??= resolveCredential();
+    const ownerRepo = parseOwnerRepo(remoteUrl);
+    const key = ownerRepo ? `${ownerRepo.owner}/${ownerRepo.repo}` : "unscoped";
+    let credentialPromise = credentialPromises.get(key);
+    if (!credentialPromise) {
+      credentialPromise = resolveCredential(ownerRepo?.owner, ownerRepo?.repo);
+      credentialPromises.set(key, credentialPromise);
+    }
     const credential = await credentialPromise;
     if (!credential) return null;
     return buildGitAuthInvocation(credential);

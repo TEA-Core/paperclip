@@ -87,11 +87,27 @@ function isExpired(cached: CachedAppToken, now: number): boolean {
   return now >= cached.expiresAt - CACHE_SAFETY_MARGIN_MS;
 }
 
-async function resolveAppInstallationToken(
+/**
+ * The minimal secret-store surface App-token minting needs. Deliberately narrower than
+ * `secretService(db)` so a credential provider (e.g. the git remote auth provider) can pass
+ * its own secret deps without pulling the whole secret service along.
+ */
+interface AppInstallationTokenSecrets {
+  getByName: (companyId: string, name: string) => Promise<{ id: string } | null | undefined>;
+  resolveSecretValue: (
+    companyId: string,
+    secretId: string,
+    version: number | "latest",
+    contextOrOptions?: any,
+  ) => Promise<string>;
+}
+
+export async function resolveAppInstallationToken(
   companyId: string,
-  secrets: ReturnType<typeof secretService>,
+  secrets: AppInstallationTokenSecrets,
   owner?: string,
   repo?: string,
+  accessContext?: Record<string, unknown>,
 ): Promise<GitHubTokenResolution | null> {
   const cacheKey = `${companyId}:${owner ?? ""}:${repo ?? ""}`;
   const now = Date.now();
@@ -111,7 +127,12 @@ async function resolveAppInstallationToken(
 
   let privateKey: string;
   try {
-    privateKey = await secrets.resolveSecretValue(companyId, secret.id, "latest");
+    privateKey = await secrets.resolveSecretValue(
+      companyId,
+      secret.id,
+      "latest",
+      accessContext ? { accessContext } : undefined,
+    );
   } catch {
     logger.warn(
       { companyId, secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME },

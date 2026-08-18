@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
@@ -13,6 +13,29 @@ import {
   isGitHubHttpsRemoteUrl,
   scrubGitCredentialText,
 } from "../services/git-credentials.ts";
+
+const { mockResolveAppInstallationToken } = vi.hoisted(() => ({
+  mockResolveAppInstallationToken: vi.fn(
+    async (
+      _companyId: string,
+      secrets: { getByName: (companyId: string, name: string) => Promise<{ id: string } | null> },
+    ) => {
+      const secret = await secrets.getByName(_companyId, "GITHUB_APP_PRIVATE_KEY");
+      if (!secret) return null;
+      return {
+        token: "app-installation-token",
+        scope: "app_installation",
+        secretName: "GITHUB_APP_PRIVATE_KEY",
+        installationId: "153736520",
+      };
+    },
+  ),
+}));
+
+vi.mock("../services/github-credential.js", () => ({
+  resolveAppInstallationToken: mockResolveAppInstallationToken,
+  GITHUB_APP_PRIVATE_KEY_SECRET_NAME: "GITHUB_APP_PRIVATE_KEY",
+}));
 
 const fakeDb = null as unknown as Db;
 
@@ -50,18 +73,58 @@ describe("isGitHubHttpsRemoteUrl", () => {
 describe("createGitRemoteAuthProvider", () => {
   const githubUrl = "https://github.com/example/repo.git";
 
+  beforeEach(() => {
+    mockResolveAppInstallationToken.mockClear();
+  });
+
   it("prefers company secrets in declared order", async () => {
     const secrets = buildSecretsFake({ GH_TOKEN: "gh-token", PAPERCLIP_GITHUB_TOKEN: "pc-token" });
     const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
       secrets,
       env: { GITHUB_TOKEN: "env-token" },
+      probeToken: async () => true,
     });
     const invocation = await provider(githubUrl);
     expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("gh-token");
     expect(invocation?.source).toBe("company_secret");
     expect(invocation?.secretName).toBe("GH_TOKEN");
-    // GITHUB_TOKEN is probed first even though only GH_TOKEN exists.
-    expect(secrets.getByName.mock.calls.map((call) => call[1])).toEqual(["GITHUB_TOKEN", "GH_TOKEN"]);
+    // The App private key is probed first even though it does not exist, then the names.
+    expect(secrets.getByName.mock.calls.map((call) => call[1])).toEqual([
+      "GITHUB_APP_PRIVATE_KEY",
+      "GITHUB_TOKEN",
+      "GH_TOKEN",
+    ]);
+  });
+
+  it("authenticates an App-covered remote with the installation token, not a company PAT", async () => {
+    const secrets = buildSecretsFake({ GITHUB_APP_PRIVATE_KEY: "stub-private-key", GITHUB_TOKEN: "company-pat" });
+    const probeToken = vi.fn(async () => true);
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: {},
+      probeToken,
+    });
+    const invocation = await provider("https://github.com/TEA-Core/paperclip.git");
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("app-installation-token");
+    expect(invocation?.source).toBe("app_installation");
+    expect(invocation?.secretName).toBe("GITHUB_APP_PRIVATE_KEY");
+    // The company secrets are never probed once the App token is accepted.
+    expect(probeToken).toHaveBeenCalledTimes(1);
+    expect(probeToken).toHaveBeenCalledWith("app-installation-token", "TEA-Core", "paperclip");
+  });
+
+  it("falls through to the next candidate when GitHub rejects the first", async () => {
+    const secrets = buildSecretsFake({ GITHUB_TOKEN: "dead-token", GH_TOKEN: "live-token" });
+    const probeToken = vi.fn(async (token: string) => token !== "dead-token");
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: {},
+      probeToken,
+    });
+    const invocation = await provider(githubUrl);
+    expect(invocation?.secretName).toBe("GH_TOKEN");
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("live-token");
+    expect(probeToken).toHaveBeenCalledTimes(2);
   });
 
   it("falls back to the server env, GITHUB_TOKEN before GH_TOKEN", async () => {
@@ -92,19 +155,26 @@ describe("createGitRemoteAuthProvider", () => {
     await expect(provider("git@github.com:example/repo.git")).resolves.toBeNull();
     await expect(provider("https://gitlab.com/example/repo.git")).resolves.toBeNull();
     expect(secrets.getByName).not.toHaveBeenCalled();
+    expect(mockResolveAppInstallationToken).not.toHaveBeenCalled();
   });
 
-  it("memoizes the credential lookup across calls", async () => {
+  it("memoizes the credential lookup per owner/repo across calls", async () => {
     const secrets = buildSecretsFake({ GITHUB_TOKEN: "token" });
     const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
       secrets,
       env: {},
+      probeToken: async () => true,
     });
     await provider(githubUrl);
     await provider(githubUrl);
-    await provider("https://github.com/example/another.git");
-    expect(secrets.getByName).toHaveBeenCalledTimes(1);
+    // One resolution for the same owner/repo: the App private-key lookup plus the names, once.
+    expect(secrets.getByName).toHaveBeenCalledTimes(2);
     expect(secrets.resolveSecretValue).toHaveBeenCalledTimes(1);
+    expect(mockResolveAppInstallationToken).toHaveBeenCalledTimes(1);
+    // A different owner/repo URL resolves separately.
+    await provider("https://github.com/example/another.git");
+    expect(secrets.getByName).toHaveBeenCalledTimes(4);
+    expect(mockResolveAppInstallationToken).toHaveBeenCalledTimes(2);
   });
 
   it("passes a system access context so resolution is audited", async () => {
@@ -113,7 +183,7 @@ describe("createGitRemoteAuthProvider", () => {
       fakeDb,
       "company-1",
       { issueId: "issue-1", heartbeatRunId: "run-1" },
-      { secrets, env: {} },
+      { secrets, env: {}, probeToken: async () => true },
     );
     await provider(githubUrl);
     expect(secrets.resolveSecretValue).toHaveBeenCalledWith("company-1", "secret-GITHUB_TOKEN", "latest", {
@@ -135,6 +205,7 @@ describe("createGitRemoteAuthProvider", () => {
     const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
       secrets,
       env: {},
+      probeToken: async () => true,
     });
     const invocation = await provider(githubUrl);
     expect(invocation?.secretName).toBe("GH_TOKEN");
@@ -250,6 +321,13 @@ describe("describeGitAuthFailure", () => {
       error: "fatal: Authentication failed",
       used: { source: "company_secret", secretName: "GH_TOKEN" },
     })).toContain("the GH_TOKEN company-secret GitHub credential");
+  });
+
+  it("names the App installation when an App installation credential was used", () => {
+    expect(describeGitAuthFailure({
+      error: "fatal: Authentication failed",
+      used: { source: "app_installation", secretName: "GITHUB_APP_PRIVATE_KEY" },
+    })).toContain("the GitHub App installation credential");
   });
 
   it("names the server environment when an env credential was used", () => {
