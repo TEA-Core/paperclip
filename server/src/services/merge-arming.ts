@@ -6,6 +6,7 @@ import {
   isGitHubTokenResolution,
   resolveGitHubTokenCandidatesForRepo,
   resolveGitHubTokenForRepo,
+  type GitHubTokenResolution,
 } from "./github-credential.js";
 
 export {
@@ -283,7 +284,148 @@ export async function publishApprovalStatus(
   const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId);
 
   if (linkedPRs.length === 0) {
-    return { kind: "skipped", message: "status:skipped:no-pr: No linked pull request found" };
+    // SUP-13313: an empty cached open-PR set means "the PR I know about is
+    // stale", not "this issue has no PR". Ask GitHub for open, non-draft PRs
+    // that carry the issue identifier before giving up.
+    const withState = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+
+    const pairs: Array<{ owner: string; repo: string }> = [];
+    const seenPairs = new Set<string>();
+    for (const row of withState) {
+      const key = `${row.owner.toLowerCase()}/${row.repo.toLowerCase()}`;
+      if (seenPairs.has(key)) continue;
+      seenPairs.add(key);
+      pairs.push({ owner: row.owner, repo: row.repo });
+    }
+
+    const matched: Array<{
+      owner: string;
+      repo: string;
+      number: number;
+      displayName: string;
+      candidate: GitHubTokenResolution;
+    }> = [];
+    const needle = issueIdentifier.toLowerCase();
+
+    for (const pair of pairs) {
+      const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pair.owner, pair.repo);
+      if (candidates.length === 0) {
+        const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pair.owner, pair.repo);
+        if (!isGitHubTokenResolution(tokenResult)) {
+          return {
+            kind: "failed",
+            message: `status:failed:auth_required: ${tokenResult.reason} (scope=null, secretName=null)`,
+          };
+        }
+        return {
+          kind: "failed",
+          message: `status:failed:auth_required: No GitHub token resolvable for ${pair.owner}/${pair.repo} (scope=null, secretName=null)`,
+        };
+      }
+
+      for (const candidate of candidates) {
+        const listResult = await fetchOpenPullRequests(candidate.token, pair.owner, pair.repo);
+        if (!listResult.ok) {
+          const { status, message } = listResult;
+          if (status === 401 || status === 403) {
+            if (candidate === candidates[candidates.length - 1]) {
+              if (candidates.length === 1) {
+                return {
+                  kind: "failed",
+                  message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""} (scope=${candidate.scope}, secretName=${candidate.secretName})`,
+                };
+              }
+              const tried = candidates.map((c) => `${c.scope}/${c.secretName}`).join(", ");
+              return {
+                kind: "failed",
+                message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""} (tried: ${tried})`,
+              };
+            }
+            continue;
+          }
+          if (status === 404) {
+            return { kind: "failed", message: `status:failed:pr_not_found: HTTP 404 ${message ?? ""}` };
+          }
+          if (status === 429) {
+            return { kind: "failed", message: `status:failed:pr_rate_limited: HTTP 429 ${message ?? ""}` };
+          }
+          if (status === 0) {
+            return { kind: "failed", message: `status:failed:pr_network: ${message ?? "network_error"}` };
+          }
+          return { kind: "failed", message: `status:failed:pr_error: HTTP ${status} ${message ?? ""}` };
+        }
+
+        for (const item of listResult.items) {
+          if (item.draft === true) continue;
+          const headRef = (item.headRef ?? "").toLowerCase();
+          const title = (item.title ?? "").toLowerCase();
+          const body = (item.body ?? "").toLowerCase();
+          if (!headRef.includes(needle) && !title.includes(needle) && !body.includes(needle)) continue;
+          matched.push({
+            owner: pair.owner,
+            repo: pair.repo,
+            number: item.number,
+            displayName: `${pair.owner}/${pair.repo}#${item.number}`,
+            candidate,
+          });
+        }
+        break;
+      }
+    }
+
+    if (matched.length > 1) {
+      const prList = matched.map((pr) => pr.displayName).join(", ");
+      return {
+        kind: "skipped",
+        message: `status:skipped:ambiguous: Multiple linked PRs (${matched.length}): ${prList}`,
+      };
+    }
+
+    if (matched.length === 1) {
+      const pr = matched[0]!;
+      const headShaResult = await fetchPullRequestHeadSha(pr.candidate.token, pr.owner, pr.repo, pr.number);
+      if (!headShaResult.ok) {
+        const { status, message } = headShaResult;
+        if (status === 401 || status === 403) {
+          return {
+            kind: "failed",
+            message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""} (scope=${pr.candidate.scope}, secretName=${pr.candidate.secretName})`,
+          };
+        }
+        if (status === 404) {
+          return { kind: "failed", message: `status:failed:pr_not_found: HTTP 404 ${message ?? ""}` };
+        }
+        if (status === 429) {
+          return { kind: "failed", message: `status:failed:pr_rate_limited: HTTP 429 ${message ?? ""}` };
+        }
+        if (status === 0) {
+          return { kind: "failed", message: `status:failed:pr_network: ${message ?? "network_error"}` };
+        }
+        return { kind: "failed", message: `status:failed:pr_error: HTTP ${status} ${message ?? ""}` };
+      }
+
+      const headSha = headShaResult.headSha;
+      const result = await writeCommitStatus(pr.candidate.token, pr.owner, pr.repo, headSha, issueIdentifier);
+      if (result.success) {
+        return {
+          kind: "armed",
+          message: `status:published (live re-resolve): paperclip/approved status written to ${pr.displayName} head ${headSha.slice(0, 7)}`,
+        };
+      }
+
+      const safeError = result.error ?? "unknown_error";
+      const truncated = safeError.length > 200 ? safeError.slice(0, 200) + "..." : safeError;
+      return { kind: "failed", message: `status:failed:${truncated}` };
+    }
+
+    const filteredList =
+      withState.length > 0
+        ? withState.map((row) => `${row.displayName} state=${row.cachedState ?? "unhydrated"}`).join(", ")
+        : "none";
+    return {
+      kind: "skipped",
+      message: `status:skipped:no-pr: no OPEN linked PR (cached mentions filtered: ${filteredList}; live re-resolve found 0)`,
+    };
   }
 
   if (linkedPRs.length > 1) {
@@ -408,6 +550,76 @@ async function fetchPullRequestHeadSha(
     return { ok: true, status: response.status, message: null, headSha: sha };
   }
   return { ok: false, status: response.status, message: "head.sha missing from response", headSha: null };
+}
+
+export interface OpenPullRequestListItem {
+  number: number;
+  draft: boolean | null;
+  headRef: string | null;
+  title: string | null;
+  body: string | null;
+}
+
+export interface OpenPullRequestsSuccess extends GitHubFetchResult {
+  ok: true;
+  items: OpenPullRequestListItem[];
+}
+
+export interface OpenPullRequestsFailure extends GitHubFetchResult {
+  ok: false;
+  items: never[];
+}
+
+export type OpenPullRequestsResult = OpenPullRequestsSuccess | OpenPullRequestsFailure;
+
+async function fetchOpenPullRequests(
+  token: string,
+  owner: string,
+  repo: string,
+): Promise<OpenPullRequestsResult> {
+  const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
+    repo,
+  )}/pulls?state=open&per_page=100`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-merge-arming",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+
+  let response: Response;
+  try {
+    response = await ghFetch(url, { headers });
+  } catch {
+    return { ok: false, status: 0, message: "network_error", items: [] };
+  }
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const message = body?.message as string | undefined;
+    return { ok: false, status: response.status, message: message ?? null, items: [] };
+  }
+
+  const body = await response.json().catch(() => null);
+  if (!Array.isArray(body)) {
+    return { ok: false, status: response.status, message: "empty_response", items: [] };
+  }
+
+  const items: OpenPullRequestListItem[] = [];
+  for (const raw of body) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const pr = raw as Record<string, unknown>;
+    if (typeof pr.number !== "number") continue;
+    const head = pr.head as Record<string, unknown> | undefined | null;
+    items.push({
+      number: pr.number,
+      draft: typeof pr.draft === "boolean" ? pr.draft : null,
+      headRef: typeof head?.ref === "string" ? head.ref : null,
+      title: typeof pr.title === "string" ? pr.title : null,
+      body: typeof pr.body === "string" ? pr.body : null,
+    });
+  }
+  return { ok: true, status: response.status, message: null, items };
 }
 
 async function writeCommitStatus(

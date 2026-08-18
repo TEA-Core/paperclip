@@ -1109,7 +1109,9 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
     it("returns status:skipped:no-pr when no linked external objects exist", async () => {
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("skipped");
-      expect(result.message).toBe("status:skipped:no-pr: No linked pull request found");
+      expect(result.message).toBe(
+        "status:skipped:no-pr: no OPEN linked PR (cached mentions filtered: none; live re-resolve found 0)",
+      );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
@@ -1122,21 +1124,247 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
 
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("skipped");
-      expect(result.message).toBe("status:skipped:no-pr: No linked pull request found");
+      expect(result.message).toBe(
+        "status:skipped:no-pr: no OPEN linked PR (cached mentions filtered: none; live re-resolve found 0)",
+      );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
-    it("returns status:skipped:no-pr when only closed PRs are linked", async () => {
+    it("returns status:skipped:no-pr naming the filtered closed mention when live re-resolve finds 0", async () => {
       await insertMention(
         createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
           state: "closed",
         }),
       );
 
+      mockGhFetch.mockResolvedValueOnce(createMockResponse([]));
+
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("skipped");
-      expect(result.message).toBe("status:skipped:no-pr: No linked pull request found");
+      expect(result.message).toBe(
+        "status:skipped:no-pr: no OPEN linked PR (cached mentions filtered: TEA-Core/paperclip#42 state=closed; live re-resolve found 0)",
+      );
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+      expect(mockGhFetch.mock.calls[0]![0]).toBe(
+        "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100",
+      );
+    });
+  });
+
+  describe("live re-resolve fallback (SUP-13313)", () => {
+    it("publishes to the live head when the only cached mention is closed and exactly one open PR matches", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 3139, {
+          state: "closed",
+        }),
+      );
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse([
+            {
+              number: 3154,
+              draft: false,
+              head: { ref: "SUP-13302-apply-migration" },
+              title: "Apply migration 20260831000253 (SUP-13302)",
+              body: "Delivers SUP-13302",
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/3154" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-13302");
+      expect(result.kind).toBe("armed");
+      expect(result.message).toBe(
+        `status:published (live re-resolve): paperclip/approved status written to TEA-Core/paperclip#3154 head ${HEAD_SHA.slice(0, 7)}`,
+      );
+
+      expect(mockGhFetch).toHaveBeenCalledTimes(3);
+      expect(mockGhFetch.mock.calls[0]![0]).toBe(
+        "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100",
+      );
+      expect(mockGhFetch.mock.calls[1]![0]).toBe(
+        "https://api.github.com/repos/TEA-Core/paperclip/pulls/3154",
+      );
+      expect(mockGhFetch.mock.calls[2]![0]).toBe(
+        `https://api.github.com/repos/TEA-Core/paperclip/statuses/${HEAD_SHA}`,
+      );
+
+      const statusCall = mockGhFetch.mock.calls[2]!;
+      expect(statusCall[1]).toMatchObject({
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${GITHUB_TOKEN}`,
+        },
+      });
+      const body = JSON.parse(statusCall[1]!.body as string);
+      expect(body).toEqual({
+        state: "success",
+        context: "paperclip/approved",
+        description: "SUP-13302 approved via Paperclip",
+        target_url: "https://paperclip.example.com/issues/SUP-13302",
+      });
+    });
+
+    it("skips with a diagnostic no-pr naming the filtered closed mention when GitHub has no matching open PR", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 3139, {
+          state: "closed",
+        }),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(createMockResponse([]));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-13302");
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("status:skipped:no-pr");
+      expect(result.message).toContain("TEA-Core/paperclip#3139 state=closed");
+      expect(result.message).not.toContain("No linked pull request found");
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("skips with ambiguous listing both live PRs when two open PRs match the issue identifier", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 3139, {
+          state: "closed",
+        }),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse([
+          {
+            number: 3154,
+            draft: false,
+            head: { ref: "SUP-13302-a" },
+            title: "SUP-13302 part 1",
+            body: "SUP-13302",
+          },
+          {
+            number: 3155,
+            draft: false,
+            head: { ref: "SUP-13302-b" },
+            title: "SUP-13302 part 2",
+            body: "SUP-13302",
+          },
+        ]),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-13302");
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("status:skipped:ambiguous");
+      expect(result.message).toContain("Multiple linked PRs (2)");
+      expect(result.message).toContain("TEA-Core/paperclip#3154");
+      expect(result.message).toContain("TEA-Core/paperclip#3155");
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("excludes draft PRs from live matches and publishes the single non-draft match", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 3139, {
+          state: "closed",
+        }),
+      );
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse([
+            {
+              number: 3154,
+              draft: true,
+              head: { ref: "SUP-13302-draft" },
+              title: "SUP-13302 draft",
+              body: "SUP-13302",
+            },
+            {
+              number: 3156,
+              draft: false,
+              head: { ref: "SUP-13302-final" },
+              title: "SUP-13302 final",
+              body: "SUP-13302",
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/3156" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-13302");
+      expect(result.kind).toBe("armed");
+      expect(result.message).toContain("live re-resolve");
+      expect(result.message).toContain("TEA-Core/paperclip#3156");
+      expect(mockGhFetch).toHaveBeenCalledTimes(3);
+      expect(mockGhFetch.mock.calls[1]![0]).toBe(
+        "https://api.github.com/repos/TEA-Core/paperclip/pulls/3156",
+      );
+    });
+
+    it("matches the issue identifier case-insensitively in head.ref, title, and body", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 3139, {
+          state: "closed",
+        }),
+      );
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse([
+            {
+              number: 3154,
+              draft: false,
+              head: { ref: "SUP-13302-x" },
+              title: "Unrelated",
+              body: "see sup-13302",
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/3154" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-13302");
+      expect(result.kind).toBe("armed");
+      expect(result.message).toContain("TEA-Core/paperclip#3154");
+    });
+
+    it("returns status:failed:auth_required in the fallback when no token is resolvable for the repo", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 3139, {
+          state: "closed",
+        }),
+      );
+
+      mockGetByName.mockResolvedValue(null);
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-13302");
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe(
+        "status:failed:auth_required: No GitHub token resolvable for TEA-Core/paperclip (repo not found at company or project scope) (scope=null, secretName=null)",
+      );
       expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("returns status:failed:pr_auth when the open PR list call 401s", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 3139, {
+          state: "closed",
+        }),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ message: "Bad credentials" }, false, 401),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-13302");
+      expect(result.kind).toBe("failed");
+      expect(result.message).toBe(
+        "status:failed:pr_auth: HTTP 401 Bad credentials (scope=company, secretName=GITHUB_TOKEN)",
+      );
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1181,14 +1409,18 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
 
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("skipped");
-      expect(result.message).toBe("status:skipped:no-pr: No linked pull request found");
+      expect(result.message).toBe(
+        "status:skipped:no-pr: no OPEN linked PR (cached mentions filtered: none; live re-resolve found 0)",
+      );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
     it("returns status:skipped:no-pr only when there is genuinely no pull_request mention row", async () => {
       const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
       expect(result.kind).toBe("skipped");
-      expect(result.message).toBe("status:skipped:no-pr: No linked pull request found");
+      expect(result.message).toBe(
+        "status:skipped:no-pr: no OPEN linked PR (cached mentions filtered: none; live re-resolve found 0)",
+      );
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
   });
