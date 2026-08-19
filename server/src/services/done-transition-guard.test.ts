@@ -225,7 +225,7 @@ describe("evaluateDoneTransitionGuard", () => {
     it("does not treat unknown disposition as override", async () => {
       const override: DoneTransitionOverride = { disposition: "some-unknown-disposition" };
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
       });
       ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ ahead_by: 1 }), { status: 200 }));
       const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
@@ -458,7 +458,7 @@ describe("evaluateDoneTransitionGuard", () => {
         { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 279, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#279", cachedState: null },
       ]);
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
@@ -480,7 +480,7 @@ describe("evaluateDoneTransitionGuard", () => {
         { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 279, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#279", cachedState: null },
       ]);
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
@@ -684,7 +684,7 @@ describe("evaluateDoneTransitionGuard", () => {
   describe("branch ahead with merged PR", () => {
     it("allows transition when branch is ahead and has a merged PR", async () => {
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
@@ -705,7 +705,7 @@ describe("evaluateDoneTransitionGuard", () => {
   describe("branch ahead without merged PR", () => {
     it("rejects transition with 409 when branch is ahead and has no merged PR", async () => {
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
@@ -728,7 +728,7 @@ describe("evaluateDoneTransitionGuard", () => {
       // unlinked/unhydrated: the approval that arms the merge must not be
       // blocked by the unmerged branch it is approving.
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
@@ -754,6 +754,168 @@ describe("evaluateDoneTransitionGuard", () => {
           }),
         }),
       );
+    });
+  });
+
+  describe("foreign workspace branch (SUP-13337)", () => {
+    // The workspace branch belongs to a different issue (shared/inherited worktree,
+    // merge-X card, corrective child on a parent branch): the branch's own
+    // ahead/merged state must not pass or fail THIS issue's `done`.
+    const foreignBranch = "SUP-99999-other-issue-branch";
+
+    it("blocks when the branch is foreign and neither commits nor merged PRs are attributable to the issue (allowed:false naming branch and identifier)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      mockGitProbe("5", "0");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.aheadBy).toBe(3);
+      expect(result.branch).toBe(foreignBranch);
+      expect(result.reason).toContain(foreignBranch);
+      expect(result.reason).toContain("SUP-12345");
+      expect(result.reason).toContain("deliver.sh");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "foreign_workspace_branch",
+            skipReason: `foreign_workspace_branch:${foreignBranch}:SUP-12345`,
+            branch: foreignBranch,
+            attributableCommitCount: 0,
+            mergedPrCount: 0,
+          }),
+        }),
+      );
+    });
+
+    it("allows when the foreign branch carries at least one commit attributable to the issue (shared branch still passes)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.aheadBy).toBe(3);
+      expect(result.reason).toContain(foreignBranch);
+      expect(result.reason).toContain("SUP-12345");
+      expect(result.skipReason).toContain(`foreign_workspace_branch:${foreignBranch}:SUP-12345`);
+      expect(ghFetchMock.mock.calls.some(([url]) => String(url).includes("/search/issues"))).toBe(false);
+    });
+
+    it("allows when the foreign branch has no attributable commits but a merged PR references the issue", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      mockGitProbe("5", "0");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 2, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("merged PR");
+      expect(result.reason).toContain("SUP-12345");
+      expect(result.skipReason).toContain(`foreign_workspace_branch:${foreignBranch}:SUP-12345`);
+    });
+
+    it("fails open when the foreign-branch attribution probes are unmeasurable", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      mockGitProbe("5", "0");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response("upstream error", { status: 502 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain(`foreign_workspace_branch:${foreignBranch}:SUP-12345`);
+      expect(result.skipReason).toContain("foreign_workspace_branch_probe_failed");
+    });
+
+    it("keeps the decisionCarried carve-out for a foreign workspace branch", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      mockGitProbe("5", "0");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.aheadBy).toBe(3);
+      expect(result.reason).toContain("arms the merge");
+      expect(result.skipReason ?? "").not.toContain(`foreign_workspace_branch:${foreignBranch}:SUP-12345`);
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "ahead_by_no_merged_pr_decision_carried:3",
+            skipReason: expect.stringContaining(`foreign_workspace_branch:${foreignBranch}:SUP-12345`),
+          }),
+        }),
+      );
+    });
+
+    it("runs no identifier-attribution probes when the branch references the issue identifier (common path byte-identical)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 1 }), { status: 200 });
+        }
+        if (url.includes("/pulls?")) {
+          return new Response(JSON.stringify([{ merged: true, merged_at: "2026-08-13T12:00:00Z" }]), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.aheadBy).toBe(1);
+      expect(result.reason).toContain("merged PR");
+      expect(result.skipReason).toBeNull();
+      expect(mockExecFile).not.toHaveBeenCalled();
+      expect(ghFetchMock.mock.calls.some(([url]) => String(url).includes("/search/issues"))).toBe(false);
     });
   });
 
@@ -949,7 +1111,7 @@ describe("evaluateDoneTransitionGuard", () => {
 
     it("allows transition when merged-PR lookup throws", async () => {
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
@@ -1006,7 +1168,7 @@ describe("evaluateDoneTransitionGuard", () => {
 
     it("allows transition and emits auth_failed:merged_pr:401 when pulls API returns 401", async () => {
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
@@ -1027,7 +1189,7 @@ describe("evaluateDoneTransitionGuard", () => {
 
     it("allows transition and emits auth_failed:merged_pr:403 when pulls API returns 403", async () => {
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
@@ -1130,7 +1292,7 @@ describe("evaluateDoneTransitionGuard", () => {
   describe("PR #221 shape (squash-merged, ahead_by: 1)", () => {
     it("allows transition for a squash-merged branch reporting ahead_by: 1", async () => {
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {

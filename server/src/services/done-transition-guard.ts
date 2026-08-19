@@ -858,6 +858,133 @@ export async function evaluateDoneTransitionGuard(
     };
   }
 
+  const identifier = issue.identifier;
+  const branchReferencesIdentifier =
+    identifier !== null && branch.toLowerCase().includes(identifier.toLowerCase());
+
+  // SUP-13337: when the workspace branch does not reference the issue identifier, it
+  // may belong to a different issue (shared/inherited worktrees, merge-X cards,
+  // corrective children on a parent branch). The branch's own ahead/merged state is
+  // then somebody else's delivery — it must not pass or fail THIS issue. Decide on
+  // identifier-attributed commits and identifier-referencing merged PRs instead,
+  // reusing the #294 helpers. Every such evaluation, allowed or blocked, records
+  // `foreign_workspace_branch:<branch>:<identifier>` in skipReason so it is countable.
+  if (identifier !== null && !branchReferencesIdentifier) {
+    const foreignToken = `foreign_workspace_branch:${branch}:${identifier}`;
+    const attribution = ctx.worktreePath
+      ? await countIssueAttributableCommits(ctx.worktreePath, ctx.defaultRef, identifier)
+      : null;
+    const attributableCount = attribution?.attributableCount ?? 0;
+
+    if (attributableCount > 0) {
+      return {
+        allowed: true,
+        reason:
+          `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch), ` +
+          `but ${attributableCount} commit${attributableCount === 1 ? "" : "s"} on it are attributable to ${identifier}; transition allowed`,
+        aheadBy,
+        branch,
+        defaultRef: ctx.defaultRef,
+        owner: parsed.owner,
+        repo: parsed.repo,
+        skipped: false,
+        skipReason: appendSkipReason(prSkipReason, foreignToken),
+      };
+    }
+
+    if (decisionCarried) {
+      // Same deadlock shape as the open-linked-PR block above, firing when the
+      // open PR is unlinked/unhydrated: the approval that arms the merge must
+      // not be blocked by the unmerged branch it is approving (SUP-13207).
+      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        reason: `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
+        skipReason: appendSkipReason(
+          foreignToken,
+          `ahead_by_no_merged_pr_decision_carried:${aheadBy}`,
+        ),
+        branch,
+        defaultRef: ctx.defaultRef,
+        aheadBy,
+      });
+      return {
+        allowed: true,
+        reason:
+          `Decision-carrying transition exempted from the ahead-of-base-without-merged-PR block: ` +
+          `Branch ${branch} is ahead of ${ctx.defaultRef} by ${aheadBy} commits, does not reference ` +
+          `${identifier} (foreign/workspace-shared branch), and carries no commit attributable to ${identifier}. ` +
+          "The approval arms the merge rather than closing the issue — the branch stays unmerged until the PR lands.",
+        aheadBy,
+        branch,
+        defaultRef: ctx.defaultRef,
+        owner: parsed.owner,
+        repo: parsed.repo,
+        skipped: false,
+        skipReason: prSkipReason,
+      };
+    }
+
+    const mergedPrCount = await githubMergedPrCountForIdentifier(
+      parsed.hostname,
+      parsed.owner,
+      parsed.repo,
+      identifier,
+      token,
+    );
+
+    if (mergedPrCount !== null && mergedPrCount > 0) {
+      return {
+        allowed: true,
+        reason:
+          `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch), ` +
+          `but ${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} reference${mergedPrCount === 1 ? "s" : ""} ${identifier} (carrier delivery); transition allowed`,
+        aheadBy,
+        branch,
+        defaultRef: ctx.defaultRef,
+        owner: parsed.owner,
+        repo: parsed.repo,
+        skipped: false,
+        skipReason: appendSkipReason(prSkipReason, foreignToken),
+      };
+    }
+
+    if (attribution === null || mergedPrCount === null) {
+      const unmeasured = attribution === null ? "attribution" : "merged_pr";
+      return fallback(
+        `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch) ` +
+          `and the attribution probe could not be fully measured (${unmeasured}); transition allowed`,
+        true,
+        appendSkipReason(foreignToken, `foreign_workspace_branch_probe_failed:${unmeasured}`),
+      );
+    }
+
+    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      reason: "foreign_workspace_branch",
+      skipReason: foreignToken,
+      branch,
+      defaultRef: ctx.defaultRef,
+      owner: parsed.owner,
+      repo: parsed.repo,
+      aheadBy,
+      attributableCommitCount: attribution.attributableCount,
+      mergedPrCount,
+    });
+    return {
+      allowed: false,
+      reason:
+        `Branch ${branch} is ahead of ${ctx.defaultRef} by ${aheadBy} commits and does not reference ` +
+        `${identifier} (foreign/workspace-shared branch); no commit on it is attributable to ` +
+        `${identifier} and no merged PR references ${identifier}. ` +
+        "Deliver this issue's work via its own branch and deliver.sh before marking the issue done.",
+      aheadBy,
+      branch,
+      defaultRef: ctx.defaultRef,
+      owner: parsed.owner,
+      repo: parsed.repo,
+      skipped: false,
+      skipReason: prSkipReason,
+    };
+  }
+
   let hasMergedPr: boolean;
   try {
     hasMergedPr = await githubBranchHasMergedPr(parsed.hostname, parsed.owner, parsed.repo, branch, token);
