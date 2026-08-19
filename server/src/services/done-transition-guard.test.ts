@@ -883,7 +883,7 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.skipped).toBe(false);
       expect(result.aheadBy).toBe(3);
       expect(result.reason).toContain("arms the merge");
-      expect(result.skipReason).toContain(`foreign_workspace_branch:${foreignBranch}:SUP-12345`);
+      expect(result.skipReason ?? "").not.toContain(`foreign_workspace_branch:${foreignBranch}:SUP-12345`);
       expect(logActivity).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({

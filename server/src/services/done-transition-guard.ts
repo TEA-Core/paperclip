@@ -919,7 +919,7 @@ export async function evaluateDoneTransitionGuard(
         owner: parsed.owner,
         repo: parsed.repo,
         skipped: false,
-        skipReason: appendSkipReason(prSkipReason, foreignToken),
+        skipReason: prSkipReason,
       };
     }
 
