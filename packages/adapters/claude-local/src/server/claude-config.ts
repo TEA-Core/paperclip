@@ -80,6 +80,28 @@ async function buildSeedSnapshotKey(files: SeedFile[]): Promise<string> {
   return hash.digest("hex").slice(0, 16);
 }
 
+/**
+ * Deliberately NOT widened to the shared `agents` group (SUP-13487).
+ *
+ * `mkdtemp` fixes the staging dir at 0700 and `fs.rename` preserves that mode, so
+ * the promoted `targetDir` is 0700 too — which under M1 (agent uid 1001, server uid
+ * 1000) is the shape that broke every `opencode_local` run in SUP-13484. It is
+ * correct here, because this snapshot never reaches an agent child:
+ *
+ *   execute.ts:569  claudeConfigSeedDir = useManagedRemoteClaudeConfig ? … : null
+ *   execute.ts:562  useManagedRemoteClaudeConfig = executionTargetIsRemote && …
+ *
+ * It is `null` for every local target, and its only consumers are `localDir:` on an
+ * upload asset (execute.ts:602) and the remote path computation (execute.ts:653) —
+ * both read by the server process that owns the directory. The sandbox receives its
+ * own copy; nothing at uid 1001 ever traverses this path.
+ *
+ * Widening it would be a downgrade, not a fix: these files are credential-bearing
+ * Claude config staged in a world-readable tmpdir parent, so group-readable here
+ * means readable by the very principal the uid split exists to exclude. If a LOCAL
+ * lane ever starts consuming this seed, that is when it needs
+ * `ensureAgentAccessibleDir` — not before.
+ */
 async function materializeSeedSnapshot(input: {
   rootDir: string;
   snapshotKey: string;

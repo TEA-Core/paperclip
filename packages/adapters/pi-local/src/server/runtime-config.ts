@@ -1,6 +1,10 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {
+  ensureAgentAccessibleDir,
+  ensureAgentAccessibleTree,
+} from "@paperclipai/adapter-utils/agent-shared-dir";
 
 type PreparedPiRuntimeConfig = {
   env: Record<string, string>;
@@ -122,12 +126,22 @@ export async function preparePiRuntimeConfig(input: {
   }
 
   const agentConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-agent-config-"));
+  // `mkdtemp` is fixed at 0700 by POSIX and ignores the server's umask 0002, so this
+  // directory is unreachable by an agent child running at uid 1001 — and it becomes
+  // that child's `PI_CODING_AGENT_DIR` below. Widen to the shared `agents` group
+  // BEFORE anything is written inside (SUP-13484 / SUP-13487).
+  await ensureAgentAccessibleDir(agentConfigDir);
   try {
     await fs.writeFile(
       path.join(agentConfigDir, "models.json"),
       `${JSON.stringify({ providers }, null, 2)}\n`,
       "utf8",
     );
+    // The child only has to READ models.json, but its mode comes from the server's
+    // umask rather than from anything here — under a stricter umask it lands 0600
+    // and stays unreadable to the child even inside a group-accessible directory.
+    // Marking the tree makes the staged config independent of the ambient umask.
+    await ensureAgentAccessibleTree(agentConfigDir);
   } catch (err) {
     // Never leak the temp dir when the write fails (e.g. disk-full): the
     // caller only receives the cleanup handle on success.

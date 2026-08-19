@@ -520,6 +520,22 @@ async function stageCodexHomeEntry(
   // managed MCP `Authorization = "Bearer …"` header (and the source writer
   // persists it 0600), so a per-file credential allowlist would silently
   // downgrade it to 0644 in a world-readable tmpdir.
+  //
+  // Re-confirmed under M1 (SUP-13487). "The owner" above was written when the
+  // server and agent runtimes shared uid 1000, so M1 (agent children exec at uid
+  // 1001) invalidates that premise everywhere it is NOT true that the reader is
+  // the server itself. Here it still is: `stageCodexHomeForSync` is only ever
+  // consumed as `localDir` on a sandbox upload asset — execute.ts:811 and
+  // acp.ts:203 — read by the server process that created it and removed by that
+  // same process at teardown (execute.ts:1642, acp.ts:264). The sandbox receives
+  // its own copy over the transport; no uid-1001 process traverses this path.
+  //
+  // So this 0700/0600 staging is deliberately NOT given the SUP-13484
+  // `ensureAgentAccessibleDir` treatment. Applying it here would hand the OAuth
+  // `auth.json` and the `config.toml` bearer header to the `agents` group — which
+  // contains the agent uid — in a world-readable tmpdir. That is the exposure the
+  // uid split exists to close, so widening here would be a regression wearing the
+  // costume of a consistency fix.
   await fs.writeFile(target, bytes, { mode: 0o600 });
   // Explicit chmod so the mode is 0600 regardless of the process umask.
   await fs.chmod(target, 0o600);

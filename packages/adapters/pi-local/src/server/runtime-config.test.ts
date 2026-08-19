@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { resetAgentSharedGidCacheForTests } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
@@ -223,5 +224,68 @@ describe("preparePiRuntimeConfig", () => {
     expect(prepared.env.PI_CODING_AGENT_DIR).toBeUndefined();
     expect(prepared.notes).toEqual([]);
     await prepared.cleanup();
+  });
+
+  // SUP-13487. The gid is injected as the process's OWN gid rather than a real
+  // `agents` group: chown(2) to a group you already belong to is permitted
+  // unprivileged, so this exercises the real chown/chmod on every host including
+  // CI, where no `agents` group exists. Mirrors the sibling suites added by
+  // SUP-13486.
+  describe("agent-uid accessibility of the staged config dir", () => {
+    const OWN_GID = typeof process.getgid === "function" ? process.getgid() : null;
+    const savedGidEnv = process.env.PAPERCLIP_AGENTS_GID;
+
+    beforeEach(() => {
+      resetAgentSharedGidCacheForTests();
+    });
+
+    afterEach(() => {
+      if (savedGidEnv === undefined) delete process.env.PAPERCLIP_AGENTS_GID;
+      else process.env.PAPERCLIP_AGENTS_GID = savedGidEnv;
+      resetAgentSharedGidCacheForTests();
+    });
+
+    it.skipIf(process.platform === "win32" || OWN_GID == null)(
+      "widens PI_CODING_AGENT_DIR and models.json so a uid-1001 child can read them",
+      async () => {
+        process.env.PAPERCLIP_AGENTS_GID = String(OWN_GID);
+        resetAgentSharedGidCacheForTests();
+
+        const prepared = await preparePiRuntimeConfig({
+          env: {
+            PAPERCLIP_PI_PROVIDERS: JSON.stringify({
+              acme: { baseUrl: "https://example.invalid/v1", models: ["m1"] },
+            }),
+          },
+        });
+        const dir = prepared.env.PI_CODING_AGENT_DIR;
+        expect(dir).toBeTruthy();
+        cleanupPaths.add(dir as string);
+
+        // `mkdtemp` is fixed at 0700 by POSIX and ignores the server umask, so
+        // without the fix the child cannot even traverse its own config dir.
+        const dirMode = (await fs.stat(dir as string)).mode & 0o7777;
+        expect(dirMode & 0o070).toBe(0o070); // group rwx
+        expect(dirMode & 0o2000).toBe(0o2000); // setgid: child-created entries keep the gid
+        expect(dirMode & 0o007).toBe(0); // never widened to other
+        expect((await fs.stat(dir as string)).gid).toBe(OWN_GID);
+
+        // The child only READS models.json. Assert group read, so a stricter
+        // umask cannot silently make the staged config unreadable to it.
+        //
+        // Deliberately no assertion on the `other` bits here: unlike the mkdtemp
+        // directory (which POSIX fixes at 0700), this file's baseline comes from
+        // the ambient umask — 0644 under the server's own 0002 — so `other` is
+        // already set before the helper runs and is not something this change
+        // controls. The helper only ever ORs in group bits; the directory
+        // assertion above is what proves nothing is widened to `other`.
+        const modelsPath = path.join(dir as string, "models.json");
+        const fileMode = (await fs.stat(modelsPath)).mode & 0o7777;
+        expect(fileMode & 0o040).toBe(0o040);
+        expect((await fs.stat(modelsPath)).gid).toBe(OWN_GID);
+
+        await prepared.cleanup();
+      },
+    );
   });
 });
