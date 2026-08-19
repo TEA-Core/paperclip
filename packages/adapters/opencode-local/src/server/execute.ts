@@ -74,6 +74,7 @@ import {
   type OpenCodeDatabaseGrowthGuard,
   type OpenCodeDatabaseGrowthTrip,
 } from "./db-guard.js";
+import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -320,8 +321,12 @@ async function ensureOpenCodeSkillsInjected(
 
 async function buildOpenCodeSkillsDir(config: Record<string, unknown>): Promise<string> {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-skills-"));
+  // Same 0700-mkdtemp hazard as the runtime config (SUP-13484): this path is handed
+  // to the agent child, which runs at uid 1001 and cannot traverse a 0700 server dir.
+  await ensureAgentAccessibleDir(tmp);
   const target = path.join(tmp, "skills");
   await fs.mkdir(target, { recursive: true });
+  await ensureAgentAccessibleDir(target);
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredNames = new Set(resolvePaperclipDesiredSkillNames(config, availableEntries));
   for (const entry of availableEntries) {
