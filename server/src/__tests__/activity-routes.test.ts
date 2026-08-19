@@ -240,6 +240,117 @@ describe.sequential("activity routes", () => {
     });
   });
 
+  it("passes company activity action, actorType, from, and to filters through to the service", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get(
+        "/api/companies/company-1/activity?action=issue.done_transition_guard_skipped&actorType=system&from=2026-04-21T10:00:00.000Z&to=2026-04-21T12:00:00.000Z&entityType=issue&agentId=agent-1&limit=50",
+      ),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith({
+      companyId: "company-1",
+      agentId: "agent-1",
+      entityType: "issue",
+      entityId: undefined,
+      limit: 50,
+      action: ["issue.done_transition_guard_skipped"],
+      actorType: "system",
+      from: new Date("2026-04-21T10:00:00.000Z"),
+      to: new Date("2026-04-21T12:00:00.000Z"),
+    });
+  });
+
+  it("splits comma-separated company activity action values before passing them to the service", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?action=a,b"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith(
+      expect.objectContaining({ action: ["a", "b"] }),
+    );
+  });
+
+  it("treats an empty company activity action comma-list as absent", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?action=,,"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith({
+      companyId: "company-1",
+      agentId: undefined,
+      entityType: undefined,
+      entityId: undefined,
+      limit: 100,
+    });
+  });
+
+  it("rejects an invalid company activity actorType with 400", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?actorType=robot"),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid activity query");
+    expect(mockActivityService.list).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unparseable company activity from value with 400", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?from=not-a-date"),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid activity query");
+    expect(mockActivityService.list).not.toHaveBeenCalled();
+  });
+
+  it("lets an agent-scoped actor list company activity with the new filters without board access", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      companyIds: ["company-1"],
+      source: "agent_token",
+      isInstanceAdmin: false,
+    });
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get(
+        "/api/companies/company-1/activity?action=issue.done_transition_guard_skipped&actorType=system&from=2026-04-21T10:00:00.000Z&to=2026-04-21T12:00:00.000Z",
+      ),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith(
+      expect.objectContaining({
+        companyId: "company-1",
+        action: ["issue.done_transition_guard_skipped"],
+        actorType: "system",
+        from: new Date("2026-04-21T10:00:00.000Z"),
+        to: new Date("2026-04-21T12:00:00.000Z"),
+      }),
+    );
+  });
+
   it("resolves alphanumeric issue identifiers before loading runs", async () => {
     mockIssueService.getByIdentifier.mockResolvedValue({
       id: "issue-uuid-1",

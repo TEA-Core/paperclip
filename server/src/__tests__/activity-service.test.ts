@@ -117,6 +117,178 @@ describeEmbeddedPostgres("activity service", () => {
     expect(result.map((event) => event.action)).toEqual(["test.newest", "test.middle"]);
   });
 
+  it("filters company activity lists by action, actorType, and inclusive from/to windows", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const t10 = new Date("2026-04-21T10:00:00.000Z");
+    const t11 = new Date("2026-04-21T11:00:00.000Z");
+    const t12 = new Date("2026-04-21T12:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Guard census target",
+      description: "Issue receiving done-transition-guard activity rows.",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+        action: "issue.done_transition_guard_skipped",
+        entityType: "issue",
+        entityId: issueId,
+        createdAt: t10,
+      },
+      {
+        companyId,
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+        action: "issue.done_transition_guard_skipped",
+        entityType: "issue",
+        entityId: issueId,
+        createdAt: t11,
+      },
+      {
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.status_changed",
+        entityType: "issue",
+        entityId: issueId,
+        createdAt: t12,
+      },
+    ]);
+
+    const service = activityService(db);
+
+    const unfiltered = await service.list({ companyId });
+    expect(unfiltered.map((event) => event.action)).toEqual([
+      "issue.status_changed",
+      "issue.done_transition_guard_skipped",
+      "issue.done_transition_guard_skipped",
+    ]);
+    expect(Object.keys(unfiltered[0] ?? {}).sort()).toEqual(
+      [
+        "id",
+        "companyId",
+        "actorType",
+        "actorId",
+        "action",
+        "entityType",
+        "entityId",
+        "agentId",
+        "runId",
+        "responsibleUserId",
+        "details",
+        "createdAt",
+      ].sort(),
+    );
+    expect(unfiltered[0]).toMatchObject({
+      companyId,
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: t12,
+    });
+
+    const guardActions = await service.list({
+      companyId,
+      action: ["issue.done_transition_guard_skipped"],
+    });
+    expect(guardActions).toHaveLength(2);
+    for (const event of guardActions) {
+      expect(event.action).toBe("issue.done_transition_guard_skipped");
+    }
+
+    const otherAction = await service.list({
+      companyId,
+      action: ["issue.status_changed"],
+    });
+    expect(otherAction.map((event) => event.action)).toEqual(["issue.status_changed"]);
+
+    const allActions = await service.list({
+      companyId,
+      action: ["issue.done_transition_guard_skipped", "issue.status_changed"],
+    });
+    expect(allActions.map((event) => event.action)).toEqual([
+      "issue.status_changed",
+      "issue.done_transition_guard_skipped",
+      "issue.done_transition_guard_skipped",
+    ]);
+
+    const windowed = await service.list({ companyId, from: t10, to: t12 });
+    expect(windowed.map((event) => event.action)).toEqual([
+      "issue.status_changed",
+      "issue.done_transition_guard_skipped",
+      "issue.done_transition_guard_skipped",
+    ]);
+    const halfOpenWindow = await service.list({ companyId, from: t11, to: t12 });
+    expect(halfOpenWindow.map((event) => event.createdAt)).toEqual([t12, t11]);
+    const emptyWindow = await service.list({
+      companyId,
+      from: new Date("2026-04-21T12:00:01.000Z"),
+      to: new Date("2026-04-21T12:00:10.000Z"),
+    });
+    expect(emptyWindow).toEqual([]);
+
+    const systemRows = await service.list({ companyId, actorType: "system" });
+    expect(systemRows).toHaveLength(2);
+    for (const event of systemRows) {
+      expect(event).toMatchObject({
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+      });
+    }
+
+    const agentRows = await service.list({
+      companyId,
+      entityType: "issue",
+      entityId: issueId,
+      agentId,
+    });
+    expect(agentRows.map((event) => event.action)).toEqual(["issue.status_changed"]);
+
+    const composed = await service.list({
+      companyId,
+      action: ["issue.done_transition_guard_skipped"],
+      entityType: "issue",
+      entityId: issueId,
+      from: t10,
+    });
+    expect(composed.map((event) => event.action)).toEqual([
+      "issue.done_transition_guard_skipped",
+      "issue.done_transition_guard_skipped",
+    ]);
+  });
+
   it("returns compact usage and result summaries for issue runs", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
