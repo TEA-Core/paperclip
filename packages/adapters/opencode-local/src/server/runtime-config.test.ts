@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { resetAgentSharedGidCacheForTests } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
@@ -480,4 +481,51 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(prepared.runtimeConfigHome).toBe(prepared.env.XDG_CONFIG_HOME);
     await prepared.cleanup();
   });
+
+  // SUP-13484. `mkdtemp` is fixed at 0700 by POSIX and ignores the server's umask,
+  // so this XDG_CONFIG_HOME reached the agent child unreadable and every
+  // `opencode_local` agent died on dispatch with
+  // `EACCES: permission denied, mkdir '<home>/opencode'`.
+  describe.skipIf(process.platform === "win32" || typeof process.getgid !== "function")(
+    "agent-uid accessibility",
+    () => {
+      const savedGidEnv = process.env.PAPERCLIP_AGENTS_GID;
+
+      afterEach(() => {
+        if (savedGidEnv === undefined) delete process.env.PAPERCLIP_AGENTS_GID;
+        else process.env.PAPERCLIP_AGENTS_GID = savedGidEnv;
+        resetAgentSharedGidCacheForTests();
+      });
+
+      it("hands the child a config home and dir it can traverse and write", async () => {
+        process.env.PAPERCLIP_AGENTS_GID = String(process.getgid!());
+        resetAgentSharedGidCacheForTests();
+
+        const configHome = await makeConfigHome({ permission: { read: "allow" } });
+        const prepared = await prepareOpenCodeRuntimeConfig({
+          env: { XDG_CONFIG_HOME: configHome },
+          config: {},
+        });
+        cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+        const home = prepared.env.XDG_CONFIG_HOME;
+        const homeMode = (await fs.stat(home)).mode & 0o7777;
+        // Traversal into the home is what the failing `mkdir` actually needed: the
+        // kernel checks parent permission before it checks existence, which is why
+        // the error was EACCES and not EEXIST.
+        expect(homeMode & 0o070).toBe(0o070);
+        expect(homeMode & 0o007).toBe(0);
+
+        const innerMode = (await fs.stat(path.join(home, "opencode")).then((s) => s.mode)) & 0o7777;
+        expect(innerMode & 0o070).toBe(0o070);
+
+        // The config we stage is useless if the child cannot read it back.
+        const cfgMode =
+          (await fs.stat(path.join(home, "opencode", "opencode.json")).then((s) => s.mode)) & 0o7777;
+        expect(cfgMode & 0o040).toBe(0o040);
+
+        await prepared.cleanup();
+      });
+    },
+  );
 });

@@ -2,6 +2,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
+import {
+  ensureAgentAccessibleDir,
+  ensureAgentAccessibleTree,
+} from "@paperclipai/adapter-utils/agent-shared-dir";
 import { isTruthyEnvFlag } from "./models.js";
 
 type PreparedOpenCodeRuntimeConfig = {
@@ -137,10 +141,19 @@ export async function prepareOpenCodeRuntimeConfig(input: {
 
   const sourceConfigDir = path.join(resolveXdgConfigHome(input.env), "opencode");
   const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-config-"));
+  // `mkdtemp` is fixed at 0700 by POSIX and ignores the server's umask 0002, so this
+  // directory is unreachable by an agent child running at uid 1001 — and it becomes
+  // that child's XDG_CONFIG_HOME below. Widen to the shared `agents` group BEFORE
+  // anything is created inside, or OpenCode dies on start with
+  // `EACCES: permission denied, mkdir '<home>/opencode'` (SUP-13484).
+  await ensureAgentAccessibleDir(runtimeConfigHome);
   const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
   const runtimeConfigPath = path.join(runtimeConfigDir, "opencode.json");
 
   await fs.mkdir(runtimeConfigDir, { recursive: true });
+  // OpenCode writes its own state (auth.json, caches) alongside the config we stage,
+  // so the child needs write access one level down too — not just traversal.
+  await ensureAgentAccessibleDir(runtimeConfigDir);
   try {
     await fs.cp(sourceConfigDir, runtimeConfigDir, {
       recursive: true,
@@ -153,6 +166,9 @@ export async function prepareOpenCodeRuntimeConfig(input: {
       throw err;
     }
   }
+  // `fs.cp` preserves source modes, so a 0600 `auth.json` staged from the operator's
+  // config would remain unreadable to the child even inside a group-accessible dir.
+  await ensureAgentAccessibleTree(runtimeConfigDir);
 
   const existingConfig = await readJsonObject(runtimeConfigPath);
   const existingPermission = isPlainObject(existingConfig.permission)
