@@ -124,7 +124,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const firstStageId = randomUUID();
     const secondStageId = randomUUID();
     const identifier = `${issuePrefix}-1`;
-    const branchName = "SUP-13185-test-branch";
+    const branchName = `${identifier}-test-branch`;
     const repoUrl = "https://github.com/TEA-Core/paperclip";
     const defaultRef = "fold/tea-patches-v2026.722.0";
     const now = new Date();
