@@ -256,7 +256,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, recoveryService } from "./recovery/service.js";
+import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES, recoveryService } from "./recovery/service.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
   decideIssueReviewPathRecovery,
@@ -396,7 +396,6 @@ const STALE_RUN_HANDOFF_HOPS_KEY = "staleRunHandoffHops";
 // contradictory (e.g. assignee and review participant disagree). Stop after one hop
 // so two agents cannot ping-pong queued runs at each other forever.
 const STALE_RUN_HANDOFF_MAX_HOPS = 1;
-const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
   ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS,
@@ -432,7 +431,7 @@ const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
 // blocks instead, with the remediation in the comment.
 const OPENCODE_DB_GROWTH_LIMIT_FAILURE_CODE = "opencode_db_growth_limit";
 const OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE = "opencode_db_growth_limit";
-const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
+export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
 // A reviewer that runs to completion and comments without deciding is deliberately
@@ -3767,7 +3766,7 @@ export function summarizeHeartbeatRunListResultJson(input: {
   return Object.keys(summary).length > 0 ? summary : null;
 }
 
-function didAutomaticRecoveryFail(
+export function didAutomaticRecoveryFail(
   latestRun: Pick<typeof heartbeatRuns.$inferSelect, "status" | "contextSnapshot"> | null,
   expectedRetryReason:
     | "assignment_recovery"
