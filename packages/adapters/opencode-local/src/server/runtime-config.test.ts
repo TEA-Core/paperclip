@@ -480,4 +480,53 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(prepared.runtimeConfigHome).toBe(prepared.env.XDG_CONFIG_HOME);
     await prepared.cleanup();
   });
+
+  // M1 uid split (SUP-12532 / SUP-13484). These assert the SHAPE of the gate,
+  // not a concrete gid: the `agents` group exists on the deployed image but not
+  // on a CI runner, so asserting gid 1002 here would be a test that passes for
+  // the wrong reason in one environment and fails for the wrong reason in the
+  // other. What must hold everywhere is that the gate is off by default and
+  // that a failed group lookup cannot take the run down.
+  describe("agent-group sharing of the runtime config home", () => {
+    const priorAgentUid = process.env.PAPERCLIP_AGENT_UID;
+
+    afterEach(() => {
+      if (priorAgentUid === undefined) delete process.env.PAPERCLIP_AGENT_UID;
+      else process.env.PAPERCLIP_AGENT_UID = priorAgentUid;
+    });
+
+    it("leaves the config home 0700 when the uid split is not armed", async () => {
+      delete process.env.PAPERCLIP_AGENT_UID;
+      const configHome = await makeConfigHome({ permission: { read: "allow" } });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      // Server and agents share a uid here, so widening the directory would
+      // grant access to nobody who does not already have it.
+      const stat = await fs.stat(prepared.runtimeConfigHome);
+      expect(stat.mode & 0o7777).toBe(0o700);
+      await prepared.cleanup();
+    });
+
+    it("still prepares a usable config when the shared group cannot be resolved", async () => {
+      // Armed, but on a host with no `agents` group — the getent lookup fails.
+      // That must degrade to the unshared directory, not throw: taking the whole
+      // fleet down because one group lookup failed is strictly worse than an
+      // agent hitting a legible EACCES at its first write.
+      process.env.PAPERCLIP_AGENT_UID = "1001";
+      const configHome = await makeConfigHome({ permission: { read: "allow" } });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      expect(prepared.runtimeConfigHome).toBe(prepared.env.XDG_CONFIG_HOME);
+      await expect(fs.stat(prepared.runtimeConfigHome)).resolves.toBeTruthy();
+      await prepared.cleanup();
+    });
+  });
 });

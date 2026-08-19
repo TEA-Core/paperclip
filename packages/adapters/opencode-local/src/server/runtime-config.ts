@@ -1,8 +1,59 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
 import { isTruthyEnvFlag } from "./models.js";
+
+const execFileAsync = promisify(execFile);
+
+// M1, SUP-12532: agent runtimes run at uid 1001 while the server stays at 1000.
+//
+// `fs.mkdtemp` always creates its directory 0700 owned by the CALLER — the
+// server — regardless of umask. There is no umask or mount option that changes
+// that. So the moment PAPERCLIP_AGENT_UID is armed, the agent principal cannot
+// even traverse the runtime config dir the server just made for it, and every
+// OpenCode run dies at its first write inside it:
+//
+//   EACCES: permission denied, mkdir '/tmp/paperclip-opencode-config-vn4oaN/opencode'
+//
+// Observed fleet-wide on 2026-08-19 within minutes of arming the gate; runs
+// failed in ~34s and surfaced as agent faults rather than as a deploy fault,
+// which is exactly the shape SUP-12532 warned prereq 3 was supposed to prevent.
+//
+// The prereq-3 sweep cannot cover this. That sweep walks static trees, and this
+// directory does not exist until a run starts — there is nothing to pre-chmod.
+// The fix has to be here, at the point of creation.
+//
+// Hand the directory to the shared `agents` group (which holds both 1000 and
+// 1001) and set the setgid bit, so anything the agent creates inside inherits
+// the group rather than reintroducing the same denial one level down.
+//
+// Mirrors ensureSharedGroupOwnership() in
+// server/src/services/shared-group-ownership.ts, inlined because adapters must
+// not import from the server package.
+async function grantAgentGroupAccess(dirPath: string): Promise<void> {
+  // Gate closed: server and agents share a uid, 0700 is already correct, and
+  // widening it would hand access to nobody who does not already have it.
+  if (!process.env.PAPERCLIP_AGENT_UID) return;
+  try {
+    const { stdout } = await execFileAsync("getent", ["group", "agents"], {
+      timeout: 5000,
+      maxBuffer: 4096,
+    });
+    const gid = Number.parseInt(stdout.trim().split(":")[2] ?? "", 10);
+    if (Number.isNaN(gid)) return;
+    const stat = await fs.stat(dirPath);
+    await fs.chown(dirPath, stat.uid, gid);
+    await fs.chmod(dirPath, (stat.mode & 0o7777) | 0o2070);
+  } catch {
+    // Deliberately non-fatal. If the group is missing or chgrp is refused, the
+    // run still starts and fails loudly at its first write — a legible error
+    // beats a silently half-configured runtime, and beats taking the whole
+    // fleet down because one lookup failed.
+  }
+}
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
@@ -137,6 +188,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
 
   const sourceConfigDir = path.join(resolveXdgConfigHome(input.env), "opencode");
   const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-config-"));
+  await grantAgentGroupAccess(runtimeConfigHome);
   const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
   const runtimeConfigPath = path.join(runtimeConfigDir, "opencode.json");
 
