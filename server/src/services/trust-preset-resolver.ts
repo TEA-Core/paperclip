@@ -21,7 +21,57 @@ export type AssertIssueExecutionPolicySatisfiableInput = {
   executionPolicy: unknown;
 };
 
+/**
+ * A stage the runtime can never route to anyone but the principal it excludes.
+ *
+ * `selectStageParticipant` excludes `resolveReturnAssignee(...)` from stage
+ * participation, so a stage whose participants are ALL the policy's declared
+ * `returnAssigneeAgentId` has no eligible participant at all. SUP-10602 made
+ * that case fall back to the excluded principal rather than fail, which turned
+ * an unroutable gate into a self-satisfied one: an approval stage approved by
+ * the very agent it was meant to gate, recorded as an ordinary `approved`
+ * decision. 28 stages were self-approved that way before this was caught.
+ *
+ * The fallback is gone; the deadlock it was papering over is prevented here
+ * instead, at the only point where the bad policy can still be stopped from
+ * landing. This runs on the WRITE paths only (issue create, child create,
+ * bulk-child create, issue PATCH, plugin host) — never on a read or a
+ * normalize of an already-stored policy, so the issues that already carry one
+ * stay mutable and are not stranded by this change.
+ */
+export function assertIssueExecutionPolicyGatesAreEnforceable(executionPolicy: unknown): void {
+  if (executionPolicy == null || typeof executionPolicy !== "object") return;
+  const policy = executionPolicy as {
+    returnAssigneeAgentId?: unknown;
+    stages?: unknown;
+  };
+  const returnAssigneeAgentId =
+    typeof policy.returnAssigneeAgentId === "string" ? policy.returnAssigneeAgentId : null;
+  if (!returnAssigneeAgentId || !Array.isArray(policy.stages)) return;
+
+  policy.stages.forEach((rawStage, index) => {
+    if (rawStage == null || typeof rawStage !== "object") return;
+    const stage = rawStage as { type?: unknown; participants?: unknown };
+    if (!Array.isArray(stage.participants) || stage.participants.length === 0) return;
+    const allAreReturnAssignee = stage.participants.every((rawParticipant) => {
+      if (rawParticipant == null || typeof rawParticipant !== "object") return false;
+      const participant = rawParticipant as { type?: unknown; agentId?: unknown };
+      return participant.type === "agent" && participant.agentId === returnAssigneeAgentId;
+    });
+    if (!allAreReturnAssignee) return;
+    const stageType = typeof stage.type === "string" ? stage.type : "unknown";
+    throw unprocessable(
+      `Execution policy stage ${index} (${stageType}) is gated solely by its own return assignee `
+      + `${returnAssigneeAgentId}; the return assignee is excluded from participant selection, so the `
+      + "stage could never be decided by anyone else. Give the stage a participant that is not the "
+      + "return assignee, or change returnAssigneeAgentId.",
+      { stageIndex: index, stageType, returnAssigneeAgentId },
+    );
+  });
+}
+
 export function assertIssueExecutionPolicySatisfiable(input: AssertIssueExecutionPolicySatisfiableInput): void {
+  assertIssueExecutionPolicyGatesAreEnforceable(input.executionPolicy);
   const resolution = resolveCoreTrustPreset({
     companyId: input.companyId,
     issue: {

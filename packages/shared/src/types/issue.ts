@@ -719,6 +719,12 @@ export interface IssueExecutionState {
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest: IssueReviewRequest | null;
   completedStageIds: string[];
+  /**
+   * Stage ids that reached `completedStageIds` WITHOUT a decision — dropped by
+   * the self-gated review auto-skip. Without this the two are indistinguishable
+   * and a skipped gate cannot be audited after the fact.
+   */
+  skippedStageIds?: string[];
   lastDecisionId: string | null;
   lastDecisionOutcome: IssueExecutionDecisionOutcome | null;
   monitor?: IssueExecutionMonitorState | null;
