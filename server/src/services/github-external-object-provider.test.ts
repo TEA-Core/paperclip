@@ -6,14 +6,17 @@ import type { ExternalObjectResolveResult } from "./external-objects.js";
 
 type CapturedRequest = { url: string; init?: RequestInit };
 
-function makeFetchMock(): { fetch: (url: string, init?: RequestInit) => Promise<Response>; calls: CapturedRequest[] } {
+function makeFetchMock(body: Record<string, unknown> = { id: 42, state: "open", title: "test" }): {
+  fetch: (url: string, init?: RequestInit) => Promise<Response>;
+  calls: CapturedRequest[];
+} {
   const calls: CapturedRequest[] = [];
   return {
     calls,
     fetch: (url: string, init?: RequestInit) => {
       calls.push({ url, init });
       return Promise.resolve(
-        new Response(JSON.stringify({ id: 42, state: "open", title: "test" }), {
+        new Response(JSON.stringify(body), {
           status: 200,
           headers: { etag: "etag-1" },
         }),
@@ -171,6 +174,64 @@ describe("github-external-object-provider", () => {
       });
 
       expect(tokenProvider).toHaveBeenCalledWith("test-company", "owner", "repo");
+    });
+  });
+
+  describe("pull_request resolver", () => {
+    it("carries merged_at on the snapshot data when the GitHub PR body has it", async () => {
+      const tokenProvider = vi.fn().mockResolvedValue(null);
+      const mockFetch = makeFetchMock({
+        id: 3158,
+        state: "closed",
+        merged: true,
+        merged_at: "2026-08-18T20:34:57Z",
+        closed_at: null,
+        title: "test",
+      });
+
+      const { resolvers } = createGitHubExternalObjectProvider({} as Db, {
+        fetch: mockFetch.fetch,
+        tokenProvider,
+      });
+
+      const pullRequestResolver = resolvers.find((r) => r.objectType === "pull_request")!;
+      const result = await pullRequestResolver.resolve({
+        companyId: "test-company",
+        object: makeObject("owner/repo#pull/3158"),
+      });
+
+      expect(result.ok).toBe(true);
+      const snapshot = (result as Extract<ExternalObjectResolveResult, { ok: true }>).snapshot;
+      expect(snapshot.data?.merged_at).toBe("2026-08-18T20:34:57Z");
+      expect(snapshot.data?.closed_at).toBeUndefined();
+    });
+
+    it("carries closed_at on the snapshot data when the GitHub PR body has it", async () => {
+      const tokenProvider = vi.fn().mockResolvedValue(null);
+      const mockFetch = makeFetchMock({
+        id: 3158,
+        state: "closed",
+        merged: false,
+        merged_at: null,
+        closed_at: "2026-08-18T20:34:57Z",
+        title: "test",
+      });
+
+      const { resolvers } = createGitHubExternalObjectProvider({} as Db, {
+        fetch: mockFetch.fetch,
+        tokenProvider,
+      });
+
+      const pullRequestResolver = resolvers.find((r) => r.objectType === "pull_request")!;
+      const result = await pullRequestResolver.resolve({
+        companyId: "test-company",
+        object: makeObject("owner/repo#pull/3158"),
+      });
+
+      expect(result.ok).toBe(true);
+      const snapshot = (result as Extract<ExternalObjectResolveResult, { ok: true }>).snapshot;
+      expect(snapshot.data?.closed_at).toBe("2026-08-18T20:34:57Z");
+      expect(snapshot.data?.merged_at).toBeUndefined();
     });
   });
 });

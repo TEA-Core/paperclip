@@ -1004,7 +1004,7 @@ export async function startServer(): Promise<StartedServer> {
       trackHeartbeatSchedulerWork(doneCloseLandingBackstop
         .sweep()
         .then((result) => {
-          if (result.confirmed > 0 || result.failed > 0) {
+          if (result.candidates > 0 || result.confirmed > 0 || result.failed > 0 || result.deferred > 0) {
             logger.info(result, "done-close landing backstop sweep dispositioned decision-carried skips");
           }
         })
