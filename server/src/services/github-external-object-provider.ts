@@ -254,6 +254,7 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       merged,
       draft,
       ...(authorLogin ? { authorLogin } : {}),
+      ...(title ? { title } : {}),
       ...(headRef ? { headRef } : {}),
       ...(headSha ? { headSha } : {}),
       ...(baseRef ? { baseRef } : {}),

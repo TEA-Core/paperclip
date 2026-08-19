@@ -354,4 +354,24 @@ describe.sequential("company route cross-company authorization", () => {
     expect(adminWrite.body.error).toContain("access to this company");
     assertNoTargetMutationSideEffects();
   });
+
+  it("persists mergeArmingEnabled when a board member patches the company (SUP-13361)", async () => {
+    const app = await createApp(boardActor({
+      userId: "member",
+      companyIds: [companyBId],
+      memberships: [{ companyId: companyBId, membershipRole: "member", status: "active" }],
+    }));
+    const res = await request(app).patch(`/api/companies/${companyBId}`).send({ mergeArmingEnabled: true }).expect(200);
+    expect(res.body.mergeArmingEnabled).toBe(true);
+    expect(mockCompanyService.update).toHaveBeenCalledTimes(1);
+    expect(mockCompanyService.update.mock.calls[0]![1]).toMatchObject({ mergeArmingEnabled: true });
+  });
+
+  it("rejects mergeArmingEnabled when a CEO agent patches the company (board-only, SUP-13361)", async () => {
+    const app = await createApp(companyACeoActor());
+    const res = await request(app).patch(`/api/companies/${companyAId}`).send({ mergeArmingEnabled: true });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("mergeArmingEnabled");
+    expect(mockCompanyService.update).not.toHaveBeenCalled();
+  });
 });

@@ -44,6 +44,12 @@ export interface LinkedPullRequest {
   number: number;
   nodeId: string | null;
   headRefName: string | null;
+  /**
+   * The PR title recorded on the cached external-object payload, or null when
+   * the object has never been hydrated with a title. Used for title-OR-branch
+   * ownership (SUP-13361).
+   */
+  title: string | null;
   displayName: string;
   /**
    * The `state` recorded on the cached external-object payload, or null when the
@@ -109,7 +115,12 @@ export async function resolveLinkedPullRequests(
     const nodeId = row.data?.node_id as string | undefined | null;
     const headRefName =
       (row.data?.head as Record<string, unknown> | undefined | null)?.ref as string | undefined ??
-      (row.data?.headRefName as string | undefined);
+      (row.data?.headRefName as string | undefined) ??
+      (row.data?.headRef as string | undefined);
+    const title =
+      row.data?.title === null || typeof row.data?.title === "string"
+        ? row.data?.title
+        : null;
 
       results.push({
         id: row.id,
@@ -118,6 +129,7 @@ export async function resolveLinkedPullRequests(
         number,
         nodeId: nodeId ?? null,
         headRefName: headRefName ?? null,
+        title,
         displayName: `${owner}/${repo}#${number}`,
         cachedState: state ?? null,
         lastErrorCode: row.lastErrorCode ?? null,
@@ -171,7 +183,12 @@ export async function resolveLinkedPullRequestsWithState(
     const nodeId = row.data?.node_id as string | undefined | null;
     const headRefName =
       (row.data?.head as Record<string, unknown> | undefined | null)?.ref as string | undefined ??
-      (row.data?.headRefName as string | undefined);
+      (row.data?.headRefName as string | undefined) ??
+      (row.data?.headRef as string | undefined);
+    const title =
+      row.data?.title === null || typeof row.data?.title === "string"
+        ? row.data?.title
+        : null;
 
       results.push({
         id: row.id,
@@ -180,6 +197,7 @@ export async function resolveLinkedPullRequestsWithState(
         number,
         nodeId: nodeId ?? null,
         headRefName: headRefName ?? null,
+        title,
         displayName: `${owner}/${repo}#${number}`,
         cachedState: state ?? null,
         lastErrorCode: row.lastErrorCode ?? null,
@@ -696,30 +714,46 @@ export async function armMergeOnApproval(
 
   const pr = linkedPRs[0]!;
 
-  const ownerMatch = /^(SUP-\d+)/.exec(pr.headRefName ?? "");
-  if (!ownerMatch) {
+  // SUP-13361: PR ownership is title-OR-branch, not branch-only. A card owns a
+  // PR when its identifier names the PR head branch (legacy convention) OR
+  // appears anywhere in the PR title. A card whose identifier appears only in
+  // the PR body / issue text / review comments is NOT an owner (the
+  // SUP-12417 / SUP-12421 mention-only refusal is preserved).
+  const candidateIds: string[] = [];
+  const pushCandidate = (identifier: string | undefined) => {
+    if (identifier && !candidateIds.includes(identifier)) candidateIds.push(identifier);
+  };
+  pushCandidate(/^(SUP-\d+)/.exec(pr.headRefName ?? "")?.[1]);
+  if (pr.title) {
+    for (const match of pr.title.matchAll(/SUP-\d+/g)) {
+      pushCandidate(match[0]);
+    }
+  }
+  if (candidateIds.length === 0) {
     return { kind: "skipped", message: "skipped:unowned-branch: PR headRefName does not name a SUP-\\d+ owner" };
   }
 
-  const ownerIdentifier = ownerMatch[1]!;
-  const [ownerRow] = await db
-    .select({
-      id: issues.id,
-      executionPolicy: issues.executionPolicy,
-      executionState: issues.executionState,
-    })
-    .from(issues)
-    .where(and(eq(issues.companyId, companyId), eq(issues.identifier, ownerIdentifier)))
-    .limit(1);
-
-  if (!ownerRow) {
-    return { kind: "skipped", message: `skipped:unowned-branch: No issue found for identifier ${ownerIdentifier}` };
+  let ownerRow: { id: string; executionPolicy: Record<string, unknown> | null; executionState: Record<string, unknown> | null } | null = null;
+  for (const ownerIdentifier of candidateIds) {
+    const [row] = await db
+      .select({
+        id: issues.id,
+        executionPolicy: issues.executionPolicy,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.identifier, ownerIdentifier)))
+      .limit(1);
+    if (row && row.id === issueId) {
+      ownerRow = row;
+      break;
+    }
   }
 
-  if (ownerRow.id !== issueId) {
+  if (!ownerRow) {
     return {
       kind: "skipped",
-      message: `skipped:not-branch-owner: PR ${pr.number} is owned by ${ownerIdentifier}, not the transitioning issue`,
+      message: `skipped:not-pr-owner: PR ${pr.number} (head branch ${pr.headRefName ?? "unknown"}, title ${pr.title ?? "(none)"}) names ${candidateIds.join(", ")} but not the transitioning issue`,
     };
   }
 
