@@ -101,6 +101,13 @@ const createActivitySchema = z.object({
 
 const agentActionAuditActorScopeSchema = z.enum(["agents", "all"]);
 
+const companyActivityQuerySchema = z.object({
+  action: z.string().optional(),
+  actorType: z.enum(["agent", "user", "system", "plugin"]).optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+});
+
 const agentActionAuditQuerySchema = z.object({
   actorScope: agentActionAuditActorScopeSchema.default("agents"),
   agentId: z.string().uuid().optional(),
@@ -224,12 +231,27 @@ export function activityRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     if (!(await assertCompanyScopeReadAllowed(req, res, companyId))) return;
 
+    const parsedQuery = companyActivityQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      throw badRequest("Invalid activity query", parsedQuery.error.issues);
+    }
+    const actionValues = parsedQuery.data.action
+      ? parsedQuery.data.action
+          .split(",")
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0)
+      : undefined;
+
     const filters = {
       companyId,
       agentId: req.query.agentId as string | undefined,
       entityType: req.query.entityType as string | undefined,
       entityId: req.query.entityId as string | undefined,
       limit: normalizeActivityLimit(Number(req.query.limit)),
+      action: actionValues?.length ? actionValues : undefined,
+      actorType: parsedQuery.data.actorType,
+      from: parsedQuery.data.from,
+      to: parsedQuery.data.to,
     };
     const result = await svc.list(filters);
     res.json(result);

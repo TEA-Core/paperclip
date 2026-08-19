@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -25,6 +25,10 @@ export interface ActivityFilters {
   entityType?: string;
   entityId?: string;
   limit?: number;
+  action?: string[];
+  actorType?: "agent" | "user" | "system" | "plugin";
+  from?: Date;
+  to?: Date;
 }
 
 const DEFAULT_ACTIVITY_LIMIT = 100;
@@ -338,6 +342,18 @@ export function activityService(db: Db) {
       }
       if (filters.entityId) {
         conditions.push(eq(activityLog.entityId, filters.entityId));
+      }
+      if (filters.action?.length) {
+        conditions.push(inArray(activityLog.action, filters.action));
+      }
+      if (filters.actorType) {
+        conditions.push(eq(activityLog.actorType, filters.actorType));
+      }
+      if (filters.from) {
+        conditions.push(gte(activityLog.createdAt, filters.from));
+      }
+      if (filters.to) {
+        conditions.push(lte(activityLog.createdAt, filters.to));
       }
 
       return db
