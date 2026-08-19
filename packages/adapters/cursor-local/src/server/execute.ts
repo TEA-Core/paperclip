@@ -46,6 +46,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
+import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { DEFAULT_CURSOR_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { parseCursorJsonl, isCursorUnknownSessionError } from "./parse.js";
 import { prepareCursorSandboxCommand } from "./remote-command.js";
@@ -119,10 +120,14 @@ function cursorSkillsHome(): string {
   return path.join(os.homedir(), ".cursor", "skills");
 }
 
-async function buildCursorSkillsDir(config: Record<string, unknown>): Promise<string> {
+export async function buildCursorSkillsDir(config: Record<string, unknown>): Promise<string> {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-skills-"));
+  // Same 0700-mkdtemp hazard as opencode-local (SUP-13484): this path is handed to the
+  // agent child, which runs at uid 1001 and cannot traverse a 0700 server dir.
+  await ensureAgentAccessibleDir(tmp);
   const target = path.join(tmp, "skills");
   await fs.mkdir(target, { recursive: true });
+  await ensureAgentAccessibleDir(target);
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredNames = new Set(resolvePaperclipDesiredSkillNames(config, availableEntries));
   for (const entry of availableEntries) {

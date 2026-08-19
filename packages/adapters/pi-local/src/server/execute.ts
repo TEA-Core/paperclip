@@ -47,6 +47,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
+import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
@@ -120,10 +121,14 @@ async function ensurePiSkillsInjected(
   }
 }
 
-async function buildPiSkillsDir(config: Record<string, unknown>): Promise<string> {
+export async function buildPiSkillsDir(config: Record<string, unknown>): Promise<string> {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-skills-"));
+  // Same 0700-mkdtemp hazard as opencode-local (SUP-13484): this path is handed to the
+  // agent child, which runs at uid 1001 and cannot traverse a 0700 server dir.
+  await ensureAgentAccessibleDir(tmp);
   const target = path.join(tmp, "skills");
   await fs.mkdir(target, { recursive: true });
+  await ensureAgentAccessibleDir(target);
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredNames = new Set(resolvePaperclipDesiredSkillNames(config, availableEntries));
   for (const entry of availableEntries) {

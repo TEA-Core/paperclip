@@ -49,6 +49,7 @@ import {
   runChildProcess,
   sanitizeInheritedPaperclipEnv,
 } from "@paperclipai/adapter-utils/server-utils";
+import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   describeGeminiFailure,
@@ -187,12 +188,16 @@ async function ensureGeminiSkillsInjected(
   }
 }
 
-async function buildGeminiSkillsDir(
+export async function buildGeminiSkillsDir(
   config: Record<string, unknown>,
 ): Promise<string> {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-skills-"));
+  // Same 0700-mkdtemp hazard as opencode-local (SUP-13484): this path is handed to the
+  // agent child, which runs at uid 1001 and cannot traverse a 0700 server dir.
+  await ensureAgentAccessibleDir(tmp);
   const target = path.join(tmp, "skills");
   await fs.mkdir(target, { recursive: true });
+  await ensureAgentAccessibleDir(target);
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredNames = new Set(resolvePaperclipDesiredSkillNames(config, availableEntries));
   for (const entry of availableEntries) {
