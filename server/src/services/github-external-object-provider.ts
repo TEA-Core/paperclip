@@ -250,6 +250,7 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       owner: identity.owner,
       repo: identity.repo,
       number: identity.number,
+      ...(title ? { title } : {}),
       state,
       merged,
       draft,
