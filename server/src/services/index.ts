@@ -76,6 +76,12 @@ export { attentionService } from "./attention.js";
 export { captureDecisionSnapshot, decisionTrainingService } from "./decision-training.js";
 export { decisionService } from "./decisions.js";
 export { decisionRetentionService } from "./decision-retention.js";
+export {
+  createDoneCloseLandingBackstopService,
+  type DoneCloseLandingBackstopOptions,
+  type DoneCloseLandingSweepResult,
+  type DoneCloseLandingWakeup,
+} from "./done-close-landing-backstop.js";
 export type {
   WorkTimelineActor,
   WorkTimelineEdge,

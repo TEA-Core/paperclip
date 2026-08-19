@@ -49,6 +49,7 @@ import {
   environmentCustomImageService,
   decisionService,
   decisionRetentionService,
+  createDoneCloseLandingBackstopService,
   externalObjectService,
   executionWorkspaceService,
   heartbeatService,
@@ -995,6 +996,22 @@ export async function startServer(): Promise<StartedServer> {
       wakeup: heartbeat.wakeup,
     });
     const terminalWorkspaces = executionWorkspaceService(db as any);
+    const doneCloseLandingBackstop = createDoneCloseLandingBackstopService(db as any, {
+      wakeup: heartbeat.wakeup,
+    });
+    const scheduleDoneCloseLandingBackstopSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(doneCloseLandingBackstop
+        .sweep()
+        .then((result) => {
+          if (result.candidates > 0 || result.confirmed > 0 || result.failed > 0 || result.deferred > 0) {
+            logger.info(result, "done-close landing backstop sweep dispositioned decision-carried skips");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "done-close landing backstop sweep failed");
+        }));
+    };
     const scheduleMergedPullRequestConfirmationSweep = () => {
       if (heartbeatSchedulerStopped) return;
       trackHeartbeatSchedulerWork(mergedPullRequestConfirmations
@@ -1252,6 +1269,7 @@ export async function startServer(): Promise<StartedServer> {
         if (heartbeatSchedulerStopped) return;
         scheduleMergedPullRequestConfirmationSweep();
         scheduleTerminalWorkspaceSweep();
+        scheduleDoneCloseLandingBackstopSweep();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
