@@ -303,6 +303,7 @@ export const issueExecutionStateSchema = z.object({
   returnAssignee: issueExecutionStatePrincipalSchema.nullable(),
   reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),
   completedStageIds: z.array(z.string().uuid()).default([]),
+  skippedStageIds: z.array(z.string().uuid()).optional().default([]),
   lastDecisionId: z.string().uuid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),

@@ -7,6 +7,7 @@ import {
 } from "@paperclipai/shared";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import {
+  assertIssueExecutionPolicySatisfiable,
   isIssueWithinLowTrustBoundary,
   resolveCoreTrustPreset,
 } from "../services/trust-preset-resolver.js";
@@ -218,5 +219,85 @@ describe("resolveCoreTrustPreset", () => {
         trustBoundary: { rootIssueId },
       },
     });
+  });
+});
+
+// A stage whose participants are ALL the policy's own returnAssigneeAgentId can
+// never be decided by anyone: the runtime excludes the return assignee from
+// participant selection. SUP-10602 papered over that by falling back to the
+// excluded principal, which turned an unroutable gate into a self-approved one
+// (28 such stages found on 2026-08-19, plus 7 review stages silently
+// auto-skipped with no decision row at all). The write paths refuse it now, so
+// the deadlock is prevented instead of softened.
+describe("assertIssueExecutionPolicySatisfiable — self-gated stages", () => {
+  const returnAssigneeAgentId = "88888888-8888-4888-8888-888888888888";
+  const reviewerAgentId = "99999999-9999-4999-8999-999999999999";
+
+  const policyWithStages = (stages: unknown[]) => ({
+    mode: "normal",
+    commentRequired: true,
+    returnAssigneeAgentId,
+    stages,
+  });
+
+  const agentStage = (type: string, ...agentIds: string[]) => ({
+    id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    type,
+    approvalsNeeded: 1,
+    participants: agentIds.map((agentId) => ({ type: "agent", agentId })),
+  });
+
+  it("rejects an approval stage gated solely by the return assignee", () => {
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        executionPolicy: policyWithStages([agentStage("approval", returnAssigneeAgentId)]),
+      }),
+    ).toThrow(/gated solely by its own return assignee/);
+  });
+
+  it("rejects a review stage gated solely by the return assignee", () => {
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        executionPolicy: policyWithStages([agentStage("review", returnAssigneeAgentId)]),
+      }),
+    ).toThrow(/gated solely by its own return assignee/);
+  });
+
+  it("allows a stage where the return assignee is only one of several participants", () => {
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        executionPolicy: policyWithStages([
+          agentStage("review", returnAssigneeAgentId, reviewerAgentId),
+        ]),
+      }),
+    ).not.toThrow();
+  });
+
+  it("allows a stage with no collision", () => {
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        executionPolicy: policyWithStages([agentStage("review", reviewerAgentId)]),
+      }),
+    ).not.toThrow();
+  });
+
+  it("ignores a policy with no declared returnAssigneeAgentId", () => {
+    // The implicit collision (return assignee seeded from the issue's own
+    // assignee at transition time) is not knowable at write time; the fire
+    // tooling covers it, and the runtime now refuses to route the stage.
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [agentStage("review", reviewerAgentId)],
+        },
+      }),
+    ).not.toThrow();
   });
 });

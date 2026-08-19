@@ -523,19 +523,20 @@ function selectStageParticipant(
   opts?: {
     preferred?: IssueExecutionStagePrincipal | null;
     exclude?: IssueExecutionStagePrincipal | null;
-    allowSelfAsFallback?: boolean;
   },
 ): IssueExecutionStagePrincipal | null {
+  // The exclusion is ABSOLUTE. SUP-10602 previously added an allowSelfAsFallback
+  // path that, when the exclude left zero participants, fell back to the full
+  // participant list "so the stage remains reachable". Reachable meant the
+  // excluded principal was handed its own gate: an approval stage routed to the
+  // return assignee and it approved itself, recorded as an ordinary `approved`
+  // decision that is indistinguishable from a real one. A ratified gate must
+  // never be satisfiable by the principal it exists to gate, so returning null
+  // here is correct; the deadlock SUP-10602 was chasing is now prevented at the
+  // door by assertIssueExecutionPolicyGatesAreEnforceable(), which refuses to
+  // store a policy whose stage is gated solely by its own return assignee.
   const exclude = opts?.exclude ?? null;
-  const participants = stage.participants.filter((participant) => !principalsEqual(participant, exclude));
-  // When the exclude would leave zero participants (e.g. a sole participant who
-  // is also the return assignee), fall back to the full participant list so the
-  // stage remains reachable instead of deadlocking. This is skipped when
-  // allowSelfAsFallback is false, which is used by the auto-skip path to
-  // correctly detect self-review-only stages.
-  const eligible = participants.length > 0 || opts?.allowSelfAsFallback === false
-    ? participants
-    : stage.participants;
+  const eligible = stage.participants.filter((participant) => !principalsEqual(participant, exclude));
   if (eligible.length === 0) return null;
   if (opts?.preferred) {
     const preferred = eligible.find((participant) => principalsEqual(participant, opts.preferred ?? null));
@@ -559,6 +560,21 @@ function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
     : { assigneeAgentId: null, assigneeUserId: principal.userId ?? null };
 }
 
+/**
+ * A stage dropped by canAutoSkipPendingStage lands in `completedStageIds`, which
+ * is the same place a genuinely approved stage lands — and a skip writes no
+ * `issue_execution_decisions` row, so afterwards nothing distinguishes the two.
+ * 7 review stages on closed issues were found in that state on 2026-08-19 and
+ * could not be audited. `skippedStageIds` is the discriminator: a stage id in
+ * both lists reached `completed` WITHOUT anyone deciding it.
+ */
+function mergeSkippedStageIds(
+  previous: IssueExecutionState | null,
+  added?: string[],
+): string[] {
+  return Array.from(new Set([...(previous?.skippedStageIds ?? []), ...(added ?? [])]));
+}
+
 function buildCompletedState(previous: IssueExecutionState | null, currentStage: IssueExecutionStage): IssueExecutionState {
   const completedStageIds = Array.from(new Set([...(previous?.completedStageIds ?? []), currentStage.id]));
   return {
@@ -570,6 +586,7 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     returnAssignee: previous?.returnAssignee ?? null,
     reviewRequest: null,
     completedStageIds,
+    skippedStageIds: mergeSkippedStageIds(previous),
     lastDecisionId: previous?.lastDecisionId ?? null,
     lastDecisionOutcome: "approved",
     monitor: previous?.monitor ?? null,
@@ -580,6 +597,7 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
 function buildStateWithCompletedStages(input: {
   previous: IssueExecutionState | null;
   completedStageIds: string[];
+  skippedStageIds?: string[];
   returnAssignee: IssueExecutionStagePrincipal | null;
 }): IssueExecutionState {
   return {
@@ -591,6 +609,7 @@ function buildStateWithCompletedStages(input: {
     returnAssignee: input.previous?.returnAssignee ?? input.returnAssignee,
     reviewRequest: input.previous?.reviewRequest ?? null,
     completedStageIds: input.completedStageIds,
+    skippedStageIds: mergeSkippedStageIds(input.previous, input.skippedStageIds),
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
@@ -600,6 +619,7 @@ function buildStateWithCompletedStages(input: {
 function buildSkippedStageCompletedState(input: {
   previous: IssueExecutionState | null;
   completedStageIds: string[];
+  skippedStageIds?: string[];
   returnAssignee: IssueExecutionStagePrincipal | null;
 }): IssueExecutionState {
   return {
@@ -611,6 +631,7 @@ function buildSkippedStageCompletedState(input: {
     returnAssignee: input.previous?.returnAssignee ?? input.returnAssignee,
     reviewRequest: null,
     completedStageIds: input.completedStageIds,
+    skippedStageIds: mergeSkippedStageIds(input.previous, input.skippedStageIds),
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
@@ -635,6 +656,7 @@ function buildPendingState(input: {
     returnAssignee: input.returnAssignee,
     reviewRequest: input.reviewRequest ?? null,
     completedStageIds: input.previous?.completedStageIds ?? [],
+    skippedStageIds: mergeSkippedStageIds(input.previous),
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
@@ -1084,21 +1106,23 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     currentAssignee,
   });
   const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
+  const newlySkippedStageIds: string[] = [];
   let participant = selectStageParticipant(pendingStage, {
     preferred:
       existingState?.status === CHANGES_REQUESTED_STATUS
         ? explicitAssignee ?? existingState.currentParticipant ?? null
         : explicitAssignee,
     exclude: returnAssignee,
-    allowSelfAsFallback: false,
   });
   while (!participant && canAutoSkipPendingStage({ stage: pendingStage, returnAssignee, requestedStatus })) {
     skippedStageIds.push(pendingStage.id);
+    newlySkippedStageIds.push(pendingStage.id);
     pendingStage = nextPendingStage(
       input.policy,
       buildStateWithCompletedStages({
         previous: existingState,
         completedStageIds: skippedStageIds,
+        skippedStageIds: newlySkippedStageIds,
         returnAssignee,
       }),
     );
@@ -1106,6 +1130,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       patch.executionState = buildSkippedStageCompletedState({
         previous: existingState,
         completedStageIds: skippedStageIds,
+        skippedStageIds: newlySkippedStageIds,
         returnAssignee,
       });
       return { patch };
@@ -1116,22 +1141,16 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           ? explicitAssignee ?? existingState.currentParticipant ?? null
           : explicitAssignee,
       exclude: returnAssignee,
-      allowSelfAsFallback: false,
     });
   }
   if (!participant) {
-    participant = selectStageParticipant(pendingStage, {
-      preferred:
-        existingState?.status === CHANGES_REQUESTED_STATUS
-          ? explicitAssignee ?? existingState.currentParticipant ?? null
-          : explicitAssignee,
-      exclude: returnAssignee,
-    });
-    if (!participant) {
-      throw unprocessable(
-        `No eligible ${pendingStage.type} participant is configured for this issue (stage ${pendingStage.id}); the return assignee is excluded from participant selection`,
-      );
-    }
+    // Reached only when the exclusion emptied the stage and the auto-skip did
+    // not apply (an approval stage, or a review stage on a transition other
+    // than `done`). Re-selecting without the exclusion is exactly the
+    // self-approval the exclusion exists to prevent, so this fails loud.
+    throw unprocessable(
+      `No eligible ${pendingStage.type} participant is configured for this issue (stage ${pendingStage.id}); the return assignee is excluded from participant selection`,
+    );
   }
 
   buildPendingStagePatch({
@@ -1142,6 +1161,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         : buildStateWithCompletedStages({
             previous: existingState,
             completedStageIds: skippedStageIds,
+            skippedStageIds: newlySkippedStageIds,
             returnAssignee,
           }),
     policy: input.policy,

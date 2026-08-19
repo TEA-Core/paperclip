@@ -159,6 +159,42 @@ describe("parseIssueExecutionState", () => {
     expect(state).not.toBeNull();
     expect(state!.status).toBe("pending");
   });
+
+  it("round-trips skippedStageIds", () => {
+    // The skip marker is only useful if it survives the read back. zod strips
+    // unknown keys, so a state written with skippedStageIds but parsed by a
+    // schema that does not declare it would lose the one field that tells a
+    // skipped stage apart from an approved one.
+    const skippedStageId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const state = parseIssueExecutionState({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      completedStageIds: [skippedStageId],
+      skippedStageIds: [skippedStageId],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    expect(state!.skippedStageIds).toEqual([skippedStageId]);
+  });
+
+  it("defaults skippedStageIds to empty for a state written before the field existed", () => {
+    const state = parseIssueExecutionState({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      completedStageIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    expect(state!.skippedStageIds).toEqual([]);
+  });
 });
 
 describe("issue execution policy transitions", () => {
@@ -1256,55 +1292,55 @@ describe("issue execution policy transitions", () => {
           currentParticipant: null,
           returnAssignee: { type: "agent", agentId: coderAgentId },
           completedStageIds: [policy.stages[0].id],
+          // The skip is now recorded. Without this the stage id sits in
+          // completedStageIds looking exactly like an approved stage, and the
+          // skip writes no decision row, so nothing afterwards can tell the
+          // two apart.
+          skippedStageIds: [policy.stages[0].id],
         },
       });
       expect(result.patch.status).toBeUndefined();
       expect(result.patch.assigneeAgentId).toBeUndefined();
     });
 
-    it("does not deadlock when the sole approval participant is also the return assignee", () => {
+    it("refuses to route an approval stage to its own return assignee", () => {
       const policy = makePolicy([
         { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
         { type: "approval", participants: [{ type: "agent", agentId: coderAgentId }] },
       ]);
       const reviewStageId = policy.stages[0].id;
-      const approvalStageId = policy.stages[1].id;
 
-      const result = applyIssueExecutionPolicyTransition({
-        issue: {
-          status: "in_review",
-          assigneeAgentId: null,
-          assigneeUserId: ctoUserId,
-          executionPolicy: policy,
-          executionState: {
-            status: "pending",
-            currentStageId: approvalStageId,
-            currentStageIndex: 1,
-            currentStageType: "approval",
-            currentParticipant: { type: "agent", agentId: coderAgentId },
-            returnAssignee: { type: "agent", agentId: coderAgentId },
-            completedStageIds: [reviewStageId],
-            lastDecisionId: null,
-            lastDecisionOutcome: null,
+      // Advancing out of the review stage has to select a participant for the
+      // approval stage. Its only participant IS the return assignee, so there
+      // is no one eligible and the transition fails loud. Before this fix the
+      // runtime fell back to the excluded principal and the coder approved its
+      // own work, recorded as an ordinary `approved` decision.
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
           },
-        },
-        policy,
-        requestedStatus: "done",
-        requestedAssigneePatch: {},
-        actor: { agentId: coderAgentId },
-        commentBody: "Approved",
-      });
-
-      expect(result.patch.executionState).toMatchObject({
-        status: "completed",
-        completedStageIds: expect.arrayContaining([reviewStageId, approvalStageId]),
-        lastDecisionOutcome: "approved",
-      });
-      expect(result.decision).toMatchObject({
-        stageId: approvalStageId,
-        stageType: "approval",
-        outcome: "approved",
-      });
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "QA signoff complete",
+        }),
+      ).toThrow(/No eligible approval participant is configured/);
     });
 
     it("skips a self-review-only review stage and advances to approval", () => {
@@ -2300,61 +2336,46 @@ describe("issue execution policy transitions", () => {
     });
   });
 
-  describe("deadlock: sole approval participant is also the return assignee", () => {
-    it("does not deadlock when starting workflow into an approval stage whose sole participant is the return assignee", () => {
+  describe("a stage gated solely by its own return assignee fails loud", () => {
+    it("refuses to make the approval stage pending when its sole participant is the return assignee", () => {
       const policy = makePolicy([
         { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
         { type: "approval", participants: [{ type: "agent", agentId: coderAgentId }] },
       ]);
       const reviewStageId = policy.stages[0].id;
-      const approvalStageId = policy.stages[1].id;
 
-      const result = applyIssueExecutionPolicyTransition({
-        issue: {
-          status: "in_progress",
-          assigneeAgentId: coderAgentId,
-          assigneeUserId: null,
-          executionPolicy: policy,
-          executionState: {
-            status: "pending",
-            currentStageId: reviewStageId,
-            currentStageIndex: 0,
-            currentStageType: "review",
-            currentParticipant: { type: "agent", agentId: qaAgentId },
-            returnAssignee: { type: "agent", agentId: coderAgentId },
-            completedStageIds: [],
-            lastDecisionId: null,
-            lastDecisionOutcome: null,
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_progress",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
           },
-        },
-        policy,
-        requestedStatus: "done",
-        requestedAssigneePatch: {},
-        actor: { agentId: qaAgentId },
-        commentBody: "QA signoff complete",
-      });
-
-      expect(result.patch.status).toBe("in_review");
-      expect(result.patch.assigneeAgentId).toBe(coderAgentId);
-      expect(result.patch.executionState).toMatchObject({
-        status: "pending",
-        currentStageId: approvalStageId,
-        currentStageType: "approval",
-        currentParticipant: { type: "agent", agentId: coderAgentId },
-        returnAssignee: { type: "agent", agentId: coderAgentId },
-        completedStageIds: [reviewStageId],
-      });
-      expect(result.decision).toMatchObject({
-        stageId: reviewStageId,
-        stageType: "review",
-        outcome: "approved",
-      });
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "QA signoff complete",
+        }),
+      ).toThrow(/No eligible approval participant is configured/);
     });
   });
 });
 
-describe("return-assignee exclusion deadlock fix (SUP-10602)", () => {
-    it("workflow-start path: sole approval participant is also the return assignee, advances through both stages", () => {
+describe("return-assignee exclusion is absolute (reverses SUP-10602 allowSelfAsFallback)", () => {
+    it("workflow-start path: the workflow starts, then refuses the self-gated approval stage", () => {
       const policy = makePolicy([
         { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
         { type: "approval", participants: [{ type: "agent", agentId: coderAgentId }] },
@@ -2388,58 +2409,36 @@ describe("return-assignee exclusion deadlock fix (SUP-10602)", () => {
         completedStageIds: [],
       });
 
-      const result2 = applyIssueExecutionPolicyTransition({
-        issue: {
-          status: "in_review",
-          assigneeAgentId: qaAgentId,
-          assigneeUserId: null,
-          executionPolicy: policy,
-          executionState: result.patch.executionState,
-        },
-        policy,
-        requestedStatus: "done",
-        requestedAssigneePatch: {},
-        actor: { agentId: qaAgentId },
-        commentBody: "QA signoff complete",
-      });
-
-      expect(result2.patch.executionState).toMatchObject({
-        status: "pending",
-        currentStageId: approvalStageId,
-        currentStageType: "approval",
-        currentParticipant: { type: "agent", agentId: coderAgentId },
-        returnAssignee: { type: "agent", agentId: coderAgentId },
-        completedStageIds: [reviewStageId],
-      });
-
-      const result3 = applyIssueExecutionPolicyTransition({
-        issue: {
-          status: "in_review",
-          assigneeAgentId: coderAgentId,
-          assigneeUserId: null,
-          executionPolicy: policy,
-          executionState: result2.patch.executionState,
-        },
-        policy,
-        requestedStatus: "done",
-        requestedAssigneePatch: {},
-        actor: { agentId: coderAgentId },
-        commentBody: "Approved",
-      });
-
-      expect(result3.patch.executionState).toMatchObject({
-        status: "completed",
-        completedStageIds: expect.arrayContaining([reviewStageId, approvalStageId]),
-        lastDecisionOutcome: "approved",
-      });
-      expect(result3.decision).toMatchObject({
-        stageId: approvalStageId,
-        stageType: "approval",
-        outcome: "approved",
-      });
+      // QA's approval clears the review stage, and the runtime then has to pick
+      // a participant for the approval stage. Its only participant is the
+      // return assignee, so there is nobody eligible. SUP-10602 made this fall
+      // back to the coder and let it approve its own issue; it must fail loud.
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: result.patch.executionState,
+          },
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "QA signoff complete",
+        }),
+      ).toThrow(/No eligible approval participant is configured/);
+      expect(approvalStageId).toBeTruthy();
     });
 
-    it("active-stage path: sole approval participant is also the return assignee", () => {
+    // NOTE: a pending state that already names the return assignee as the stage
+    // participant is now unreachable — selectStageParticipant can never emit
+    // one. The decision path still honours a hand-built state, so the guard
+    // lives at the point the state is CREATED, plus
+    // assertIssueExecutionPolicyGatesAreEnforceable() at the write path so the
+    // policy cannot be stored in the first place.
+    it("active-stage path: the self-gated approval stage is never made pending", () => {
       const policy = makePolicy([
         { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
         { type: "approval", participants: [{ type: "agent", agentId: coderAgentId }] },
@@ -2447,41 +2446,33 @@ describe("return-assignee exclusion deadlock fix (SUP-10602)", () => {
       const reviewStageId = policy.stages[0].id;
       const approvalStageId = policy.stages[1].id;
 
-      const result = applyIssueExecutionPolicyTransition({
-        issue: {
-          status: "in_review",
-          assigneeAgentId: null,
-          assigneeUserId: ctoUserId,
-          executionPolicy: policy,
-          executionState: {
-            status: "pending",
-            currentStageId: approvalStageId,
-            currentStageIndex: 1,
-            currentStageType: "approval",
-            currentParticipant: { type: "agent", agentId: coderAgentId },
-            returnAssignee: { type: "agent", agentId: coderAgentId },
-            completedStageIds: [reviewStageId],
-            lastDecisionId: null,
-            lastDecisionOutcome: null,
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: null,
+            assigneeUserId: ctoUserId,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
           },
-        },
-        policy,
-        requestedStatus: "done",
-        requestedAssigneePatch: {},
-        actor: { agentId: coderAgentId },
-        commentBody: "Approved",
-      });
-
-      expect(result.patch.executionState).toMatchObject({
-        status: "completed",
-        completedStageIds: expect.arrayContaining([reviewStageId, approvalStageId]),
-        lastDecisionOutcome: "approved",
-      });
-      expect(result.decision).toMatchObject({
-        stageId: approvalStageId,
-        stageType: "approval",
-        outcome: "approved",
-      });
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "QA signoff complete",
+        }),
+      ).toThrow(/No eligible approval participant is configured/);
+      expect(approvalStageId).toBeTruthy();
     });
 
     it("self-review protection is preserved when an alternative participant exists", () => {
@@ -2555,11 +2546,10 @@ describe("return-assignee exclusion deadlock fix (SUP-10602)", () => {
     });
 
     it("throw message names the stage type and id and mentions return-assignee exclusion", () => {
-      // After the fix, the sole-participant-is-return-assignee case no longer
-      // throws. The throw is only reachable for genuinely zero-participant
-      // stages, which normalizeIssueExecutionPolicy rejects. We hand-build the
-      // policy object (bypassing normalizeIssueExecutionPolicy) to exercise the
-      // active-stage throw site directly.
+      // A genuinely zero-participant stage throws for the same reason a
+      // self-gated one does: nobody eligible. normalizeIssueExecutionPolicy
+      // strips such a stage, so the policy object is hand-built here to
+      // exercise the active-stage throw site directly.
       const zeroParticipantStage = {
         id: "00000000-0000-4000-8000-000000000001",
         type: "review" as const,
