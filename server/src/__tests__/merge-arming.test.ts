@@ -103,6 +103,7 @@ function createPRExternalObject(
     node_id: string | null;
     externalId: string;
     headRefName: string | null;
+    title: string | null;
   }> = {},
 ) {
   const externalId = overrides.externalId ?? `${owner}/${repo}#pull/${number}`;
@@ -121,6 +122,11 @@ function createPRExternalObject(
     }
   } else {
     data.head = { ref: "some-branch-name" };
+  }
+  if ("title" in overrides) {
+    if (overrides.title !== null) {
+      data.title = overrides.title;
+    }
   }
   return {
     companyId,
@@ -342,7 +348,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
-    it("returns skipped:not-branch-owner when PR is owned by a different issue", async () => {
+    it("returns skipped:not-pr-owner when PR is owned by a different issue", async () => {
       await insertOwnerIssue({
         identifier: "SUP-99999",
         executionState: APPROVED_STATE,
@@ -356,7 +362,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
       const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
       expect(result.kind).toBe("skipped");
-      expect(result.message).toContain("skipped:not-branch-owner");
+      expect(result.message).toContain("skipped:not-pr-owner");
       expect(result.message).toContain("SUP-99999");
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
@@ -437,9 +443,135 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
 
       const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
       expect(result.kind).toBe("skipped");
-      expect(result.message).toContain("skipped:not-branch-owner");
+      expect(result.message).toContain("skipped:not-pr-owner");
       expect(result.message).toContain("SUP-12360");
       expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("title-OR-branch ownership (SUP-13361)", () => {
+    it("arms when the PR title names the transitioning issue but the branch names a different card (six live misses)", async () => {
+      await insertOwnerIssue({
+        identifier: "SUP-13251",
+        executionState: APPROVED_STATE,
+      });
+
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 3157, {
+          title: `Publish sources and metrics on the manifest payload (${issueIdentifier})`,
+          headRefName: "SUP-13251-plan-parent-branch",
+        }),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("armed");
+      expect(result.message).toBe("armed: Auto-merge enabled for TEA-Core/paperclip#3157");
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("arms when the branch names the transitioning issue and the title names no card (SUP-12421 behaviour)", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          title: "chore: no card named anywhere in this title",
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("armed");
+      expect(result.message).toBe("armed: Auto-merge enabled for TEA-Core/paperclip#42");
+    });
+
+    it("skips with not-pr-owner when both title and branch name only a different approved card (SUP-12417 stays fixed)", async () => {
+      await insertOwnerIssue({
+        identifier: "SUP-99999",
+        executionState: APPROVED_STATE,
+      });
+
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          title: "Redo: SUP-99999 — discuss PR ownership",
+          headRefName: "SUP-99999-some-branch",
+        }),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("skipped:not-pr-owner");
+      expect(result.message).toContain("SUP-99999");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("arms for the first co-owning card named in a fix(SUP-A,SUP-B) title", async () => {
+      await insertOwnerIssue({
+        identifier: "SUP-88888",
+        executionState: APPROVED_STATE,
+      });
+
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 3145, {
+          title: `fix(${issueIdentifier},SUP-88888): co-owned plan work`,
+          headRefName: "SUP-88888-shared-plan-branch",
+        }),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("armed");
+      expect(result.message).toBe("armed: Auto-merge enabled for TEA-Core/paperclip#3145");
+    });
+
+    it("arms for the second co-owning card when the transitioning issue is the one named in the title", async () => {
+      const cardB = await insertOwnerIssue({
+        identifier: "SUP-88888",
+        executionState: APPROVED_STATE,
+      });
+
+      await insertMention(
+        {
+          ...createPRExternalObject(companyId, "TEA-Core", "paperclip", 3145, {
+            title: `fix(${issueIdentifier},SUP-88888): co-owned plan work`,
+            headRefName: "SUP-88888-shared-plan-branch",
+          }),
+          sourceIssueId: cardB.id,
+        },
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, cardB.id, DECISION);
+      expect(result.kind).toBe("armed");
+      expect(result.message).toBe("armed: Auto-merge enabled for TEA-Core/paperclip#3145");
+    });
+
+    it("arms when the title names a card with no issue row and the branch names the transitioning issue", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          title: `fix(SUP-00001): ${issueIdentifier} follow-up`,
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+      );
+
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("armed");
+      expect(result.message).toBe("armed: Auto-merge enabled for TEA-Core/paperclip#42");
     });
   });
 

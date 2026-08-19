@@ -46,6 +46,14 @@ export interface LinkedPullRequest {
   headRefName: string | null;
   displayName: string;
   /**
+   * The PR title as recorded on the cached external-object payload, or null
+   * when the object has never been hydrated from the provider. Shared-branch
+   * child PRs carry the approving card's identifier in the title rather than
+   * the branch name (SUP-13361), so title-OR-branch ownership matches over
+   * this field. Stale cached rows without a title rehydrate on TTL.
+   */
+  title: string | null;
+  /**
    * The `state` recorded on the cached external-object payload, or null when the
    * object has never been hydrated from the provider. Callers that need positive
    * evidence a PR is open (rather than "not known to be closed") must check for
@@ -118,6 +126,7 @@ export async function resolveLinkedPullRequests(
         number,
         nodeId: nodeId ?? null,
         headRefName: headRefName ?? null,
+        title: (row.data?.title as string | undefined) ?? null,
         displayName: `${owner}/${repo}#${number}`,
         cachedState: state ?? null,
         lastErrorCode: row.lastErrorCode ?? null,
@@ -180,6 +189,7 @@ export async function resolveLinkedPullRequestsWithState(
         number,
         nodeId: nodeId ?? null,
         headRefName: headRefName ?? null,
+        title: (row.data?.title as string | undefined) ?? null,
         displayName: `${owner}/${repo}#${number}`,
         cachedState: state ?? null,
         lastErrorCode: row.lastErrorCode ?? null,
@@ -696,30 +706,54 @@ export async function armMergeOnApproval(
 
   const pr = linkedPRs[0]!;
 
-  const ownerMatch = /^(SUP-\d+)/.exec(pr.headRefName ?? "");
-  if (!ownerMatch) {
-    return { kind: "skipped", message: "skipped:unowned-branch: PR headRefName does not name a SUP-\\d+ owner" };
+  // SUP-13361: title-OR-branch ownership. Shared-branch child PRs carry the
+  // approving card's identifier in the PR title, so the branch prefix alone
+  // refuses every shared-branch PR. A card that merely MENTIONS a PR still
+  // owns neither its title nor its branch, so SUP-12417 stays fixed.
+  const titleIds = (pr.title ?? "").match(/SUP-\d+/g) ?? [];
+  const branchMatch = /^(SUP-\d+)/.exec(pr.headRefName ?? "");
+  const branchId = branchMatch ? branchMatch[1]! : null;
+
+  const candidateIdentifiers: string[] = [];
+  for (const candidate of [...titleIds, ...(branchId ? [branchId] : [])]) {
+    if (!candidateIdentifiers.includes(candidate)) {
+      candidateIdentifiers.push(candidate);
+    }
   }
 
-  const ownerIdentifier = ownerMatch[1]!;
-  const [ownerRow] = await db
-    .select({
-      id: issues.id,
-      executionPolicy: issues.executionPolicy,
-      executionState: issues.executionState,
-    })
-    .from(issues)
-    .where(and(eq(issues.companyId, companyId), eq(issues.identifier, ownerIdentifier)))
-    .limit(1);
-
-  if (!ownerRow) {
-    return { kind: "skipped", message: `skipped:unowned-branch: No issue found for identifier ${ownerIdentifier}` };
-  }
-
-  if (ownerRow.id !== issueId) {
+  if (candidateIdentifiers.length === 0) {
     return {
       kind: "skipped",
-      message: `skipped:not-branch-owner: PR ${pr.number} is owned by ${ownerIdentifier}, not the transitioning issue`,
+      message: "skipped:unowned-branch: PR title and headRefName do not name a SUP-\\d+ owner",
+    };
+  }
+
+  let ownerRow:
+    | { id: string; executionPolicy: unknown; executionState: unknown }
+    | undefined;
+  for (const candidateIdentifier of candidateIdentifiers) {
+    const [candidateRow] = await db
+      .select({
+        id: issues.id,
+        executionPolicy: issues.executionPolicy,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(
+        and(eq(issues.companyId, companyId), eq(issues.identifier, candidateIdentifier)),
+      )
+      .limit(1);
+    if (!candidateRow) continue;
+    if (candidateRow.id === issueId) {
+      ownerRow = candidateRow;
+      break;
+    }
+  }
+
+  if (!ownerRow) {
+    return {
+      kind: "skipped",
+      message: `skipped:not-pr-owner: PR ${pr.number} title=[${titleIds.length > 0 ? titleIds.join(", ") : "(none)"}] branch=${branchId ?? "(none)"} — none is the transitioning issue`,
     };
   }
 
