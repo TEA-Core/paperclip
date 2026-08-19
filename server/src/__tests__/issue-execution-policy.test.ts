@@ -159,6 +159,42 @@ describe("parseIssueExecutionState", () => {
     expect(state).not.toBeNull();
     expect(state!.status).toBe("pending");
   });
+
+  it("round-trips skippedStageIds", () => {
+    // The skip marker is only useful if it survives the read back. zod strips
+    // unknown keys, so a state written with skippedStageIds but parsed by a
+    // schema that does not declare it would lose the one field that tells a
+    // skipped stage apart from an approved one.
+    const skippedStageId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const state = parseIssueExecutionState({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      completedStageIds: [skippedStageId],
+      skippedStageIds: [skippedStageId],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    expect(state!.skippedStageIds).toEqual([skippedStageId]);
+  });
+
+  it("defaults skippedStageIds to empty for a state written before the field existed", () => {
+    const state = parseIssueExecutionState({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      completedStageIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    expect(state!.skippedStageIds).toEqual([]);
+  });
 });
 
 describe("issue execution policy transitions", () => {
