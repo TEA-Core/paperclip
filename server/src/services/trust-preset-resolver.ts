@@ -19,14 +19,21 @@ export type TrustPresetPolicySource = "agent" | "project" | "issue" | "run";
 export type AssertIssueExecutionPolicySatisfiableInput = {
   companyId: string;
   executionPolicy: unknown;
+  /**
+   * The issue's own assignee AFTER the write being validated. `resolveReturnAssignee()`
+   * falls back to it when the policy declares no `returnAssigneeAgentId`, so it is half
+   * of the principal the runtime excludes. Omit it only where the write genuinely has no
+   * assignee in hand — the guard then degrades to the declared field alone.
+   */
+  assigneeAgentId?: string | null;
 };
 
 /**
  * A stage the runtime can never route to anyone but the principal it excludes.
  *
  * `selectStageParticipant` excludes `resolveReturnAssignee(...)` from stage
- * participation, so a stage whose participants are ALL the policy's declared
- * `returnAssigneeAgentId` has no eligible participant at all. SUP-10602 made
+ * participation, so a stage whose participants are ALL the resolved return
+ * assignee has no eligible participant at all. SUP-10602 made
  * that case fall back to the excluded principal rather than fail, which turned
  * an unroutable gate into a self-satisfied one: an approval stage approved by
  * the very agent it was meant to gate, recorded as an ordinary `approved`
@@ -38,15 +45,36 @@ export type AssertIssueExecutionPolicySatisfiableInput = {
  * bulk-child create, issue PATCH, plugin host) — never on a read or a
  * normalize of an already-stored policy, so the issues that already carry one
  * stay mutable and are not stranded by this change.
+ *
+ * RESOLVE THE PRINCIPAL THE WAY THE RUNTIME DOES. `returnAssigneeAgentId` is the
+ * MINORITY case: only 7 of the 40 collisions measured on 2026-08-19 declared it.
+ * The other 33 collided implicitly, because `resolveReturnAssignee()` seeds the
+ * excluded principal from the issue's own assignee when the field is unset. A
+ * guard keyed on the declared field alone therefore misses 82% of the population
+ * it exists to stop, and every miss becomes a 422 at stage advance instead — the
+ * SUP-10602 deadlock, re-exposed for the common case. `_resolve_return_assignee()`
+ * in fire_issue.py already keys on `returnAssigneeAgentId or assigneeAgentId`;
+ * this is the same resolution on the server write paths.
  */
-export function assertIssueExecutionPolicyGatesAreEnforceable(executionPolicy: unknown): void {
+export function assertIssueExecutionPolicyGatesAreEnforceable(
+  executionPolicy: unknown,
+  assigneeAgentId?: string | null,
+): void {
   if (executionPolicy == null || typeof executionPolicy !== "object") return;
   const policy = executionPolicy as {
     returnAssigneeAgentId?: unknown;
     stages?: unknown;
   };
-  const returnAssigneeAgentId =
-    typeof policy.returnAssigneeAgentId === "string" ? policy.returnAssigneeAgentId : null;
+  const declaredReturnAssigneeAgentId =
+    typeof policy.returnAssigneeAgentId === "string" && policy.returnAssigneeAgentId.length > 0
+      ? policy.returnAssigneeAgentId
+      : null;
+  const derivedReturnAssigneeAgentId =
+    typeof assigneeAgentId === "string" && assigneeAgentId.length > 0 ? assigneeAgentId : null;
+  const returnAssigneeAgentId = declaredReturnAssigneeAgentId ?? derivedReturnAssigneeAgentId;
+  const returnAssigneeSource = declaredReturnAssigneeAgentId
+    ? "returnAssigneeAgentId"
+    : "assigneeAgentId";
   if (!returnAssigneeAgentId || !Array.isArray(policy.stages)) return;
 
   policy.stages.forEach((rawStage, index) => {
@@ -60,18 +88,23 @@ export function assertIssueExecutionPolicyGatesAreEnforceable(executionPolicy: u
     });
     if (!allAreReturnAssignee) return;
     const stageType = typeof stage.type === "string" ? stage.type : "unknown";
+    const sourceDescription = declaredReturnAssigneeAgentId
+      ? "executionPolicy.returnAssigneeAgentId"
+      : "the issue's own assigneeAgentId (returnAssigneeAgentId is unset, so the runtime seeds the "
+        + "return assignee from the assignee at transition time)";
     throw unprocessable(
       `Execution policy stage ${index} (${stageType}) is gated solely by its own return assignee `
-      + `${returnAssigneeAgentId}; the return assignee is excluded from participant selection, so the `
-      + "stage could never be decided by anyone else. Give the stage a participant that is not the "
-      + "return assignee, or change returnAssigneeAgentId.",
-      { stageIndex: index, stageType, returnAssigneeAgentId },
+      + `${returnAssigneeAgentId}, taken from ${sourceDescription}; the return assignee is excluded `
+      + "from participant selection, so the stage could never be decided by anyone else. Give the "
+      + "stage a participant that is not the return assignee, or change the return assignee. Never "
+      + "drop the stage to make this pass.",
+      { stageIndex: index, stageType, returnAssigneeAgentId, returnAssigneeSource },
     );
   });
 }
 
 export function assertIssueExecutionPolicySatisfiable(input: AssertIssueExecutionPolicySatisfiableInput): void {
-  assertIssueExecutionPolicyGatesAreEnforceable(input.executionPolicy);
+  assertIssueExecutionPolicyGatesAreEnforceable(input.executionPolicy, input.assigneeAgentId ?? null);
   const resolution = resolveCoreTrustPreset({
     companyId: input.companyId,
     issue: {

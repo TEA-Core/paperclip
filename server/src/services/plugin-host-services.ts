@@ -3094,7 +3094,11 @@ export function buildHostServices(
             : {};
           if (policy) executionPolicy.authorizationPolicy = policy;
           else delete executionPolicy.authorizationPolicy;
-          assertIssueExecutionPolicySatisfiable({ companyId, executionPolicy });
+          assertIssueExecutionPolicySatisfiable({
+            companyId,
+            executionPolicy,
+            assigneeAgentId: issue.assigneeAgentId ?? null,
+          });
           await db
             .update(issuesTable)
             .set({ executionPolicy, updatedAt: new Date() })
