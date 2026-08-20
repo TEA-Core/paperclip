@@ -273,6 +273,25 @@ RUN groupadd -g ${AGENTS_GID} agents \
             'cat /proc/1/environ >/dev/null 2>&1 && exit 1 || exit 0'; \
      else \
        echo "SKIP paperclip-spawn-agent exec probes: BUILDPLATFORM=${BUILDPLATFORM} != TARGETPLATFORM=${TARGETPLATFORM} (setuid bit is not honoured under binfmt emulation)"; \
+     fi \
+  # capsh is the other half of the uid split: the entrypoint uses it to hand the
+  # server an ambient CAP_KILL, without which the server can create agent
+  # processes but never signal them. It arrives with libcap2-bin. Prove it is
+  # present AND functional in the built image, so a base-image bump that drops
+  # the package fails the build instead of silently degrading every deployment
+  # to a server that cannot enforce a run timeout.
+  #
+  # The grant itself also needs cap_kill in the BOUNDING set, which belongs to
+  # the builder rather than the image — a builder that trims capabilities would
+  # fail this probe for a reason the image cannot fix. So assert the full grant
+  # only when the builder actually has cap_kill, and otherwise assert presence
+  # alone and say so out loud: a probe that quietly downgrades reads as a pass.
+  && command -v capsh >/dev/null \
+  && if capsh --print | sed -n 's/^Bounding set =//p' | grep -q '\bcap_kill\b'; then \
+       [ "$(capsh --keep=1 --user=node --inh=cap_kill --addamb=cap_kill \
+              --shell=/bin/sh -- -c 'id -u')" = "$(id -u node)" ]; \
+     else \
+       echo "SKIP capsh grant probe: cap_kill is not in the builder's bounding set (capsh presence is still asserted)"; \
      fi
 
 COPY --from=build /app /app

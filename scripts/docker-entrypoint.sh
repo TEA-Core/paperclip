@@ -162,12 +162,35 @@ umask 002
 # `sh -c 'exec "$@"' --` re-execs the original argv with no shell left in the
 # middle, so the server keeps the same process shape it has under gosu and tini
 # still reaps it directly.
+#
+# PROBE THE GRANT, NOT THE BINARY. `command -v capsh` proves only that the file
+# exists. The grant additionally needs cap_kill in the container's BOUNDING set,
+# which is a property of the runtime and not of the image: under
+# `cap_drop: [KILL]`, a restricted Kubernetes PodSecurity profile, or any
+# runtime that trims the default set, `--inh=cap_kill` fails with
+#
+#   Unable to set inheritable capabilities: Operation not permitted
+#
+# and capsh exits 1. Because the real invocation is `exec`ed, that exit status
+# IS the entrypoint's, so a flag whose only intent was to REMOVE a privilege
+# would instead put the server into a boot loop and take the deployment down.
+# That is the same failure class as the whole-tree chown above, which never
+# reached /api/health on 2026-08-15 and had to be rolled back at gate 2.
+#
+# So: run the exact same option vector in a subshell first and only exec it if
+# it succeeded. One extra fork at boot converts an outage into a documented
+# degrade back to the gosu path — the server then behaves exactly as it did
+# before CAP_KILL existed, which is survivable, unlike not starting.
+#
+# A missing capsh takes the same branch (127 from the shell), so one probe
+# covers both causes and the captured stderr names which one it was.
 if [ -n "${PAPERCLIP_AGENT_UID:-}" ]; then
-    if command -v capsh >/dev/null 2>&1; then
+    if cap_probe_err="$(capsh --keep=1 --user=node --inh=cap_kill --addamb=cap_kill \
+        --shell=/bin/sh -- -c 'exit 0' 2>&1)"; then
         exec capsh --keep=1 --user=node --inh=cap_kill --addamb=cap_kill \
             --shell=/bin/sh -- -c 'exec "$@"' -- "$@"
     fi
-    echo "docker-entrypoint.sh: warning: PAPERCLIP_AGENT_UID is set but capsh is unavailable; the server cannot signal agent processes and run timeouts will fail with EPERM" >&2
+    echo "docker-entrypoint.sh: warning: PAPERCLIP_AGENT_UID is set but CAP_KILL could not be granted (${cap_probe_err:-capsh unavailable}). Starting without it: the server cannot signal agent processes, so run timeouts will fail with EPERM and leave runtimes orphaned. Restore the KILL capability to fix this." >&2
 fi
 
 exec gosu node "$@"
