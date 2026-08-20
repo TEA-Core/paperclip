@@ -1,3 +1,7 @@
+import {
+  ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH,
+  issueCommentMetadataSchema,
+} from "@paperclipai/shared";
 import { describe, expect, it } from "vitest";
 import {
   buildWorkspaceReadyComment,
@@ -188,5 +192,32 @@ describe("workspace-ready comment builders", () => {
       "- Warning: Warning text",
       "- Service: web: http://localhost:3100 (reused)",
     ].join("\n"));
+  });
+  // A workspace warning is unbounded provider text. When one exceeded the
+  // metadata row cap the whole comment failed zod validation with
+  // {"code":"too_big","maximum":2000,"path":["sections",1,"rows",0,"text"]},
+  // so the workspace-ready signal never landed on the issue - on every run of
+  // an affected agent.
+  it("clamps an over-long warning so the metadata still validates", () => {
+    const longWarning = `head ${"w".repeat(5_000)} tail`;
+    const input = {
+      workspace: workspace({ warnings: [longWarning] }),
+      runtimeServices: [],
+    };
+
+    const metadata = buildWorkspaceReadyMetadata(input);
+    const warningsSection = metadata.sections.at(-1);
+
+    expect(warningsSection?.title).toBe("Warnings");
+    const row = warningsSection?.rows[0];
+    expect(row?.type).toBe("text");
+    const text = row && row.type === "text" ? row.text : "";
+    expect(text.length).toBe(ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH);
+    expect(text.startsWith("head ")).toBe(true);
+    expect(text.endsWith("\u2026")).toBe(true);
+    expect(() => issueCommentMetadataSchema.parse(metadata)).not.toThrow();
+
+    // The markdown body has no cap, so nothing is lost.
+    expect(buildWorkspaceReadyComment(input)).toContain(longWarning);
   });
 });
