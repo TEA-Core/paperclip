@@ -14,6 +14,7 @@ import {
   assertPushCapabilityCheckoutValid,
   buildExplicitResumeSessionOverride,
   buildEffectiveRunSessionConfigMetadata,
+  buildSessionWorkspaceConfigCategoryValue,
   buildRuntimeStateSessionJson,
   buildEffectiveRunWorkspaceConfigMetadata,
   buildWorkspaceConfigFreshnessOperation,
@@ -3298,5 +3299,107 @@ describe("reconcileReusedExecutionWorkspaceProjectWorkspaceId", () => {
     expect(
       reconcileReusedExecutionWorkspaceProjectWorkspaceId(undefined, "resolved-workspace"),
     ).toBe("resolved-workspace");
+  });
+});
+
+describe("SUP-13585 session workspaceConfig category — resumability, not row churn", () => {
+  const baseInput = {
+    requestedMode: "isolated_workspace",
+    effectiveMode: "isolated_workspace",
+    issueContext: {
+      projectId: "project-1",
+      projectWorkspaceId: "pw-1",
+      executionWorkspaceId: "ew-1",
+      executionWorkspacePreference: "isolated_workspace",
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+      // Deliberately present: a caller passing the whole issue row must not leak these
+      // into the hash. Touching an issue is not a reason to drop its agent's session.
+      updatedAt: new Date("2026-08-20T10:00:00.000Z"),
+      status: "in_progress",
+      title: "before",
+    },
+    projectContext: {
+      id: "project-1",
+      executionWorkspacePolicy: { allowIsolated: true },
+      updatedAt: new Date("2026-08-20T10:00:00.000Z"),
+      env: { PROJECT_FLAG: "enabled" },
+    },
+    projectPolicy: { allowIsolated: true },
+    issueSettings: { mode: "isolated_workspace" },
+    reusableExecutionWorkspaceConfig: null,
+    existingExecutionWorkspace: { id: "ew-1", branchName: "SUP-1-x", baseRef: "origin/main" },
+  };
+
+  const fingerprintOf = async (input: Parameters<typeof buildSessionWorkspaceConfigCategoryValue>[0]) => {
+    const metadata = await buildSessionConfigMetadata({
+      workspaceConfig: buildSessionWorkspaceConfigCategoryValue(input),
+    });
+    return metadata.categoryFingerprints.workspaceConfig;
+  };
+
+  it("ignores issue and project row churn that cannot affect resumability", async () => {
+    const before = await fingerprintOf(baseInput);
+    const after = await fingerprintOf({
+      ...baseInput,
+      issueContext: {
+        ...baseInput.issueContext,
+        // The agent writing its own issue while it works: status flip, retitle, new
+        // updatedAt. None of it changes whether the saved session is still usable.
+        updatedAt: new Date("2026-08-20T11:30:00.000Z"),
+        status: "in_review",
+        title: "after",
+      },
+      projectContext: {
+        ...baseInput.projectContext,
+        updatedAt: new Date("2026-08-20T11:30:00.000Z"),
+      },
+    });
+
+    expect(after).toBe(before);
+  });
+
+  it.each([
+    ["projectWorkspaceId", { projectWorkspaceId: "pw-2" }],
+    ["executionWorkspaceId", { executionWorkspaceId: "ew-2" }],
+    ["executionWorkspacePreference", { executionWorkspacePreference: "shared_workspace" }],
+    ["executionWorkspaceSettings", { executionWorkspaceSettings: { mode: "shared_workspace" } }],
+    ["projectId", { projectId: "project-2" }],
+  ])("still rotates when the issue's %s changes", async (_label, patch) => {
+    const before = await fingerprintOf(baseInput);
+    const after = await fingerprintOf({
+      ...baseInput,
+      issueContext: { ...baseInput.issueContext, ...patch },
+    });
+
+    expect(after).not.toBe(before);
+  });
+
+  it("still rotates when the project execution-workspace policy changes", async () => {
+    const before = await fingerprintOf(baseInput);
+    const after = await fingerprintOf({
+      ...baseInput,
+      projectContext: { ...baseInput.projectContext, executionWorkspacePolicy: { allowIsolated: false } },
+    });
+
+    expect(after).not.toBe(before);
+  });
+
+  it.each([
+    ["requested mode", { requestedMode: "shared_workspace" }],
+    ["effective mode", { effectiveMode: "shared_workspace" }],
+    ["existing workspace branch", { existingExecutionWorkspace: { id: "ew-1", branchName: "other", baseRef: "origin/main" } }],
+    ["existing workspace base ref", { existingExecutionWorkspace: { id: "ew-1", branchName: "SUP-1-x", baseRef: "origin/other" } }],
+  ])("still rotates on a workspace identity change: %s", async (_label, patch) => {
+    const before = await fingerprintOf(baseInput);
+    const after = await fingerprintOf({ ...baseInput, ...patch });
+
+    expect(after).not.toBe(before);
+  });
+
+  it("distinguishes an issueless run from an issue-bearing one", async () => {
+    const withIssue = await fingerprintOf(baseInput);
+    const withoutIssue = await fingerprintOf({ ...baseInput, issueContext: null, projectContext: null });
+
+    expect(withoutIssue).not.toBe(withIssue);
   });
 });

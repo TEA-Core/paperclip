@@ -5125,6 +5125,74 @@ function buildSessionConfigCategoryValues(input: {
   } satisfies Record<EffectiveRunSessionConfigCategory, unknown>;
 }
 
+/**
+ * The `workspaceConfig` category of the session fingerprint decides whether a saved
+ * agent session can be resumed. It used to carry `issues.updatedAt` and
+ * `projects.updatedAt` as revision proxies, which made the category rotate on ANY write
+ * to those rows — a status transition, an execution lock, a comment, a work product.
+ * An agent writes its own issue row while it works, so every run invalidated its own
+ * successor: over the 7 days to 2026-08-20, 2,376 runs carried a stored fingerprint and
+ * 13 resumed (0.5%), and the rotation correlated perfectly with an issue being attached
+ * (1843/1851 with an issue, 0/525 without).
+ *
+ * They also slipped past the existing noise filter by name: `isTimestampNoiseKey` in
+ * effective-run-config-fingerprints.ts strips `*updatedAt`-style keys, but carves out
+ * anything matching /(revision|version)/i — so `issueConfigRevisionAt` was deliberately
+ * exempted from the very filter that would have caught it. Renaming alone would have
+ * "fixed" the symptom by accident; projecting the values is the honest fix.
+ *
+ * The timestamps were redundant as well as noisy: every issue and project field that
+ * actually feeds workspace configuration is already hashed BY VALUE in this same object
+ * (`issueSettings`, `projectPolicy`, `reusableExecutionWorkspaceConfig`) or elsewhere in
+ * the fingerprint (`projects.env` under `envBindings.project.env`). Projecting the
+ * config-relevant columns explicitly is strictly more precise than a row timestamp: it
+ * drops the noise AND closes a real gap, since `issues.projectWorkspaceId` moved the
+ * timestamp but was never hashed on its own.
+ */
+export function buildSessionWorkspaceConfigCategoryValue(input: {
+  requestedMode: unknown;
+  effectiveMode: unknown;
+  issueContext: {
+    projectId?: unknown;
+    projectWorkspaceId?: unknown;
+    executionWorkspaceId?: unknown;
+    executionWorkspacePreference?: unknown;
+    executionWorkspaceSettings?: unknown;
+  } | null | undefined;
+  projectContext: { id?: unknown; executionWorkspacePolicy?: unknown } | null | undefined;
+  projectPolicy: unknown;
+  issueSettings: unknown;
+  reusableExecutionWorkspaceConfig: unknown;
+  existingExecutionWorkspace: unknown;
+}) {
+  return {
+    requestedMode: input.requestedMode,
+    effectiveMode: input.effectiveMode,
+    // Config-relevant projection, NOT the row timestamp. Anything added here must change
+    // whether a saved session is still usable; if it does not, it belongs nowhere in this
+    // category. See the invariant test in heartbeat-workspace-session.test.ts.
+    issueConfigRevision: input.issueContext
+      ? {
+          projectId: input.issueContext.projectId ?? null,
+          projectWorkspaceId: input.issueContext.projectWorkspaceId ?? null,
+          executionWorkspaceId: input.issueContext.executionWorkspaceId ?? null,
+          executionWorkspacePreference: input.issueContext.executionWorkspacePreference ?? null,
+          executionWorkspaceSettings: input.issueContext.executionWorkspaceSettings ?? null,
+        }
+      : null,
+    projectConfigRevision: input.projectContext
+      ? {
+          id: input.projectContext.id ?? null,
+          executionWorkspacePolicy: input.projectContext.executionWorkspacePolicy ?? null,
+        }
+      : null,
+    projectPolicy: input.projectPolicy,
+    issueSettings: input.issueSettings,
+    reusableExecutionWorkspaceConfig: input.reusableExecutionWorkspaceConfig,
+    existingExecutionWorkspace: input.existingExecutionWorkspace,
+  };
+}
+
 export async function buildEffectiveRunSessionConfigMetadata(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
@@ -15009,15 +15077,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentRuntimeConfig: agent.runtimeConfig,
           modelProfile: modelProfileMetadata,
           issueOverrides: issueAssigneeOverrides,
-          workspaceConfig: {
+          workspaceConfig: buildSessionWorkspaceConfigCategoryValue({
             requestedMode: requestedExecutionWorkspaceMode,
             effectiveMode: effectiveExecutionWorkspaceMode,
-            issueConfigRevisionAt: issueContext?.updatedAt instanceof Date
-              ? issueContext.updatedAt.toISOString()
-              : issueContext?.updatedAt ?? null,
-            projectConfigRevisionAt: projectContext?.updatedAt instanceof Date
-              ? projectContext.updatedAt.toISOString()
-              : projectContext?.updatedAt ?? null,
+            issueContext,
+            projectContext,
             projectPolicy: projectExecutionWorkspacePolicy,
             issueSettings: issueExecutionWorkspaceSettings,
             reusableExecutionWorkspaceConfig: requestedReusableExecutionWorkspaceConfig,
@@ -15033,7 +15097,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   config: reusableExistingExecutionWorkspace.config,
                 }
               : null,
-          },
+          }),
           environment: {
             selectionSource: environmentResolution.source,
             selectedEnvironmentId,
