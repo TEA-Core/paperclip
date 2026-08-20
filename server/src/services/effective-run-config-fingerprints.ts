@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import type { RuntimeSecretManifestEntry } from "./secrets.js";
 
-export const EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION = 1;
+// v2 (SUP-13585): the session `workspaceConfig` category dropped `issues.updatedAt` /
+// `projects.updatedAt` revision proxies in favour of an explicit config-relevant
+// projection. Bumped so the one-time transitional mismatch reports itself as a
+// version change rather than masquerading as "workspace config changed".
+export const EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION = 2;
 export const EFFECTIVE_RUN_CONFIG_FINGERPRINT_ALGORITHM = "sha256";
 export const EFFECTIVE_RUN_CONFIG_FINGERPRINT_CATEGORIES = ["session", "workspace", "lease"] as const;
 
