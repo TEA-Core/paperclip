@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION,
   canonicalizeEffectiveRunConfigCategory,
   createEffectiveRunConfigFingerprints,
   diffEffectiveRunConfigFingerprints,
 } from "../services/effective-run-config-fingerprints.ts";
+
+// This suite is about determinism and versioning, not about the version being any
+// particular number. Assert against the exported constant so a deliberate bump does
+// not read as a regression here.
+const FP = EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION;
+const FINGERPRINT_PATTERN = new RegExp(`^v${FP}:sha256:[a-f0-9]{64}$`);
 
 describe("effective run config fingerprints", () => {
   it("emits versioned deterministic fingerprints with stable object ordering", () => {
@@ -67,14 +74,14 @@ describe("effective run config fingerprints", () => {
       },
     });
 
-    expect(first.version).toBe(1);
+    expect(first.version).toBe(FP);
     expect(first.categories).toEqual(["session", "workspace", "lease"]);
     expect(first.sessionFingerprint).toMatchObject({
-      version: 1,
+      version: FP,
       category: "session",
       algorithm: "sha256",
     });
-    expect(first.sessionFingerprint.fingerprint).toMatch(/^v1:sha256:[a-f0-9]{64}$/);
+    expect(first.sessionFingerprint.fingerprint).toMatch(FINGERPRINT_PATTERN);
     expect(second).toEqual(first);
   });
 

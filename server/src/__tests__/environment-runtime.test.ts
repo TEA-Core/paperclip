@@ -10,6 +10,7 @@ import {
   startSshEnvLabFixture,
   stopSshEnvLabFixture,
 } from "@paperclipai/adapter-utils/ssh";
+import { EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION } from "../services/effective-run-config-fingerprints.ts";
 import {
   agents,
   companies,
@@ -1970,7 +1971,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       provider: "fake-plugin",
       leaseFingerprint: expect.objectContaining({
         category: "lease",
-        fingerprint: expect.stringMatching(/^v1:sha256:[a-f0-9]{64}$/),
+        fingerprint: expect.stringMatching(
+          new RegExp(`^v${EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION}:sha256:[a-f0-9]{64}$`),
+        ),
       }),
     });
     await runtimeWithPlugin.releaseRunLeases(runId);
