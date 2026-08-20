@@ -84,6 +84,61 @@ function resolveProcessGroupId(child: ChildProcess) {
   return typeof child.pid === "number" && child.pid > 0 ? child.pid : null;
 }
 
+/**
+ * Default re-arm interval for `scheduleWallClockDeadline`.
+ */
+export const WALL_CLOCK_DEADLINE_TICK_MS = 30_000;
+
+/**
+ * Fire `onDeadline` when wall-clock time reaches `deadlineMs`.
+ *
+ * `setTimeout` counts libuv loop time (CLOCK_MONOTONIC), not wall-clock time.
+ * On hosts whose monotonic clock drifts against CLOCK_REALTIME a single long
+ * `setTimeout` therefore fires at the wrong wall-clock instant: on the WSL2
+ * dev host a `setTimeout(5400_000)` armed for an adapter run elapsed after
+ * only ~5063 seconds of wall clock, so agent runs were killed 337 seconds
+ * before the budget the operator configured — and every surface still
+ * reported the configured 5400. The deficit is not a constant; it tracked
+ * host clock skew (34s on 2026-08-17, 274s on 2026-08-18, 341s on 2026-08-19)
+ * and applied to every adapter on the host.
+ *
+ * Re-arming in short ticks against a `Date.now()` deadline re-measures the
+ * skew on every tick instead of compounding it across the whole budget, and
+ * is equally correct when the monotonic clock runs slow (host suspend), where
+ * a single `setTimeout` fires late instead of early.
+ */
+export function scheduleWallClockDeadline(opts: {
+  deadlineMs: number;
+  onDeadline: () => void;
+  tickMs?: number;
+  now?: () => number;
+}): { cancel: () => void } {
+  const now = opts.now ?? (() => Date.now());
+  const tickMs = Math.max(1, opts.tickMs ?? WALL_CLOCK_DEADLINE_TICK_MS);
+  let timer: NodeJS.Timeout | null = null;
+  let cancelled = false;
+
+  const arm = () => {
+    timer = null;
+    if (cancelled) return;
+    const remainingMs = opts.deadlineMs - now();
+    if (remainingMs <= 0) {
+      opts.onDeadline();
+      return;
+    }
+    timer = setTimeout(arm, Math.min(remainingMs, tickMs));
+  };
+  arm();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+    },
+  };
+}
+
 // Exported so the direct-child fallback branch can be unit-tested directly.
 export function signalRunningProcess(
   running: Pick<RunningProcess, "child" | "processGroupId">,
@@ -3391,16 +3446,25 @@ export async function runChildProcess(
           }, graceMs);
         };
 
+        // The adapter wall-clock budget is measured against Date.now(), not
+        // against the event loop's monotonic clock. See
+        // scheduleWallClockDeadline: a bare setTimeout(timeoutSec * 1000) is
+        // only correct while CLOCK_MONOTONIC and CLOCK_REALTIME agree, and on
+        // a drifting host it kills runs hundreds of seconds early while every
+        // report still shows the configured timeoutSec.
         const timeout =
           opts.timeoutSec > 0
-            ? setTimeout(() => {
-                timedOut = true;
-                clearTerminalCleanupTimers();
-                signalRunningProcess({ child, processGroupId }, "SIGTERM");
-                setTimeout(() => {
-                  signalRunningProcess({ child, processGroupId }, "SIGKILL");
-                }, Math.max(1, opts.graceSec) * 1000);
-              }, opts.timeoutSec * 1000)
+            ? scheduleWallClockDeadline({
+                deadlineMs: Date.now() + opts.timeoutSec * 1000,
+                onDeadline: () => {
+                  timedOut = true;
+                  clearTerminalCleanupTimers();
+                  signalRunningProcess({ child, processGroupId }, "SIGTERM");
+                  setTimeout(() => {
+                    signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                  }, Math.max(1, opts.graceSec) * 1000);
+                },
+              })
             : null;
 
         child.stdout?.on("data", (chunk: unknown) => {
@@ -3445,7 +3509,7 @@ export async function runChildProcess(
         }
 
         child.on("error", (err: Error) => {
-          if (timeout) clearTimeout(timeout);
+          timeout?.cancel();
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
           void target.cleanup?.();
@@ -3463,7 +3527,7 @@ export async function runChildProcess(
         });
 
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
-          if (timeout) clearTimeout(timeout);
+          timeout?.cancel();
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
           void logChain.finally(() => {
