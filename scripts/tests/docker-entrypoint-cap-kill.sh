@@ -5,8 +5,8 @@
 # kernel capability sets and a real setuid drop. Nothing here can be asserted
 # from the source text.
 #
-#   scripts/test-docker-entrypoint-cap-kill.sh
-#   IMAGE=tea-core/paperclip:v2026.722.0-tea scripts/test-docker-entrypoint-cap-kill.sh
+#   scripts/tests/docker-entrypoint-cap-kill.sh
+#   IMAGE=tea-core/paperclip:v2026.722.0-tea scripts/tests/docker-entrypoint-cap-kill.sh
 #
 # The working-tree entrypoint is mounted over the image's, so a change can be
 # tested without a rebuild. It is invoked as `sh /tmp/ep.sh ...` because the file
@@ -22,7 +22,7 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EP="$HERE/docker-entrypoint.sh"
+EP="$(cd "$HERE/.." && pwd)/docker-entrypoint.sh"
 IMAGE="${IMAGE:-tea-core/paperclip:v2026.722.0-tea}"
 
 PASS=0
