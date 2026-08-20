@@ -101,6 +101,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../issue-assignee-review-gate.js";
 import { loadConfig } from "../../config.js";
 import {
   canAgentSatisfyIssueWorkspaceSettings,
@@ -1436,6 +1437,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         identifier: issues.identifier,
         status: issues.status,
         createdByAgentId: issues.createdByAgentId,
+        assigneeAgentId: issues.assigneeAgentId,
+        executionPolicy: issues.executionPolicy,
+        executionState: issues.executionState,
       })
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -1477,8 +1481,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
       const blockingLinks = formatIssueLinksForComment(relations.blocks);
+      // SUP-13526: route this recovery reassignment through the same gate as
+      // the PATCH handler and the other recovery paths. A refusal keeps the
+      // blocker unassigned instead of making its review stage self-satisfiable.
+      const nextAssigneeAgentId = resolveRecoveryReassignedAssignee(candidate, creatorAgent.id);
+      if (!nextAssigneeAgentId) {
+        skipped += 1;
+        continue;
+      }
       const updated = await issuesSvc.update(candidate.id, {
-        assigneeAgentId: creatorAgent.id,
+        assigneeAgentId: nextAssigneeAgentId,
         assigneeUserId: null,
       });
       if (!updated) {
@@ -3824,6 +3836,49 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  /**
+   * SUP-13526: recovery reassignment writes `assigneeAgentId` straight through
+   * the issue service, bypassing the PATCH handler's gate. When the recovery
+   * owner is a participant of an incomplete review stage that cannot be cleared
+   * without their own approval, refuse the reassignment: keep the current
+   * assignee (or leave the issue unassigned) and still block it.
+   */
+  function resolveRecoveryReassignedAssignee(
+    issue: {
+      id: string;
+      identifier?: string | null;
+      assigneeAgentId: string | null;
+      executionPolicy: unknown;
+      executionState: unknown;
+    },
+    recoveryOwnerAgentId: string | null,
+    currentAssigneeAgentId?: string | null,
+  ): string | null {
+    const candidate = recoveryOwnerAgentId ?? issue.assigneeAgentId;
+    const effectiveCurrent = currentAssigneeAgentId ?? issue.assigneeAgentId;
+    if (!candidate || candidate === effectiveCurrent) return candidate;
+    try {
+      assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
+        executionPolicy: issue.executionPolicy,
+        executionState: issue.executionState,
+        incomingAssigneeAgentId: candidate,
+      });
+    } catch (error) {
+      logger.warn(
+        {
+          issueId: issue.id,
+          identifier: issue.identifier,
+          refusedAssigneeAgentId: candidate,
+          keptAssigneeAgentId: effectiveCurrent,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "recovery reassignment refused: assignee write would make an incomplete review stage self-satisfiable",
+      );
+      return effectiveCurrent;
+    }
+    return candidate;
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -3875,7 +3930,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         agentId: recoveryAction.returnOwnerAgentId,
       });
     }
-    const nextAssigneeAgentId = recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId;
+    const nextAssigneeAgentId = resolveRecoveryReassignedAssignee(input.issue, recoveryAction.ownerAgentId);
     const updated = await blockIssueWithUnresolvedBlockers(db, input.issue, {
       source: escalationSource,
       previousStatus: input.previousStatus,
@@ -4029,7 +4084,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         const reblocked = await blockIssueWithUnresolvedBlockers(db, input.issue, {
           source: escalationSource,
           previousStatus: input.previousStatus,
-          extraUpdate: { assigneeAgentId: recoveryAction.ownerAgentId },
+          extraUpdate: {
+            assigneeAgentId: resolveRecoveryReassignedAssignee(
+              input.issue,
+              recoveryAction.ownerAgentId,
+              currentIssue.assigneeAgentId,
+            ),
+          },
         });
         if (reblocked) return reblocked;
       }

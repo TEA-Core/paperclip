@@ -217,6 +217,7 @@ import {
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
@@ -9343,6 +9344,17 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
+    // SUP-13526: an explicit assigneeAgentId write must not land an assignee
+    // that is required to approve their own incomplete review stage. Runtime
+    // stage-transition assignee writes (review start selecting its active
+    // participant) are not request writes and are checked nowhere else.
+    if (normalizedAssigneeAgentId !== undefined) {
+      assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
+        executionPolicy: nextExecutionPolicy,
+        executionState: existing.executionState,
+        incomingAssigneeAgentId: normalizedAssigneeAgentId,
+      });
+    }
     if (updateFields.executionPolicy !== undefined) {
       const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
       const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;
