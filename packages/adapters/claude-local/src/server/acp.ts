@@ -26,6 +26,7 @@ import {
 } from "@paperclipai/adapter-utils/acpx-engine/constants";
 import type {
   AcpxEngineExecutorOptions,
+  AcpxLocalManagedHomeContext,
   AcpxRemoteManagedHomeContext,
   AcpxRemoteManagedHomeResult,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
@@ -37,6 +38,8 @@ import {
 import {
   materializeRemoteClaudeConfig,
   prepareClaudeConfigSeed,
+  resolveAgentSideClaudeConfigDir,
+  seedAgentSideClaudeConfig,
 } from "./claude-config.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -269,10 +272,45 @@ async function prepareClaudeRemoteManagedHome(
   return { stagedRuntime };
 }
 
+/**
+ * Claude local managed-home prep for the LOCAL ACP lane (the local counterpart
+ * of {@link prepareClaudeRemoteManagedHome}). The local bridge spawns on this
+ * host, so instead of shipping a seed through the staging seam, we materialize
+ * the agent-side config home in place and repoint `CLAUDE_CONFIG_DIR` onto it.
+ *
+ * The agent principal runs as a different uid (1001) from the server (1000)
+ * but shares the `agents` group, so the home and its seeded credential files
+ * land group-`agents` readable (0o2770 dirs, 0o660 files) and the agent uid
+ * reaches them without any uid change on the lane. The server's shared home
+ * (~/.claude, with 0700 subdirs) is only read, never modified.
+ *
+ * An operator-set `CLAUDE_CONFIG_DIR` is already merged into the run env
+ * before the engine invokes this seam; the local lane can reach host paths
+ * verbatim, so an explicit value is honored and we do NOT repoint it.
+ */
+export async function prepareClaudeLocalManagedHome(
+  input: AcpxLocalManagedHomeContext,
+): Promise<void> {
+  const { env, companyId, agentId, onLog } = input;
+  const explicit = typeof env.CLAUDE_CONFIG_DIR === "string" ? env.CLAUDE_CONFIG_DIR.trim() : "";
+  if (explicit) return;
+  // Host-side resolution: PAPERCLIP_HOME / PAPERCLIP_INSTANCE_ID live in the
+  // server process env, not in the per-run env the engine hands over (mirrors
+  // the remote seam's use of process.env for the managed seed below).
+  const hostEnv = process.env;
+  await seedAgentSideClaudeConfig(hostEnv, onLog, companyId, agentId);
+  env.CLAUDE_CONFIG_DIR = resolveAgentSideClaudeConfigDir(hostEnv, companyId, agentId);
+  await onLog(
+    "stdout",
+    `[paperclip] Local ACP run will use the agent-side Claude config home ${env.CLAUDE_CONFIG_DIR}\n`,
+  );
+}
+
 function withClaudeAcpDefaults(options: ClaudeAcpExecutorOptions): AcpxEngineExecutorOptions {
   return {
     resolveBillingIdentity: resolveClaudeAcpBillingIdentity,
     prepareRemoteManagedHome: prepareClaudeRemoteManagedHome,
+    prepareLocalManagedHome: prepareClaudeLocalManagedHome,
     ...options,
     adapterType: "claude_local",
     moduleDir,
