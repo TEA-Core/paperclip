@@ -8267,7 +8267,11 @@ export function issueRoutes(
     }
     await assertIssueEnvironmentSelection(companyId, createBody.executionWorkspaceSettings?.environmentId);
 
-    assertIssueExecutionPolicySatisfiable({ companyId, executionPolicy: normalizedExecutionPolicy });
+    assertIssueExecutionPolicySatisfiable({
+      companyId,
+      executionPolicy: normalizedExecutionPolicy,
+      assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+    });
     const executionPolicy = applyActorMonitorScheduledBy(normalizedExecutionPolicy, actor.actorType);
     await assertCanManageIssueMonitor(access, req, companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issueId = randomUUID();
@@ -8489,7 +8493,11 @@ export function issueRoutes(
     const currentSerializedChild = serializationContext
       ? await findCurrentSerializedWatchdogChild(parent)
       : null;
-    assertIssueExecutionPolicySatisfiable({ companyId: parent.companyId, executionPolicy: normalizedExecutionPolicy });
+    assertIssueExecutionPolicySatisfiable({
+      companyId: parent.companyId,
+      executionPolicy: normalizedExecutionPolicy,
+      assigneeAgentId: normalizedAssigneeAgentRef.id ?? null,
+    });
     const executionPolicy = applyActorMonitorScheduledBy(normalizedExecutionPolicy, actor.actorType);
     await assertCanManageIssueMonitor(access, req, parent.companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issueId = randomUUID();
@@ -8664,7 +8672,11 @@ export function issueRoutes(
     const normalizedChildren = [];
     for (const child of requestedChildren) {
       const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(child.executionPolicy);
-      assertIssueExecutionPolicySatisfiable({ companyId: sourceIssue.companyId, executionPolicy: normalizedExecutionPolicy });
+      assertIssueExecutionPolicySatisfiable({
+        companyId: sourceIssue.companyId,
+        executionPolicy: normalizedExecutionPolicy,
+        assigneeAgentId: (child.assigneeAgentId as string | null | undefined) ?? null,
+      });
       const executionPolicy = applyActorMonitorScheduledBy(
         normalizedExecutionPolicy,
         actor.actorType,
@@ -9314,7 +9326,13 @@ export function issueRoutes(
     }
     if (req.body.executionPolicy !== undefined) {
       const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
-      assertIssueExecutionPolicySatisfiable({ companyId: existing.companyId, executionPolicy: normalizedExecutionPolicy });
+      // requestedAssigneeAgentId is the assignee AFTER this PATCH, so a PATCH that
+      // moves the assignee off the collision in the same body is accepted.
+      assertIssueExecutionPolicySatisfiable({
+        companyId: existing.companyId,
+        executionPolicy: normalizedExecutionPolicy,
+        assigneeAgentId: requestedAssigneeAgentId ?? null,
+      });
       updateFields.executionPolicy = applyActorMonitorScheduledBy(
         normalizedExecutionPolicy,
         actor.actorType,

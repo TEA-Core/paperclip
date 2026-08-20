@@ -5,6 +5,7 @@ import {
   LOW_TRUST_REVIEW_RAW_OUTPUT_DISPOSITION,
   LOW_TRUST_REVIEW_PRESET,
 } from "@paperclipai/shared";
+import { HttpError } from "../errors.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import {
   assertIssueExecutionPolicySatisfiable,
@@ -285,10 +286,7 @@ describe("assertIssueExecutionPolicySatisfiable — self-gated stages", () => {
     ).not.toThrow();
   });
 
-  it("ignores a policy with no declared returnAssigneeAgentId", () => {
-    // The implicit collision (return assignee seeded from the issue's own
-    // assignee at transition time) is not knowable at write time; the fire
-    // tooling covers it, and the runtime now refuses to route the stage.
+  it("allows a policy with no declared return assignee and no assignee to check against", () => {
     expect(() =>
       assertIssueExecutionPolicySatisfiable({
         companyId,
@@ -297,6 +295,134 @@ describe("assertIssueExecutionPolicySatisfiable — self-gated stages", () => {
           commentRequired: true,
           stages: [agentStage("review", reviewerAgentId)],
         },
+      }),
+    ).not.toThrow();
+  });
+});
+
+// 33 of the 40 collisions measured on 2026-08-19 declared NO
+// returnAssigneeAgentId at all: resolveReturnAssignee() seeds the excluded
+// principal from the issue's own assignee, so the collision is IMPLICIT. A
+// guard keyed on the declared field alone sees none of them, and the removal of
+// allowSelfAsFallback turns every one into a 422 at stage advance instead — the
+// SUP-10602 deadlock, back for the majority case. The write path knows the
+// assignee (it is in the same create/PATCH body), so it resolves the principal
+// the same way the runtime does: returnAssigneeAgentId ?? assigneeAgentId. This
+// mirrors _resolve_return_assignee() in fire_issue.py.
+describe("assertIssueExecutionPolicySatisfiable — implicit self-gated stages", () => {
+  const assigneeAgentId = "77777777-7777-4777-8777-777777777777";
+  const declaredReturnAssigneeAgentId = "88888888-8888-4888-8888-888888888888";
+  const reviewerAgentId = "99999999-9999-4999-8999-999999999999";
+
+  const agentStage = (type: string, ...agentIds: string[]) => ({
+    id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    type,
+    approvalsNeeded: 1,
+    participants: agentIds.map((agentId) => ({ type: "agent", agentId })),
+  });
+
+  const undeclaredPolicy = (stages: unknown[]) => ({
+    mode: "normal",
+    commentRequired: true,
+    stages,
+  });
+
+  it("rejects an approval stage gated solely by the issue's own assignee", () => {
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        assigneeAgentId,
+        executionPolicy: undeclaredPolicy([agentStage("approval", assigneeAgentId)]),
+      }),
+    ).toThrow(/gated solely by its own return assignee/);
+  });
+
+  it("rejects a review stage gated solely by the issue's own assignee", () => {
+    // The review shape is the dangerous one: it does not 422, it silently
+    // auto-skips on the `done` transition and leaves no decision row.
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        assigneeAgentId,
+        executionPolicy: undeclaredPolicy([agentStage("review", assigneeAgentId)]),
+      }),
+    ).toThrow(/gated solely by its own return assignee/);
+  });
+
+  it("names the assignee as the source so the operator knows which field to move", () => {
+    try {
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        assigneeAgentId,
+        executionPolicy: undeclaredPolicy([agentStage("approval", assigneeAgentId)]),
+      });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(HttpError);
+      const httpErr = err as HttpError;
+      expect(httpErr.status).toBe(422);
+      expect(httpErr.message).toMatch(/assigneeAgentId/);
+      expect(httpErr.details).toMatchObject({
+        stageIndex: 0,
+        stageType: "approval",
+        returnAssigneeAgentId: assigneeAgentId,
+        returnAssigneeSource: "assigneeAgentId",
+      });
+    }
+  });
+
+  it("rejects the ADR-072 close ladder when the parent drifts onto its own approver", () => {
+    // SUP-13489 exactly: support-QAE -> coder-LE -> exec-CTO, parent reassigned
+    // onto exec-CTO, no returnAssigneeAgentId declared.
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        assigneeAgentId,
+        executionPolicy: undeclaredPolicy([
+          agentStage("review", reviewerAgentId),
+          agentStage("review", declaredReturnAssigneeAgentId),
+          agentStage("approval", assigneeAgentId),
+        ]),
+      }),
+    ).toThrow(/stage 2 \(approval\)/);
+  });
+
+  it("prefers the declared return assignee over the assignee when both are present", () => {
+    // A stage gated solely by the ASSIGNEE is legitimate once the policy names a
+    // different return assignee: the runtime excludes the declared one, so the
+    // assignee is still an eligible participant and the gate is real.
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        assigneeAgentId,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          returnAssigneeAgentId: declaredReturnAssigneeAgentId,
+          stages: [agentStage("review", assigneeAgentId)],
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it("allows an implicit stage where the assignee is only one of several participants", () => {
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        assigneeAgentId,
+        executionPolicy: undeclaredPolicy([
+          agentStage("review", assigneeAgentId, reviewerAgentId),
+        ]),
+      }),
+    ).not.toThrow();
+  });
+
+  it("allows an implicit policy with no collision", () => {
+    expect(() =>
+      assertIssueExecutionPolicySatisfiable({
+        companyId,
+        assigneeAgentId,
+        executionPolicy: undeclaredPolicy([agentStage("review", reviewerAgentId)]),
       }),
     ).not.toThrow();
   });
