@@ -1897,6 +1897,167 @@ describe("agent issue mutation checkout ownership", () => {
     });
   });
 
+  describe("assignee write self-satisfiable review stage guard (SUP-13526)", () => {
+    const gateStageId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const gateReviewerAgentId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const gateSecondParticipantAgentId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const gateThirdParticipantAgentId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+
+    function gateIssue(overrides: Record<string, unknown> = {}) {
+      return makeIssue({
+        status: "in_progress",
+        assigneeAgentId: ownerAgentId,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            {
+              id: gateStageId,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ id: "44444444-4444-4444-8444-444444444444", type: "agent", agentId: gateReviewerAgentId }],
+            },
+          ],
+        },
+        ...overrides,
+      });
+    }
+
+    beforeEach(() => {
+      mockAgentService.getById.mockImplementation(async (id: string) => ({
+        id,
+        companyId,
+        name: `Agent ${id}`,
+      }));
+      mockAgentService.resolveByReference.mockImplementation(async (_companyId: string, raw: string) => ({
+        agent: { id: raw, companyId, name: `Agent ${raw}`, status: "active" },
+        ambiguous: false,
+      }));
+      mockIssueService.getById.mockResolvedValue(gateIssue());
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...gateIssue(),
+        ...patch,
+      }));
+    });
+
+    it("rejects an assigneeAgentId write that would make an incomplete review stage self-satisfiable", async () => {
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: gateReviewerAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toContain(gateStageId);
+      expect(res.body.error).toContain("self-satisfiable");
+      expect(res.body.details.guard).toBe("assignee_review_gate");
+      expect(res.body.details.issueStageId).toBe(gateStageId);
+      expect(res.body.details.assigneeAgentId).toBe(gateReviewerAgentId);
+      expect(res.body.details.participantsExcludingAssignee).toBe(0);
+      expect(res.body.details.approvalsNeeded).toBe(1);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects the same write when it arrives through the ancestor escape hatch", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed:
+          input.action === "tasks:assign" ||
+          input.action === "issue:comment" ||
+          input.action === "issue:read" ||
+          input.action === "company_scope:read",
+        action: input.action,
+        reason:
+          input.action === "tasks:assign" ||
+          input.action === "issue:comment" ||
+          input.action === "issue:read" ||
+          input.action === "company_scope:read"
+          ? "allow_explicit_grant"
+          : "deny_missing_grant",
+        explanation: "Ancestor boundary without issue:mutate.",
+      }));
+      mockAccessService.isManagerOf.mockResolvedValue(true);
+      const ancestorActor = {
+        type: "agent",
+        agentId: peerAgentId,
+        companyId,
+        source: "agent_key",
+        runId: "66666666-6666-4666-8666-666666666666",
+      };
+
+      const res = await request(await createApp(ancestorActor))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: gateReviewerAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toContain(gateStageId);
+      expect(res.body.error).toContain("self-satisfiable");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows the write when other participants can clear the stage without the assignee", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        gateIssue({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [
+              {
+                id: gateStageId,
+                type: "review",
+                approvalsNeeded: 1,
+                participants: [
+                  { id: "44444444-4444-4444-8444-444444444444", type: "agent", agentId: gateReviewerAgentId },
+                  { id: "55555555-5555-4555-8555-555555555555", type: "agent", agentId: gateSecondParticipantAgentId },
+                  { id: "66666666-6666-4666-8666-666666666666", type: "agent", agentId: gateThirdParticipantAgentId },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: gateReviewerAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ assigneeAgentId: gateReviewerAgentId }),
+      );
+    });
+
+    it.each([
+      ["completed", { completedStageIds: [gateStageId] }],
+      ["skipped", { skippedStageIds: [gateStageId] }],
+    ])("allows the same write when the stage is %s", async (_label, stateOverride) => {
+      mockIssueService.getById.mockResolvedValue(
+        gateIssue({
+          executionState: {
+            status: "idle",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            reviewRequest: null,
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            ...stateOverride,
+          },
+        }),
+      );
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: gateReviewerAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ assigneeAgentId: gateReviewerAgentId }),
+      );
+    });
+  });
+
   it("records escape_hatch_creator in the issue.comment_added activity when the creating agent comments via the escape hatch", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:comment" || input.action === "issue:read",
