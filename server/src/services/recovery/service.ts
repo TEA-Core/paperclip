@@ -1437,6 +1437,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         identifier: issues.identifier,
         status: issues.status,
         createdByAgentId: issues.createdByAgentId,
+        assigneeAgentId: issues.assigneeAgentId,
+        executionPolicy: issues.executionPolicy,
+        executionState: issues.executionState,
       })
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -1478,8 +1481,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
       const blockingLinks = formatIssueLinksForComment(relations.blocks);
+      // SUP-13526: route this recovery reassignment through the same gate as
+      // the PATCH handler and the other recovery paths. A refusal keeps the
+      // blocker unassigned instead of making its review stage self-satisfiable.
+      const nextAssigneeAgentId = resolveRecoveryReassignedAssignee(candidate, creatorAgent.id);
+      if (!nextAssigneeAgentId) {
+        skipped += 1;
+        continue;
+      }
       const updated = await issuesSvc.update(candidate.id, {
-        assigneeAgentId: creatorAgent.id,
+        assigneeAgentId: nextAssigneeAgentId,
         assigneeUserId: null,
       });
       if (!updated) {
@@ -3830,10 +3841,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
    * the issue service, bypassing the PATCH handler's gate. When the recovery
    * owner is a participant of an incomplete review stage that cannot be cleared
    * without their own approval, refuse the reassignment: keep the current
-   * assignee and still block the issue.
+   * assignee (or leave the issue unassigned) and still block it.
    */
   function resolveRecoveryReassignedAssignee(
-    issue: typeof issues.$inferSelect,
+    issue: {
+      id: string;
+      identifier?: string | null;
+      assigneeAgentId: string | null;
+      executionPolicy: unknown;
+      executionState: unknown;
+    },
     recoveryOwnerAgentId: string | null,
     currentAssigneeAgentId?: string | null,
   ): string | null {

@@ -1218,6 +1218,119 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("refuses to assign an unassigned blocker whose review stage only its creator can clear", async () => {
+    const { companyId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const blockerId = randomUUID();
+    const stageId = randomUUID();
+    const issueNumber = 1000 + Math.floor(Math.random() * 900000);
+    // SUP-13526: the creator (coder) is the sole participant of the blocker's
+    // own incomplete review stage. Assigning the creator to the blocker would
+    // make the stage self-satisfiable, so the recovery path must refuse.
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Orphan blocker with a self-satisfiable review stage",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByAgentId: coderId,
+      issueNumber,
+      identifier: `${prefix}-${issueNumber}`,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: coderId, userId: null }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        completedStageIds: [],
+        skippedStageIds: [],
+      },
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: sourceIssueId,
+      type: "blocks",
+    });
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ orphanBlockersAssigned: 0 });
+    const [blocker] = await db.select().from(issues).where(eq(issues.id, blockerId));
+    expect(blocker?.assigneeAgentId).toBeNull();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("still assigns an unassigned blocker whose review stage does not require the creator", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const blockerId = randomUUID();
+    const stageId = randomUUID();
+    const issueNumber = 1000 + Math.floor(Math.random() * 900000);
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Orphan blocker with an independent review stage",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByAgentId: coderId,
+      issueNumber,
+      identifier: `${prefix}-${issueNumber}`,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        completedStageIds: [],
+        skippedStageIds: [],
+      },
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: sourceIssueId,
+      type: "blocks",
+    });
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ orphanBlockersAssigned: 1 });
+    const [blocker] = await db.select().from(issues).where(eq(issues.id, blockerId));
+    expect(blocker?.assigneeAgentId).toBe(coderId);
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      coderId,
+      expect.objectContaining({
+        reason: "issue_assigned",
+        payload: expect.objectContaining({ mutation: "unassigned_blocker_recovery" }),
+      }),
+    );
+  });
+
   it("uses the default quota backoff when the provider does not state a reset time", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     await db.insert(heartbeatRuns).values({
