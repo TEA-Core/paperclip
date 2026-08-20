@@ -1003,7 +1003,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timedOut: true,
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
-        errorMeta,
+        // Present only when the process outlived every signal we could send it,
+        // so an operator reading the run sees it is still out there rather than
+        // assuming the timeout stopped it.
+        errorMeta: proc.orphanedProcess
+          ? { ...(errorMeta ?? {}), orphanedProcess: proc.orphanedProcess }
+          : errorMeta,
         // Only present when the stream carried a terminal result; a mid-turn
         // kill usually leaves both null, which is honest rather than zeroed.
         ...(parsedStream.usage ? { usage: parsedStream.usage } : {}),

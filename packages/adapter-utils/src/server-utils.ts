@@ -30,6 +30,10 @@ export interface RunProcessResult {
   finishedAt?: string | null;
   durationMs?: number | null;
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
+  // Set only when the supervisor asked the OS to stop this process and the OS
+  // refused. The run is reported, the process is still running. Absent on every
+  // normal path, so existing producers and consumers are unaffected.
+  orphanedProcess?: OrphanedProcessEvidence | null;
 }
 
 export interface TerminalResultCleanupOptions {
@@ -49,6 +53,42 @@ export interface TerminalResultCleanupEvidence {
   terminalResultSeen: boolean;
   signal: NodeJS.Signals | null;
   forceKilled: boolean;
+}
+
+export const SIGNAL_UNDELIVERABLE_REASON =
+  "the supervisor could not signal this process; it is still running unattended";
+
+/**
+ * Evidence that a run ended while its process was still alive because no
+ * signal the supervisor sent could be delivered.
+ *
+ * The concrete case is the agent-uid split: with PAPERCLIP_AGENT_UID armed the
+ * server spawns agents through a setuid shim at a different uid, so POSIX lets
+ * it CREATE those children while refusing every kill(2) against them unless the
+ * server also holds CAP_KILL. Every timeout then returned EPERM, and the run
+ * was reported as a start failure while the process kept working.
+ */
+export interface OrphanedProcessEvidence {
+  kind: "orphaned_process";
+  reason: typeof SIGNAL_UNDELIVERABLE_REASON;
+  pid: number | null;
+  processGroupId: number | null;
+  /** The last signal the supervisor tried to deliver. */
+  signal: NodeJS.Signals;
+  /** errno of the failed delivery, e.g. "EPERM". Null when the OS gave none. */
+  errorCode: string | null;
+}
+
+/** Whether a signal actually reached the target. */
+export interface SignalDeliveryResult {
+  /**
+   * True when the signal was accepted, or when the child had already exited so
+   * there was nothing to deliver. False means the process is still running and
+   * the supervisor has no way to stop it.
+   */
+  delivered: boolean;
+  /** errno of the failed attempt, when one was reported. */
+  errorCode: string | null;
 }
 
 interface RunningProcess {
@@ -140,24 +180,34 @@ export function scheduleWallClockDeadline(opts: {
 }
 
 // Exported so the direct-child fallback branch can be unit-tested directly.
+// Reports whether the signal was actually delivered: both failure paths used to
+// be silent, so a process the supervisor could not stop was indistinguishable
+// from one it had just stopped.
 export function signalRunningProcess(
   running: Pick<RunningProcess, "child" | "processGroupId">,
   signal: NodeJS.Signals,
-) {
+): SignalDeliveryResult {
+  let errorCode: string | null = null;
   if (process.platform !== "win32" && running.processGroupId && running.processGroupId > 0) {
     try {
       process.kill(-running.processGroupId, signal);
-      return;
-    } catch {
+      return { delivered: true, errorCode: null };
+    } catch (err) {
       // Fall back to the direct child signal if group signaling fails.
+      errorCode = (err as NodeJS.ErrnoException).code ?? null;
     }
   }
   // Gate on real liveness: `child.killed` only means a signal was sent, not that
   // the process exited, so escalating on it would suppress a follow-up SIGKILL.
   // `exitCode`/`signalCode` are null until the child actually closes.
   if (running.child.exitCode === null && running.child.signalCode === null) {
-    running.child.kill(signal);
+    // `kill` returns false when the signal could not be sent, and separately
+    // emits an 'error' event on the child carrying the errno.
+    if (!running.child.kill(signal)) return { delivered: false, errorCode };
+    return { delivered: true, errorCode: null };
   }
+  // Already exited: nothing to deliver, and nothing failed.
+  return { delivered: true, errorCode: null };
 }
 
 export const runningProcesses = new Map<string, RunningProcess>();
@@ -3449,6 +3499,12 @@ export async function runChildProcess(
         runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
 
         let timedOut = false;
+        // Set when a signal the supervisor sent could not be delivered. The
+        // process is then still running, so `close` may never arrive and the
+        // run has to be reported without it.
+        let orphanedProcess: OrphanedProcessEvidence | null = null;
+        let settled = false;
+        let targetCleanupStarted = false;
         let stdout = "";
         let stderr = "";
         let logChain: Promise<void> = Promise.resolve();
@@ -3501,7 +3557,8 @@ export async function runChildProcess(
               terminalCleanupKillTimer = null;
               terminalCleanupSignal = "SIGKILL";
               terminalCleanupForceKilled = true;
-              signalRunningProcess({ child, processGroupId }, "SIGKILL");
+              const killed = signalRunningProcess({ child, processGroupId }, "SIGKILL");
+              if (!killed.delivered) reportOrphanedProcess("SIGKILL", killed.errorCode);
             }, Math.max(1, opts.graceSec) * 1000);
           }, graceMs);
         };
@@ -3532,6 +3589,77 @@ export async function runChildProcess(
               })
             : null;
 
+        // Reachable from the close path and, when a signal cannot be delivered,
+        // never at all. Idempotent so the two cannot double-free the target.
+        const runTargetCleanup = async () => {
+          if (targetCleanupStarted) return;
+          targetCleanupStarted = true;
+          await target.cleanup?.();
+        };
+
+        // One place that shapes the result, so the orphan path cannot drift
+        // away from the normal close path.
+        const buildResult = (
+          exitCode: number | null,
+          signal: NodeJS.Signals | null,
+        ): RunProcessResult => ({
+          exitCode,
+          signal,
+          timedOut,
+          stdout,
+          stderr,
+          pid: child.pid ?? null,
+          startedAt,
+          terminalResultCleanup: terminalCleanupStarted
+            ? {
+              kind: "terminal_result_cleanup",
+              stopped: true,
+              stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+              reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+              terminalResultSeen,
+              signal: terminalCleanupSignal,
+              forceKilled: terminalCleanupForceKilled,
+            }
+            : null,
+          orphanedProcess,
+        });
+
+        // Report a run whose process outlived every signal we could send.
+        //
+        // Deliberately does NOT delete the runningProcesses entry and does NOT
+        // run the target cleanup: the process is still alive, so it keeps its
+        // working environment and stays addressable by runId in case the
+        // supervisor regains the privilege to stop it. Whenever it does finally
+        // exit, the close handler performs both, and skips a second resolve.
+        const reportOrphanedProcess = (signal: NodeJS.Signals, errorCode: string | null) => {
+          if (settled) return;
+          orphanedProcess = {
+            kind: "orphaned_process",
+            reason: SIGNAL_UNDELIVERABLE_REASON,
+            pid: child.pid ?? null,
+            processGroupId,
+            signal,
+            errorCode,
+          };
+          const detail = errorCode ? ` (${errorCode})` : "";
+          logChain = logChain
+            .then(() =>
+              opts.onLog(
+                "stderr",
+                `[paperclip] ${signal} could not be delivered to pid ${child.pid ?? "?"}${detail}. ` +
+                  "The process is still running and is no longer supervised.\n",
+              ),
+            )
+            .catch((err) => onLogError(err, runId, "failed to append orphaned process notice"));
+          onLogError(
+            new Error(`${signal} undeliverable${detail}`),
+            runId,
+            "child process survived termination and is now unsupervised",
+          );
+          settled = true;
+          resolve(buildResult(null, null));
+        };
+
         // The adapter wall-clock budget is measured against Date.now(), not
         // against the event loop's monotonic clock. See
         // scheduleWallClockDeadline: a bare setTimeout(timeoutSec * 1000) is
@@ -3548,7 +3676,12 @@ export async function runChildProcess(
                   deadlineWarning?.cancel();
                   signalRunningProcess({ child, processGroupId }, "SIGTERM");
                   setTimeout(() => {
-                    signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                    const killed = signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                    // SIGKILL cannot be caught or ignored, so a process that
+                    // survives it was never sent it. Waiting for a close that
+                    // will not come would hang the run behind a child the
+                    // supervisor has no way to stop.
+                    if (!killed.delivered) reportOrphanedProcess("SIGKILL", killed.errorCode);
                   }, Math.max(1, opts.graceSec) * 1000);
                 },
               })
@@ -3596,12 +3729,32 @@ export async function runChildProcess(
         }
 
         child.on("error", (err: Error) => {
+          const errno = (err as NodeJS.ErrnoException).code;
+          // Node emits 'error' on the child for a failed SPAWN and, separately,
+          // for a failed kill(2). Only the first is fatal, and only the first
+          // means the command never started.
+          //
+          // Treating the second as fatal is what made every timeout under the
+          // agent-uid split surface as `Failed to start command ...: kill EPERM`
+          // on a run that had been working for over an hour: the promise
+          // rejected, so the run was recorded as adapter_failed with
+          // timeout_fired false, and the adapter's timeout branch -- the one
+          // that preserves the session so the next run resumes rather than
+          // restarting cold -- never executed.
+          //
+          // A pid means the spawn succeeded, so anything arriving here after
+          // that point is a delivery failure against a live process. The
+          // termination paths already report it through reportOrphanedProcess;
+          // record it and let the run reach its real conclusion.
+          if (typeof child.pid === "number" && child.pid > 0) {
+            onLogError(err, runId, "failed to signal child process");
+            return;
+          }
           timeout?.cancel();
           deadlineWarning?.cancel();
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
-          void target.cleanup?.();
-          const errno = (err as NodeJS.ErrnoException).code;
+          void runTargetCleanup();
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
           const msg =
             errno === "ENOENT"
@@ -3621,28 +3774,14 @@ export async function runChildProcess(
           runningProcesses.delete(runId);
           void logChain.finally(() => {
             void Promise.resolve()
-              .then(() => target.cleanup?.())
+              .then(() => runTargetCleanup())
               .finally(() => {
-              resolve({
-                exitCode: code,
-                signal,
-                timedOut,
-                stdout,
-                stderr,
-                pid: child.pid ?? null,
-                startedAt,
-                terminalResultCleanup: terminalCleanupStarted
-                  ? {
-                    kind: "terminal_result_cleanup",
-                    stopped: true,
-                    stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-                    reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-                    terminalResultSeen,
-                    signal: terminalCleanupSignal,
-                    forceKilled: terminalCleanupForceKilled,
-                  }
-                  : null,
-              });
+                // A run already reported as orphaned settled long ago; this is
+                // the process finally exiting, which is still what releases the
+                // target and the runningProcesses entry above.
+                if (settled) return;
+                settled = true;
+                resolve(buildResult(code, signal));
               });
           });
         });

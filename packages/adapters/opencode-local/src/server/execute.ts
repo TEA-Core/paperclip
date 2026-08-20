@@ -49,6 +49,7 @@ import {
   sanitizeInheritedPaperclipEnv,
   signalRunningProcess,
   runningProcesses,
+  type OrphanedProcessEvidence,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   describeIncompleteOpenCodeStream,
@@ -930,7 +931,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const toResult = (
       attempt: {
-        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string };
+        proc: {
+          exitCode: number | null;
+          signal: string | null;
+          timedOut: boolean;
+          stdout: string;
+          stderr: string;
+          orphanedProcess?: OrphanedProcessEvidence | null;
+        };
         rawStderr: string;
         parsed: ReturnType<typeof parseOpenCodeJsonl>;
       },
@@ -1008,6 +1016,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMeta: {
             stderrTail: stderrTail(attempt.proc.stderr),
             adapterSessionId: runtimeSessionId ?? runtime.sessionId ?? null,
+            // Present only when the run timed out and the process outlived
+            // every signal we could send it, so an operator reading the run
+            // sees the process is still out there rather than assuming the
+            // timeout stopped it.
+            ...(attempt.proc.orphanedProcess
+              ? { orphanedProcess: attempt.proc.orphanedProcess }
+              : {}),
           },
           finishReason: attempt.parsed.finalStepReason,
           usage: {
