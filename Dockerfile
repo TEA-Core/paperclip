@@ -4,6 +4,12 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 \
+  # libcap2-bin provides capsh, which the entrypoint uses to hand the server an
+  # ambient CAP_KILL when the agent-uid split is armed — without it the server
+  # cannot signal the agent uid and every run timeout dies with EPERM. It is
+  # currently pulled in transitively by the base image; name it explicitly so a
+  # base bump cannot silently remove it.
+  && apt-get install -y --no-install-recommends libcap2-bin \
   # Agents run as an unprivileged user with no sudo, so anything they need at
   # runtime has to be baked in here — they cannot apt-get install it themselves.
   # Process and network inspection: agents manage background dev servers.
