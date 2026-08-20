@@ -232,6 +232,114 @@ export async function prepareClaudeConfigSeed(
   return targetDir;
 }
 
+export function resolveAgentSideClaudeConfigDir(
+  env: NodeJS.ProcessEnv,
+  companyId: string,
+  agentId: string,
+): string {
+  const instanceRoot = resolvePaperclipInstanceRootForAdapter({
+    homeDir: nonEmpty(env.PAPERCLIP_HOME) ?? undefined,
+    instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
+  });
+  return path.join(instanceRoot, "companies", companyId, "agents", agentId, "claude-config");
+}
+
+// The docker image fixes the principal layout (Dockerfile ARGs +
+// docker/agent-spawn-shim/spawn-agent.c): the server runs as uid 1000 (`node`)
+// and the agent principal as uid 1001 (`node-agent`); both belong to the
+// `agents` group (gid 1002). The agent-side home is therefore made
+// group-`agents` readable so the agent uid can reach it without any uid change
+// on the lane.
+const AGENTS_GROUP_GID = 1002;
+
+/**
+ * Best-effort group-ownership handover to the shared `agents` group. The
+ * server owns every path it creates, so it may chgrp to any group it belongs
+ * to; when it cannot (non-docker dev hosts without the `agents` group), the
+ * lane still works for same-uid setups and the degradation is logged, not
+ * fatal.
+ */
+async function chownToAgentsGroup(
+  candidate: string,
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<void> {
+  if (typeof process.getuid !== "function") return;
+  try {
+    await fs.chown(candidate, process.getuid(), AGENTS_GROUP_GID);
+  } catch (error) {
+    await onLog(
+      "stderr",
+      `[paperclip] agent-side Claude config: could not chgrp ${candidate} to agents (gid ${AGENTS_GROUP_GID}): ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  }
+}
+
+/**
+ * Atomically replace `target` with a copy of `source`, landing at 0o660 with
+ * the `agents` group. The temp+rename shape means the credential file is never
+ * briefly world-readable (plain copyFile would create at 0666&~umask first).
+ */
+async function copyFileToAgentSideHome(
+  source: string,
+  target: string,
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<void> {
+  const contents = await fs.readFile(source);
+  const tempPath = `${target}.tmp-${process.pid}`;
+  const handle = await fs.open(tempPath, "wx", 0o660);
+  try {
+    await handle.writeFile(contents);
+    await handle.close();
+    await chownToAgentsGroup(tempPath, onLog);
+    await fs.rename(tempPath, target);
+    await fs.chmod(target, 0o660).catch(() => {});
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function seedAgentSideClaudeConfig(
+  env: NodeJS.ProcessEnv,
+  onLog: AdapterExecutionContext["onLog"],
+  companyId: string,
+  agentId: string,
+): Promise<void> {
+  const configDir = resolveAgentSideClaudeConfigDir(env, companyId, agentId);
+  await fs.mkdir(configDir, { recursive: true, mode: 0o2770 });
+  // mkdir masks the mode with the process umask (and skips existing dirs), so
+  // enforce the full 0o2770 explicitly: the agent uid (1001) writes SDK
+  // session state into this home through its `agents` group membership.
+  await fs.chmod(configDir, 0o2770);
+  await chownToAgentsGroup(configDir, onLog);
+
+  // Pre-create the SDK subdirectories at 0o2770 so a run writing into the home
+  // starts from group-writable dirs instead of 0700 SDK-created ones.
+  const subdirs: string[] = ["projects", "session-env", "sessions", "shell-snapshots", "statsig"];
+  for (const subdir of subdirs) {
+    const subdirPath = path.join(configDir, subdir);
+    await fs.mkdir(subdirPath, { recursive: true, mode: 0o2770 });
+    await fs.chmod(subdirPath, 0o2770);
+    await chownToAgentsGroup(subdirPath, onLog);
+  }
+
+  // Refresh the two credential artifacts from the server's shared home (the
+  // server uid can read its own 0600 files; this copy never touches them).
+  const sourceDir = resolveSharedClaudeConfigDir(env);
+  const seededFiles: string[] = [".credentials.json", ".claude.json"];
+  for (const name of seededFiles) {
+    const sourcePath = path.join(sourceDir, name);
+    if (!(await pathExists(sourcePath))) continue;
+    await copyFileToAgentSideHome(sourcePath, path.join(configDir, name), onLog);
+  }
+
+  await onLog(
+    "stdout",
+    `[paperclip] Seeded agent-side Claude config at ${configDir}\n`,
+  );
+}
+
 export function buildRemoteClaudeConfigMaterializationCommand(input: {
   remoteClaudeConfigDir: string;
   remoteClaudeConfigSeedDir: string;

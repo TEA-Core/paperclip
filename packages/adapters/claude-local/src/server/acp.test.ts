@@ -66,6 +66,7 @@ type FakeRuntimeTurn = {
 const tempRoots: string[] = [];
 const originalNodeVersion = process.version;
 const originalEnv: Record<string, string | undefined> = {
+  HOME: process.env.HOME,
   PAPERCLIP_HOME: process.env.PAPERCLIP_HOME,
   PAPERCLIP_INSTANCE_ID: process.env.PAPERCLIP_INSTANCE_ID,
   CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
@@ -459,6 +460,11 @@ describe("claude_local ACP lane", () => {
   it("executes through ACPX with Claude model env, settings.local.json, and ephemeral skills", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-exec-");
     const skill = await createRuntimeSkill(root);
+    // Keep the local managed-home seam (agent-side CLAUDE_CONFIG_DIR home) inside
+    // the temp root instead of the host's real instance root.
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.HOME = path.join(root, "server-home");
     const runtimes: FakeRuntime[] = [];
     const meta: AdapterInvocationMeta[] = [];
     const execute = createClaudeAcpExecutor({
@@ -623,6 +629,165 @@ describe("claude_local ACP lane", () => {
     expect(Object.keys(meta[0]?.env ?? {}).filter((key) => key.startsWith("XDG_"))).toEqual([]);
   });
 
+  it("seeds the agent-side Claude config home on the local lane and repoints CLAUDE_CONFIG_DIR onto it", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-local-home-");
+    const localCwd = path.join(root, "worktree");
+    await fs.mkdir(localCwd, { recursive: true });
+    // The server's shared home: where the server uid keeps its credentials.
+    const serverHome = path.join(root, "server-home");
+    const sharedClaudeConfig = path.join(serverHome, ".claude");
+    await fs.mkdir(sharedClaudeConfig, { recursive: true });
+    const credentialsBody = JSON.stringify({ fake: "credential-artifact" });
+    const claudeJsonBody = JSON.stringify({ fake: "state-artifact" });
+    await fs.writeFile(path.join(sharedClaudeConfig, ".credentials.json"), credentialsBody, "utf8");
+    await fs.writeFile(path.join(sharedClaudeConfig, ".claude.json"), claudeJsonBody, "utf8");
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      process.env.HOME = serverHome;
+      process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+      process.env.PAPERCLIP_INSTANCE_ID = "test";
+      delete process.env.CLAUDE_CONFIG_DIR;
+
+      const meta: AdapterInvocationMeta[] = [];
+      const execute = createClaudeAcpExecutor({
+        createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+      });
+      const result = await execute(
+        buildContext(localCwd, {
+          config: {
+            engine: "acp",
+            cwd: localCwd,
+            agentCommand: "node ./fake-acp.js",
+            stateDir: path.join(root, "state"),
+            promptTemplate: "Do the assigned work.",
+          },
+          context: {
+            issueId: "issue-1",
+            paperclipWorkspace: { cwd: localCwd, source: "project_workspace", workspaceId: "workspace-1" },
+          },
+          authToken: "real-run-jwt",
+          onMeta: async (payload: AdapterInvocationMeta) => {
+            meta.push(payload);
+          },
+        }),
+      );
+
+      expect(result.exitCode).toBe(0);
+      // Repointed onto the deterministic agent-side home, NOT the server home.
+      const agentSideHome = String(meta[0]?.env?.CLAUDE_CONFIG_DIR ?? "");
+      const expectedHome = path.join(
+        root,
+        "paperclip-home",
+        "instances",
+        "test",
+        "companies",
+        "company-1",
+        "agents",
+        "agent-1",
+        "claude-config",
+      );
+      expect(agentSideHome).toBe(expectedHome);
+      // Both credential artifacts were seeded, byte-identical to the server's.
+      await expect(
+        fs.readFile(path.join(agentSideHome, ".credentials.json"), "utf8"),
+      ).resolves.toBe(credentialsBody);
+      await expect(
+        fs.readFile(path.join(agentSideHome, ".claude.json"), "utf8"),
+      ).resolves.toBe(claudeJsonBody);
+      // The home and its SDK subdirs are group-accessible (0o2770, including
+      // setgid so SDK-created children inherit the group), not 0700. The mask
+      // must keep the setgid bit (0o7777), or the comparison can never hold.
+      const homeMode = (await fs.stat(agentSideHome)).mode & 0o7777;
+      expect(homeMode).toBe(0o2770);
+      for (const subdir of ["projects", "session-env", "sessions", "shell-snapshots", "statsig"]) {
+        const subdirMode = (await fs.stat(path.join(agentSideHome, subdir))).mode & 0o7777;
+        expect(subdirMode).toBe(0o2770);
+      }
+      // The server's shared home is only read, never modified.
+      await expect(
+        fs.readFile(path.join(sharedClaudeConfig, ".credentials.json"), "utf8"),
+      ).resolves.toBe(credentialsBody);
+      await expect(
+        fs.readFile(path.join(sharedClaudeConfig, ".claude.json"), "utf8"),
+      ).resolves.toBe(claudeJsonBody);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+    }
+  });
+
+  it("honors an operator-provided CLAUDE_CONFIG_DIR on the local lane without repointing", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-local-explicit-");
+    const localCwd = path.join(root, "worktree");
+    await fs.mkdir(localCwd, { recursive: true });
+    const operatorConfigDir = path.join(root, "operator-claude-config");
+    await fs.mkdir(operatorConfigDir, { recursive: true });
+
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    try {
+      process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+      process.env.PAPERCLIP_INSTANCE_ID = "test";
+
+      const meta: AdapterInvocationMeta[] = [];
+      const execute = createClaudeAcpExecutor({
+        createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+      });
+      const result = await execute(
+        buildContext(localCwd, {
+          config: {
+            engine: "acp",
+            cwd: localCwd,
+            agentCommand: "node ./fake-acp.js",
+            stateDir: path.join(root, "state"),
+            promptTemplate: "Do the assigned work.",
+            env: { CLAUDE_CONFIG_DIR: operatorConfigDir },
+          },
+          context: {
+            issueId: "issue-1",
+            paperclipWorkspace: { cwd: localCwd, source: "project_workspace", workspaceId: "workspace-1" },
+          },
+          authToken: "real-run-jwt",
+          onMeta: async (payload: AdapterInvocationMeta) => {
+            meta.push(payload);
+          },
+        }),
+      );
+
+      expect(result.exitCode).toBe(0);
+      // The explicit value is forwarded verbatim — the local lane reaches host
+      // paths, so no managed-home substitution.
+      expect(String(meta[0]?.env?.CLAUDE_CONFIG_DIR ?? "")).toBe(operatorConfigDir);
+      const agentSideHome = path.join(
+        root,
+        "paperclip-home",
+        "instances",
+        "test",
+        "companies",
+        "company-1",
+        "agents",
+        "agent-1",
+        "claude-config",
+      );
+      await expect(fs.access(agentSideHome)).rejects.toThrow();
+    } finally {
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+    }
+  });
+
   it("remaps a workspace-relative explicit CLAUDE_CONFIG_DIR onto the in-sandbox workspace path", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-explicit-inworkspace-");
     const localCwd = path.join(root, "worktree");
@@ -785,6 +950,11 @@ describe("claude_local ACP lane", () => {
 
   it("delivers the issue description exactly once per prompt and compacts non-assignment resume deltas", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-brief-");
+    // Keep the local managed-home seam (agent-side CLAUDE_CONFIG_DIR home) inside
+    // the temp root instead of the host's real instance root.
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.HOME = path.join(root, "server-home");
     const runtimes: FakeRuntime[] = [];
     const execute = createClaudeAcpExecutor({
       createRuntime: (options: FakeRuntimeOptions) => {
@@ -860,6 +1030,11 @@ describe("claude_local ACP lane", () => {
 
   it("resumes compatible ACP sessions on later Claude ACP runs", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-resume-");
+    // Keep the local managed-home seam (agent-side CLAUDE_CONFIG_DIR home) inside
+    // the temp root instead of the host's real instance root.
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.HOME = path.join(root, "server-home");
     const runtimes: FakeRuntime[] = [];
     const execute = createClaudeAcpExecutor({
       createRuntime: (options: FakeRuntimeOptions) => {

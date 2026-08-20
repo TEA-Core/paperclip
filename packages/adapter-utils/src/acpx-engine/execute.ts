@@ -310,6 +310,40 @@ export interface AcpxRemoteManagedHomeResult {
   disposeStaged?: () => Promise<void>;
 }
 
+/**
+ * Per-adapter local managed-home prep seam, injected by each adapter's ACP
+ * wiring ({codex,claude,gemini}-local `acp.ts`). The local-lane counterpart of
+ * {@link prepareRemoteManagedHome}: the local bridge spawns on this host, so
+ * instead of shipping a seed through the staging seam, the adapter materializes
+ * a host config home in place — reachable by the agent principal, which runs
+ * as a different uid but shares the `agents` group — and repoints the
+ * adapter's config env var inside `env` before the bridge launch freezes it.
+ *
+ * It is invoked ONLY on the local execution-target lane, after the operator
+ * config env has been merged into the run env, so an explicit operator value
+ * for the adapter's config env var is already present and the seam honors it
+ * (no repoint). When absent (custom agents, the shared-engine tests) the
+ * engine behaves byte-identically to the pre-seam behavior.
+ *
+ * Adapter-agnostic by construction: it carries only generic inputs (the
+ * resolved run `env`, the agent/company identity, `config`) so nothing
+ * adapter-specific leaks across the boundary — the same rule as the remote
+ * seam above.
+ */
+export interface AcpxLocalManagedHomeContext {
+  acpxAgent: string;
+  companyId: string;
+  agentId: string;
+  runId: string;
+  config: Record<string, unknown>;
+  /**
+   * The run env. The seam MUST repoint the adapter's config env var here onto
+   * the materialized host home (add/change only — it never deletes keys).
+   */
+  env: Record<string, string>;
+  onLog: AdapterExecutionContext["onLog"];
+}
+
 export interface AcpxEngineExecutorOptions {
   createRuntime?: AcpxRuntimeFactory;
   now?: () => number;
@@ -349,6 +383,12 @@ export interface AcpxEngineExecutorOptions {
   prepareRemoteManagedHome?: (
     input: AcpxRemoteManagedHomeContext,
   ) => Promise<AcpxRemoteManagedHomeResult>;
+  /**
+   * Per-adapter local managed-home prep + config-env repoint (local-lane
+   * counterpart of `prepareRemoteManagedHome`). See
+   * {@link AcpxLocalManagedHomeContext}. Absent → no-op on the local lane.
+   */
+  prepareLocalManagedHome?: (input: AcpxLocalManagedHomeContext) => Promise<void>;
 }
 
 interface AcpxPreparedRuntime {
@@ -1297,7 +1337,7 @@ async function writePaperclipClaudeSettings(input: {
   await writeFileAtomically({
     target: filePath,
     contents: `${JSON.stringify(next, null, 2)}\n`,
-    mode: 0o600,
+    mode: 0o640,
   });
   return {
     filePath,
@@ -1591,6 +1631,27 @@ async function buildRuntime(input: {
     resolvedAdapterEnv[key] = value;
   }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
+  // Local managed-home seam (adapter-provided; the local-lane counterpart of
+  // `prepareRemoteManagedHome`). Invoked ONLY on the local execution-target
+  // lane (`executionTargetIsRemote` is false — an absent target is the local
+  // lane), AFTER the operator config env has been merged into `env` above — so
+  // an operator-set value for the adapter's config env var (e.g.
+  // CLAUDE_CONFIG_DIR) is already visible to the seam and wins — and BEFORE
+  // the bridge launch freezes the run env. Adapters use it to materialize a
+  // host config home reachable by the agent uid and to repoint their config
+  // env var in `env`. Absent → no-op, byte-identical to the pre-seam
+  // behavior.
+  if (!executionTargetIsRemote && input.deps.prepareLocalManagedHome) {
+    await input.deps.prepareLocalManagedHome({
+      acpxAgent,
+      companyId: agent.companyId,
+      agentId: agent.id,
+      runId,
+      config,
+      env,
+      onLog: input.ctx.onLog,
+    });
+  }
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
   // via session/set_config_option — the ACP server's set_config_option handler
   // validates the value against its internal available-models list and rejects

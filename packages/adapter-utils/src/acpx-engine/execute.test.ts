@@ -181,6 +181,7 @@ async function runExecutor(
     executionTarget?: Record<string, unknown>;
     runtimeMcp?: AdapterRuntimeMcpAccess;
     prepareRemoteManagedHome?: AcpxEngineExecutorOptions["prepareRemoteManagedHome"];
+    prepareLocalManagedHome?: AcpxEngineExecutorOptions["prepareLocalManagedHome"];
     startupTraceContext?: AdapterExecutionContext["startupTraceContext"];
   } = {},
 ) {
@@ -193,6 +194,9 @@ async function runExecutor(
   const execute = createAcpxEngineExecutor({
     ...(options.prepareRemoteManagedHome
       ? { prepareRemoteManagedHome: options.prepareRemoteManagedHome }
+      : {}),
+    ...(options.prepareLocalManagedHome
+      ? { prepareLocalManagedHome: options.prepareLocalManagedHome }
       : {}),
     createRuntime: (options) => {
       runtimeOptions.push(options as unknown as Record<string, unknown>);
@@ -1559,6 +1563,55 @@ describe("shared ACPX engine runtime behavior", () => {
       entry.includes("Paperclip-managed Claude settings"),
     );
     expect(note).toBeTruthy();
+    // Group-readable so the agent principal (uid 1001, `agents` group) can
+    // read the settings the lane wrote for it.
+    const settingsMode = (await fs.stat(settingsPath)).mode & 0o777;
+    expect(settingsMode).toBe(0o640);
+  });
+
+  it("invokes the local managed-home seam on the local lane and forwards its env repoint to the session", async () => {
+    let observedSessionEnv: Record<string, string> | undefined;
+    let seamContext:
+      | { acpxAgent?: string; companyId?: string; agentId?: string; runId?: string }
+      | null = null;
+    const execute = createAcpxEngineExecutor({
+      prepareLocalManagedHome: async (input) => {
+        seamContext = { acpxAgent: input.acpxAgent, companyId: input.companyId, agentId: input.agentId, runId: input.runId };
+        input.env.CLAUDE_CONFIG_DIR = "/fake/agent-side-claude-home";
+      },
+      createRuntime: () => ({
+        ensureSession: async (input: { sessionOptions?: { env?: Record<string, string> } }) => {
+          observedSessionEnv = input.sessionOptions?.env;
+          return { backendSessionId: "backend-session", agentSessionId: "agent-session", runtimeSessionName: "runtime-session" };
+        },
+        startTurn: () => ({
+          events: (async function* () { yield { type: "done", stopReason: "end_turn" }; })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js" },
+      context: {},
+      authToken: "runtime-key",
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+    expect(result.exitCode).toBe(0);
+    // The seam saw the generic, adapter-agnostic context...
+    expect(seamContext).toEqual({
+      acpxAgent: "custom",
+      companyId: "company-1",
+      agentId: "agent-1",
+      runId: "run-1",
+    });
+    // ...and its env repoint reached the spawned session env.
+    expect(observedSessionEnv?.CLAUDE_CONFIG_DIR).toBe("/fake/agent-side-claude-home");
   });
 
   it("merges Paperclip allowlist into an existing .claude/settings.local.json without losing user entries", async () => {
@@ -2600,6 +2653,24 @@ describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", (
     };
     return { root, stateDir, localCwd, remoteCwd, executionTarget };
   }
+
+  it("never invokes the local managed-home seam on the remote sandbox lane", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    let localSeamCalls = 0;
+    const { meta } = await runExecutor(
+      { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+      {
+        authToken: "real-run-jwt",
+        executionTarget,
+        prepareLocalManagedHome: async () => {
+          localSeamCalls += 1;
+        },
+      },
+    );
+    expect(localSeamCalls).toBe(0);
+    // The remote lane still completed normally.
+    expect(typeof meta[0]).toBe("object");
+  });
 
   it("test_remote_seam_receives_adapter_agnostic_context", async () => {
     const { stateDir, localCwd, remoteCwd, executionTarget } = await setupRemoteSandbox();
