@@ -45,14 +45,53 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("execution policy — implicit return-assignee collision at the write path", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let previousSchedulingSuppression: string | undefined;
 
   beforeAll(async () => {
+    // Suppress heartbeat dispatch for the lifetime of this suite.
+    //
+    // Most embedded-Postgres suites do not need this and do not set it -- they
+    // never seed anything the scheduler will pick up. The handful that do seed
+    // dispatchable work (done-transition-guard-decision-routes,
+    // activity-log-best-effort-routes) all set it. This suite seeds companies,
+    // agents and assigned issues, so it belongs in the second group and was
+    // missing it.
+    //
+    // These are route tests: they drive the write path and assert on responses.
+    // They inject a heartbeat stub for the wake calls the routes make directly,
+    // but that stub does not reach the SCHEDULER. Left dispatching, the real
+    // service picks the seeded issues up, and executeRun keeps issuing queries
+    // (wakeups, environment-lease release, run bookkeeping) after the last
+    // assertion has returned.
+    //
+    // Those queries then race `tempDb.cleanup()`. The failure does not look like
+    // a failing test, because it is not one -- all five pass. The postgres driver
+    // takes a queued write off setImmediate after teardown has already nulled the
+    // socket:
+    //
+    //   TypeError: Cannot read properties of null (reading 'write')
+    //     at Immediate.nextWrite (postgres/src/connection.js:255)
+    //
+    // That is an uncaught EXCEPTION inside the driver, not a rejection, so no
+    // .catch() on any call site can absorb it. Vitest reports "Errors 1 error"
+    // and exits non-zero on a suite whose tests all passed.
+    //
+    // The flag gates new dispatch and never cancels anything already running
+    // (see getHeartbeatSchedulingSuppression), so it removes the background work
+    // rather than papering over the symptom.
+    previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-implicit-collision-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();
+    if (previousSchedulingSuppression === undefined) {
+      delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    } else {
+      process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
+    }
   });
 
   const heartbeatStub = { requestWakeup: async () => null, enqueueWakeup: async () => null } as any;
