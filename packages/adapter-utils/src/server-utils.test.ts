@@ -20,6 +20,7 @@ import {
   runningProcesses,
   runChildProcess,
   sanitizeInheritedPaperclipEnv,
+  scheduleWallClockDeadline,
   sanitizeSshRemoteEnv,
   signalRunningProcess,
   shapePaperclipWorkspaceEnvForExecution,
@@ -434,6 +435,90 @@ describe("adapter skill snapshots", () => {
       state: "stale",
       managed: true,
     }));
+  });
+});
+
+describe("scheduleWallClockDeadline", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // A bare setTimeout(timeoutSec * 1000) measures libuv loop time. On a host
+  // whose monotonic clock runs fast against CLOCK_REALTIME it fires before the
+  // configured wall-clock budget has elapsed: the WSL2 dev host killed
+  // 5400s-budget agent runs after 5063s of wall clock. The deadline must be
+  // re-checked against Date.now() on every tick so the skew cannot compound.
+  it("does not fire while the wall clock is short of the deadline", () => {
+    vi.useFakeTimers();
+    let wallClockMs = 0;
+    const onDeadline = vi.fn();
+
+    scheduleWallClockDeadline({
+      deadlineMs: 5_400_000,
+      onDeadline,
+      tickMs: 30_000,
+      now: () => wallClockMs,
+    });
+
+    // Monotonic time runs 6.3% fast: each 30s timer tick is only 28.1s of
+    // wall clock. Burn the whole configured budget in timer time.
+    for (let tick = 0; tick < 180; tick += 1) {
+      wallClockMs += 28_100;
+      vi.advanceTimersByTime(30_000);
+    }
+
+    expect(wallClockMs).toBeLessThan(5_400_000);
+    expect(onDeadline).not.toHaveBeenCalled();
+
+    // Give it the wall-clock time it is actually owed.
+    for (let tick = 0; tick < 20 && onDeadline.mock.calls.length === 0; tick += 1) {
+      wallClockMs += 28_100;
+      vi.advanceTimersByTime(30_000);
+    }
+
+    expect(onDeadline).toHaveBeenCalledTimes(1);
+    expect(wallClockMs).toBeGreaterThanOrEqual(5_400_000);
+  });
+
+  it("fires once the wall clock passes the deadline and stops re-arming", () => {
+    vi.useFakeTimers();
+    let wallClockMs = 0;
+    const onDeadline = vi.fn();
+
+    scheduleWallClockDeadline({
+      deadlineMs: 60_000,
+      onDeadline,
+      tickMs: 30_000,
+      now: () => wallClockMs,
+    });
+
+    wallClockMs = 60_000;
+    vi.advanceTimersByTime(30_000);
+
+    expect(onDeadline).toHaveBeenCalledTimes(1);
+
+    wallClockMs = 600_000;
+    vi.advanceTimersByTime(600_000);
+    expect(onDeadline).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancel() stops the deadline from firing", () => {
+    vi.useFakeTimers();
+    let wallClockMs = 0;
+    const onDeadline = vi.fn();
+
+    const handle = scheduleWallClockDeadline({
+      deadlineMs: 60_000,
+      onDeadline,
+      tickMs: 30_000,
+      now: () => wallClockMs,
+    });
+    handle.cancel();
+
+    wallClockMs = 600_000;
+    vi.advanceTimersByTime(600_000);
+
+    expect(onDeadline).not.toHaveBeenCalled();
   });
 });
 
