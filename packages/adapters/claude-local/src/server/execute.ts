@@ -33,6 +33,8 @@ import {
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   joinPromptSections,
+  renderRunDeadlineNotice,
+  buildRunDeadlineEnv,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePathInEnv,
@@ -312,6 +314,10 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     asNumber(config.timeoutSec, 0),
   );
   const graceSec = asNumber(config.graceSec, 20);
+  // One deadline shared by the child's env and the prompt's wrap-up guidance:
+  // computing it twice would let the two drift apart by the spawn latency.
+  // Derived from the EFFECTIVE timeout, which a remote target may have capped.
+  Object.assign(env, buildRunDeadlineEnv(timeoutSec));
   await ensureAdapterExecutionTargetRuntimeCommandInstalled({
     runId,
     target: executionTarget,
@@ -817,8 +823,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ? ""
     : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  // Read back from the env the child will actually receive, so the number in
+  // the prompt is the same one `date +%s` gets compared against.
+  const deadlineNotice = renderRunDeadlineNotice(
+    timeoutSec,
+    Number(env.PAPERCLIP_RUN_DEADLINE_EPOCH ?? 0),
+  );
   const prompt = joinPromptSections([
     renderedBootstrapPrompt,
+    deadlineNotice,
     wakePrompt,
     sessionHandoffNote,
     taskContextNote,
@@ -826,6 +839,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   ]);
   const promptMetrics = {
     promptChars: prompt.length,
+    deadlineNoticeChars: deadlineNotice.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
@@ -962,6 +976,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : undefined;
 
     if (proc.timedOut) {
+      // SIGTERM mid-turn does not destroy the Claude session — the id already
+      // arrived on the event stream (`parsedStream`), even though the terminal
+      // result JSON never did. Return it so the next run resumes rather than
+      // restarting cold. Usage is carried for the same reason: the tokens were
+      // spent regardless of where the wall landed.
+      const timedOutSessionId = parsedStream.sessionId || opts.fallbackSessionId;
+      const timedOutSessionParams = timedOutSessionId
+        ? ({
+            sessionId: timedOutSessionId,
+            cwd: effectiveExecutionCwd,
+            promptBundleKey: promptBundle.bundleKey,
+            ...(executionTargetIsRemote
+              ? {
+                  remoteExecution: adapterExecutionTargetSessionIdentity(executionTarget),
+                }
+              : {}),
+            ...(workspaceId ? { workspaceId } : {}),
+            ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+            ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+          } as Record<string, unknown>)
+        : null;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
@@ -969,7 +1004,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        // Only present when the stream carried a terminal result; a mid-turn
+        // kill usually leaves both null, which is honest rather than zeroed.
+        ...(parsedStream.usage ? { usage: parsedStream.usage } : {}),
+        sessionId: timedOutSessionId,
+        sessionParams: timedOutSessionParams,
+        sessionDisplayId: timedOutSessionId,
+        costUsd: parsedStream.costUsd ?? null,
+        clearSession: Boolean(opts.clearSessionOnMissingSession && !timedOutSessionId),
       };
     }
 
