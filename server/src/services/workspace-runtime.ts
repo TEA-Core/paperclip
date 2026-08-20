@@ -11,6 +11,7 @@ import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
+  ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH,
   listWorkspaceServiceCommandDefinitions,
   type GitWorktreeBranchAncestryVerdict,
   type GitWorktreeBranchIncoherenceEvidence as SharedGitWorktreeBranchIncoherenceEvidence,
@@ -7017,6 +7018,21 @@ export function buildWorkspaceReadyPresentation(
   };
 }
 
+// Workspace warnings are unbounded provider text (git output, provisioning
+// diagnostics), but issueCommentMetadataSchema caps a metadata row at
+// ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH. An over-long warning made the whole
+// workspace-ready comment fail zod validation with
+// {"code":"too_big","path":["sections",1,"rows",0,"text"]}, so the
+// workspace-ready signal never landed on the issue at all - on every run of an
+// affected agent. Clamp the row the same way the presentation title is
+// clamped, and keep the full text in the markdown body, which has no cap.
+function clampWorkspaceReadyRowText(text: string) {
+  const trimmed = text.trim();
+  return trimmed.length > ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH
+    ? `${trimmed.slice(0, ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH - 1)}\u2026`
+    : trimmed;
+}
+
 export function buildWorkspaceReadyMetadata(
   input: WorkspaceReadyCommentInput,
 ): IssueCommentMetadata {
@@ -7046,7 +7062,10 @@ export function buildWorkspaceReadyMetadata(
       ...(input.workspace.warnings.length > 0
         ? [{
             title: "Warnings",
-            rows: input.workspace.warnings.map((warning) => ({ type: "text" as const, text: warning })),
+            rows: input.workspace.warnings.map((warning) => ({
+              type: "text" as const,
+              text: clampWorkspaceReadyRowText(warning),
+            })),
           }]
         : []),
     ],

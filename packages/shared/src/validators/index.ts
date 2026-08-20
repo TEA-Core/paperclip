@@ -425,6 +425,7 @@ export {
   issueCommentPresentationSchema,
   issueCommentMetadataRowSchema,
   issueCommentMetadataSectionSchema,
+  ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH,
   issueCommentMetadataSchema,
   addIssueCommentSchema,
   issueThreadInteractionStatusSchema,

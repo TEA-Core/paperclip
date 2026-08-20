@@ -656,7 +656,8 @@ export const checkoutIssueSchema = z.object({
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
 
 const commentMetadataLabelSchema = z.string().trim().min(1).max(120);
-const commentMetadataTextSchema = z.string().trim().min(1).max(2000);
+export const ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH = 2000;
+const commentMetadataTextSchema = z.string().trim().min(1).max(ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH);
 
 export const issueCommentAuthorTypeSchema = z.enum(ISSUE_COMMENT_AUTHOR_TYPES);
 
