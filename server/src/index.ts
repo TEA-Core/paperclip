@@ -1503,6 +1503,29 @@ export async function startServer(): Promise<StartedServer> {
     });
   }
 
+  // SUP-13535. The paperclip/approved status is written once, on the head that
+  // existed at approval time. When that head later moves (conflict resolution,
+  // update-branch) the status is stranded and the merge queue loses it. This
+  // reconciler re-publishes on the live head, gated by content identity (Guard
+  // A) and stage integrity (Guard B); idempotent re-runs perform zero writes.
+  if (config.approvalStatusReconcilerEnabled) {
+    const { startApprovalStatusReconciler } = await import("./services/approval-status-reconciler.js");
+    logger.info(
+      {
+        intervalMinutes: config.approvalStatusReconcilerIntervalMinutes,
+      },
+      "Approval status reconciler enabled",
+    );
+    startApprovalStatusReconciler(db, {
+      intervalMs: config.approvalStatusReconcilerIntervalMinutes * 60 * 1000,
+    });
+  } else {
+    logger.info(
+      {},
+      "Approval status reconciler disabled (PAPERCLIP_APPROVAL_STATUS_RECONCILER_ENABLED)",
+    );
+  }
+
   // SUP-13018: detect + attribute unexpected files in the secrets directory.
   // The boot scan is immediate (runs once migrations are applied and the DB is
   // ready); the interval keeps a mid-lifetime drop bounded to the stated window.
