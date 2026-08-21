@@ -68,10 +68,13 @@ The non-pusher approval is real; it is recorded one layer up from GitHub.
 
 The fold's own changes are TEA-authored deliveries with Paperclip cards, so
 they carry `paperclip/approved` once their card is approved. Any PR with **no**
-Paperclip card (doctrine sync, rescue, upstream-patch experiment) must declare
-either the PR-body line `Paperclip-Approved-Waiver: <reason>` (non-empty) or
-the exact label `no-paperclip-card`. A waived run exits 0 and logs `waived:`
-with the declared reason or label.
+Paperclip card (doctrine sync, rescue, upstream-patch experiment, the lockfile
+refresh bot) must declare either the PR-body line
+`Paperclip-Approved-Waiver: <reason>` (non-empty) or the exact label
+`no-paperclip-card`. A waived run exits 0 and logs `waived:` with the declared
+reason or label. The lockfile refresh bot's PR body already carries the waiver
+(`.github/workflows/refresh-lockfile.yml`, SUP-13629) so its auto-merge is not
+stranded by the required context.
 
 ## Admin bypass — decision (SUP-13629)
 
