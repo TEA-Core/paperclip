@@ -1482,6 +1482,14 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     env: sanitizeRemoteExecutionEnv(launchEnv),
   }), "utf8").toString("base64");
 
+  // The launch exec's `$!` is the remote wrapper's pid. The wrapper is
+  // `nohup`'d from that exec's shell, so it sits in the exec's process group,
+  // not the run's — the group-directed teardown signal never reaches it, and
+  // only a signal to this pid does. `stop()` uses it to reap the wrapper (and,
+  // via the wrapper's own SIGTERM handler, the agent child) so a finished run
+  // leaves no process-session helper behind.
+  let remoteWrapperPid: number | null = null;
+
   // Legacy poll path: background the wrapper with `nohup` and read its output
   // event files with the host poll below. The streamed path launches the wrapper
   // as one foreground session command further down instead, so skip this.
@@ -1510,6 +1518,8 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     if (startResult.timedOut || (startResult.exitCode ?? 1) !== 0) {
       throw new Error(`Failed to start sandbox ACP process session bridge: ${startResult.stderr || startResult.stdout}`);
     }
+    const wrapperPid = Number.parseInt((startResult.stdout ?? "").trim(), 10);
+    if (Number.isSafeInteger(wrapperPid) && wrapperPid > 0) remoteWrapperPid = wrapperPid;
   }
 
   let socket: net.Socket | null = null;
@@ -1745,7 +1755,10 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     void runner
       .execute({
         command: shellCommand,
-        args: shellCommandArgs(`node ${shellQuote(remoteScriptPath)}`),
+        // `exec` so the spawned shell is replaced by the wrapper node process
+        // (same pid): `onSpawn` then reports the wrapper's pid for the
+        // teardown kill below.
+        args: shellCommandArgs(`exec node ${shellQuote(remoteScriptPath)}`),
         cwd: target.remoteCwd,
         env: {
           PAPERCLIP_PROCESS_SESSION_DIR: sessionDir,
@@ -1754,6 +1767,9 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
         },
         timeoutMs,
         useSession: true,
+        onSpawn: async (meta) => {
+          remoteWrapperPid = meta.pid;
+        },
         onLog: async (stream, chunk) => {
           if (stream === "stdout") ingestStreamChunk(chunk);
         },
@@ -1790,6 +1806,34 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
         path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
         jsonLine({ type: "stdinEnd" }),
       ).catch(() => undefined);
+      if (remoteWrapperPid !== null) {
+        // Signal the wrapper by the pid captured at launch. It sits in the
+        // launch exec's process group, not the run's, so the group-directed
+        // teardown signal never reaches it. Its SIGTERM handler terminates the
+        // agent child (TERM, then KILL) and exits within a few seconds. The
+        // `/proc/<pid>/cmdline` guard ensures a pid that no longer runs this
+        // wrapper (reaped, or recycled to an unrelated process) is never
+        // signalled. Fire-and-forget: the wrapper self-terminates, so the run
+        // teardown does not block on it.
+        await runner
+          .execute({
+            command: shellCommand,
+            args: shellCommandArgs(
+              `case $(tr '\\0' ' ' < /proc/${remoteWrapperPid}/cmdline 2>/dev/null) in` +
+                `  *paperclip-process-session-remote*) kill -TERM ${remoteWrapperPid} 2>/dev/null ;;` +
+                `esac; true`,
+            ),
+            cwd: target.remoteCwd,
+            env: {
+              PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
+            },
+            timeoutMs,
+            // Teardown plumbing: keep it off the persistent session so it never
+            // queues behind (or ahead of) an in-run session command.
+            bypassSession: true,
+          })
+          .catch(() => undefined);
+      }
       await client.remove(sessionDir).catch(() => undefined);
       await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
     },
@@ -1848,6 +1892,29 @@ function getProcessSessionRemoteSource(input?: { outputToStdout?: boolean }): st
     ? getProcessSessionRemoteStreamSource()
     : getProcessSessionRemoteEventFileSource();
 }
+
+// The shared run-teardown handler. The wrapper is `nohup`'d out of the launch
+// exec's shell, so it sits in that exec's process group, not the run's — the
+// group-directed teardown signal never reaches it, and only a signal to its
+// own pid does (the host sends it from `stop()`). Forward it to the agent
+// child, escalate to SIGKILL, and exit, so a finished run leaves no helper.
+const PROCESS_SESSION_SHUTDOWN_TAIL = `let shutdownStarted = false;
+function beginShutdown() {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  try { child.kill("SIGTERM"); } catch {}
+  setTimeout(() => {
+    try { child.kill("SIGKILL"); } catch {}
+    process.exit(typeof process.exitCode === "number" ? process.exitCode : 0);
+  }, 3000);
+}
+process.on("SIGTERM", beginShutdown);
+process.on("SIGINT", beginShutdown);
+child.on("close", () => {
+  if (shutdownStarted) process.exit(typeof process.exitCode === "number" ? process.exitCode : 0);
+});
+
+`;
 
 // The shared stdin drain. Both wrappers read newline-delimited stdin messages
 // from the stdin file queue and write them to the child, then end the child
@@ -1927,6 +1994,7 @@ child.on("close", (code, signal) => {
   process.exitCode = typeof code === "number" ? code : 1;
 });
 
+ ${PROCESS_SESSION_SHUTDOWN_TAIL}
 ${PROCESS_SESSION_STDIN_POLL_TAIL}`;
 }
 
@@ -1974,6 +2042,7 @@ child.on("error", (error) => void writeEvent({ type: "error", message: error.mes
 // the write chain then guarantees the exit file lands after every data file.
 child.on("close", (code, signal) => void writeEvent({ type: "exit", code, signal }));
 
+ ${PROCESS_SESSION_SHUTDOWN_TAIL}
 ${PROCESS_SESSION_STDIN_POLL_TAIL}`;
 }
 

@@ -143,6 +143,50 @@ describe("sandbox adapter execution targets", () => {
     return events.filter((event) => event.stream === stream).map((event) => event.chunk).join("");
   }
 
+  async function findPidsWithCmdlineFragment(fragment: string): Promise<number[]> {
+    const entries = await readdir("/proc", { withFileTypes: true }).catch(() => []);
+    const pids: number[] = [];
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry.name)) continue;
+      const cmdline = await readFile(path.join("/proc", entry.name, "cmdline"), "utf8").catch(() => "");
+      if (cmdline.includes(fragment)) pids.push(Number(entry.name));
+    }
+    return pids;
+  }
+
+  // Alive means the /proc entry exists and is not a zombie: a killed-but-
+  // unreaped child still has a /proc entry, and counting it as alive would
+  // make the reaping assertions below flaky.
+  async function isPidAlive(pid: number): Promise<boolean> {
+    const stat = await readFile(path.join("/proc", String(pid), "stat"), "utf8").catch(() => null);
+    if (stat === null) return false;
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen < 0) return false;
+    return stat.slice(closeParen + 2, closeParen + 3) !== "Z";
+  }
+
+  async function livePidsWithCmdlineFragment(fragment: string): Promise<number[]> {
+    const pids = await findPidsWithCmdlineFragment(fragment);
+    const alive: number[] = [];
+    for (const pid of pids) {
+      if (await isPidAlive(pid)) alive.push(pid);
+    }
+    return alive;
+  }
+
+  async function waitForConditionAsync(
+    predicate: () => Promise<boolean>,
+    message: string,
+    timeoutMs: number,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(message);
+  }
+
   it("executes through the provider-neutral runner without a remote spec", async () => {
     const runner = {
       execute: vi.fn(async () => ({
@@ -1237,6 +1281,155 @@ describe("sandbox adapter execution targets", () => {
         await bridge?.stop();
       }
     });
+  });
+
+  it("stop() reaps the remote process session wrapper and its agent child", async () => {
+    // Regression for the run-teardown leak: the wrapper is `nohup`'d out of
+    // the launch exec's shell, so it lives in that exec's process group, not
+    // the run's, and the group-directed teardown signal never reaches it.
+    // `stop()` must signal it by the pid captured at launch; the wrapper's
+    // SIGTERM handler terminates the agent child (TERM, then KILL) and exits.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-reap-"));
+    cleanupDirs.push(rootDir);
+    const childPath = path.join(rootDir, "stubborn-acp-child.mjs");
+    await writeFile(
+      childPath,
+      [
+        "process.stdin.setEncoding('utf8');",
+        "process.stdin.resume();",
+        "process.on('SIGTERM', () => {});",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      "utf8",
+    );
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "local-test",
+      remoteCwd: rootDir,
+      timeoutMs: 30_000,
+      runner: createLocalSandboxRunner(),
+    };
+
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "run-process-session-reap",
+      target,
+      runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+      adapterKey: "acpx",
+      command: process.execPath,
+      args: [childPath],
+      cwd: rootDir,
+      env: {},
+      timeoutSec: 5,
+      onLog: async () => {},
+    });
+    expect(bridge).not.toBeNull();
+
+    try {
+      // Wait until both the wrapper (nohup'd node helper) and its agent child
+      // are running, so the reaping below proves both were reaped — not just
+      // that neither was ever started.
+      await waitForConditionAsync(
+        () => livePidsWithCmdlineFragment("paperclip-process-session-remote.mjs").then((pids) => pids.length > 0),
+        "Timed out waiting for the remote process session wrapper.",
+        5000,
+      );
+      await waitForConditionAsync(
+        () => livePidsWithCmdlineFragment(path.basename(childPath)).then((pids) => pids.length > 0),
+        "Timed out waiting for the process session agent child.",
+        5000,
+      );
+
+      await bridge!.stop();
+
+      // The child ignores SIGTERM, so it only dies via the wrapper's SIGKILL
+      // escalation: the wrapper must have received the host's signal by pid.
+      await waitForConditionAsync(
+        () => livePidsWithCmdlineFragment("paperclip-process-session-remote.mjs").then((pids) => pids.length === 0),
+        "Timed out waiting for the remote process session wrapper to exit.",
+        8000,
+      );
+      await waitForConditionAsync(
+        () => livePidsWithCmdlineFragment(path.basename(childPath)).then((pids) => pids.length === 0),
+        "Timed out waiting for the process session agent child to exit.",
+        8000,
+      );
+    } finally {
+      await bridge?.stop();
+    }
+  });
+
+  it("stop() signals the process session wrapper with a captured, cmdline-guarded pid", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-kill-exec-"));
+    cleanupDirs.push(rootDir);
+    const childPath = path.join(rootDir, "quiet-acp-child.mjs");
+    await writeFile(childPath, "process.stdout.write('ok\\n');\n", "utf8");
+
+    const delegate = createLocalSandboxRunner();
+    const results: Array<{ bypassSession?: boolean; script: string; stdout: string }> = [];
+    const runner = {
+      execute: async (
+        input: Parameters<typeof delegate.execute>[0] & { bypassSession?: boolean },
+      ) => {
+        const result = await delegate.execute(input);
+        results.push({
+          bypassSession: input.bypassSession,
+          script: input.args?.[1] ?? "",
+          stdout: result.stdout,
+        });
+        return result;
+      },
+    };
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "local-test",
+      remoteCwd: rootDir,
+      timeoutMs: 30_000,
+      runner,
+    };
+
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "run-process-session-kill-exec",
+      target,
+      runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+      adapterKey: "acpx",
+      command: process.execPath,
+      args: [childPath],
+      cwd: rootDir,
+      env: {},
+      timeoutSec: 5,
+      onLog: async () => {},
+    });
+    expect(bridge).not.toBeNull();
+
+    let stopped = false;
+    try {
+      await bridge!.stop();
+      stopped = true;
+    } finally {
+      // Only a safety stop for a failed assertion above — a second stop would
+      // re-record the teardown kill exec and skew the assertions below.
+      if (!stopped) await bridge?.stop().catch(() => undefined);
+    }
+
+    const launch = results.find((result) => result.script.includes("nohup node"));
+    expect(launch).toBeDefined();
+    const launchPid = Number.parseInt((launch!.stdout ?? "").trim(), 10);
+    expect(Number.isSafeInteger(launchPid)).toBe(true);
+    expect(launchPid).toBeGreaterThan(0);
+
+    // Match the exact teardown kill for the captured pid: other control-plane
+    // execs (remote pid locks) reference `kill` for stale-lock probing.
+    const killExecs = results.filter((result) => result.script.includes(`kill -TERM ${launchPid}`));
+    expect(killExecs).toHaveLength(1);
+    // The kill must carry the exact pid the launch exec printed, and it must
+    // run off the persistent session like the other control-plane execs.
+    expect(killExecs[0]!.script).toContain(`kill -TERM ${launchPid}`);
+    expect(killExecs[0]!.bypassSession).toBe(true);
+    // The /proc/<pid>/cmdline guard keeps a recycled pid from being signalled.
+    expect(killExecs[0]!.script).toContain(`/proc/${launchPid}/cmdline`);
+    expect(killExecs[0]!.script).toContain("*paperclip-process-session-remote*");
   });
 
   it("applies the remote sandbox fallback when adapter timeoutSec is unset", () => {
