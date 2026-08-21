@@ -1289,9 +1289,24 @@ describe("sandbox adapter execution targets", () => {
     // the run's, and the group-directed teardown signal never reaches it.
     // `stop()` must signal it by the pid captured at launch; the wrapper's
     // SIGTERM handler terminates the agent child (TERM, then KILL) and exits.
+    //
+    // The explicit 20s it-timeout: the happy path is dominated by the wrapper's
+    // 3s SIGKILL escalation (~3.1s measured), so vitest's 5s default has no
+    // headroom under CI load and this guard for the 18.3 GB leak would flake.
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-reap-"));
     cleanupDirs.push(rootDir);
     const childPath = path.join(rootDir, "stubborn-acp-child.mjs");
+    // Scope the reaping assertions to THIS test's own processes: the wrapper
+    // and the child both carry this test's mkdtemp root in their argv, so
+    // wrappers leaked by other runs (the exact condition this issue documents)
+    // are never counted — a global basename fragment would make the
+    // `length === 0` waits unsatisfiable on any host that already holds them.
+    const runtimeRootDir = path.posix.join(rootDir, ".paperclip-runtime", "acpx");
+    const wrapperFragment = path.posix.join(
+      runtimeRootDir,
+      "process-sessions",
+      "paperclip-process-session-remote.mjs",
+    );
     await writeFile(
       childPath,
       [
@@ -1314,7 +1329,7 @@ describe("sandbox adapter execution targets", () => {
     const bridge = await startAdapterExecutionTargetProcessSessionBridge({
       runId: "run-process-session-reap",
       target,
-      runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+      runtimeRootDir,
       adapterKey: "acpx",
       command: process.execPath,
       args: [childPath],
@@ -1330,12 +1345,12 @@ describe("sandbox adapter execution targets", () => {
       // are running, so the reaping below proves both were reaped — not just
       // that neither was ever started.
       await waitForConditionAsync(
-        () => livePidsWithCmdlineFragment("paperclip-process-session-remote.mjs").then((pids) => pids.length > 0),
+        () => livePidsWithCmdlineFragment(wrapperFragment).then((pids) => pids.length > 0),
         "Timed out waiting for the remote process session wrapper.",
         5000,
       );
       await waitForConditionAsync(
-        () => livePidsWithCmdlineFragment(path.basename(childPath)).then((pids) => pids.length > 0),
+        () => livePidsWithCmdlineFragment(childPath).then((pids) => pids.length > 0),
         "Timed out waiting for the process session agent child.",
         5000,
       );
@@ -1345,19 +1360,96 @@ describe("sandbox adapter execution targets", () => {
       // The child ignores SIGTERM, so it only dies via the wrapper's SIGKILL
       // escalation: the wrapper must have received the host's signal by pid.
       await waitForConditionAsync(
-        () => livePidsWithCmdlineFragment("paperclip-process-session-remote.mjs").then((pids) => pids.length === 0),
+        () => livePidsWithCmdlineFragment(wrapperFragment).then((pids) => pids.length === 0),
         "Timed out waiting for the remote process session wrapper to exit.",
         8000,
       );
       await waitForConditionAsync(
-        () => livePidsWithCmdlineFragment(path.basename(childPath)).then((pids) => pids.length === 0),
+        () => livePidsWithCmdlineFragment(childPath).then((pids) => pids.length === 0),
         "Timed out waiting for the process session agent child to exit.",
         8000,
       );
     } finally {
       await bridge?.stop();
     }
-  });
+  }, 20_000);
+
+  it("stop() reaps the streamed remote process session wrapper and its agent child", async () => {
+    // Streamed-path half of the same run-teardown regression: the wrapper runs
+    // as `exec node` in the launch exec's shell, so `onSpawn` reports the
+    // wrapper's own pid and `stop()` signals it the same way. If the pid were
+    // never captured, stop() would skip the kill and this wait would time out.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-reap-stream-"));
+    cleanupDirs.push(rootDir);
+    const childPath = path.join(rootDir, "stubborn-stream-acp-child.mjs");
+    const runtimeRootDir = path.posix.join(rootDir, ".paperclip-runtime", "acpx");
+    const wrapperFragment = path.posix.join(
+      runtimeRootDir,
+      "process-sessions",
+      "paperclip-process-session-remote-stream.mjs",
+    );
+    await writeFile(
+      childPath,
+      [
+        "process.stdin.setEncoding('utf8');",
+        "process.stdin.resume();",
+        "process.on('SIGTERM', () => {});",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      "utf8",
+    );
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "local-test",
+      remoteCwd: rootDir,
+      timeoutMs: 30_000,
+      runner: createLocalSandboxRunner(),
+    };
+
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "run-process-session-reap-stream",
+      target,
+      runtimeRootDir,
+      adapterKey: "acpx",
+      command: process.execPath,
+      args: [childPath],
+      cwd: rootDir,
+      env: {},
+      timeoutSec: 5,
+      onLog: async () => {},
+      streamOutputViaSession: true,
+    });
+    expect(bridge).not.toBeNull();
+
+    try {
+      await waitForConditionAsync(
+        () => livePidsWithCmdlineFragment(wrapperFragment).then((pids) => pids.length > 0),
+        "Timed out waiting for the streamed remote process session wrapper.",
+        5000,
+      );
+      await waitForConditionAsync(
+        () => livePidsWithCmdlineFragment(childPath).then((pids) => pids.length > 0),
+        "Timed out waiting for the process session agent child.",
+        5000,
+      );
+
+      await bridge!.stop();
+
+      await waitForConditionAsync(
+        () => livePidsWithCmdlineFragment(wrapperFragment).then((pids) => pids.length === 0),
+        "Timed out waiting for the streamed remote process session wrapper to exit.",
+        8000,
+      );
+      await waitForConditionAsync(
+        () => livePidsWithCmdlineFragment(childPath).then((pids) => pids.length === 0),
+        "Timed out waiting for the process session agent child to exit.",
+        8000,
+      );
+    } finally {
+      await bridge?.stop();
+    }
+  }, 20_000);
 
   it("stop() signals the process session wrapper with a captured, cmdline-guarded pid", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-kill-exec-"));
