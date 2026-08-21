@@ -2,4 +2,4 @@
 
 This PR intentionally has no Paperclip approval. It exists to prove the gate.
 
-rev 3 — body fixed for quality gates.
+rev 4 — body fixed for quality gates.
