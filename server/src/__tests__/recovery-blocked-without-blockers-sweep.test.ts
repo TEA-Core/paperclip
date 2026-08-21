@@ -1221,6 +1221,104 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(escalatedAction?.evidence).toMatchObject({ healAttemptCount: 5 });
   });
 
+  it("flag ON + prior resolved bwob heals + unrelated active action: ceiling reads the resolved bwob count, not 0", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Prior bwob heals + unrelated active action",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+
+    // Seed 4 prior resolved blocked_without_blockers heals with counts 1-4,
+    // ordered so count 4 is the latest resolved (that is what the sweep reads).
+    for (let i = 1; i <= 4; i++) {
+      await db.insert(issueRecoveryActions).values({
+        id: randomUUID(),
+        companyId,
+        sourceIssueId: issueId,
+        kind: "blocked_without_blockers",
+        status: "resolved",
+        ownerType: "board",
+        cause: "blocked_without_blockers",
+        fingerprint: `bwob:${companyId}:${issueId}`,
+        attemptCount: 1,
+        nextAction: "Review this blocked issue.",
+        evidence: { identifier: null, healAttemptCount: i },
+        resolvedAt: new Date(Date.now() - (5 - i) * 60_000),
+      });
+    }
+
+    // Seed an unrelated ACTIVE action (successful_run_missing_state). This is
+    // the row that previously made the heal branch skip the resolved-bwob
+    // lookup and reset healAttemptCount to 0.
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId: issueId,
+      kind: "successful_run_missing_state",
+      status: "active",
+      ownerType: "board",
+      cause: "successful_run_missing_state",
+      fingerprint: `srm:${companyId}:${issueId}`,
+      attemptCount: 1,
+      nextAction: "Review successful run missing state issue.",
+      evidence: { identifier: null, status: "blocked", blockedAt: oldDate() },
+    });
+
+    const heartbeat = heartbeatService(db);
+
+    // First sweep: prior count 4 is read (not reset to 0), so this heal is #5
+    // and it persists count 5 onto a new resolved bwob action.
+    const firstResult = await heartbeat.reconcileBlockedWithoutBlockers();
+    expect(firstResult.healed).toBe(1);
+    expect(firstResult.escalated).toBe(0);
+
+    const healedAction = await db
+      .select({ evidence: issueRecoveryActions.evidence })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+          eq(issueRecoveryActions.kind, "blocked_without_blockers"),
+          eq(issueRecoveryActions.status, "resolved"),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.resolvedAt))
+      .limit(1)
+      .then((rows) => rows[0]);
+    expect(healedAction?.evidence).toMatchObject({ healAttemptCount: 5 });
+
+    await drainAgentRuns(agentId);
+
+    // Re-block and sweep again: count 5 is at the ceiling, so the sweep must
+    // NOT heal a 6th time. The unrelated active action is still present.
+    await db
+      .update(issues)
+      .set({ status: "blocked", updatedAt: oldDate() })
+      .where(eq(issues.id, issueId));
+    const secondResult = await heartbeat.reconcileBlockedWithoutBlockers();
+    expect(secondResult.healed).toBe(0);
+    expect(secondResult.alreadyActionedSkipped).toBe(0);
+    expect(secondResult.escalated).toBe(1);
+    expect(secondResult.issueIds).toEqual([issueId]);
+
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.status).toBe("blocked");
+
+    await drainAgentRuns(agentId);
+  });
+
   async function seedCompanyAgentAndProject() {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const projectId = randomUUID();
