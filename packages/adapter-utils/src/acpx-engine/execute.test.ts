@@ -31,6 +31,7 @@ import {
   findAncestorBin,
   geminiVersionSupportsNativeAcpFlag,
   parseGeminiVersionParts,
+  probeSignalDeliverability,
   rewriteGeminiAcpFlagForVersion,
   summarizeAcpxTurnUsage,
   type AcpxEngineExecutorOptions,
@@ -2174,13 +2175,17 @@ describe("gemini ACP flag selection", () => {
 
     expect(result.timedOut).toBe(true);
     expect(result.errorCode).toBe("acpx_timeout");
-    // The whole point: the run reports the process is still out there.
+    // The whole point: the run reports the process is still out there. The
+    // stand-in agent is spawned by the test itself (same uid), so the
+    // kill(pid, 0) probe succeeds and no errno is observed — the errorCode
+    // field is the probe's honest result, not an assumed EPERM. probeSignalDeliverability
+    // pins the EPERM shape for the split-uid case separately.
     expect(result.errorMeta).toMatchObject({
       orphanedProcess: {
         kind: "orphaned_process",
         pid: agentPid,
         signal: "SIGTERM",
-        errorCode: "EPERM",
+        errorCode: null,
       },
     });
     expect(logs.some((entry) => entry.text.includes(`${agentPid} could not be signaled`))).toBe(true);
@@ -2192,6 +2197,56 @@ describe("gemini ACP flag selection", () => {
       // already gone
     }
   }, 15_000);
+});
+
+describe("probeSignalDeliverability", () => {
+  it("reports the EPERM a split-uid supervisor observes on a live agent", () => {
+    const err = new Error("kill EPERM") as NodeJS.ErrnoException;
+    err.code = "EPERM";
+    const spy = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw err;
+    });
+    try {
+      expect(probeSignalDeliverability(43_210)).toEqual({ errorCode: "EPERM" });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("drops the orphan when the process exited between the liveness probe and here", () => {
+    const err = new Error("kill ESRCH") as NodeJS.ErrnoException;
+    err.code = "ESRCH";
+    const spy = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw err;
+    });
+    try {
+      expect(probeSignalDeliverability(43_210)).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("observes no errno when the supervisor can still signal the agent", () => {
+    const spy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      expect(probeSignalDeliverability(43_210)).toEqual({ errorCode: null });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("does not report an unrelated errno as the signal-delivery error", () => {
+    const err = new Error("kill EINVAL") as NodeJS.ErrnoException;
+    err.code = "EINVAL";
+    const spy = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw err;
+    });
+    try {
+      expect(probeSignalDeliverability(43_210)).toEqual({ errorCode: null });
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 describe("summarizeAcpxTurnUsage", () => {

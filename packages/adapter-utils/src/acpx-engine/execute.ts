@@ -163,11 +163,13 @@ type AcpxProcessIdentitySink = {
 // supervisor lacks CAP_KILL against the split agent uid, a run that times out
 // therefore records timed_out while its agent keeps running, invisible.
 //
-// A liveness probe cannot use process.kill(pid, 0) as the opencode lane does:
-// against a different uid WITHOUT CAP_KILL it throws EPERM for a LIVE process —
-// indistinguishable from ESRCH at a glance. /proc/<pid> is the authoritative
-// namespace-local existence probe on the container platforms the uid split
-// targets; elsewhere fall back to kill(pid, 0) and treat EPERM as alive.
+// A liveness probe cannot rely on process.kill(pid, 0) alone the way the
+// opencode lane does: against a different uid WITHOUT CAP_KILL it throws EPERM
+// for a LIVE process — easy to misread as ESRCH. /proc/<pid> is the
+// authoritative namespace-local existence probe on the container platforms the
+// uid split targets; elsewhere fall back to kill(pid, 0) and treat EPERM as
+// alive. The errno such a probe raises is still real evidence, and
+// probeSignalDeliverability reads it for the orphaned-process block.
 function isAgentProcessAlive(pid: number | null | undefined): boolean {
   if (!pid || pid <= 0) return false;
   if (process.platform === "linux") {
@@ -186,6 +188,25 @@ function isAgentProcessAlive(pid: number | null | undefined): boolean {
   }
 }
 
+// Observe the errno a signal would produce instead of assuming one: the acpx
+// kill sites swallow whether a signal was delivered, so the evidence block's
+// errorCode must come from THIS probe, not from the opencode lane's incident.
+// kill(pid, 0) performs error-checking only (POSIX signal 0): success means the
+// process exists and the supervisor may signal it, EPERM means it exists but is
+// out of reach — the split-uid failure mode — and ESRCH means it exited between
+// the liveness probe and here, leaving no orphan to report.
+export function probeSignalDeliverability(pid: number | null | undefined): { errorCode: string | null } | null {
+  if (!pid || pid <= 0) return null;
+  try {
+    process.kill(pid, 0);
+    return { errorCode: null };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? null;
+    if (code === "ESRCH") return null;
+    return { errorCode: code === "EPERM" ? code : null };
+  }
+}
+
 // Surface an agent that outlived its run's termination the same way #327
 // surfaces the opencode lane's orphan: an evidence block on the result plus a
 // stderr line, so an operator sees the process is still out there instead of
@@ -197,13 +218,15 @@ function buildOrphanedAgentEvidence(
 ): OrphanedProcessEvidence | null {
   const pid = processIdentitySink.latest?.pid ?? null;
   if (!isAgentProcessAlive(pid)) return null;
+  const probe = probeSignalDeliverability(pid);
+  if (!probe) return null;
   return {
     kind: "orphaned_process",
     reason: SIGNAL_UNDELIVERABLE_REASON,
     pid,
     processGroupId: null,
     signal: "SIGTERM",
-    errorCode: "EPERM",
+    errorCode: probe.errorCode,
   };
 }
 
