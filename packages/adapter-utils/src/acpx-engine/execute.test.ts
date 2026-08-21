@@ -2197,6 +2197,75 @@ describe("gemini ACP flag selection", () => {
       // already gone
     }
   }, 15_000);
+
+  it("surfaces no orphaned-process evidence when the agent is already gone at the timeout", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+
+    // A real agent stand-in that exits on its own: by the time the wall-clock
+    // timer fires, the pid is gone, so the post-cancel probe observes ESRCH (or
+    // a missing /proc/<pid> on Linux) and there is no orphan to report.
+    const agent = spawn(process.execPath, ["-e", "setTimeout(() => {}, 50);"], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    const agentPid = agent.pid as number;
+    await new Promise<void>((resolve) => agent.once("exit", () => resolve()));
+    const spawnedAt = new Date().toISOString();
+
+    let releaseTurn: (() => void) | null = null;
+    const turnCancelled = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+
+    const execute = createAcpxEngineExecutor({
+      createRuntime: (options) => {
+        // Report the (already dead) agent process identity exactly as the
+        // patched acpx spawn lifecycle hook did at spawn time.
+        void options.onAgentSpawn?.({ pid: agentPid, startedAt: spawnedAt });
+        return {
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            events: (async function* () {
+              await turnCancelled;
+            })(),
+            result: turnCancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+            cancel: async () => {
+              releaseTurn?.();
+            },
+          }),
+          close: async () => {},
+        } as never;
+      },
+    });
+
+    const result = await execute({
+      runId: "run-timeout-gone",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        cwd,
+        timeoutSec: 1,
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    // Timeout labelling is unchanged, and a gone agent carries no surviving
+    // process evidence: nothing is pointing at a process that is not there.
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("acpx_timeout");
+    expect(result.errorMeta?.orphanedProcess ?? null).toBeNull();
+  }, 15_000);
 });
 
 describe("probeSignalDeliverability", () => {
