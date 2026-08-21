@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterExecutionContext, AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
@@ -2100,6 +2101,96 @@ describe("gemini ACP flag selection", () => {
     expect(result.errorCode).toBe("acpx_timeout");
     expect(result.errorMessage).toBe(expectedMessage);
     expect(cancelReasons).toContain(expectedMessage);
+  }, 15_000);
+
+  it("surfaces a surviving agent as orphaned-process evidence when the run timed out", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+
+    // A real, long-lived stand-in for the ACP agent process. acpx's kill sites
+    // swallow undeliverable signals (a failed kill(2) arrives as a false
+    // `child.kill()` return and an 'error' event, exactly the pair #327 fixed on
+    // the opencode lane), so on a split uid without CAP_KILL the agent outlives
+    // the timeout cleanup. The executor must surface it, not assume the timeout
+    // stopped it.
+    const agent = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const agentPid = agent.pid as number;
+    const spawnedAt = new Date().toISOString();
+
+    const cancelReasons: string[] = [];
+    let releaseTurn: (() => void) | null = null;
+    const turnCancelled = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+
+    const logs: Array<{ stream: string; text: string }> = [];
+    const execute = createAcpxEngineExecutor({
+      createRuntime: (options) => {
+        // Report the agent process identity exactly as the patched acpx spawn
+        // lifecycle hook does.
+        void options.onAgentSpawn?.({ pid: agentPid, startedAt: spawnedAt });
+        return {
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            events: (async function* () {
+              await turnCancelled;
+            })(),
+            result: turnCancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+            cancel: async ({ reason }: { reason: string }) => {
+              cancelReasons.push(reason);
+              releaseTurn?.();
+            },
+          }),
+          close: async () => {},
+        } as never;
+      },
+    });
+
+    const result = await execute({
+      runId: "run-timeout-orphan",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        cwd,
+        timeoutSec: 1,
+      },
+      context: {},
+      onLog: async (stream: string, text: string) => {
+        logs.push({ stream, text });
+      },
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("acpx_timeout");
+    // The whole point: the run reports the process is still out there.
+    expect(result.errorMeta).toMatchObject({
+      orphanedProcess: {
+        kind: "orphaned_process",
+        pid: agentPid,
+        signal: "SIGTERM",
+        errorCode: "EPERM",
+      },
+    });
+    expect(logs.some((entry) => entry.text.includes(`${agentPid} could not be signaled`))).toBe(true);
+
+    agent.kill("SIGKILL");
+    try {
+      await new Promise((resolve) => agent.once("close", resolve));
+    } catch {
+      // already gone
+    }
   }, 15_000);
 });
 
