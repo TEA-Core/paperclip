@@ -94,7 +94,7 @@ jobs:
 
           # The exact command a human runs to open the PR by hand. Emitted in the
           # ::error:: remediation below so the pushed branch is never left unpointed.
-          PR_CMD="gh pr create --head \"${BRANCH}\" --base \"${BASE_REF}\" --title \"chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}\" --body \"Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml.\""
+          PR_CMD="gh pr create --head \"${BRANCH}\" --base \"${BASE_REF}\" --title \"chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}\" --body \$'Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml.\n\nPaperclip-Approved-Waiver: automated lockfile refresh, no Paperclip card (SUP-13629)'"
 
           # The default GITHUB_TOKEN cannot create PRs in this org ("GitHub Actions
           # is not permitted to create or approve pull requests"), so the bot token
@@ -117,7 +117,7 @@ jobs:
               --head "$BRANCH" \
               --base "$BASE_REF" \
               --title "chore(lockfile): refresh pnpm-lock.yaml for ${BASE_REF}" \
-              --body "Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml." > "$RUNNER_TEMP/pr-create.out"; then
+              --body $'Auto-generated lockfile refresh after dependencies changed on ${BASE_REF}. This PR only updates pnpm-lock.yaml.\n\nPaperclip-Approved-Waiver: automated lockfile refresh, no Paperclip card (SUP-13629)' > "$RUNNER_TEMP/pr-create.out"; then
               echo "::error title=Lockfile PR not created::Failed to open a PR for pushed branch '${BRANCH}'. Open it manually with: ${PR_CMD}"
               echo "pr_url=" >> "$GITHUB_OUTPUT"
               exit 0
