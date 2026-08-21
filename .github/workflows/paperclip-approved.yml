@@ -1,0 +1,65 @@
+name: Paperclip Approval Enforcer
+
+on:
+  pull_request:
+    branches:
+      - 'fold/**'
+  # SUP-12280 phase 2 / SUP-13629: required checks must run for `merge_group`
+  # or a queue entry never gets a report on the required context and waits on
+  # a check that is never going to arrive. Same branch coverage as
+  # `pull_request` above.
+  merge_group:
+    branches:
+      - 'fold/**'
+  # The context is safe to require only if the job also reports success (never
+  # `skipped`) when the branch is updated by a push — a skipped context never
+  # satisfies a required status check (SUP-13500). Kept in its own workflow so
+  # a push to the fold does not re-run the heavy pr.yml suite.
+  push:
+    branches:
+      - 'fold/**'
+
+concurrency:
+  group: paperclip-approved-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # SUP-13589/SUP-13590/SUP-13629: the approval gate on the fold branch.
+  # Consumes the control-plane `paperclip/approved` commit status on the PR
+  # head (READ-ONLY — nothing in this repository may create, mock or write
+  # that context; see the script header). Advisory on pull_request (the status
+  # is published only at review-stage approval, which happens after CI first
+  # runs on the PR); fail-closed on merge_group (the last gate before the
+  # commit lands on the fold); no-op on push. Runs on all three events and
+  # always lands a conclusion — success on the advisory/no-op paths, never
+  # skipped.
+  paperclip-approved-enforcer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: read
+      pull-requests: read
+    env:
+      # `gh api` needs a token in the workflow environment — GITHUB_TOKEN is
+      # not guaranteed on every runner class; without it every API call fails
+      # and the merge_group leg would fail-closed on its own plumbing.
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Event note
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) echo "paperclip-approved: pull_request — advisory; the merge queue enforces at the merge boundary" ;;
+            merge_group)  echo "paperclip-approved: merge_group — enforcing the approval gate" ;;
+            *)            echo "paperclip-approved: '${{ github.event_name }}' — no-op, reporting success" ;;
+          esac
+      - uses: actions/checkout@v7
+      - name: Check the paperclip/approved status
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) bash scripts/ci/check-paperclip-approved.sh pull_request "${{ github.event.pull_request.number }}" ;;
+            merge_group)  bash scripts/ci/check-paperclip-approved.sh merge_group ;;
+            *)            bash scripts/ci/check-paperclip-approved.sh push ;;
+          esac
