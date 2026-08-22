@@ -8362,6 +8362,24 @@ export function issueService(db: Db) {
                 },
               });
             }
+            // SUP-13699: a routine execution that reached `done` subsumes every
+            // earlier still-open run of the same routine, so retire those
+            // siblings in place instead of leaving a growing population of
+            // permanently-blocked duplicates. Terminal `cancelled` does NOT
+            // supersede: a later run that was itself cancelled did not do the
+            // work. Dynamic import breaks the module cycle
+            // (routines.js imports issueService).
+            if (
+              updated.status === "done" &&
+              updated.originKind === "routine_execution" &&
+              updated.originId
+            ) {
+              const { supersedeOpenRoutineExecutionSiblings } = await import("./routines.js");
+              await supersedeOpenRoutineExecutionSiblings(tx, updated, {
+                agentId: actorAgentId ?? null,
+                userId: actorUserId ?? null,
+              });
+            }
           }
           // A status-card generation task that goes done/cancelled/blocked stops
           // making progress; release the card's generation claim so the board tile

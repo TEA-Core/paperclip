@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, lt, ne, not, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -15,6 +15,7 @@ import {
   folders,
   goals,
   heartbeatRuns,
+  issueComments,
   issueInboxArchives,
   issues,
   pluginManagedResources,
@@ -61,6 +62,7 @@ import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
+import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
@@ -74,7 +76,7 @@ import {
   type WorktreeRunExecutionActivationState,
 } from "./instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, logActivityInTransaction } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
@@ -642,6 +644,151 @@ function mapRoutineDescriptionDocument(row: {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+/**
+ * SUP-13699: a `routine_execution` issue is an idempotent periodic sweep — each
+ * run subsumes whatever the previous run would have done. When a run reaches
+ * terminal `done`, the still-open earlier runs of the same routine are work a
+ * later run already did, and leaving them open parks a growing population of
+ * permanently-blocked duplicates on the board. Retire them in place: cancel
+ * each one with a supersede note naming the superseding issue.
+ *
+ * Eligibility is strict: same company, `originKind: "routine_execution"`, same
+ * routine (`originId`), strictly earlier period (`createdAt`), still
+ * non-terminal. Terminal siblings (`done`/`cancelled`) and any non-routine
+ * issue are never touched; matching is never on title. The per-row CAS (only
+ * cancel while the sibling is still open) makes the sweep idempotent under
+ * re-runs and concurrent superseding runs: a sibling another writer already
+ * retired gets no second write and no second comment.
+ *
+ * Runs inside the caller's transaction so the retirements are atomic with the
+ * superseding issue's terminal write.
+ */
+export async function supersedeOpenRoutineExecutionSiblings(
+  executor: Db,
+  superseding: {
+    id: string;
+    companyId: string;
+    originKind: string | null;
+    originId: string | null;
+    identifier: string | null;
+    createdAt: Date | string;
+  },
+  actor: { agentId?: string | null; userId?: string | null } = {},
+): Promise<Array<{ issueId: string; identifier: string | null; previousStatus: string }>> {
+  if (superseding.originKind !== "routine_execution" || !superseding.originId) return [];
+  const supersedingCreatedAt = new Date(superseding.createdAt);
+  const siblings = await executor
+    .select()
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, superseding.companyId),
+        eq(issues.originKind, "routine_execution"),
+        eq(issues.originId, superseding.originId),
+        inArray(issues.status, OPEN_ISSUE_STATUSES),
+        isNull(issues.hiddenAt),
+        isNull(issues.harnessKind),
+        ne(issues.id, superseding.id),
+        lt(issues.createdAt, supersedingCreatedAt),
+      ),
+    )
+    .orderBy(asc(issues.createdAt));
+  if (siblings.length === 0) return [];
+
+  const superseded: Array<{ issueId: string; identifier: string | null; previousStatus: string }> = [];
+  const now = new Date();
+  for (const sibling of siblings) {
+    // Mirror the canonical terminal-transition side effects of a
+    // blocked/cancelled write (issues.ts `update`): status + cancelledAt,
+    // cleared execution/checkout locks, cleared monitor wake fields, and the
+    // blocked-transition markers.
+    const [retired] = await executor
+      .update(issues)
+      .set({
+        status: "cancelled",
+        cancelledAt: now,
+        updatedAt: now,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        checkoutRunId: null,
+        monitorNextCheckAt: null,
+        monitorWakeRequestedAt: null,
+        unblockDescriptor: null,
+        blockedTransitionAt: null,
+        blockedOwnerNotifiedAt: null,
+      })
+      .where(and(eq(issues.id, sibling.id), inArray(issues.status, OPEN_ISSUE_STATUSES)))
+      .returning();
+    if (!retired) continue;
+
+    await executor.insert(issueComments).values({
+      companyId: superseding.companyId,
+      issueId: retired.id,
+      authorAgentId: null,
+      authorUserId: null,
+      authorType: "system",
+      createdByRunId: null,
+      body:
+        `Superseded by ${superseding.identifier ?? "a later run of the same routine"}: ` +
+        "a later run of this routine reached done, so this earlier run is retired automatically. " +
+        "No action is required on this issue.",
+      presentation: null,
+      metadata: null,
+      sourceTrust: null,
+    });
+
+    // Keep the routine run ledger consistent the way `syncRunStatusForIssue`
+    // does for route-level blocked/cancelled transitions.
+    if (retired.originRunId) {
+      await executor
+        .update(routineRuns)
+        .set({
+          status: "failed",
+          failureReason: `Superseded by ${superseding.identifier ?? "a later run of the same routine"}`,
+          completedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(routineRuns.id, retired.originRunId),
+            notInArray(routineRuns.status, ["coalesced", "skipped", "completed", "failed"]),
+          ),
+        );
+    }
+
+    await issueThreadInteractionService(executor).expirePendingInteractionsForTerminalIssue(
+      { id: retired.id, companyId: retired.companyId, status: retired.status },
+      { agentId: actor.agentId ?? null, userId: actor.userId ?? null },
+    );
+
+    await logActivityInTransaction(executor, {
+      companyId: superseding.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.routine_execution_superseded",
+      entityType: "issue",
+      entityId: retired.id,
+      details: {
+        identifier: retired.identifier,
+        previousStatus: sibling.status,
+        supersededByIssueId: superseding.id,
+        supersededByIdentifier: superseding.identifier,
+        source: "issue.status_transition.routine_supersede",
+      },
+    });
+
+    superseded.push({
+      issueId: retired.id,
+      identifier: retired.identifier,
+      previousStatus: sibling.status,
+    });
+  }
+  return superseded;
 }
 
 export function routineService(
