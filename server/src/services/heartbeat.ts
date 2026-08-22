@@ -4413,11 +4413,19 @@ const PAPERCLIP_SESSION_METADATA_KEYS = new Set([
   SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY,
 ]);
 const WORKSPACE_CONFIG_FINGERPRINT_METADATA_KEY = "configFingerprint";
+// SUP-13734: the former `modelProfile` category was dropped from the session
+// fingerprint. A model-profile change only moves the model the next turn is
+// sent to; the saved session is a transcript the adapters replay and is not
+// model-keyed (opencode resumes via `--session <id> --model <m>`, the Claude
+// CLI via `--resume <id> --model <m>`, and neither resume gate nor the ACP
+// `isCompatibleSession` predicate keys on the model). The router moves agents
+// between models between wakes, so fingerprinting the profile rotated the
+// session on routine model churn. The model-selection keys of the adapter
+// config are projected out of the `adapterConfig` category below instead.
 const EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES = [
   "adapter",
   "adapterConfig",
   "agentRuntimeConfig",
-  "modelProfile",
   "instructions",
   "issueOverrides",
   "workspaceConfig",
@@ -4784,7 +4792,6 @@ const EFFECTIVE_RUN_SESSION_CONFIG_CATEGORY_LABELS: Record<EffectiveRunSessionCo
   adapter: "adapter",
   adapterConfig: "adapter config",
   agentRuntimeConfig: "agent runtime config",
-  modelProfile: "model profile",
   instructions: "instructions",
   issueOverrides: "issue overrides",
   workspaceConfig: "workspace config",
@@ -5086,11 +5093,36 @@ async function resolveInstructionsConfigFingerprintMetadata(config: Record<strin
   return metadata;
 }
 
+// Top-level adapter-config keys that select the per-run model and its
+// reasoning lane. These are NOT session identity: the model the next turn is
+// sent to can move between wakes (model router churn, model-profile flips)
+// without making the saved transcript unusable — the adapters resume by
+// session id and pass the model as an independent per-run flag (opencode
+// `--session <id> --model <m>`, Claude CLI `--resume <id> --model <m>`).
+// Fingerprinting them rotated the session on every model swap (SUP-13734:
+// 235 of 791 evaluated runs). Structural adapter config (command, extraArgs,
+// cwd, env, MCP servers, ...) still rotates the `adapterConfig` category.
+const SESSION_ADAPTER_CONFIG_MODEL_SELECTION_KEYS = new Set([
+  "model",
+  "variant",
+  "effort",
+  "modelReasoningEffort",
+  "reasoningEffort",
+  "thinkingEffort",
+]);
+
+function projectSessionAdapterConfigCategoryValue(
+  adapterConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(adapterConfig).filter(([key]) => !SESSION_ADAPTER_CONFIG_MODEL_SELECTION_KEYS.has(key)),
+  );
+}
+
 function buildSessionConfigCategoryValues(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
   agentRuntimeConfig: unknown;
-  modelProfile: unknown;
   instructions: unknown;
   issueOverrides: unknown;
   workspaceConfig: unknown;
@@ -5108,9 +5140,8 @@ function buildSessionConfigCategoryValues(input: {
       adapterType: input.adapterType,
       agentConfigRevision: input.agentConfigRevision,
     },
-    adapterConfig: input.effectiveAdapterConfig,
+    adapterConfig: projectSessionAdapterConfigCategoryValue(input.effectiveAdapterConfig),
     agentRuntimeConfig: input.agentRuntimeConfig,
-    modelProfile: input.modelProfile,
     instructions: input.instructions,
     issueOverrides: input.issueOverrides,
     workspaceConfig: input.workspaceConfig,
@@ -5197,7 +5228,6 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
   agentRuntimeConfig: unknown;
-  modelProfile: unknown;
   issueOverrides: unknown;
   workspaceConfig: unknown;
   environment: unknown;
@@ -5214,7 +5244,6 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     adapterType: input.adapterType,
     effectiveAdapterConfig: input.effectiveAdapterConfig,
     agentRuntimeConfig: input.agentRuntimeConfig,
-    modelProfile: input.modelProfile,
     instructions,
     issueOverrides: input.issueOverrides,
     workspaceConfig: input.workspaceConfig,
@@ -5466,6 +5495,10 @@ function readConfiguredModelFromAdapterConfig(
   return readNonEmptyString(adapterConfig?.model);
 }
 
+// The configured model is recorded on the session params for diagnostics only
+// (which model the session last ran under). Since SUP-13734 a model change
+// never resets the session, so nothing reads this back for a freshness
+// decision; it is always stripped before adapter invocation.
 function attachPaperclipSessionMetadataToSessionParams(
   sessionParams: Record<string, unknown> | null | undefined,
   configuredModel: string | null,
@@ -5483,31 +5516,6 @@ function attachPaperclipSessionMetadataToSessionParams(
   return next;
 }
 
-function readConfiguredModelFromSessionParams(
-  sessionParams: Record<string, unknown> | null | undefined,
-) {
-  return readNonEmptyString(sessionParams?.[SESSION_CONFIGURED_MODEL_KEY]);
-}
-
-export function shouldResetTaskSessionForModelChange(input: {
-  configuredModel: string | null;
-  taskSessionParams: Record<string, unknown> | null | undefined;
-}) {
-  const { configuredModel, taskSessionParams } = input;
-  if (!configuredModel || !taskSessionParams) return false;
-  const sessionModel = readConfiguredModelFromSessionParams(taskSessionParams);
-  return !!sessionModel && sessionModel !== configuredModel;
-}
-
-export function stripConfiguredModelFromSessionParams(
-  sessionParams: Record<string, unknown> | null | undefined,
-) {
-  if (!sessionParams) return null;
-  const next = { ...sessionParams };
-  delete next[SESSION_CONFIGURED_MODEL_KEY];
-  return next;
-}
-
 export function stripPaperclipSessionMetadataFromSessionParams(
   sessionParams: Record<string, unknown> | null | undefined,
 ) {
@@ -5519,9 +5527,13 @@ export function stripPaperclipSessionMetadataFromSessionParams(
   return next;
 }
 
+// SUP-13734: a configured-model change no longer resets the task session. The
+// session is a model-portable transcript (the adapters resume by session id and
+// pass the model as an independent per-run flag), so routine model swaps must
+// preserve it. Genuine config drift (adapter, instructions, secrets,
+// envBindings, runtimeSkills, workspace) still resets via the category diff.
 export function resolveTaskSessionConfigFreshness(input: {
   hasTaskSession: boolean;
-  configuredModel: string | null;
   taskSessionParams: Record<string, unknown> | null | undefined;
   configMetadata: EffectiveRunSessionConfigMetadata | null;
   wakeResetReason?: string | null;
@@ -5539,14 +5551,6 @@ export function resolveTaskSessionConfigFreshness(input: {
 
   const reasons: string[] = [];
   const storedConfig = readConfigFingerprintFromSessionParams(input.taskSessionParams);
-  const taskSessionConfiguredModel = readConfiguredModelFromSessionParams(input.taskSessionParams);
-  const modelChangedSinceTaskSession = shouldResetTaskSessionForModelChange({
-    configuredModel: input.configuredModel,
-    taskSessionParams: input.taskSessionParams,
-  });
-  if (modelChangedSinceTaskSession && taskSessionConfiguredModel) {
-    reasons.push(`configured model changed from "${taskSessionConfiguredModel}" to "${input.configuredModel}"`);
-  }
 
   let changedCategories: EffectiveRunSessionConfigCategory[] = [];
   if (input.configMetadata) {
@@ -15075,7 +15079,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           adapterType: agent.adapterType,
           effectiveAdapterConfig: runtimeConfig,
           agentRuntimeConfig: agent.runtimeConfig,
-          modelProfile: modelProfileMetadata,
           issueOverrides: issueAssigneeOverrides,
           workspaceConfig: buildSessionWorkspaceConfigCategoryValue({
             requestedMode: requestedExecutionWorkspaceMode,
@@ -15129,7 +15132,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const wakeSessionResetReason = describeSessionResetReason(context);
         const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
           hasTaskSession: taskSession != null,
-          configuredModel,
           taskSessionParams: taskSession?.sessionParamsJson ?? taskSessionDecodedParams,
           configMetadata: sessionConfigMetadata,
           wakeResetReason: wakeSessionResetReason,
