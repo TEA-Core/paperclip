@@ -9805,6 +9805,28 @@ export function issueRoutes(
       const issueIdentifier = `SUP-${issue.issueNumber}`;
       try {
         const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier);
+
+        // SUP-13714 Guard A persistence: record which head the approval
+        // certified so the reconciler can verify content identity before any
+        // later re-publish. Stored in issues.executionState (no migration; the
+        // stage machine rebuilds this blob only on a further transition, which
+        // for an approved card is a new review cycle that re-persists).
+        if (statusOutcome.kind === "armed" && typeof statusOutcome.headSha === "string") {
+          const currentState = (issue.executionState ?? {}) as Record<string, unknown>;
+          await db
+            .update(issueRows)
+            .set({
+              executionState: {
+                ...currentState,
+                approvalStatus: {
+                  publishedHeadSha: statusOutcome.headSha,
+                  publishedAt: new Date().toISOString(),
+                },
+              },
+            })
+            .where(eq(issueRows.id, issue.id));
+        }
+
         await svc.addComment(
           issue.id,
           `[Merge-arming] ${statusOutcome.message}`,

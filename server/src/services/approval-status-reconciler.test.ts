@@ -48,6 +48,9 @@ if (!embeddedPostgresSupport.supported) {
 
 const GITHUB_TOKEN = "ghp_test_token_value";
 const NEW_HEAD = "new0000000000000000000000000000000000000002";
+const APPROVED_HEAD = "approved00000000000000000000000000000000001";
+const MOVED_HEAD = "moved0000000000000000000000000000000000000004";
+const APPROVED_AT = "2026-08-20T00:00:00Z";
 const APPROVAL_STAGE_ID = "00000000-0000-0000-0000-0000000000a1";
 const REVIEW_STAGE_ID = "00000000-0000-0000-0000-0000000000a2";
 const PAPERCLIP_APPROVED = "paperclip/approved";
@@ -59,6 +62,7 @@ const USER_REVIEWER = "reviewer-user";
 const PR_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/42";
 const COMBINED_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/status`;
 const POST_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/statuses/${NEW_HEAD}`;
+const COMPARE_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${APPROVED_HEAD}...${NEW_HEAD}`;
 
 const OPEN_PR_BODY = {
   state: "open",
@@ -122,6 +126,11 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       currentStageId: null,
       currentParticipant: null,
       returnAssignee: null,
+      // Default: the approval was published on NEW_HEAD, which is also the
+      // live PR head — so Guard A takes the same-SHA fast path and performs no
+      // compare call in the happy-path tests. Tests that need a moved head or
+      // the unrecoverable case override this.
+      approvalStatus: { publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT },
       ...overrides,
     };
   }
@@ -320,6 +329,164 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
 
       expect(summary.republished).toBe(0);
       expect(summary.skipped["already-success"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("refuses to re-publish when a reviewed file changed after approval (guard A)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        {
+          url: COMPARE_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 1,
+            files: [{ filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000001", status: "modified" }],
+          },
+        },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("re-publishes exactly once on a byte-identical head move (guard A passes)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: COMPARE_URL, body: { status: "ahead", ahead_by: 1, files: [] } },
+        { url: POST_STATUS_URL, body: { id: 12346 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      const calls = postStatusCalls();
+      expect(calls).toHaveLength(1);
+      expect(calls[0]![0]).toBe(POST_STATUS_URL);
+    });
+
+    it("refuses to re-publish for a head that was never reviewed when the approved head is unrecoverable (guard A)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({ approvalStatus: null }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:no-approved-head"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("fails closed when the head-content compare cannot be verified (guard A)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: COMPARE_URL, ok: false, status: 500, body: { message: "server error" } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:compare-failed"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("fails closed when the compare returns no file list (guard A, truncation)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: COMPARE_URL, body: { status: "ahead", ahead_by: 1 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:unverifiable"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("does not stamp a head that moves between validation and the delegated write (TOCTOU pin)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      let prReads = 0;
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        const method = (init as RequestInit | undefined)?.method ?? "GET";
+        if (url === PR_URL && method === "GET") {
+          prReads += 1;
+          const headSha = prReads === 1 ? NEW_HEAD : MOVED_HEAD;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ ...OPEN_PR_BODY, head: { ref: "SUP-42-branch", sha: headSha } }),
+          } as unknown as Response;
+        }
+        if (url === COMBINED_STATUS_URL) {
+          return { ok: true, status: 200, json: async () => ({ state: "pending", statuses: [] }) } as unknown as Response;
+        }
+        if (url === COMPARE_URL) {
+          return { ok: true, status: 200, json: async () => ({ status: "ahead", ahead_by: 1, files: [] }) } as unknown as Response;
+        }
+        if (url.includes("/statuses") && method === "POST") {
+          return { ok: true, status: 201, json: async () => ({ id: 12347 }) } as unknown as Response;
+        }
+        throw new Error(`unmocked ghFetch URL: ${url} method ${method}`);
+      });
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:head-moved-during-write"]).toBe(1);
       expect(postStatusCalls()).toHaveLength(0);
     });
 

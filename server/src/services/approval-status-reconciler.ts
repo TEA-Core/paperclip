@@ -34,14 +34,23 @@ import {
 //   - the linked PR is still open and unmerged (live field-read from GitHub);
 //   - the head does not already carry paperclip/approved=success. The head's
 //     combined status is read first, so idempotent re-runs perform zero
-//     writes.
+//     writes;
+//   - Guard A (SUP-13714): the live head is only re-published when its content
+//     is byte-identical to the head that was approved. The approval
+//     transition persists the certified head SHA in
+//     executionState.approvalStatus.publishedHeadSha; when the live head
+//     differs, per-file blob SHAs are compared via the compare endpoint
+//     (live-verified: two distinct commits with identical trees return an
+//     empty `files` list). No persisted head, an unverifiable compare, or any
+//     changed file refuses the re-publish — the paperclip/approved stamp is an
+//     authorization, and may only certify content that was actually reviewed.
 //
-// The write itself is delegated to publishApprovalStatus() from merge-arming
-// (live re-resolves the head, SUP-13313); this service only decides whether a
-// re-publish is warranted. A head that moves between the combined-status
-// check and the delegated write is harmless: the write lands on the newer
-// head of the same approved card's open PR, which needs the signal just as
-// much, and the next tick verifies it.
+// The write itself is delegated to publishApprovalStatus() from merge-arming.
+// The TOCTOU window (the delegated write re-resolves the head live) is closed
+// by pinning the delegated write to the head validated here
+// (expectedHeadSha): a head that moves in that window makes the delegated
+// publish refuse (skipped, head_moved) with zero writes instead of stamping
+// unreviewed content.
 
 const PAPERCLIP_APPROVED_CONTEXT = "paperclip/approved";
 const DEFAULT_MAX_CANDIDATES = 20;
@@ -91,6 +100,29 @@ interface GitHubReadOutcome {
   status: number;
   message: string | null;
   body: unknown;
+}
+
+interface ApprovedHeadRecord {
+  publishedHeadSha: string;
+  publishedAt?: string;
+}
+
+/**
+ * The approved head persisted by the approval transition
+ * (executionState.approvalStatus.publishedHeadSha), or null when the card was
+ * approved before SUP-13714 shipped or the record was never written. A null
+ * here is Guard A's approved-head-unrecoverable case: the reconciler refuses
+ * to re-publish, because it cannot prove the live head was ever reviewed.
+ */
+function readApprovedHead(state: Record<string, unknown> | null | undefined): ApprovedHeadRecord | null {
+  const approvalStatus = state?.approvalStatus as Record<string, unknown> | null | undefined;
+  if (!approvalStatus || typeof approvalStatus !== "object") return null;
+  const publishedHeadSha = approvalStatus.publishedHeadSha;
+  if (typeof publishedHeadSha !== "string" || publishedHeadSha.length === 0) return null;
+  return {
+    publishedHeadSha,
+    publishedAt: typeof approvalStatus.publishedAt === "string" ? approvalStatus.publishedAt : undefined,
+  };
 }
 
 /**
@@ -369,12 +401,64 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     };
   }
 
-  const outcome = await publishApprovalStatus(db, row.companyId, row.id, row.identifier ?? "");
+  // Guard A — content-identity anti-laundering check (SUP-13714). The
+  // paperclip/approved status is an authorization: it may only certify content
+  // that was actually reviewed. The approval transition persisted the exact
+  // head it certified (executionState.approvalStatus.publishedHeadSha). When
+  // the live head differs, re-publish only if the two heads are byte-identical
+  // (compare endpoint, per-file blob SHAs; an empty `files` list means identical
+  // trees). Any case we cannot positively verify is a refusal with a recorded
+  // reason — never a re-publish.
+  const approvedHead = readApprovedHead(row.executionState);
+  if (!approvedHead) {
+    return {
+      kind: "skipped",
+      reason: "guard-a:no-approved-head",
+      detail: `guard-a: no persisted approved head for ${label}; refusing to re-publish unverified head ${headSha.slice(0, 7)}`,
+    };
+  }
+  if (approvedHead.publishedHeadSha !== headSha) {
+    const comparePath = `/compare/${encodeURIComponent(approvedHead.publishedHeadSha)}...${encodeURIComponent(headSha)}`;
+    const compare = await ghReadJson(db, row.companyId, target.owner, target.repo, comparePath);
+    if (!compare.ok) {
+      return {
+        kind: "skipped",
+        reason: "guard-a:compare-failed",
+        detail: `guard-a: head-content compare ${approvedHead.publishedHeadSha.slice(0, 7)}...${headSha.slice(0, 7)} failed (HTTP ${compare.status} ${compare.message ?? ""}); refusing to re-publish`,
+      };
+    }
+    const compareFiles = (compare.body as Record<string, unknown> | null)?.files;
+    if (!Array.isArray(compareFiles)) {
+      return {
+        kind: "skipped",
+        reason: "guard-a:unverifiable",
+        detail: `guard-a: compare returned no file list; cannot prove ${headSha.slice(0, 7)} was reviewed; refusing to re-publish`,
+      };
+    }
+    if (compareFiles.length > 0) {
+      const changed = (compareFiles as Array<Record<string, unknown>>)
+        .slice(0, 3)
+        .map((f) => String(f.filename ?? "?"))
+        .join(", ");
+      return {
+        kind: "skipped",
+        reason: "guard-a:changed-blob",
+        detail: `guard-a: head ${headSha.slice(0, 7)} differs from approved head ${approvedHead.publishedHeadSha.slice(0, 7)} (${compareFiles.length} changed file(s): ${changed}${compareFiles.length > 3 ? ", ..." : ""}); head was never reviewed; refusing to re-publish`,
+      };
+    }
+  }
+
+  const outcome = await publishApprovalStatus(db, row.companyId, row.id, row.identifier ?? "", {
+    expectedHeadSha: headSha,
+  });
   if (outcome.kind === "armed") {
     return { kind: "republished", detail: `republished ${target.displayName}: ${outcome.message}` };
   }
   if (outcome.kind === "skipped") {
-    return { kind: "skipped", reason: "publish:skipped", detail: `publish skipped: ${outcome.message}` };
+    const reason = outcome.message.startsWith("status:skipped:head_moved")
+      ? "guard-a:head-moved-during-write"
+      : "publish:skipped";
+    return { kind: "skipped", reason, detail: `publish skipped: ${outcome.message}` };
   }
   const truncated = outcome.message.length > 200 ? `${outcome.message.slice(0, 200)}...` : outcome.message;
   return { kind: "failed", detail: `publish failed: ${truncated}` };
