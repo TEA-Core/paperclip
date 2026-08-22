@@ -8,6 +8,7 @@ import {
   buildClaudeAcpConfig,
   createClaudeAcpExecutor,
   nodeVersionMeetsClaudeAcpMinimum,
+  prepareClaudeLocalManagedHome,
   resolveClaudeAcpBillingIdentity,
   resolveClaudeExecutionEngine,
   resolveClaudeExecutionEngineForRun,
@@ -781,6 +782,115 @@ describe("claude_local ACP lane", () => {
       );
       await expect(fs.access(agentSideHome)).rejects.toThrow();
     } finally {
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+    }
+  });
+
+  it("returns a post-run teardown that re-normalizes CLI-recreated owner-only dirs on the agent-side home", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-local-renormalize-");
+    // The server's shared home: where the server uid keeps its credentials.
+    const serverHome = path.join(root, "server-home");
+    await fs.mkdir(path.join(serverHome, ".claude"), { recursive: true });
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      process.env.HOME = serverHome;
+      process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+      process.env.PAPERCLIP_INSTANCE_ID = "test";
+      delete process.env.CLAUDE_CONFIG_DIR;
+
+      const runEnv: Record<string, string> = {};
+      const result = await prepareClaudeLocalManagedHome({
+        acpxAgent: "claude",
+        companyId: "company-1",
+        agentId: "agent-1",
+        runId: "run-1",
+        config: {},
+        env: runEnv,
+        onLog: async () => {},
+      });
+      const agentSideHome = path.join(
+        root,
+        "paperclip-home",
+        "instances",
+        "test",
+        "companies",
+        "company-1",
+        "agents",
+        "agent-1",
+        "claude-config",
+      );
+      // Repointed onto the deterministic agent-side home, and a post-run hook
+      // was returned for the lane to fire on its exit path.
+      expect(runEnv.CLAUDE_CONFIG_DIR).toBe(agentSideHome);
+      expect(result).toBeDefined();
+      expect(typeof result?.teardown).toBe("function");
+
+      // Simulate the claude CLI re-creating SDK state dirs with owner-only modes
+      // mid-run: sessions/ at 0700 and a per-worktree projects/<cwd>/ at 2700
+      // (0700 under the setgid home). These defeat the one-shot 0o2770 seed.
+      const sessionsDir = path.join(agentSideHome, "sessions");
+      const projectDir = path.join(agentSideHome, "projects", "worktree-cwd");
+      await fs.mkdir(projectDir, { recursive: true });
+      await fs.chmod(sessionsDir, 0o700);
+      await fs.chmod(projectDir, 0o2700);
+      expect((await fs.stat(sessionsDir)).mode & 0o7777).toBe(0o700);
+      expect((await fs.stat(projectDir)).mode & 0o7777).toBe(0o2700);
+
+      // The post-run teardown restores the group-`agents`-reachable shape — zero
+      // 0700 dirs anywhere in the home the agent uid reaches.
+      await result?.teardown?.();
+      expect((await fs.stat(agentSideHome)).mode & 0o7777).toBe(0o2770);
+      expect((await fs.stat(sessionsDir)).mode & 0o7777).toBe(0o2770);
+      expect((await fs.stat(projectDir)).mode & 0o7777).toBe(0o2770);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+    }
+  });
+
+  it("returns no teardown (no repoint) when an operator CLAUDE_CONFIG_DIR is already set", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-local-no-teardown-");
+    const operatorConfigDir = path.join(root, "operator-claude-config");
+    await fs.mkdir(operatorConfigDir, { recursive: true });
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    try {
+      process.env.HOME = path.join(root, "server-home");
+      process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+      process.env.PAPERCLIP_INSTANCE_ID = "test";
+
+      const runEnv: Record<string, string> = { CLAUDE_CONFIG_DIR: operatorConfigDir };
+      const result = await prepareClaudeLocalManagedHome({
+        acpxAgent: "claude",
+        companyId: "company-1",
+        agentId: "agent-1",
+        runId: "run-1",
+        config: {},
+        env: runEnv,
+        onLog: async () => {},
+      });
+      // The operator value is honored verbatim; no managed-home substitution and
+      // no post-run hook (the operator's home is not ours to re-normalize).
+      expect(runEnv.CLAUDE_CONFIG_DIR).toBe(operatorConfigDir);
+      expect(result).toBeUndefined();
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
       if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
       else process.env.PAPERCLIP_HOME = previousPaperclipHome;
       if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;

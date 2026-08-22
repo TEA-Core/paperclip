@@ -340,6 +340,65 @@ export async function seedAgentSideClaudeConfig(
   );
 }
 
+/**
+ * Re-normalize the agent-side Claude config home's directory tree to 0o2770 +
+ * the `agents` group after a run.
+ *
+ * The claude CLI re-creates SDK state dirs with owner-only modes DURING a run —
+ * notably `sessions/` at explicit 0o700 and per-worktree `projects/<cwd>/` at
+ * 0o700 (→ 0o2700 under the setgid home) — which defeats the one-shot 0o2770
+ * seed from `seedAgentSideClaudeConfig`. Walking the tree and re-applying 0o2770
+ * + the group after the turn restores the group-`agents`-reachable shape the
+ * agent uid (1001) reaches, keeping zero 0700 dirs in the home.
+ *
+ * Symlinks are not followed: the dirent type is read, not stat-ed, so a symlink
+ * inside the home can never redirect the walk out of it. Best-effort by
+ * construction: a chmod/chgrp fault on one dir is logged and skipped, never
+ * thrown — a re-normalize miss degrades to the next run's seed, not a failed
+ * run. Files are left untouched (the seeded credentials are already 0o660;
+ * CLI-owned session files are the agent uid's own to read).
+ */
+export async function normalizeAgentSideClaudeConfigDirPermissions(
+  env: NodeJS.ProcessEnv,
+  onLog: AdapterExecutionContext["onLog"],
+  companyId: string,
+  agentId: string,
+): Promise<void> {
+  const configDir = resolveAgentSideClaudeConfigDir(env, companyId, agentId);
+  await normalizeClaudeConfigDirTree(configDir, onLog);
+}
+
+async function normalizeClaudeConfigDirTree(
+  dirPath: string,
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<void> {
+  try {
+    await fs.chmod(dirPath, 0o2770);
+  } catch (error) {
+    await onLog(
+      "stderr",
+      `[paperclip] agent-side Claude config: could not chmod ${dirPath} to 0o2770: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return;
+  }
+  await chownToAgentsGroup(dirPath, onLog);
+  let entries: Array<{ name: string; isDirectory(): boolean }>;
+  try {
+    entries = await fs.readdir(dirPath, { withFileTypes: true });
+  } catch {
+    // The dir vanished or is unreadable between the chmod and the readdir; the
+    // chmod above already did what it could. Nothing left to walk.
+    return;
+  }
+  for (const entry of entries) {
+    // Only recurse into real directories. A symlink dirent reports
+    // isDirectory() === false (the link's own type, not its target's), so the
+    // walk never follows a link out of the home.
+    if (!entry.isDirectory()) continue;
+    await normalizeClaudeConfigDirTree(path.join(dirPath, entry.name), onLog);
+  }
+}
+
 export function buildRemoteClaudeConfigMaterializationCommand(input: {
   remoteClaudeConfigDir: string;
   remoteClaudeConfigSeedDir: string;
