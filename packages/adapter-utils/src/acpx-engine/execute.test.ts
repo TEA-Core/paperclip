@@ -3049,6 +3049,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
   function recordingRuntime(input: {
     ensureInputs: Array<Record<string, unknown>>;
     terminalStatus?: "completed" | "failed";
+    terminalErrorMessage?: string;
   }) {
     return {
       ensureSession: async (session: Record<string, unknown>) => {
@@ -3065,7 +3066,7 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
         })(),
         result:
           input.terminalStatus === "failed"
-            ? Promise.resolve({ status: "failed", error: new Error("boom") })
+            ? Promise.resolve({ status: "failed", error: new Error(input.terminalErrorMessage ?? "boom") })
             : Promise.resolve({ status: "completed", stopReason: "end_turn" }),
         cancel: async () => {},
       }),
@@ -3360,6 +3361,72 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
     // the per-run copy-back still fired.
     expect(teardownCalls).toBe(1);
     expect(disposeCalls).toBe(1);
+  });
+
+  // SUP-13716: an auth-flavored terminal turn failure (e.g. the Claude ACP
+  // server's "not logged in" after a refresh failure) must surface as
+  // acpx_auth_required instead of the generic acpx_turn_failed, so the
+  // continuation handler stops retrying instead of burning turns.
+  it("test_terminal_auth_failure_classified_as_acpx_auth_required", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    const ensureInputs: Array<Record<string, unknown>> = [];
+    const logs: Array<{ stream: string; text: string }> = [];
+    const execute = createAcpxEngineExecutor({
+      warmHandles: new Map(),
+      stagedRuntimes: new Map(),
+      createRuntime: () =>
+        recordingRuntime({
+          ensureInputs,
+          terminalStatus: "failed",
+          terminalErrorMessage: "Not logged in · Please run /login (OAuth credentials expired)",
+        }) as never,
+      prepareRemoteManagedHome: async (input) => ({
+        stagedRuntime: await input.stage([]),
+        teardown: async () => {},
+        disposeStaged: async () => {},
+      }),
+    });
+    const base = baseExecuteArgs({ stateDir, localCwd, executionTarget });
+
+    const result = await execute({
+      runId: "run-a",
+      runtime: {},
+      ...base,
+      onLog: async (stream: "stdout" | "stderr", text: string) => {
+        logs.push({ stream, text });
+      },
+    } as never);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("acpx_auth_required");
+    const errorLogLine = logs.find((entry) => entry.stream === "stdout" && entry.text.includes("\"type\":\"acpx.error\""));
+    expect(errorLogLine).toBeTruthy();
+    const errorPayload = JSON.parse(errorLogLine!.text.trim());
+    expect(errorPayload.errorCode).toBe("acpx_auth_required");
+  });
+
+  // SUP-13716: a non-auth terminal turn failure keeps the generic
+  // acpx_turn_failed code (bounded retry behavior unchanged).
+  it("test_terminal_generic_failure_keeps_acpx_turn_failed", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    const ensureInputs: Array<Record<string, unknown>> = [];
+    const execute = createAcpxEngineExecutor({
+      warmHandles: new Map(),
+      stagedRuntimes: new Map(),
+      createRuntime: () =>
+        recordingRuntime({ ensureInputs, terminalStatus: "failed" }) as never,
+      prepareRemoteManagedHome: async (input) => ({
+        stagedRuntime: await input.stage([]),
+        teardown: async () => {},
+        disposeStaged: async () => {},
+      }),
+    });
+    const base = baseExecuteArgs({ stateDir, localCwd, executionTarget });
+
+    const result = await execute({ runId: "run-a", runtime: {}, ...base } as never);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("acpx_turn_failed");
   });
 
   it("test_idle_staged_runtime_cleanup_waits_for_active_turn_release", async () => {

@@ -300,6 +300,170 @@ async function copyFileToAgentSideHome(
   }
 }
 
+function toTimestampMs(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  // Claude Code stores expiresAt/refreshTokenExpiresAt as seconds since epoch
+  // with fractional millis. Treat values below 1e12 as seconds.
+  return value < 1e12 ? value * 1000 : value;
+}
+
+function readJwtExp(accessToken: string): number | null {
+  const parts = accessToken.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return typeof payload?.exp === "number" && Number.isFinite(payload.exp) ? payload.exp : null;
+  } catch {
+    return null;
+  }
+}
+
+interface ClaudeConfigCredentialHealth {
+  status:
+    | "ok"
+    | "access_expired"
+    | "refresh_expiring"
+    | "refresh_expired"
+    | "missing"
+    | "unparseable"
+    | "no_oauth_token";
+  /** Safe metadata only; never a token value. */
+  detail: string;
+  modifiedAtMs: number | null;
+  accessExpiresAtMs: number | null;
+  refreshExpiresAtMs: number | null;
+}
+
+export async function probeClaudeConfigCredentialHealth(
+  configDir: string,
+): Promise<ClaudeConfigCredentialHealth> {
+  let targetPath: string | null = null;
+  let stat: { mtimeMs: number } | null = null;
+  let raw: string | null = null;
+  for (const name of [".credentials.json", "credentials.json"]) {
+    const candidate = path.join(configDir, name);
+    if (!(await pathExists(candidate))) continue;
+    try {
+      const [content, s] = await Promise.all([fs.readFile(candidate, "utf8"), fs.stat(candidate)]);
+      targetPath = candidate;
+      raw = content;
+      stat = s;
+      break;
+    } catch {
+      continue;
+    }
+  }
+  if (!targetPath || raw == null || stat == null) {
+    return {
+      status: "missing",
+      detail: `No credentials file found in ${configDir}`,
+      modifiedAtMs: null,
+      accessExpiresAtMs: null,
+      refreshExpiresAtMs: null,
+    };
+  }
+  const modifiedAtMs = stat.mtimeMs;
+  const modifiedAtIso = new Date(modifiedAtMs).toISOString();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    return {
+      status: "unparseable",
+      detail: `Credentials file at ${targetPath} is not valid JSON: ${reason}`,
+      modifiedAtMs,
+      accessExpiresAtMs: null,
+      refreshExpiresAtMs: null,
+    };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {
+      status: "unparseable",
+      detail: `Credentials file at ${targetPath} is not a JSON object`,
+      modifiedAtMs,
+      accessExpiresAtMs: null,
+      refreshExpiresAtMs: null,
+    };
+  }
+  const oauth = (parsed as Record<string, unknown>)["claudeAiOauth"];
+  if (typeof oauth !== "object" || oauth === null) {
+    return {
+      status: "no_oauth_token",
+      detail: `Credentials file at ${targetPath} has no claudeAiOauth section`,
+      modifiedAtMs,
+      accessExpiresAtMs: null,
+      refreshExpiresAtMs: null,
+    };
+  }
+  const oauthRecord = oauth as Record<string, unknown>;
+  const accessToken = oauthRecord["accessToken"];
+  const refreshToken = oauthRecord["refreshToken"];
+  if (
+    typeof accessToken !== "string" ||
+    accessToken.length === 0 ||
+    typeof refreshToken !== "string" ||
+    refreshToken.length === 0
+  ) {
+    return {
+      status: "no_oauth_token",
+      detail: `Credentials file at ${targetPath} is missing access/refresh token keys`,
+      modifiedAtMs,
+      accessExpiresAtMs: null,
+      refreshExpiresAtMs: null,
+    };
+  }
+  const accessExpiresAtMs = toTimestampMs(oauthRecord["expiresAt"]) ?? toTimestampMs(readJwtExp(accessToken));
+  const refreshExpiresAtMs = toTimestampMs(oauthRecord["refreshTokenExpiresAt"]);
+  const now = Date.now();
+  const accessInMins = accessExpiresAtMs != null ? Math.floor((accessExpiresAtMs - now) / 60_000) : null;
+  const refreshInMins = refreshExpiresAtMs != null ? Math.floor((refreshExpiresAtMs - now) / 60_000) : null;
+
+  if (refreshExpiresAtMs != null && refreshExpiresAtMs <= now) {
+    return {
+      status: "refresh_expired",
+      detail:
+        `Refresh token expired at ${new Date(refreshExpiresAtMs).toISOString()}` +
+        ` (credentials file modified ${modifiedAtIso}); re-login required`,
+      modifiedAtMs,
+      accessExpiresAtMs,
+      refreshExpiresAtMs,
+    };
+  }
+  if (refreshExpiresAtMs != null && refreshExpiresAtMs <= now + 24 * 60 * 60 * 1000) {
+    return {
+      status: "refresh_expiring",
+      detail:
+        `Refresh token expires in ${refreshInMins} minutes` +
+        ` (credentials file modified ${modifiedAtIso}); schedule re-login`,
+      modifiedAtMs,
+      accessExpiresAtMs,
+      refreshExpiresAtMs,
+    };
+  }
+  if (accessExpiresAtMs != null && accessExpiresAtMs <= now) {
+    return {
+      status: "access_expired",
+      detail:
+        `Access token expired at ${new Date(accessExpiresAtMs).toISOString()}` +
+        ` (credentials file modified ${modifiedAtIso}); refresh will be attempted`,
+      modifiedAtMs,
+      accessExpiresAtMs,
+      refreshExpiresAtMs,
+    };
+  }
+  return {
+    status: "ok",
+    detail:
+      `Credentials file modified ${modifiedAtIso}; ` +
+      `access expires in ${accessInMins ?? "unknown"} minutes; ` +
+      `refresh expires in ${refreshInMins ?? "unknown"} minutes`,
+    modifiedAtMs,
+    accessExpiresAtMs,
+    refreshExpiresAtMs,
+  };
+}
+
 export async function seedAgentSideClaudeConfig(
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],

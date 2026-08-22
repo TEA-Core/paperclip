@@ -38,7 +38,9 @@ import {
 import {
   materializeRemoteClaudeConfig,
   prepareClaudeConfigSeed,
+  probeClaudeConfigCredentialHealth,
   resolveAgentSideClaudeConfigDir,
+  resolveSharedClaudeConfigDir,
   seedAgentSideClaudeConfig,
 } from "./claude-config.js";
 
@@ -300,6 +302,46 @@ export async function prepareClaudeLocalManagedHome(
   const hostEnv = process.env;
   await seedAgentSideClaudeConfig(hostEnv, onLog, companyId, agentId);
   env.CLAUDE_CONFIG_DIR = resolveAgentSideClaudeConfigDir(hostEnv, companyId, agentId);
+
+  // Only enforce OAuth credential presence; API-key, Bedrock, and
+  // CLAUDE_CODE_OAUTH_TOKEN authentication do not need a stored credentials
+  // file.
+  const hasFilelessAuth =
+    isNonEmpty(env.ANTHROPIC_API_KEY) ||
+    isNonEmpty(hostEnv.ANTHROPIC_API_KEY) ||
+    isNonEmpty(env.CLAUDE_CODE_OAUTH_TOKEN) ||
+    isNonEmpty(hostEnv.CLAUDE_CODE_OAUTH_TOKEN) ||
+    env.CLAUDE_CODE_USE_BEDROCK === "1" ||
+    env.CLAUDE_CODE_USE_BEDROCK === "true" ||
+    hostEnv.CLAUDE_CODE_USE_BEDROCK === "1" ||
+    hostEnv.CLAUDE_CODE_USE_BEDROCK === "true" ||
+    isNonEmpty(env.ANTHROPIC_BEDROCK_BASE_URL) ||
+    isNonEmpty(hostEnv.ANTHROPIC_BEDROCK_BASE_URL);
+  if (!hasFilelessAuth) {
+    const health = await probeClaudeConfigCredentialHealth(env.CLAUDE_CONFIG_DIR);
+    const failingStatuses = ["missing", "unparseable", "no_oauth_token", "refresh_expired"];
+    if (failingStatuses.includes(health.status)) {
+      const sharedHome = resolveSharedClaudeConfigDir(hostEnv);
+      await onLog(
+        "stderr",
+        `[paperclip] claude-credential-health: ${health.status}: ${health.detail}\n`,
+      );
+      // Throw an auth-like error so the engine classifies it as
+      // acpx_auth_required and the heartbeat continuation handler stops
+      // retrying instead of burning turns.
+      throw new Error(
+        `Claude OAuth credentials ${health.status} in agent-side home ${env.CLAUDE_CONFIG_DIR}.` +
+          ` Re-login is required in the shared Claude home (${sharedHome}).`,
+      );
+    }
+    if (health.status !== "ok") {
+      await onLog(
+        "stderr",
+        `[paperclip] claude-credential-health: ${health.status}: ${health.detail}\n`,
+      );
+    }
+  }
+
   await onLog(
     "stdout",
     `[paperclip] Local ACP run will use the agent-side Claude config home ${env.CLAUDE_CONFIG_DIR}\n`,

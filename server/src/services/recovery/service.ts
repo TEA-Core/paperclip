@@ -443,6 +443,14 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   // trips on one issue inside four minutes. Nothing retries its way out of this;
   // the command has to change first.
   OPENCODE_DB_GROWTH_LIMIT_ERROR_CODE,
+  // SUP-13716: once ACP lane OAuth credentials become unrefreshable, every retry
+  // burns an identical failed turn. Stop the storm and put the issue in a
+  // board-visible blocked state so the operator can re-login. Both the ACP lane's
+  // own code and the CLI lane's claude_auth_required (reached when a default-ACP
+  // agent falls back to CLI after a prepare-time credential failure) are covered:
+  // neither can refresh its way out of expired OAuth credentials.
+  "acpx_auth_required",
+  "claude_auth_required",
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
