@@ -137,13 +137,18 @@ export interface ExecutionWorkspaceProvisioningInput {
   mergedConfig: Record<string, unknown>;
   executionPolicy: { executionMode: string };
   context: Record<string, unknown>;
+  previousSessionParams: Record<string, unknown> | null;
   resolveWorkspace: (
     previousSessionParams: Record<string, unknown> | null,
   ) => Promise<ResolvedWorkspaceForRun>;
   resolveSessionConfig: (input: {
-    requestedShouldReuseExisting: boolean;
-    reusableExistingExecutionWorkspace: ExecutionWorkspace | null;
-    requestedReusableExecutionWorkspaceConfig: ExecutionWorkspaceConfig | null;
+    persistedExecutionWorkspace: ExecutionWorkspace | null;
+    postAttachIssuePatch: {
+      executionWorkspaceId?: string;
+      executionWorkspacePreference?: string;
+      executionWorkspaceSettings?: Record<string, unknown>;
+      projectWorkspaceId?: string;
+    } | null;
   }) => Promise<{
     previousSessionParams: Record<string, unknown> | null;
     resetTaskSession: boolean;
@@ -336,18 +341,6 @@ export async function provisionIssueExecutionWorkspace(
       : null;
   const requestedReusableExecutionWorkspaceConfig = reusableExistingExecutionWorkspace?.config ?? null;
 
-  const {
-    previousSessionParams,
-    resetTaskSession,
-    sessionResetReason,
-    sessionConfigFreshness,
-    sessionConfigMetadata,
-  } = await input.resolveSessionConfig({
-    requestedShouldReuseExisting,
-    reusableExistingExecutionWorkspace,
-    requestedReusableExecutionWorkspaceConfig,
-  });
-
   const effectiveExecutionWorkspaceMode = input.effectiveExecutionWorkspaceMode;
 
   const { selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver, workspace: resolvedWorkspace } =
@@ -371,7 +364,7 @@ export async function provisionIssueExecutionWorkspace(
         });
         return preflightEnvironment.driver;
       },
-      resolveWorkspace: () => input.resolveWorkspace(previousSessionParams),
+      resolveWorkspace: () => input.resolveWorkspace(input.previousSessionParams),
     });
 
   const hostExecutionWorkspaceConfig = stripHostWorkspaceProvisionForLowTrustSandbox({
@@ -746,25 +739,39 @@ export async function provisionIssueExecutionWorkspace(
       cleanupReason: null,
     });
   }
+  const nextIssueWorkspaceMode = persistedExecutionWorkspace
+    ? issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode)
+    : null;
+  const shouldSwitchIssueToExistingWorkspace =
+    issueRef?.executionWorkspacePreference === "reuse_existing" ||
+    input.effectiveExecutionWorkspaceMode === "isolated_workspace" ||
+    input.effectiveExecutionWorkspaceMode === "operator_branch";
+  const nextIssuePatch: Record<string, unknown> = {};
+  const postAttachIssuePatch: {
+    executionWorkspaceId?: string;
+    executionWorkspacePreference?: string;
+    executionWorkspaceSettings?: Record<string, unknown>;
+    projectWorkspaceId?: string;
+  } | null = persistedExecutionWorkspace ? {} : null;
+
   if (issueId && persistedExecutionWorkspace) {
-    const nextIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode);
-    const shouldSwitchIssueToExistingWorkspace =
-      issueRef?.executionWorkspacePreference === "reuse_existing" ||
-      input.effectiveExecutionWorkspaceMode === "isolated_workspace" ||
-      input.effectiveExecutionWorkspaceMode === "operator_branch";
-    const nextIssuePatch: Record<string, unknown> = {};
     if (issueRef?.executionWorkspaceId !== persistedExecutionWorkspace.id) {
       nextIssuePatch.executionWorkspaceId = persistedExecutionWorkspace.id;
+      postAttachIssuePatch!.executionWorkspaceId = persistedExecutionWorkspace.id;
     }
     if (resolvedProjectWorkspaceId && issueRef?.projectWorkspaceId !== resolvedProjectWorkspaceId) {
       nextIssuePatch.projectWorkspaceId = resolvedProjectWorkspaceId;
+      postAttachIssuePatch!.projectWorkspaceId = resolvedProjectWorkspaceId;
     }
     if (shouldSwitchIssueToExistingWorkspace) {
       nextIssuePatch.executionWorkspacePreference = "reuse_existing";
-      nextIssuePatch.executionWorkspaceSettings = {
+      postAttachIssuePatch!.executionWorkspacePreference = "reuse_existing";
+      const patchedSettings = {
         ...(input.issueExecutionWorkspaceSettings ?? {}),
         mode: nextIssueWorkspaceMode,
       };
+      nextIssuePatch.executionWorkspaceSettings = patchedSettings;
+      postAttachIssuePatch!.executionWorkspaceSettings = patchedSettings;
     }
     if (Object.keys(nextIssuePatch).length > 0) {
       // This binding is produced BY the project's own policy, not supplied by an
@@ -774,6 +781,17 @@ export async function provisionIssueExecutionWorkspace(
       await issuesSvc.update(issueId, { ...nextIssuePatch, systemWorkspaceBinding: true });
     }
   }
+
+  const {
+    previousSessionParams,
+    resetTaskSession,
+    sessionResetReason,
+    sessionConfigFreshness,
+    sessionConfigMetadata,
+  } = await input.resolveSessionConfig({
+    persistedExecutionWorkspace,
+    postAttachIssuePatch,
+  });
 
   if (persistedExecutionWorkspace) {
     input.context.executionWorkspaceId = persistedExecutionWorkspace.id;

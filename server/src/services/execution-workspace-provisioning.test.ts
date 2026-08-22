@@ -23,7 +23,7 @@ import {
 import { instanceSettingsService } from "./instance-settings.js";
 import { issueService } from "./issues.js";
 import { provisionIssueExecutionWorkspace } from "./execution-workspace-provisioning.js";
-import type { Environment } from "@paperclipai/shared";
+import type { Environment, ProjectExecutionWorkspacePolicy } from "@paperclipai/shared";
 import type { TrustPresetResolution } from "./trust-preset-resolver.js";
 import type {
   ExecutionWorkspaceProvisioningIssueRef,
@@ -35,7 +35,11 @@ import {
   EFFECTIVE_RUN_CONFIG_FINGERPRINT_CATEGORIES,
 } from "./effective-run-config-fingerprints.js";
 import type { EffectiveRunConfigFingerprint } from "./effective-run-config-fingerprints.js";
-import type { buildEffectiveRunSessionConfigMetadata } from "./heartbeat.js";
+import {
+  buildEffectiveRunSessionConfigMetadata,
+  buildSessionWorkspaceConfigCategoryValue,
+  projectExecutionWorkspaceForSessionCategory,
+} from "./heartbeat.js";
 
 type SessionConfigMetadata = Awaited<ReturnType<typeof buildEffectiveRunSessionConfigMetadata>>;
 
@@ -325,6 +329,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       issueId,
       issueRef,
       runId,
+      previousSessionParams: null,
       effectiveExecutionWorkspaceMode: "isolated_workspace",
       trustPreset: standardTrustResolution(),
        isolatedWorkspacesEnabled: true,
@@ -363,7 +368,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
           repoUrl: null,
           repoRef: null,
         }),
-      resolveSessionConfig: async () => ({
+      resolveSessionConfig: async (_input) => ({
         previousSessionParams: null,
         resetTaskSession: true,
         sessionResetReason: null,
@@ -658,6 +663,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       issueId,
       issueRef,
       runId,
+      previousSessionParams: null,
       effectiveExecutionWorkspaceMode: "isolated_workspace",
       trustPreset: standardTrustResolution(),
        isolatedWorkspacesEnabled: true,
@@ -696,7 +702,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
           repoUrl: null,
           repoRef: null,
         }),
-      resolveSessionConfig: async () => ({
+      resolveSessionConfig: async (_input) => ({
         previousSessionParams: null,
         resetTaskSession: true,
         sessionResetReason: null,
@@ -719,6 +725,294 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
     expect(result.kind).toBe("deferred");
     expect(lifecycleCalled).toBe(true);
   });
+
+  // SUP-13585 acceptance 2 / SUP-13733: the session's `workspaceConfig` subcategory must be
+  // computed from the POST-attach state (attached issue fields + the persisted workspace
+  // row), not from the pre-decision snapshot. Only then does what run N stores equal what
+  // run N+1 computes, so the session evaluator stops resetting every time the
+  // attach/persist decision itself changed the fields being hashed.
+  it("keeps the session workspaceConfig subcategory stable across consecutive runs that reuse the same workspace row", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const issueIdentifier = `${issuePrefix}-1`;
+    const now = new Date("2026-07-07T00:00:00.000Z");
+
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-provisioning-session-stability-"));
+    tempRoots.push(tempRoot);
+    initTempGitRepo(tempRoot);
+
+    await instanceSettingsService(db).updateExperimental({
+      enableIsolatedWorkspaces: true,
+      enableWorkspaceBranchReconcileForward: false,
+      enableWorkspaceDirtyQuarantineRepair: false,
+    });
+
+    const projectPolicy = {
+      enabled: true,
+      defaultMode: "isolated_workspace",
+      allowIssueOverride: true,
+      workspaceStrategy: {
+        type: "git_worktree",
+        provisionCommand: "echo provision",
+      },
+    } satisfies ProjectExecutionWorkspacePolicy;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Acme",
+      issuePrefix,
+      status: "active",
+      defaultResponsibleUserId: "responsible-user",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Session stability test",
+      status: "active",
+      executionWorkspacePolicy: projectPolicy,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: tempRoot,
+      isPrimary: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "SessionStabilityAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Session stability test issue",
+      status: "in_progress",
+      workMode: "standard",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: issueIdentifier,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const localEnvironment: Environment = {
+      id: "local-env",
+      name: "Local",
+      description: null,
+      driver: "local",
+      status: "active",
+      config: {},
+      envVars: {},
+      metadata: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const agent = await db.query.agents.findFirst({ where: eq(agents.id, agentId) });
+
+    // Captured at the start of each run (before provisioning mutates the issue row); the
+    // post-attach computation below mirrors heartbeat.ts' resolveSessionConfig exactly:
+    // pre-attach issue state + postAttachIssuePatch + the post-persist workspace row —
+    // i.e. the state the NEXT run will read from the database.
+    let preAttachIssueState: {
+      projectWorkspaceId: string | null;
+      executionWorkspacePreference: string | null;
+      executionWorkspaceSettings: Record<string, unknown> | null;
+    } | null = null;
+
+    async function provisionOnce(runId: string) {
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        responsibleUserId: "responsible-user",
+        createdAt: now,
+        updatedAt: now,
+      });
+      const run = await db.query.heartbeatRuns.findFirst({ where: eq(heartbeatRuns.id, runId) });
+      const preAttachRow = await db
+        .select({
+          projectWorkspaceId: issues.projectWorkspaceId,
+          executionWorkspaceId: issues.executionWorkspaceId,
+          executionWorkspacePreference: issues.executionWorkspacePreference,
+          executionWorkspaceSettings: issues.executionWorkspaceSettings,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!);
+      preAttachIssueState = {
+        projectWorkspaceId: preAttachRow.projectWorkspaceId,
+        executionWorkspacePreference: preAttachRow.executionWorkspacePreference,
+        executionWorkspaceSettings: preAttachRow.executionWorkspaceSettings,
+      };
+      const issueRef: ExecutionWorkspaceProvisioningIssueRef = {
+        id: issueId,
+        identifier: issueIdentifier,
+        title: "Session stability test issue",
+        status: "in_progress",
+        priority: "medium",
+        workMode: "standard",
+        description: null,
+        projectId,
+        projectWorkspaceId,
+        executionWorkspaceId: preAttachRow.executionWorkspaceId,
+        executionWorkspacePreference: preAttachRow.executionWorkspacePreference,
+      };
+      return provisionIssueExecutionWorkspace({
+        db,
+        run: run!,
+        agent: agent!,
+        issueId,
+        issueRef,
+        runId,
+        previousSessionParams: null,
+        effectiveExecutionWorkspaceMode: "isolated_workspace",
+        trustPreset: standardTrustResolution(),
+        isolatedWorkspacesEnabled: true,
+        selectedEnvironmentId: null,
+        selectedEnvironmentForConfig: null,
+        localEnvironment,
+        environmentSelectionSource: "local",
+        configSnapshot: null,
+        secretManifest: [],
+        projectExecutionWorkspacePolicy: projectPolicy,
+        issueExecutionWorkspaceSettings: { mode: "isolated_workspace" },
+        executionProjectId: projectId,
+        resolvedInstanceSettings: {
+          experimental: {
+            enableWorkspaceBranchReconcileForward: false,
+            enableWorkspaceDirtyQuarantineRepair: false,
+          },
+        },
+        mergedConfig: {},
+        executionPolicy: { executionMode: "standard" },
+        context: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        resolveWorkspace: async () =>
+          buildResolvedWorkspace({
+            cwd: tempRoot,
+            source: "project_primary",
+            projectId,
+            workspaceId: projectWorkspaceId,
+            repoUrl: null,
+            repoRef: null,
+          }),
+        resolveSessionConfig: async ({ persistedExecutionWorkspace, postAttachIssuePatch }) => {
+          const postAttachIssueContext = preAttachIssueState
+            ? {
+                projectId,
+                projectWorkspaceId:
+                  postAttachIssuePatch?.projectWorkspaceId ?? preAttachIssueState.projectWorkspaceId,
+                executionWorkspacePreference:
+                  postAttachIssuePatch?.executionWorkspacePreference ??
+                  preAttachIssueState.executionWorkspacePreference,
+                executionWorkspaceSettings:
+                  postAttachIssuePatch?.executionWorkspaceSettings ??
+                  preAttachIssueState.executionWorkspaceSettings,
+              }
+            : null;
+          const postAttachIssueSettings = postAttachIssuePatch?.executionWorkspaceSettings
+            ? postAttachIssuePatch.executionWorkspaceSettings
+            : { mode: "isolated_workspace" };
+          const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata({
+            adapterType: "codex_local",
+            effectiveAdapterConfig: {},
+            agentRuntimeConfig: agent?.runtimeConfig ?? null,
+            modelProfile: null,
+            issueOverrides: null,
+            workspaceConfig: buildSessionWorkspaceConfigCategoryValue({
+              requestedMode: "isolated_workspace",
+              effectiveMode: "isolated_workspace",
+              issueContext: postAttachIssueContext,
+              projectContext: { id: projectId, executionWorkspacePolicy: projectPolicy },
+              projectPolicy,
+              issueSettings: postAttachIssueSettings,
+              existingExecutionWorkspace:
+                projectExecutionWorkspaceForSessionCategory(persistedExecutionWorkspace),
+            }),
+            environment: null,
+            environmentEnv: null,
+            projectEnv: null,
+            routineEnv: null,
+            secretManifest: [],
+            runtimeSkills: null,
+            agentConfigRevision: null,
+          });
+          return {
+            previousSessionParams: null,
+            resetTaskSession: false,
+            sessionResetReason: null,
+            sessionConfigFreshness: {
+              reset: false,
+              reasons: [],
+              changedCategories: [],
+              nextFingerprint: null,
+              storedFingerprint: null,
+            },
+            sessionConfigMetadata,
+          };
+        },
+        runLifecycle: { onExecutionWorkspaceOccupied: async () => undefined },
+      });
+    }
+
+    const first = await provisionOnce(randomUUID());
+    expect(first.kind).toBe("provisioned");
+    if (first.kind !== "provisioned") return;
+    expect(first.persistedExecutionWorkspace).not.toBeNull();
+    const workspaceRowId = first.persistedExecutionWorkspace!.id;
+    const firstWorkspaceConfigFingerprint =
+      first.sessionConfigMetadata.categoryFingerprints.workspaceConfig;
+
+    const second = await provisionOnce(randomUUID());
+    expect(second.kind).toBe("provisioned");
+    if (second.kind !== "provisioned") return;
+    // Run 2 is the "workspace evaluator reports reuse" arm: the row is restored, not
+    // re-provisioned, and nothing config-relevant changed.
+    expect(second.reusedExecutionWorkspace).not.toBeNull();
+    expect(second.persistedExecutionWorkspace?.id).toBe(workspaceRowId);
+    expect(second.workspaceConfigFreshness.action).toBe("reuse");
+    expect(second.workspaceConfigFreshness.changedCategories).toEqual([]);
+    // The invariant: what run 1 stores for the session must equal what run 2 computes —
+    // otherwise the session evaluator resets on every reuse.
+    expect(second.sessionConfigMetadata.categoryFingerprints.workspaceConfig).toBe(
+      firstWorkspaceConfigFingerprint,
+    );
+  }, 60_000);
 });
 
 /**
@@ -1125,7 +1419,10 @@ describeEmbeddedPostgres("allowIssueOverride enforcement (SUP-13058)", () => {
             repoUrl: null,
             repoRef: null,
           }),
-        resolveSessionConfig: async () => ({
+        resolveSessionConfig: async (_input: {
+          persistedExecutionWorkspace: unknown;
+          postAttachIssuePatch: unknown;
+        }) => ({
           previousSessionParams: null,
           resetTaskSession: true,
           sessionResetReason: null,
