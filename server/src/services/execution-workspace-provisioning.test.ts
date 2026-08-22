@@ -45,7 +45,6 @@ function buildTestSessionConfigMetadata(): SessionConfigMetadata {
     "adapter",
     "adapterConfig",
     "agentRuntimeConfig",
-    "modelProfile",
     "instructions",
     "issueOverrides",
     "workspaceConfig",

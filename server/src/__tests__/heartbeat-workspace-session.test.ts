@@ -43,8 +43,6 @@ import {
   shouldDeferFollowupWakeForSameIssue,
   stripHostWorkspaceProvisionForLowTrustSandbox,
   stripWorkspaceRuntimeFromExecutionRunConfig,
-  shouldResetTaskSessionForModelChange,
-  stripConfiguredModelFromSessionParams,
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
@@ -2227,64 +2225,6 @@ describe("shouldDeferFollowupWakeForSameIssue", () => {
   });
 });
 
-describe("shouldResetTaskSessionForModelChange", () => {
-  it("resets when configured model differs from persisted session model", () => {
-    expect(
-      shouldResetTaskSessionForModelChange({
-        configuredModel: "gpt-5.4-mini",
-        taskSessionParams: {
-          sessionId: "thread-1",
-          __paperclipConfiguredModel: "opencode/mimo-v2-pro-free",
-        },
-      }),
-    ).toBe(true);
-  });
-
-  it("does not reset when models match", () => {
-    expect(
-      shouldResetTaskSessionForModelChange({
-        configuredModel: "gpt-5.4-mini",
-        taskSessionParams: {
-          sessionId: "thread-1",
-          __paperclipConfiguredModel: "gpt-5.4-mini",
-        },
-      }),
-    ).toBe(false);
-  });
-
-  it("does not reset when persisted session model is missing", () => {
-    expect(
-      shouldResetTaskSessionForModelChange({
-        configuredModel: "gpt-5.4-mini",
-        taskSessionParams: {
-          sessionId: "thread-1",
-        },
-      }),
-    ).toBe(false);
-  });
-
-  it("does not reset when configured model is missing", () => {
-    expect(
-      shouldResetTaskSessionForModelChange({
-        configuredModel: null,
-        taskSessionParams: {
-          sessionId: "thread-1",
-          __paperclipConfiguredModel: "gpt-5.4-mini",
-        },
-      }),
-    ).toBe(false);
-  });
-
-  it("does not reset when task session params are missing", () => {
-    expect(
-      shouldResetTaskSessionForModelChange({
-        configuredModel: "gpt-5.4-mini",
-        taskSessionParams: null,
-      }),
-    ).toBe(false);
-  });
-});
-
 type SessionConfigMetadata = Awaited<ReturnType<typeof buildEffectiveRunSessionConfigMetadata>>;
 
 async function buildSessionConfigMetadata(
@@ -2305,7 +2245,6 @@ async function buildSessionConfigMetadata(
         maxConcurrentRuns: 1,
       },
     },
-    modelProfile: null,
     issueOverrides: null,
     workspaceConfig: {
       requestedMode: "agent_default",
@@ -2387,7 +2326,6 @@ describe("effective run session config freshness", () => {
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
       taskSessionParams: sessionParamsWithConfigMetadata(base),
       configMetadata: next,
     });
@@ -2399,20 +2337,68 @@ describe("effective run session config freshness", () => {
     expect(decision.reasons.join("\n")).toContain("adapter config");
   });
 
-  it("keeps model-only compatibility as an additional reset reason", async () => {
-    const base = await buildSessionConfigMetadata();
+  it("preserves the session on a pure model swap across profile flips (SUP-13734)", async () => {
+    const base = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: {
+        command: "codex",
+        model: "claude-opus-5",
+        reasoningEffort: "high",
+        env: {
+          OPENAI_API_KEY: "resolved-secret-value",
+          PLAIN_FLAG: "plain-value",
+        },
+      },
+    });
+    const next = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: {
+        command: "codex",
+        model: "claude-sonnet-5",
+        reasoningEffort: "low",
+        variant: "low",
+        env: {
+          OPENAI_API_KEY: "resolved-secret-value",
+          PLAIN_FLAG: "plain-value",
+        },
+      },
+    });
+
+    expect(next.fingerprint).toBe(base.fingerprint);
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
-      taskSessionParams: sessionParamsWithConfigMetadata(base, "opencode/mimo-v2-pro-free"),
-      configMetadata: base,
+      taskSessionParams: sessionParamsWithConfigMetadata(base, "claude-opus-5"),
+      configMetadata: next,
     });
 
-    expect(decision.reset).toBe(true);
-    expect(decision.reasons).toEqual([
-      'configured model changed from "opencode/mimo-v2-pro-free" to "gpt-5.4-mini"',
-    ]);
+    expect(decision.reset).toBe(false);
+    expect(decision.changedCategories).toEqual([]);
+    expect(decision.reasons).toEqual([]);
+  });
+
+  it("still rotates the session when a non-model adapter config key changes", async () => {
+    const base = await buildSessionConfigMetadata();
+    const next = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: {
+        command: "codex",
+        model: "gpt-5.4-mini",
+        extraArgs: ["--strict"],
+        env: {
+          OPENAI_API_KEY: "resolved-secret-value",
+          PLAIN_FLAG: "plain-value",
+        },
+      },
+    });
+
+    const decision = resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      taskSessionParams: sessionParamsWithConfigMetadata(base),
+      configMetadata: next,
+    });
+
+    expect(decision).toMatchObject({
+      reset: true,
+      changedCategories: ["adapterConfig"],
+    });
   });
 
   it("freshens legacy task sessions that lack versioned config metadata", async () => {
@@ -2420,7 +2406,6 @@ describe("effective run session config freshness", () => {
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
       taskSessionParams: {
         sessionId: "thread-1",
         __paperclipConfiguredModel: "gpt-5.4-mini",
@@ -2439,7 +2424,6 @@ describe("effective run session config freshness", () => {
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
       taskSessionParams: persistedParams,
       configMetadata: metadata,
     });
@@ -2453,7 +2437,6 @@ describe("effective run session config freshness", () => {
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
       taskSessionParams: {
         sessionId: "thread-1",
         __paperclipConfiguredModel: "gpt-5.4-mini",
@@ -2467,24 +2450,13 @@ describe("effective run session config freshness", () => {
     expect(decision.reasons).toEqual([]);
   });
 
-  it("names safe categories for model profile, issue override, env, secret, and runtime skill drift", async () => {
+  it("names safe categories for issue override, env, secret, and runtime skill drift", async () => {
     const base = await buildSessionConfigMetadata();
     const cases: Array<{
       name: string;
       category: string;
       metadata: SessionConfigMetadata;
     }> = [
-      {
-        name: "model profile",
-        category: "modelProfile",
-        metadata: await buildSessionConfigMetadata({
-          modelProfile: {
-            requested: "cheap",
-            applied: true,
-            configSource: "agent_runtime",
-          },
-        }),
-      },
       {
         name: "issue overrides",
         category: "issueOverrides",
@@ -2546,7 +2518,6 @@ describe("effective run session config freshness", () => {
     for (const testCase of cases) {
       const decision = resolveTaskSessionConfigFreshness({
         hasTaskSession: true,
-        configuredModel: "gpt-5.4-mini",
         taskSessionParams: sessionParamsWithConfigMetadata(base),
         configMetadata: testCase.metadata,
       });
@@ -2584,7 +2555,6 @@ describe("effective run session config freshness", () => {
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
       taskSessionParams: sessionParamsWithConfigMetadata(base),
       configMetadata: next,
     });
@@ -2623,39 +2593,6 @@ describe("effective run session config freshness", () => {
     expect(canonical).not.toContain("plain-value");
     expect(canonical).not.toContain("enabled");
     expect(canonical).not.toContain("openai-api-key");
-  });
-});
-
-describe("stripConfiguredModelFromSessionParams", () => {
-  it("removes the internal model key from persisted session params", () => {
-    expect(
-      stripConfiguredModelFromSessionParams({
-        sessionId: "thread-1",
-        __paperclipConfiguredModel: "gpt-5.4-mini",
-      }),
-    ).toEqual({ sessionId: "thread-1" });
-  });
-
-  it("returns null when session params are missing", () => {
-    expect(stripConfiguredModelFromSessionParams(null)).toBeNull();
-    expect(stripConfiguredModelFromSessionParams(undefined)).toBeNull();
-  });
-
-  it("returns a copy without mutating the input", () => {
-    const input = { sessionId: "thread-1", __paperclipConfiguredModel: "gpt-5.4-mini" };
-    const result = stripConfiguredModelFromSessionParams(input);
-    expect(result).not.toBe(input);
-    expect(input.__paperclipConfiguredModel).toBe("gpt-5.4-mini");
-  });
-
-  it("returns an empty object when only the internal model key is present (caller must normalize)", () => {
-    const stripped = stripConfiguredModelFromSessionParams({
-      __paperclipConfiguredModel: "gpt-5.4-mini",
-    });
-    expect(stripped).toEqual({});
-    // Callers that forward params to adapters must normalize {} back to null so
-    // the pre-PR null contract is preserved (adapters distinguishing {} from null).
-    expect(normalizeSessionParams(stripped)).toBeNull();
   });
 });
 
