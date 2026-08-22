@@ -1,12 +1,17 @@
 import type { Db } from "@paperclipai/db";
-import { externalObjectMentions, externalObjects, issueExecutionDecisions, issues } from "@paperclipai/db";
+import {
+  externalObjectMentions,
+  externalObjects,
+  issueExecutionDecisions,
+  issues,
+} from "@paperclipai/db";
 import { and, eq, ne, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
-import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubTokenCandidatesForRepo,
   type GitHubTokenResolution,
 } from "./github-credential.js";
+import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   publishApprovalStatus,
   resolveLinkedPullRequestsWithState,
@@ -15,35 +20,32 @@ import {
 
 // SUP-13535. The paperclip/approved commit status is written exactly once, on
 // the PR head that existed when the card was approved. When that head later
-// moves (conflict resolution, update-branch), the status is stranded on the
-// old head and the merge queue loses it. This service re-publishes the status
-// on the live head, and only when:
+// moves (conflict resolution, update-branch) the status is stranded on the
+// old head and the merge queue loses it. This service re-publishes it on the
+// live head, and only when:
 //
-//   - the recorded approval decision is still `approved` (a rejection leaves
-//     no trace and must never be republished);
-//   - the linked PR is still open and unmerged (field-read from GitHub, not
-//     the cached state);
-//   - the head does not already carry paperclip/approved=success (idempotent
-//     re-runs perform zero writes);
-//   - Guard A (content identity): the file->blob map of diff(base, current
-//     head) is byte-identical to diff(base, approved head). The approved head
-//     is recovered from the PR's push events: the newest historical head whose
-//     commit statuses include paperclip/approved=success. If no historical
-//     head can be recovered, the candidate is skipped with a logged reason —
-//     never guessed.
-//   - Guard B (stage integrity, ADR-073): no skipped stage, every completed
-//     stage exists in executionPolicy.stages AND has an issue_execution_decisions
-//     row, and no completed stage's latest decision was made by the card's
-//     author or its returnAssignee. Self-approved or auto-skipped stages are
-//     not approvals.
+//   - the card's recorded approval decision is still `approved` in the
+//     control-plane DB (the SQL trigger below). Approval is never inferred
+//     from the commit, from GitHub's reviewDecision, or from the card status;
+//   - stage integrity holds (ADR-073): no auto-skipped stage, every completed
+//     stage has a decision row, and no completed stage's latest decision was
+//     made by the card's author or its returnAssignee. Self-approved or
+//     auto-skipped stages are not approvals;
+//   - the linked PR is still open and unmerged (live field-read from GitHub);
+//   - the head does not already carry paperclip/approved=success. The head's
+//     combined status is read first, so idempotent re-runs perform zero
+//     writes.
 //
-// The write itself is delegated to publishApprovalStatus() from merge-arming —
-// this service only decides whether a re-publish is warranted.
+// The write itself is delegated to publishApprovalStatus() from merge-arming
+// (live re-resolves the head, SUP-13313); this service only decides whether a
+// re-publish is warranted. A head that moves between the combined-status
+// check and the delegated write is harmless: the write lands on the newer
+// head of the same approved card's open PR, which needs the signal just as
+// much, and the next tick verifies it.
 
 const PAPERCLIP_APPROVED_CONTEXT = "paperclip/approved";
 const DEFAULT_MAX_CANDIDATES = 20;
 const DEFAULT_INITIAL_DELAY_MS = 60 * 1000;
-const MAX_HEAD_PROBES_PER_PR = 25;
 const MAX_DETAIL_ENTRIES = 25;
 const USER_AGENT = "paperclip-approval-status-reconciler";
 
@@ -73,7 +75,6 @@ interface CandidateRow {
   id: string;
   companyId: string;
   identifier: string | null;
-  status: string;
   createdByAgentId: string | null;
   createdByUserId: string | null;
   executionState: Record<string, unknown> | null;
@@ -90,10 +91,6 @@ interface GitHubReadOutcome {
   status: number;
   message: string | null;
   body: unknown;
-}
-
-function apiBase(): string {
-  return gitHubApiBase("github.com");
 }
 
 /**
@@ -116,7 +113,7 @@ async function ghReadJson(
   let last: GitHubReadOutcome | null = null;
   for (let i = 0; i < candidates.length; i++) {
     const candidate: GitHubTokenResolution = candidates[i]!;
-    const url = `${apiBase()}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}${path}`;
+    const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}${path}`;
     let response: Response;
     try {
       response = await ghFetch(url, {
@@ -151,13 +148,17 @@ async function ghReadJson(
   return last!;
 }
 
+/**
+ * Cards whose recorded approval decision is still `approved`, that are not
+ * cancelled, and that carry at least one linked GitHub PR. The trigger is the
+ * control-plane record alone — nothing is inferred from commits or GitHub.
+ */
 async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateRow[]> {
   return db
     .select({
       id: issues.id,
       companyId: issues.companyId,
       identifier: issues.identifier,
-      status: issues.status,
       createdByAgentId: issues.createdByAgentId,
       createdByUserId: issues.createdByUserId,
       executionState: issues.executionState,
@@ -184,21 +185,15 @@ async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateR
     .limit(limit);
 }
 
-interface StageIntegrityVerdict {
-  reason: string;
-  detail: string;
-}
-
-async function evaluateStageIntegrity(db: Db, row: CandidateRow): Promise<StageIntegrityVerdict | null> {
+/**
+ * ADR-073 stage-integrity audit of the recorded approval. Returns a skip
+ * verdict when the "approved" record is not backed by a real, non-self
+ * decision: an auto-skipped review stage writes no decision row and lands in
+ * skippedStageIds, so it must never be treated as an approval.
+ */
+async function evaluateStageIntegrity(db: Db, row: CandidateRow): Promise<{ reason: string; detail: string } | null> {
   const state: Record<string, unknown> = row.executionState ?? {};
   const policy: Record<string, unknown> = row.executionPolicy ?? {};
-
-  if (state.lastDecisionOutcome !== "approved") {
-    return {
-      reason: "guard-b:state-not-approved",
-      detail: `lastDecisionOutcome=${String(state.lastDecisionOutcome ?? "null")}`,
-    };
-  }
 
   const skippedStageIds = Array.isArray(state.skippedStageIds)
     ? (state.skippedStageIds as unknown[]).filter((s): s is string => typeof s === "string")
@@ -210,11 +205,11 @@ async function evaluateStageIntegrity(db: Db, row: CandidateRow): Promise<StageI
     };
   }
 
-  const policyStages = Array.isArray(policy.stages)
-    ? (policy.stages as Array<Record<string, unknown> | null | undefined>)
-    : [];
   const policyStageIds = new Set(
-    policyStages
+    (Array.isArray(policy.stages)
+      ? (policy.stages as Array<Record<string, unknown> | null | undefined>)
+      : []
+    )
       .map((stage) => (stage && typeof stage.id === "string" ? stage.id : null))
       .filter((id): id is string => id !== null),
   );
@@ -289,123 +284,16 @@ async function evaluateStageIntegrity(db: Db, row: CandidateRow): Promise<StageI
 
   for (const stageId of completedStageIds) {
     const latest = latestByStage.get(stageId)!;
-    if (latest.actorAgentId && forbiddenAgents.has(latest.actorAgentId)) {
+    if ((latest.actorAgentId && forbiddenAgents.has(latest.actorAgentId)) ||
+        (latest.actorUserId && forbiddenUsers.has(latest.actorUserId))) {
       return {
         reason: "guard-b:decision-by-author-or-return-assignee",
-        detail: `stage ${stageId} decided by agent ${latest.actorAgentId} (card author or returnAssignee)`,
-      };
-    }
-    if (latest.actorUserId && forbiddenUsers.has(latest.actorUserId)) {
-      return {
-        reason: "guard-b:decision-by-author-or-return-assignee",
-        detail: `stage ${stageId} decided by user ${latest.actorUserId} (card author or returnAssignee)`,
+        detail: `stage ${stageId} decided by the card's author or returnAssignee`,
       };
     }
   }
 
   return null;
-}
-
-type HeadSearchResult =
-  | { ok: true; sha: string }
-  | { ok: false; reason: string; detail: string };
-
-async function findApprovedHeadSha(
-  db: Db,
-  companyId: string,
-  target: LinkedPullRequest,
-  currentHeadSha: string,
-): Promise<HeadSearchResult> {
-  const eventsRead = await ghReadJson(
-    db,
-    companyId,
-    target.owner,
-    target.repo,
-    `/pulls/${target.number}/events?per_page=100`,
-  );
-  if (!eventsRead.ok) {
-    return {
-      ok: false,
-      reason: "guard-a:head-history-unavailable",
-      detail: `head-history fetch failed: HTTP ${eventsRead.status} ${eventsRead.message ?? ""}`.trim(),
-    };
-  }
-
-  const events = Array.isArray(eventsRead.body)
-    ? (eventsRead.body as Array<Record<string, unknown> | null | undefined>)
-    : [];
-  const headShas: string[] = [];
-  const seen = new Set<string>();
-  for (const event of events) {
-    const headObj = event?.head as Record<string, unknown> | undefined;
-    const sha =
-      (typeof headObj?.sha === "string" && headObj.sha) ||
-      (typeof event?.commit_id === "string" && event.commit_id) ||
-      null;
-    if (!sha || seen.has(sha)) continue;
-    seen.add(sha);
-    headShas.push(sha);
-  }
-
-  let probed = 0;
-  for (let i = headShas.length - 1; i >= 0; i--) {
-    const sha = headShas[i]!;
-    if (sha === currentHeadSha) continue;
-    if (probed >= MAX_HEAD_PROBES_PER_PR) break;
-    probed += 1;
-    const read = await ghReadJson(
-      db,
-      companyId,
-      target.owner,
-      target.repo,
-      `/commits/${encodeURIComponent(sha)}/statuses`,
-    );
-    if (!read.ok) continue;
-    const statuses = Array.isArray(read.body) ? (read.body as Array<Record<string, unknown>>) : [];
-    if (statuses.some((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success")) {
-      return { ok: true, sha };
-    }
-  }
-
-  return {
-    ok: false,
-    reason: "guard-a:approved-head-not-found",
-    detail: `no historical head carries ${PAPERCLIP_APPROVED_CONTEXT}=success (probed ${probed} of ${headShas.length} heads)`,
-  };
-}
-
-function extractFileBlobMap(body: unknown): Map<string, string | null> | null {
-  const payload = body as Record<string, unknown> | null;
-  if (!payload) return null;
-  if (payload.truncated === true) return null;
-  const files = payload.files;
-  if (!Array.isArray(files)) return null;
-  const map = new Map<string, string | null>();
-  for (const entry of files as Array<Record<string, unknown> | null | undefined>) {
-    const filename = entry && typeof entry.filename === "string" ? entry.filename : null;
-    if (!filename) return null;
-    map.set(filename, entry && typeof entry.sha === "string" ? entry.sha : null);
-  }
-  return map;
-}
-
-function mapsEqual(a: Map<string, string | null>, b: Map<string, string | null>): boolean {
-  if (a.size !== b.size) return false;
-  for (const [key, value] of a) {
-    if (b.get(key) !== value) return false;
-  }
-  return true;
-}
-
-function describeDiff(a: Map<string, string | null>, b: Map<string, string | null>): string {
-  const changed: string[] = [];
-  for (const [key, value] of a) {
-    if (!b.has(key) || b.get(key) !== value) changed.push(key);
-  }
-  for (const key of b.keys()) {
-    if (!a.has(key)) changed.push(key);
-  }
-  return changed.length > 5 ? `${changed.length} files differ` : `${changed.join(", ")} differ`;
 }
 
 async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateResult> {
@@ -443,9 +331,8 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   }
   const prBody = prRead.body as Record<string, unknown> | null;
   const headSha = ((prBody?.head as Record<string, unknown> | undefined)?.sha as string | undefined) ?? null;
-  const baseSha = ((prBody?.base as Record<string, unknown> | undefined)?.sha as string | undefined) ?? null;
-  if (!headSha || !baseSha) {
-    return { kind: "failed", detail: "pr-fetch-failed: no head/base sha in PR payload" };
+  if (!headSha) {
+    return { kind: "failed", detail: "pr-fetch-failed: no head sha in PR payload" };
   }
   if (prBody?.merged === true) {
     return { kind: "skipped", reason: "pr-merged", detail: `pr-merged: ${target.displayName} is merged` };
@@ -454,78 +341,31 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     return { kind: "skipped", reason: "pr-closed", detail: `pr-closed: ${target.displayName} state=${prBody.state}` };
   }
 
-  const headStatuses = await ghReadJson(
+  // Idempotency pre-check: read the head's combined status. A 404 means the
+  // ref itself is not resolvable (the sha was just read from the live PR, so
+  // this is not the "no statuses yet" case) — treat it as a failure, never as
+  // a publish trigger.
+  const headStatus = await ghReadJson(
     db,
     row.companyId,
     target.owner,
     target.repo,
-    `/commits/${encodeURIComponent(headSha)}/statuses`,
+    `/commits/${encodeURIComponent(headSha)}/status`,
   );
-  if (!headStatuses.ok) {
+  if (!headStatus.ok) {
     return {
       kind: "failed",
-      detail: `head-status-check-failed: HTTP ${headStatuses.status} ${headStatuses.message ?? ""}`.trim(),
+      detail: `head-status-check-failed: HTTP ${headStatus.status} ${headStatus.message ?? ""}`.trim(),
     };
   }
-  const statuses = Array.isArray(headStatuses.body)
-    ? (headStatuses.body as Array<Record<string, unknown>>)
+  const statuses = Array.isArray((headStatus.body as Record<string, unknown> | null)?.statuses)
+    ? ((headStatus.body as Record<string, unknown>).statuses as Array<Record<string, unknown>>)
     : [];
   if (statuses.some((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success")) {
     return {
       kind: "skipped",
       reason: "already-success",
       detail: `already-success: ${target.displayName} head ${headSha.slice(0, 7)} already carries ${PAPERCLIP_APPROVED_CONTEXT}=success`,
-    };
-  }
-
-  const approvedHead = await findApprovedHeadSha(db, row.companyId, target, headSha);
-  if (!approvedHead.ok) {
-    return { kind: "skipped", reason: approvedHead.reason, detail: `guard-a ${approvedHead.detail}` };
-  }
-
-  const compareApproved = await ghReadJson(
-    db,
-    row.companyId,
-    target.owner,
-    target.repo,
-    `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(approvedHead.sha)}`,
-  );
-  if (!compareApproved.ok) {
-    return {
-      kind: "skipped",
-      reason: "guard-a:compare-unavailable",
-      detail: `guard-a compare(approved head) failed: HTTP ${compareApproved.status} ${compareApproved.message ?? ""}`.trim(),
-    };
-  }
-  const compareCurrent = await ghReadJson(
-    db,
-    row.companyId,
-    target.owner,
-    target.repo,
-    `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`,
-  );
-  if (!compareCurrent.ok) {
-    return {
-      kind: "skipped",
-      reason: "guard-a:compare-unavailable",
-      detail: `guard-a compare(current head) failed: HTTP ${compareCurrent.status} ${compareCurrent.message ?? ""}`.trim(),
-    };
-  }
-
-  const approvedFiles = extractFileBlobMap(compareApproved.body);
-  const currentFiles = extractFileBlobMap(compareCurrent.body);
-  if (approvedFiles === null || currentFiles === null) {
-    return {
-      kind: "skipped",
-      reason: "guard-a:compare-unavailable",
-      detail: "guard-a compare payload missing files[] or truncated",
-    };
-  }
-  if (!mapsEqual(approvedFiles, currentFiles)) {
-    return {
-      kind: "skipped",
-      reason: "guard-a:content-changed",
-      detail: `guard-a content-changed: ${describeDiff(approvedFiles, currentFiles)}`,
     };
   }
 

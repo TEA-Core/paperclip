@@ -13,25 +13,25 @@ import {
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
-} from "./helpers/embedded-postgres.js";
+} from "../__tests__/helpers/embedded-postgres.js";
 import {
   runApprovalStatusReconcilerTick,
   startApprovalStatusReconciler,
   type ApprovalStatusReconcilerTickSummary,
-} from "../services/approval-status-reconciler.js";
+} from "./approval-status-reconciler.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
 const mockGhFetch = vi.hoisted(() => vi.fn());
 
-vi.mock("../services/secrets.js", () => ({
+vi.mock("./secrets.js", () => ({
   secretService: () => ({
     getByName: mockGetByName,
     resolveSecretValue: mockResolveSecretValue,
   }),
 }));
 
-vi.mock("../services/github-fetch.js", () => ({
+vi.mock("./github-fetch.js", () => ({
   ghFetch: mockGhFetch,
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
@@ -47,9 +47,7 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 const GITHUB_TOKEN = "ghp_test_token_value";
-const OLD_HEAD = "old0000000000000000000000000000000000000001";
 const NEW_HEAD = "new0000000000000000000000000000000000000002";
-const BASE_SHA = "base00000000000000000000000000000000000000003";
 const APPROVAL_STAGE_ID = "00000000-0000-0000-0000-0000000000a1";
 const REVIEW_STAGE_ID = "00000000-0000-0000-0000-0000000000a2";
 const PAPERCLIP_APPROVED = "paperclip/approved";
@@ -57,36 +55,16 @@ const AGENT_REVIEWER = "11111111-1111-1111-1111-111111111111";
 const AGENT_AUTHOR = "22222222-2222-2222-2222-222222222222";
 const AGENT_LEAD = "33333333-3333-3333-3333-333333333333";
 const USER_REVIEWER = "reviewer-user";
-const USER_AUTHOR = "author-user";
-const USER_LEAD = "lead-user";
 
 const PR_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/42";
-const NEW_HEAD_STATUSES_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/statuses`;
-const OLD_HEAD_STATUSES_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${OLD_HEAD}/statuses`;
-const EVENTS_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/42/events?per_page=100";
-const COMPARE_APPROVED_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${OLD_HEAD}`;
-const COMPARE_CURRENT_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${NEW_HEAD}`;
+const COMBINED_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/status`;
 const POST_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/statuses/${NEW_HEAD}`;
 
 const OPEN_PR_BODY = {
   state: "open",
   merged: false,
   head: { ref: "SUP-42-branch", sha: NEW_HEAD },
-  base: { ref: "main", sha: BASE_SHA },
-};
-
-const SAME_FILES = {
-  files: [
-    { filename: "a.ts", sha: "blob-a" },
-    { filename: "b.ts", sha: "blob-b" },
-  ],
-};
-
-const CHANGED_FILES = {
-  files: [
-    { filename: "a.ts", sha: "blob-a" },
-    { filename: "b.ts", sha: "blob-b-changed" },
-  ],
+  base: { ref: "main", sha: "base00000000000000000000000000000000000000003" },
 };
 
 function zeroSummary(): ApprovalStatusReconcilerTickSummary {
@@ -274,7 +252,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     await db.insert(externalObjectMentions).values({
       companyId,
       sourceIssueId: issueId,
-      sourceKind: "issue_comment",
+      sourceKind: "comment",
       objectId: externalObj!.id,
       objectType: "pull_request",
       providerKey: "github",
@@ -283,18 +261,14 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   }
 
   describe("runApprovalStatusReconcilerTick", () => {
-    it("republishes exactly once when the diff is byte-identical to the approved head", async () => {
+    it("republishes exactly once when the status is missing on the live head", async () => {
       const issueId = await insertIssue();
       await insertDecision(issueId);
       await insertMention(issueId);
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
-        { url: NEW_HEAD_STATUSES_URL, body: [] },
-        { url: EVENTS_URL, body: [{ head: { sha: OLD_HEAD } }, { head: { sha: NEW_HEAD } }] },
-        { url: OLD_HEAD_STATUSES_URL, body: [{ context: PAPERCLIP_APPROVED, state: "success" }] },
-        { url: COMPARE_APPROVED_URL, body: SAME_FILES },
-        { url: COMPARE_CURRENT_URL, body: SAME_FILES },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: POST_STATUS_URL, body: { id: 12345 } },
       ]);
 
@@ -315,11 +289,15 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         description: "SUP-42 approved via Paperclip",
       });
 
+      // Pre-publish reads are the live PR read and the head combined-status
+      // read only — no head-history or compare probes. The delegated publish
+      // re-reads the PR itself (live re-resolve, SUP-13313).
       const getUrls = mockGhFetch.mock.calls
         .filter((call) => (call[1] as RequestInit | undefined)?.method !== "POST")
         .map((call) => String(call[0]));
-      expect(getUrls).toContain(COMPARE_APPROVED_URL);
-      expect(getUrls).toContain(COMPARE_CURRENT_URL);
+      const distinct = [...new Set(getUrls)];
+      expect(distinct).toEqual([PR_URL, COMBINED_STATUS_URL]);
+      expect(getUrls.slice(0, 2)).toEqual([PR_URL, COMBINED_STATUS_URL]);
     });
 
     it("performs zero writes when the head already carries paperclip/approved=success", async () => {
@@ -329,7 +307,13 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
-        { url: NEW_HEAD_STATUSES_URL, body: [{ context: PAPERCLIP_APPROVED, state: "success" }] },
+        {
+          url: COMBINED_STATUS_URL,
+          body: {
+            state: "success",
+            statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }],
+          },
+        },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
@@ -337,6 +321,18 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(summary.republished).toBe(0);
       expect(summary.skipped["already-success"]).toBe(1);
       expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("never scans a card that was never approved", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({ lastDecisionOutcome: null }),
+      });
+      await insertMention(issueId);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.scanned).toBe(0);
+      expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
     it("never scans rejected cards", async () => {
@@ -393,48 +389,6 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
-    it("skips with a logged reason when a blob sha changed since approval (guard A)", async () => {
-      const issueId = await insertIssue();
-      await insertDecision(issueId);
-      await insertMention(issueId);
-
-      installRoutes([
-        { url: PR_URL, body: OPEN_PR_BODY },
-        { url: NEW_HEAD_STATUSES_URL, body: [] },
-        { url: EVENTS_URL, body: [{ head: { sha: OLD_HEAD } }, { head: { sha: NEW_HEAD } }] },
-        { url: OLD_HEAD_STATUSES_URL, body: [{ context: PAPERCLIP_APPROVED, state: "success" }] },
-        { url: COMPARE_APPROVED_URL, body: SAME_FILES },
-        { url: COMPARE_CURRENT_URL, body: CHANGED_FILES },
-      ]);
-
-      const summary = await runApprovalStatusReconcilerTick(db);
-
-      expect(summary.republished).toBe(0);
-      expect(summary.skipped["guard-a:content-changed"]).toBe(1);
-      expect(summary.skippedDetails[0]).toContain("SUP-42");
-      expect(summary.skippedDetails[0]).toContain("b.ts");
-      expect(postStatusCalls()).toHaveLength(0);
-    });
-
-    it("skips when no historical head carries the approved status (guard A)", async () => {
-      const issueId = await insertIssue();
-      await insertDecision(issueId);
-      await insertMention(issueId);
-
-      installRoutes([
-        { url: PR_URL, body: OPEN_PR_BODY },
-        { url: NEW_HEAD_STATUSES_URL, body: [] },
-        { url: EVENTS_URL, body: [{ head: { sha: OLD_HEAD } }, { head: { sha: NEW_HEAD } }] },
-        { url: OLD_HEAD_STATUSES_URL, body: [{ context: "ci/build", state: "success" }] },
-      ]);
-
-      const summary = await runApprovalStatusReconcilerTick(db);
-
-      expect(summary.republished).toBe(0);
-      expect(summary.skipped["guard-a:approved-head-not-found"]).toBe(1);
-      expect(postStatusCalls()).toHaveLength(0);
-    });
-
     it("skips when the approval was made by the card's own author (guard B)", async () => {
       await insertAgent(AGENT_AUTHOR, "Author");
       const issueId = await insertIssue({ createdByAgentId: AGENT_AUTHOR });
@@ -454,18 +408,6 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         executionPolicy: { ...EXECUTION_POLICY, returnAssigneeAgentId: AGENT_LEAD },
       });
       await insertDecision(issueId, { actorAgentId: AGENT_LEAD });
-      await insertMention(issueId);
-
-      const summary = await runApprovalStatusReconcilerTick(db);
-
-      expect(summary.skipped["guard-b:decision-by-author-or-return-assignee"]).toBe(1);
-      expect(postStatusCalls()).toHaveLength(0);
-      expect(mockGhFetch).not.toHaveBeenCalled();
-    });
-
-    it("skips when the approval was made by a user who is the card's author (guard B)", async () => {
-      const issueId = await insertIssue({ createdByUserId: USER_AUTHOR });
-      await insertDecision(issueId, { actorAgentId: null, actorUserId: USER_AUTHOR });
       await insertMention(issueId);
 
       const summary = await runApprovalStatusReconcilerTick(db);

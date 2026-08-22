@@ -1506,8 +1506,8 @@ export async function startServer(): Promise<StartedServer> {
   // SUP-13535. The paperclip/approved status is written once, on the head that
   // existed at approval time. When that head later moves (conflict resolution,
   // update-branch) the status is stranded and the merge queue loses it. This
-  // reconciler re-publishes on the live head, gated by content identity (Guard
-  // A) and stage integrity (Guard B); idempotent re-runs perform zero writes.
+  // reconciler re-publishes on the live head, gated by stage integrity
+  // (ADR-073) and an idempotent combined-status pre-check.
   if (config.approvalStatusReconcilerEnabled) {
     const { startApprovalStatusReconciler } = await import("./services/approval-status-reconciler.js");
     logger.info(
