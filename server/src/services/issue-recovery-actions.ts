@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions } from "@paperclipai/db";
 import type {
@@ -48,6 +48,15 @@ export type ResolveIssueRecoveryActionInput = {
   outcome: IssueRecoveryActionOutcome;
   resolutionNote?: string | null;
   evidence?: Record<string, unknown>;
+  /**
+   * An action the sweep escalated at its attempt ceiling
+   * (`escalated` + `outcome: "exhausted"`) is terminal: it may only be
+   * cleared by an explicit board/operator resolution. Ordinary callers
+   * (source revalidation, sweep folds) must leave this unset so
+   * exhaustion cannot be silently erased and re-minted as a fresh
+   * post-ceiling action on the next upsert. (SUP-13698)
+   */
+  boardResolution?: boolean;
 };
 
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
@@ -293,6 +302,14 @@ export function issueRecoveryActionService(db: Db) {
         input.sourceIssueId,
         input.fingerprint,
       );
+      // SUP-13698: when the latest action for this fingerprint already consumed
+      // its full sweep budget (attemptCount >= maxAttempts, stamped by the
+      // escalation), start a fresh attempt budget instead of carrying the
+      // post-ceiling count forward. Carrying it would mint a new action
+      // already past its ceiling, which the next sweep re-escalates and
+      // re-comments on immediately.
+      const predecessorBudgetExhausted =
+        prev != null && prev.maxAttempts != null && prev.attemptCount >= prev.maxAttempts;
       const [created] = await db
         .insert(issueRecoveryActions)
         .values({
@@ -312,7 +329,7 @@ export function issueRecoveryActionService(db: Db) {
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: (prev?.attemptCount ?? 0) + 1,
+          attemptCount: predecessorBudgetExhausted ? 1 : (prev?.attemptCount ?? 0) + 1,
           maxAttempts: input.maxAttempts ?? null,
           timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
@@ -352,6 +369,20 @@ export function issueRecoveryActionService(db: Db) {
     }
     if (input.fingerprint) {
       predicates.push(eq(issueRecoveryActions.fingerprint, input.fingerprint));
+    }
+    if (!input.boardResolution) {
+      // SUP-13698: a sweep-escalated action that exhausted its attempt ceiling
+      // (`escalated` + `outcome: "exhausted"`) is terminal until an explicit
+      // board resolution. Ordinary callers must not erase it: clearing it
+      // re-mints a new action carrying a post-ceiling attemptCount, which the
+      // next sweep re-escalates and re-comments on, forever.
+      predicates.push(
+        or(
+          ne(issueRecoveryActions.status, "escalated"),
+          ne(issueRecoveryActions.outcome, "exhausted"),
+          isNull(issueRecoveryActions.outcome),
+        )!,
+      );
     }
 
     const [updated] = await dbOrTx

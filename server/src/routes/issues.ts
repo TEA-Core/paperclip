@@ -6710,6 +6710,10 @@ export function issueRoutes(
           status: actionStatus,
           outcome: recordedOutcome,
           resolutionNote: resolutionNote ?? null,
+          // Explicit operator resolution of the escalation: allowed to clear a
+          // terminal swept-exhausted action so a genuinely new action can be
+          // minted on the next upsert. (SUP-13698)
+          boardResolution: true,
         },
         tx,
       );
