@@ -434,6 +434,57 @@ export function normalizeIssueExecutionPolicy(
 }
 
 /**
+ * SUP-13634: rejects PATCH executionPolicy shapes that would strip the close
+ * ladder before the write (and any reviewer/approver detach side-effect) can
+ * run.
+ *
+ * The close ladder is a ratified control (ADR-029/ADR-072); it must not be
+ * removable with a two-character value or a bare null. Three destructive
+ * shapes are rejected at the write boundary:
+ *
+ * - an explicitly empty `stages` array (`executionPolicy.stages: []`);
+ * - an explicit `executionPolicy: null` on an issue whose stored policy is
+ *   non-null;
+ * - any other body over an issue that currently has stages, where the body
+ *   normalizes back to null (e.g. `{}` or `{mode: "normal"}`) so it cannot
+ *   silently clear the ladder.
+ *
+ * `null` over a `null` stored policy stays a no-op and is allowed. A
+ * monitor-only policy (or a policy with authorization/review-preset content
+ * but no stages) can still be cleared or replaced with a body that is not
+ * null-as-is and that omits the `stages` field.
+ */
+export function assertPatchableExecutionPolicyWrite(input: {
+  raw: unknown;
+  currentPolicy: IssueExecutionPolicy | null;
+  /** True when the client expressly included `stages: []` in the PATCH body,
+   *  before the schema default `[]` is applied. */
+  stagesExplicitlyEmpty: boolean;
+}): void {
+  const { raw, currentPolicy, stagesExplicitlyEmpty } = input;
+
+  if (stagesExplicitlyEmpty) {
+    throw unprocessable("executionPolicy.stages must not be empty");
+  }
+
+  if (raw === null && currentPolicy !== null) {
+    throw unprocessable(
+      "executionPolicy must not be set to null on an issue that currently has a policy; send the full replacement policy instead",
+    );
+  }
+
+  if (raw !== null && typeof raw === "object" && !Array.isArray(raw) &&
+      currentPolicy !== null && currentPolicy.stages.length > 0) {
+    const normalized = normalizeIssueExecutionPolicy(raw);
+    if (normalized === null) {
+      throw unprocessable(
+        "executionPolicy must not clear the issue's existing close stages; send the full replacement policy instead",
+      );
+    }
+  }
+}
+
+/**
  * Normalizes a project-level default execution policy for issue creation.
  *
  * Unlike `normalizeIssueExecutionPolicy`, a malformed stored default returns

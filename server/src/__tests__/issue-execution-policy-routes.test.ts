@@ -1489,6 +1489,130 @@ describe("issue execution policy routes", () => {
     });
   });
 
+  describe("write-boundary close-ladder protection (SUP-13634)", () => {
+    function ladderIssue(issueId: string) {
+      return {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-13634",
+        title: "Close ladder protection",
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [
+            {
+              type: "review",
+              participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+            },
+            {
+              type: "approval",
+              participants: [{ type: "user", userId: "cto-user" }],
+            },
+          ],
+        }),
+        executionState: null,
+      };
+    }
+
+    it("rejects a PATCH whose executionPolicy.stages is an empty array and leaves the stored policy untouched", async () => {
+      const issueId = randomUUID();
+      const issue = ladderIssue(issueId);
+      const storedPolicy = issue.executionPolicy;
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: null } as any);
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: { stages: [] } });
+
+      expect(res.status).toBe(422);
+      expect(res.body).toMatchObject({ error: "executionPolicy.stages must not be empty" });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      for (const call of mockLogActivity.mock.calls) {
+        expect((call[1] as { action?: string }).action).not.toBe("issue.reviewers_updated");
+        expect((call[1] as { action?: string }).action).not.toBe("issue.approvers_updated");
+      }
+      expect(storedPolicy).not.toBeNull();
+    });
+
+    it("rejects a PATCH that sets executionPolicy to null over a non-null stored policy and leaves it untouched", async () => {
+      const issueId = randomUUID();
+      const issue = ladderIssue(issueId);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: null } as any);
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: null });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("executionPolicy must not be set to null");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      for (const call of mockLogActivity.mock.calls) {
+        expect((call[1] as { action?: string }).action).not.toBe("issue.reviewers_updated");
+        expect((call[1] as { action?: string }).action).not.toBe("issue.approvers_updated");
+      }
+    });
+
+    it("still allows a full replacement policy so repaired ladders can be re-PATCHed", async () => {
+      const issueId = randomUUID();
+      const issue = ladderIssue(issueId);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const replacement = normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: "55555555-5555-4555-8555-555555555555" }],
+          },
+          {
+            type: "approval",
+            participants: [{ type: "user", userId: "cto-user" }],
+          },
+        ],
+      })!;
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: replacement });
+
+      expect(res.status).toBe(200);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(updatePatch.executionPolicy).toMatchObject({
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: "55555555-5555-4555-8555-555555555555" }] },
+          { type: "approval", participants: [{ type: "user", userId: "cto-user" }] },
+        ],
+      });
+    });
+
+    it("still allows an explicit null over a null stored policy (no-op)", async () => {
+      const issueId = randomUUID();
+      const issue = { ...ladderIssue(issueId), executionPolicy: null };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: null });
+
+      expect(res.status).toBe(200);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(updatePatch.executionPolicy).toBeNull();
+    });
+  });
+
   describe("non-coder agent assignee with no execution policy", () => {
     it("allows creating a company issue with assigneeAgentId and no execution policy", async () => {
       mockIssueService.create.mockResolvedValue({

@@ -36,4 +36,37 @@ describe("buildExecutionPolicy", () => {
       expect(stage.participants[0]?.id).toMatch(UUID_PATTERN);
     }
   });
+
+  it("omits empty stages from the payload so the API's write boundary does not reject it", () => {
+    const policy = buildExecutionPolicy({
+      existingPolicy: null,
+      reviewerValues: [],
+      approverValues: [],
+    });
+    expect(policy).toBeNull();
+
+    const monitorPolicy = buildExecutionPolicy({
+      existingPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          notes: "Check deployment",
+          scheduledBy: "assignee",
+          kind: null,
+          serviceName: null,
+          externalRef: null,
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: null,
+        },
+      } as any,
+      reviewerValues: [],
+      approverValues: [],
+    });
+    expect(monitorPolicy).not.toBeNull();
+    expect(monitorPolicy).not.toHaveProperty("stages");
+    expect(issueExecutionPolicySchema.safeParse(monitorPolicy).success).toBe(true);
+  });
 });
