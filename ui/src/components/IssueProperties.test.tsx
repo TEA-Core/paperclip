@@ -2116,7 +2116,6 @@ describe("IssueProperties", () => {
       executionPolicy: {
         mode: "normal",
         commentRequired: true,
-        stages: [],
       },
     });
 
