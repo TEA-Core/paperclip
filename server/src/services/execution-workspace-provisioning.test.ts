@@ -952,7 +952,6 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
             adapterType: "codex_local",
             effectiveAdapterConfig: {},
             agentRuntimeConfig: agent?.runtimeConfig ?? null,
-            modelProfile: null,
             issueOverrides: null,
             workspaceConfig: buildSessionWorkspaceConfigCategoryValue({
               requestedMode: "isolated_workspace",
