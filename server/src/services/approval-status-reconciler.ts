@@ -35,15 +35,19 @@ import {
 //   - the head does not already carry paperclip/approved=success. The head's
 //     combined status is read first, so idempotent re-runs perform zero
 //     writes;
-//   - Guard A (SUP-13714): the live head is only re-published when its content
-//     is byte-identical to the head that was approved. The approval
-//     transition persists the certified head SHA in
-//     executionState.approvalStatus.publishedHeadSha; when the live head
-//     differs, per-file blob SHAs are compared via the compare endpoint
-//     (live-verified: two distinct commits with identical trees return an
-//     empty `files` list). No persisted head, an unverifiable compare, or any
-//     changed file refuses the re-publish — the paperclip/approved stamp is an
-//     authorization, and may only certify content that was actually reviewed.
+//   - Guard A (SUP-13714): the live head is only re-published when the PR's
+//     diff-vs-base is unchanged in substance from the head that was approved
+//     (exec-CTO ruling). The approval transition persists the certified head
+//     SHA in executionState.approvalStatus.publishedHeadSha. When the live
+//     head differs, the PR's base commit is resolved and the three-dot compare
+//     (merge-base-resolved) is fetched at each head; the per-file blob SHAs of
+//     the two diffs-vs-base are compared. This is what makes update-branch and
+//     rebase inert (the head tree gains the base's new files, but the PR's own
+//     diff-vs-base is stable), and what catches a content push, a renumber, or
+//     any added/removed file. No persisted head, an unverifiable compare
+//     (failure, missing file list, truncated), or any map difference refuses
+//     the re-publish — the paperclip/approved stamp is an authorization, and
+//     may only certify content that was actually reviewed.
 //
 // The write itself is delegated to publishApprovalStatus() from merge-arming.
 // The TOCTOU window (the delegated write re-resolves the head live) is closed
@@ -123,6 +127,57 @@ function readApprovedHead(state: Record<string, unknown> | null | undefined): Ap
     publishedHeadSha,
     publishedAt: typeof approvalStatus.publishedAt === "string" ? approvalStatus.publishedAt : undefined,
   };
+}
+
+/**
+ * Build a `filename -> blob sha` map from a GitHub compare response, or null
+ * when the response is unusable. `files` entries carry the blob SHA of each
+ * side of the diff; equality of two maps therefore means byte-identical
+ * content per file. A `truncated` compare (GitHub caps `files` at 300) is not
+ * a complete diff and must fail closed.
+ */
+function fileMapFromCompare(body: unknown): Map<string, string> | null {
+  const record = body as Record<string, unknown> | null;
+  if (!record || record.truncated === true) return null;
+  const files = record.files;
+  if (!Array.isArray(files)) return null;
+  const map = new Map<string, string>();
+  for (const file of files as Array<Record<string, unknown>>) {
+    const filename = file.filename;
+    const sha = file.sha;
+    if (typeof filename !== "string" || typeof sha !== "string") return null;
+    map.set(filename, sha);
+  }
+  return map;
+}
+
+/**
+ * Bounded, human-readable summary of the difference between the approved and
+ * live diff-vs-base maps, or null when the two maps are identical.
+ */
+function diffSubstanceChange(
+  approved: Map<string, string>,
+  live: Map<string, string>,
+): string | null {
+  const changed: string[] = [];
+  for (const [filename, sha] of approved) {
+    const liveSha = live.get(filename);
+    if (liveSha === undefined) {
+      changed.push(`${filename} (removed)`);
+    } else if (liveSha !== sha) {
+      changed.push(`${filename} (changed)`);
+    }
+  }
+  for (const filename of live.keys()) {
+    if (!approved.has(filename)) {
+      changed.push(`${filename} (added)`);
+    }
+  }
+  if (changed.length === 0) return null;
+  const shown = changed.slice(0, 3).join(", ");
+  return changed.length > 3
+    ? `${shown}, ... (${changed.length} file(s) differ)`
+    : `${shown} (${changed.length} file(s) differ)`;
 }
 
 /**
@@ -405,10 +460,14 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   // paperclip/approved status is an authorization: it may only certify content
   // that was actually reviewed. The approval transition persisted the exact
   // head it certified (executionState.approvalStatus.publishedHeadSha). When
-  // the live head differs, re-publish only if the two heads are byte-identical
-  // (compare endpoint, per-file blob SHAs; an empty `files` list means identical
-  // trees). Any case we cannot positively verify is a refusal with a recorded
-  // reason — never a re-publish.
+  // the live head differs, re-publish only if the PR's diff-vs-base is
+  // unchanged in substance from the approved head (exec-CTO ruling): resolve
+  // the PR's base commit, fetch the three-dot compare (merge-base-resolved) at
+  // each head, and compare the per-file blob SHAs. This makes update-branch and
+  // rebase inert (the head tree gains the base's new files, but the PR's own
+  // diff-vs-base is stable) and catches a content push, a renumber, or any
+  // added/removed file. Any case we cannot positively verify is a refusal with
+  // a recorded reason — never a re-publish.
   const approvedHead = readApprovedHead(row.executionState);
   if (!approvedHead) {
     return {
@@ -418,32 +477,64 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     };
   }
   if (approvedHead.publishedHeadSha !== headSha) {
-    const comparePath = `/compare/${encodeURIComponent(approvedHead.publishedHeadSha)}...${encodeURIComponent(headSha)}`;
-    const compare = await ghReadJson(db, row.companyId, target.owner, target.repo, comparePath);
-    if (!compare.ok) {
+    const baseSha = ((prBody?.base as Record<string, unknown> | undefined)?.sha as string | undefined) ?? null;
+    if (!baseSha) {
+      return {
+        kind: "skipped",
+        reason: "guard-a:no-base-ref",
+        detail: `guard-a: PR payload for ${target.displayName} carries no base sha; cannot compute diff-vs-base for ${headSha.slice(0, 7)}; refusing to re-publish`,
+      };
+    }
+    const approvedDiff = await ghReadJson(
+      db,
+      row.companyId,
+      target.owner,
+      target.repo,
+      `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(approvedHead.publishedHeadSha)}`,
+    );
+    if (!approvedDiff.ok) {
       return {
         kind: "skipped",
         reason: "guard-a:compare-failed",
-        detail: `guard-a: head-content compare ${approvedHead.publishedHeadSha.slice(0, 7)}...${headSha.slice(0, 7)} failed (HTTP ${compare.status} ${compare.message ?? ""}); refusing to re-publish`,
+        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHead.publishedHeadSha.slice(0, 7)} failed (HTTP ${approvedDiff.status} ${approvedDiff.message ?? ""}); refusing to re-publish`,
       };
     }
-    const compareFiles = (compare.body as Record<string, unknown> | null)?.files;
-    if (!Array.isArray(compareFiles)) {
+    const approvedFiles = fileMapFromCompare(approvedDiff.body);
+    if (!approvedFiles) {
       return {
         kind: "skipped",
         reason: "guard-a:unverifiable",
-        detail: `guard-a: compare returned no file list; cannot prove ${headSha.slice(0, 7)} was reviewed; refusing to re-publish`,
+        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHead.publishedHeadSha.slice(0, 7)} returned no usable file list; cannot prove ${headSha.slice(0, 7)} was reviewed; refusing to re-publish`,
       };
     }
-    if (compareFiles.length > 0) {
-      const changed = (compareFiles as Array<Record<string, unknown>>)
-        .slice(0, 3)
-        .map((f) => String(f.filename ?? "?"))
-        .join(", ");
+    const liveDiff = await ghReadJson(
+      db,
+      row.companyId,
+      target.owner,
+      target.repo,
+      `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`,
+    );
+    if (!liveDiff.ok) {
+      return {
+        kind: "skipped",
+        reason: "guard-a:compare-failed",
+        detail: `guard-a: live diff-vs-base ${baseSha.slice(0, 7)}...${headSha.slice(0, 7)} failed (HTTP ${liveDiff.status} ${liveDiff.message ?? ""}); refusing to re-publish`,
+      };
+    }
+    const liveFiles = fileMapFromCompare(liveDiff.body);
+    if (!liveFiles) {
+      return {
+        kind: "skipped",
+        reason: "guard-a:unverifiable",
+        detail: `guard-a: live diff-vs-base ${baseSha.slice(0, 7)}...${headSha.slice(0, 7)} returned no usable file list; refusing to re-publish`,
+      };
+    }
+    const substanceChange = diffSubstanceChange(approvedFiles, liveFiles);
+    if (substanceChange) {
       return {
         kind: "skipped",
         reason: "guard-a:changed-blob",
-        detail: `guard-a: head ${headSha.slice(0, 7)} differs from approved head ${approvedHead.publishedHeadSha.slice(0, 7)} (${compareFiles.length} changed file(s): ${changed}${compareFiles.length > 3 ? ", ..." : ""}); head was never reviewed; refusing to re-publish`,
+        detail: `guard-a: diff-vs-base substance changed for ${label} (${substanceChange}); head ${headSha.slice(0, 7)} was never reviewed; refusing to re-publish`,
       };
     }
   }

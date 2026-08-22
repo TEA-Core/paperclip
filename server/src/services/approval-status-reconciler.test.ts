@@ -62,13 +62,15 @@ const USER_REVIEWER = "reviewer-user";
 const PR_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/42";
 const COMBINED_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/status`;
 const POST_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/statuses/${NEW_HEAD}`;
-const COMPARE_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${APPROVED_HEAD}...${NEW_HEAD}`;
+const BASE_SHA = "base00000000000000000000000000000000000000003";
+const APPROVED_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${APPROVED_HEAD}`;
+const LIVE_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${NEW_HEAD}`;
 
 const OPEN_PR_BODY = {
   state: "open",
   merged: false,
   head: { ref: "SUP-42-branch", sha: NEW_HEAD },
-  base: { ref: "main", sha: "base00000000000000000000000000000000000000003" },
+  base: { ref: "main", sha: BASE_SHA },
 };
 
 function zeroSummary(): ApprovalStatusReconcilerTickSummary {
@@ -332,7 +334,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
-    it("refuses to re-publish when a reviewed file changed after approval (guard A)", async () => {
+    it("refuses to re-publish when the PR's diff-vs-base changed after approval (guard A)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
           approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
@@ -345,11 +347,19 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         {
-          url: COMPARE_URL,
+          url: APPROVED_DIFF_URL,
           body: {
             status: "ahead",
             ahead_by: 1,
             files: [{ filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000001", status: "modified" }],
+          },
+        },
+        {
+          url: LIVE_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 2,
+            files: [{ filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000002", status: "modified" }],
           },
         },
       ]);
@@ -362,7 +372,37 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
-    it("re-publishes exactly once on a byte-identical head move (guard A passes)", async () => {
+    it("republishes when the PR's own diff-vs-base is unchanged after an update-branch (guard A passes)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      const ownDiff = [
+        { filename: "server/src/a.ts", sha: "blobaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", status: "modified" },
+        { filename: "server/src/b.ts", sha: "blobbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", status: "added" },
+      ];
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: APPROVED_DIFF_URL, body: { status: "ahead", ahead_by: 7, files: ownDiff } },
+        { url: LIVE_DIFF_URL, body: { status: "ahead", ahead_by: 7, files: ownDiff } },
+        { url: POST_STATUS_URL, body: { id: 12346 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      const calls = postStatusCalls();
+      expect(calls).toHaveLength(1);
+      expect(calls[0]![0]).toBe(POST_STATUS_URL);
+    });
+
+    it("republishes exactly once on a byte-identical head move (guard A passes)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
           approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
@@ -374,7 +414,14 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
-        { url: COMPARE_URL, body: { status: "ahead", ahead_by: 1, files: [] } },
+        {
+          url: APPROVED_DIFF_URL,
+          body: { status: "ahead", ahead_by: 1, files: [{ filename: "server/src/a.ts", sha: "blobaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", status: "modified" }] },
+        },
+        {
+          url: LIVE_DIFF_URL,
+          body: { status: "ahead", ahead_by: 1, files: [{ filename: "server/src/a.ts", sha: "blobaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", status: "modified" }] },
+        },
         { url: POST_STATUS_URL, body: { id: 12346 } },
       ]);
 
@@ -385,6 +432,69 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const calls = postStatusCalls();
       expect(calls).toHaveLength(1);
       expect(calls[0]![0]).toBe(POST_STATUS_URL);
+    });
+
+    it("refuses to re-publish for a renumber, even when blob content is unchanged (guard A, ADR-074 coupling)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        {
+          url: APPROVED_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 1,
+            files: [
+              { filename: "server/db/migrations/000328_thing.sql", sha: "blob0000000000000000000000000000000000000001", status: "modified" },
+            ],
+          },
+        },
+        {
+          url: LIVE_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 1,
+            files: [
+              { filename: "server/db/migrations/000329_thing.sql", sha: "blob0000000000000000000000000000000000000001", status: "renamed", previous_filename: "server/db/migrations/000328_thing.sql" },
+            ],
+          },
+        },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("refuses when the live PR payload carries no base sha (guard A)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: { ...OPEN_PR_BODY, base: { ref: "main" } } },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:no-base-ref"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
     });
 
     it("refuses to re-publish for a head that was never reviewed when the approved head is unrecoverable (guard A)", async () => {
@@ -406,7 +516,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
-    it("fails closed when the head-content compare cannot be verified (guard A)", async () => {
+    it("fails closed when the diff-vs-base compare cannot be verified (guard A)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
           approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
@@ -418,7 +528,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
-        { url: COMPARE_URL, ok: false, status: 500, body: { message: "server error" } },
+        { url: APPROVED_DIFF_URL, ok: false, status: 500, body: { message: "server error" } },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
@@ -428,7 +538,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
-    it("fails closed when the compare returns no file list (guard A, truncation)", async () => {
+    it("fails closed when the live diff-vs-base compare cannot be verified (guard A)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
           approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
@@ -440,7 +550,55 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
-        { url: COMPARE_URL, body: { status: "ahead", ahead_by: 1 } },
+        {
+          url: APPROVED_DIFF_URL,
+          body: { status: "ahead", ahead_by: 1, files: [] },
+        },
+        { url: LIVE_DIFF_URL, ok: false, status: 500, body: { message: "server error" } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:compare-failed"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("fails closed when a compare returns no file list (guard A, truncation)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: APPROVED_DIFF_URL, body: { status: "ahead", ahead_by: 1 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:unverifiable"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("fails closed when a compare is truncated (guard A)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: APPROVED_DIFF_URL, body: { status: "ahead", ahead_by: 1, truncated: true, files: [] } },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
@@ -474,7 +632,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         if (url === COMBINED_STATUS_URL) {
           return { ok: true, status: 200, json: async () => ({ state: "pending", statuses: [] }) } as unknown as Response;
         }
-        if (url === COMPARE_URL) {
+        if (url === APPROVED_DIFF_URL || url === LIVE_DIFF_URL) {
           return { ok: true, status: 200, json: async () => ({ status: "ahead", ahead_by: 1, files: [] }) } as unknown as Response;
         }
         if (url.includes("/statuses") && method === "POST") {
