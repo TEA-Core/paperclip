@@ -420,6 +420,178 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(exhaustionComments).toHaveLength(1);
   });
 
+  async function seedExhaustedSweepCandidate(input: { companyId: string; managerId: string; sourceIssueId: string; fingerprint: string }) {
+    const staleAt = new Date(Date.now() - 30 * 60 * 1000);
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId: input.companyId,
+      sourceIssueId: input.sourceIssueId,
+      recoveryIssueId: null,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: input.managerId,
+      ownerUserId: null,
+      previousOwnerAgentId: null,
+      returnOwnerAgentId: null,
+      cause: "stranded_assigned_issue",
+      fingerprint: input.fingerprint,
+      evidence: { latestRunId: "run-1" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner", reason: "test" },
+      monitorPolicy: null,
+      attemptCount: 5,
+      maxAttempts: null,
+      timeoutAt: null,
+      lastAttemptAt: staleAt,
+    });
+    return { actionId, staleAt };
+  }
+
+  it("keeps a swept-exhausted action sticky against ordinary resolution and refuses to re-mint a post-ceiling action", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const fingerprint = "recovery:stuck:fingerprint";
+    const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const svc = issueRecoveryActionService(db);
+
+    const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+    expect(sweep.maxAttemptsReached).toBe(1);
+
+    // Ordinary (non-board) resolution, e.g. source revalidation, must not clear the exhaustion.
+    const cleared = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      fingerprint,
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Source revalidation claims the issue recovered.",
+    });
+    expect(cleared).toBeNull();
+
+    const [row] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(row).toMatchObject({ status: "escalated", outcome: "exhausted", attemptCount: 5 });
+
+    // A producer upsert for the same fingerprint must return the terminal row, not mint a new one.
+    const upserted = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    expect(upserted.id).toBe(actionId);
+    expect(upserted.status).toBe("escalated");
+    expect(upserted.outcome).toBe("exhausted");
+    expect(upserted.attemptCount).toBe(5);
+
+    // Repeated sweeps must not post further exhaustion comments.
+    const repeat = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+    expect(repeat.maxAttemptsReached).toBe(0);
+    const again = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+    expect(again.maxAttemptsReached).toBe(0);
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    expect(comments.filter((c) => (c.body ?? "").includes("exhausted its attempt ceiling"))).toHaveLength(1);
+  });
+
+  it("lets an explicit board resolution clear a swept-exhausted action and re-mint a fresh attempt budget", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const fingerprint = "recovery:board:fingerprint";
+    const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const svc = issueRecoveryActionService(db);
+
+    const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+    expect(sweep.maxAttemptsReached).toBe(1);
+
+    const cleared = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      fingerprint,
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Board reviewed; recovery no longer needed.",
+      boardResolution: true,
+    });
+    expect(cleared?.id).toBe(actionId);
+    expect(cleared?.status).toBe("cancelled");
+    expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+
+    const upserted = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    expect(upserted.id).not.toBe(actionId);
+    expect(upserted.status).toBe("active");
+    expect(upserted.attemptCount).toBe(1);
+    expect(upserted.outcome).toBeNull();
+  });
+
+  it("lets the resolve endpoint clear a swept-exhausted action so a fresh action can be minted", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const fingerprint = "recovery:endpoint:fingerprint";
+    const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+    expect(sweep.maxAttemptsReached).toBe(1);
+
+    const app = createApp();
+    const res = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        outcome: "cancelled",
+        sourceIssueStatus: "done",
+        resolutionNote: "Board cleared the escalation.",
+      })
+      .expect(200);
+    expect(res.body.recoveryAction).toMatchObject({
+      id: actionId,
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+    expect(res.body.issue).toMatchObject({ id: sourceIssueId, status: "done", activeRecoveryAction: null });
+
+    const upserted = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    expect(upserted.id).not.toBe(actionId);
+    expect(upserted.status).toBe("active");
+    expect(upserted.attemptCount).toBe(1);
+  });
+
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
     const { companyId, coderId, sourceIssue, prefix } = await seedCompany();
     const blockerIssueId = await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
