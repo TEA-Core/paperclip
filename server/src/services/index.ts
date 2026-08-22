@@ -183,4 +183,11 @@ export {
 } from "./codex-auth-reconciliation.js";
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
 export { armMergeOnApproval, publishApprovalStatus, shouldPublishApprovalStatus, type ArmingOutcome, type MergeArmingDecision } from "./merge-arming.js";
+export {
+  runApprovalStatusReconcilerTick,
+  startApprovalStatusReconciler,
+  type ApprovalStatusReconcilerSchedule,
+  type ApprovalStatusReconcilerTickOptions,
+  type ApprovalStatusReconcilerTickSummary,
+} from "./approval-status-reconciler.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";

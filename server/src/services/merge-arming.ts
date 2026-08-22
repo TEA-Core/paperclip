@@ -35,6 +35,12 @@ export function shouldPublishApprovalStatus<T extends Pick<MergeArmingDecision, 
 export interface ArmingOutcome {
   kind: "armed" | "skipped" | "failed";
   message: string;
+  /**
+   * The PR head SHA the paperclip/approved status was written to, when known
+   * (armed). The approval transition persists this so the reconciler can later
+   * verify content identity before any re-publish (SUP-13714 Guard A).
+   */
+  headSha?: string | null;
 }
 
 export interface LinkedPullRequest {
@@ -285,11 +291,23 @@ async function enableAutoMerge(
   }
 }
 
+export interface PublishApprovalStatusOptions {
+  /**
+   * SUP-13714 TOCTOU pin. When set, the live head re-resolved just before the
+   * write MUST equal this SHA or the publish is refused (`skipped`, head_moved)
+   * with zero writes. The reconciler passes the head it validated with Guard A
+   * so a head that moves between validation and the delegated write is never
+   * stamped.
+   */
+  expectedHeadSha?: string;
+}
+
 export async function publishApprovalStatus(
   db: Db,
   companyId: string,
   issueId: string,
   issueIdentifier: string,
+  options?: PublishApprovalStatusOptions,
 ): Promise<ArmingOutcome> {
   const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId);
 
@@ -415,11 +433,19 @@ export async function publishApprovalStatus(
       }
 
       const headSha = headShaResult.headSha;
+      if (options?.expectedHeadSha && headSha !== options.expectedHeadSha) {
+        return {
+          kind: "skipped",
+          message: `status:skipped:head_moved: ${pr.displayName} head moved to ${headSha.slice(0, 7)} after content-identity validation (expected ${options.expectedHeadSha.slice(0, 7)}); not re-stamped`,
+          headSha,
+        };
+      }
       const result = await writeCommitStatus(pr.candidate.token, pr.owner, pr.repo, headSha, issueIdentifier);
       if (result.success) {
         return {
           kind: "armed",
           message: `status:published (live re-resolve): paperclip/approved status written to ${pr.displayName} head ${headSha.slice(0, 7)}`,
+          headSha,
         };
       }
 
@@ -496,11 +522,19 @@ export async function publishApprovalStatus(
     }
 
     const headSha = headShaResult.headSha;
+    if (options?.expectedHeadSha && headSha !== options.expectedHeadSha) {
+      return {
+        kind: "skipped",
+        message: `status:skipped:head_moved: ${pr.displayName} head moved to ${headSha.slice(0, 7)} after content-identity validation (expected ${options.expectedHeadSha.slice(0, 7)}); not re-stamped`,
+        headSha,
+      };
+    }
     const result = await writeCommitStatus(token, pr.owner, pr.repo, headSha, issueIdentifier);
     if (result.success) {
       return {
         kind: "armed",
         message: `status:published: paperclip/approved status written to ${pr.displayName} head ${headSha.slice(0, 7)}`,
+        headSha,
       };
     }
 

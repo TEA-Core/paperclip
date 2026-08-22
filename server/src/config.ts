@@ -73,6 +73,8 @@ export interface Config {
   opencodeJanitorIntervalMinutes: number;
   opencodeJanitorRetentionDays: number;
   opencodeJanitorVacuum: boolean;
+  approvalStatusReconcilerEnabled: boolean;
+  approvalStatusReconcilerIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -296,6 +298,21 @@ export function loadConfig(): Config {
   // Opt-in, unlike the rest of the sweep: VACUUM holds an exclusive lock for the
   // length of a full-file rewrite, and getting that wrong starves the fleet.
   const opencodeJanitorVacuum = process.env.PAPERCLIP_OPENCODE_JANITOR_VACUUM === "true";
+  // SUP-13535. The paperclip/approved commit status is written once, on the
+  // head that existed at approval time. When that head later moves (conflict
+  // resolution, update-branch) the status is stranded and the merge queue
+  // loses it. This reconciler re-publishes on the live head, gated by content
+  // identity (Guard A) and stage integrity (Guard B). On by default: the write
+  // is a single idempotent GitHub API call, and off-by-default is how the
+  // stranded-status incidents keep happening.
+  const approvalStatusReconcilerEnabled =
+    process.env.PAPERCLIP_APPROVAL_STATUS_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_APPROVAL_STATUS_RECONCILER_ENABLED === "true"
+      : true;
+  const approvalStatusReconcilerIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_APPROVAL_STATUS_RECONCILER_INTERVAL_MINUTES) || 5,
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -338,6 +355,8 @@ export function loadConfig(): Config {
     opencodeJanitorIntervalMinutes,
     opencodeJanitorRetentionDays,
     opencodeJanitorVacuum,
+    approvalStatusReconcilerEnabled,
+    approvalStatusReconcilerIntervalMinutes,
     databaseBackupEnabled,
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,

@@ -1235,6 +1235,66 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       expect(body.description).toBe("SUP-12345 approved via Paperclip");
       expect(body.target_url).toBe("https://paperclip.example.com/issues/SUP-12345");
     });
+
+    it("reports the head SHA it stamped on armed (SUP-13714 persistence)", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/42" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("armed");
+      expect(result.headSha).toBe(HEAD_SHA);
+    });
+  });
+
+  describe("status:skipped:head_moved (TOCTOU pin)", () => {
+    it("refuses to write when expectedHeadSha does not match the live head", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/42" }),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345", {
+        expectedHeadSha: "different0000000000000000000000000000000000000000",
+      });
+
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("status:skipped:head_moved");
+      expect(result.headSha).toBe(HEAD_SHA);
+
+      const posts = mockGhFetch.mock.calls.filter(
+        (call) => (call[1] as RequestInit | undefined)?.method === "POST",
+      );
+      expect(posts).toHaveLength(0);
+    });
+
+    it("writes when expectedHeadSha matches the live head", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/42" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345", {
+        expectedHeadSha: HEAD_SHA,
+      });
+      expect(result.kind).toBe("armed");
+      expect(result.headSha).toBe(HEAD_SHA);
+      expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe("status:skipped:no-pr", () => {
