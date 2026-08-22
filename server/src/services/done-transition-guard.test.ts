@@ -1129,6 +1129,179 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
+  describe("origin/ baseRef prefix (SUP-13691)", () => {
+    it("strips the origin/ prefix from a slashed baseRef for the GitHub compare call only", async () => {
+      setupDbMock({
+        executionWorkspaces: [
+          mockExecutionWorkspaceRow({
+            baseRef: "origin/fold/tea-patches-v2026.722.0",
+            branchName: "SUP-12345-test-branch",
+          }),
+        ],
+      });
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 }));
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.aheadBy).toBe(0);
+      const compareUrl = ghFetchMock.mock.calls.map(([url]) => String(url)).find((u) => u.includes("/compare/"));
+      expect(compareUrl).toBe(
+        "https://api.github.com/repos/TEA-Core/paperclip/compare/fold%2Ftea-patches-v2026.722.0...SUP-12345-test-branch",
+      );
+      expect(compareUrl).not.toContain("origin%2F");
+    });
+
+    it("strips the origin/ prefix from a simple baseRef (origin/main) for the compare call", async () => {
+      setupDbMock({
+        executionWorkspaces: [
+          mockExecutionWorkspaceRow({
+            baseRef: "origin/main",
+            branchName: "SUP-12345-test-branch",
+          }),
+        ],
+      });
+      ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 }));
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.aheadBy).toBe(0);
+      const compareUrl = ghFetchMock.mock.calls.map(([url]) => String(url)).find((u) => u.includes("/compare/"));
+      expect(compareUrl).toBe(
+        "https://api.github.com/repos/TEA-Core/paperclip/compare/main...SUP-12345-test-branch",
+      );
+    });
+
+    it("keeps the full origin/ ref for the local git attribution probe", async () => {
+      setupDbMock({
+        executionWorkspaces: [
+          mockExecutionWorkspaceRow({
+            baseRef: "origin/fold/tea-patches-v2026.722.0",
+            branchName: "SUP-12345-test-branch",
+          }),
+        ],
+      });
+      const ranges: string[] = [];
+      mockExecFile.mockImplementation(
+        (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+          ranges.push(args[args.length - 1] as string);
+          cb(null, args.includes("--grep") ? "0" : "5");
+        },
+      );
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_absent_on_remote:SUP-12345-test-branch");
+      expect(ranges).toEqual([
+        "origin/fold/tea-patches-v2026.722.0..HEAD",
+        "origin/fold/tea-patches-v2026.722.0..HEAD",
+      ]);
+    });
+
+    it("allows a DECISION-CARRYING approval for a pushed branch with an open PR when baseRef has the origin/ prefix (SUP-13688 repro)", async () => {
+      // The false block: pushed branch + green CI, approval 409'd because the
+      // compare call 404'd on the origin/-prefixed base ref and fell into the
+      // branch-absent path, which had no decisionCarried carve-out.
+      setupDbMock({
+        executionWorkspaces: [
+          mockExecutionWorkspaceRow({
+            baseRef: "origin/fold/tea-patches-v2026.722.0",
+            branchName: "SUP-12345-test-branch",
+          }),
+        ],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        if (url.includes("/pulls?")) {
+          return new Response(JSON.stringify([{ merged: false, merged_at: null }]), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.aheadBy).toBe(3);
+      expect(result.reason).toContain("arms the merge");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "ahead_by_no_merged_pr_decision_carried:3",
+            skipReason: "ahead_by_no_merged_pr_decision_carried:3",
+          }),
+        }),
+      );
+    });
+
+    it("allows a DECISION-CARRYING transition on the branch-absent path (defense-in-depth carve-out)", async () => {
+      setupDbMock({
+        executionWorkspaces: [
+          mockExecutionWorkspaceRow({
+            baseRef: "origin/fold/tea-patches-v2026.722.0",
+          }),
+        ],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.aheadBy).toBeNull();
+      expect(result.branch).toBe("SUP-12686-test-branch");
+      expect(result.reason).toContain("Decision-carrying transition exempted from the branch-absent-on-remote block");
+      expect(result.reason).toContain("arms the merge");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "branch_absent_decision_carried:SUP-12686-test-branch",
+            skipReason: "branch_absent_decision_carried:SUP-12686-test-branch",
+          }),
+        }),
+      );
+    });
+
+    it("still blocks a plain (non-decision) close on the branch-absent path with an origin/ baseRef", async () => {
+      setupDbMock({
+        executionWorkspaces: [
+          mockExecutionWorkspaceRow({
+            baseRef: "origin/fold/tea-patches-v2026.722.0",
+          }),
+        ],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("does not exist on the remote");
+      expect(result.reason).toContain("deliver.sh");
+    });
+  });
+
   describe("auth failure classification", () => {
     it("allows transition and emits auth_failed:compare:401 when compare API returns 401", async () => {
       setupDbMock({
