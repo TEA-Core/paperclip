@@ -91,16 +91,21 @@ jobs:
           head_sha="$HEAD_SHA"
           merge_base=$(git merge-base "$base_sha" "$head_sha")
 
-          # Time-based: merge base cut > 24h ago
+          # A 0-behind branch is by definition cut at the current base tip:
+          # there is nothing to rebase onto and no merged work to revert, so
+          # the base branch's own age cannot make the branch stale (SUP-13630).
+          # Both rejections therefore require the branch to actually be behind.
+          behind=$(git rev-list --count "${merge_base}..${base_sha}")
           base_age_seconds=$(($(date +%s) - $(git log -1 --format=%ct "$merge_base")))
-          if [ "$base_age_seconds" -gt 86400 ]; then
-            echo "::error::PR merge base is $((base_age_seconds / 3600))h old (> 24h)."
+
+          # Time-based: merge base cut > 24h ago AND the branch is behind
+          if [ "$behind" -gt 0 ] && [ "$base_age_seconds" -gt 86400 ]; then
+            echo "::error::PR merge base is $((base_age_seconds / 3600))h old (> 24h) and $behind commit(s) behind."
             echo "::error::Stale bases silently revert merged work (SUP-12097). Please rebase onto current fold/tea-patches-v2026.722.0."
             exit 1
           fi
 
           # Commit-count: merge base > 20 commits behind
-          behind=$(git rev-list --count "${merge_base}..${base_sha}")
           if [ "$behind" -gt 20 ]; then
             echo "::error::PR merge base is $behind commits behind (> 20). Please rebase."
             exit 1
