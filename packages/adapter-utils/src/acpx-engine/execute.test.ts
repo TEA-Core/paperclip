@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterExecutionContext, AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
@@ -30,6 +31,7 @@ import {
   findAncestorBin,
   geminiVersionSupportsNativeAcpFlag,
   parseGeminiVersionParts,
+  probeSignalDeliverability,
   rewriteGeminiAcpFlagForVersion,
   summarizeAcpxTurnUsage,
   type AcpxEngineExecutorOptions,
@@ -2101,6 +2103,219 @@ describe("gemini ACP flag selection", () => {
     expect(result.errorMessage).toBe(expectedMessage);
     expect(cancelReasons).toContain(expectedMessage);
   }, 15_000);
+
+  it("surfaces a surviving agent as orphaned-process evidence when the run timed out", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+
+    // A real, long-lived stand-in for the ACP agent process. acpx's kill sites
+    // swallow undeliverable signals (a failed kill(2) arrives as a false
+    // `child.kill()` return and an 'error' event, exactly the pair #327 fixed on
+    // the opencode lane), so on a split uid without CAP_KILL the agent outlives
+    // the timeout cleanup. The executor must surface it, not assume the timeout
+    // stopped it.
+    const agent = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const agentPid = agent.pid as number;
+    const spawnedAt = new Date().toISOString();
+
+    const cancelReasons: string[] = [];
+    let releaseTurn: (() => void) | null = null;
+    const turnCancelled = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+
+    const logs: Array<{ stream: string; text: string }> = [];
+    const execute = createAcpxEngineExecutor({
+      createRuntime: (options) => {
+        // Report the agent process identity exactly as the patched acpx spawn
+        // lifecycle hook does.
+        void options.onAgentSpawn?.({ pid: agentPid, startedAt: spawnedAt });
+        return {
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            events: (async function* () {
+              await turnCancelled;
+            })(),
+            result: turnCancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+            cancel: async ({ reason }: { reason: string }) => {
+              cancelReasons.push(reason);
+              releaseTurn?.();
+            },
+          }),
+          close: async () => {},
+        } as never;
+      },
+    });
+
+    const result = await execute({
+      runId: "run-timeout-orphan",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        cwd,
+        timeoutSec: 1,
+      },
+      context: {},
+      onLog: async (stream: string, text: string) => {
+        logs.push({ stream, text });
+      },
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("acpx_timeout");
+    // The whole point: the run reports the process is still out there. The
+    // stand-in agent is spawned by the test itself (same uid), so the
+    // kill(pid, 0) probe succeeds and no errno is observed — the errorCode
+    // field is the probe's honest result, not an assumed EPERM. probeSignalDeliverability
+    // pins the EPERM shape for the split-uid case separately.
+    expect(result.errorMeta).toMatchObject({
+      orphanedProcess: {
+        kind: "orphaned_process",
+        pid: agentPid,
+        signal: "SIGTERM",
+        errorCode: null,
+      },
+    });
+    expect(logs.some((entry) => entry.text.includes(`${agentPid} could not be signaled`))).toBe(true);
+
+    agent.kill("SIGKILL");
+    try {
+      await new Promise((resolve) => agent.once("close", resolve));
+    } catch {
+      // already gone
+    }
+  }, 15_000);
+
+  it("surfaces no orphaned-process evidence when the agent is already gone at the timeout", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+
+    // A real agent stand-in that exits on its own: by the time the wall-clock
+    // timer fires, the pid is gone, so the post-cancel probe observes ESRCH (or
+    // a missing /proc/<pid> on Linux) and there is no orphan to report.
+    const agent = spawn(process.execPath, ["-e", "setTimeout(() => {}, 50);"], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    const agentPid = agent.pid as number;
+    await new Promise<void>((resolve) => agent.once("exit", () => resolve()));
+    const spawnedAt = new Date().toISOString();
+
+    let releaseTurn: (() => void) | null = null;
+    const turnCancelled = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+
+    const execute = createAcpxEngineExecutor({
+      createRuntime: (options) => {
+        // Report the (already dead) agent process identity exactly as the
+        // patched acpx spawn lifecycle hook did at spawn time.
+        void options.onAgentSpawn?.({ pid: agentPid, startedAt: spawnedAt });
+        return {
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            events: (async function* () {
+              await turnCancelled;
+            })(),
+            result: turnCancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+            cancel: async () => {
+              releaseTurn?.();
+            },
+          }),
+          close: async () => {},
+        } as never;
+      },
+    });
+
+    const result = await execute({
+      runId: "run-timeout-gone",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        cwd,
+        timeoutSec: 1,
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    // Timeout labelling is unchanged, and a gone agent carries no surviving
+    // process evidence: nothing is pointing at a process that is not there.
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("acpx_timeout");
+    expect(result.errorMeta?.orphanedProcess ?? null).toBeNull();
+  }, 15_000);
+});
+
+describe("probeSignalDeliverability", () => {
+  it("reports the EPERM a split-uid supervisor observes on a live agent", () => {
+    const err = new Error("kill EPERM") as NodeJS.ErrnoException;
+    err.code = "EPERM";
+    const spy = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw err;
+    });
+    try {
+      expect(probeSignalDeliverability(43_210)).toEqual({ errorCode: "EPERM" });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("drops the orphan when the process exited between the liveness probe and here", () => {
+    const err = new Error("kill ESRCH") as NodeJS.ErrnoException;
+    err.code = "ESRCH";
+    const spy = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw err;
+    });
+    try {
+      expect(probeSignalDeliverability(43_210)).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("observes no errno when the supervisor can still signal the agent", () => {
+    const spy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      expect(probeSignalDeliverability(43_210)).toEqual({ errorCode: null });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("does not report an unrelated errno as the signal-delivery error", () => {
+    const err = new Error("kill EINVAL") as NodeJS.ErrnoException;
+    err.code = "EINVAL";
+    const spy = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw err;
+    });
+    try {
+      expect(probeSignalDeliverability(43_210)).toEqual({ errorCode: null });
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 describe("summarizeAcpxTurnUsage", () => {

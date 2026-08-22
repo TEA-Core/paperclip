@@ -57,7 +57,9 @@ import {
   sanitizeInheritedPaperclipEnv,
   shapePaperclipWorkspaceEnvForExecution,
   stringifyPaperclipWakePayload,
+  SIGNAL_UNDELIVERABLE_REASON,
   SECRET_ENV_KEYS,
+  type OrphanedProcessEvidence,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
@@ -153,6 +155,80 @@ type AcpxProcessIdentitySink = {
   current: AdapterExecutionContext["onSpawn"];
   latest: AcpxAgentProcessIdentity | null;
 };
+
+// The ACP lane terminates its agent through acpx, whose signal sites
+// (killAgentIfRunning / sendSignal / terminateProcess) ignore whether the
+// signal was actually delivered: child.kill() returns false and emits 'error'
+// on the child, process.kill throws EPERM, and all of it is swallowed. When the
+// supervisor lacks CAP_KILL against the split agent uid, a run that times out
+// therefore records timed_out while its agent keeps running, invisible.
+//
+// A liveness probe cannot rely on process.kill(pid, 0) alone the way the
+// opencode lane does: against a different uid WITHOUT CAP_KILL it throws EPERM
+// for a LIVE process — easy to misread as ESRCH. /proc/<pid> is the
+// authoritative namespace-local existence probe on the container platforms the
+// uid split targets; elsewhere fall back to kill(pid, 0) and treat EPERM as
+// alive. The errno such a probe raises is still real evidence, and
+// probeSignalDeliverability reads it for the orphaned-process block.
+function isAgentProcessAlive(pid: number | null | undefined): boolean {
+  if (!pid || pid <= 0) return false;
+  if (process.platform === "linux") {
+    try {
+      fsSync.statSync(`/proc/${pid}`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+// Observe the errno a signal would produce instead of assuming one: the acpx
+// kill sites swallow whether a signal was delivered, so the evidence block's
+// errorCode must come from THIS probe, not from the opencode lane's incident.
+// kill(pid, 0) performs error-checking only (POSIX signal 0): success means the
+// process exists and the supervisor may signal it, EPERM means it exists but is
+// out of reach — the split-uid failure mode — and ESRCH means it exited between
+// the liveness probe and here, leaving no orphan to report.
+export function probeSignalDeliverability(pid: number | null | undefined): { errorCode: string | null } | null {
+  if (!pid || pid <= 0) return null;
+  try {
+    process.kill(pid, 0);
+    return { errorCode: null };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? null;
+    if (code === "ESRCH") return null;
+    return { errorCode: code === "EPERM" ? code : null };
+  }
+}
+
+// Surface an agent that outlived its run's termination the same way #327
+// surfaces the opencode lane's orphan: an evidence block on the result plus a
+// stderr line, so an operator sees the process is still out there instead of
+// assuming the timeout stopped it. Only meaningful on the timed-out path — a
+// warm persistent handle keeps the agent alive across runs BY DESIGN, so a
+// liveness probe on a clean turn would be a false positive.
+function buildOrphanedAgentEvidence(
+  processIdentitySink: AcpxProcessIdentitySink,
+): OrphanedProcessEvidence | null {
+  const pid = processIdentitySink.latest?.pid ?? null;
+  if (!isAgentProcessAlive(pid)) return null;
+  const probe = probeSignalDeliverability(pid);
+  if (!probe) return null;
+  return {
+    kind: "orphaned_process",
+    reason: SIGNAL_UNDELIVERABLE_REASON,
+    pid,
+    processGroupId: null,
+    signal: "SIGTERM",
+    errorCode: probe.errorCode,
+  };
+}
 
 type AcpxRuntimeFactory = (options: PaperclipAcpRuntimeOptions) => AcpRuntime;
 
@@ -3795,6 +3871,17 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         });
         await cleanupRemoteBridges(prepared);
         flushChildStderr(childStderrState);
+        // A timed-out ACP run terminates its agent through acpx, which swallows
+        // undeliverable signals. When the agent survives anyway (e.g. the server
+        // lacks CAP_KILL against the split uid), surface the orphan the way #327
+        // does for the opencode lane so the run is not mistaken for a clean stop.
+        const orphanedProcess = timedOut ? buildOrphanedAgentEvidence(processIdentitySink) : null;
+        if (orphanedProcess) {
+          await ctx.onLog(
+            "stderr",
+            `[paperclip] ACP agent process ${orphanedProcess.pid} could not be signaled after the run timed out; it is still running unattended.\n`,
+          );
+        }
         // The one clean-completion path clears the run failure flag; every other
         // path keeps it set, so the run root span closes with error status.
         runFailed = terminal.status === "completed" && !timedOut ? false : true;
@@ -3804,6 +3891,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           timedOut,
           errorMessage,
           errorCode: terminal.status === "failed" ? "acpx_turn_failed" : timedOut ? "acpx_timeout" : null,
+          ...(orphanedProcess ? { errorMeta: { orphanedProcess } } : {}),
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
           sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
           sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -3857,13 +3945,22 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         });
         await cleanupRemoteBridges(prepared);
         flushChildStderr(childStderrState);
+        const orphanedProcess = timedOut ? buildOrphanedAgentEvidence(processIdentitySink) : null;
+        if (orphanedProcess) {
+          await ctx.onLog(
+            "stderr",
+            `[paperclip] ACP agent process ${orphanedProcess.pid} could not be signaled after the run timed out; it is still running unattended.\n`,
+          );
+        }
         return {
           exitCode: 1,
           signal: timedOut ? "SIGTERM" : null,
           timedOut,
           errorMessage: message,
           errorCode: timedOut ? "acpx_timeout" : classified.errorCode,
-          errorMeta: classified.errorMeta,
+          errorMeta: orphanedProcess
+            ? { ...(classified.errorMeta ?? {}), orphanedProcess }
+            : classified.errorMeta,
           ...billingFields,
           ...referencedProjectStagingFailuresField,
           model: prepared.requestedModel || null,
