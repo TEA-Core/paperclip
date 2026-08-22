@@ -212,6 +212,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  assertPatchableExecutionPolicyWrite,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -9008,7 +9009,23 @@ export function issueRoutes(
     },
   );
 
-  router.patch("/issues/:id", validate(updateIssueRouteSchema), async (req, res) => {
+  router.patch(
+    "/issues/:id",
+    (req, _res, next) => {
+      // SUP-13634: capture whether the client explicitly sent an empty
+      // `executionPolicy.stages` array before validate() applies the schema's
+      // `.default([])` and loses the distinction.
+      const policy = (req.body as { executionPolicy?: unknown } | undefined)?.executionPolicy;
+      (req as unknown as Record<string, unknown>).executionPolicyStagesExplicitlyEmpty =
+        policy !== null &&
+        typeof policy === "object" &&
+        !Array.isArray(policy) &&
+        Array.isArray((policy as { stages?: unknown }).stages) &&
+        (policy as { stages: unknown[] }).stages.length === 0;
+      next();
+    },
+    validate(updateIssueRouteSchema),
+    async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
@@ -9325,7 +9342,19 @@ export function issueRoutes(
         actor,
       });
     }
+    const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
     if (req.body.executionPolicy !== undefined) {
+      // SUP-13634: a PATCH must not strip the close ladder. An explicitly
+      // empty stages array, or an explicit null over a non-null stored
+      // policy, is rejected before any write or reviewer/approver detach
+      // side-effect can run.
+      assertPatchableExecutionPolicyWrite({
+        raw: req.body.executionPolicy,
+        currentPolicy: previousExecutionPolicy,
+        stagesExplicitlyEmpty: Boolean(
+          (req as unknown as Record<string, unknown>).executionPolicyStagesExplicitlyEmpty,
+        ),
+      });
       const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
       // requestedAssigneeAgentId is the assignee AFTER this PATCH, so a PATCH that
       // moves the assignee off the collision in the same body is accepted.
@@ -9339,7 +9368,6 @@ export function issueRoutes(
         actor.actorType,
       );
     }
-    const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
     const nextExecutionPolicy =
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)

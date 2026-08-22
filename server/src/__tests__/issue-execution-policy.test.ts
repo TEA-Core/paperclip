@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
 const coderAgentId = "11111111-1111-4111-8111-111111111111";
@@ -131,6 +132,132 @@ describe("normalizeIssueExecutionPolicy", () => {
         externalRef: "[redacted]",
       },
     });
+  });
+});
+
+describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
+  const monitor = {
+    nextCheckAt: "2026-04-11T12:30:00.000Z",
+    notes: "Check deployment",
+  };
+
+  function assertWrite(
+    input: Omit<Parameters<typeof assertPatchableExecutionPolicyWrite>[0], "stagesExplicitlyEmpty"> & {
+      stagesExplicitlyEmpty?: boolean;
+    },
+  ) {
+    return assertPatchableExecutionPolicyWrite({
+      stagesExplicitlyEmpty: false,
+      ...input,
+    });
+  }
+
+  it("rejects an explicit empty stages array", () => {
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { stages: [] },
+        currentPolicy: twoStagePolicy(),
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError(HttpError);
+    try {
+      assertPatchableExecutionPolicyWrite({
+        raw: { stages: [] },
+        currentPolicy: twoStagePolicy(),
+        stagesExplicitlyEmpty: true,
+      });
+      throw new Error("expected assert to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(HttpError);
+      expect((error as HttpError).status).toBe(422);
+      expect((error as Error).message).toBe("executionPolicy.stages must not be empty");
+    }
+  });
+
+  it("rejects an explicit empty stages array even when no policy is stored yet", () => {
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { stages: [] },
+        currentPolicy: null,
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy.stages must not be empty");
+  });
+
+  it("rejects an explicit empty stages array even when other policy fields are present", () => {
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { stages: [], monitor },
+        currentPolicy: twoStagePolicy(),
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy.stages must not be empty");
+  });
+
+  it("flags explicit-emptiness via the captured pre-default flag, not the parsed body", () => {
+    const raw = { mode: "normal", commentRequired: true, stages: [], monitor };
+    expect(() =>
+      assertWrite({ raw, currentPolicy: twoStagePolicy() }),
+    ).not.toThrow();
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw,
+        currentPolicy: twoStagePolicy(),
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy.stages must not be empty");
+  });
+
+  it("rejects an explicit null over a non-null stored policy", () => {
+    expect(() =>
+      assertWrite({ raw: null, currentPolicy: twoStagePolicy() }),
+    ).toThrowError(
+      "executionPolicy must not be set to null on an issue that currently has a policy; send the full replacement policy instead",
+    );
+  });
+
+  it("allows an explicit null over a null stored policy (no-op)", () => {
+    expect(() => assertWrite({ raw: null, currentPolicy: null })).not.toThrow();
+  });
+
+  it("rejects a body that normalizes to null over an issue with a close ladder", () => {
+    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: twoStagePolicy() })).toThrowError(
+      "executionPolicy must not clear the issue's existing close stages",
+    );
+    expect(() => assertWrite({ raw: { commentRequired: true }, currentPolicy: twoStagePolicy() })).toThrowError(
+      "executionPolicy must not clear the issue's existing close stages",
+    );
+  });
+
+  it("allows a body that normalizes to null over an issue with no close ladder", () => {
+    const monitorOnly = normalizeIssueExecutionPolicy({ monitor, stages: [] });
+    expect(monitorOnly).not.toBeNull();
+    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: monitorOnly })).not.toThrow();
+  });
+
+  it("allows a full replacement policy over a non-null stored policy", () => {
+    expect(() =>
+      assertWrite({
+        raw: {
+          stages: [
+            {
+              type: "review",
+              participants: [{ type: "agent", agentId: qaAgentId }],
+            },
+          ],
+        },
+        currentPolicy: twoStagePolicy(),
+      }),
+    ).not.toThrow();
+  });
+
+  it("allows a monitor-only policy that omits the stages field", () => {
+    expect(() => assertWrite({ raw: { monitor }, currentPolicy: null })).not.toThrow();
+    expect(() => assertWrite({ raw: { monitor }, currentPolicy: twoStagePolicy() })).not.toThrow();
+  });
+
+  it("leaves malformed non-object shapes to the schema", () => {
+    expect(() => assertWrite({ raw: "nope", currentPolicy: twoStagePolicy() })).not.toThrow();
   });
 });
 

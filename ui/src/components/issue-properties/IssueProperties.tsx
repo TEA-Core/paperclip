@@ -1026,7 +1026,9 @@ export function IssueProperties({
       executionPolicy: {
         mode: basePolicy?.mode ?? issue.executionPolicy?.mode ?? "normal",
         commentRequired: true,
-        stages: basePolicy?.stages ?? [],
+        // Omit an empty stages array: the write boundary rejects an explicit
+        // `stages: []` (SUP-13634) and the PATCH schema defaults it.
+        ...(basePolicy?.stages?.length ? { stages: basePolicy.stages } : {}),
         ...(nextMonitor ? { monitor: nextMonitor } : {}),
       },
     });
