@@ -169,7 +169,15 @@ async function githubCompareAheadBy(
   token: string,
 ): Promise<number | null> {
   const apiBase = gitHubApiBase(hostname);
-  const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(defaultRef)}...${encodeURIComponent(branch)}`;
+  // baseRef is a local git ref (e.g. "origin/main", "origin/fold/tea-patches-...").
+  // The GitHub compare API takes the bare remote branch name and 404s on the
+  // remote-tracking prefix (SUP-13691). Strip it for this call only — the local
+  // git attribution probes below keep the full ref, where it is correct.
+  const compareBase =
+    defaultRef.startsWith("origin/") && defaultRef.length > "origin/".length
+      ? defaultRef.slice("origin/".length)
+      : defaultRef;
+  const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(compareBase)}...${encodeURIComponent(branch)}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "user-agent": "paperclip-done-transition-guard",
@@ -794,6 +802,40 @@ export async function evaluateDoneTransitionGuard(
             true,
             `branch_absent_landed_via_merged_pr:${issue.identifier}:${mergedPrCount}`,
           );
+        }
+        if (decisionCarried) {
+          // Defense-in-depth (SUP-13691): a 404 here means the branch was not
+          // pushed (or the base ref did not resolve on the remote). The review
+          // approval that arms the merge must not be blocked by the unpushed
+          // branch it is approving (SUP-13207/13290 precedent); a plain close
+          // still lands the deliverable first.
+          void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+            reason: `branch_absent_decision_carried:${branch}`,
+            skipReason: `branch_absent_decision_carried:${branch}`,
+            branch,
+            defaultRef: ctx.defaultRef,
+            owner: parsed.owner,
+            repo: parsed.repo,
+            aheadCount: attribution.aheadCount,
+            attributableCommitCount: attribution.attributableCount,
+            mergedPrCount,
+          });
+          return {
+            allowed: true,
+            reason:
+              `Decision-carrying transition exempted from the branch-absent-on-remote block: ` +
+              `Branch ${branch} is absent from the remote while the execution workspace carries ` +
+              `${attribution.attributableCount} commit${attribution.attributableCount === 1 ? "" : "s"} attributable to ` +
+              `${issue.identifier} and no merged PR references it. ` +
+              "The approval arms the merge rather than closing the issue — the branch lands with delivery.",
+            aheadBy: null,
+            branch,
+            defaultRef: ctx.defaultRef,
+            owner: parsed.owner,
+            repo: parsed.repo,
+            skipped: false,
+            skipReason: prSkipReason,
+          };
         }
         void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
           reason: "branch_absent_on_remote",
