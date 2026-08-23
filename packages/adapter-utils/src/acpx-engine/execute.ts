@@ -420,6 +420,24 @@ export interface AcpxLocalManagedHomeContext {
   onLog: AdapterExecutionContext["onLog"];
 }
 
+/**
+ * Per-run return from {@link AcpxEngineExecutorOptions.prepareLocalManagedHome}.
+ * Mirrors the remote seam's `AcpxRemoteManagedHomeResult.teardown`: the local
+ * lane's one-shot seed runs at run START (before the agent CLI launches), but
+ * the CLI re-creates SDK state dirs with owner-only modes DURING the run, so a
+ * post-run hook is needed to restore the group-reachable shape.
+ */
+export interface AcpxLocalManagedHomeResult {
+  /**
+   * Per-run post-run hook for the local managed home: re-normalize any
+   * artifacts the agent CLI created during the turn (e.g., re-applying 0o2770 +
+   * the shared group to directories the CLI recreated with owner-only modes).
+   * Invoked once on every exit path by `cleanupRemoteBridges`, after the
+   * bridges stop. Absent → no-op.
+   */
+  teardown?: () => Promise<void>;
+}
+
 export interface AcpxEngineExecutorOptions {
   createRuntime?: AcpxRuntimeFactory;
   now?: () => number;
@@ -463,8 +481,15 @@ export interface AcpxEngineExecutorOptions {
    * Per-adapter local managed-home prep + config-env repoint (local-lane
    * counterpart of `prepareRemoteManagedHome`). See
    * {@link AcpxLocalManagedHomeContext}. Absent → no-op on the local lane.
+   *
+   * May return an {@link AcpxLocalManagedHomeResult} whose `teardown` runs a
+   * post-run re-normalize (the CLI re-creates SDK dirs owner-only mid-run, so
+   * the one-shot seed alone cannot hold the group-reachable shape). Fired on
+   * every exit path by `cleanupRemoteBridges`; returning `undefined` opts out.
    */
-  prepareLocalManagedHome?: (input: AcpxLocalManagedHomeContext) => Promise<void>;
+  prepareLocalManagedHome?: (
+    input: AcpxLocalManagedHomeContext,
+  ) => Promise<AcpxLocalManagedHomeResult | undefined>;
 }
 
 interface AcpxPreparedRuntime {
@@ -506,10 +531,17 @@ interface AcpxPreparedRuntime {
   stagedRuntime: PreparedAdapterExecutionTargetRuntime | null;
   // Per-run copy-back hook from the per-adapter remote managed-home seam: runs
   // the codex auth copy-back (via `restoreWorkspace()`). Invoked once on every
-  // exit path by `cleanupRemoteBridges`; it never removes staged temp, so it is
-  // safe on every compatible resume. Null for local runs, the runner-less
-  // fallback, and adapters with no seam.
-  remoteManagedHomeTeardown: (() => Promise<void>) | null;
+   // exit path by `cleanupRemoteBridges`; it never removes staged temp, so it is
+   // safe on every compatible resume. Null for local runs, the runner-less
+   // fallback, and adapters with no seam.
+   remoteManagedHomeTeardown: (() => Promise<void>) | null;
+   // Per-run post-run hook from the per-adapter local managed-home seam:
+   // re-normalizes CLI-created directories in the agent-side config home after
+   // the turn (the one-shot seed at run start cannot hold the group-reachable
+   // shape once the CLI recreates SDK dirs owner-only). Invoked once on every
+   // exit path by `cleanupRemoteBridges`. Null for the remote lane, the
+   // runner-less fallback, and adapters with no local seam.
+   localManagedHomeTeardown: (() => Promise<void>) | null;
   // One-time host-side staged-resource cleanup from the seam (remove staged temp
   // dirs). Fired ONLY when the staged runtime is dropped (failed/cancelled/timed
   // -out turn, incompatible re-stage, idle eviction), not on a clean turn that
@@ -1712,13 +1744,16 @@ async function buildRuntime(input: {
   // lane (`executionTargetIsRemote` is false — an absent target is the local
   // lane), AFTER the operator config env has been merged into `env` above — so
   // an operator-set value for the adapter's config env var (e.g.
-  // CLAUDE_CONFIG_DIR) is already visible to the seam and wins — and BEFORE
-  // the bridge launch freezes the run env. Adapters use it to materialize a
-  // host config home reachable by the agent uid and to repoint their config
-  // env var in `env`. Absent → no-op, byte-identical to the pre-seam
-  // behavior.
+   // CLAUDE_CONFIG_DIR) is already visible to the seam and wins — and BEFORE
+   // the bridge launch freezes the run env. Adapters use it to materialize a
+   // host config home reachable by the agent uid and to repoint their config
+   // env var in `env`. Absent → no-op, byte-identical to the pre-seam
+   // behavior. The seam may also return a post-run `teardown` (the CLI
+   // re-creates SDK dirs owner-only mid-run, so the one-shot seed needs a run-end
+   // re-normalize); it is fired on every exit path by `cleanupRemoteBridges`.
+  let localManagedHomeTeardown: (() => Promise<void>) | null = null;
   if (!executionTargetIsRemote && input.deps.prepareLocalManagedHome) {
-    await input.deps.prepareLocalManagedHome({
+    const localManagedHomeResult = await input.deps.prepareLocalManagedHome({
       acpxAgent,
       companyId: agent.companyId,
       agentId: agent.id,
@@ -1727,6 +1762,7 @@ async function buildRuntime(input: {
       env,
       onLog: input.ctx.onLog,
     });
+    localManagedHomeTeardown = localManagedHomeResult?.teardown ?? null;
   }
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
   // via session/set_config_option — the ACP server's set_config_option handler
@@ -2262,6 +2298,7 @@ async function buildRuntime(input: {
     paperclipBridge,
     stagedRuntime,
     remoteManagedHomeTeardown,
+    localManagedHomeTeardown,
     remoteStagingDispose,
     remoteStagingEnvDelta,
     sessionStagingLeaseRelease,
@@ -2400,6 +2437,13 @@ async function cleanupRemoteBridges(prepared: AcpxPreparedRuntime): Promise<void
   // — so a teardown fault never masks or fails the run result here.
   if (prepared.remoteManagedHomeTeardown) {
     await prepared.remoteManagedHomeTeardown().catch(() => {});
+  }
+  // Local-lane counterpart of the remote teardown above: re-normalize the
+  // agent-side config home after the CLI's run-end dir creation. Same
+  // best-effort contract — the seam logs and swallows its own faults, so a
+  // re-normalize miss never masks or fails the run result here.
+  if (prepared.localManagedHomeTeardown) {
+    await prepared.localManagedHomeTeardown().catch(() => {});
   }
   prepared.sessionStagingLeaseRelease?.();
 }

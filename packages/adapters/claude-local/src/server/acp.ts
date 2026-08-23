@@ -27,6 +27,7 @@ import {
 import type {
   AcpxEngineExecutorOptions,
   AcpxLocalManagedHomeContext,
+  AcpxLocalManagedHomeResult,
   AcpxRemoteManagedHomeContext,
   AcpxRemoteManagedHomeResult,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
@@ -37,6 +38,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   materializeRemoteClaudeConfig,
+  normalizeAgentSideClaudeConfigDirPermissions,
   prepareClaudeConfigSeed,
   resolveAgentSideClaudeConfigDir,
   seedAgentSideClaudeConfig,
@@ -286,24 +288,39 @@ async function prepareClaudeRemoteManagedHome(
  *
  * An operator-set `CLAUDE_CONFIG_DIR` is already merged into the run env
  * before the engine invokes this seam; the local lane can reach host paths
- * verbatim, so an explicit value is honored and we do NOT repoint it.
+ * verbatim, so an explicit value is honored and we do NOT repoint it (and we
+ * return no post-run hook — the operator's home is not ours to re-normalize).
+ *
+ * The one-shot 0o2770 seed above runs at run START, before the agent CLI
+ * launches. The CLI re-creates SDK state dirs with owner-only modes DURING the
+ * run (`sessions/` at 0o700, per-worktree `projects/<cwd>/` at 0o700 → 0o2700),
+ * so this seam ALSO returns a `teardown` that re-normalizes the whole home tree
+ * after the turn — keeping zero 0700 dirs in the home the agent uid reaches.
  */
 export async function prepareClaudeLocalManagedHome(
   input: AcpxLocalManagedHomeContext,
-): Promise<void> {
+): Promise<AcpxLocalManagedHomeResult | undefined> {
   const { env, companyId, agentId, onLog } = input;
   const explicit = typeof env.CLAUDE_CONFIG_DIR === "string" ? env.CLAUDE_CONFIG_DIR.trim() : "";
-  if (explicit) return;
+  if (explicit) return undefined;
   // Host-side resolution: PAPERCLIP_HOME / PAPERCLIP_INSTANCE_ID live in the
   // server process env, not in the per-run env the engine hands over (mirrors
   // the remote seam's use of process.env for the managed seed below).
   const hostEnv = process.env;
   await seedAgentSideClaudeConfig(hostEnv, onLog, companyId, agentId);
-  env.CLAUDE_CONFIG_DIR = resolveAgentSideClaudeConfigDir(hostEnv, companyId, agentId);
+  const agentSideHome = resolveAgentSideClaudeConfigDir(hostEnv, companyId, agentId);
+  env.CLAUDE_CONFIG_DIR = agentSideHome;
   await onLog(
     "stdout",
-    `[paperclip] Local ACP run will use the agent-side Claude config home ${env.CLAUDE_CONFIG_DIR}\n`,
+    `[paperclip] Local ACP run will use the agent-side Claude config home ${agentSideHome}\n`,
   );
+  return {
+    // Re-normalize the home tree after the CLI's run-end dir creation so the
+    // agent uid keeps group-`agents` reachability into the next run. Best-effort:
+    // the normalize logs and swallows its own faults (never fails the run).
+    teardown: () =>
+      normalizeAgentSideClaudeConfigDirPermissions(hostEnv, onLog, companyId, agentId),
+  };
 }
 
 function withClaudeAcpDefaults(options: ClaudeAcpExecutorOptions): AcpxEngineExecutorOptions {

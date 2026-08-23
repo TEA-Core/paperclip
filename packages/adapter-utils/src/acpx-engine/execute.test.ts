@@ -1576,10 +1576,12 @@ describe("shared ACPX engine runtime behavior", () => {
     let seamContext:
       | { acpxAgent?: string; companyId?: string; agentId?: string; runId?: string }
       | null = null;
+    let localTeardownCalls = 0;
     const execute = createAcpxEngineExecutor({
       prepareLocalManagedHome: async (input) => {
         seamContext = { acpxAgent: input.acpxAgent, companyId: input.companyId, agentId: input.agentId, runId: input.runId };
         input.env.CLAUDE_CONFIG_DIR = "/fake/agent-side-claude-home";
+        return { teardown: async () => { localTeardownCalls += 1; } };
       },
       createRuntime: () => ({
         ensureSession: async (input: { sessionOptions?: { env?: Record<string, string> } }) => {
@@ -1614,6 +1616,10 @@ describe("shared ACPX engine runtime behavior", () => {
     });
     // ...and its env repoint reached the spawned session env.
     expect(observedSessionEnv?.CLAUDE_CONFIG_DIR).toBe("/fake/agent-side-claude-home");
+    // The seam's post-run teardown fired exactly once on the run's exit path
+    // (the CLI re-creates SDK dirs owner-only mid-run, so the one-shot seed
+    // needs a run-end re-normalize).
+    expect(localTeardownCalls).toBe(1);
   });
 
   it("merges Paperclip allowlist into an existing .claude/settings.local.json without losing user entries", async () => {
@@ -2879,6 +2885,7 @@ describe("ACPX engine remote managed-home seam (PR 2: per-adapter home seed)", (
         executionTarget,
         prepareLocalManagedHome: async () => {
           localSeamCalls += 1;
+          return undefined;
         },
       },
     );
