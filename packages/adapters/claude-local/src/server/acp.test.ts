@@ -7,6 +7,7 @@ import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
   buildClaudeAcpConfig,
   createClaudeAcpExecutor,
+  isAcpAgentUidSplitArmed,
   nodeVersionMeetsClaudeAcpMinimum,
   prepareClaudeLocalManagedHome,
   resolveClaudeAcpBillingIdentity,
@@ -262,6 +263,47 @@ describe("claude_local ACP lane", () => {
       permissionMode: "approve-all",
       nonInteractivePermissions: "deny",
       warmHandleIdleMs: 25,
+    });
+  });
+
+  describe("ACP lane uid-split gate (SUP-13504)", () => {
+    it("is off by default and ignores non-string or falsy values", () => {
+      expect(isAcpAgentUidSplitArmed({})).toBe(false);
+      expect(isAcpAgentUidSplitArmed({ env: {} })).toBe(false);
+      expect(isAcpAgentUidSplitArmed({ env: { PAPERCLIP_ACP_AGENT_UID_SPLIT: 1 } })).toBe(false);
+      expect(isAcpAgentUidSplitArmed({ env: { PAPERCLIP_ACP_AGENT_UID_SPLIT: "0" } })).toBe(false);
+      expect(isAcpAgentUidSplitArmed({ env: { PAPERCLIP_ACP_AGENT_UID_SPLIT: "false" } })).toBe(false);
+      expect(isAcpAgentUidSplitArmed({ env: { PAPERCLIP_ACP_AGENT_UID_SPLIT: "off" } })).toBe(false);
+      expect(isAcpAgentUidSplitArmed({ env: { PAPERCLIP_ACP_AGENT_UID_SPLIT: " " } })).toBe(false);
+    });
+
+    it("arms only from the per-agent env config with a truthy value", () => {
+      for (const value of ["1", "true", "on", " TRUE ", "On"]) {
+        expect(isAcpAgentUidSplitArmed({ env: { PAPERCLIP_ACP_AGENT_UID_SPLIT: value } })).toBe(true);
+      }
+    });
+
+    it("normalizes the armed flag onto the ACP config without dropping the raw env key", () => {
+      const config = buildClaudeAcpConfig({
+        engine: "acp",
+        env: { PAPERCLIP_ACP_AGENT_UID_SPLIT: "1", ANTHROPIC_MODEL: "claude-opus-4-7" },
+      });
+      expect(config.acpAgentUidSplit).toBe(true);
+      // The raw key must survive into config.env: it feeds the session
+      // fingerprint so flipping the gate invalidates a warm handle, and the
+      // engine strips it from the agent env via envUnset instead.
+      expect(config.env).toEqual({
+        PAPERCLIP_ACP_AGENT_UID_SPLIT: "1",
+        ANTHROPIC_MODEL: "claude-opus-4-7",
+      });
+    });
+
+    it("omits acpAgentUidSplit when the gate is not armed (byte-identical config)", () => {
+      const config = buildClaudeAcpConfig({ engine: "acp" });
+      expect(config).not.toHaveProperty("acpAgentUidSplit");
+      expect(buildClaudeAcpConfig({ env: { PAPERCLIP_ACP_AGENT_UID_SPLIT: "0" } })).not.toHaveProperty(
+        "acpAgentUidSplit",
+      );
     });
   });
 

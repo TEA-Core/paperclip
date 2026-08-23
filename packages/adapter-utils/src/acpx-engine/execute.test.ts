@@ -27,11 +27,13 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (importActual) => {
   };
 });
 import {
+  ACP_AGENT_UID_SPLIT_ENV_KEY,
   createAcpxEngineExecutor,
   findAncestorBin,
   geminiVersionSupportsNativeAcpFlag,
   parseGeminiVersionParts,
   probeSignalDeliverability,
+  resolveAcpAgentSpawnTarget,
   rewriteGeminiAcpFlagForVersion,
   summarizeAcpxTurnUsage,
   type AcpxEngineExecutorOptions,
@@ -4798,5 +4800,74 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
     expect(emitted.has("stage.sync")).toBe(false);
     expect(emitted.has("bridge.paperclip")).toBe(false);
     expect(emitted.has("bridge.process-session")).toBe(false);
+  });
+});
+
+describe("ACP lane uid-split spawn target (SUP-13504)", () => {
+  let originalAgentUid: string | undefined;
+  let originalShimOverride: string | undefined;
+
+  beforeEach(() => {
+    originalAgentUid = process.env.PAPERCLIP_AGENT_UID;
+    originalShimOverride = process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+  });
+
+  afterEach(() => {
+    if (originalAgentUid === undefined) delete process.env.PAPERCLIP_AGENT_UID;
+    else process.env.PAPERCLIP_AGENT_UID = originalAgentUid;
+    if (originalShimOverride === undefined) delete process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+    else process.env.PAPERCLIP_AGENT_SPAWN_SHIM = originalShimOverride;
+  });
+
+  async function makeExecutableShim(): Promise<string> {
+    const root = await makeTempRoot();
+    const shimPath = path.join(root, "paperclip-spawn-agent");
+    await fs.writeFile(shimPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.chmod(shimPath, 0o755);
+    return shimPath;
+  }
+
+  it("stays undefined with the lane flag off, even when the deployment arm and shim hold", async () => {
+    process.env.PAPERCLIP_AGENT_UID = "1001";
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = await makeExecutableShim();
+    await expect(
+      resolveAcpAgentSpawnTarget({ laneFlagArmed: false, executionTargetIsRemote: false }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("stays undefined for remote execution targets even with the lane flag on", async () => {
+    process.env.PAPERCLIP_AGENT_UID = "1001";
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = await makeExecutableShim();
+    await expect(
+      resolveAcpAgentSpawnTarget({ laneFlagArmed: true, executionTargetIsRemote: true }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("stays undefined when PAPERCLIP_AGENT_UID is not armed", async () => {
+    delete process.env.PAPERCLIP_AGENT_UID;
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = await makeExecutableShim();
+    await expect(
+      resolveAcpAgentSpawnTarget({ laneFlagArmed: true, executionTargetIsRemote: false }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("resolves the shim path when lane flag, deployment arm, and executable shim all hold", async () => {
+    const shimPath = await makeExecutableShim();
+    process.env.PAPERCLIP_AGENT_UID = "1001";
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = shimPath;
+    await expect(
+      resolveAcpAgentSpawnTarget({ laneFlagArmed: true, executionTargetIsRemote: false }),
+    ).resolves.toEqual({ command: shimPath });
+  });
+
+  it("hard-fails when the lane flag is armed but the shim is not executable", async () => {
+    const missingShim = path.join(await makeTempRoot(), "paperclip-spawn-agent-missing");
+    process.env.PAPERCLIP_AGENT_UID = "1001";
+    process.env.PAPERCLIP_AGENT_SPAWN_SHIM = missingShim;
+    await expect(
+      resolveAcpAgentSpawnTarget({ laneFlagArmed: true, executionTargetIsRemote: false }),
+    ).rejects.toThrow(
+      new RegExp(`${ACP_AGENT_UID_SPLIT_ENV_KEY} is armed but the setuid spawn shim is not executable`),
+    );
   });
 });

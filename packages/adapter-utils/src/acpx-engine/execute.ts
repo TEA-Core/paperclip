@@ -33,6 +33,7 @@ import {
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   applyPaperclipWorkspaceEnv,
+  asBoolean,
   asNumber,
   asString,
   buildInvocationEnvForLogs,
@@ -228,6 +229,66 @@ function buildOrphanedAgentEvidence(
     signal: "SIGTERM",
     errorCode: probe.errorCode,
   };
+}
+
+// Lane-scoped gate for the ACP-lane agent-uid split (SUP-13504). The raw key
+// lives in the agent's per-agent env config; the claude_local adapter
+// normalizes it onto the config as `acpAgentUidSplit` before the engine sees
+// it. It is deliberately NOT read from the server's process env: the
+// deployment-level arm (PAPERCLIP_AGENT_UID) is already process-wide, so a
+// flag that read host env would arm every claude_local agent at once instead
+// of one staged canary at a time.
+export const ACP_AGENT_UID_SPLIT_ENV_KEY = "PAPERCLIP_ACP_AGENT_UID_SPLIT";
+
+// Mirrors server-utils.ts' DEFAULT_AGENT_SPAWN_SHIM (that file is out of the
+// uid-split patch budget, so the default path cannot be shared; keep them in
+// lockstep).
+const DEFAULT_ACP_AGENT_SPAWN_SHIM = "/usr/local/sbin/paperclip-spawn-agent";
+
+/**
+ * Resolve the ACP lane's uid-drop spawn target. The ACP bridge is spawned by
+ * acpx itself, bypassing runChildProcess's resolveSpawnTarget, so the setuid
+ * shim is handed to acpx as a spawn-target substitute (`agentSpawnTarget`):
+ * acpx execs the shim with the resolved agent command + args as the shim's
+ * argv[1..], landing the bridge (and its SDK child) at the split uid.
+ *
+ * Armed only when every gate holds:
+ *   - local execution target (the shim is a host binary; remote/sandbox lanes
+ *     are out of scope for the split),
+ *   - the per-agent lane flag (`acpAgentUidSplit`),
+ *   - the deployment-level arm `PAPERCLIP_AGENT_UID` (the same gate
+ *     resolveSpawnTarget applies on the CLI lane),
+ *   - an executable setuid shim on disk.
+ *
+ * Any missing gate returns `undefined`, and acpx then spawns the original
+ * agent command — byte-identical to the pre-split behavior. When the lane
+ * flag IS armed but the shim is missing, hard-fail: that combination would
+ * silently land the agent at uid 1000 and reopen the master-key exposure.
+ */
+export async function resolveAcpAgentSpawnTarget(input: {
+  laneFlagArmed: boolean;
+  executionTargetIsRemote: boolean;
+}): Promise<{ command: string; args?: string[] } | undefined> {
+  if (input.executionTargetIsRemote) return undefined;
+  if (!input.laneFlagArmed) return undefined;
+  if (process.platform === "win32") return undefined;
+  if (!(process.env.PAPERCLIP_AGENT_UID ?? "").trim()) return undefined;
+  const shimPath = process.env.PAPERCLIP_AGENT_SPAWN_SHIM?.trim() || DEFAULT_ACP_AGENT_SPAWN_SHIM;
+  let shimExecutable = false;
+  try {
+    await fs.access(shimPath, fsSync.constants.X_OK);
+    shimExecutable = true;
+  } catch {
+    shimExecutable = false;
+  }
+  if (!shimExecutable) {
+    throw new Error(
+      `${ACP_AGENT_UID_SPLIT_ENV_KEY} is armed but the setuid spawn shim is not executable at "${shimPath}". ` +
+        "Agent runs would land at uid 1000, reopening the master-key exposure. " +
+        "Install the shim or unset PAPERCLIP_AGENT_UID / PAPERCLIP_ACP_AGENT_UID_SPLIT.",
+    );
+  }
+  return { command: shimPath };
 }
 
 type AcpxRuntimeFactory = (options: PaperclipAcpRuntimeOptions) => AcpRuntime;
@@ -521,6 +582,11 @@ interface AcpxPreparedRuntime {
   fingerprint: string;
   agentCommand: string | null;
   agentRegistry: AcpAgentRegistry;
+  // Lane-scoped uid-drop spawn target for acpx (SUP-13504): the setuid shim
+  // path the agent process must land on. `undefined` unless the lane flag,
+  // the deployment arm, and an executable shim all hold — then acpx spawns
+  // the original agent command as the shim's argv[1].
+  agentSpawnTarget: { command: string; args?: string[] } | undefined;
   processSessionBridge: AdapterExecutionTargetProcessSessionBridgeHandle | null;
   paperclipBridge: AdapterExecutionTargetPaperclipBridgeHandle | null;
   // The workspace/runtime staged into a runner-backed remote sandbox (null for
@@ -2261,8 +2327,24 @@ async function buildRuntime(input: {
       ...secretsNamespaceKeys,
       "DATABASE_URL",
       "DATABASE_MIGRATION_URL",
+      // The ACP-lane uid-split gate is engine plumbing, not agent config: it
+      // arms agentSpawnTarget below and must not leak into the agent env.
+      // The raw key still feeds the session fingerprint (resolvedAdapterEnv),
+      // so flipping it invalidates a warm/resumable handle.
+      ...(ACP_AGENT_UID_SPLIT_ENV_KEY in envConfig ? [ACP_AGENT_UID_SPLIT_ENV_KEY] : []),
     ]),
   ];
+  // Lane-scoped uid split (SUP-13504): hand acpx the setuid shim as the spawn
+  // target ONLY when the lane flag, the deployment-level arm, and an
+  // executable shim all hold. The lane flag rides the normalized
+  // `acpAgentUidSplit` the claude_local adapter sets from
+  // PAPERCLIP_ACP_AGENT_UID_SPLIT (per-agent env config, default off);
+  // PAPERCLIP_AGENT_UID supplies the deployment arm, exactly as
+  // resolveSpawnTarget reads it on the CLI lane.
+  const agentSpawnTarget = await resolveAcpAgentSpawnTarget({
+    laneFlagArmed: asBoolean(config.acpAgentUidSplit, false),
+    executionTargetIsRemote,
+  });
 
   return {
     acpxAgent,
@@ -2294,6 +2376,7 @@ async function buildRuntime(input: {
     fingerprint,
     agentCommand,
     agentRegistry,
+    agentSpawnTarget,
     processSessionBridge,
     paperclipBridge,
     stagedRuntime,
@@ -3497,6 +3580,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // fingerprint / compat key are unaffected — this redirects ONLY the host
         // `spawn()` `chdir`, not the in-sandbox data path.
         spawnCwd: prepared.hostSpawnCwd,
+        // Lane-scoped uid-drop spawn target (SUP-13504). `undefined` unless
+        // the lane flag, the deployment-level PAPERCLIP_AGENT_UID arm, and an
+        // executable setuid shim all hold; then acpx execs the shim with the
+        // agent command as argv[1], landing the bridge at the split uid.
+        // Only meaningful on a cold start: a warm handle already spawned its
+        // agent with the target its own sessionKey (flag-sensitive
+        // fingerprint) pinned.
+        agentSpawnTarget: prepared.agentSpawnTarget,
         sessionStore: createRuntimeStore({ stateDir: prepared.stateDir }),
         agentRegistry: prepared.agentRegistry,
         permissionMode: prepared.permissionMode,
