@@ -5186,14 +5186,12 @@ export function buildSessionWorkspaceConfigCategoryValue(input: {
   issueContext: {
     projectId?: unknown;
     projectWorkspaceId?: unknown;
-    executionWorkspaceId?: unknown;
     executionWorkspacePreference?: unknown;
     executionWorkspaceSettings?: unknown;
   } | null | undefined;
   projectContext: { id?: unknown; executionWorkspacePolicy?: unknown } | null | undefined;
   projectPolicy: unknown;
   issueSettings: unknown;
-  reusableExecutionWorkspaceConfig: unknown;
   existingExecutionWorkspace: unknown;
 }) {
   return {
@@ -5206,7 +5204,6 @@ export function buildSessionWorkspaceConfigCategoryValue(input: {
       ? {
           projectId: input.issueContext.projectId ?? null,
           projectWorkspaceId: input.issueContext.projectWorkspaceId ?? null,
-          executionWorkspaceId: input.issueContext.executionWorkspaceId ?? null,
           executionWorkspacePreference: input.issueContext.executionWorkspacePreference ?? null,
           executionWorkspaceSettings: input.issueContext.executionWorkspaceSettings ?? null,
         }
@@ -5219,8 +5216,25 @@ export function buildSessionWorkspaceConfigCategoryValue(input: {
       : null,
     projectPolicy: input.projectPolicy,
     issueSettings: input.issueSettings,
-    reusableExecutionWorkspaceConfig: input.reusableExecutionWorkspaceConfig,
     existingExecutionWorkspace: input.existingExecutionWorkspace,
+  };
+}
+
+export function projectExecutionWorkspaceForSessionCategory(
+  workspace: ExecutionWorkspace | null | undefined,
+): (Pick<
+  ExecutionWorkspace,
+  "mode" | "strategyType" | "projectWorkspaceId" | "repoUrl" | "baseRef" | "branchName"
+> & { config: ExecutionWorkspaceConfig | null }) | null {
+  if (!workspace) return null;
+  return {
+    mode: workspace.mode,
+    strategyType: workspace.strategyType,
+    projectWorkspaceId: workspace.projectWorkspaceId,
+    repoUrl: workspace.repoUrl,
+    baseRef: workspace.baseRef,
+    branchName: workspace.branchName,
+    config: workspace.config,
   };
 }
 
@@ -15031,6 +15045,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
     const latestAgentConfigRevision = await getLatestAgentConfigRevision(agent.companyId, agent.id);
     const configuredModel = readConfiguredModelFromAdapterConfig(runtimeConfig);
+
+    // SUP-13733: the anchor workspace may be resolved before the session's config-freshness
+    // decision has seen the post-attach workspace state. Use the raw (pre-reset) session resume
+    // parameters for workspace anchoring; the freshness-gated value is still computed and used
+    // later to decide whether the adapter actually resumes the session.
+    function resolvePreviousSessionParams(allowTaskSession: boolean, allowRuntimeStateFallback: boolean) {
+      return (
+        explicitResumeSessionParams ??
+        (isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId)
+          ? { sessionId: explicitResumeSessionDisplayId }
+          : null) ??
+        normalizeResumeParamsForAdapter(
+          agent.adapterType,
+          stripPaperclipSessionMetadataFromSessionParams(
+            allowTaskSession ? taskSessionDecodedParams : null,
+          ),
+        ) ??
+        (taskKey || !allowRuntimeStateFallback
+          ? null
+          : normalizeResumeParamsForAdapter(
+              agent.adapterType,
+              readRuntimeStateSessionParams(runtime.stateJson, runtime.sessionId),
+            ))
+      );
+    }
+    const anchorPreviousSessionParams = resolvePreviousSessionParams(true, true);
+
     const provisionWorkspaceResult = await provisionIssueExecutionWorkspace({
       db,
       agent,
@@ -15056,6 +15097,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       context,
       pluginWorkerManager: options.pluginWorkerManager,
       environmentRuntime,
+      previousSessionParams: anchorPreviousSessionParams,
       resolveWorkspace: (previousSessionParams) =>
         resolveWorkspaceForRun(
           agent,
@@ -15070,11 +15112,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             executionEnvironmentDriver: selectedEnvironmentForConfig?.driver ?? null,
           },
         ),
-      resolveSessionConfig: async ({
-        requestedShouldReuseExisting,
-        reusableExistingExecutionWorkspace,
-        requestedReusableExecutionWorkspaceConfig,
-      }) => {
+      resolveSessionConfig: async ({ persistedExecutionWorkspace, postAttachIssuePatch }) => {
+        const postAttachIssueContext = issueContext
+          ? {
+              ...issueContext,
+              projectWorkspaceId:
+                postAttachIssuePatch?.projectWorkspaceId ?? issueContext.projectWorkspaceId,
+              executionWorkspacePreference:
+                postAttachIssuePatch?.executionWorkspacePreference ??
+                issueContext.executionWorkspacePreference,
+              executionWorkspaceSettings:
+                postAttachIssuePatch?.executionWorkspaceSettings ??
+                issueContext.executionWorkspaceSettings,
+            }
+          : null;
+        const postAttachIssueSettings = postAttachIssuePatch?.executionWorkspaceSettings
+          ? postAttachIssuePatch.executionWorkspaceSettings
+          : (issueExecutionWorkspaceSettings as Record<string, unknown> | null) ?? null;
         const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata({
           adapterType: agent.adapterType,
           effectiveAdapterConfig: runtimeConfig,
@@ -15083,23 +15137,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           workspaceConfig: buildSessionWorkspaceConfigCategoryValue({
             requestedMode: requestedExecutionWorkspaceMode,
             effectiveMode: effectiveExecutionWorkspaceMode,
-            issueContext,
+            issueContext: postAttachIssueContext,
             projectContext,
             projectPolicy: projectExecutionWorkspacePolicy,
-            issueSettings: issueExecutionWorkspaceSettings,
-            reusableExecutionWorkspaceConfig: requestedReusableExecutionWorkspaceConfig,
-            existingExecutionWorkspace: reusableExistingExecutionWorkspace
-              ? {
-                  id: reusableExistingExecutionWorkspace.id,
-                  mode: reusableExistingExecutionWorkspace.mode,
-                  strategyType: reusableExistingExecutionWorkspace.strategyType,
-                  projectWorkspaceId: reusableExistingExecutionWorkspace.projectWorkspaceId,
-                  repoUrl: reusableExistingExecutionWorkspace.repoUrl,
-                  baseRef: reusableExistingExecutionWorkspace.baseRef,
-                  branchName: reusableExistingExecutionWorkspace.branchName,
-                  config: reusableExistingExecutionWorkspace.config,
-                }
-              : null,
+            issueSettings: postAttachIssueSettings,
+            existingExecutionWorkspace:
+              projectExecutionWorkspaceForSessionCategory(persistedExecutionWorkspace),
           }),
           environment: {
             selectionSource: environmentResolution.source,
@@ -15141,24 +15184,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const resetTaskSession =
           shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
         const sessionResetReason = sessionConfigFreshness.reasons.join("; ") || null;
-        const taskSessionForRun = resetTaskSession ? null : taskSession;
-        const previousSessionParams =
-          explicitResumeSessionParams ??
-          (isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId)
-            ? { sessionId: explicitResumeSessionDisplayId }
-            : null) ??
-          normalizeResumeParamsForAdapter(
-            agent.adapterType,
-            stripPaperclipSessionMetadataFromSessionParams(
-              sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
-            ),
-          ) ??
-          (taskKey || resetTaskSession
-            ? null
-            : normalizeResumeParamsForAdapter(
-                agent.adapterType,
-                readRuntimeStateSessionParams(runtime.stateJson, runtime.sessionId),
-              ));
+        const previousSessionParams = resolvePreviousSessionParams(
+          !resetTaskSession,
+          !resetTaskSession,
+        );
         return {
           previousSessionParams,
           resetTaskSession,

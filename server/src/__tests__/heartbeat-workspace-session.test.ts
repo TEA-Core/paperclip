@@ -26,6 +26,7 @@ import {
   preflightLowTrustWorkspaceIsolation,
   prioritizeProjectWorkspaceCandidatesForRun,
   parseSessionCompactionPolicy,
+  projectExecutionWorkspaceForSessionCategory,
   provisionExecutionWorkspaceForFreshnessDecision,
   readRuntimeStateSessionParams,
   reconcileReusedExecutionWorkspaceProjectWorkspaceId,
@@ -3239,32 +3240,48 @@ describe("reconcileReusedExecutionWorkspaceProjectWorkspaceId", () => {
   });
 });
 
-describe("SUP-13585 session workspaceConfig category — resumability, not row churn", () => {
-  const baseInput = {
-    requestedMode: "isolated_workspace",
-    effectiveMode: "isolated_workspace",
-    issueContext: {
+describe("SUP-13585 / SUP-13733 session workspaceConfig category — resumability, not row churn", () => {
+  const baseExistingWorkspace = {
+    id: "ew-row-1",
+    mode: "isolated_workspace",
+    strategyType: "git_worktree",
+    projectWorkspaceId: "pw-1",
+    repoUrl: "https://github.com/TEA-Core/Trading-Signal-Platform",
+    baseRef: "origin/main",
+    branchName: "SUP-1-x",
+    config: { provisionCommand: "bash ./scripts/provision-worktree.sh" },
+    updatedAt: new Date("2026-08-20T10:00:00.000Z"),
+    lastUsedAt: new Date("2026-08-20T10:00:00.000Z"),
+  };
+
+  function baseIssueContext(overrides?: Record<string, unknown>) {
+    return {
       projectId: "project-1",
       projectWorkspaceId: "pw-1",
-      executionWorkspaceId: "ew-1",
-      executionWorkspacePreference: "isolated_workspace",
+      executionWorkspacePreference: "reuse_existing",
       executionWorkspaceSettings: { mode: "isolated_workspace" },
       // Deliberately present: a caller passing the whole issue row must not leak these
       // into the hash. Touching an issue is not a reason to drop its agent's session.
       updatedAt: new Date("2026-08-20T10:00:00.000Z"),
       status: "in_progress",
       title: "before",
-    },
+      ...overrides,
+    };
+  }
+
+  const baseInput = {
+    requestedMode: "isolated_workspace",
+    effectiveMode: "isolated_workspace",
+    issueContext: baseIssueContext(),
     projectContext: {
       id: "project-1",
-      executionWorkspacePolicy: { allowIsolated: true },
+      executionWorkspacePolicy: { allowIsolated: true, workspaceStrategy: { type: "git_worktree" } },
       updatedAt: new Date("2026-08-20T10:00:00.000Z"),
       env: { PROJECT_FLAG: "enabled" },
     },
-    projectPolicy: { allowIsolated: true },
+    projectPolicy: { allowIsolated: true, workspaceStrategy: { type: "git_worktree" } },
     issueSettings: { mode: "isolated_workspace" },
-    reusableExecutionWorkspaceConfig: null,
-    existingExecutionWorkspace: { id: "ew-1", branchName: "SUP-1-x", baseRef: "origin/main" },
+    existingExecutionWorkspace: projectExecutionWorkspaceForSessionCategory(baseExistingWorkspace as Parameters<typeof projectExecutionWorkspaceForSessionCategory>[0]),
   };
 
   const fingerprintOf = async (input: Parameters<typeof buildSessionWorkspaceConfigCategoryValue>[0]) => {
@@ -3280,8 +3297,6 @@ describe("SUP-13585 session workspaceConfig category — resumability, not row c
       ...baseInput,
       issueContext: {
         ...baseInput.issueContext,
-        // The agent writing its own issue while it works: status flip, retitle, new
-        // updatedAt. None of it changes whether the saved session is still usable.
         updatedAt: new Date("2026-08-20T11:30:00.000Z"),
         status: "in_review",
         title: "after",
@@ -3297,7 +3312,6 @@ describe("SUP-13585 session workspaceConfig category — resumability, not row c
 
   it.each([
     ["projectWorkspaceId", { projectWorkspaceId: "pw-2" }],
-    ["executionWorkspaceId", { executionWorkspaceId: "ew-2" }],
     ["executionWorkspacePreference", { executionWorkspacePreference: "shared_workspace" }],
     ["executionWorkspaceSettings", { executionWorkspaceSettings: { mode: "shared_workspace" } }],
     ["projectId", { projectId: "project-2" }],
@@ -3324,13 +3338,51 @@ describe("SUP-13585 session workspaceConfig category — resumability, not row c
   it.each([
     ["requested mode", { requestedMode: "shared_workspace" }],
     ["effective mode", { effectiveMode: "shared_workspace" }],
-    ["existing workspace branch", { existingExecutionWorkspace: { id: "ew-1", branchName: "other", baseRef: "origin/main" } }],
-    ["existing workspace base ref", { existingExecutionWorkspace: { id: "ew-1", branchName: "SUP-1-x", baseRef: "origin/other" } }],
-  ])("still rotates on a workspace identity change: %s", async (_label, patch) => {
+    ["workspace repo url", { existingExecutionWorkspace: { ...baseInput.existingExecutionWorkspace, repoUrl: "https://github.com/other/repo" } }],
+    ["workspace branch", { existingExecutionWorkspace: { ...baseInput.existingExecutionWorkspace, branchName: "other" } }],
+    ["workspace base ref", { existingExecutionWorkspace: { ...baseInput.existingExecutionWorkspace, baseRef: "origin/other" } }],
+  ])("still rotates on a genuine workspace config change: %s", async (_label, patch) => {
     const before = await fingerprintOf(baseInput);
     const after = await fingerprintOf({ ...baseInput, ...patch });
 
     expect(after).not.toBe(before);
+  });
+
+  it("does not rotate when the same workspace is re-read with updated row timestamps", async () => {
+    const before = await fingerprintOf(baseInput);
+    const reReadWorkspace = {
+      ...baseExistingWorkspace,
+      updatedAt: new Date("2026-08-20T11:30:00.000Z"),
+      lastUsedAt: new Date("2026-08-20T11:30:00.000Z"),
+    };
+    const after = await fingerprintOf({
+      ...baseInput,
+      existingExecutionWorkspace: projectExecutionWorkspaceForSessionCategory(reReadWorkspace as Parameters<typeof projectExecutionWorkspaceForSessionCategory>[0]),
+    });
+
+    expect(after).toBe(before);
+  });
+
+  it("does not rotate when the issue is re-attached to a different workspace row with the same config", async () => {
+    const before = await fingerprintOf(baseInput);
+    const reattachedWorkspace = {
+      ...baseExistingWorkspace,
+      id: "ew-row-2",
+      updatedAt: new Date("2026-08-20T11:30:00.000Z"),
+      lastUsedAt: new Date("2026-08-20T11:30:00.000Z"),
+    };
+    const after = await fingerprintOf({
+      ...baseInput,
+      issueContext: {
+        ...baseInput.issueContext,
+        // The issue's executionWorkspaceId changed (cc352dbd -> 7eddf776 in the live case),
+        // but that is attach-state noise, not a workspace-config change.
+        executionWorkspaceId: "ew-row-2",
+      },
+      existingExecutionWorkspace: projectExecutionWorkspaceForSessionCategory(reattachedWorkspace as Parameters<typeof projectExecutionWorkspaceForSessionCategory>[0]),
+    });
+
+    expect(after).toBe(before);
   });
 
   it("distinguishes an issueless run from an issue-bearing one", async () => {
