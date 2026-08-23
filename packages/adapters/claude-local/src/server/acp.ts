@@ -24,12 +24,13 @@ import {
   DEFAULT_ACP_ENGINE_PERMISSION_MODE,
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "@paperclipai/adapter-utils/acpx-engine/constants";
-import type {
-  AcpxEngineExecutorOptions,
-  AcpxLocalManagedHomeContext,
-  AcpxLocalManagedHomeResult,
-  AcpxRemoteManagedHomeContext,
-  AcpxRemoteManagedHomeResult,
+import {
+  ACP_AGENT_UID_SPLIT_ENV_KEY,
+  type AcpxEngineExecutorOptions,
+  type AcpxLocalManagedHomeContext,
+  type AcpxLocalManagedHomeResult,
+  type AcpxRemoteManagedHomeContext,
+  type AcpxRemoteManagedHomeResult,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
 import {
   asNumber,
@@ -116,6 +117,25 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
   return undefined;
 }
 
+/**
+ * Lane-scoped uid-split gate for the local ACP lane (SUP-13504).
+ *
+ * Sourced ONLY from the per-agent env config (`config.env`), never from the
+ * server's process env. That is deliberate: `PAPERCLIP_AGENT_UID` is already
+ * process-wide in the deployment, so a flag that read host env would arm
+ * every claude_local agent at once (including the executives) with no staged
+ * rollout. This flag arms one agent's ACP lane at a time; `PAPERCLIP_AGENT_UID`
+ * supplies the deployment-level arm, this flag decides whether the lane
+ * actually drops. Default off.
+ */
+export function isAcpAgentUidSplitArmed(config: Record<string, unknown>): boolean {
+  const envConfig = parseObject(config.env);
+  const raw = envConfig[ACP_AGENT_UID_SPLIT_ENV_KEY];
+  if (typeof raw !== "string") return false;
+  const normalized = raw.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "on";
+}
+
 export function buildClaudeAcpConfig(config: Record<string, unknown>): Record<string, unknown> {
   const agentCommand = firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
   const stateDir = firstNonEmptyString(config.stateDir, config.acpStateDir);
@@ -130,6 +150,7 @@ export function buildClaudeAcpConfig(config: Record<string, unknown>): Record<st
     config.warmHandleIdleMs ??
     config.acpWarmHandleIdleMs ??
     DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS;
+  const agentUidSplit = isAcpAgentUidSplitArmed(config);
 
   return {
     ...config,
@@ -140,6 +161,7 @@ export function buildClaudeAcpConfig(config: Record<string, unknown>): Record<st
     warmHandleIdleMs,
     ...(agentCommand ? { agentCommand } : {}),
     ...(stateDir ? { stateDir } : {}),
+    ...(agentUidSplit ? { acpAgentUidSplit: true } : {}),
   };
 }
 
