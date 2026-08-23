@@ -372,17 +372,17 @@ const DEFINITIONS = validateBuiltInAgentDefinitions([
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
         variables: [
-          { name: "lookbackDays", label: "Lookback days", type: "number", defaultValue: 7, required: true, options: [] },
-          { name: "maxTargetAgents", label: "Max target agents", type: "number", defaultValue: 8, required: true, options: [] },
+          { name: "lookbackDays", label: "Lookback window (days)", type: "number", defaultValue: 7, required: false, options: [] },
+          { name: "maxTargetAgents", label: "Max target agents per run", type: "number", defaultValue: 8, required: false, options: [] },
           {
             name: "targetAgentMode",
-            label: "Target agent mode",
+            label: "Target selection mode",
             type: "select",
             defaultValue: "recent_active",
-            required: true,
-            options: ["recent_active", "recent_blocked", "recent_completed"],
+            required: false,
+            options: ["recent_active", "all", "explicit"],
           },
-          { name: "excludeAgentIds", label: "Excluded agent ids", type: "text", defaultValue: "", required: false, options: [] },
+          { name: "excludeAgentIds", label: "Agent ids to exclude (comma-separated)", type: "string", defaultValue: null, required: false, options: [] },
         ],
         triggers: [
           {
