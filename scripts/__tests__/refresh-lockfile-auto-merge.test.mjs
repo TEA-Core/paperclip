@@ -88,7 +88,15 @@ test("auto-merge is enabled for lockfile PRs on master and fold branches", () =>
   );
 });
 
-test("the auto-merge step still squashes with delete-branch", () => {
+test("the auto-merge step arms without --delete-branch or a per-PR merge method", () => {
   const body = stepBody("Enable auto-merge for lockfile PR").join("\n");
-  assert.match(body, /gh pr merge --auto --squash --delete-branch/);
+  const cmd = body.split("\n").find(line => line.trim().startsWith("gh pr merge")) ?? "";
+  assert.ok(cmd, "the auto-merge step must run a `gh pr merge` command");
+  assert.match(cmd, /gh pr merge --auto/, "auto-merge must stay armed for lockfile PRs");
+  // `--delete-branch` is rejected when the target branch has a merge queue
+  // enabled, and on a merge-queue branch the queue owns the merge method, so
+  // neither may appear in the command. Assert on the command line only (not the
+  // step's comments), so the surrounding explanation cannot trip these checks.
+  assert.doesNotMatch(cmd, /--delete-branch/, "no --delete-branch: rejected on merge-queue branches");
+  assert.doesNotMatch(cmd, /--(squash|rebase|merge)\b/, "no per-PR merge method: the merge queue owns it");
 });
