@@ -717,6 +717,15 @@ export interface IssueExecutionState {
   currentStageType: IssueExecutionStageType | null;
   currentParticipant: IssueExecutionStagePrincipal | null;
   returnAssignee: IssueExecutionStagePrincipal | null;
+  /**
+   * The assignee of record at the moment the issue was delivered to
+   * `in_review` — the principal that authored the diff. Distinct from the
+   * issue assignee (which becomes the review participant at delivery) and
+   * from `returnAssignee` (the bounce target), so a cold read of the record
+   * no longer shows participant == assignee for external-lane hand-PATCH
+   * deliveries (SUP-13899).
+   */
+  deliveryAuthor?: IssueExecutionStagePrincipal | null;
   reviewRequest: IssueReviewRequest | null;
   completedStageIds: string[];
   /**

@@ -122,6 +122,7 @@ function blankExecutionState(): IssueExecutionState {
     currentStageType: null,
     currentParticipant: null,
     returnAssignee: null,
+    deliveryAuthor: null,
     reviewRequest: null,
     completedStageIds: [],
     lastDecisionId: null,
@@ -635,6 +636,7 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     currentStageType: null,
     currentParticipant: null,
     returnAssignee: previous?.returnAssignee ?? null,
+    deliveryAuthor: previous?.deliveryAuthor ?? null,
     reviewRequest: null,
     completedStageIds,
     skippedStageIds: mergeSkippedStageIds(previous),
@@ -658,6 +660,7 @@ function buildStateWithCompletedStages(input: {
     currentStageType: input.previous?.currentStageType ?? null,
     currentParticipant: input.previous?.currentParticipant ?? null,
     returnAssignee: input.previous?.returnAssignee ?? input.returnAssignee,
+    deliveryAuthor: input.previous?.deliveryAuthor ?? null,
     reviewRequest: input.previous?.reviewRequest ?? null,
     completedStageIds: input.completedStageIds,
     skippedStageIds: mergeSkippedStageIds(input.previous, input.skippedStageIds),
@@ -680,6 +683,7 @@ function buildSkippedStageCompletedState(input: {
     currentStageType: null,
     currentParticipant: null,
     returnAssignee: input.previous?.returnAssignee ?? input.returnAssignee,
+    deliveryAuthor: input.previous?.deliveryAuthor ?? null,
     reviewRequest: null,
     completedStageIds: input.completedStageIds,
     skippedStageIds: mergeSkippedStageIds(input.previous, input.skippedStageIds),
@@ -697,6 +701,7 @@ function buildPendingState(input: {
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   changesRequestedCount?: number;
+  deliveryAuthor?: IssueExecutionStagePrincipal | null;
 }): IssueExecutionState {
   return {
     status: PENDING_STATUS,
@@ -705,6 +710,7 @@ function buildPendingState(input: {
     currentStageType: input.stage.type,
     currentParticipant: input.participant,
     returnAssignee: input.returnAssignee,
+    deliveryAuthor: input.deliveryAuthor ?? input.previous?.deliveryAuthor ?? null,
     reviewRequest: input.reviewRequest ?? null,
     completedStageIds: input.previous?.completedStageIds ?? [],
     skippedStageIds: mergeSkippedStageIds(input.previous),
@@ -742,6 +748,7 @@ function buildPendingStagePatch(input: {
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   changesRequestedCount?: number;
+  deliveryAuthor?: IssueExecutionStagePrincipal | null;
 }) {
   input.patch.status = "in_review";
   Object.assign(input.patch, patchForPrincipal(input.participant));
@@ -753,6 +760,7 @@ function buildPendingStagePatch(input: {
     returnAssignee: input.returnAssignee,
     reviewRequest: input.reviewRequest,
     changesRequestedCount: input.changesRequestedCount,
+    deliveryAuthor: input.deliveryAuthor,
   });
 }
 
@@ -1204,6 +1212,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     );
   }
 
+  // The assignee of record at delivery is the delivery author. Capturing it
+  // here (before the patch reassigns the issue to the review participant)
+  // keeps the diff author distinguishable on the recorded shape; the
+  // exclusion above already keeps the author from being selected as the
+  // participant of their own stage.
   buildPendingStagePatch({
     patch,
     previous:
@@ -1220,6 +1233,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     participant,
     returnAssignee,
     reviewRequest: input.reviewRequest ?? null,
+    deliveryAuthor: currentAssignee,
   });
   return {
     patch,
