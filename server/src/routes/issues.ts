@@ -137,10 +137,13 @@ import {
   projectService,
   routineService,
   workProductService,
+} from "../services/index.js";
+import {
   armMergeOnApproval,
   publishApprovalStatus,
-} from "../services/index.js";
-import { shouldPublishApprovalStatus } from "../services/merge-arming.js";
+  shouldPublishApprovalStatus,
+  type MergeArmingDecision,
+} from "../services/merge-arming.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
 import {
   evaluateDoneTransitionGuard,
@@ -2764,6 +2767,80 @@ export function issueRoutes(
       `GitHub credential. See SUP-13038.`;
     await issueSvc.addComment(issueId, body, {}, { authorType: "system" });
   }
+
+  // SUP-13904: shared post-transition merge-arming hook, run by BOTH doors that
+  // record an approved review decision (the PATCH decision path and the comment
+  // auto-approval path). Publishes paperclip/approved on the approved head,
+  // persists Guard A's executionState.approvalStatus.publishedHeadSha (so the
+  // approval-status reconciler can verify content identity before re-publishing),
+  // and arms the merge when the company has merge arming enabled. A hook failure
+  // is logged and reported as a system comment, never fatal to the transition.
+  const runApprovalMergeArming = async ({
+    issue,
+    decision,
+    closingTransition,
+  }: {
+    issue: { id: string; companyId: string; issueNumber: number | null; executionState: unknown };
+    decision: MergeArmingDecision | null | undefined;
+    closingTransition: boolean;
+  }): Promise<void> => {
+    if (!shouldPublishApprovalStatus(decision)) return;
+    const issueIdentifier = `SUP-${issue.issueNumber}`;
+    try {
+      // SUP-13831: the zero-mention-row live-discovery in publishApprovalStatus
+      // is a delivery probe. It must only run when the transition CLOSes the
+      // issue (effectiveStatus === "done"), not when a stage approval redirects
+      // the requested `done` to a later stage (effectiveStatus === "in_review").
+      const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier, {
+        closingTransition,
+      });
+
+      // SUP-13714 Guard A persistence: record which head this approval
+      // certified so the reconciler can verify content identity before
+      // subsequent re-publishes. Stored in issues.executionState (no migration;
+      // the stage machine only rebuilds this blob on a subsequent transition,
+      // which for an approved card is a new review cycle and is re-persisted).
+      if (statusOutcome.kind === "armed" && typeof statusOutcome.headSha === "string") {
+        const currentState = (issue.executionState ?? {}) as Record<string, unknown>;
+        await db
+          .update(issueRows)
+          .set({
+            executionState: {
+              ...currentState,
+              approvalStatus: {
+                publishedHeadSha: statusOutcome.headSha,
+                publishedAt: new Date().toISOString(),
+              },
+            },
+          })
+          .where(eq(issueRows.id, issue.id));
+      }
+
+      await svc.addComment(
+        issue.id,
+        `[Merge-arming] ${statusOutcome.message}`,
+        {},
+        { authorType: "system" },
+      );
+
+      const company = await db
+        .select({ mergeArmingEnabled: companies.mergeArmingEnabled })
+        .from(companies)
+        .where(eq(companies.id, issue.companyId))
+        .then((rows) => rows[0] ?? null);
+      if (company?.mergeArmingEnabled) {
+        const armingOutcome = await armMergeOnApproval(db, issue.companyId, issue.id, decision);
+        await svc.addComment(
+          issue.id,
+          `[Merge-arming] ${armingOutcome.message}`,
+          {},
+          { authorType: "system" },
+        );
+      }
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id, companyId: issue.companyId }, "merge-arming hook failed");
+    }
+  };
 
   type DoneTransitionGuardOutcome =
     | { ok: true }
@@ -9805,63 +9882,11 @@ export function issueRoutes(
     }
     for (const publication of postCommitActivityPublications) publishActivity(publication);
 
-    if (shouldPublishApprovalStatus(transition.decision)) {
-      const issueIdentifier = `SUP-${issue.issueNumber}`;
-      try {
-        // SUP-13831: publishApprovalStatus's zero-mention-row live discovery is a
-        // delivery probe; it must run only when the transition CLOSes the issue
-        // (effectiveStatus === "done"), not when a stage approval redirects the
-        // requested `done` to a later stage (effectiveStatus === "in_review").
-        const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier, {
-          closingTransition: isDoneRequest,
-        });
-
-        // SUP-13714 Guard A persistence: record which head the approval
-        // certified so the reconciler can verify content identity before any
-        // later re-publish. Stored in issues.executionState (no migration; the
-        // stage machine rebuilds this blob only on a further transition, which
-        // for an approved card is a new review cycle that re-persists).
-        if (statusOutcome.kind === "armed" && typeof statusOutcome.headSha === "string") {
-          const currentState = (issue.executionState ?? {}) as Record<string, unknown>;
-          await db
-            .update(issueRows)
-            .set({
-              executionState: {
-                ...currentState,
-                approvalStatus: {
-                  publishedHeadSha: statusOutcome.headSha,
-                  publishedAt: new Date().toISOString(),
-                },
-              },
-            })
-            .where(eq(issueRows.id, issue.id));
-        }
-
-        await svc.addComment(
-          issue.id,
-          `[Merge-arming] ${statusOutcome.message}`,
-          {},
-          { authorType: "system" },
-        );
-
-        const company = await db
-          .select({ mergeArmingEnabled: companies.mergeArmingEnabled })
-          .from(companies)
-          .where(eq(companies.id, issue.companyId))
-          .then((rows) => rows[0] ?? null);
-        if (company?.mergeArmingEnabled) {
-          const armingOutcome = await armMergeOnApproval(db, issue.companyId, issue.id, transition.decision);
-          await svc.addComment(
-            issue.id,
-            `[Merge-arming] ${armingOutcome.message}`,
-            {},
-            { authorType: "system" },
-          );
-        }
-      } catch (err) {
-        logger.warn({ err, issueId: issue.id, companyId: issue.companyId }, "merge-arming hook failed");
-      }
-    }
+    await runApprovalMergeArming({
+      issue,
+      decision: transition.decision,
+      closingTransition: isDoneRequest,
+    });
 
     if (enteringBlocked) {
       const blockedIssue = issue;
@@ -12215,6 +12240,17 @@ export function issueRoutes(
           },
         });
       }
+      // SUP-13904: this comment door is a second door onto an approved review
+      // decision, so it must run the same merge-arming post-hook as the PATCH
+      // door — otherwise the card closes without paperclip/approved and without
+      // executionState.approvalStatus, stranding the PR at the fail-closed merge
+      // enforcer and leaving the reconciler's Guard A with no certified head to
+      // re-publish from.
+      await runApprovalMergeArming({
+        issue: currentIssue,
+        decision: transition.decision,
+        closingTransition: autoApproveEffectiveStatus === "done",
+      });
       commentDecisionStageWakeup = buildExecutionStageWakeup({
         issueId: currentIssue.id,
         previousState: currentExecutionState,

@@ -223,6 +223,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       id: issueId,
       companyId,
       identifier,
+      issueNumber: 1,
       title: "Approval-closed card must still clear the delivery guard",
       status: "in_review",
       priority: "medium",
@@ -469,5 +470,74 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await statusOf(issueId)).toBe("done");
+  });
+
+  it("POST comment: auto-approval publishes paperclip/approved and persists the Guard A head (SUP-13904)", async () => {
+    // The comment door is a second door onto an approved review decision. Before
+    // the shared post-hook it closed the card WITHOUT publishing
+    // paperclip/approved and WITHOUT persisting executionState.approvalStatus —
+    // the PR stranded open at the fail-closed merge enforcer and the
+    // approval-status reconciler's Guard A had no certified head to re-publish
+    // from (guard-a:no-approved-head on every tick).
+    // Prefix "SUP" mirrors the issueIdentifier the hook builds (`SUP-<number>`),
+    // so the live PR head ref (`SUP-1-test-branch`) carries the match needle.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("SUP");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const branchName = `${identifier}-test-branch`;
+    const headSha = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      // done-guard delivery probe: branch ahead of the default ref, PR open and unmerged.
+      if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+      if (url.includes("/pulls?")) {
+        return new Response(
+          JSON.stringify([
+            {
+              number: 42,
+              draft: false,
+              merged: false,
+              merged_at: null,
+              head: { ref: branchName },
+              title: `${identifier}: fix the thing`,
+              body: null,
+            },
+          ]),
+          { status: 200 },
+        );
+      }
+      if (url.includes(`/pulls/42`)) return new Response(JSON.stringify({ head: { sha: headSha } }), { status: 200 });
+      if (url.includes("/statuses/")) return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    // Exercise the merge-arming gate as well (armMergeOnApproval is called for
+    // 0 linked PRs in the DB and reports skipped:no-pr without touching GitHub).
+    await db.update(companies).set({ mergeArmingEnabled: true }).where(eq(companies.id, companyId));
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: "## Review: APPROVED\n\nShip it." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+
+    // The paperclip/approved commit status was written to the live PR head.
+    const statusCalls = mockGhFetch.mock.calls.filter(
+      ([url, init]) => String(url).includes("/statuses/") && (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(statusCalls.length).toBe(1);
+    expect(String(statusCalls[0]![0])).toContain(headSha);
+
+    // Guard A persistence: the approval certified a head, so the reconciler can
+    // verify content identity before any later re-publish.
+    const stateRows = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const approvalStatus = (stateRows[0]?.executionState as Record<string, any> | null)?.approvalStatus;
+    expect(approvalStatus?.publishedHeadSha).toBe(headSha);
+    expect(typeof approvalStatus?.publishedAt).toBe("string");
   });
 });
