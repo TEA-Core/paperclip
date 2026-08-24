@@ -176,9 +176,13 @@ import { resolveGitHubToken } from "./github-credential.js";
 
 const ghFetchMock = vi.mocked(ghFetch);
 
-function mockGitProbe(aheadCount: string, attributableCount: string) {
+function mockGitProbe(aheadCount: string, attributableCount: string, statusOutput = " M server/src/x.ts") {
   mockExecFile.mockImplementation(
     (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+      if (args.includes("status")) {
+        cb(null, statusOutput);
+        return;
+      }
       cb(null, args.includes("--grep") ? attributableCount : aheadCount);
     },
   );
@@ -775,7 +779,7 @@ describe("evaluateDoneTransitionGuard", () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
       });
-      mockGitProbe("5", "0");
+      mockGitProbe("5", "0", " M server/src/x.ts");
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
@@ -803,9 +807,98 @@ describe("evaluateDoneTransitionGuard", () => {
             branch: foreignBranch,
             attributableCommitCount: 0,
             mergedPrCount: 0,
+            worktreeDirty: true,
           }),
         }),
       );
+    });
+
+    it("allows the no-repo-deliverable close when the foreign branch owns no commits, no merged PR, and the issue's worktree is clean (SUP-13873)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      mockGitProbe("5", "0", "");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.aheadBy).toBe(3);
+      expect(result.branch).toBe(foreignBranch);
+      expect(result.reason).toContain(foreignBranch);
+      expect(result.reason).toContain("SUP-12345");
+      expect(result.reason).toContain("no repo deliverable is owed");
+      expect(result.skipReason).toContain(`foreign_workspace_branch:${foreignBranch}:SUP-12345`);
+      expect(result.skipReason).toContain("no_repo_deliverable_clean_worktree:SUP-12345");
+    });
+
+    it("blocks the no-repo-deliverable close when the issue's worktree holds uncommitted work (owed diff)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      mockGitProbe("5", "0", "?? server/docs/design/SPEC-draft.md");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain(foreignBranch);
+      expect(result.reason).toContain("SUP-12345");
+      expect(result.reason).toContain("uncommitted work");
+      expect(result.reason).toContain("deliver.sh");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "foreign_workspace_branch",
+            worktreeDirty: true,
+          }),
+        }),
+      );
+    });
+
+    it("fails open when the foreign-branch worktree status probe cannot be measured (SUP-13873)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
+      });
+      mockExecFile.mockImplementation(
+        (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+          if (args.includes("status")) {
+            cb(new Error("git status failed"), "");
+            return;
+          }
+          cb(null, args.includes("--grep") ? "0" : "5");
+        },
+      );
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        if (url.includes("/search/issues")) {
+          return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain(`foreign_workspace_branch:${foreignBranch}:SUP-12345`);
+      expect(result.skipReason).toContain("foreign_workspace_branch_status_probe_failed");
     });
 
     it("allows when the foreign branch carries at least one commit attributable to the issue (shared branch still passes)", async () => {
