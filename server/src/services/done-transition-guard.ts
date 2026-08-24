@@ -198,6 +198,25 @@ async function countIssueAttributableCommits(
 }
 
 /**
+ * Whether the worktree at `worktreePath` carries uncommitted content
+ * (modified, staged, or untracked non-ignored files). This is the owed-diff
+ * discriminator for the foreign-branch block: a clean worktree with zero
+ * attributable commits and no merged PR owes no observable repo content — the
+ * no-repo-deliverable shape (design/spec cards whose acceptance is a recorded
+ * decision, SUP-13873). Returns null when the probe is unreachable (path
+ * missing, git failure) so callers fail open instead of blocking on an
+ * unmeasured signal.
+ */
+async function worktreeHasUncommittedContent(worktreePath: string): Promise<boolean | null> {
+  try {
+    const out = await runGit(["status", "--porcelain"], worktreePath);
+    return out.split(/\r?\n/).some((line) => line.trim().length > 0);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Count merged PRs in the repo whose title or body references the issue identifier.
  *
  * This is the carrier-delivery discriminator: work is routinely landed on a shared
@@ -1122,6 +1141,46 @@ export async function evaluateDoneTransitionGuard(
       );
     }
 
+    // SUP-13873: with attribution and merged-PR probes both measured at zero,
+    // the branch still owes no observable repo content only when the issue's
+    // worktree itself is clean. A design/spec card whose acceptance is a
+    // recorded decision (a done-tier disposition, SUP-12693) leaves no
+    // attributable commit, no merged PR, and no uncommitted work — that is the
+    // sanctioned no-repo-deliverable close. A dirty worktree means content
+    // exists that was never delivered: keep the block and name the owed step.
+    const uncommitted = ctx.worktreePath
+      ? await worktreeHasUncommittedContent(ctx.worktreePath)
+      : null;
+    if (uncommitted === null) {
+      return fallback(
+        `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch) ` +
+          `and the worktree status probe could not be measured; transition allowed`,
+        true,
+        appendSkipReason(foreignToken, "foreign_workspace_branch_status_probe_failed"),
+      );
+    }
+    if (!uncommitted) {
+      return {
+        allowed: true,
+        reason:
+          `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch); ` +
+          `no commit on it is attributable to ${identifier}, no merged PR references ${identifier}, ` +
+          "and the issue's worktree is clean — no repo deliverable is owed. " +
+          "This is the sanctioned no-repo-deliverable close; the done-tier disposition " +
+          "records the outcome.",
+        aheadBy,
+        branch,
+        defaultRef: ctx.defaultRef,
+        owner: parsed.owner,
+        repo: parsed.repo,
+        skipped: false,
+        skipReason: appendSkipReason(
+          foreignToken,
+          `no_repo_deliverable_clean_worktree:${identifier}`,
+        ),
+      };
+    }
+
     void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
       reason: "foreign_workspace_branch",
       skipReason: foreignToken,
@@ -1132,14 +1191,17 @@ export async function evaluateDoneTransitionGuard(
       aheadBy,
       attributableCommitCount: attribution.attributableCount,
       mergedPrCount,
+      worktreeDirty: true,
     });
     return {
       allowed: false,
       reason:
         `Branch ${branch} is ahead of ${ctx.defaultRef} by ${aheadBy} commits and does not reference ` +
         `${identifier} (foreign/workspace-shared branch); no commit on it is attributable to ` +
-        `${identifier} and no merged PR references ${identifier}. ` +
-        "Deliver this issue's work via its own branch and deliver.sh before marking the issue done.",
+        `${identifier} and no merged PR references ${identifier}, but the issue's worktree holds ` +
+        "uncommitted work that was never delivered. Deliver that work via its own branch and " +
+        "deliver.sh (or record the disposition, e.g. as a design/spec card whose acceptance is a " +
+        "done-tier decision) before marking the issue done.",
       aheadBy,
       branch,
       defaultRef: ctx.defaultRef,
