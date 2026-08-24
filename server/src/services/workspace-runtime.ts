@@ -3321,7 +3321,8 @@ export type BaseRepoHygieneDecision =
   | { action: "ok" }
   | { action: "fastForward" }
   | { action: "restore"; reasons: string[]; snapshotTrackedChanges: boolean }
-  | { action: "diverged"; aheadCount: number; behindCount: number; aheadCommitSubjects: string[] };
+  | { action: "diverged"; aheadCount: number; behindCount: number; aheadCommitSubjects: string[] }
+  | { action: "indeterminate"; graftCommits: string[] };
 
 /**
  * SUP-11285: should the base repo be put back before we cut a worktree from it?
@@ -3373,6 +3374,24 @@ export function resolveBaseRepoHygieneDecision(input: {
    * Best-effort; may be undefined when unavailable.
    */
   aheadCommitSubjects?: string[];
+  /**
+   * SUP-13857: false when ancestry between HEAD and the base ref cannot be
+   * computed — a shallow clone whose graft severs the history, or two roots
+   * with no merge base at all.
+   *
+   * This exists because `git rev-list --left-right --count A...B` does NOT fail
+   * when there is no merge base: it silently degenerates to counting BOTH WHOLE
+   * HISTORIES. Observed on the Trading-Signal-Platform base repo 2026-08-24 —
+   * reported 2519 ahead / 137 behind where the truth was 22 ahead / 349 behind.
+   * Those numbers then classify the repo `diverged`, and `diverged` by design
+   * never resets, so the base repo drifts permanently with no way back.
+   *
+   * A count nobody can compute must not be published at all. Defaults to true
+   * so every existing caller and every non-shallow repo behaves exactly as before.
+   */
+  divergenceComputable?: boolean;
+  /** Graft commits read from `.git/shallow`, for the indeterminate warning. */
+  graftCommits?: string[];
 }): BaseRepoHygieneDecision {
   const reasons: string[] = [];
   const defaultRef = input.defaultRef?.replace(/^origin\//, "") ?? null;
@@ -3397,6 +3416,13 @@ export function resolveBaseRepoHygieneDecision(input: {
     if (input.headBehindBaseRef) {
       return { action: "fastForward" };
     }
+    // SUP-13857: refuse to publish a divergence we cannot compute. Deliberately
+    // AFTER the fastForward check: `merge-base --is-ancestor` succeeding proves
+    // the ancestry is intact for that pair, so a genuine fast-forward inside the
+    // shallow window still resolves normally.
+    if (input.divergenceComputable === false) {
+      return { action: "indeterminate", graftCommits: input.graftCommits ?? [] };
+    }
     if (input.aheadCount && input.aheadCount > 0 && input.behindCount && input.behindCount > 0) {
       return {
         action: "diverged",
@@ -3412,6 +3438,100 @@ export function resolveBaseRepoHygieneDecision(input: {
     reasons,
     snapshotTrackedChanges: input.dirtyTrackedPathCount > 0 || input.unmergedPathCount > 0,
   };
+}
+
+/**
+ * SUP-13857: how long a base-repo deepen may take, and how far it may reach.
+ *
+ * Bounded on purpose. The deepen is opportunistic hygiene on a repo the dispatched
+ * issue did not break, so it must never become the thing that makes a dispatch slow
+ * or stuck. One attempt at each strategy, an explicit wall clock, no retry loop.
+ */
+const BASE_REPO_DEEPEN_TIMEOUT_MS = 60_000;
+const BASE_REPO_DEEPEN_COMMITS = 1000;
+
+/** Run a git command with a hard wall clock. Rejects on timeout; the caller decides. */
+async function runGitBounded(args: string[], cwd: string, timeoutMs: number): Promise<string> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs);
+    // Never let the bound itself hold the process open.
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([runGit(args, cwd), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Graft commits recorded in `.git/shallow`, or [] when the repo is not shallow. */
+async function readShallowGraftCommits(repoRoot: string): Promise<string[]> {
+  // Ask git where the git dir is rather than assuming `<repoRoot>/.git` — it is a
+  // FILE, not a directory, in a linked worktree.
+  const gitDir = await runGit(["rev-parse", "--git-dir"], repoRoot).catch(() => null);
+  if (!gitDir) return [];
+  const shallowPath = path.isAbsolute(gitDir)
+    ? path.join(gitDir, "shallow")
+    : path.join(repoRoot, gitDir, "shallow");
+  return await fs
+    .readFile(shallowPath, "utf8")
+    .then((text) => text.split("\n").map((line) => line.trim()).filter((line) => line.length > 0))
+    .catch(() => []);
+}
+
+/**
+ * SUP-13857: decide ONCE, before any counting, whether ahead/behind is computable.
+ *
+ * `git rev-list --left-right --count A...B` does not fail without a merge base — it
+ * counts both whole histories and returns two large, meaningless integers. Those get
+ * classified `diverged`, which never resets, so the base repo is stuck for good. The
+ * only safe move is to not produce the numbers.
+ *
+ * Deepening is attempted first because the honest fix is to restore the ancestry, and
+ * it is entirely best-effort: any failure becomes a warning and the dispatch proceeds.
+ */
+async function resolveBaseRepoShallowState(
+  repoRoot: string,
+  baseRef: string,
+): Promise<{ divergenceComputable: boolean; graftCommits: string[]; warnings: string[] }> {
+  const warnings: string[] = [];
+  const describe = (err: unknown) => (err instanceof Error ? err.message : String(err)).split("\n")[0];
+  const isShallow = async () =>
+    (await runGit(["rev-parse", "--is-shallow-repository"], repoRoot).catch(() => "false")).trim() === "true";
+
+  let shallow = await isShallow();
+  if (shallow) {
+    let deepened = false;
+    try {
+      await runGitBounded(["fetch", "--unshallow"], repoRoot, BASE_REPO_DEEPEN_TIMEOUT_MS);
+      deepened = true;
+    } catch (unshallowError) {
+      // --unshallow fails on a repo that is already complete, and on some servers
+      // that refuse it; --deepen is the narrower fallback.
+      try {
+        await runGitBounded(["fetch", `--deepen=${BASE_REPO_DEEPEN_COMMITS}`], repoRoot, BASE_REPO_DEEPEN_TIMEOUT_MS);
+        deepened = true;
+      } catch (deepenError) {
+        warnings.push(
+          `Base repository at ${repoRoot} is a shallow clone and could not be deepened ` +
+            `(git fetch --unshallow: ${describe(unshallowError)}; ` +
+            `git fetch --deepen=${BASE_REPO_DEEPEN_COMMITS}: ${describe(deepenError)}). ` +
+            `Proceeding without ahead/behind counts.`,
+        );
+      }
+    }
+    if (deepened) shallow = await isShallow();
+  }
+
+  // Still checked when NOT shallow: two unrelated roots have no merge base either,
+  // and the same whole-history degeneration applies.
+  const mergeBase = await runGit(["merge-base", "HEAD", baseRef], repoRoot)
+    .then((value) => value.trim())
+    .catch(() => "");
+  const divergenceComputable = !shallow && mergeBase.length > 0;
+  const graftCommits = divergenceComputable ? [] : await readShallowGraftCommits(repoRoot);
+  return { divergenceComputable, graftCommits, warnings };
 }
 
 async function inspectBaseRepoHygiene(repoRoot: string) {
@@ -3663,10 +3783,19 @@ export async function prepareBaseRepoForWorkspace(input: {
         ? await runGit(["merge-base", "--is-ancestor", headSha!, currentBaseRefSha!], input.repoRoot)
             .then(() => true).catch(() => false)
         : false;
+      // SUP-13857: resolve shallowness ONCE, before any counting. When ancestry is
+      // severed the counts below are not merely approximate, they are whole-history
+      // totals, so the guard has to sit in front of them rather than sanity-check
+      // them afterwards.
+      const shallowState = await resolveBaseRepoShallowState(input.repoRoot, baseRef);
+      baseRepoHygieneWarnings.push(...shallowState.warnings);
       let aheadCount: number | undefined;
       let behindCount: number | undefined;
       let aheadCommitSubjects: string[] | undefined;
-      if (!headBehindBaseRef && headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
+      if (
+        shallowState.divergenceComputable &&
+        !headBehindBaseRef && headSha && currentBaseRefSha && headSha !== currentBaseRefSha
+      ) {
         const revList = await runGit(["rev-list", "--left-right", "--count", baseRef + "...HEAD"], input.repoRoot)
           .then((value) => {
             const tokens = value.trim().split(/\s+/);
@@ -3697,6 +3826,8 @@ export async function prepareBaseRepoForWorkspace(input: {
         aheadCount,
         behindCount,
         aheadCommitSubjects,
+        divergenceComputable: shallowState.divergenceComputable,
+        graftCommits: shallowState.graftCommits,
       });
       if (decision.action === "restore") {
         const result = await restoreBaseRepoToDefaultRef({
@@ -3734,8 +3865,20 @@ export async function prepareBaseRepoForWorkspace(input: {
           `Ahead commits: ${subjects}. Local commits preserved — no reset performed.`;
         baseRepoHygieneWarnings.push(message);
         logger.warn(message);
+      } else if (decision.action === "indeterminate") {
+        // No integers in this message, by contract: the whole point is that there is
+        // no ahead/behind number anyone is entitled to state.
+        const grafts = decision.graftCommits.length > 0
+          ? decision.graftCommits.map((sha) => sha.slice(0, 12)).join(", ")
+          : `none recorded — HEAD and ${baseRef} share no merge base`;
+        const message =
+          `Base repository at ${input.repoRoot} has an indeterminate (shallow) relationship to ${baseRef}: ` +
+          `ancestry between HEAD and ${baseRef} cannot be computed, so no ahead/behind counts are reported ` +
+          `and no reset was performed. Graft commits: ${grafts}.`;
+        baseRepoHygieneWarnings.push(message);
+        logger.warn(message);
       } else if (decision.action === "ok") {
-        if (headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
+        if (shallowState.divergenceComputable && headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
           const revList = await runGit(
             ["rev-list", "--left-right", "--count", `HEAD...${baseRef}`],
             input.repoRoot,
