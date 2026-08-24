@@ -158,15 +158,37 @@ lane; T4/T5/T7 stayed blocked). Per the pre-committed rule, executed 18:28-18:29
   to the rollback JSON posted to SUP-13823 at 17:08:32.
 - Stood up a **dedicated vault project** `07aa11d6-a538-4687-8985-e6be4e060392`
   ("tsp-obsidian-vault", created 18:29:43) whose primary workspace is the vault repo itself
-  (`42c7243b-eed4-4e2c-9064-b3e75e71f576`, repoUrl `https://github.com/TEA-Core/tsp-obsidian-vault`,
-  `defaultRef: main`). The project carries **no** `executionWorkspacePolicy.workspaceStrategy` —
-  i.e. no pnpm provisionCommand. Strategy defaults to `project_primary`, so vault-lane issues run
-  directly on the vault checkout with no project-level install command: the pnpm failure mode is
-  structurally removed, not patched, and the lane is actually usable for T4/T5/T7.
-- SUP-13874 (canary probe): **cancelled**. Its lane question is answered by this finding; the 5×
-  `setup_failed` retry loop was deterministic and is now moot.
+   (`42c7243b-eed4-4e2c-9064-b3e75e71f576`, repoUrl `https://github.com/TEA-Core/tsp-obsidian-vault`,
+   `defaultRef: main`). The project carries **no** `executionWorkspacePolicy.workspaceStrategy`
+   (live-confirmed: execution-workspace config `provisionCommand: null`) and `defaultMode:
+   isolated_workspace`, so vault-lane issues get a `git_worktree` workspace cut from the managed
+   vault checkout with **no project-level install command** (provisionExecutionWorktree skips
+   empty commands — `if (!provisionCommand) return;`, workspace-runtime.ts:3278): the pnpm
+   failure mode is structurally removed, not patched, and the lane is actually usable for T4/T5/T7.
+- SUP-13874 (canary probe): **cancelled** — terminal since 18:40:25Z; the assignee re-affirmed
+  the cancel at 19:12:33Z (PATCH 200 from the SUP-13895 run; response `changes.cancelledAt.from
+  = 18:40:25.384Z`) and left the evidence comment in its thread. The 5× `setup_failed` retry loop
+  was deterministic and is moot. Residual: recovery action `3a79dd45` stays `escalated`/
+  `exhausted` with `ownerType: board` — per SUP-13698 that shape is terminal until an explicit
+  board resolution (no re-sweep dispatch, no heal loop), and the resolution is board-only:
+  `issue:mutate` has no manager-chain path and the recovery-resolve endpoint requires a board
+  actor. The trap the review flagged is neutralized: the source issue is terminal.
 - T4/T5/T7 unblock: they dispatch onto the dedicated vault project (`07aa11d6`) rather than a
   second workspace on the TSP project.
+
+## Lane proof on the dedicated project (executed 2026-08-24 19:12-19:40 UTC)
+
+The round-1 review required this proof to come from **dispatched runs**, not executor-written
+commits. Two dispatched runs on project `07aa11d6` / workspace `42c7243b` (both exec-CEO,
+top-level issues created by coder-BE) prove it:
+
+| Run | Issue | Result |
+|---|---|---|
+| `57151501` | SUP-13895 (cleanup task) | Provisioned 19:12:11→19:12:28 (17 s): `git_worktree`, CWD `…/07aa11d6…/tsp-obsidian-vault/.paperclip/worktrees/SUP-13895-…`, branch `SUP-13895-…`, workspace config `provisionCommand: null` — no pnpm step, no `setup_failed`. |
+| `b5e1d549` | SUP-13896 (lane proof) | Same lane (19:38:57→19:40:20). Pre-run checks: `origin` = TEA-Core/tsp-obsidian-vault, no `package.json`, no `node_modules`. Committed marker `bfe2e7b "vault-sep T3: lane-proof marker (dispatched run, dedicated project)"` to branch `vault-sep/t3-lane-proof` (one line in `10_Projects/Trading Signal Platform v2/Plans/decisions/2026-08-24 - VAULT-SEP T3 lane proof marker (scratch).md`, labelled "scratch: do not merge") and pushed it: `git ls-remote` → `bfe2e7b… refs/heads/vault-sep/t3-lane-proof`. |
+
+AC bullet 3 is met by a live issue run on that lane: worktree path above;
+`git log -1` = `bfe2e7b78167c70cfe5b7141ebc3a28708830196`.
 
 ## Follow-up (out of scope for T3)
 
