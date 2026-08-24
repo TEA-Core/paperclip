@@ -130,7 +130,7 @@ Lane-proof commit capability, on the canary's provisioned vault worktree:
 marker commit `a85affa "VAULT-SEP T3: canary marker (vault 2nd-workspace provisioning proof)"`
 (local only — not pushed, no PR, no merge; worktree left in place as evidence).
 
-## Decision (executed, 2026-08-24)
+## Decision (revised after review, executed 2026-08-24 18:28-18:29 UTC)
 
 The task's question — "does `workspaces[]` honour more than one entry end-to-end (accepted by the
 projects API AND provisioned per-issue)?" — is answered **YES at every control-plane layer the
@@ -138,34 +138,41 @@ feature owns**: API acceptance, per-issue workspace selection, per-repo managed 
 worktree materialisation from the declared row's `repoUrl`/`defaultRef`. All four were measured
 live, not inferred.
 
-The remaining obstacle is **not** a multi-workspace defect: the failing step is the
-single PROJECT-level `executionWorkspacePolicy.workspaceStrategy.provisionCommand`, which runs in
-every worktree of the project regardless of which workspace row declared it, was untouched by
-this task (out of scope), and would fail identically for any second repo attached to this
-project. The task's own "lead worth testing" anticipated exactly this ("it would fail
-provisioning on every vault issue") and asked that the attach-with-no-op-setupCommand shape be
-tested and the finding recorded. The vault row carries its own `setupCommand: "true"` and does
-NOT inherit the primary row's `setupCommand` (the "must NOT inherit TSP's pnpm install && pnpm
-run build" bar — that string is the primary row's `setupCommand`, which the vault row does not
-carry, and which the server never executes in this path at all).
+The remaining obstacle is **not** a multi-workspace defect: the failing step is the single
+PROJECT-level `executionWorkspacePolicy.workspaceStrategy.provisionCommand`, which runs in every
+worktree of the project regardless of which workspace row declared it, is not repo-aware, and
+would fail identically for any second repo attached to this project. The task's own "lead worth
+testing" anticipated exactly this and asked that the attach-with-no-op-setupCommand shape be
+tested and the finding recorded. The vault row's `setupCommand: "true"` is inert metadata the
+server never executes, so it cannot dodge the project-level pnpm hook.
 
-Therefore the **attach stands** (no rollback, no dedicated vault project): T3's deliverable is
-the proven lane + the recorded finding. Sibling tasks T4/T5/T7 (blocked on T3) get a vault
-workspace on `86aa3f31` whose worktrees materialise correctly; agent dispatch onto a vault
-worktree remains blocked until the control-plane follow-up below lands, and that block is now
-precisely documented (failure mode, error code, code citations, authz gate) so the unblock is a
-single, well-scoped change rather than a mystery.
+**Outcome — the negative-lane result was honoured, not the "attach stands" draft.** Review of the
+first DELIVERED revision (SUP-13823, changes requested 18:03:14) held that the draft decision
+overrode the pre-committed decision rule — the monitor notes recorded that a canary failing at
+the pnpm provision step means "DELETE ws `756acf58` + stand up a dedicated vault project" — and
+that keeping the attach left the lane unusable (no live issue-run ever dispatched on the vault
+lane; T4/T5/T7 stayed blocked). Per the pre-committed rule, executed 18:28-18:29 UTC:
 
-- Rollback remains available per the pre-change JSON posted to SUP-13823 (17:08:32):
-  `DELETE /projects/86aa3f31-ce0d-42f8-98e9-02154f9be6a9/workspaces/756acf58-d946-4714-a80c-b4c9f4682899`.
-- SUP-13874 (canary probe) was answered with evidence and commented "probe complete"
-  (17:41); its `stranded_assigned_issue` recovery is owned by agent `38ca3dab…`, so the final
-  `cancelled` transition is that owner's (or a reviewer's) action — the retry loop is a no-op
-  until then because the failure is deterministic.
+- Rolled back the attach: `DELETE /projects/86aa3f31-ce0d-42f8-98e9-02154f9be6a9/workspaces/756acf58-d946-4714-a80c-b4c9f4682899`
+  (18:28:05). Project `86aa3f31` is back to its single pre-change row `77ffa827`, byte-identical
+  to the rollback JSON posted to SUP-13823 at 17:08:32.
+- Stood up a **dedicated vault project** `07aa11d6-a538-4687-8985-e6be4e060392`
+  ("tsp-obsidian-vault", created 18:29:43) whose primary workspace is the vault repo itself
+  (`42c7243b-eed4-4e2c-9064-b3e75e71f576`, repoUrl `https://github.com/TEA-Core/tsp-obsidian-vault`,
+  `defaultRef: main`). The project carries **no** `executionWorkspacePolicy.workspaceStrategy` —
+  i.e. no pnpm provisionCommand. Strategy defaults to `project_primary`, so vault-lane issues run
+  directly on the vault checkout with no project-level install command: the pnpm failure mode is
+  structurally removed, not patched, and the lane is actually usable for T4/T5/T7.
+- SUP-13874 (canary probe): **cancelled**. Its lane question is answered by this finding; the 5×
+  `setup_failed` retry loop was deterministic and is now moot.
+- T4/T5/T7 unblock: they dispatch onto the dedicated vault project (`07aa11d6`) rather than a
+  second workspace on the TSP project.
 
 ## Follow-up (out of scope for T3)
 
-The clean control-plane fix is to make the provision step repo-aware — e.g. execute the
+The clean control-plane fix remains to make the provision step repo-aware — e.g. execute the
 anchor workspace's own `setupCommand` inside the worktree instead of (or before) the
 project-level command. That is a server change touching
-`provisionExecutionWorktree`/`realizeExecutionWorkspace`; T3 only proves and records.
+`provisionExecutionWorktree`/`realizeExecutionWorkspace`; T3 proves and records. For now the vault
+lane is unblocked by the dedicated project above; the TSP project's pnpm `provisionCommand` is
+unchanged and out of scope.
