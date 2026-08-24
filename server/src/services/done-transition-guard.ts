@@ -1,14 +1,19 @@
 import { execFile } from "node:child_process";
 import type { Db } from "@paperclipai/db";
-import { and, eq, inArray } from "drizzle-orm";
-import { executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
   type GitHubTokenScope,
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
-import { resolveLinkedPullRequestsWithState, type LinkedPullRequest } from "./merge-arming.js";
+import {
+  fetchOpenPullRequests,
+  parseRepoUrl,
+  resolveIssueRepoContext,
+  resolveLinkedPullRequestsWithState,
+  type IssueRepoContext,
+  type LinkedPullRequest,
+} from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
 
@@ -63,101 +68,8 @@ export interface DoneTierDeclarationResult {
   skipReason: string | null;
 }
 
-function parseRepoUrl(repoUrl: string | null): { hostname: string; owner: string; repo: string } | null {
-  if (!repoUrl) return null;
-  let url: URL;
-  try {
-    url = new URL(repoUrl);
-  } catch {
-    return null;
-  }
-  if (url.protocol !== "https:") return null;
-  if (url.username || url.password) return null;
-  const parts = url.pathname.split("/").filter(Boolean);
-  if (parts.length < 2) return null;
-  const owner = parts[0]!;
-  const repo = parts[1]!.replace(/\.git$/i, "");
-  if (!owner || !repo) return null;
-  return { hostname: url.hostname, owner, repo };
-}
-
 function appendSkipReason(current: string | null, piece: string): string {
   return current ? `${current}; ${piece}` : piece;
-}
-
-async function resolveIssueRepoContext(
-  db: Db,
-  issue: {
-    companyId: string;
-    projectId: string | null;
-    projectWorkspaceId: string | null;
-    executionWorkspaceId: string | null;
-  },
-): Promise<{
-  branch: string | null;
-  defaultRef: string | null;
-  repoUrl: string | null;
-  providerType: string | null;
-  worktreePath: string | null;
-} | null> {
-  if (issue.executionWorkspaceId) {
-    const row = await db
-      .select()
-      .from(executionWorkspaces)
-      .where(eq(executionWorkspaces.id, issue.executionWorkspaceId))
-      .then((rows) => rows[0] ?? null);
-    if (row) {
-      return {
-        branch: row.branchName ?? null,
-        defaultRef: row.baseRef ?? null,
-        repoUrl: row.repoUrl ?? null,
-        providerType: row.providerType ?? null,
-        worktreePath: row.providerRef ?? row.cwd ?? null,
-      };
-    }
-  }
-
-  if (issue.projectWorkspaceId) {
-    const row = await db
-      .select()
-      .from(projectWorkspaces)
-      .where(eq(projectWorkspaces.id, issue.projectWorkspaceId))
-      .then((rows) => rows[0] ?? null);
-    if (row) {
-      return {
-        branch: null,
-        defaultRef: row.defaultRef ?? row.repoRef ?? null,
-        repoUrl: row.repoUrl ?? null,
-        providerType: null,
-        worktreePath: null,
-      };
-    }
-  }
-
-  if (issue.projectId) {
-    const primaryWorkspace = await db
-      .select()
-      .from(projectWorkspaces)
-      .where(
-        and(
-          eq(projectWorkspaces.projectId, issue.projectId),
-          eq(projectWorkspaces.companyId, issue.companyId),
-          eq(projectWorkspaces.isPrimary, true),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
-    if (primaryWorkspace) {
-      return {
-        branch: null,
-        defaultRef: primaryWorkspace.defaultRef ?? primaryWorkspace.repoRef ?? null,
-        repoUrl: primaryWorkspace.repoUrl ?? null,
-        providerType: null,
-        worktreePath: null,
-      };
-    }
-  }
-
-  return null;
 }
 
 async function githubCompareAheadBy(
@@ -200,6 +112,52 @@ async function githubCompareAheadBy(
   const ahead = (body as Record<string, unknown> | null)?.ahead_by;
   if (typeof ahead === "number") return ahead;
   return null;
+}
+
+/**
+ * Dedicated branch-existence probe for the compare API. The compare endpoint
+ * 404s when either the base or the head ref is unresolvable on the remote
+ * (SUP-13831), so a compare-404 is not positive evidence the head branch is
+ * absent. This ref probe distinguishes the two: a 200 here proves the branch
+ * exists and the compare 404 was about the base ref (or a transient API
+ * state). 401/403 is classified as auth_failed with the status; every other
+ * unmeasurable outcome (network failure, unexpected status) is "error" so
+ * callers fail open.
+ */
+type BranchProbeOutcome =
+  | { outcome: "present" }
+  | { outcome: "absent" }
+  | { outcome: "error" }
+  | { outcome: "auth_failed"; status: number };
+
+async function githubBranchExists(
+  hostname: string,
+  owner: string,
+  repo: string,
+  branch: string,
+  token: string,
+): Promise<BranchProbeOutcome> {
+  const apiBase = gitHubApiBase(hostname);
+  const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
+    repo,
+  )}/git/ref/heads/${encodeURIComponent(branch)}`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-done-transition-guard",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+  try {
+    const response = await ghFetch(url, { headers });
+    if (response.status === 401 || response.status === 403) {
+      return { outcome: "auth_failed", status: response.status };
+    }
+    if (response.status === 404) return { outcome: "absent" };
+    if (response.ok) return { outcome: "present" };
+    return { outcome: "error" };
+  } catch {
+    return { outcome: "error" };
+  }
 }
 
 function runGit(args: string[], cwd: string): Promise<string> {
@@ -553,6 +511,82 @@ export async function evaluateDoneTierDeclaration(
   };
 }
 
+/**
+ * SUP-13831: live discovery of open PRs when the issue has zero cached
+ * mention rows. Mention rows are only created when a comment posts a full PR
+ * URL; repos that name a PR without the URL (e.g. "PR #3264") leave the
+ * external-object table empty, so the cached resolver sees nothing even when
+ * an open PR blocks. Ask GitHub directly for open, non-draft PRs that carry
+ * the issue identifier in the head ref, title, or body — the same ownership
+ * rule the live re-resolve in merge-arming uses.
+ *
+ * Failures never throw: they surface as `error` so the caller can count them
+ * in skipReason, and the guard falls back to the cached-empty state plus the
+ * compare flow below.
+ */
+async function liveDiscoverOpenLinkedPullRequests(
+  db: Db,
+  issue: { companyId: string; identifier: string | null },
+  ctx: IssueRepoContext | null,
+): Promise<{ prs: LinkedPullRequest[]; error: string | null }> {
+  if (!issue.identifier || !ctx?.repoUrl) return { prs: [], error: null };
+  const parsed = parseRepoUrl(ctx.repoUrl);
+  if (!parsed) return { prs: [], error: null };
+
+  let token: string | null;
+  try {
+    const tokenResult = await resolveGitHubToken(db, issue.companyId);
+    token = tokenResult.token;
+  } catch {
+    // Token resolution failure is already counted by the main flow's own
+    // token_resolution_failed / token_missing fallback; do not double-report.
+    return { prs: [], error: null };
+  }
+  if (!token) return { prs: [], error: null };
+
+  const listResult = await fetchOpenPullRequests(
+    token,
+    parsed.owner,
+    parsed.repo,
+    parsed.hostname,
+  );
+  if (!listResult.ok) {
+    return {
+      prs: [],
+      error: listResult.status === 0 ? "network" : `HTTP${listResult.status}`,
+    };
+  }
+
+  const needle = issue.identifier.toLowerCase();
+  const seen = new Set<string>();
+  const prs: LinkedPullRequest[] = [];
+  for (const item of listResult.items) {
+    if (item.draft === true) continue;
+    const headRef = (item.headRef ?? "").toLowerCase();
+    const title = (item.title ?? "").toLowerCase();
+    const body = (item.body ?? "").toLowerCase();
+    if (!headRef.includes(needle) && !title.includes(needle) && !body.includes(needle)) {
+      continue;
+    }
+    const key = `${parsed.owner.toLowerCase()}/${parsed.repo.toLowerCase()}#${item.number}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    prs.push({
+      id: `live:${key}`,
+      owner: parsed.owner,
+      repo: parsed.repo,
+      number: item.number,
+      nodeId: null,
+      headRefName: item.headRef,
+      title: item.title,
+      displayName: `${parsed.owner}/${parsed.repo}#${item.number}`,
+      cachedState: "open",
+      lastErrorCode: null,
+    });
+  }
+  return { prs, error: null };
+}
+
 export async function evaluateDoneTransitionGuard(
   db: Db,
   issue: {
@@ -603,7 +637,36 @@ export async function evaluateDoneTransitionGuard(
   // Treating an unhydrated row as open would block `done` on any issue that merely
   // links a PR (including already-merged or unrelated ones) in exactly the
   // credential-less configuration this guard is built for. Fail open on unknown.
+  let prSkipReason: string | null = null;
+  let cachedCtx: IssueRepoContext | null | undefined;
+  const getCtx = async (): Promise<IssueRepoContext | null> => {
+    if (cachedCtx === undefined) {
+      cachedCtx = await resolveIssueRepoContext(db, issue);
+    }
+    return cachedCtx;
+  };
+
   let resolvedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+
+  // SUP-13831: zero cached mention rows is a false negative when the PR was
+  // never posted with its full URL. Live-discover open PRs carrying the issue
+  // identifier; failures are counted in skipReason and the compare flow below
+  // still applies.
+  if (resolvedPrs.length === 0) {
+    let live: { prs: LinkedPullRequest[]; error: string | null } = { prs: [], error: null };
+    try {
+      const liveCtx = await getCtx();
+      live = await liveDiscoverOpenLinkedPullRequests(db, issue, liveCtx);
+    } catch {
+      live = { prs: [], error: "ctx" };
+    }
+    if (live.prs.length > 0) {
+      resolvedPrs = live.prs;
+      prSkipReason = appendSkipReason(prSkipReason, `live_linked_pr_discovered:${live.prs.length}`);
+    } else if (live.error !== null) {
+      prSkipReason = appendSkipReason(prSkipReason, `live_pr_discovery_failed:${live.error}`);
+    }
+  }
 
   // Best-effort synchronous hydration: attempt to fetch current state from GitHub for
   // any unhydrated (cachedState === null) rows and any cached-"open" rows. A cached
@@ -612,7 +675,6 @@ export async function evaluateDoneTransitionGuard(
   // stale state. A thrown/failed hydration must NOT throw — degrade to the cached
   // state. We only hydrate if a company token is available; if token resolution
   // itself fails, we keep the cached states as-is.
-  let prSkipReason: string | null = null;
   try {
     const tokenResult = await resolveGitHubToken(db, issue.companyId);
     if (tokenResult.token !== null) {
@@ -703,7 +765,7 @@ export async function evaluateDoneTransitionGuard(
     };
   }
 
-  const ctx = await resolveIssueRepoContext(db, issue);
+  const ctx = await getCtx();
   if (!ctx || !ctx.repoUrl || !ctx.defaultRef) {
     return fallback("No resolvable execution workspace or repo context; transition allowed");
   }
@@ -769,6 +831,67 @@ export async function evaluateDoneTransitionGuard(
       // commits ahead of a stale local base with none attributable — must fail
       // open, because that state is a property of the checkout mechanism, not of
       // the issue's work (SUP-13205).
+      //
+      // A compare 404 is ambiguous (SUP-13831): it fires when the BASE ref is
+      // unresolvable on the remote just as it does when the head branch is
+      // absent. Probe the head ref directly before classifying the 404.
+      const probe = await githubBranchExists(
+        parsed.hostname,
+        parsed.owner,
+        parsed.repo,
+        branch,
+        token,
+      );
+      if (probe.outcome === "auth_failed") {
+        return fallback(
+          `GitHub ref probe rejected the credential (HTTP ${probe.status}); transition allowed`,
+          true,
+          `auth_failed:branch_probe:${probe.status}`,
+        );
+      }
+      if (probe.outcome === "error") {
+        return fallback(
+          `Branch ${branch} ref probe could not be measured; transition allowed`,
+          true,
+          `branch_probe_failed:${branch}`,
+        );
+      }
+      if (probe.outcome === "present") {
+        // The head ref exists on the remote: the compare 404 was about the base
+        // ref (unresolvable/stale on the remote) or a transient API state, not
+        // the deliverable branch. Never report this as branch-absent.
+        if (decisionCarried) {
+          void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+            reason: `compare_404_base_ref_unresolvable_decision_carried:${branch}`,
+            skipReason: prSkipReason,
+            branch,
+            defaultRef: ctx.defaultRef,
+            owner: parsed.owner,
+            repo: parsed.repo,
+          });
+          return {
+            allowed: true,
+            reason:
+              `Decision-carrying transition allowed: compare 404 for branch ${branch} but the branch exists on the remote ` +
+              `(the base ref ${ctx.defaultRef} could not be resolved on the remote). ` +
+              "The approval arms the merge rather than closing the issue — the branch lands with delivery.",
+            aheadBy: null,
+            branch,
+            defaultRef: ctx.defaultRef,
+            owner: parsed.owner,
+            repo: parsed.repo,
+            skipped: false,
+            skipReason: prSkipReason,
+          };
+        }
+        return fallback(
+          `Branch ${branch} exists on the remote; the compare 404 indicates the base ref ${ctx.defaultRef} could not be resolved on the remote. Transition allowed`,
+          true,
+          `compare_404_base_ref_unresolvable:${branch}`,
+        );
+      }
+      // probe.outcome === "absent": the dedicated ref probe confirms the branch
+      // is genuinely absent from the remote. Existing attribution logic below.
       const attribution = ctx.worktreePath
         ? await countIssueAttributableCommits(ctx.worktreePath, ctx.defaultRef, issue.identifier)
         : null;

@@ -1,6 +1,12 @@
 import type { Db } from "@paperclipai/db";
 import { and, eq, ilike } from "drizzle-orm";
-import { externalObjectMentions, externalObjects, issues } from "@paperclipai/db";
+import {
+  externalObjectMentions,
+  externalObjects,
+  issues,
+  executionWorkspaces,
+  projectWorkspaces,
+} from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   isGitHubTokenResolution,
@@ -74,6 +80,101 @@ export interface LinkedPullRequest {
    * positively proven open (SUP-13234).
    */
   lastErrorCode: string | null;
+}
+
+export interface IssueRepoContext {
+  branch: string | null;
+  defaultRef: string | null;
+  repoUrl: string | null;
+  providerType: string | null;
+  worktreePath: string | null;
+}
+
+export function parseRepoUrl(repoUrl: string | null): { hostname: string; owner: string; repo: string } | null {
+  if (!repoUrl) return null;
+  let url: URL;
+  try {
+    url = new URL(repoUrl);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:") return null;
+  if (url.username || url.password) return null;
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length < 2) return null;
+  const owner = parts[0]!;
+  const repo = parts[1]!.replace(/\.git$/i, "");
+  if (!owner || !repo) return null;
+  return { hostname: url.hostname, owner, repo };
+}
+
+export async function resolveIssueRepoContext(
+  db: Db,
+  issue: {
+    companyId: string;
+    projectId: string | null;
+    projectWorkspaceId: string | null;
+    executionWorkspaceId: string | null;
+  },
+): Promise<IssueRepoContext | null> {
+  if (issue.executionWorkspaceId) {
+    const row = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, issue.executionWorkspaceId))
+      .then((rows) => rows[0] ?? null);
+    if (row) {
+      return {
+        branch: row.branchName ?? null,
+        defaultRef: row.baseRef ?? null,
+        repoUrl: row.repoUrl ?? null,
+        providerType: row.providerType ?? null,
+        worktreePath: row.providerRef ?? row.cwd ?? null,
+      };
+    }
+  }
+
+  if (issue.projectWorkspaceId) {
+    const row = await db
+      .select()
+      .from(projectWorkspaces)
+      .where(eq(projectWorkspaces.id, issue.projectWorkspaceId))
+      .then((rows) => rows[0] ?? null);
+    if (row) {
+      return {
+        branch: null,
+        defaultRef: row.defaultRef ?? row.repoRef ?? null,
+        repoUrl: row.repoUrl ?? null,
+        providerType: null,
+        worktreePath: null,
+      };
+    }
+  }
+
+  if (issue.projectId) {
+    const primaryWorkspace = await db
+      .select()
+      .from(projectWorkspaces)
+      .where(
+        and(
+          eq(projectWorkspaces.projectId, issue.projectId),
+          eq(projectWorkspaces.companyId, issue.companyId),
+          eq(projectWorkspaces.isPrimary, true),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (primaryWorkspace) {
+      return {
+        branch: null,
+        defaultRef: primaryWorkspace.defaultRef ?? primaryWorkspace.repoRef ?? null,
+        repoUrl: primaryWorkspace.repoUrl ?? null,
+        providerType: null,
+        worktreePath: null,
+      };
+    }
+  }
+
+  return null;
 }
 
 const GITHUB_GRAPHQL_URL = "https://api.github.com/graphql";
@@ -300,6 +401,17 @@ export interface PublishApprovalStatusOptions {
    * stamped.
    */
   expectedHeadSha?: string;
+  /**
+   * SUP-13831: the zero-mention-row live-discovery fallback (derive the repo
+   * pair from the issue's own workspace context and ask GitHub for open PRs)
+   * is a delivery probe. It runs only for a CLOSING transition — a requested
+   * `done` that resolves to `done`. A stage approval that the policy redirects
+   * to a later stage (`in_review`) must make no delivery probe at all, so
+   * callers passing `closingTransition: false` skip the fallback and keep the
+   * no-PR outcome a plain negative. Defaults to true for callers acting on
+   * already-closed cards (the approval-status reconciler).
+   */
+  closingTransition?: boolean;
 }
 
 export async function publishApprovalStatus(
@@ -324,6 +436,33 @@ export async function publishApprovalStatus(
       if (seenPairs.has(key)) continue;
       seenPairs.add(key);
       pairs.push({ owner: row.owner, repo: row.repo });
+    }
+
+    if (pairs.length === 0 && (options?.closingTransition ?? true)) {
+      // SUP-13831: zero cached mention rows (the PR was never posted with its
+      // full URL in-thread) leave the live re-resolve with no owner/repo pair
+      // to ask GitHub. Derive one from the issue's own repo context instead of
+      // giving up with skipped:no-pr. This is a delivery probe, so it runs
+      // only for closing transitions (closingTransition); a stage approval
+      // that advances to a LATER stage must make no delivery probe at all.
+      const [issueRow] = await db
+        .select({
+          projectId: issues.projectId,
+          projectWorkspaceId: issues.projectWorkspaceId,
+          executionWorkspaceId: issues.executionWorkspaceId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      const ctx = await resolveIssueRepoContext(db, {
+        companyId,
+        projectId: issueRow?.projectId ?? null,
+        projectWorkspaceId: issueRow?.projectWorkspaceId ?? null,
+        executionWorkspaceId: issueRow?.executionWorkspaceId ?? null,
+      });
+      const parsed = ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null;
+      if (parsed) {
+        pairs.push({ owner: parsed.owner, repo: parsed.repo });
+      }
     }
 
     const matched: Array<{
@@ -616,12 +755,13 @@ export interface OpenPullRequestsFailure extends GitHubFetchResult {
 
 export type OpenPullRequestsResult = OpenPullRequestsSuccess | OpenPullRequestsFailure;
 
-async function fetchOpenPullRequests(
+export async function fetchOpenPullRequests(
   token: string,
   owner: string,
   repo: string,
+  hostname: string = "github.com",
 ): Promise<OpenPullRequestsResult> {
-  const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
+  const url = `${gitHubApiBase(hostname)}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
     repo,
   )}/pulls?state=open&per_page=100`;
   const headers: Record<string, string> = {

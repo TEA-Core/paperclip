@@ -9808,7 +9808,13 @@ export function issueRoutes(
     if (shouldPublishApprovalStatus(transition.decision)) {
       const issueIdentifier = `SUP-${issue.issueNumber}`;
       try {
-        const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier);
+        // SUP-13831: publishApprovalStatus's zero-mention-row live discovery is a
+        // delivery probe; it must run only when the transition CLOSes the issue
+        // (effectiveStatus === "done"), not when a stage approval redirects the
+        // requested `done` to a later stage (effectiveStatus === "in_review").
+        const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier, {
+          closingTransition: isDoneRequest,
+        });
 
         // SUP-13714 Guard A persistence: record which head the approval
         // certified so the reconciler can verify content identity before any
