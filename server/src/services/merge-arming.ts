@@ -401,6 +401,17 @@ export interface PublishApprovalStatusOptions {
    * stamped.
    */
   expectedHeadSha?: string;
+  /**
+   * SUP-13831: the zero-mention-row live-discovery fallback (derive the repo
+   * pair from the issue's own workspace context and ask GitHub for open PRs)
+   * is a delivery probe. It runs only for a CLOSING transition — a requested
+   * `done` that resolves to `done`. A stage approval that the policy redirects
+   * to a later stage (`in_review`) must make no delivery probe at all, so
+   * callers passing `closingTransition: false` skip the fallback and keep the
+   * no-PR outcome a plain negative. Defaults to true for callers acting on
+   * already-closed cards (the approval-status reconciler).
+   */
+  closingTransition?: boolean;
 }
 
 export async function publishApprovalStatus(
@@ -427,11 +438,13 @@ export async function publishApprovalStatus(
       pairs.push({ owner: row.owner, repo: row.repo });
     }
 
-    if (pairs.length === 0) {
+    if (pairs.length === 0 && (options?.closingTransition ?? true)) {
       // SUP-13831: zero cached mention rows (the PR was never posted with its
       // full URL in-thread) leave the live re-resolve with no owner/repo pair
       // to ask GitHub. Derive one from the issue's own repo context instead of
-      // giving up with skipped:no-pr.
+      // giving up with skipped:no-pr. This is a delivery probe, so it runs
+      // only for closing transitions (closingTransition); a stage approval
+      // that advances to a LATER stage must make no delivery probe at all.
       const [issueRow] = await db
         .select({
           projectId: issues.projectId,
