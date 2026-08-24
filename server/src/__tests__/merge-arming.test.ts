@@ -1560,6 +1560,59 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
     });
   });
 
+  describe("repo-context fallback when zero mention rows are cached (SUP-13831)", () => {
+    it("arms the merge by live-resolving the repo from the issue's project workspace when no PR was ever mentioned", async () => {
+      const [projectRow] = await db
+        .insert(projects)
+        .values({
+          id: randomUUID(),
+          companyId,
+          name: "TEA-Core/paperclip",
+          urlKey: "TEA-Core-paperclip",
+          status: "in_progress",
+        })
+        .returning();
+      await db.insert(projectWorkspaces).values({
+        id: randomUUID(),
+        companyId,
+        projectId: projectRow!.id,
+        name: "paperclip",
+        repoUrl: "https://github.com/TEA-Core/paperclip",
+        isPrimary: true,
+      });
+      await db.update(issues).set({ projectId: projectRow!.id }).where(eq(issues.id, issueId));
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse([
+            {
+              number: 3264,
+              draft: false,
+              head: { ref: "TST-12345-work" },
+              title: "deliver TST-12345",
+              body: null,
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({
+            head: { sha: HEAD_SHA },
+            html_url: "https://github.com/TEA-Core/paperclip/pull/3264",
+          }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "TST-12345");
+      expect(result.kind).toBe("armed");
+      expect(result.message).toContain("live re-resolve");
+      expect(result.message).toContain("TEA-Core/paperclip#3264");
+      expect(mockGhFetch).toHaveBeenCalledTimes(3);
+      expect(mockGhFetch.mock.calls[0]![0]).toBe(
+        "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100",
+      );
+    });
+  });
+
   describe("D1: fail-open on un-hydrated data (draft-hoist fix)", () => {
     it("returns status:published when PR data is empty {} (un-hydrated) — head SHA resolved live", async () => {
       await insertMention({

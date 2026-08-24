@@ -156,9 +156,15 @@ vi.mock("../middleware/logger.js", () => ({
 }));
 
 const mockResolveLinkedPullRequestsWithState = vi.hoisted(() => vi.fn());
-vi.mock("./merge-arming.js", () => ({
-  resolveLinkedPullRequestsWithState: mockResolveLinkedPullRequestsWithState,
-}));
+const mockFetchOpenPullRequests = vi.hoisted(() => vi.fn());
+vi.mock("./merge-arming.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./merge-arming.js")>();
+  return {
+    ...actual,
+    resolveLinkedPullRequestsWithState: mockResolveLinkedPullRequestsWithState,
+    fetchOpenPullRequests: mockFetchOpenPullRequests,
+  };
+});
 
 const mockExecFile = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", () => ({
@@ -191,6 +197,8 @@ describe("evaluateDoneTransitionGuard", () => {
     ghFetchMock.mockReset();
     mockResolveLinkedPullRequestsWithState.mockReset();
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+    mockFetchOpenPullRequests.mockReset();
+    mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: [] });
     mockResolveGitHubToken.mockReset();
     mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
     vi.mocked(logActivity).mockClear();
@@ -929,6 +937,9 @@ describe("evaluateDoneTransitionGuard", () => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
         if (url.includes("/search/issues")) {
           return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
         }
@@ -973,6 +984,9 @@ describe("evaluateDoneTransitionGuard", () => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
         if (url.includes("/search/issues")) {
           return new Response(JSON.stringify({ total_count: 2, items: [] }), { status: 200 });
         }
@@ -992,6 +1006,9 @@ describe("evaluateDoneTransitionGuard", () => {
       mockGitProbe("5", "1");
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
         if (url.includes("/search/issues")) {
@@ -1014,6 +1031,9 @@ describe("evaluateDoneTransitionGuard", () => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
         if (url.includes("/search/issues")) {
           throw new Error("rate limited");
         }
@@ -1032,6 +1052,9 @@ describe("evaluateDoneTransitionGuard", () => {
       mockGitProbe("5", "0");
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
         if (url.includes("/search/issues")) {
@@ -1054,6 +1077,9 @@ describe("evaluateDoneTransitionGuard", () => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
         return new Response(JSON.stringify({}), { status: 200 });
       });
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
@@ -1072,6 +1098,9 @@ describe("evaluateDoneTransitionGuard", () => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
         return new Response(JSON.stringify({}), { status: 200 });
       });
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
@@ -1087,6 +1116,9 @@ describe("evaluateDoneTransitionGuard", () => {
       });
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
         return new Response(JSON.stringify({}), { status: 200 });
@@ -1189,6 +1221,9 @@ describe("evaluateDoneTransitionGuard", () => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
         return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
       });
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
@@ -1252,6 +1287,9 @@ describe("evaluateDoneTransitionGuard", () => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
         if (url.includes("/search/issues")) {
           return new Response(JSON.stringify({ total_count: 0, items: [] }), { status: 200 });
         }
@@ -1287,6 +1325,9 @@ describe("evaluateDoneTransitionGuard", () => {
       mockGitProbe("5", "1");
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
         if (url.includes("/search/issues")) {
@@ -1405,6 +1446,9 @@ describe("evaluateDoneTransitionGuard", () => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
         }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
         return new Response(JSON.stringify({}), { status: 200 });
       });
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
@@ -1484,6 +1528,228 @@ describe("evaluateDoneTransitionGuard", () => {
       const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
       expect(result.allowed).toBe(true);
       expect(result.aheadBy).toBe(1);
+    });
+  });
+
+  describe("compare-404 branch probe (SUP-13831)", () => {
+    it("classifies compare-404 with an existing remote branch as base-ref-unresolvable, never branch-absent", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ ref: "refs/heads/SUP-12686-test-branch" }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("compare_404_base_ref_unresolvable:SUP-12686-test-branch");
+      expect(result.skipReason).not.toContain("branch_absent_on_remote");
+      expect(result.reason).toContain("SUP-12686-test-branch exists on the remote");
+      expect(result.reason).toContain("fold/tea-patches-v2026.722.0");
+    });
+
+    it("lets a DECISION-CARRYING transition through with the branch present and logs the exemption", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ ref: "refs/heads/SUP-12686-test-branch" }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.aheadBy).toBeNull();
+      expect(result.branch).toBe("SUP-12686-test-branch");
+      expect(result.reason).toContain("Decision-carrying transition allowed");
+      expect(result.reason).toContain("arms the merge");
+      expect(result.skipReason).toBeNull();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "compare_404_base_ref_unresolvable_decision_carried:SUP-12686-test-branch",
+          }),
+        }),
+      );
+    });
+
+    it("fails open with branch_probe_failed when the ref probe returns an unexpected status", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("5", "1");
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Bad gateway" }), { status: 502 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("branch_probe_failed:SUP-12686-test-branch");
+      expect(result.skipReason).not.toContain("branch_absent_on_remote");
+      expect(result.reason).toContain("could not be measured");
+    });
+
+    it("classifies a probe credential rejection distinctly as auth_failed:branch_probe", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        if (url.includes("/git/ref/heads/")) {
+          return new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain("auth_failed:branch_probe:401");
+      expect(result.skipReason).not.toContain("branch_absent_on_remote");
+    });
+  });
+
+  describe("live open-PR discovery when zero linked rows are cached (SUP-13831)", () => {
+    const prItems = [
+      {
+        number: 3264,
+        draft: false,
+        headRef: "SUP-12345-work",
+        title: "fix(SUP-12345): rework the transition guard",
+        body: null,
+      },
+    ];
+
+    it("discovers the open PR via the live list and lets a DECISION-CARRYING transition through (arms the merge)", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: prItems });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/pulls/3264")) {
+          return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+        }
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(result.reason).toContain("TEA-Core/paperclip#3264");
+      expect(result.skipReason).toContain("live_linked_pr_discovered:1");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "open_linked_prs_decision_carried:1",
+            prs: "TEA-Core/paperclip#3264",
+          }),
+        }),
+      );
+    });
+
+    it("blocks a plain close on the live-discovered open PR", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: prItems });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/pulls/3264")) {
+          return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("1 open linked PR");
+      expect(result.reason).toContain("TEA-Core/paperclip#3264");
+      expect(result.skipReason).toBeNull();
+    });
+
+    it("counts a failed live list in skipReason and continues with the compare flow", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
+      });
+      mockFetchOpenPullRequests.mockResolvedValue({ ok: false, status: 500, message: "internal", items: [] });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.aheadBy).toBe(0);
+      expect(result.skipReason).toContain("live_pr_discovery_failed:HTTP500");
+    });
+
+    it("stays silent when the live list is empty", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.aheadBy).toBe(0);
+      expect(result.skipReason).toBeNull();
+      expect(mockFetchOpenPullRequests).toHaveBeenCalledTimes(1);
+    });
+
+    it("excludes draft and non-matching PRs from the live list", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: "SUP-12345-test-branch" })],
+      });
+      mockFetchOpenPullRequests.mockResolvedValue({
+        ok: true,
+        status: 200,
+        message: null,
+        items: [
+          { number: 1, draft: true, headRef: "SUP-12345-draft", title: "draft", body: null },
+          { number: 2, draft: false, headRef: "feature/unrelated", title: "unrelated change", body: null },
+        ],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, null);
+      expect(result.allowed).toBe(true);
+      expect(result.aheadBy).toBe(0);
+      expect(result.skipReason).toBeNull();
     });
   });
 });
