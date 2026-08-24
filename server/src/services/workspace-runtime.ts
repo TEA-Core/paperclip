@@ -3494,7 +3494,7 @@ async function readShallowGraftCommits(repoRoot: string): Promise<string[]> {
 async function resolveBaseRepoShallowState(
   repoRoot: string,
   baseRef: string,
-): Promise<{ divergenceComputable: boolean; graftCommits: string[]; warnings: string[] }> {
+): Promise<{ divergenceComputable: boolean; graftCommits: string[]; warnings: string[]; mergeBase: string | null }> {
   const warnings: string[] = [];
   const describe = (err: unknown) => (err instanceof Error ? err.message : String(err)).split("\n")[0];
   const isShallow = async () =>
@@ -3531,7 +3531,187 @@ async function resolveBaseRepoShallowState(
     .catch(() => "");
   const divergenceComputable = !shallow && mergeBase.length > 0;
   const graftCommits = divergenceComputable ? [] : await readShallowGraftCommits(repoRoot);
-  return { divergenceComputable, graftCommits, warnings };
+  // SUP-13858 reuses the merge base to bound its patch-id window. Resolving it twice
+  // could disagree if a concurrent fetch lands between the two calls.
+  return { divergenceComputable, graftCommits, warnings, mergeBase: mergeBase.length > 0 ? mergeBase : null };
+}
+
+/**
+ * SUP-13858: how far the patch-id comparison may look, on EITHER side.
+ *
+ * Bounded on purpose, and the bound is the safety property, not a performance
+ * tweak. Comparing whole histories is what produced the fabricated counts T1
+ * exists to stop; a reset authorised off an unbounded scan would be the same
+ * mistake with a destructive ending. Exceeding the window is treated as
+ * "cannot prove duplication", which means no reset.
+ */
+const BASE_REPO_PATCH_ID_WINDOW_COMMITS = 1000;
+
+/** Run git with `input` on stdin. Needed because `git patch-id` reads a diff there. */
+async function runGitWithStdin(args: string[], cwd: string, input: string): Promise<string> {
+  const proc = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
+    const child = spawn("git", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ stdout, stderr, code }));
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(input);
+  });
+  if (proc.code !== 0) throw new Error(proc.stderr.trim() || `git ${args.join(" ")} failed`);
+  return proc.stdout.trim();
+}
+
+/**
+ * Stable patch-id for one commit, or null when it cannot be determined.
+ *
+ * Null is the FAIL-CLOSED answer and every caller must read it as "this commit is
+ * unique". A merge commit lands here by design: `git show --format=` prints no diff
+ * for one, so there is no single patch-id to compare and a merge must never be
+ * counted as a duplicate of anything.
+ */
+async function resolveCommitPatchId(repoRoot: string, sha: string): Promise<string | null> {
+  const diff = await runGit(["show", "--format=", "--no-color", sha], repoRoot).catch(() => null);
+  if (!diff) return null;
+  const output = await runGitWithStdin(["patch-id", "--stable"], repoRoot, `${diff}\n`).catch(() => null);
+  if (!output) return null;
+  const id = output.split(/\s+/)[0] ?? "";
+  return /^[0-9a-f]{40,}$/.test(id) ? id : null;
+}
+
+/**
+ * SUP-13858: is EVERY ahead commit already upstream, by patch-id?
+ *
+ * Only ever used to authorise discarding local commits, so it is written to be wrong
+ * in one direction only. Every uncertainty — an unreadable commit, an empty patch-id,
+ * a merge, a window overrun, a git failure — returns `false` with a reason. Nothing
+ * about "I could not tell" may read as "safe to reset".
+ */
+async function resolveBaseRepoAheadCommitsAllUpstream(input: {
+  repoRoot: string;
+  baseRef: string;
+  mergeBase: string | null;
+}): Promise<{ allUpstream: boolean; aheadCount: number; reason: string | null }> {
+  const cap = BASE_REPO_PATCH_ID_WINDOW_COMMITS;
+  const revList = async (range: string) =>
+    (await runGit(["rev-list", `--max-count=${cap + 1}`, range], input.repoRoot).catch(() => ""))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+  const aheadShas = await revList(`${input.baseRef}..HEAD`);
+  if (aheadShas.length === 0) return { allUpstream: false, aheadCount: 0, reason: "no ahead commits to compare" };
+  if (aheadShas.length > cap) {
+    return { allUpstream: false, aheadCount: aheadShas.length, reason: `more than ${cap} ahead commits` };
+  }
+
+  // The upstream side is bounded by the merge base. Without one there is no honest
+  // window at all, and T1 has already classified that case as indeterminate anyway.
+  if (!input.mergeBase) {
+    return { allUpstream: false, aheadCount: aheadShas.length, reason: "no merge base — no bounded upstream window" };
+  }
+  const upstreamShas = await revList(`${input.mergeBase}..${input.baseRef}`);
+  if (upstreamShas.length > cap) {
+    return { allUpstream: false, aheadCount: aheadShas.length, reason: `upstream window exceeds ${cap} commits` };
+  }
+
+  const upstreamPatchIds = new Set<string>();
+  for (const sha of upstreamShas) {
+    const id = await resolveCommitPatchId(input.repoRoot, sha);
+    // An indeterminate UPSTREAM commit only shrinks the duplicate set, so it can be
+    // skipped: it can cause a false "unique", never a false "duplicate".
+    if (id) upstreamPatchIds.add(id);
+  }
+
+  for (const sha of aheadShas) {
+    const id = await resolveCommitPatchId(input.repoRoot, sha);
+    if (!id) {
+      return {
+        allUpstream: false,
+        aheadCount: aheadShas.length,
+        reason: `indeterminate patch-id for ${sha.slice(0, 12)} (merge commit or unreadable diff)`,
+      };
+    }
+    if (!upstreamPatchIds.has(id)) {
+      return { allUpstream: false, aheadCount: aheadShas.length, reason: `${sha.slice(0, 12)} is not upstream` };
+    }
+  }
+  return { allUpstream: true, aheadCount: aheadShas.length, reason: null };
+}
+
+/**
+ * SUP-13858: pin the current tip on a rescue ref, THEN reset to the base ref.
+ *
+ * Order is the whole contract. The rescue ref is created and independently re-read
+ * before anything moves, so a reset can never be the step that makes commits
+ * unreachable. If the pin cannot be proven, nothing moves at all — the diverged
+ * repo is an inconvenience, an unreachable commit is data loss.
+ */
+async function resetBaseRepoToBaseRefWithRescue(input: {
+  repoRoot: string;
+  baseRef: string;
+  baseRefSha: string;
+  priorTip: string;
+  aheadCount: number;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ reset: boolean; rescueRef: string | null; warnings: string[] }> {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  const rescueRef = `refs/paperclip/rescue/base-repo/${stamp}/head`;
+
+  try {
+    await runGit(["update-ref", rescueRef, input.priorTip], input.repoRoot);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
+    return {
+      reset: false,
+      rescueRef: null,
+      warnings: [
+        `Base repository at ${input.repoRoot} has ${input.aheadCount} ahead commit(s) already upstream, ` +
+          `but the rescue ref could not be created (${detail}). NOT reset — local commits preserved.`,
+      ],
+    };
+  }
+
+  // Read it back rather than trusting update-ref's exit code: this is the only
+  // guarantee that the commits survive the reset.
+  const pinned = await runGit(["rev-parse", "--verify", `${rescueRef}^{commit}`], input.repoRoot).catch(() => null);
+  if (pinned !== input.priorTip) {
+    return {
+      reset: false,
+      rescueRef: null,
+      warnings: [
+        `Base repository at ${input.repoRoot} has ${input.aheadCount} ahead commit(s) already upstream, ` +
+          `but the rescue ref ${rescueRef} did not resolve to the prior tip ${input.priorTip.slice(0, 12)} ` +
+          `(got ${pinned ? pinned.slice(0, 12) : "nothing"}). NOT reset — local commits preserved.`,
+      ],
+    };
+  }
+
+  try {
+    await runGit(["reset", "--hard", input.baseRefSha], input.repoRoot);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
+    return {
+      reset: false,
+      rescueRef,
+      warnings: [
+        `Base repository at ${input.repoRoot} could not be reset to ${input.baseRef} (${detail}). ` +
+          `The prior tip is pinned at ${rescueRef}; no commits were lost.`,
+      ],
+    };
+  }
+
+  return {
+    reset: true,
+    rescueRef,
+    warnings: [
+      `Base repository at ${input.repoRoot} was reset to ${input.baseRef}: all ${input.aheadCount} ahead ` +
+        `commit(s) were already upstream (same patch-id), so none represented unshipped work. ` +
+        `Prior tip ${input.priorTip.slice(0, 12)} is preserved at ${rescueRef}.`,
+    ],
+  };
 }
 
 async function inspectBaseRepoHygiene(repoRoot: string) {
@@ -3856,15 +4036,45 @@ export async function prepareBaseRepoForWorkspace(input: {
             : `Could not fast-forward base repository at ${input.repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
         );
       } else if (decision.action === "diverged") {
-        const subjects = decision.aheadCommitSubjects.length > 0
-          ? decision.aheadCommitSubjects.join(", ")
-          : "(no subjects)";
-        const message =
-          `Base repository at ${input.repoRoot} has diverged from ${baseRef}: ` +
-          `${decision.aheadCount} ahead, ${decision.behindCount} behind. ` +
-          `Ahead commits: ${subjects}. Local commits preserved — no reset performed.`;
-        baseRepoHygieneWarnings.push(message);
-        logger.warn(message);
+        // SUP-13858: `diverged` never resets, by design — which is right when the ahead
+        // commits are real work, and a permanent freeze when they are not. In the
+        // motivating incident 20 of 22 ahead commits were duplicates or belonged to a
+        // cancelled issue and ZERO were unshipped, yet the base repo stayed stuck for
+        // 16 days. So: prove every ahead commit is already upstream by patch-id, pin the
+        // tip, and only then reset. Anything short of proof falls through to the
+        // unchanged warning below.
+        const upstreamCheck = await resolveBaseRepoAheadCommitsAllUpstream({
+          repoRoot: input.repoRoot,
+          baseRef,
+          mergeBase: shallowState.mergeBase,
+        });
+        const resetOutcome = upstreamCheck.allUpstream && headSha && currentBaseRefSha
+          ? await resetBaseRepoToBaseRefWithRescue({
+              repoRoot: input.repoRoot,
+              baseRef,
+              baseRefSha: currentBaseRefSha,
+              priorTip: headSha,
+              aheadCount: upstreamCheck.aheadCount,
+              recorder: input.recorder ?? null,
+            })
+          : null;
+
+        if (resetOutcome) {
+          baseRepoHygieneWarnings.push(...resetOutcome.warnings);
+          for (const warning of resetOutcome.warnings) logger.warn(warning);
+        } else {
+          // Unchanged, verbatim: at least one ahead commit is unique, or duplication
+          // could not be proven. Warn, preserve, never reset.
+          const subjects = decision.aheadCommitSubjects.length > 0
+            ? decision.aheadCommitSubjects.join(", ")
+            : "(no subjects)";
+          const message =
+            `Base repository at ${input.repoRoot} has diverged from ${baseRef}: ` +
+            `${decision.aheadCount} ahead, ${decision.behindCount} behind. ` +
+            `Ahead commits: ${subjects}. Local commits preserved — no reset performed.`;
+          baseRepoHygieneWarnings.push(message);
+          logger.warn(message);
+        }
       } else if (decision.action === "indeterminate") {
         // No integers in this message, by contract: the whole point is that there is
         // no ahead/behind number anyone is entitled to state.
