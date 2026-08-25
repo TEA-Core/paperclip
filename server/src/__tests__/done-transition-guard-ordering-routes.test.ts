@@ -901,4 +901,208 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(body?.includes("Delivery verification was SKIPPED") ?? false).toBe(false);
     }
   });
+
+  describe("SUP-13939: tier-2 close-evidence gate on the control-plane done entry", () => {
+    function deliveryAllowed(branch: string) {
+      return {
+        allowed: true,
+        reason: `Branch ${branch} delivered; transition allowed`,
+        aheadBy: 0,
+        branch,
+        defaultRef: "fold/tea-patches-v2026.722.0",
+        owner: "TEA-Core",
+        repo: "paperclip",
+        skipped: false,
+      };
+    }
+
+    function boardActor(): Express.Request["actor"] {
+      return {
+        type: "board",
+        userId: "local-board",
+        userName: "Local Board",
+        userEmail: null,
+        isInstanceAdmin: true,
+        source: "local_implicit",
+      };
+    }
+
+    it("AC1: agent done PATCH without Tier 2 probe output and without the Tier 1 line is 422, status unchanged, comment not written", async () => {
+      const { companyId, agentId, issueId, identifier } = await seedIssue("SUP13939A");
+      currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "All tests pass. Shipping it." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(res.body.error).toContain("missing a done-tier declaration");
+      expect(res.body.details.issueId).toBe(issueId);
+      expect(res.body.details.identifier).toBe(identifier);
+      // The rejection must name both accepted forms.
+      expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
+      expect(res.body.details.remedy).toContain(
+        '"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."',
+      );
+
+      const statusRows = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(statusRows[0]?.status).toBe("todo");
+
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(0);
+    });
+
+    it("AC2: the verbatim Tier 1 substitution line closes the card", async () => {
+      const { companyId, agentId, issueId, identifier, branchName } = await seedIssue("SUP13939B");
+      currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+      mockEvaluateDoneTransitionGuard.mockResolvedValue(deliveryAllowed(branchName));
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment:
+            "Closed at Tier 1 (landed, not liveness-probed): docs-only change, no runtime surface. Liveness unverified.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const statusRows = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(statusRows[0]?.status).toBe("done");
+
+      const audit = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
+        .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
+      expect(audit).toHaveLength(1);
+    });
+
+    it("AC3: Tier 2 acceptance-probe output in the close comment closes the card", async () => {
+      const { companyId, agentId, issueId, identifier, branchName } = await seedIssue("SUP13939C");
+      currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+      mockEvaluateDoneTransitionGuard.mockResolvedValue(deliveryAllowed(branchName));
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment:
+            "Closed at Tier 2 (live): acceptance probe — GET /api/health returned 200 and the patched path executed without the regression.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const statusRows = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(statusRows[0]?.status).toBe("done");
+
+      const audit = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
+        .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
+      expect(audit).toHaveLength(0);
+    });
+
+    it("AC4: a board actor closes without evidence, bypassing the gate with an audited bypass row", async () => {
+      const { companyId, issueId, identifier, branchName } = await seedIssue("SUP13939D");
+      currentActor = boardActor();
+      mockEvaluateDoneTransitionGuard.mockResolvedValue(deliveryAllowed(branchName));
+
+      const res = await request(app).patch(`/api/issues/${identifier}`).send({ status: "done" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const statusRows = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(statusRows[0]?.status).toBe("done");
+
+      const audit = await db
+        .select({ action: activityLog.action, details: activityLog.details })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
+        .then((rows) => rows.filter((r) => r.action === "issue.done_tier_declaration_skipped"));
+      expect(audit).toHaveLength(1);
+      expect(audit[0]!.details.skipReason).toBe("board_actor_bypass");
+    });
+
+    it("AC4: board close with a comment lacking evidence still bypasses the gate", async () => {
+      const { companyId, issueId, identifier, branchName } = await seedIssue("SUP13939E");
+      currentActor = boardActor();
+      mockEvaluateDoneTransitionGuard.mockResolvedValue(deliveryAllowed(branchName));
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Closing this out on board judgment." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const statusRows = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(statusRows[0]?.status).toBe("done");
+
+      const audit = await db
+        .select({ action: activityLog.action, details: activityLog.details })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
+        .then((rows) => rows.filter((r) => r.action === "issue.done_tier_declaration_skipped"));
+      expect(audit).toHaveLength(1);
+      expect(audit[0]!.details.skipReason).toBe("board_actor_bypass");
+    });
+
+    it("AC5: statuses other than done are not subject to the tier gate", async () => {
+      // `in_review` carries its own pre-existing review-path disposition rule
+      // (SUP-10525), so it is exercised by the broader issue-route suites; here
+      // the point is that no tier-evidence 422 fires for non-done statuses.
+      const cases: Array<{ suffix: string; to: string; preStatus?: string }> = [
+        { suffix: "F", to: "in_progress" },
+        { suffix: "G", to: "cancelled" },
+        { suffix: "H", to: "backlog" },
+        { suffix: "I", to: "todo", preStatus: "in_progress" },
+      ];
+      for (const { suffix, to, preStatus } of cases) {
+        const { companyId, agentId, issueId, identifier } = await seedIssue(`SUP13939${suffix}`);
+        if (preStatus) {
+          await db.update(issues).set({ status: preStatus }).where(eq(issues.id, issueId));
+        }
+        currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+        mockEvaluateDoneTransitionGuard.mockResolvedValue(deliveryAllowed(identifier));
+
+        const res = await request(app).patch(`/api/issues/${identifier}`).send({ status: to });
+        expect(res.status, JSON.stringify(res.body, null, 2)).toBe(200);
+
+        const statusRows = await db
+          .select({ status: issues.status })
+          .from(issues)
+          .where(eq(issues.id, issueId));
+        expect(statusRows[0]?.status).toBe(to);
+      }
+    });
+  });
 });
