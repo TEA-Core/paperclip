@@ -312,17 +312,27 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_OPENCODE_LOG_ROTATION_ENABLED !== undefined
       ? process.env.PAPERCLIP_OPENCODE_LOG_ROTATION_ENABLED === "true"
       : true;
-  const opencodeLogMaxSizeBytes = Math.max(
-    0,
-    Number(process.env.PAPERCLIP_OPENCODE_LOG_MAX_SIZE_BYTES) || 512 * 1024 * 1024,
+  // Zero is meaningful for all three of these (rotate on every tick, keep no
+  // archive, keep no tail), so the usual `Number(env) || default` idiom cannot
+  // be used: it would silently rewrite an explicit 0 into the default. Read the
+  // override only when the variable is present and parses to a finite number.
+  const opencodeLogNumber = (name: string, fallback: number): number => {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === "") return fallback;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : fallback;
+  };
+  const opencodeLogMaxSizeBytes = opencodeLogNumber(
+    "PAPERCLIP_OPENCODE_LOG_MAX_SIZE_BYTES",
+    512 * 1024 * 1024,
   );
-  const opencodeLogRetainedArchives = Math.max(
-    0,
-    Number(process.env.PAPERCLIP_OPENCODE_LOG_RETAINED_ARCHIVES) || 5,
+  const opencodeLogRetainedArchives = opencodeLogNumber(
+    "PAPERCLIP_OPENCODE_LOG_RETAINED_ARCHIVES",
+    5,
   );
-  const opencodeLogRetainedTailBytes = Math.max(
-    0,
-    Number(process.env.PAPERCLIP_OPENCODE_LOG_RETAINED_TAIL_BYTES) || 32 * 1024 * 1024,
+  const opencodeLogRetainedTailBytes = opencodeLogNumber(
+    "PAPERCLIP_OPENCODE_LOG_RETAINED_TAIL_BYTES",
+    32 * 1024 * 1024,
   );
   // SUP-13535. The paperclip/approved commit status is written once, on the
   // head that existed at approval time. When that head later moves (conflict

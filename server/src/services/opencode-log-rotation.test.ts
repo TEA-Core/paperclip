@@ -156,6 +156,41 @@ describe("opencode log rotation (SUP-13970)", () => {
     await expect(fs.stat(openCodeLogArchivePath(logPath, 1))).rejects.toThrow();
   });
 
+  it("prunes every archive above a lowered retention, not just the boundary slot", async () => {
+    const root = await makeStorageRoot();
+    const logPath = await makeLog(root, "F".repeat(4096));
+    // Five archives on disk from a previous, higher retention. A shift-only
+    // sweep would touch slot 2 and strand 3, 4 and 5 forever.
+    for (const index of [1, 2, 3, 4, 5]) {
+      await fs.writeFile(openCodeLogArchivePath(logPath, index), `archive-${index}`);
+    }
+
+    const result = await rotateOpenCodeLog({ ...smallThreshold, retainedArchives: 2, storageDir: root });
+
+    expect(result).toMatchObject({ rotated: true, prunedArchives: 4 });
+    expect(await fs.readFile(openCodeLogArchivePath(logPath, 1), "utf8")).toBe("F".repeat(128));
+    expect(await fs.readFile(openCodeLogArchivePath(logPath, 2), "utf8")).toBe("archive-1");
+    for (const index of [3, 4, 5]) {
+      await expect(fs.stat(openCodeLogArchivePath(logPath, index))).rejects.toThrow();
+    }
+  });
+
+  it("removes every existing archive when retention drops to zero", async () => {
+    const root = await makeStorageRoot();
+    const logPath = await makeLog(root, "G".repeat(4096));
+    for (const index of [1, 2, 3]) {
+      await fs.writeFile(openCodeLogArchivePath(logPath, index), `archive-${index}`);
+    }
+
+    const result = await rotateOpenCodeLog({ ...smallThreshold, retainedArchives: 0, storageDir: root });
+
+    expect(result).toMatchObject({ rotated: true, archivedBytes: 0, prunedArchives: 3 });
+    expect(await fs.readFile(logPath, "utf8")).toBe("");
+    for (const index of [1, 2, 3]) {
+      await expect(fs.stat(openCodeLogArchivePath(logPath, index))).rejects.toThrow();
+    }
+  });
+
   it("clears a stale .1.tmp left behind by an interrupted sweep", async () => {
     const root = await makeStorageRoot();
     const logPath = await makeLog(root, "E".repeat(4096));

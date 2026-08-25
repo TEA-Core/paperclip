@@ -965,6 +965,31 @@ export async function startServer(): Promise<StartedServer> {
     pluginWorkerManager,
     enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,
   });
+  // SUP-13970: the opencode log is a single unrotated file that reached 1 GB on
+  // the same volume as the worktrees. The size-triggered rotation is a no-op
+  // where opencode_local is not used, and like the run-scratch reaper it keeps
+  // running while dispatch is quiesced: bounding disk must not stop for a
+  // drain. Defined outside the `heartbeat` branch and called from both interval
+  // callbacks — a host with HEARTBEAT_SCHEDULER_ENABLED=false still writes this
+  // log, so gating rotation on the heartbeat service would leave exactly the
+  // hosts that cannot self-heal unbounded.
+  const scheduleOpenCodeLogRotationSweep = () => {
+    if (!config.opencodeLogRotationEnabled) return;
+    if (heartbeatSchedulerStopped) return;
+    trackHeartbeatSchedulerWork(rotateOpenCodeLog({
+        maxSizeBytes: config.opencodeLogMaxSizeBytes,
+        retainedArchives: config.opencodeLogRetainedArchives,
+        retainedTailBytes: config.opencodeLogRetainedTailBytes,
+      })
+      .then((result) => {
+        if (result.rotated) {
+          logger.warn({ ...result }, "periodic opencode log rotation truncated an oversized log");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "periodic opencode log rotation failed");
+      }));
+  };
   const scheduleExternalObjectRefreshSweep = (now = new Date()) => {
     if (heartbeatSchedulerStopped) return;
     trackHeartbeatSchedulerWork(externalObjects
@@ -1379,26 +1404,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "periodic abandoned run scratch sweep failed");
           }));
 
-        // SUP-13970: the opencode log is a single unrotated file that reached
-        // 1 GB on the same volume as the worktrees. The size-triggered
-        // rotation is a no-op where opencode_local is not used, and like the
-        // reaper above it keeps running while dispatch is quiesced: bounding
-        // disk must not stop for a drain.
-        if (config.opencodeLogRotationEnabled) {
-          trackHeartbeatSchedulerWork(rotateOpenCodeLog({
-              maxSizeBytes: config.opencodeLogMaxSizeBytes,
-              retainedArchives: config.opencodeLogRetainedArchives,
-              retainedTailBytes: config.opencodeLogRetainedTailBytes,
-            })
-            .then((result) => {
-              if (result.rotated) {
-                logger.warn({ ...result }, "periodic opencode log rotation truncated an oversized log");
-              }
-            })
-            .catch((err) => {
-              logger.error({ err }, "periodic opencode log rotation failed");
-            }));
-        }
+        scheduleOpenCodeLogRotationSweep();
 
         if (heartbeatSchedulerStopped) return;
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
@@ -1518,6 +1524,7 @@ export async function startServer(): Promise<StartedServer> {
   } else {
     startHeartbeatSchedulerInterval(() => {
       scheduleExternalObjectRefreshSweep(new Date());
+      scheduleOpenCodeLogRotationSweep();
     });
   }
   

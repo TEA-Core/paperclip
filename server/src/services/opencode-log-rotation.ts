@@ -45,10 +45,12 @@ export function resolveOpenCodeStorageDir(storageDirOverride?: string): string {
   return resolveHomeAwarePath(candidate);
 }
 
+/** Absolute path of the live opencode log inside the resolved storage root. */
 export function resolveOpenCodeLogPath(storageDirOverride?: string): string {
   return path.join(resolveOpenCodeStorageDir(storageDirOverride), OPENCODE_LOG_DIR_NAME, OPENCODE_LOG_BASENAME);
 }
 
+/** Path of archive slot `index` (`opencode.log.1` is the newest archive). */
 export function openCodeLogArchivePath(logPath: string, index: number): string {
   return `${logPath}.${index}`;
 }
@@ -82,12 +84,35 @@ export type OpenCodeLogRotationOutcome =
       sizeBeforeBytes?: number;
     };
 
+/** True when the path exists and is a regular file; false on any stat error. */
 async function isRegularFile(candidatePath: string): Promise<boolean> {
   try {
     return (await fs.stat(candidatePath)).isFile();
   } catch {
     return false;
   }
+}
+
+/**
+ * Numbered archive slots present next to `logPath`, ascending. Reading the
+ * directory (rather than probing slots `1..retainedArchives`) is what lets a
+ * lowered retention prune the archives that the previous, higher retention
+ * left behind. Returns an empty list when the directory is unreadable.
+ */
+async function listOpenCodeLogArchiveIndexes(logPath: string): Promise<number[]> {
+  const dir = path.dirname(logPath);
+  const prefix = `${path.basename(logPath)}.`;
+  const entries = await fs.readdir(dir).catch(() => [] as string[]);
+  const indexes: number[] = [];
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) continue;
+    const suffix = entry.slice(prefix.length);
+    // Digits only: this must never match the `.1.tmp` staging file.
+    if (!/^\d+$/.test(suffix)) continue;
+    const index = Number(suffix);
+    if (index >= 1 && (await isRegularFile(path.join(dir, entry)))) indexes.push(index);
+  }
+  return indexes.sort((a, b) => a - b);
 }
 
 /**
@@ -121,17 +146,22 @@ export async function rotateOpenCodeLog(
   }
 
   try {
-    // Shift existing archives toward the oldest slot, pruning it. `.1` is
-    // always the newest archive after the sweep.
+    // Prune every archive that the current retention no longer has room for,
+    // then shift the survivors one slot older. Enumerating rather than only
+    // touching slot `retainedArchives` matters when retention is lowered
+    // between sweeps (or set to 0): the archives above the new limit are
+    // already on disk and a shift-only pass would strand them forever.
     let prunedArchives = 0;
-    for (let index = retainedArchives; index >= 1; index -= 1) {
+    for (const index of await listOpenCodeLogArchiveIndexes(logPath)) {
+      if (index < retainedArchives) continue;
+      await fs.rm(openCodeLogArchivePath(logPath, index), { force: true });
+      prunedArchives += 1;
+    }
+    // `.1` is always the newest archive after the sweep, so shift oldest-first
+    // to avoid clobbering a slot that has not moved yet.
+    for (let index = retainedArchives - 1; index >= 1; index -= 1) {
       const source = openCodeLogArchivePath(logPath, index);
       if (!(await isRegularFile(source))) continue;
-      if (index === retainedArchives) {
-        await fs.rm(source, { force: true });
-        prunedArchives += 1;
-        continue;
-      }
       await fs.rename(source, openCodeLogArchivePath(logPath, index + 1));
     }
 
