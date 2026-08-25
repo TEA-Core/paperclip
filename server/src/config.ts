@@ -73,6 +73,10 @@ export interface Config {
   opencodeJanitorIntervalMinutes: number;
   opencodeJanitorRetentionDays: number;
   opencodeJanitorVacuum: boolean;
+  opencodeLogRotationEnabled: boolean;
+  opencodeLogMaxSizeBytes: number;
+  opencodeLogRetainedArchives: number;
+  opencodeLogRetainedTailBytes: number;
   approvalStatusReconcilerEnabled: boolean;
   approvalStatusReconcilerIntervalMinutes: number;
   serveUi: boolean;
@@ -298,6 +302,28 @@ export function loadConfig(): Config {
   // Opt-in, unlike the rest of the sweep: VACUUM holds an exclusive lock for the
   // length of a full-file rewrite, and getting that wrong starves the fleet.
   const opencodeJanitorVacuum = process.env.PAPERCLIP_OPENCODE_JANITOR_VACUUM === "true";
+  // SUP-13970. opencode's own log is a single unrotated file; on the paperclip
+  // host it reached 1 GB on the same volume that holds worktrees. The periodic
+  // rotation caps it: when the live log exceeds max size, its most recent tail
+  // bytes are archived and the file is truncated in place. On by default: the
+  // no-op cost where opencode is not used is one stat per scheduler tick, and
+  // the archive footprint is bounded by retainedArchives x retainedTailBytes.
+  const opencodeLogRotationEnabled =
+    process.env.PAPERCLIP_OPENCODE_LOG_ROTATION_ENABLED !== undefined
+      ? process.env.PAPERCLIP_OPENCODE_LOG_ROTATION_ENABLED === "true"
+      : true;
+  const opencodeLogMaxSizeBytes = Math.max(
+    0,
+    Number(process.env.PAPERCLIP_OPENCODE_LOG_MAX_SIZE_BYTES) || 512 * 1024 * 1024,
+  );
+  const opencodeLogRetainedArchives = Math.max(
+    0,
+    Number(process.env.PAPERCLIP_OPENCODE_LOG_RETAINED_ARCHIVES) || 5,
+  );
+  const opencodeLogRetainedTailBytes = Math.max(
+    0,
+    Number(process.env.PAPERCLIP_OPENCODE_LOG_RETAINED_TAIL_BYTES) || 32 * 1024 * 1024,
+  );
   // SUP-13535. The paperclip/approved commit status is written once, on the
   // head that existed at approval time. When that head later moves (conflict
   // resolution, update-branch) the status is stranded and the merge queue
@@ -355,6 +381,10 @@ export function loadConfig(): Config {
     opencodeJanitorIntervalMinutes,
     opencodeJanitorRetentionDays,
     opencodeJanitorVacuum,
+    opencodeLogRotationEnabled,
+    opencodeLogMaxSizeBytes,
+    opencodeLogRetainedArchives,
+    opencodeLogRetainedTailBytes,
     approvalStatusReconcilerEnabled,
     approvalStatusReconcilerIntervalMinutes,
     databaseBackupEnabled,

@@ -64,6 +64,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
+import { rotateOpenCodeLog } from "./services/opencode-log-rotation.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
@@ -1377,6 +1378,27 @@ export async function startServer(): Promise<StartedServer> {
           .catch((err) => {
             logger.error({ err }, "periodic abandoned run scratch sweep failed");
           }));
+
+        // SUP-13970: the opencode log is a single unrotated file that reached
+        // 1 GB on the same volume as the worktrees. The size-triggered
+        // rotation is a no-op where opencode_local is not used, and like the
+        // reaper above it keeps running while dispatch is quiesced: bounding
+        // disk must not stop for a drain.
+        if (config.opencodeLogRotationEnabled) {
+          trackHeartbeatSchedulerWork(rotateOpenCodeLog({
+              maxSizeBytes: config.opencodeLogMaxSizeBytes,
+              retainedArchives: config.opencodeLogRetainedArchives,
+              retainedTailBytes: config.opencodeLogRetainedTailBytes,
+            })
+            .then((result) => {
+              if (result.rotated) {
+                logger.warn({ ...result }, "periodic opencode log rotation truncated an oversized log");
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic opencode log rotation failed");
+            }));
+        }
 
         if (heartbeatSchedulerStopped) return;
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
