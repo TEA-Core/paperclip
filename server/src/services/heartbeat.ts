@@ -201,6 +201,8 @@ import {
   cleanupHeartbeatRunScratch,
   prepareHeartbeatRunScratch,
   reapAbandonedRunScratchDirs,
+  resolveRecordableRunProcessGroupId,
+  terminateProcessesWithCwdUnderDir,
   terminateRunScratchProcessGroup,
   type HeartbeatRunScratch,
   type HeartbeatRunScratchMetadata,
@@ -13857,12 +13859,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * Liveness is resolved per directory rather than inferred, and anything the
    * lookup cannot answer is left alone (see `reapAbandonedRunScratchDirs`): a
    * database blip must never turn the backstop into a killer of live runs.
+   *
+   * SUP-13966: runs whose row carries no process group (the ACP lane's agent
+   * child sits in the server's own group; remote runs carry a foreign pid)
+   * used to hit a silent refusal here. They now get the cwd-matched fallback:
+   * processes whose /proc/<pid>/cwd still resolves under the directory are
+   * terminated, and the directory is removed.
    */
   async function sweepAbandonedRunScratch(opts?: { minAgeMs?: number; now?: Date }) {
     const outcomes = await reapAbandonedRunScratchDirs({
       minAgeMs: opts?.minAgeMs,
       now: opts?.now,
       terminateProcessGroup: terminateRunScratchProcessGroupForRun,
+      // The cwd match reads /proc; off linux it cannot see processes at all,
+      // and a blind "nothing matched" would turn into a removal out from
+      // under live children. There the historical refusal stays.
+      terminateCwdProcesses:
+        process.platform === "linux" ? (dir) => terminateProcessesWithCwdUnderDir({ dir }) : undefined,
       onError: (err, dir) => {
         logger.warn({ err, scratchDir: dir }, "abandoned run scratch sweep failed for directory");
       },
@@ -13888,10 +13901,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!run) {
           // No row at all. The run cannot still be executing against a record
           // that does not exist, and the directory has already outlived the
-          // minimum age, so this is garbage. There is no process group to read,
-          // which the terminator reports as `no_group` — that is a refusal, so
-          // a rowless directory with survivors is left for an operator rather
-          // than silently deleted out from under them.
+          // minimum age, so this is garbage. There is no process group to read;
+          // the reaper's cwd-matched fallback handles anything still sitting
+          // in the directory and leaves it in place for an operator if a
+          // process survives even SIGKILL.
           return { liveness: "finished" as RunScratchLiveness };
         }
         if (!isHeartbeatRunTerminalStatus(run.status)) {
@@ -13904,7 +13917,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped = outcomes.filter((o) => o.reaped);
     const survived = outcomes.filter((o) => !o.reaped && o.reason === "process_group_survived");
     const escalated = reaped.filter(
-      (o) => o.terminatedProcessGroup.terminated && o.terminatedProcessGroup.escalatedToKill,
+      (o) =>
+        (o.terminatedProcessGroup.terminated && o.terminatedProcessGroup.escalatedToKill) ||
+        (o.terminatedCwdProcesses?.escalatedToKill ?? false),
     );
     return {
       scanned: outcomes.length,
@@ -13912,6 +13927,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Groups that needed SIGKILL. A non-zero count here is the fleet telling
       // you an adapter leaves helpers that ignore SIGTERM.
       forceKilled: escalated.length,
+      // SUP-13966: with the no-pgid cwd fallback wired in, `process_group_survived`
+      // is only emitted for a process that actually outlived SIGKILL (the group,
+      // or a cwd-matched process). "We had no pgid to signal" no longer lands
+      // here: it is either reaped through the fallback or a real survivor.
       survived: survived.length,
       dirs: reaped.map((o) => o.dir),
       survivedDirs: survived.map((o) => o.dir),
@@ -16292,10 +16311,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           onSpawn: async (meta) => {
             await persistRunProcessMetadata(run.id, {
               pid: meta.pid,
-              processGroupId:
-                "processGroupId" in meta && typeof meta.processGroupId === "number"
-                  ? meta.processGroupId
-                  : null,
+              // SUP-13966: record a process group for every detached spawn,
+              // not just the ones whose adapter meta happens to carry one.
+              // The resolver guards against persisting the server's own
+              // group, and the pid fallback is local-only: a remote run's
+              // pid belongs to another host, where a local getpgid would
+              // only name an unrelated local process.
+              processGroupId: await resolveRecordableRunProcessGroupId({
+                pid: meta.pid,
+                reported:
+                  "processGroupId" in meta && typeof meta.processGroupId === "number"
+                    ? meta.processGroupId
+                    : null,
+                allowPidFallback: !remoteExecution,
+              }),
               startedAt: meta.startedAt,
             });
           },
