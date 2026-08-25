@@ -80,6 +80,7 @@ import {
 import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+import { redactCommandText } from "@paperclipai/adapter-utils/command-redaction";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -148,6 +149,36 @@ export function classifyOpenCodeFailure(input: {
     errorMeta.toolErrors = toolErrors;
   }
   return { errorCode, errorMeta };
+}
+
+/**
+ * SUP-13963: a failure that records a non-null `errorCode` must leave a
+ * greppable line in the container log. `errorMeta.stderrTail` is captured and
+ * persisted on the run record, but until this it reached no log — the next
+ * `opencode_exit_N` was an elimination exercise instead of a grep. One
+ * structured line per failed run, scrubbed through the adapter's existing
+ * redaction helper; the JSON payload keeps multi-line tails on a single
+ * physical line so the grep target stays one line per failure.
+ */
+export function buildOpenCodeFailureLogLine(input: {
+  runId: string;
+  errorCode: string | null;
+  errorMeta?: Record<string, unknown> | null;
+}): string | null {
+  const { runId, errorCode, errorMeta } = input;
+  if (!errorCode) return null;
+  const stderrTail = typeof errorMeta?.stderrTail === "string" ? errorMeta.stderrTail : "";
+  const adapterSessionId =
+    typeof errorMeta?.adapterSessionId === "string" ? errorMeta.adapterSessionId : null;
+  return (
+    `[paperclip] ${JSON.stringify({
+      event: "opencode_adapter_failure",
+      runId,
+      errorCode,
+      adapterSessionId,
+      stderrTail: redactCommandText(stderrTail),
+    })}\n`
+  );
 }
 
 // SUP-10914: opencode resolves its SQLite database as
@@ -929,7 +960,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     };
 
-    const toResult = (
+    // SUP-13963: emit the structured failure line for any result carrying a
+    // non-null errorCode. The billing-abort branch records no errorCode and
+    // stays quiet (that condition has its own stdout line above).
+    const emitAdapterFailureLog = async (result: {
+      errorCode?: string | null;
+      errorMeta?: Record<string, unknown>;
+    }): Promise<void> => {
+      const line = buildOpenCodeFailureLogLine({
+        runId,
+        errorCode: result.errorCode ?? null,
+        errorMeta: result.errorMeta,
+      });
+      if (line) await onLog("stderr", line);
+    };
+
+    const toResult = async (
       attempt: {
         proc: {
           exitCode: number | null;
@@ -947,7 +993,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Set when the adapter itself ended the run for a reason the process's own
       // exit status cannot express (currently: the database growth guard).
       errorMessageOverride: string | null = null,
-    ): AdapterExecutionResult => {
+    ): Promise<AdapterExecutionResult> => {
       const terminalBillingError = isOpenCodeTerminalBillingError(
         "",
         attempt.proc.stderr,
@@ -1007,7 +1053,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // of restarting cold and re-deriving the same context. Usage is carried
       // too — the tokens were spent whether or not the run reached the wall.
       if (attempt.proc.timedOut) {
-        return {
+        const result: AdapterExecutionResult = {
           exitCode: attempt.proc.exitCode,
           signal: attempt.proc.signal,
           timedOut: true,
@@ -1036,6 +1082,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           costUsd: attempt.parsed.costUsd,
           clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
         };
+        await emitAdapterFailureLog(result);
+        return result;
       }
 
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
@@ -1078,7 +1126,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
 
-      return {
+      const result: AdapterExecutionResult = {
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
@@ -1112,6 +1160,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
       };
+      await emitAdapterFailureLog(result);
+      return result;
     };
 
     // A guard-tripped attempt must never be retried: the retry would replay the
@@ -1119,9 +1169,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // both the unknown-session retry and the transient-statement retry loop —
     // and a runaway run plausibly emits lock errors of its own, which is exactly
     // what the latter retries on.
-    const databaseGuardResult = (
+    const databaseGuardResult = async (
       attempt: Awaited<ReturnType<typeof runAttempt>>,
-    ): AdapterExecutionResult | null => {
+    ): Promise<AdapterExecutionResult | null> => {
       if (!databaseGuardTrip) return null;
       return toResult(
         attempt,
@@ -1133,7 +1183,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     try {
       const initial = await runAttempt(sessionId);
-      const initialGuardResult = databaseGuardResult(initial);
+      const initialGuardResult = await databaseGuardResult(initial);
       if (initialGuardResult) return initialGuardResult;
       const initialFailed =
         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
@@ -1147,7 +1197,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `[paperclip] OpenCode session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
         const retry = await runAttempt(null);
-        return databaseGuardResult(retry) ?? toResult(retry, true);
+        return (await databaseGuardResult(retry)) ?? toResult(retry, true);
       }
 
       if (
@@ -1167,7 +1217,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             `[paperclip] transient opencode statement error, retry ${attemptIndex + 1}/2 after ${delay}ms: ${firstNonEmptyLine(attempt.rawStderr)}\n`,
           );
           const retry = await runAttempt(sessionId);
-          const retryGuardResult = databaseGuardResult(retry);
+          const retryGuardResult = await databaseGuardResult(retry);
           if (retryGuardResult) return retryGuardResult;
           const retryFailed =
             !retry.proc.timedOut &&
