@@ -130,11 +130,27 @@ export async function readClaudeAuthStatus(): Promise<ClaudeAuthStatus | null> {
   }
 }
 
-function describeClaudeSubscriptionAuth(status: ClaudeAuthStatus | null): string | null {
-  if (!status?.loggedIn || status.authMethod !== "claude.ai") return null;
+/**
+ * Auth methods that mean "a Claude subscription is backing this session".
+ *
+ * `claude.ai` is an interactive browser login. `oauth_token` is a long-lived
+ * subscription token supplied through `CLAUDE_CODE_OAUTH_TOKEN` (SUP-13941) —
+ * the same subscription, delivered without the 8-hour refresh cycle that the
+ * interactive login depends on. Billing is identical: `resolveClaudeBillingType`
+ * reports `subscription` for both, and only `ANTHROPIC_API_KEY` changes it.
+ *
+ * Both belong here. An API key does not: it is metered separately and has no
+ * subscription quota to report.
+ */
+const CLAUDE_SUBSCRIPTION_AUTH_METHODS = new Set(["claude.ai", "oauth_token"]);
+
+export function describeClaudeSubscriptionAuth(status: ClaudeAuthStatus | null): string | null {
+  if (!status?.loggedIn || !status.authMethod) return null;
+  if (!CLAUDE_SUBSCRIPTION_AUTH_METHODS.has(status.authMethod)) return null;
+  const via = status.authMethod === "oauth_token" ? "a subscription OAuth token" : "claude.ai";
   return status.subscriptionType
-    ? `Claude is logged in via claude.ai (${status.subscriptionType})`
-    : "Claude is logged in via claude.ai";
+    ? `Claude is logged in via ${via} (${status.subscriptionType})`
+    : `Claude is logged in via ${via}`;
 }
 
 export async function readClaudeToken(): Promise<string | null> {
