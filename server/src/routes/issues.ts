@@ -5334,6 +5334,23 @@ export function issueRoutes(
     return runToInterrupt?.status === "running" ? runToInterrupt : null;
   }
 
+  // SUP-13931 (ghost-pass-reporting.md): an `in_progress` status claim must be
+  // backed by live execution-run evidence — the serialized `activeRun` field is
+  // non-null when the issue's executionRunId points at a queued or running
+  // run, or the assignee's own live run targets this issue. Mirror that
+  // evidence test so a bare PATCH cannot fabricate `in_progress` state.
+  async function hasActiveRunEvidenceForIssue(issue: {
+    id: string;
+    assigneeAgentId: string | null;
+    executionRunId?: string | null;
+  }): Promise<boolean> {
+    if (issue.executionRunId) {
+      const run = await heartbeat.getRun(issue.executionRunId);
+      if (run && (run.status === "queued" || run.status === "running")) return true;
+    }
+    return (await resolveActiveIssueRun(issue)) !== null;
+  }
+
   function operatorInterruptCancelOptions(input: { issueId: string; actor: ReturnType<typeof getActorInfo> }) {
     return {
       errorCode: "operator_interrupted",
@@ -9548,6 +9565,38 @@ export function issueRoutes(
       existing.assigneeAgentId,
       req.body.executionPolicy !== undefined && monitorChanged,
     );
+
+    // SUP-13931 (ghost-pass-reporting.md): a client-requested transition INTO
+    // in_progress requires activeRun evidence (a queued or running execution
+    // run for this issue). A pending execution stage is excluded: there, a
+    // requested in_progress is the stage's changes-requested bounce (or a
+    // stage-dissolve by board override) — a workflow transition that ends with
+    // a fresh wake, not a state claim. No pending stage, no active run, no
+    // in_progress.
+    const requestedInProgressTransition =
+      typeof updateFields.status === "string"
+      && updateFields.status === "in_progress"
+      && existing.status !== "in_progress";
+    if (requestedInProgressTransition) {
+      const existingExecutionState = parseIssueExecutionState(existing.executionState);
+      const stageDrivenTransition = existingExecutionState?.status === "pending";
+      if (!stageDrivenTransition && !(await hasActiveRunEvidenceForIssue(existing))) {
+        res.status(422).json({
+          error:
+            "Entering in_progress requires activeRun evidence: the issue must have a queued or running execution run (GET /api/issues/<id> → executionState.activeRun non-null) per ghost-pass-reporting.md",
+          code: "in_progress_requires_active_run",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            currentStatus: existing.status,
+            executionRunId: existing.executionRunId ?? null,
+            remedy:
+              "Start or queue an execution run for the issue before transitioning, or mark it blocked with an unblock owner instead of claiming in_progress without live run evidence.",
+          },
+        });
+        return;
+      }
+    }
 
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,

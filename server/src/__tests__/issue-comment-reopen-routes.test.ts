@@ -3415,13 +3415,229 @@ describe.sequential("issue comment reopen routes", () => {
         payload: expect.objectContaining({
           issueId: "11111111-1111-4111-8111-111111111111",
           executionStage: expect.objectContaining({
-            wakeRole: "executor",
-            stageType: "review",
-            lastDecisionOutcome: "changes_requested",
-            allowedActions: ["address_changes", "resubmit"],
-          }),
+             wakeRole: "executor",
+             stageType: "review",
+             lastDecisionOutcome: "changes_requested",
+             allowedActions: ["address_changes", "resubmit"],
+           }),
+         }),
+       }),
+     ));
+  });
+
+  describe("in_progress activeRun evidence guard (SUP-13931)", () => {
+    const issueId = "11111111-1111-4111-8111-111111111111";
+    const assigneeId = "22222222-2222-4222-8222-222222222222";
+
+    function mockRunningReceipt(issue: ReturnType<typeof makeIssue>) {
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+    }
+
+    it("rejects a board PATCH todo -> in_progress without activeRun evidence", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_active_run");
+      expect(res.body.details).toEqual(
+        expect.objectContaining({
+          issueId,
+          currentStatus: "todo",
+          executionRunId: null,
         }),
-      }),
-    ));
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a resume PATCH with explicit in_progress when no run is active", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", resume: true, comment: "start it now" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_active_run");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows a board PATCH todo -> in_progress when the stamped execution run is running", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-live" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-live", status: "running" });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("allows a board PATCH todo -> in_progress when the stamped execution run is queued", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-queued" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-queued", status: "queued" });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("rejects when the stamped execution run is terminal and no assignee run is active", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-dead" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-dead", status: "completed" });
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_active_run");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows when the assignee's live run targets this issue via contextSnapshot", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+        id: "run-live",
+        status: "running",
+        agentId: assigneeId,
+        contextSnapshot: { issueId },
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("rejects when the assignee's live run targets a different issue", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+        id: "run-live",
+        status: "running",
+        agentId: assigneeId,
+        contextSnapshot: { issueId: "99999999-9999-4999-8999-999999999999" },
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_active_run");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows the assignee agent whose own run holds the issue lock", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-1" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-1", status: "running" });
+
+      const res = await request(await installActor(createApp(), agentActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("does not guard a no-op in_progress -> in_progress PATCH without run evidence", async () => {
+      const issue = makeIssue("in_progress");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("still allows a stage changes_requested bounce to in_progress without run evidence", async () => {
+      const policy = await normalizePolicy({
+        stages: [
+          {
+            id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            type: "review",
+            participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+          },
+        ],
+      })!;
+      const issue = {
+        ...makeIssue("in_review"),
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: policy.stages[0].id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+          returnAssignee: { type: "agent", agentId: assigneeId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(
+        await installActor(createApp(), {
+          type: "agent",
+          agentId: "33333333-3333-4333-8333-333333333333",
+          companyId: "company-1",
+          runId: "run-2",
+        }),
+      )
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", comment: "Needs another pass" });
+
+      expect(res.status).toBe(200);
+      const updateArgs = mockIssueService.update.mock.calls[0];
+      expect(updateArgs?.[0]).toBe(issueId);
+      expect(updateArgs?.[1]).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: assigneeId,
+      });
+    });
   });
 });
