@@ -2854,7 +2854,9 @@ export function issueRoutes(
   // the delivery guard, the tier declaration AND the activity_log rows entirely — so
   // approval-closed cards closed without merge verification and were invisible to the
   // ghost-PASS census by construction (SUP-13185). The comment auto-approval path never
-  // ran them at all.
+  // ran them at all. Contract since SUP-13939: a missing close-evidence declaration
+  // rejects with 422 (the delivery guard stays 409), and board actors are exempt from
+  // the tier-evidence check with an audited `board_actor_bypass` row.
   async function evaluateDoneTransitionGuards(input: {
     issue: Parameters<typeof evaluateDoneTransitionGuard>[1] & { id: string; identifier: string | null };
     override: DoneTransitionOverride | null;
@@ -2864,11 +2866,15 @@ export function issueRoutes(
     // guard applies in full on decision-carrying transitions. The tier declaration is
     // the implementer's obligation under SUP-12693 — a reviewer cannot make a liveness
     // claim on the implementer's behalf, and the approval comment is a verdict, not a
-    // close-out — so there it degrades to an audit row rather than a 409 that would
+    // close-out — so there it degrades to an audit row rather than a 422 that would
     // deadlock the approval circuit. Either way the transition becomes auditable.
     decisionCarried: boolean;
+    // Board actors close on the board's own judgment (SUP-13939): the tier-evidence
+    // requirement is bypassed, but an audit row is written so board closes stay
+    // countable in the ghost-PASS census. The delivery guard still applies in full.
+    boardActor: boolean;
   }): Promise<DoneTransitionGuardOutcome> {
-    const { issue, override, commentBody, runId, decisionCarried } = input;
+    const { issue, override, commentBody, runId, decisionCarried, boardActor } = input;
 
     const guardResult = await evaluateDoneTransitionGuard(db, issue, override, decisionCarried);
     if (guardResult.skipped || guardResult.skipReason) {
@@ -2916,6 +2922,18 @@ export function issueRoutes(
       };
     }
 
+    if (boardActor) {
+      // SUP-13939: board closes are exempt from the tier-evidence requirement, but the
+      // bypass itself is recorded so board closes stay countable in the ghost-PASS
+      // census (an unexplained "skip" would look exactly like the old silent gap).
+      void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
+        reason: "Board actor bypassed the done-tier close-evidence requirement",
+        skipReason: "board_actor_bypass",
+        decisionCarried,
+      });
+      return { ok: true };
+    }
+
     const tierResult = await evaluateDoneTierDeclaration(
       db,
       issue,
@@ -2943,7 +2961,7 @@ export function issueRoutes(
       }
       return {
         ok: false,
-        status: 409,
+        status: 422,
         body: {
           error: tierResult.reason,
           code: "done_transition_missing_tier_declaration",
@@ -9726,6 +9744,7 @@ export function issueRoutes(
         commentBody: commentBody ?? null,
         runId: actor.runId ?? null,
         decisionCarried: !!transition.decision,
+        boardActor: req.actor.type === "board",
       });
       if (!outcome.ok) {
         res.status(outcome.status).json(outcome.body);
@@ -12124,8 +12143,9 @@ export function issueRoutes(
       // This route is a second door onto `done` and used to run neither done-guard, so
       // an approval comment on a final review stage closed the card without any merge
       // verification and without an activity_log row (SUP-13185, the SUP-13176/13181
-      // shape). Evaluate before the transaction: a 409 here must leave both the comment
-      // and the status change unwritten.
+      // shape). Evaluate before the transaction: a 409 (delivery) or 422 (missing
+      // close evidence) here must leave both the comment and the status change
+      // unwritten.
       const autoApproveEffectiveStatus =
         typeof transition.patch.status === "string" ? transition.patch.status : "done";
       if (autoApproveEffectiveStatus === "done" && currentIssue.status !== "done") {
@@ -12135,6 +12155,7 @@ export function issueRoutes(
           commentBody: req.body.body ?? null,
           runId: actor.runId ?? null,
           decisionCarried: !!transition.decision,
+          boardActor: req.actor.type === "board",
         });
         if (!outcome.ok) {
           res.status(outcome.status).json(outcome.body);
