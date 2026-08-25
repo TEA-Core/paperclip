@@ -784,6 +784,65 @@ export async function evaluateDoneTransitionGuard(
     };
   }
 
+const closedButNotMergedPrs = resolvedPrs.filter(
+    (p) => p.cachedState !== "open" && p.cachedState !== null,
+  );
+  if (closedButNotMergedPrs.length > 0) {
+    const prChecks = await Promise.all(
+      closedButNotMergedPrs.map((pr) =>
+        githubBranchHasMergedPr(parsed.hostname, parsed.owner, parsed.repo, branch, token),
+      ),
+    );
+    const anyMerged = prChecks.some((check) => check);
+    if (anyMerged) {
+      const mergedNames = closedButNotMergedPrs
+        .filter((_pr, i) => prChecks[i])
+        .map((pr) => pr.displayName)
+        .join(", ");
+      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        reason: `closed_but_not_merged_prs:${mergedNames}`,
+        prs: mergedNames,
+      });
+      return {
+        allowed: false,
+        reason:
+          `Issue has ${closedButNotMergedPrs.length} closed but not merged linked PR${closedButNotMergedPrs.length === 1 ? "" : "s"} (${mergedNames}). ` +
+          "Land them (merge the PRs) before marking done, or set doneTransitionOverride to a " +
+          `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}). ` +
+          "A done-tier declaration alone does not clear this block — the tier check runs after this guard.",
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    const unmergedNames = closedButNotMergedPrs
+      .filter((_pr, i) => !prChecks[i])
+      .map((pr) => pr.displayName)
+      .join(", ");
+    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      reason: `closed_but_not_merged_prs:${unmergedNames}`,
+      prs: unmergedNames,
+    });
+    return {
+      allowed: false,
+      reason:
+        `Issue has ${closedButNotMergedPrs.length} closed but not merged linked PR${closedButNotMergedPrs.length === 1 ? "" : "s"} (${unmergedNames}). ` +
+        "Land them (merge the PRs) before marking done, or set doneTransitionOverride to a " +
+        `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}). ` +
+        "A done-tier declaration alone does not clear this block — the tier check runs after this guard.",
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
   const ctx = await getCtx();
   if (!ctx || !ctx.repoUrl || !ctx.defaultRef) {
     return fallback("No resolvable execution workspace or repo context; transition allowed");
