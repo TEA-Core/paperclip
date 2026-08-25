@@ -744,7 +744,7 @@ describe("run spawn process group recording (SUP-13966)", () => {
 
   it("reads a real detached child's own group from /proc when no reader is injected", async () => {
     if (process.platform !== "linux") return;
-    const child = spawn("sleep", ["0.5"], { detached: true, stdio: "ignore" });
+    const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
     child.unref();
     const pid = child.pid;
     if (pid === undefined) return;
@@ -762,7 +762,7 @@ describe("run spawn process group recording (SUP-13966)", () => {
     // No `detached`: the child joins the test runner's process group, which
     // is exactly the ACP lane's shape. Persisting that group would hand the
     // reaper the server's own address.
-    const child = spawn("sleep", ["0.5"], { stdio: "ignore" });
+    const child = spawn("sleep", ["30"], { stdio: "ignore" });
     child.unref();
     const pid = child.pid;
     if (pid === undefined) return;
@@ -884,5 +884,60 @@ describe("cwd-matched run scratch termination (SUP-13966)", () => {
 
     expect(result).toEqual({ terminated: true, matchedPids: [21], escalatedToKill: false });
     expect(kill.mock.calls).toEqual([[21, "SIGTERM"]]);
+  });
+
+  it("does not SIGKILL a pid the kernel recycled during the grace window", async () => {
+    const kill = vi.fn();
+    let cwd = dir;
+
+    const result = await terminateProcessesWithCwdUnderDir({
+      dir,
+      listProcessIds: () => [21],
+      // The pid matched, exited under SIGTERM, and the kernel handed the same
+      // number to an unrelated process whose cwd is somewhere else entirely.
+      readProcessCwd: () => cwd,
+      isProcessAlive: () => true,
+      kill,
+      sleep: async () => {
+        cwd = "/some/other/place";
+      },
+    });
+
+    expect(result).toEqual({ terminated: true, matchedPids: [21], escalatedToKill: false });
+    expect(kill.mock.calls).toEqual([[21, "SIGTERM"]]);
+  });
+
+  it("matches a real process whose cwd was deleted out from under it", async () => {
+    if (process.platform !== "linux") return;
+    const victimRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-cwd-deleted-"));
+    const victimDir = path.join(victimRoot, "work");
+    await fs.mkdir(victimDir);
+    const child = spawn("sleep", ["30"], { cwd: victimDir, stdio: "ignore" });
+    const pid = child.pid;
+    if (pid === undefined) {
+      await fs.rm(victimRoot, { recursive: true, force: true });
+      return;
+    }
+    try {
+      // The directory is gone but the process lives: /proc/<pid>/cwd now reads
+      // back with the kernel's " (deleted)" suffix, and realpath fails.
+      await fs.rm(victimDir, { recursive: true, force: true });
+
+      const result = await terminateProcessesWithCwdUnderDir({
+        dir: victimDir,
+        listProcessIds: () => [pid],
+        graceMs: 50,
+      });
+
+      expect(result.matchedPids).toEqual([pid]);
+      expect(result.terminated).toBe(true);
+    } finally {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+      await fs.rm(victimRoot, { recursive: true, force: true });
+    }
   });
 });

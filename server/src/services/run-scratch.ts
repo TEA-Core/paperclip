@@ -362,6 +362,8 @@ async function defaultListProcessIds(): Promise<number[]> {
   return entries.filter((entry) => /^\d+$/.test(entry)).map((entry) => Number(entry));
 }
 
+const DELETED_LINK_SUFFIX = " (deleted)";
+
 async function defaultReadProcessCwd(pid: number): Promise<string | null> {
   const linkPath = path.join("/proc", String(pid), "cwd");
   try {
@@ -369,9 +371,12 @@ async function defaultReadProcessCwd(pid: number): Promise<string | null> {
   } catch {
     // The cwd's path can be gone even while the process lives (the directory
     // was deleted out from under it). The raw link still names it, and the
-    // match below runs on that name.
+    // match below runs on that name. The kernel appends " (deleted)" to that
+    // name; leaving it on would break the match for exactly the processes
+    // this fallback exists to find.
     try {
-      return await fs.readlink(linkPath);
+      const link = await fs.readlink(linkPath);
+      return link.endsWith(DELETED_LINK_SUFFIX) ? link.slice(0, -DELETED_LINK_SUFFIX.length) : link;
     } catch {
       return null;
     }
@@ -453,7 +458,17 @@ export async function terminateProcessesWithCwdUnderDir(input: {
     }
   }
   await sleep(graceMs);
-  let survivors = matched.filter((pid) => checkAlive(pid));
+  // The match input is stale by exactly the grace interval: a matched pid can
+  // exit during it and the kernel can hand that number to an unrelated
+  // process. SIGKILL is uncatchable, so re-confirm the cwd before escalating —
+  // liveness alone would let a recycled pid inherit the kill.
+  const survivorsInDir: number[] = [];
+  for (const pid of matched) {
+    if (!checkAlive(pid)) continue;
+    const cwd = await resolveCwd(pid);
+    if (cwd !== null && isPathInside(dir, cwd)) survivorsInDir.push(pid);
+  }
+  let survivors = survivorsInDir;
   let escalatedToKill = false;
   if (survivors.length > 0) {
     escalatedToKill = true;
