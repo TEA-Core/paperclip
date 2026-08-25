@@ -200,7 +200,12 @@ import {
   buildHeartbeatRunScratchEnv,
   cleanupHeartbeatRunScratch,
   prepareHeartbeatRunScratch,
+  reapAbandonedRunScratchDirs,
+  terminateRunScratchProcessGroup,
   type HeartbeatRunScratch,
+  type HeartbeatRunScratchMetadata,
+  type RunScratchLiveness,
+  type RunScratchTerminationOutcome,
 } from "./run-scratch.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
@@ -6231,6 +6236,19 @@ function isSameTaskScope(left: string | null, right: string | null) {
 
 function isTrackedLocalChildProcessAdapter(adapterType: string) {
   return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
+}
+
+/**
+ * SUP-13949: bound the escalation ladder for a finished run's process group.
+ *
+ * Thin on purpose — the policy lives in `terminateRunScratchProcessGroup`; this
+ * only pins the liveness probe so both the teardown path and the periodic
+ * backstop agree on what "still alive" means.
+ */
+function terminateRunScratchProcessGroupForRun(
+  processGroupId: number | null | undefined,
+): Promise<RunScratchTerminationOutcome> {
+  return terminateRunScratchProcessGroup({ processGroupId, isProcessGroupAlive });
 }
 
 function isHeartbeatRunTerminalStatus(
@@ -13826,6 +13844,80 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * SUP-13949: backstop reaper for run scratch directories whose run is over.
+   *
+   * The teardown path now terminates a finished run's process group, but it can
+   * only do that for runs this server process is still holding. Anything the
+   * server lost — a crash, a hard restart, a container recreate mid-run —
+   * leaves the directory and its process group with nobody to clean them. That
+   * is the class that reached 42 hours old and 19 GB. This sweep reads the
+   * directories back off disk and finishes the job.
+   *
+   * Liveness is resolved per directory rather than inferred, and anything the
+   * lookup cannot answer is left alone (see `reapAbandonedRunScratchDirs`): a
+   * database blip must never turn the backstop into a killer of live runs.
+   */
+  async function sweepAbandonedRunScratch(opts?: { minAgeMs?: number; now?: Date }) {
+    const outcomes = await reapAbandonedRunScratchDirs({
+      minAgeMs: opts?.minAgeMs,
+      now: opts?.now,
+      terminateProcessGroup: terminateRunScratchProcessGroupForRun,
+      onError: (err, dir) => {
+        logger.warn({ err, scratchDir: dir }, "abandoned run scratch sweep failed for directory");
+      },
+      resolveLiveness: async (metadata: HeartbeatRunScratchMetadata) => {
+        // An execution this process is still driving is authoritative and
+        // cheaper than a query, and it also covers the window where the row is
+        // written but the status has not caught up yet.
+        if (activeRunExecutions.has(metadata.runId)) {
+          return { liveness: "active" as RunScratchLiveness };
+        }
+        let run;
+        try {
+          run = await getRun(metadata.runId);
+        } catch (err) {
+          // Explicitly NOT "finished". A failed lookup is the one case where
+          // guessing wrong kills live work, so it defers to the next sweep.
+          logger.warn(
+            { err, runId: metadata.runId },
+            "abandoned run scratch sweep could not resolve run liveness",
+          );
+          return { liveness: "unknown" as RunScratchLiveness };
+        }
+        if (!run) {
+          // No row at all. The run cannot still be executing against a record
+          // that does not exist, and the directory has already outlived the
+          // minimum age, so this is garbage. There is no process group to read,
+          // which the terminator reports as `no_group` — that is a refusal, so
+          // a rowless directory with survivors is left for an operator rather
+          // than silently deleted out from under them.
+          return { liveness: "finished" as RunScratchLiveness };
+        }
+        if (!isHeartbeatRunTerminalStatus(run.status)) {
+          return { liveness: "active" as RunScratchLiveness };
+        }
+        return { liveness: "finished" as RunScratchLiveness, processGroupId: run.processGroupId };
+      },
+    });
+
+    const reaped = outcomes.filter((o) => o.reaped);
+    const survived = outcomes.filter((o) => !o.reaped && o.reason === "process_group_survived");
+    const escalated = reaped.filter(
+      (o) => o.terminatedProcessGroup.terminated && o.terminatedProcessGroup.escalatedToKill,
+    );
+    return {
+      scanned: outcomes.length,
+      reaped: reaped.length,
+      // Groups that needed SIGKILL. A non-zero count here is the fleet telling
+      // you an adapter leaves helpers that ignore SIGTERM.
+      forceKilled: escalated.length,
+      survived: survived.length,
+      dirs: reaped.map((o) => o.dir),
+      survivedDirs: survived.map((o) => o.dir),
+    };
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; stillbornTtlMs?: number; selfDeclaredRunTtlMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const stillbornTtlMs = opts?.stillbornTtlMs ?? DEFAULT_STILLBORN_RUN_TTL_MS;
@@ -16958,6 +17050,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 scratch: scratchForCleanup,
                 processGroupId: latestRun.processGroupId,
                 isProcessGroupAlive,
+                // SUP-13949: the run is terminal here (guarded by
+                // isHeartbeatRunTerminalStatus above), so anything still in its
+                // process group is a background helper the adapter child left
+                // behind. Skipping used to be the whole behaviour, and nothing
+                // ever came back for these — they reparented to pid 1 and ran
+                // until the container was near OOM.
+                terminateProcessGroup: terminateRunScratchProcessGroupForRun,
               });
             } catch (scratchCleanupError) {
               logger.warn(
@@ -19729,6 +19828,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
+    sweepAbandonedRunScratch,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
