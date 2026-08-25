@@ -443,7 +443,9 @@ export function normalizeIssueExecutionPolicy(
  * removable with a two-character value or a bare null. Three destructive
  * shapes are rejected at the write boundary:
  *
- * - an explicitly empty `stages` array (`executionPolicy.stages: []`);
+ * - an explicitly empty `stages` array (`executionPolicy.stages: []`), unless
+ *   the stored policy is *already* stage-less, in which case the array removes
+ *   nothing (SUP-13925);
  * - an explicit `executionPolicy: null` on an issue whose stored policy is
  *   non-null;
  * - any other body over an issue that currently has stages, where the body
@@ -454,6 +456,18 @@ export function normalizeIssueExecutionPolicy(
  * monitor-only policy (or a policy with authorization/review-preset content
  * but no stages) can still be cleared or replaced with a body that is not
  * null-as-is and that omits the `stages` field.
+ *
+ * SUP-13925: the empty-`stages` rejection is scoped to writes that actually
+ * remove something. A monitor-only watcher's stored policy is
+ * `{mode, stages: [], monitor}` by design, and the natural re-arm idiom is to
+ * read that policy, edit `monitor.nextCheckAt`, and write the whole object
+ * back. That round-trip carries an explicit `stages: []` and used to 422, which
+ * left the only working re-arm path a partial `{monitor: {...}}` body that
+ * relies on merge semantics. Permitting the round-trip grants no new
+ * capability: over an already stage-less policy the identical stored result is
+ * reachable today by omitting the `stages` key entirely, so the rejection was
+ * blocking an idiom rather than defending the ladder. Over a policy that *has*
+ * stages the rejection is unchanged — that is the case ADR-029/ADR-072 guard.
  */
 export function assertPatchableExecutionPolicyWrite(input: {
   raw: unknown;
@@ -464,7 +478,12 @@ export function assertPatchableExecutionPolicyWrite(input: {
 }): void {
   const { raw, currentPolicy, stagesExplicitlyEmpty } = input;
 
-  if (stagesExplicitlyEmpty) {
+  // SUP-13925: only reject when there is a close ladder to strip. `stages: []`
+  // over a stored policy that is already stage-less is a faithful round-trip,
+  // not a removal. `currentPolicy === null` still rejects: there is no stored
+  // shape being round-tripped, so an explicit empty array there is the
+  // ladder-free policy the guard was written to keep off the board.
+  if (stagesExplicitlyEmpty && (currentPolicy === null || currentPolicy.stages.length > 0)) {
     throw unprocessable("executionPolicy.stages must not be empty");
   }
 

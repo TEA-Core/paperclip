@@ -1537,6 +1537,63 @@ describe("issue execution policy routes", () => {
       expect(storedPolicy).not.toBeNull();
     });
 
+    // SUP-13925: the monitor re-arm round-trip. A monitor-only watcher stores
+    // `stages: []` by design, so reading its policy, editing
+    // `monitor.nextCheckAt` and writing the whole object back necessarily
+    // carries an explicit empty array. That used to 422, which silently stopped
+    // the ci-health daily digest from re-arming.
+    function monitorOnlyIssue(issueId: string) {
+      return {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        // A monitor may only be scheduled on an agent-assigned in_progress /
+        // in_review issue, so the watcher fixture carries an assignee.
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-13925",
+        title: "Monitor-only watcher",
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [],
+          monitor: { nextCheckAt: "2026-08-25T08:00:00.000Z", notes: "ci-health digest" },
+        }),
+        executionState: null,
+      };
+    }
+
+    it("accepts the whole-object monitor re-arm on an empty-stages issue and persists the new nextCheckAt", async () => {
+      const issueId = randomUUID();
+      const issue = monitorOnlyIssue(issueId);
+      expect((issue.executionPolicy as { stages: unknown[] }).stages).toEqual([]);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue(issue as any);
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [],
+            monitor: {
+              nextCheckAt: "2026-08-26T08:00:00.000Z",
+              notes: "ci-health digest",
+              maxAttempts: 100,
+            },
+          },
+        });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+      const written = mockIssueService.update.mock.calls.at(-1)?.[1] as {
+        executionPolicy?: { stages?: unknown[]; monitor?: { nextCheckAt?: string; maxAttempts?: number } };
+      };
+      expect(written.executionPolicy?.stages).toEqual([]);
+      expect(written.executionPolicy?.monitor?.nextCheckAt).toBe("2026-08-26T08:00:00.000Z");
+      expect(written.executionPolicy?.monitor?.maxAttempts).toBe(100);
+    });
+
     it("rejects a PATCH that sets executionPolicy to null over a non-null stored policy and leaves it untouched", async () => {
       const issueId = randomUUID();
       const issue = ladderIssue(issueId);
