@@ -83,6 +83,7 @@ import { runningProcesses, sanitizeInheritedPaperclipEnv } from "@paperclipai/ad
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
 
 import {
+  buildOpenCodeFailureLogLine,
   buildOpenCodeRunArgs,
   classifyOpenCodeFailure,
   ensureRemoteOpenCodeModelConfiguredAndAvailable,
@@ -389,6 +390,61 @@ describe("classifyOpenCodeFailure", () => {
   });
 });
 
+// SUP-13963: a failure that records a non-null errorCode used to leave no
+// trace in the container log — stderrTail was captured into the run record but
+// nothing was emitted, so the next occurrence was an elimination exercise. The
+// line below is that trace: one structured line per failed run, scrubbed
+// through the repo's secret-redaction helper, stable enough to grep.
+describe("buildOpenCodeFailureLogLine", () => {
+  it("builds a single-line payload carrying errorCode, adapterSessionId, and stderrTail", () => {
+    const line = buildOpenCodeFailureLogLine({
+      runId: "run-13963",
+      errorCode: "opencode_exit_1",
+      errorMeta: {
+        adapterSessionId: "ses_abc",
+        stderrTail: "Error: Unexpected error\nEACCES: permission denied",
+      },
+    });
+    expect(typeof line).toBe("string");
+    const text = line as string;
+    // A multi-line tail must stay on one physical line (escaped in the JSON).
+    expect(text.trimEnd().split("\n")).toHaveLength(1);
+    const payload = JSON.parse(text.replace(/^\[paperclip\] /, "")) as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      event: "opencode_adapter_failure",
+      runId: "run-13963",
+      errorCode: "opencode_exit_1",
+      adapterSessionId: "ses_abc",
+    });
+    expect(payload.stderrTail).toBe("Error: Unexpected error\nEACCES: permission denied");
+  });
+
+  it("emits nothing for a clean run (null errorCode)", () => {
+    expect(
+      buildOpenCodeFailureLogLine({
+        runId: "run-13963",
+        errorCode: null,
+        errorMeta: { adapterSessionId: "ses_abc", stderrTail: "" },
+      }),
+    ).toBeNull();
+  });
+
+  it("redacts secret-shaped values out of stderrTail before emission", () => {
+    const secret = "sk-testsecret12345678901";
+    const line = buildOpenCodeFailureLogLine({
+      runId: "run-13963",
+      errorCode: "opencode_exit_1",
+      errorMeta: {
+        adapterSessionId: "ses_abc",
+        stderrTail: `Error: request failed Authorization: Bearer ${secret}`,
+      },
+    });
+    expect(line).not.toBeNull();
+    expect(line).not.toContain(secret);
+    expect(line).toContain("***REDACTED***");
+  });
+});
+
 describe("execute — transient statement error retry", () => {
   const TRANSIENT_STDERR = "Failed to execute statement / Unexpected server error";
 
@@ -483,6 +539,107 @@ describe("execute — transient statement error retry", () => {
     expect(result.errorMessage).toContain(TRANSIENT_STDERR);
     expect(runAdapterExecutionTargetProcessMock).toHaveBeenCalledTimes(3);
   }, 15000);
+});
+
+// SUP-13963: a non-zero-exit adapter failure must leave exactly one structured
+// line in the container log carrying errorCode, adapterSessionId, and the
+// redacted stderrTail — the trace that turns the next occurrence into a grep
+// instead of an elimination exercise.
+describe("execute — SUP-13963 failure log line", () => {
+  const FAILURE_STDERR = "Error: Unexpected error";
+  const SEED_SECRET = "sk-testsecret12345678901";
+
+  function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
+    return {
+      runId: "run-faillog",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Agent",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "ses_faillog",
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: { model: "router/coder", cwd: process.cwd() },
+      context: {},
+      onLog: async () => {},
+      ...overrides,
+    };
+  }
+
+  function failureResult() {
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: `${FAILURE_STDERR}\nAuthorization: Bearer ${SEED_SECRET}`,
+    };
+  }
+
+  function successResult() {
+    return {
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: [
+        JSON.stringify({ type: "text", part: { text: "Done", messageID: "msg-1" } }),
+        JSON.stringify({ type: "step_finish", part: { reason: "stop", tokens: { input: 10, output: 5, reasoning: 0 }, cost: 0 } }),
+      ].join("\n"),
+      stderr: "",
+    };
+  }
+
+  beforeEach(() => {
+    runAdapterExecutionTargetProcessMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("emits exactly one structured line carrying errorCode, adapterSessionId, and the redacted stderrTail", async () => {
+    const logs: string[] = [];
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => failureResult());
+
+    const result = await execute(
+      makeCtx({
+        onLog: async (_stream: "stdout" | "stderr", chunk: string) => void logs.push(chunk),
+      }),
+    );
+
+    expect(result.errorCode).toBe("opencode_exit_1");
+    const failureLines = logs.filter((chunk) => chunk.includes("opencode_adapter_failure"));
+    expect(failureLines).toHaveLength(1);
+    const payload = JSON.parse(failureLines[0].trimEnd().replace(/^\[paperclip\] /, "")) as Record<string, unknown>;
+    expect(payload.errorCode).toBe("opencode_exit_1");
+    expect(payload.adapterSessionId).toBe("ses_faillog");
+    expect(String(payload.stderrTail)).toContain(FAILURE_STDERR);
+    // The seeded secret-shaped value must not survive into the emitted line.
+    expect(failureLines[0]).not.toContain(SEED_SECRET);
+    expect(failureLines[0]).toContain("***REDACTED***");
+    // One physical line per failure, even with a multi-line tail.
+    expect(failureLines[0].trimEnd().split("\n")).toHaveLength(1);
+  });
+
+  it("emits no failure line for a clean run", async () => {
+    const logs: string[] = [];
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => successResult());
+
+    const result = await execute(
+      makeCtx({
+        onLog: async (_stream: "stdout" | "stderr", chunk: string) => void logs.push(chunk),
+      }),
+    );
+
+    expect(result.errorCode ?? null).toBeNull();
+    expect(logs.some((chunk) => chunk.includes("opencode_adapter_failure"))).toBe(false);
+  });
 });
 
 // SUP-10914: every opencode_local run wrote to ONE shared SQLite database
