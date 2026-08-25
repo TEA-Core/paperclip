@@ -372,17 +372,19 @@ const DEFINITIONS = validateBuiltInAgentDefinitions([
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
         variables: [
-          { name: "lookbackDays", label: "Lookback days", type: "number", defaultValue: 7, required: true, options: [] },
-          { name: "maxTargetAgents", label: "Max target agents", type: "number", defaultValue: 8, required: true, options: [] },
+          { name: "lookbackDays", label: "Lookback window (days)", type: "number", defaultValue: 7, required: false, options: [] },
+          { name: "maxTargetAgents", label: "Max target agents per run", type: "number", defaultValue: 8, required: false, options: [] },
           {
             name: "targetAgentMode",
-            label: "Target agent mode",
+            label: "Target selection mode",
             type: "select",
             defaultValue: "recent_active",
-            required: true,
-            options: ["recent_active", "recent_blocked", "recent_completed"],
+            required: false,
+            // recent_blocked / recent_completed were never implemented and appear nowhere
+            // else in the tree; the routine prompt branches on all / explicit instead.
+            options: ["recent_active", "all", "explicit"],
           },
-          { name: "excludeAgentIds", label: "Excluded agent ids", type: "text", defaultValue: "", required: false, options: [] },
+          { name: "excludeAgentIds", label: "Agent ids to exclude (comma-separated)", type: "text", defaultValue: "", required: false, options: [] },
         ],
         triggers: [
           {
@@ -444,14 +446,14 @@ const DEFINITIONS = validateBuiltInAgentDefinitions([
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
         variables: [
-          { name: "staleAfterHours", label: "Refresh slots older than (hours)", type: "number", defaultValue: 24, required: true, options: [] },
-          { name: "maxSlots", label: "Max slots to refresh per run", type: "number", defaultValue: 10, required: true, options: [] },
+          { name: "staleAfterHours", label: "Refresh slots older than (hours)", type: "number", defaultValue: 24, required: false, options: [] },
+          { name: "maxSlots", label: "Max slots to refresh per run", type: "number", defaultValue: 10, required: false, options: [] },
           {
             name: "scopeKinds",
             label: "Scope kinds to include",
             type: "select",
             defaultValue: "all",
-            required: true,
+            required: false,
             options: ["all", "project", "workspaces_overview", "project_workspace", "execution_workspace"],
           },
         ],
