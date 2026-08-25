@@ -322,6 +322,41 @@ describe("parseIssueExecutionState", () => {
     });
     expect(state!.skippedStageIds).toEqual([]);
   });
+
+  it("round-trips deliveryAuthor", () => {
+    // The delivery author is only useful if it survives the read back. zod
+    // strips unknown keys, so a state written with deliveryAuthor but parsed
+    // by a schema that does not declare it would lose the one field that
+    // tells a hand-PATCH delivery apart from a self-review (SUP-13899).
+    const state = parseIssueExecutionState({
+      status: "pending",
+      currentStageId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    expect(state!.deliveryAuthor).toEqual({ type: "agent", agentId: coderAgentId });
+  });
+
+  it("defaults deliveryAuthor to null for a state written before the field existed", () => {
+    const state = parseIssueExecutionState({
+      status: "pending",
+      currentStageId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    expect(state!.deliveryAuthor).toBeNull();
+  });
 });
 
 describe("issue execution policy transitions", () => {
@@ -3011,6 +3046,249 @@ describe("review round circuit breaker", () => {
       status: "pending",
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
+    });
+  });
+});
+
+describe("delivery author record (SUP-13899)", () => {
+  it("records the delivering author distinctly from the review participant on a hand-PATCH delivery", () => {
+    const policy = reviewOnlyPolicy();
+    // External-lane shape: the delivery author (coder) is still the issue
+    // assignee when the hand PATCH moves the issue to in_review; no explicit
+    // assignee write accompanies it.
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: null,
+    });
+
+    // The recorded shape a gate reads back: the issue assignee is the review
+    // participant, but the delivery author is recorded separately, so
+    // participant == assignee no longer reads as a self-approved stage.
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("still fails loud when the only review participant is the delivering author", () => {
+    const selfGatedPolicy = makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
+    ]);
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: selfGatedPolicy,
+          executionState: null,
+        },
+        policy: selfGatedPolicy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: null,
+      }),
+    ).toThrow(/No eligible review participant/);
+  });
+
+  it("carries deliveryAuthor forward through the review decision into the completed state", () => {
+    const policy = twoStagePolicy();
+    const reviewStageId = policy.stages[0].id;
+
+    const delivered = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: null,
+    });
+
+    const reviewed = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: delivered.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "QA signoff complete",
+    });
+    expect(reviewed.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageType: "approval",
+      completedStageIds: [reviewStageId],
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+
+    const completed = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: ctoUserId,
+        executionPolicy: policy,
+        executionState: reviewed.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { userId: ctoUserId },
+      commentBody: "Ship it",
+    });
+
+    expect(completed.patch.executionState).toMatchObject({
+      status: "completed",
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("updates deliveryAuthor on re-delivery after changes_requested", () => {
+    const policy = reviewOnlyPolicy();
+    const reviewStageId = policy.stages[0].id;
+
+    const bounced = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          deliveryAuthor: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Round one feedback",
+    });
+    expect(bounced.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+
+    const reDelivered = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: bounced.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: null,
+    });
+    expect(reDelivered.patch.executionState).toMatchObject({
+      status: "pending",
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("records the assignee of record at re-delivery when the issue was handed off mid-bounce", () => {
+    const policy = reviewOnlyPolicy();
+    const reviewStageId = policy.stages[0].id;
+
+    const bounced = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          deliveryAuthor: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Round one feedback",
+    });
+
+    // A plain handoff (no stage transition) leaves the recorded state — and
+    // its delivery author — untouched.
+    const handoff = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: bounced.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: { assigneeAgentId: ctoAgentId },
+      actor: { userId: boardUserId },
+      commentBody: null,
+    });
+    expect(handoff.patch.executionState).toBeUndefined();
+
+    const reDelivered = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: ctoAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: bounced.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: ctoAgentId },
+      commentBody: null,
+    });
+    // The handoff agent is now the delivery author while the return assignee
+    // still points at the original author — the two are recorded distinctly.
+    expect(reDelivered.patch.executionState).toMatchObject({
+      status: "pending",
+      deliveryAuthor: { type: "agent", agentId: ctoAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
     });
   });
 });

@@ -301,6 +301,16 @@ export const issueExecutionStateSchema = z.object({
   currentStageType: z.enum(ISSUE_EXECUTION_STAGE_TYPES).nullable(),
   currentParticipant: issueExecutionStatePrincipalSchema.nullable(),
   returnAssignee: issueExecutionStatePrincipalSchema.nullable(),
+  /**
+   * The assignee of record at the moment the issue was delivered to
+   * `in_review` — i.e. the principal that authored the diff. Recorded
+   * distinctly from `currentParticipant`/the issue assignee (which becomes
+   * the review participant at delivery) and from `returnAssignee` (the
+   * bounce target). Without it, an external-lane hand-PATCH delivery records
+   * participant == assignee, the cold-read shape of a self-approved stage
+   * (SUP-13899).
+   */
+  deliveryAuthor: issueExecutionStatePrincipalSchema.nullable().optional().default(null),
   reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),
   completedStageIds: z.array(z.string().uuid()).default([]),
   skippedStageIds: z.array(z.string().uuid()).optional().default([]),
