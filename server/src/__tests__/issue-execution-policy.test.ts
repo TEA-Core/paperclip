@@ -208,6 +208,63 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
     ).toThrowError("executionPolicy.stages must not be empty");
   });
 
+  // SUP-13925: a monitor-only watcher's stored policy is `{mode, stages: [],
+  // monitor}` by design. The re-arm idiom reads that policy, edits
+  // `monitor.nextCheckAt`, and writes the whole object back — which carries an
+  // explicit `stages: []` and used to 422, leaving a partial `{monitor}` body
+  // as the only working path.
+  function monitorOnlyPolicy() {
+    return normalizeIssueExecutionPolicy({ stages: [], monitor })!;
+  }
+
+  it("allows an explicit empty stages array over an already stage-less stored policy", () => {
+    expect(monitorOnlyPolicy().stages).toEqual([]);
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { mode: "normal", commentRequired: true, stages: [], monitor },
+        currentPolicy: monitorOnlyPolicy(),
+        stagesExplicitlyEmpty: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it("allows the monitor re-arm round-trip that regressed (whole-object write with a new nextCheckAt)", () => {
+    const stored = monitorOnlyPolicy();
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: {
+          ...stored,
+          monitor: { ...stored.monitor, nextCheckAt: "2026-08-26T08:00:00.000Z", maxAttempts: 100 },
+        },
+        currentPolicy: stored,
+        stagesExplicitlyEmpty: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it("grants no capability the partial-body path did not already have", () => {
+    // The permissive branch is safe precisely because omitting `stages`
+    // entirely reaches the identical stored result today. If that ever stops
+    // being true, this test fails and the relaxation must be re-argued.
+    const stored = monitorOnlyPolicy();
+    const whole = { mode: "normal" as const, commentRequired: true, stages: [], monitor };
+    expect(normalizeIssueExecutionPolicy(whole)).toEqual(
+      normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, monitor }),
+    );
+    expect(normalizeIssueExecutionPolicy(whole)!.stages).toEqual(stored.stages);
+  });
+
+  it("still rejects an explicit empty stages array over a policy that HAS stages", () => {
+    // The ADR-029/ADR-072 case. Unchanged by SUP-13925.
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { mode: "normal", commentRequired: true, stages: [], monitor },
+        currentPolicy: reviewOnlyPolicy(),
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy.stages must not be empty");
+  });
+
   it("rejects an explicit null over a non-null stored policy", () => {
     expect(() =>
       assertWrite({ raw: null, currentPolicy: twoStagePolicy() }),
