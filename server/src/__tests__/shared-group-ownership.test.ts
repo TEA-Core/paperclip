@@ -292,4 +292,110 @@ describe("shared-group-ownership", () => {
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("refusing shared-group ownership"));
     });
   });
+
+  describe("ensureSharedGroupTraversalPath", () => {
+    beforeEach(() => {
+      mockChown.mockReset();
+      mockChmod.mockReset();
+      mockStat.mockReset();
+    });
+
+    // Traversal is an all-or-nothing property of the whole ancestor chain:
+    // uid 1001 needs the x bit on EVERY directory between the repo root and
+    // the worktree. Repairing only the leaf leaves the chain broken while
+    // looking fixed, which is exactly how the production EACCES happened.
+    it("repairs every ancestor from the leaf up to and including stopAt", async () => {
+      const { ensureSharedGroupTraversalPath } = await loadFreshModule();
+      const repoRoot = path.join(os.tmpdir(), "paperclip-traversal-repo");
+      const dotPaperclip = path.join(repoRoot, ".paperclip");
+      const worktrees = path.join(dotPaperclip, "worktrees");
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o2700 });
+
+      await ensureSharedGroupTraversalPath(worktrees, repoRoot, {
+        resolveGid: async () => REAL_GID,
+        resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
+      });
+
+      expect(mockChmod).toHaveBeenCalledTimes(3);
+      expect(mockChmod.mock.calls.map((c) => c[0])).toEqual([repoRoot, dotPaperclip, worktrees]);
+      // 0o2700 -> 0o2770: the group x bit is what makes the path traversable.
+      for (const call of mockChmod.mock.calls) {
+        expect(call[1]).toBe(0o2700 | 0o2070);
+      }
+    });
+
+    // Top-down, so an interrupted walk never leaves a traversable leaf sitting
+    // behind an untraversable ancestor — a state that reads as repaired but
+    // still returns EACCES.
+    it("repairs top-down, stopAt before the leaf", async () => {
+      const { ensureSharedGroupTraversalPath } = await loadFreshModule();
+      const repoRoot = path.join(os.tmpdir(), "paperclip-traversal-order");
+      const worktrees = path.join(repoRoot, ".paperclip", "worktrees");
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o2700 });
+
+      await ensureSharedGroupTraversalPath(worktrees, repoRoot, {
+        resolveGid: async () => REAL_GID,
+        resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
+      });
+
+      const order = mockChmod.mock.calls.map((c) => c[0] as string);
+      expect(order[0]).toBe(repoRoot);
+      expect(order[order.length - 1]).toBe(worktrees);
+    });
+
+    it("repairs only the leaf when it does not sit under stopAt", async () => {
+      const { ensureSharedGroupTraversalPath } = await loadFreshModule();
+      const repoRoot = path.join(os.tmpdir(), "paperclip-traversal-repo");
+      // A configured worktreeParentDir may point outside the repo entirely.
+      // Walking "up to" an unrelated stopAt would climb to the filesystem root.
+      const outside = path.join(os.tmpdir(), "paperclip-traversal-elsewhere", "worktrees");
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o2700 });
+
+      await ensureSharedGroupTraversalPath(outside, repoRoot, {
+        resolveGid: async () => REAL_GID,
+        resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
+      });
+
+      expect(mockChmod).toHaveBeenCalledTimes(1);
+      expect(mockChmod).toHaveBeenCalledWith(outside, 0o2700 | 0o2070);
+    });
+
+    it("repairs exactly once when the leaf is stopAt", async () => {
+      const { ensureSharedGroupTraversalPath } = await loadFreshModule();
+      const repoRoot = path.join(os.tmpdir(), "paperclip-traversal-same");
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o2700 });
+
+      await ensureSharedGroupTraversalPath(repoRoot, repoRoot, {
+        resolveGid: async () => REAL_GID,
+        resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
+      });
+
+      expect(mockChmod).toHaveBeenCalledTimes(1);
+      expect(mockChmod).toHaveBeenCalledWith(repoRoot, 0o2700 | 0o2070);
+    });
+
+    it("still refuses a server-owned directory encountered while walking the chain", async () => {
+      const { ensureSharedGroupTraversalPath } = await loadFreshModule();
+      const repoRoot = path.join(os.tmpdir(), "paperclip-traversal-denied");
+      const worktrees = path.join(repoRoot, ".paperclip", "worktrees");
+      const warnSpy = vi.fn();
+
+      mockStat.mockResolvedValue({ uid: 1000, mode: 0o2700 });
+
+      // The repo root is an ancestor of the secrets key dir here, so the
+      // denial must survive the walk rather than be bypassed by it.
+      await ensureSharedGroupTraversalPath(worktrees, repoRoot, {
+        resolveGid: async () => REAL_GID,
+        resolveMasterKeyDir: () => path.join(repoRoot, "secrets"),
+        warn: warnSpy,
+      });
+
+      expect(mockChmod.mock.calls.map((c) => c[0])).not.toContain(repoRoot);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("refusing shared-group ownership"));
+    });
+  });
 });

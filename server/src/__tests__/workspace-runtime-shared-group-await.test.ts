@@ -50,10 +50,19 @@ const sourceLines = readFileSync(WORKSPACE_RUNTIME_PATH, "utf8").split("\n");
 const heartbeatLines = readFileSync(HEARTBEAT_PATH, "utf8").split("\n");
 const runScratchLines = readFileSync(RUN_SCRATCH_PATH, "utf8").split("\n");
 
-const CALL_RE = /ensureSharedGroupOwnership\s*\(/;
-const AWAITED_CALL_RE = /await\s+ensureSharedGroupOwnership\s*\(/;
-const PARENT_DIR_CALL_RE =
-  /await\s+ensureSharedGroupOwnership\(\s*(?:worktreeParentDir|path\.dirname\(worktreePath\))\s*\)/;
+// `ensureSharedGroupTraversalPath` is the chain-walking wrapper around
+// `ensureSharedGroupOwnership`; it applies the same chgrp/chmod to every
+// directory between the repo root and the leaf, so it carries exactly the same
+// await-before-`worktree add` obligation and must be scanned identically.
+const HELPER_RE_SRC = "ensureSharedGroup(?:Ownership|TraversalPath)";
+const CALL_RE = new RegExp(`${HELPER_RE_SRC}\\s*\\(`);
+const AWAITED_CALL_RE = new RegExp(`await\\s+${HELPER_RE_SRC}\\s*\\(`);
+// Matches whichever helper is used, as long as its FIRST argument is the
+// worktree parent directory — `(worktreeParentDir)` and
+// `(worktreeParentDir, repoRoot)` both qualify.
+const PARENT_DIR_CALL_RE = new RegExp(
+  `await\\s+${HELPER_RE_SRC}\\(\\s*(?:worktreeParentDir|path\\.dirname\\(worktreePath\\))\\s*[,)]`,
+);
 const WORKTREE_ADD_RE = /"worktree",\s*"add"/;
 const FUNCTION_START_RE = /^(?:export\s+)?async\s+function\s+/;
 

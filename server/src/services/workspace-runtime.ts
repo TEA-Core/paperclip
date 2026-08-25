@@ -3222,7 +3222,7 @@ export async function assertWorktreeWritableByProcessUser(worktreePath: string):
   }
 }
 
-import { ensureSharedGroupOwnership } from "./shared-group-ownership.js";
+import { ensureSharedGroupOwnership, ensureSharedGroupTraversalPath } from "./shared-group-ownership.js";
 
 /**
  * SUP-13090: pnpm refuses a frozen install when the committed lockfile disagrees
@@ -4199,7 +4199,13 @@ export async function realizeExecutionWorkspace(input: {
   const currentBaseRefSha = baseRepoHygiene.baseRefSha;
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
-  await ensureSharedGroupOwnership(worktreeParentDir);
+  // Repair the whole chain, not just the leaf. The recursive mkdir above can
+  // create BOTH `.paperclip` and `worktrees`, and the repo root above them was
+  // never repaired at all — it was group-traversable only by accident of the
+  // creating process's umask. A repo root left at 0o2700 makes every path
+  // beneath it EACCES for the agent uid, which surfaces as a run on issue A
+  // dying while it stats issue B's worktree.
+  await ensureSharedGroupTraversalPath(worktreeParentDir, repoRoot);
 
   async function reuseExistingWorktree(reusablePath: string, effectiveBranchName = branchName, extraWarnings: string[] = []) {
     const refresh = currentBaseRefSha
