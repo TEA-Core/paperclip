@@ -1101,6 +1101,26 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
 
+        // SUP-13949: the startup pass is the one that matters most. A server
+        // that died mid-run left its scratch directories and their detached
+        // process groups behind with nothing holding a handle to them, so this
+        // is the only thing that will ever reach them. Runs still executing are
+        // protected by the liveness lookup, not by skipping the sweep.
+        try {
+          const scratchSweep = await heartbeat.sweepAbandonedRunScratch();
+          if (scratchSweep.reaped > 0 || scratchSweep.survived > 0) {
+            logger.warn(
+              { ...scratchSweep },
+              "startup sweep reclaimed abandoned run scratch directories",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup abandoned run scratch sweep failed - periodic sweep will serve as backstop",
+          );
+        }
+
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
@@ -1342,6 +1362,20 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "periodic secret proposal expiry sweep failed");
+          }));
+
+        // SUP-13949: deliberately outside the scheduling-suppression gate below.
+        // Quiescing dispatch must not also stop reclaiming the processes of
+        // runs that already finished — a drain is exactly when the container is
+        // most likely to be near its memory limit.
+        trackHeartbeatSchedulerWork(heartbeat.sweepAbandonedRunScratch()
+          .then((scratchSweep) => {
+            if (scratchSweep.reaped > 0 || scratchSweep.survived > 0) {
+              logger.warn({ ...scratchSweep }, "periodic sweep reclaimed abandoned run scratch directories");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "periodic abandoned run scratch sweep failed");
           }));
 
         if (heartbeatSchedulerStopped) return;
