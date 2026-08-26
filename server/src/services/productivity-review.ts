@@ -35,6 +35,28 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 100
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
 
+// SUP-14051: terminal run error codes the platform records when it aborts a run
+// before the assignee's adapter reaches the task. Such a run cannot post an
+// issue comment by construction, so a storm of them produces exactly the
+// high_churn shape (N runs / 0 comments) and must not count as assignee churn.
+// "execution_workspace_occupied" mirrors EXECUTION_WORKSPACE_OCCUPIED_FAILURE_CODE
+// in heartbeat.ts (kept literal here: heartbeat.ts imports this module, so an
+// import back would be circular).
+export const PRODUCTIVITY_REVIEW_PLATFORM_ABORT_ERROR_CODES = [
+  "execution_workspace_occupied",
+] as const;
+// Adapter process launch failures (see classifyOpenCodeFailure in
+// packages/adapters/opencode-local) report `opencode_exit_<N>` before task work.
+export const PRODUCTIVITY_REVIEW_ADAPTER_LAUNCH_ERROR_CODE_PATTERN = /^opencode_exit_\d+$/;
+
+export function isPlatformAbortedRunErrorCode(errorCode: string | null | undefined): boolean {
+  if (!errorCode) return false;
+  return (
+    (PRODUCTIVITY_REVIEW_PLATFORM_ABORT_ERROR_CODES as readonly string[]).includes(errorCode) ||
+    PRODUCTIVITY_REVIEW_ADAPTER_LAUNCH_ERROR_CODE_PATTERN.test(errorCode)
+  );
+}
+
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
@@ -49,7 +71,7 @@ type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 // result_json/context_snapshot for up to MAX_RUNS_FOR_STREAK runs per issue.
 type ProductivityRunSample = Pick<
   HeartbeatRunRow,
-  "id" | "agentId" | "status" | "livenessState" | "startedAt" | "finishedAt" | "createdAt" | "nextAction" | "usageJson"
+  "id" | "agentId" | "status" | "livenessState" | "startedAt" | "finishedAt" | "createdAt" | "nextAction" | "usageJson" | "errorCode"
 >;
 type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
 
@@ -420,21 +442,6 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     return comment;
   }
 
-  async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
-    return db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, companyId),
-          eq(heartbeatRuns.agentId, agentId),
-          issueRunScopeSql(issueId),
-          sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
-        ),
-      )
-      .then((rows) => rows[0]?.count ?? 0);
-  }
-
   async function countIssueCommentsSince(companyId: string, issueId: string, agentId: string, since?: Date) {
     return db
       .select({ count: sql<number>`count(*)::int` })
@@ -474,6 +481,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         createdAt: heartbeatRuns.createdAt,
         nextAction: heartbeatRuns.nextAction,
         usageJson: heartbeatRuns.usageJson,
+        errorCode: heartbeatRuns.errorCode,
       })
       .from(heartbeatRuns)
       .where(
@@ -513,17 +521,28 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       noCommentStreak += runBudgetWeight(run);
     }
 
+    // SUP-14051: churn numerators count only runs the assignee's adapter
+    // actually attempted. Runs the platform aborted before task work (workspace
+    // contention deferral giving up, adapter launch failure) cannot post a
+    // comment by construction, so counting them would report a platform
+    // condition as assignee churn. They stay visible in the rendered evidence.
+    const countAttemptedRunsSince = (since: Date) =>
+      latestRuns.reduce((count, run) => {
+        const anchor = run.startedAt ?? run.createdAt;
+        if (!anchor || anchor.getTime() < since.getTime()) return count;
+        if (isPlatformAbortedRunErrorCode(run.errorCode)) return count;
+        return count + 1;
+      }, 0);
+    const runCountLastHour = countAttemptedRunsSince(oneHourAgo);
+    const runCountLastSixHours = countAttemptedRunsSince(sixHoursAgo);
+
     const [
-      runCountLastHour,
-      runCountLastSixHours,
       assigneeRunCommentCount,
       assigneeRunCommentCountLastHour,
       assigneeRunCommentCountLastSixHours,
       latestComments,
       costRow,
     ] = await Promise.all([
-      countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
-      countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, sixHoursAgo),
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id),
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo),
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo),
@@ -667,7 +686,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
   function buildReviewMarkdown(evidence: ProductivityReviewEvidence, prefix: string) {
     const latestRuns = evidence.latestRuns.length > 0
       ? evidence.latestRuns.map((run) =>
-        `- ${runUiLink(run, prefix)} \`${run.status}\` liveness \`${run.livenessState ?? "unknown"}\`, created ${run.createdAt.toISOString()}${run.nextAction ? `, next action: ${truncateInline(run.nextAction, 160)}` : ""}`,
+        `- ${runUiLink(run, prefix)} \`${run.status}\` liveness \`${run.livenessState ?? "unknown"}\`, created ${run.createdAt.toISOString()}${run.errorCode ? `, error \`${run.errorCode}\`` : ""}${run.nextAction ? `, next action: ${truncateInline(run.nextAction, 160)}` : ""}`,
       ).join("\n")
       : "- none";
     const latestComments = evidence.latestComments.length > 0

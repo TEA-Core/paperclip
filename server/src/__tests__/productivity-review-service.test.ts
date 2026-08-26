@@ -22,6 +22,7 @@ import {
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_FULL_BUDGET_MS,
+  isPlatformAbortedRunErrorCode,
   productivityReviewService,
 } from "../services/productivity-review.ts";
 
@@ -123,6 +124,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     withRunComments?: boolean;
     status?: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
     durationMs?: number;
+    errorCode?: string | null;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
@@ -143,6 +145,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         nextAction: "Continue processing the next batch.",
         createdAt,
         updatedAt: createdAt,
+        errorCode: input.errorCode ?? null,
       });
     }
     await db.insert(heartbeatRuns).values(runs);
@@ -634,6 +637,108 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Runs in rolling windows: 10/1h");
   });
 
+  it("does not generate a review for a workspace-contention storm (SUP-14038 shape: 16 platform-aborted + 3 real runs)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 11,
+      now,
+      status: "cancelled",
+      durationMs: 10_000,
+      errorCode: "execution_workspace_occupied",
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 5,
+      now,
+      status: "failed",
+      durationMs: 10_000,
+      errorCode: "opencode_exit_1",
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 3,
+      now,
+      status: "succeeded",
+      durationMs: 20 * 60_000,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still generates a high_churn review for a genuine 10-real-run / 0-comment hour", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      status: "succeeded",
+      durationMs: 5 * 60_000,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).toContain("Runs in rolling windows: 10/1h");
+  });
+
+  it("keeps excluded platform-aborted runs visible in the review evidence body", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 11,
+      now,
+      status: "cancelled",
+      durationMs: 10_000,
+      errorCode: "execution_workspace_occupied",
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      status: "succeeded",
+      durationMs: 5 * 60_000,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).toContain("Runs in rolling windows: 10/1h");
+    expect(review?.description).toContain("`cancelled`");
+    expect(review?.description).toContain("error `execution_workspace_occupied`");
+  });
+
   it("ignores non-assignee comments when evaluating high-churn productivity reviews", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
@@ -1115,5 +1220,23 @@ describeEmbeddedPostgres("productivity review service", () => {
     const reviews = await listProductivityReviews(companyId);
     expect(reviews).toHaveLength(1);
     expect(reviews[0]?.assigneeAgentId).toBe(ctoId);
+  });
+});
+
+describe("isPlatformAbortedRunErrorCode", () => {
+  it("classifies platform-abort terminal error codes", () => {
+    expect(isPlatformAbortedRunErrorCode("execution_workspace_occupied")).toBe(true);
+    expect(isPlatformAbortedRunErrorCode("opencode_exit_1")).toBe(true);
+    expect(isPlatformAbortedRunErrorCode("opencode_exit_42")).toBe(true);
+  });
+
+  it("does not classify assignee or unrelated failure codes", () => {
+    expect(isPlatformAbortedRunErrorCode("opencode_signal_SIGTERM")).toBe(false);
+    expect(isPlatformAbortedRunErrorCode("opencode_tool_error")).toBe(false);
+    expect(isPlatformAbortedRunErrorCode("adapter_failed")).toBe(false);
+    expect(isPlatformAbortedRunErrorCode("provider_quota")).toBe(false);
+    expect(isPlatformAbortedRunErrorCode(null)).toBe(false);
+    expect(isPlatformAbortedRunErrorCode(undefined)).toBe(false);
+    expect(isPlatformAbortedRunErrorCode("")).toBe(false);
   });
 });
