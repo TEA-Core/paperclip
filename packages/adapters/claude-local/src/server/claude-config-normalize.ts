@@ -16,9 +16,9 @@ import {
  * `<instanceRoot>/companies/<companyId>/agents/<agentId>/claude-config`;
  * anything else is refused before the walk touches the filesystem. The walk
  * itself is the shared `normalizeClaudeConfigDirTree`, so this pass keeps
- * byte-identical semantics with the in-process pass (dirent-type-only
- * recursion, per-dir best-effort, stat-and-skip of dirs the running uid does
- * not own, files untouched).
+ * byte-identical semantics with the in-process pass (no-follow,
+ * descriptor-anchored recursion, per-dir best-effort, fstat-and-skip of dirs
+ * the running uid does not own, files untouched).
  *
  * The caller (the managed-home teardown in `acp.ts`) scrubs the control-plane
  * secrets out of the child env before exec'ing: this process runs as the
