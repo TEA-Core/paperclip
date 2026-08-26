@@ -125,6 +125,72 @@ if [ -d "$MCP_PREFIX/lib/node_modules/@paperclipai/mcp-server" ]; then
     ' -- "$MCP_PREFIX" "$NPM_GLOBAL"
 fi
 
+# Seed CodeRabbit CLI credentials so `coderabbit review --agent` runs headless.
+#
+# The CLI reads ONLY $HOME/.coderabbit/auth.json. It does NOT read
+# CODERABBIT_API_KEY at review time -- verified against the shipped binary:
+# with the variable exported and no auth.json, `coderabbit auth status` still
+# reports "signed out". Unauthenticated, `coderabbit review` does not review;
+# it falls through to an interactive browser OAuth flow and, with no browser
+# reachable, exits 1 in ~5s with {"status":"environment_unsupported"}. That is
+# a clean failure rather than a hang, but it is still every agent review
+# failing, so seeding here is what makes the CLI usable at all.
+#
+# Both the server (uid 1000) and agent runtimes (PAPERCLIP_AGENT_UID, uid 1001)
+# have HOME=/paperclip and therefore share this one directory, so it takes the
+# fork's shared-group treatment (setgid `agents`, group-writable) rather than
+# the CLI's own 0700/0600 default -- which uid 1001 could not read. The CLI
+# also writes machine-id, logs, and per-review state in here, so group WRITE is
+# required, not just group read.
+#
+# Credentials are portable: an auth.json captured on one machine authenticates
+# unchanged on another (no machine-id binding), and OAuth tokens carry
+# "expiresAt":"never", so there is no refresh treadmill to keep alive.
+coderabbit_home="${home_dir}/.coderabbit"
+if [ -n "${CODERABBIT_AUTH_JSON_B64:-}" ] || [ -n "${CODERABBIT_API_KEY:-}" ]; then
+    install -d -m 2770 -o node "$coderabbit_home" 2>/dev/null || mkdir -p "$coderabbit_home"
+    if getent group agents >/dev/null 2>&1; then
+        chgrp agents "$coderabbit_home" 2>/dev/null || true
+        chmod 2770 "$coderabbit_home" 2>/dev/null || true
+    fi
+fi
+
+# Preferred path: a known-good auth.json handed over base64-encoded. This is
+# offline -- no call to CodeRabbit at boot -- so a CodeRabbit outage can never
+# hold up a container start. Decoded to a temp file and validated before it
+# replaces a working credential, so a malformed variable degrades to a warning
+# instead of destroying the auth that was already on the volume.
+if [ -n "${CODERABBIT_AUTH_JSON_B64:-}" ]; then
+    cr_tmp="${coderabbit_home}/.auth.json.tmp"
+    # The token must be a non-empty STRING, not merely present: `has()` is true
+    # for {"accessToken":null} and {"accessToken":""} alike, either of which
+    # would replace a working credential with one the CLI cannot use -- and,
+    # because the file then exists, also suppress the API-key fallback below.
+    if printf '%s' "$CODERABBIT_AUTH_JSON_B64" | base64 -d > "$cr_tmp" 2>/dev/null \
+        && jq -e '(.accessToken | type == "string") and (.accessToken | length > 0)' "$cr_tmp" >/dev/null 2>&1; then
+        mv "$cr_tmp" "${coderabbit_home}/auth.json"
+        chown node "${coderabbit_home}/auth.json" 2>/dev/null || true
+        getent group agents >/dev/null 2>&1 && chgrp agents "${coderabbit_home}/auth.json" 2>/dev/null || true
+        chmod 0660 "${coderabbit_home}/auth.json" 2>/dev/null || true
+        echo "docker-entrypoint.sh: seeded CodeRabbit CLI credentials from CODERABBIT_AUTH_JSON_B64"
+    else
+        rm -f "$cr_tmp"
+        echo "docker-entrypoint.sh: warning: CODERABBIT_AUTH_JSON_B64 is not valid base64-encoded CodeRabbit auth JSON; leaving existing CodeRabbit credentials untouched. every \`coderabbit review\` will exit 1 with \"environment_unsupported\" until this is fixed." >&2
+    fi
+# Fallback: exchange an API key for stored credentials. This one DOES call
+# CodeRabbit (the key is validated server-side), so it is skipped whenever a
+# credential already exists and is non-fatal when it fails -- a degraded CLI is
+# survivable, a container that will not boot is not.
+elif [ -n "${CODERABBIT_API_KEY:-}" ] && [ ! -f "${coderabbit_home}/auth.json" ]; then
+    if gosu node env HOME="$home_dir" coderabbit auth login --api-key "$CODERABBIT_API_KEY" >/dev/null 2>&1; then
+        getent group agents >/dev/null 2>&1 && chgrp agents "${coderabbit_home}/auth.json" 2>/dev/null || true
+        chmod 0660 "${coderabbit_home}/auth.json" 2>/dev/null || true
+        echo "docker-entrypoint.sh: authenticated CodeRabbit CLI from CODERABBIT_API_KEY"
+    else
+        echo "docker-entrypoint.sh: warning: CodeRabbit API key login failed (invalid/expired key, or CodeRabbit unreachable). every \`coderabbit review\` will exit 1 with \"environment_unsupported\" until this is fixed." >&2
+    fi
+fi
+
 umask 002
 
 # Give the server CAP_KILL when the agent-uid split is armed.
