@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -916,6 +916,69 @@ function withRecoveryActionsOnRelationSummaries(
   return {
     blockedBy: relations.blockedBy.map(augment),
     blocks: relations.blocks.map(augment),
+  };
+}
+
+// SUP-14030 (ghost-pass-reporting.md §2a): "no activeRun" is NOT "no continuation
+// path". An issue remains live while any one of the four §2a disjuncts holds —
+// activeRun (queued|running), a monitor with a future nextCheckAt, a live
+// watchdog/scheduledRetry/activeRecoveryAction, or a successfulRunHandoff
+// preserving progress (hasLiveContinuation) — and an issue whose lastActivityAt
+// falls inside the 5-minute settle window is not a ghost even when none of
+// (1)-(4) are present (run stamping and status commit are not simultaneous).
+const IN_PROGRESS_SETTLE_WINDOW_MS = 5 * 60 * 1000;
+
+function toContinuationPathDate(value: Date | string | null | undefined): Date | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+export function evaluateIssueContinuationPath(
+  evidence: {
+    activeRun: boolean;
+    monitorNextCheckAt: Date | string | null | undefined;
+    watchdog: unknown;
+    scheduledRetry: unknown;
+    activeRecoveryAction: unknown;
+    successfulRunHandoff: { hasLiveContinuation?: boolean | null } | null | undefined;
+    lastActivityAt: Date | string | null | undefined;
+  },
+  options: { now?: Date; settleWindowMs?: number } = {},
+): {
+  ok: boolean;
+  disjuncts: {
+    activeRun: boolean;
+    monitorNextCheckAtInFuture: boolean;
+    watchdog: boolean;
+    scheduledRetry: boolean;
+    activeRecoveryAction: boolean;
+    successfulRunHandoffLive: boolean;
+  };
+  settledWithinWindow: boolean;
+  lastActivityAt: Date | null;
+} {
+  const now = options.now ?? new Date();
+  const settleWindowMs = options.settleWindowMs ?? IN_PROGRESS_SETTLE_WINDOW_MS;
+  const monitorNextCheckAt = toContinuationPathDate(evidence.monitorNextCheckAt);
+  const lastActivityAt = toContinuationPathDate(evidence.lastActivityAt);
+  const disjuncts = {
+    activeRun: evidence.activeRun === true,
+    monitorNextCheckAtInFuture:
+      monitorNextCheckAt !== null && monitorNextCheckAt.getTime() > now.getTime(),
+    watchdog: evidence.watchdog !== null && evidence.watchdog !== undefined,
+    scheduledRetry: evidence.scheduledRetry !== null && evidence.scheduledRetry !== undefined,
+    activeRecoveryAction:
+      evidence.activeRecoveryAction !== null && evidence.activeRecoveryAction !== undefined,
+    successfulRunHandoffLive: evidence.successfulRunHandoff?.hasLiveContinuation === true,
+  };
+  const settledWithinWindow =
+    lastActivityAt !== null && now.getTime() - lastActivityAt.getTime() < settleWindowMs;
+  return {
+    ok: Object.values(disjuncts).some(Boolean) || settledWithinWindow,
+    disjuncts,
+    settledWithinWindow,
+    lastActivityAt,
   };
 }
 
@@ -5352,6 +5415,80 @@ export function issueRoutes(
     return runToInterrupt?.status === "running" ? runToInterrupt : null;
   }
 
+  // SUP-14030 (ghost-pass-reporting.md §2a): gather the issue's live
+  // continuation-path evidence — the four §2a disjuncts plus lastActivityAt
+  // (the settle-window input) — then evaluate it with the exported pure
+  // predicate. lastActivityAt mirrors the serialized field:
+  // max(updatedAt, latest comment createdAt, latest activity-log createdAt).
+  async function evaluateContinuationPathForIssue(issue: {
+    id: string;
+    companyId: string;
+    assigneeAgentId: string | null;
+    executionRunId?: string | null;
+    monitorNextCheckAt?: Date | null;
+    updatedAt?: Date | string | null;
+  }): Promise<ReturnType<typeof evaluateIssueContinuationPath>> {
+    // §2a disjunct 1: activeRun — a queued or running execution run stamped on
+    // executionRunId, or the assignee's live run targeting this issue.
+    let activeRun = false;
+    if (issue.executionRunId) {
+      const run = await heartbeat.getRun(issue.executionRunId);
+      activeRun = run !== null && (run.status === "queued" || run.status === "running");
+    }
+    if (!activeRun) activeRun = (await resolveActiveIssueRun(issue)) !== null;
+
+    const [
+      watchdog,
+      scheduledRetry,
+      activeRecoveryAction,
+      handoffStates,
+      commentRows,
+      logRows,
+    ] = await Promise.all([
+      taskWatchdogsSvc.getActiveForIssue(issue.companyId, issue.id),
+      svc.getCurrentScheduledRetry(issue.id),
+      recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
+      listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id]),
+      db
+        .select({ latestCommentAt: sql<Date | null>`MAX(${issueComments.createdAt})` })
+        .from(issueComments)
+        .where(and(eq(issueComments.issueId, issue.id), eq(issueComments.companyId, issue.companyId))),
+      db
+        .select({ latestLogAt: sql<Date | null>`MAX(${activityLog.createdAt})` })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, issue.id),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.companyId, issue.companyId),
+          ),
+        ),
+    ]);
+
+    const timestamps: Date[] = [];
+    const updatedAt = toContinuationPathDate(issue.updatedAt);
+    if (updatedAt) timestamps.push(updatedAt);
+    const latestCommentAt = toContinuationPathDate(commentRows[0]?.latestCommentAt);
+    if (latestCommentAt) timestamps.push(latestCommentAt);
+    const latestLogAt = toContinuationPathDate(logRows[0]?.latestLogAt);
+    if (latestLogAt) timestamps.push(latestLogAt);
+
+    return evaluateIssueContinuationPath({
+      activeRun,
+      monitorNextCheckAt: issue.monitorNextCheckAt,
+      watchdog,
+      scheduledRetry,
+      activeRecoveryAction,
+      successfulRunHandoff: handoffStates.get(issue.id) ?? null,
+      lastActivityAt:
+        timestamps.length > 0
+          ? timestamps.reduce((latest, candidate) =>
+              candidate.getTime() > latest.getTime() ? candidate : latest,
+            )
+          : null,
+    });
+  }
+
   function operatorInterruptCancelOptions(input: { issueId: string; actor: ReturnType<typeof getActorInfo> }) {
     return {
       errorCode: "operator_interrupted",
@@ -9566,6 +9703,74 @@ export function issueRoutes(
       existing.assigneeAgentId,
       req.body.executionPolicy !== undefined && monitorChanged,
     );
+
+    // SUP-14030 (ghost-pass-reporting.md §2a): a client-requested transition
+    // INTO in_progress requires a live continuation path — at least one of the
+    // four §2a disjuncts (activeRun queued|running, a future monitorNextCheckAt,
+    // a live watchdog/scheduledRetry/activeRecoveryAction, a live
+    // successfulRunHandoff), or the issue's lastActivityAt inside the 5-minute
+    // settle window. A pending execution stage is excluded: there, a requested
+    // in_progress is the stage's changes-requested bounce (or a stage-dissolve
+    // by board override) — a workflow transition that ends with a fresh wake,
+    // not a state claim. No pending stage, no live continuation path, no
+    // in_progress.
+    const requestedInProgressTransition =
+      typeof updateFields.status === "string"
+      && updateFields.status === "in_progress"
+      && existing.status !== "in_progress";
+    if (requestedInProgressTransition) {
+      const existingExecutionState = parseIssueExecutionState(existing.executionState);
+      const stageDrivenTransition = existingExecutionState?.status === "pending";
+      if (!stageDrivenTransition) {
+        // Evaluate the monitor against the post-patch state: a PATCH that arms
+        // a monitor through executionPolicy in the same body that claims
+        // in_progress commits a scheduled monitor, so the continuation-path
+        // evidence must include it — the same resolution as
+        // hasScheduledMonitor in the in_review disposition gate. Take the
+        // later of the stored column value and the committed policy value.
+        const monitorCandidates = [existing.monitorNextCheckAt, nextExecutionPolicy?.monitor?.nextCheckAt]
+          .map(toContinuationPathDate)
+          .filter((candidate): candidate is Date => candidate !== null);
+        const effectiveMonitorNextCheckAt = monitorCandidates.length > 0
+          ? monitorCandidates.reduce((latest, candidate) =>
+              candidate.getTime() > latest.getTime() ? candidate : latest,
+            )
+          : null;
+        const continuationPath = await evaluateContinuationPathForIssue({
+          ...existing,
+          monitorNextCheckAt: effectiveMonitorNextCheckAt,
+        });
+        if (!continuationPath.ok) {
+          const disjunctNames = Object.keys(
+            continuationPath.disjuncts,
+          ) as Array<keyof typeof continuationPath.disjuncts>;
+          res.status(422).json({
+            error:
+              "Entering in_progress requires a live continuation path per ghost-pass-reporting.md §2a: at least one of activeRun (queued|running), a future monitorNextCheckAt, a live watchdog/scheduledRetry/activeRecoveryAction, a live successfulRunHandoff, or a lastActivityAt within the 5-minute settle window.",
+            code: "in_progress_requires_continuation_path",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              currentStatus: existing.status,
+              executionRunId: existing.executionRunId ?? null,
+              monitorNextCheckAt: effectiveMonitorNextCheckAt,
+              lastActivityAt: continuationPath.lastActivityAt
+                ? continuationPath.lastActivityAt.toISOString()
+                : null,
+              settleWindowMs: IN_PROGRESS_SETTLE_WINDOW_MS,
+              settledWithinWindow: continuationPath.settledWithinWindow,
+              checkedDisjuncts: disjunctNames,
+              presentDisjuncts: disjunctNames.filter((name) => continuationPath.disjuncts[name]),
+              absentDisjuncts: disjunctNames.filter((name) => !continuationPath.disjuncts[name]),
+              disjuncts: continuationPath.disjuncts,
+              remedy:
+                "Arm a continuation path first — queue or start an execution run, or set a monitor with a future nextCheckAt, or a live watchdog / scheduled retry / recovery action — or mark the issue blocked with an unblock owner instead of claiming in_progress without live continuation evidence.",
+            },
+          });
+          return;
+        }
+      }
+    }
 
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,

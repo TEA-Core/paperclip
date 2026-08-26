@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
+import { evaluateIssueContinuationPath } from "../routes/issues.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -3415,13 +3416,528 @@ describe.sequential("issue comment reopen routes", () => {
         payload: expect.objectContaining({
           issueId: "11111111-1111-4111-8111-111111111111",
           executionStage: expect.objectContaining({
-            wakeRole: "executor",
-            stageType: "review",
-            lastDecisionOutcome: "changes_requested",
-            allowedActions: ["address_changes", "resubmit"],
-          }),
+             wakeRole: "executor",
+             stageType: "review",
+             lastDecisionOutcome: "changes_requested",
+             allowedActions: ["address_changes", "resubmit"],
+           }),
+         }),
+       }),
+     ));
+  });
+
+  describe("in_progress continuation-path evidence guard (SUP-14030, ghost-pass-reporting §2a)", () => {
+    const issueId = "11111111-1111-4111-8111-111111111111";
+    const assigneeId = "22222222-2222-4222-8222-222222222222";
+
+    function mockRunningReceipt(issue: ReturnType<typeof makeIssue>) {
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+    }
+
+    it("rejects a board PATCH todo -> in_progress without a live continuation path", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      // The 422 payload is diagnosable without reading the source: it names the
+      // §2a disjuncts checked, which are absent, and the settle-window state.
+      expect(res.body.details).toEqual(
+        expect.objectContaining({
+          issueId,
+          currentStatus: "todo",
+          executionRunId: null,
+          monitorNextCheckAt: null,
+          lastActivityAt: null,
+          settleWindowMs: 300000,
+          settledWithinWindow: false,
+          checkedDisjuncts: [
+            "activeRun",
+            "monitorNextCheckAtInFuture",
+            "watchdog",
+            "scheduledRetry",
+            "activeRecoveryAction",
+            "successfulRunHandoffLive",
+          ],
+          absentDisjuncts: [
+            "activeRun",
+            "monitorNextCheckAtInFuture",
+            "watchdog",
+            "scheduledRetry",
+            "activeRecoveryAction",
+            "successfulRunHandoffLive",
+          ],
+          disjuncts: {
+            activeRun: false,
+            monitorNextCheckAtInFuture: false,
+            watchdog: false,
+            scheduledRetry: false,
+            activeRecoveryAction: false,
+            successfulRunHandoffLive: false,
+          },
         }),
-      }),
-    ));
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a resume PATCH with explicit in_progress when no run is active", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", resume: true, comment: "start it now" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows a board PATCH todo -> in_progress when the stamped execution run is running", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-live" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-live", status: "running" });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("allows a board PATCH todo -> in_progress when the stamped execution run is queued", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-queued" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-queued", status: "queued" });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("rejects when the stamped execution run is terminal and no assignee run is active", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-dead" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-dead", status: "completed" });
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows when the assignee's live run targets this issue via contextSnapshot", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+        id: "run-live",
+        status: "running",
+        agentId: assigneeId,
+        contextSnapshot: { issueId },
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("rejects when the assignee's live run targets a different issue", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+        id: "run-live",
+        status: "running",
+        agentId: assigneeId,
+        contextSnapshot: { issueId: "99999999-9999-4999-8999-999999999999" },
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows the assignee agent whose own run holds the issue lock", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-1" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-1", status: "running" });
+
+      const res = await request(await installActor(createApp(), agentActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("allows a board PATCH todo -> in_progress when a future monitorNextCheckAt is armed (no run)", async () => {
+      const issue = {
+        ...makeIssue("todo"),
+        monitorNextCheckAt: new Date(Date.now() + 60_000),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("rejects when monitorNextCheckAt is in the past and no run is active", async () => {
+      const issue = {
+        ...makeIssue("todo"),
+        monitorNextCheckAt: new Date(Date.now() - 60_000),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(res.body.details.absentDisjuncts).toContain("monitorNextCheckAtInFuture");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows a board PATCH that arms a monitor and claims in_progress in the same body", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "in_progress",
+          executionPolicy: {
+            monitor: { nextCheckAt: new Date(Date.now() + 60_000).toISOString() },
+          },
+        });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("does not reject an issue stamped moments ago (5-minute settle window)", async () => {
+      const issue = {
+        ...makeIssue("todo"),
+        updatedAt: new Date(Date.now() - 60_000),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("rejects when lastActivityAt is older than the settle window and no disjunct holds", async () => {
+      const issue = {
+        ...makeIssue("todo"),
+        updatedAt: new Date(Date.now() - 10 * 60_000),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(res.body.details.settledWithinWindow).toBe(false);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows when a scheduled retry is live", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+        runId: "run-scheduled",
+        scheduledAt: new Date(Date.now() + 120_000),
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("allows when an active recovery action is live", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: "recovery-1",
+        state: "active",
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("does not guard a no-op in_progress -> in_progress PATCH without run evidence", async () => {
+      const issue = makeIssue("in_progress");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("still allows a stage changes_requested bounce to in_progress without run evidence", async () => {
+      const policy = await normalizePolicy({
+        stages: [
+          {
+            id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            type: "review",
+            participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+          },
+        ],
+      })!;
+      const issue = {
+        ...makeIssue("in_review"),
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: policy.stages[0].id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+          returnAssignee: { type: "agent", agentId: assigneeId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(
+        await installActor(createApp(), {
+          type: "agent",
+          agentId: "33333333-3333-4333-8333-333333333333",
+          companyId: "company-1",
+          runId: "run-2",
+        }),
+      )
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", comment: "Needs another pass" });
+
+      expect(res.status).toBe(200);
+      const updateArgs = mockIssueService.update.mock.calls[0];
+      expect(updateArgs?.[0]).toBe(issueId);
+      expect(updateArgs?.[1]).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: assigneeId,
+      });
+    });
+  });
+
+  describe("evaluateIssueContinuationPath (ghost-pass-reporting §2a predicate, SUP-14030)", () => {
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    const emptyEvidence = {
+      activeRun: false,
+      monitorNextCheckAt: null,
+      watchdog: null,
+      scheduledRetry: null,
+      activeRecoveryAction: null,
+      successfulRunHandoff: null,
+      lastActivityAt: null,
+    };
+
+    it("rejects when no disjunct holds and lastActivityAt is absent", () => {
+      const result = evaluateIssueContinuationPath(emptyEvidence, { now });
+      expect(result.ok).toBe(false);
+      expect(result.disjuncts).toEqual({
+        activeRun: false,
+        monitorNextCheckAtInFuture: false,
+        watchdog: false,
+        scheduledRetry: false,
+        activeRecoveryAction: false,
+        successfulRunHandoffLive: false,
+      });
+      expect(result.settledWithinWindow).toBe(false);
+      expect(result.lastActivityAt).toBeNull();
+    });
+
+    it("accepts on the activeRun disjunct alone", () => {
+      const result = evaluateIssueContinuationPath(
+        { ...emptyEvidence, activeRun: true },
+        { now },
+      );
+      expect(result.ok).toBe(true);
+      expect(result.disjuncts.activeRun).toBe(true);
+    });
+
+    it("accepts on a future monitorNextCheckAt (Date or ISO string)", () => {
+      for (const monitorNextCheckAt of [
+        new Date("2026-08-25T12:01:00.000Z"),
+        "2026-08-25T12:01:00.000Z",
+      ]) {
+        const result = evaluateIssueContinuationPath(
+          { ...emptyEvidence, monitorNextCheckAt },
+          { now },
+        );
+        expect(result.ok).toBe(true);
+        expect(result.disjuncts.monitorNextCheckAtInFuture).toBe(true);
+      }
+    });
+
+    it("rejects a monitorNextCheckAt at or before now", () => {
+      for (const monitorNextCheckAt of [
+        new Date("2026-08-25T11:59:59.999Z"),
+        "2026-08-25T12:00:00.000Z",
+      ]) {
+        const result = evaluateIssueContinuationPath(
+          { ...emptyEvidence, monitorNextCheckAt },
+          { now },
+        );
+        expect(result.ok).toBe(false);
+        expect(result.disjuncts.monitorNextCheckAtInFuture).toBe(false);
+      }
+    });
+
+    it("accepts on a live watchdog, scheduled retry, or recovery action", () => {
+      const result = evaluateIssueContinuationPath(
+        { ...emptyEvidence, watchdog: { id: "wd-1" } },
+        { now },
+      );
+      expect(result.ok).toBe(true);
+      expect(result.disjuncts.watchdog).toBe(true);
+
+      const retry = evaluateIssueContinuationPath(
+        { ...emptyEvidence, scheduledRetry: { runId: "run-sched" } },
+        { now },
+      );
+      expect(retry.ok).toBe(true);
+      expect(retry.disjuncts.scheduledRetry).toBe(true);
+
+      const recovery = evaluateIssueContinuationPath(
+        { ...emptyEvidence, activeRecoveryAction: { id: "rec-1" } },
+        { now },
+      );
+      expect(recovery.ok).toBe(true);
+      expect(recovery.disjuncts.activeRecoveryAction).toBe(true);
+    });
+
+    it("accepts a successfulRunHandoff only when hasLiveContinuation is true", () => {
+      const live = evaluateIssueContinuationPath(
+        { ...emptyEvidence, successfulRunHandoff: { hasLiveContinuation: true } },
+        { now },
+      );
+      expect(live.ok).toBe(true);
+      expect(live.disjuncts.successfulRunHandoffLive).toBe(true);
+
+      const stale = evaluateIssueContinuationPath(
+        { ...emptyEvidence, successfulRunHandoff: { hasLiveContinuation: false } },
+        { now },
+      );
+      expect(stale.ok).toBe(false);
+      expect(stale.disjuncts.successfulRunHandoffLive).toBe(false);
+    });
+
+    it("applies the 5-minute settle window against lastActivityAt", () => {
+      // 4m59s ago -> inside the window, accepted even with no disjuncts.
+      const fresh = evaluateIssueContinuationPath(
+        { ...emptyEvidence, lastActivityAt: new Date("2026-08-25T11:55:01.000Z") },
+        { now },
+      );
+      expect(fresh.ok).toBe(true);
+      expect(fresh.settledWithinWindow).toBe(true);
+
+      // Exactly 5 minutes ago -> outside the window (strict <).
+      const boundary = evaluateIssueContinuationPath(
+        { ...emptyEvidence, lastActivityAt: new Date("2026-08-25T11:55:00.000Z") },
+        { now },
+      );
+      expect(boundary.ok).toBe(false);
+      expect(boundary.settledWithinWindow).toBe(false);
+
+      // ISO strings and unparseable values are handled.
+      const freshString = evaluateIssueContinuationPath(
+        { ...emptyEvidence, lastActivityAt: "2026-08-25T11:59:00.000Z" },
+        { now },
+      );
+      expect(freshString.ok).toBe(true);
+
+      const garbage = evaluateIssueContinuationPath(
+        { ...emptyEvidence, lastActivityAt: "not-a-date" },
+        { now },
+      );
+      expect(garbage.ok).toBe(false);
+      expect(garbage.lastActivityAt).toBeNull();
+    });
   });
 });
