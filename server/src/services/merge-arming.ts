@@ -854,6 +854,56 @@ async function writeCommitStatus(
   return { success: false, error: message ?? `HTTP ${response.status}` };
 }
 
+export interface PostPullRequestCommentResult {
+  success: boolean;
+  status: number;
+  error: string | null;
+}
+
+/**
+ * SUP-14049: post a comment on a PR's conversation (the issues-comments
+ * endpoint covers pull requests). Advisory-only by construction: this is a
+ * plain comment and never creates, mocks, or writes the paperclip/approved
+ * status — that context stays owned by the control-plane publish path alone
+ * (the check-paperclip-approved.sh consume-contract).
+ */
+export async function postPullRequestComment(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+  body: string,
+): Promise<PostPullRequestCommentResult> {
+  const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
+    repo,
+  )}/issues/${number}/comments`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-merge-arming",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+
+  let response: Response;
+  try {
+    response = await ghFetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ body }),
+    });
+  } catch {
+    return { success: false, status: 0, error: "network_error" };
+  }
+
+  if (response.ok) {
+    return { success: true, status: response.status, error: null };
+  }
+
+  const responseBody = await response.json().catch(() => null) as Record<string, unknown> | null;
+  const message = responseBody?.message as string | undefined;
+  return { success: false, status: response.status, error: message ?? `HTTP ${response.status}` };
+}
+
 export async function armMergeOnApproval(
   db: Db,
   companyId: string,
