@@ -65,6 +65,8 @@ const POST_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/statuse
 const BASE_SHA = "base00000000000000000000000000000000000000003";
 const APPROVED_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${APPROVED_HEAD}`;
 const LIVE_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${NEW_HEAD}`;
+const COMMENT_LIST_URL = "https://api.github.com/repos/TEA-Core/paperclip/issues/42/comments?per_page=100&direction=desc";
+const COMMENT_POST_URL = "https://api.github.com/repos/TEA-Core/paperclip/issues/42/comments";
 
 const OPEN_PR_BODY = {
   state: "open",
@@ -82,6 +84,8 @@ function zeroSummary(): ApprovalStatusReconcilerTickSummary {
     failed: 0,
     failedDetails: [],
     capped: 0,
+    voidWarnings: 0,
+    voidWarningDetails: [],
   };
 }
 
@@ -113,6 +117,20 @@ function postStatusCalls() {
 
 function postStatusBodies(): Array<Record<string, unknown>> {
   return postStatusCalls().map((call) => JSON.parse(String((call[1] as RequestInit).body)));
+}
+
+function postCommentCalls() {
+  return mockGhFetch.mock.calls.filter((call) => {
+    const url = String(call[0]);
+    const init = call[1] as RequestInit | undefined;
+    return url === COMMENT_POST_URL && init?.method === "POST";
+  });
+}
+
+function postCommentBodies(): string[] {
+  return postCommentCalls().map(
+    (call) => JSON.parse(String((call[1] as RequestInit).body)).body as string,
+  );
 }
 
 describeEmbeddedPostgres("approval-status-reconciler", () => {
@@ -309,6 +327,11 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const distinct = [...new Set(getUrls)];
       expect(distinct).toEqual([PR_URL, COMBINED_STATUS_URL]);
       expect(getUrls.slice(0, 2)).toEqual([PR_URL, COMBINED_STATUS_URL]);
+
+      // The live head still matches publishedHeadSha — nothing is voided,
+      // so no PR warning.
+      expect(postCommentCalls()).toHaveLength(0);
+      expect(summary.voidWarnings).toBe(0);
     });
 
     it("performs zero writes when the head already carries paperclip/approved=success", async () => {
@@ -362,6 +385,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
             files: [{ filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000002", status: "modified" }],
           },
         },
+        { url: COMMENT_LIST_URL, body: [] },
+        { url: COMMENT_POST_URL, body: { id: 9001 } },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
@@ -369,6 +394,108 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(summary.republished).toBe(0);
       expect(summary.failed).toBe(0);
       expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("warns on the PR when a new head voids the published approval (SUP-14049, #349 repro)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        {
+          url: APPROVED_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 1,
+            files: [{ filename: "docs/sup-13870.md", sha: "blob0000000000000000000000000000000000000001", status: "modified" }],
+          },
+        },
+        {
+          url: LIVE_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 2,
+            files: [{ filename: "docs/sup-13870.md", sha: "blob0000000000000000000000000000000000000002", status: "modified" }],
+          },
+        },
+        { url: COMMENT_LIST_URL, body: [] },
+        { url: COMMENT_POST_URL, body: { id: 9001 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      // Guard A's verdict is unchanged: the voided head is refused, not re-stamped.
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+      expect(summary.voidWarnings).toBe(1);
+      expect(summary.voidWarningDetails).toEqual(["SUP-42: posted"]);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      // Advisory-only signal, visible on the PR itself: one comment naming both
+      // SHAs and carrying the dedup marker — and nothing written to
+      // paperclip/approved.
+      expect(postCommentCalls()).toHaveLength(1);
+      const body = postCommentBodies()[0]!;
+      expect(body).toContain(`This PR was approved at ${APPROVED_HEAD} (SUP-42)`);
+      expect(body).toContain(`head ${NEW_HEAD} voids that approval`);
+      expect(body).toContain(`[paperclip:approval-voided ${APPROVED_HEAD} -> ${NEW_HEAD}]`);
+      expect(body).not.toContain("context");
+    });
+
+    it("does not re-post the void warning when the same pair was already warned (dedup)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        {
+          url: APPROVED_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 1,
+            files: [{ filename: "docs/sup-13870.md", sha: "blob0000000000000000000000000000000000000001", status: "modified" }],
+          },
+        },
+        {
+          url: LIVE_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 2,
+            files: [{ filename: "docs/sup-13870.md", sha: "blob0000000000000000000000000000000000000002", status: "modified" }],
+          },
+        },
+        {
+          url: COMMENT_LIST_URL,
+          body: [
+            {
+              id: 9001,
+              body: `previous warning [paperclip:approval-voided ${APPROVED_HEAD} -> ${NEW_HEAD}]`,
+            },
+          ],
+        },
+        { url: COMMENT_POST_URL, body: { id: 9002 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+      expect(summary.voidWarnings).toBe(1);
+      expect(summary.voidWarningDetails).toEqual(["SUP-42: already-posted"]);
+      expect(postCommentCalls()).toHaveLength(0);
       expect(postStatusCalls()).toHaveLength(0);
     });
 
@@ -466,6 +593,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
             ],
           },
         },
+        { url: COMMENT_LIST_URL, body: [] },
+        { url: COMMENT_POST_URL, body: { id: 9001 } },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
@@ -514,6 +643,9 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(summary.republished).toBe(0);
       expect(summary.skipped["guard-a:no-approved-head"]).toBe(1);
       expect(postStatusCalls()).toHaveLength(0);
+      // No publishedHeadSha means nothing is voided — no PR warning either.
+      expect(postCommentCalls()).toHaveLength(0);
+      expect(summary.voidWarnings).toBe(0);
     });
 
     it("fails closed when the diff-vs-base compare cannot be verified (guard A)", async () => {

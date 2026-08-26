@@ -13,6 +13,7 @@ import {
 } from "./github-credential.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
+  postPullRequestComment,
   publishApprovalStatus,
   resolveLinkedPullRequestsWithState,
   type LinkedPullRequest,
@@ -55,6 +56,30 @@ import {
 // (expectedHeadSha): a head that moves in that window makes the delegated
 // publish refuse (skipped, head_moved) with zero writes instead of stamping
 // unreviewed content.
+//
+// SUP-14049. When the live head moved off the persisted approved head and
+// Guard A positively proves the diff-vs-base changed in substance
+// (changed-blob), the published paperclip/approved stamp is stranded on the
+// old head and the PR reads green on its own page until the merge queue
+// ejects it. The refusal itself is already recorded in this service's
+// summary; the void is additionally surfaced ON the PR as an advisory
+// comment naming both SHAs ("this PR was approved at <sha>; head <new-sha>
+// voids that approval"). The warning:
+//   - is advisory only — it is a plain PR comment and never creates, mocks,
+//     or writes the paperclip/approved status (the consume-contract);
+//   - fires only on positive evidence (changed-blob). Guard A's
+//     can-not-verify refusals (compare failure, truncated/missing file
+//     list, no base sha) self-heal or retry on the next tick and must not
+//     manufacture a false "voided" claim;
+//   - is deduplicated by an embedded marker carrying the exact
+//     approved->head pair, so a head that stays voided across ticks posts
+//     at most one comment per (approved, voiding) pair;
+//   - fails soft: a failed read or post is recorded in the tick summary and
+//     the PR-conversation detail, never fatal to the reconcile tick — the
+//     Guard A refusal is the primary verdict.
+// There is no GitHub webhook receiver in this control plane: the reconciler
+// tick IS the synchronize observer (it live-reads the linked PR each tick),
+// so the warning lands the first tick after the voiding push.
 
 const PAPERCLIP_APPROVED_CONTEXT = "paperclip/approved";
 const DEFAULT_MAX_CANDIDATES = 20;
@@ -82,6 +107,13 @@ export interface ApprovalStatusReconcilerTickSummary {
   failedDetails: string[];
   /** Candidates dropped by the per-tick cap. */
   capped: number;
+  /**
+   * SUP-14049: voids observed this tick whose PR warning was ensured
+   * (posted now, or already present from an earlier tick).
+   */
+  voidWarnings: number;
+  /** Bounded "IDENTIFIER: detail" void-warning outcomes. */
+  voidWarningDetails: string[];
 }
 
 interface CandidateRow {
@@ -96,7 +128,7 @@ interface CandidateRow {
 
 type CandidateResult =
   | { kind: "republished"; detail: string }
-  | { kind: "skipped"; reason: string; detail: string }
+  | { kind: "skipped"; reason: string; detail: string; voidWarning?: "posted" | "already-posted" }
   | { kind: "failed"; detail: string };
 
 interface GitHubReadOutcome {
@@ -233,6 +265,100 @@ async function ghReadJson(
   }
 
   return last!;
+}
+
+/**
+ * SUP-14049: the machine-checkable marker embedded at the end of the void
+ * warning comment. It carries the full approved -> voiding head pair, so the
+ * marker is a content-key: re-runs for the same pair dedupe, while a later
+ * voiding head posts its own comment instead of being swallowed.
+ */
+function voidWarningMarker(approvedHeadSha: string, headSha: string): string {
+  return `[paperclip:approval-voided ${approvedHeadSha} -> ${headSha}]`;
+}
+
+/**
+ * SUP-14049: the body of the void warning, landed on the PR itself so the
+ * stranded stamp is visible where the PR reads green — not only in
+ * control-plane logs. Advisory only: it names both SHAs and states what
+ * happens next (a human or the review stage decides; no auto re-approval).
+ */
+function voidWarningBody(
+  identifier: string,
+  approvedHeadSha: string,
+  headSha: string,
+  substanceChange: string,
+): string {
+  return (
+    `[Paperclip approval voided] This PR was approved at ${approvedHeadSha} (${identifier}); ` +
+    `head ${headSha} voids that approval.\n\n` +
+    `The paperclip/approved stamp is stranded on ${approvedHeadSha} and no longer covers this head: ` +
+    `the PR's diff-vs-base changed in substance after approval (${substanceChange}). ` +
+    `The approval-status reconciler refuses to re-stamp content that was never reviewed ` +
+    `(Guard A) and does not auto re-approve — a human or the review stage decides next steps.\n\n` +
+    voidWarningMarker(approvedHeadSha, headSha)
+  );
+}
+
+/**
+ * SUP-14049: surface the void on the PR. Dedupes by re-reading the newest
+ * page of the PR conversation for this exact approved->head marker before
+ * posting, so a head that stays voided across ticks posts at most one
+ * comment (the marker we posted is the most recent comment, hence
+ * direction=desc). A failed read fails the post (a write we cannot dedup
+ * must not be attempted); a failed post is reported, never fatal — the
+ * Guard A refusal is the primary verdict and the warning is advisory.
+ */
+async function postApprovalVoidWarning(
+  db: Db,
+  row: CandidateRow,
+  target: LinkedPullRequest,
+  approvedHeadSha: string,
+  headSha: string,
+  substanceChange: string,
+): Promise<{ kind: "posted" } | { kind: "already-posted" } | { kind: "failed"; detail: string }> {
+  const marker = voidWarningMarker(approvedHeadSha, headSha);
+  const listing = await ghReadJson(
+    db,
+    row.companyId,
+    target.owner,
+    target.repo,
+    `/issues/${target.number}/comments?per_page=100&direction=desc`,
+  );
+  if (!listing.ok) {
+    return {
+      kind: "failed",
+      detail: `void warning comment check failed: HTTP ${listing.status} ${listing.message ?? ""}`.trim(),
+    };
+  }
+  const comments = Array.isArray(listing.body)
+    ? (listing.body as Array<Record<string, unknown>>)
+    : [];
+  if (comments.some((c) => typeof c.body === "string" && c.body.includes(marker))) {
+    return { kind: "already-posted" };
+  }
+
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, row.companyId, target.owner, target.repo);
+  if (candidates.length === 0) {
+    return { kind: "failed", detail: "void warning post skipped: no GitHub token candidates" };
+  }
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i]!;
+    const result = await postPullRequestComment(
+      candidate.token,
+      target.owner,
+      target.repo,
+      target.number,
+      voidWarningBody(row.identifier ?? row.id, approvedHeadSha, headSha, substanceChange),
+    );
+    if (result.success) return { kind: "posted" };
+    if ((result.status === 401 || result.status === 403) && i < candidates.length - 1) continue;
+    return {
+      kind: "failed",
+      detail: `void warning post failed: HTTP ${result.status} ${result.error ?? ""}`.trim(),
+    };
+  }
+  return { kind: "failed", detail: "void warning post failed: exhausted GitHub token candidates" };
 }
 
 /**
@@ -531,10 +657,30 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     }
     const substanceChange = diffSubstanceChange(approvedFiles, liveFiles);
     if (substanceChange) {
+      // SUP-14049: positive evidence the new head voids the published
+      // approval — surface it on the PR itself, advisory-only.
+      const voidWarning = await postApprovalVoidWarning(
+        db,
+        row,
+        target,
+        approvedHead.publishedHeadSha,
+        headSha,
+        substanceChange,
+      );
+      const voidNote =
+        voidWarning.kind === "posted"
+          ? "; void warning posted on the PR"
+          : voidWarning.kind === "already-posted"
+            ? "; void warning already posted on the PR"
+            : `; ${voidWarning.detail}`;
       return {
         kind: "skipped",
         reason: "guard-a:changed-blob",
-        detail: `guard-a: diff-vs-base substance changed for ${label} (${substanceChange}); head ${headSha.slice(0, 7)} was never reviewed; refusing to re-publish`,
+        detail: `guard-a: diff-vs-base substance changed for ${label} (${substanceChange}); head ${headSha.slice(0, 7)} was never reviewed; refusing to re-publish${voidNote}`,
+        voidWarning:
+          voidWarning.kind === "posted" || voidWarning.kind === "already-posted"
+            ? voidWarning.kind
+            : undefined,
       };
     }
   }
@@ -572,6 +718,8 @@ export async function runApprovalStatusReconcilerTick(
     failed: 0,
     failedDetails: [],
     capped,
+    voidWarnings: 0,
+    voidWarningDetails: [],
   };
 
   for (const row of batch) {
@@ -585,6 +733,12 @@ export async function runApprovalStatusReconcilerTick(
         summary.skipped[result.reason] = (summary.skipped[result.reason] ?? 0) + 1;
         if (summary.skippedDetails.length < MAX_DETAIL_ENTRIES) {
           summary.skippedDetails.push(`${label}: ${result.detail}`);
+        }
+        if (result.voidWarning) {
+          summary.voidWarnings += 1;
+          if (summary.voidWarningDetails.length < MAX_DETAIL_ENTRIES) {
+            summary.voidWarningDetails.push(`${label}: ${result.voidWarning}`);
+          }
         }
       } else {
         summary.failed += 1;
@@ -611,6 +765,8 @@ export async function runApprovalStatusReconcilerTick(
       failed: summary.failed,
       failedDetails: summary.failedDetails,
       capped: summary.capped,
+      voidWarnings: summary.voidWarnings,
+      voidWarningDetails: summary.voidWarningDetails,
     },
     "approval status reconciler tick",
   );
