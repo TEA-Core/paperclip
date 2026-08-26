@@ -52,7 +52,10 @@ async function getMonthlySpendTotal(
 export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
   const budgets = budgetService(db, budgetHooks);
   return {
-    createEvent: async (companyId: string, data: Omit<typeof costEvents.$inferInsert, "companyId">) => {
+    createEvent: async (
+      companyId: string,
+      data: Omit<typeof costEvents.$inferInsert, "companyId" | "agentId"> & { agentId: string },
+    ) => {
       const agent = await db
         .select()
         .from(agents)
@@ -87,7 +90,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           spentMonthlyCents: agentMonthSpend,
           updatedAt: new Date(),
         })
-        .where(eq(agents.id, event.agentId));
+        .where(eq(agents.id, agent.id));
 
       await db
         .update(companies)
