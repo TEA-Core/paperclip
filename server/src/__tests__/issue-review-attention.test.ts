@@ -6,6 +6,7 @@ import {
   approvals,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issueRecoveryActions,
@@ -43,6 +44,7 @@ describeEmbeddedPostgres("issue review attention", () => {
     await db.delete(issueApprovals);
     await db.delete(approvals);
     await db.delete(issueRecoveryActions);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issues);

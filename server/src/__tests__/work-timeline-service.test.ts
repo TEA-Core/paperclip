@@ -9,6 +9,7 @@ import {
   authUsers,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issueComments,
@@ -45,6 +46,7 @@ describeEmbeddedPostgres("work timeline aggregation", () => {
     await db.delete(issueComments);
     await db.delete(issueApprovals);
     await db.delete(approvals);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);

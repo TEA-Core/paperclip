@@ -16,6 +16,7 @@ import {
   companySecretVersions,
   companySecrets,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
@@ -60,6 +61,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await db.delete(companySecrets);
     await db.delete(companySecretProviderConfigs);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);

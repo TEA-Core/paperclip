@@ -17,6 +17,7 @@ import {
   documents,
   executionWorkspaces,
   folders,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
   issueInboxArchives,
@@ -84,6 +85,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await db.delete(documentRevisions);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(executionWorkspaces);

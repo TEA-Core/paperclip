@@ -13,6 +13,7 @@ import {
   environmentLeases,
   environments,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
   issues,
@@ -50,6 +51,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
     await db.delete(companySecretBindings);
     await db.delete(environmentCustomImageSetupSessions);
     await db.delete(environmentLeases);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(executionWorkspaces);

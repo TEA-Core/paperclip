@@ -6,6 +6,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
   issueComments,
@@ -53,6 +54,7 @@ describeEmbeddedPostgres("routine execution supersede on terminal done", () => {
     await db.delete(issueInboxArchives);
     await db.delete(issueReadStates);
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(routineRuns);
     await db.delete(routines);

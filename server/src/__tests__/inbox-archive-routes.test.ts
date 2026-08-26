@@ -10,6 +10,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueInboxArchives,
@@ -43,6 +44,7 @@ describeEmbeddedPostgres("inbox archive routes", () => {
     await db.delete(issueInboxArchives);
     await db.delete(activityLog);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(userInboxAgentPolicies);
     await db.delete(principalPermissionGrants);

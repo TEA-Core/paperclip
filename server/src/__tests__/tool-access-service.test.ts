@@ -14,6 +14,7 @@ import {
   companySecrets,
   companySecretVersions,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueThreadInteractions,
   issues,
@@ -453,6 +454,7 @@ describeEmbeddedPostgres("tool access service", () => {
     await db.delete(toolConnections);
     await db.delete(toolApplications);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(principalPermissionGrants);

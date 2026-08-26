@@ -9,6 +9,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueRelations,
   issues,
@@ -198,6 +199,7 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     await db.delete(activityLog);
     await db.delete(agentWakeupRequests);
     await db.delete(issueRelations);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);

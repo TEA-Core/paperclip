@@ -8,6 +8,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueCreateIdempotencyKeys,
   issues,
@@ -48,6 +49,7 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     await db.delete(activityLog);
     await db.delete(issueCreateIdempotencyKeys);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);

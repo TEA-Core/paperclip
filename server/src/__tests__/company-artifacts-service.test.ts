@@ -10,6 +10,7 @@ import {
   createDb,
   documentMemberships,
   documents,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueAttachments,
   issueComments,
@@ -73,6 +74,7 @@ describeEmbeddedPostgres("companyArtifactsService", () => {
     await db.delete(issueComments);
     await db.delete(issueDocuments);
     await db.delete(documents);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(projects);

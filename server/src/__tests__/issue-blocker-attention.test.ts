@@ -8,6 +8,7 @@ import {
   approvals,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issueRelations,
@@ -52,6 +53,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await db.delete(issueApprovals);
     await db.delete(approvals);
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueRecoveryActions);

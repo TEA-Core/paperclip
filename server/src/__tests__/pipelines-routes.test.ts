@@ -12,6 +12,7 @@ import {
   documents,
   documentRevisions,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
   issueComments,
@@ -78,6 +79,7 @@ describeEmbeddedPostgres("pipeline routes", () => {
     await db.delete(issueComments);
     await db.delete(activityLog);
     await db.delete(routineRuns);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(executionWorkspaces);

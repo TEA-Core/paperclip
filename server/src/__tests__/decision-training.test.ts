@@ -10,6 +10,7 @@ import {
   createDb,
   decisionTrainingExamples,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
@@ -50,6 +51,7 @@ describeEmbeddedPostgres("decision training", () => {
     await db.delete(issueThreadInteractions);
     await db.delete(issueComments);
     await db.delete(executionWorkspaces);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(projectWorkspaces);

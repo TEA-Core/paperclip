@@ -13,6 +13,7 @@ import {
   companyMemberships,
   companySkills,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   principalPermissionGrants,
 } from "@paperclipai/db";
@@ -57,6 +58,7 @@ describeEmbeddedPostgres("company skill import authorization routes", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(companySkills);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);

@@ -4,6 +4,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueRecoveryActions,
   issues,
@@ -128,6 +129,7 @@ describeEmbeddedPostgres("recovery observability report", () => {
 
   afterEach(async () => {
     await db.delete(issueRecoveryActions);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
