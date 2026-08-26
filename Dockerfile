@@ -223,6 +223,30 @@ RUN mkdir -p /opt/blacksmith/bin \
   && ln -sf /opt/blacksmith/bin/blacksmith /usr/local/bin/blacksmith \
   && /opt/blacksmith/bin/blacksmith --version
 
+# CodeRabbit CLI — `coderabbit review --agent` emits NDJSON findings a QA agent
+# can consume. NOT an npm package: `@coderabbitai/cli` does not exist on the
+# registry (404), so the only supported install is the vendor script, which
+# fetches a ~100MB self-contained binary for the build platform. The script
+# resolves linux x64 and arm64 from `uname -m`, so this layer stays correct for
+# the tagged multi-arch build.
+#
+# Same node-owned-prefix reasoning as blacksmith above: `coderabbit update`
+# self-updates the binary in place, and the default install dir (~/.local/bin)
+# is under /paperclip — a VOLUME, so a build-time write there is masked at
+# runtime. CODERABBIT_INSTALL_DIR moves it to a real image path.
+#
+# CI=1 suppresses the installer's interactive post-install login prompt, and
+# putting the target on PATH for the duration keeps the installer from
+# appending a PATH line to root's shell profile (it never reads it here, and
+# the symlinks below are what actually make the CLI reachable).
+RUN mkdir -p /opt/coderabbit/bin \
+  && CI=1 CODERABBIT_INSTALL_DIR=/opt/coderabbit/bin PATH="/opt/coderabbit/bin:${PATH}" \
+    sh -c "$(curl -fsSL https://cli.coderabbit.ai/install.sh)" \
+  && chown -R node:node /opt/coderabbit \
+  && ln -sf /opt/coderabbit/bin/coderabbit /usr/local/bin/coderabbit \
+  && ln -sf /opt/coderabbit/bin/coderabbit /usr/local/bin/cr \
+  && /opt/coderabbit/bin/coderabbit --version
+
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

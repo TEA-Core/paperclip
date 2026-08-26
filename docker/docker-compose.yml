@@ -29,6 +29,11 @@ services:
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private"
       PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://localhost:3100}"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      # Credentials for the bundled CodeRabbit CLI, seeded into
+      # /paperclip/.coderabbit by the entrypoint so agents can run
+      # `coderabbit review --agent` headless. Optional: unset simply leaves the
+      # CLI installed and signed out. See .env.example for how to produce it.
+      CODERABBIT_AUTH_JSON_B64: "${CODERABBIT_AUTH_JSON_B64:-}"
     volumes:
       - paperclip-data:/paperclip
     depends_on:
