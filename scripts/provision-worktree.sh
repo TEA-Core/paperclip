@@ -66,9 +66,32 @@ base_cli_healthy() {
   (cd "$base_cwd" && node "$base_cli_runner_path" "$base_cli_entry_path" --help >/dev/null 2>&1)
 }
 
+# The owning uid of a path, or empty when it cannot be determined. GNU and BSD
+# stat disagree on the flag, and neither is guaranteed present.
+path_owner_uid() {
+  stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null || true
+}
+
 repair_base_workspace_install() {
   command -v pnpm >/dev/null 2>&1 || return 1
   [[ -f "$base_cwd/package.json" && -f "$base_cwd/pnpm-lock.yaml" ]] || return 1
+  # SUP-13977: this repair installs into the SHARED BASE WORKSPACE, not into the
+  # worktree — and since the worktree provision now drops to the agent uid, that
+  # would write the server's tree as the wrong user. pnpm's linkBins chmods every
+  # bin it links, so a base whose `dist/*` bins the server owns fails with EPERM
+  # here; and where it did not fail it would seed the server-owned base with
+  # agent-owned files, which is this same bug one level up.
+  #
+  # Refuse instead. The caller falls through to the CLI paths that do not need a
+  # healthy base checkout, and if none of them work the provision fails naming
+  # the real cause rather than burying it in a pnpm stack trace.
+  local base_owner_uid current_uid
+  base_owner_uid="$(path_owner_uid "$base_cwd")"
+  current_uid="$(id -u)"
+  if [[ -n "$base_owner_uid" && "$base_owner_uid" != "$current_uid" ]]; then
+    echo "Refusing to repair the base workspace at $base_cwd: it is owned by uid $base_owner_uid but this provision runs as uid $current_uid. Repairing it here would write the shared base checkout as the wrong user. Repair it as uid $base_owner_uid instead." >&2
+    return 1
+  fi
   echo "Base workspace CLI at $base_cli_entry_path failed its health check (typically dangling pnpm symlinks after a partial install); repairing with pnpm install in $base_cwd." >&2
   # --force guarantees relinking even when pnpm's up-to-date heuristics would
   # otherwise skip the dangling symlinks; --frozen-lockfile keeps the repair
