@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +27,7 @@ import {
 } from "@paperclipai/adapter-utils/acpx-engine/constants";
 import {
   ACP_AGENT_UID_SPLIT_ENV_KEY,
+  resolveAcpAgentSpawnTarget,
   type AcpxEngineExecutorOptions,
   type AcpxLocalManagedHomeContext,
   type AcpxLocalManagedHomeResult,
@@ -33,9 +35,11 @@ import {
   type AcpxRemoteManagedHomeResult,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
 import {
+  asBoolean,
   asNumber,
   asString,
   parseObject,
+  SECRET_ENV_KEYS,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   materializeRemoteClaudeConfig,
@@ -318,7 +322,91 @@ async function prepareClaudeRemoteManagedHome(
  * run (`sessions/` at 0o700, per-worktree `projects/<cwd>/` at 0o700 → 0o2700),
  * so this seam ALSO returns a `teardown` that re-normalizes the whole home tree
  * after the turn — keeping zero 0700 dirs in the home the agent uid reaches.
+ *
+ * Armed lanes (SUP-13872), keyed off the existing arm predicate (no second
+ * flag): the seed stops pre-creating the SDK subdirs (the agent uid creates
+ * and owns them), and the teardown gains a second pass exec'd through the
+ * setuid spawn shim so the walk runs at that uid; the two passes' union
+ * covers mixed-ownership trees.
  */
+/**
+ * The agent-uid pass of the run-end re-normalize (SUP-13872): exec the
+ * standalone normalizer through the setuid spawn shim so the walk runs as the
+ * agent uid (1001) and can chmod/chgrp the SDK dirs the CLI created during
+ * the run. The server uid cannot fix those — chown across uids needs
+ * CAP_CHOWN — and the in-process pass stat-and-skips exactly those dirs.
+ *
+ * Best-effort by construction: a spawn fault or a non-zero shim/normalizer
+ * exit is logged and swallowed — the re-normalize must never fail the run.
+ * The child env is scrubbed the same way the acpx spawn boundary scrubs it:
+ * the normalizer runs as the agent uid, and handing it the server's
+ * `PAPERCLIP_SECRETS_*` env would reopen the exposure the split closes.
+ */
+function runAgentUidClaudeConfigNormalizer(input: {
+  shimPath: string;
+  configDir: string;
+  onLog: AdapterExecutionContext["onLog"];
+}): Promise<void> {
+  const normalizerScript = path.join(moduleDir, "claude-config-normalize.js");
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(childEnv)) {
+    if (
+      SECRET_ENV_KEYS.has(key) ||
+      key.startsWith("PAPERCLIP_SECRETS_") ||
+      key === "DATABASE_URL" ||
+      key === "DATABASE_MIGRATION_URL"
+    ) {
+      delete childEnv[key];
+    }
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(input.shimPath, [process.execPath, normalizerScript, input.configDir], {
+        env: childEnv,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      void input.onLog(
+        "stderr",
+        `[paperclip] agent-uid Claude config normalizer: spawn failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      settle();
+      return;
+    }
+    let output = "";
+    const collect = (chunk: Buffer): void => {
+      output += chunk.toString("utf8");
+      if (output.length > 2000) output = output.slice(-2000);
+    };
+    child.stderr?.on("data", collect);
+    child.on("error", (error) => {
+      void input.onLog(
+        "stderr",
+        `[paperclip] agent-uid Claude config normalizer: shim spawn error: ${error.message}\n`,
+      );
+      settle();
+    });
+    child.on("close", (code, signal) => {
+      if (code === 0) {
+        settle();
+        return;
+      }
+      void input.onLog(
+        "stderr",
+        `[paperclip] agent-uid Claude config normalizer exited ${signal ? `with signal ${signal}` : `with code ${code}`} (config dir ${input.configDir}): ${output.trim().slice(-500)}\n`,
+      );
+      settle();
+    });
+  });
+}
+
 export async function prepareClaudeLocalManagedHome(
   input: AcpxLocalManagedHomeContext,
 ): Promise<AcpxLocalManagedHomeResult | undefined> {
@@ -329,7 +417,19 @@ export async function prepareClaudeLocalManagedHome(
   // server process env, not in the per-run env the engine hands over (mirrors
   // the remote seam's use of process.env for the managed seed below).
   const hostEnv = process.env;
-  await seedAgentSideClaudeConfig(hostEnv, onLog, companyId, agentId);
+  // Armed through the EXISTING arm predicate (SUP-13504) — no second flag.
+  // Armed means the bridge and the SDK dirs it creates land at the agent uid
+  // (1001), so the seed stops pre-creating the SDK subdirs (the server would
+  // mint a subtree it cannot hand over — chown across uids needs CAP_CHOWN)
+  // and the run-end re-normalize gains a shim-exec'd pass at that uid.
+  const agentSpawnTarget = await resolveAcpAgentSpawnTarget({
+    laneFlagArmed: asBoolean(input.config.acpAgentUidSplit, false),
+    executionTargetIsRemote: false,
+  });
+  const agentUidSplitArmed = agentSpawnTarget !== undefined;
+  await seedAgentSideClaudeConfig(hostEnv, onLog, companyId, agentId, {
+    skipSdkSubdirs: agentUidSplitArmed,
+  });
   const agentSideHome = resolveAgentSideClaudeConfigDir(hostEnv, companyId, agentId);
   env.CLAUDE_CONFIG_DIR = agentSideHome;
   await onLog(
@@ -340,8 +440,20 @@ export async function prepareClaudeLocalManagedHome(
     // Re-normalize the home tree after the CLI's run-end dir creation so the
     // agent uid keeps group-`agents` reachability into the next run. Best-effort:
     // the normalize logs and swallows its own faults (never fails the run).
-    teardown: () =>
-      normalizeAgentSideClaudeConfigDirPermissions(hostEnv, onLog, companyId, agentId),
+    // Armed lanes run BOTH passes: a home populated pre-arming is entirely the
+    // server uid's, and the server uid cannot hand its dirs over (chown across
+    // uids needs CAP_CHOWN) — the in-process pass fixes the server-owned dirs,
+    // the shim pass fixes the agent-owned ones; each stat-and-skips the dirs
+    // it does not own.
+    teardown: async () => {
+      await normalizeAgentSideClaudeConfigDirPermissions(hostEnv, onLog, companyId, agentId);
+      if (!agentUidSplitArmed || !agentSpawnTarget) return;
+      await runAgentUidClaudeConfigNormalizer({
+        shimPath: agentSpawnTarget.command,
+        configDir: agentSideHome,
+        onLog,
+      });
+    },
   };
 }
 

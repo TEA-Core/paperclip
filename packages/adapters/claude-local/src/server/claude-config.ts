@@ -305,6 +305,7 @@ export async function seedAgentSideClaudeConfig(
   onLog: AdapterExecutionContext["onLog"],
   companyId: string,
   agentId: string,
+  options?: { skipSdkSubdirs?: boolean },
 ): Promise<void> {
   const configDir = resolveAgentSideClaudeConfigDir(env, companyId, agentId);
   await fs.mkdir(configDir, { recursive: true, mode: 0o2770 });
@@ -315,13 +316,35 @@ export async function seedAgentSideClaudeConfig(
   await chownToAgentsGroup(configDir, onLog);
 
   // Pre-create the SDK subdirectories at 0o2770 so a run writing into the home
-  // starts from group-writable dirs instead of 0700 SDK-created ones.
-  const subdirs: string[] = ["projects", "session-env", "sessions", "shell-snapshots", "statsig"];
-  for (const subdir of subdirs) {
-    const subdirPath = path.join(configDir, subdir);
-    await fs.mkdir(subdirPath, { recursive: true, mode: 0o2770 });
-    await fs.chmod(subdirPath, 0o2770);
-    await chownToAgentsGroup(subdirPath, onLog);
+  // starts from group-writable dirs instead of 0700 SDK-created ones. When the
+  // lane is armed the agent uid (1001) creates and owns these dirs itself —
+  // pre-creating them as the server uid would only mint a subtree the server
+  // cannot hand over (chown across uids needs CAP_CHOWN), so the seed skips
+  // them and guarantees only the home root + the two credential files below.
+  if (options?.skipSdkSubdirs) {
+    await onLog(
+      "stdout",
+      `[paperclip] agent-side Claude config: uid split armed — leaving the SDK subdirs of ${configDir} to the agent uid\n`,
+    );
+  } else {
+    const subdirs: string[] = ["projects", "session-env", "sessions", "shell-snapshots", "statsig"];
+    for (const subdir of subdirs) {
+      const subdirPath = path.join(configDir, subdir);
+      await fs.mkdir(subdirPath, { recursive: true, mode: 0o2770 });
+      try {
+        await fs.chmod(subdirPath, 0o2770);
+      } catch (error) {
+        // Best-effort, the same contract as the run-end re-normalize: a subdir
+        // this uid cannot chmod (e.g. a uid-1001-owned dir on an armed lane)
+        // is logged and skipped, never fatal — the run must not fail at prep.
+        await onLog(
+          "stderr",
+          `[paperclip] agent-side Claude config: could not chmod ${subdirPath} to 0o2770: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+        continue;
+      }
+      await chownToAgentsGroup(subdirPath, onLog);
+    }
   }
 
   // Refresh the two credential artifacts from the server's shared home (the
@@ -368,25 +391,72 @@ export async function normalizeAgentSideClaudeConfigDirPermissions(
   await normalizeClaudeConfigDirTree(configDir, onLog);
 }
 
-async function normalizeClaudeConfigDirTree(
+/**
+ * Path-shape guard for the standalone agent-uid normalizer's argv (SUP-13872):
+ * the target must resolve to exactly
+ * `<instanceRoot>/companies/<companyId>/agents/<agentId>/claude-config` — one
+ * company segment, one agent segment, the fixed leaf name. Anything else (a
+ * sibling dir, a deeper path, `..` traversal, another tree entirely) is
+ * refused before the walk touches the filesystem.
+ */
+export function isAgentSideClaudeConfigPath(
+  target: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (typeof target !== "string" || target.trim().length === 0) return false;
+  const instanceRoot = resolvePaperclipInstanceRootForAdapter({
+    homeDir: nonEmpty(env.PAPERCLIP_HOME) ?? undefined,
+    instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
+    env,
+  });
+  const rel = path.relative(instanceRoot, path.resolve(target));
+  return /^companies\/[^/]+\/agents\/[^/]+\/claude-config$/.test(rel);
+}
+
+/**
+ * Re-normalize a directory tree to 0o2770 + the `agents` group. Shared by the
+ * in-process pass (server uid) and the standalone agent-uid pass, so both
+ * walks keep byte-identical semantics:
+ *
+ *   - dirent-type-only recursion (a symlink is never followed out of the tree),
+ *   - per-dir best-effort (a chmod fault is logged and skips that subtree; a
+ *     vanished/unreadable dir stops quietly),
+ *   - files untouched,
+ *   - stat-and-skip of dirs the running uid does not own, while still
+ *     recursing through them: on a mixed-ownership tree each pass fixes every
+ *     dir it owns wherever nested and leaves the other uid's dirs alone, so
+ *     neither pass emits EPERM noise on the other's dirs every run.
+ */
+export async function normalizeClaudeConfigDirTree(
   dirPath: string,
   onLog: AdapterExecutionContext["onLog"],
 ): Promise<void> {
+  let self: Awaited<ReturnType<typeof fs.stat>>;
   try {
-    await fs.chmod(dirPath, 0o2770);
-  } catch (error) {
-    await onLog(
-      "stderr",
-      `[paperclip] agent-side Claude config: could not chmod ${dirPath} to 0o2770: ${error instanceof Error ? error.message : String(error)}\n`,
-    );
+    self = await fs.stat(dirPath);
+  } catch {
+    // The dir vanished; nothing left to do here.
     return;
   }
-  await chownToAgentsGroup(dirPath, onLog);
+  const ownsDir =
+    typeof process.getuid !== "function" || self.uid === process.getuid();
+  if (ownsDir) {
+    try {
+      await fs.chmod(dirPath, 0o2770);
+    } catch (error) {
+      await onLog(
+        "stderr",
+        `[paperclip] agent-side Claude config: could not chmod ${dirPath} to 0o2770: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return;
+    }
+    await chownToAgentsGroup(dirPath, onLog);
+  }
   let entries: Array<{ name: string; isDirectory(): boolean }>;
   try {
     entries = await fs.readdir(dirPath, { withFileTypes: true });
   } catch {
-    // The dir vanished or is unreadable between the chmod and the readdir; the
+    // The dir vanished or is unreadable between the stat and the readdir; the
     // chmod above already did what it could. Nothing left to walk.
     return;
   }

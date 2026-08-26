@@ -903,6 +903,192 @@ describe("claude_local ACP lane", () => {
     }
   });
 
+  it("armed lane: the seed leaves SDK subdirs to the agent uid and the teardown execs the normalizer through the shim", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-local-armed-");
+    const serverHome = path.join(root, "server-home");
+    await fs.mkdir(path.join(serverHome, ".claude"), { recursive: true });
+
+    // Fake setuid shim: records its argv and the env it saw, then exits 0.
+    const shimPath = path.join(root, "fake-spawn-shim");
+    const argvLog = path.join(root, "shim-argv.log");
+    const masterKey = "master-key-never-leave-the-server";
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        "{",
+        'printf "argc=%s\\n" "$#"',
+        'for a in "$@"; do printf "arg=%s\\n" "$a"; done',
+        'printf "master_key=%s\\n" "${PAPERCLIP_SECRETS_MASTER_KEY-}"',
+        'printf "paperclip_home=%s\\n" "${PAPERCLIP_HOME-}"',
+        `} > "${argvLog}"`,
+        "exit 0",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    const previousAgentUid = process.env.PAPERCLIP_AGENT_UID;
+    const previousShim = process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+    const previousMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    try {
+      process.env.HOME = serverHome;
+      process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+      process.env.PAPERCLIP_INSTANCE_ID = "test";
+      process.env.PAPERCLIP_AGENT_UID = "1001";
+      process.env.PAPERCLIP_AGENT_SPAWN_SHIM = shimPath;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY = masterKey;
+      delete process.env.CLAUDE_CONFIG_DIR;
+
+      const logs: string[] = [];
+      const runEnv: Record<string, string> = {};
+      const result = await prepareClaudeLocalManagedHome({
+        acpxAgent: "claude",
+        companyId: "company-1",
+        agentId: "agent-1",
+        runId: "run-1",
+        config: { acpAgentUidSplit: true },
+        env: runEnv,
+        onLog: async (_stream, message) => {
+          logs.push(message);
+        },
+      });
+      const agentSideHome = path.join(
+        root,
+        "paperclip-home",
+        "instances",
+        "test",
+        "companies",
+        "company-1",
+        "agents",
+        "agent-1",
+        "claude-config",
+      );
+      expect(runEnv.CLAUDE_CONFIG_DIR).toBe(agentSideHome);
+      // Armed: the seed must NOT pre-create the SDK subdirs — the agent uid
+      // creates and owns them.
+      for (const subdir of ["projects", "session-env", "sessions", "shell-snapshots", "statsig"]) {
+        await expect(fs.access(path.join(agentSideHome, subdir))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      }
+      expect((await fs.stat(agentSideHome)).mode & 0o7777).toBe(0o2770);
+
+      // Simulate the agent-uid CLI creating SDK state dirs mid-run...
+      const sessionsDir = path.join(agentSideHome, "sessions");
+      const projectDir = path.join(agentSideHome, "projects", "worktree-cwd");
+      await fs.mkdir(sessionsDir, { recursive: true });
+      await fs.mkdir(projectDir, { recursive: true });
+      await fs.chmod(sessionsDir, 0o700);
+      await fs.chmod(projectDir, 0o2700);
+
+      // ...and the dual-pass teardown: the in-process pass re-normalizes what
+      // the server uid owns; the shim pass execs the standalone normalizer.
+      await result?.teardown?.();
+      expect((await fs.stat(sessionsDir)).mode & 0o7777).toBe(0o2770);
+      expect((await fs.stat(projectDir)).mode & 0o7777).toBe(0o2770);
+      const argvLogContent = await fs.readFile(argvLog, "utf8");
+      const argv = argvLogContent.split("\n");
+      expect(argv).toContain(`arg=${process.execPath}`);
+      expect(argv).toContain(`arg=${agentSideHome}`);
+      expect(
+        argv.some((line) => line.startsWith("arg=") && line.endsWith("claude-config-normalize.js")),
+      ).toBe(true);
+      // The scrubbed child env never carried the master key; the host plumbing
+      // keys (needed for the path-shape check) did.
+      expect(argvLogContent).not.toContain(masterKey);
+      expect(argv).toContain("master_key=");
+      expect(argv).toContain(`paperclip_home=${path.join(root, "paperclip-home")}`);
+      // Exit 0: no fault was logged.
+      expect(logs.some((line) => line.includes("exited with code"))).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+      if (previousAgentUid === undefined) delete process.env.PAPERCLIP_AGENT_UID;
+      else process.env.PAPERCLIP_AGENT_UID = previousAgentUid;
+      if (previousShim === undefined) delete process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+      else process.env.PAPERCLIP_AGENT_SPAWN_SHIM = previousShim;
+      if (previousMasterKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      else process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousMasterKey;
+    }
+  });
+
+  it("armed lane: a non-zero normalizer shim exit is logged, not thrown", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-local-armed-fail-");
+    const serverHome = path.join(root, "server-home");
+    await fs.mkdir(path.join(serverHome, ".claude"), { recursive: true });
+
+    const shimPath = path.join(root, "fake-spawn-shim");
+    await fs.writeFile(
+      shimPath,
+      ["#!/bin/sh", 'echo "normalizer: simulated failure" >&2', "exit 3"].join("\n") + "\n",
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    const previousAgentUid = process.env.PAPERCLIP_AGENT_UID;
+    const previousShim = process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+    try {
+      process.env.HOME = serverHome;
+      process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+      process.env.PAPERCLIP_INSTANCE_ID = "test";
+      process.env.PAPERCLIP_AGENT_UID = "1001";
+      process.env.PAPERCLIP_AGENT_SPAWN_SHIM = shimPath;
+      delete process.env.CLAUDE_CONFIG_DIR;
+
+      const logs: string[] = [];
+      const result = await prepareClaudeLocalManagedHome({
+        acpxAgent: "claude",
+        companyId: "company-1",
+        agentId: "agent-1",
+        runId: "run-1",
+        config: { acpAgentUidSplit: true },
+        env: {},
+        onLog: async (_stream, message) => {
+          logs.push(message);
+        },
+      });
+
+      // The re-normalize must never fail the run.
+      await expect(result?.teardown?.()).resolves.toBeUndefined();
+      expect(
+        logs.some(
+          (line) =>
+            line.includes("agent-uid Claude config normalizer") &&
+            line.includes("exited with code 3") &&
+            line.includes("normalizer: simulated failure"),
+        ),
+      ).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+      if (previousAgentUid === undefined) delete process.env.PAPERCLIP_AGENT_UID;
+      else process.env.PAPERCLIP_AGENT_UID = previousAgentUid;
+      if (previousShim === undefined) delete process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+      else process.env.PAPERCLIP_AGENT_SPAWN_SHIM = previousShim;
+    }
+  });
+
   it("returns no teardown (no repoint) when an operator CLAUDE_CONFIG_DIR is already set", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-local-no-teardown-");
     const operatorConfigDir = path.join(root, "operator-claude-config");
