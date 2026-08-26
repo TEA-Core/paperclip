@@ -121,6 +121,21 @@ grep -q 'test-token-not-a-real-credential' <<<"$OUT" \
 grep -q 'not valid base64-encoded CodeRabbit auth JSON' <<<"$OUT" \
   && ok "wrong JSON shape: the degrade is announced" || no "wrong JSON shape: degraded silently"
 
+# --- 4b. A present-but-unusable token is rejected too -----------------------
+# `has("accessToken")` is true for null and for "", so a key-present check would
+# accept both. Either one replaces a working credential with one the CLI cannot
+# use AND, because the file then exists, suppresses the API-key fallback — a
+# quiet downgrade from working to broken. Non-object JSON must not pass either.
+for shape in '{"accessToken":null}' '{"accessToken":""}' '["accessToken"]'; do
+  OUT="$(run_entrypoint -e CODERABBIT_AUTH_JSON_B64="$(printf '%s' "$shape" | base64 -w0)" -- 'cat /paperclip/.coderabbit/auth.json')"; RC=$?
+  [ "$RC" -eq 0 ] && ok "unusable token $shape: entrypoint still starts" || no "unusable token $shape: entrypoint exited $RC"
+  grep -q 'test-token-not-a-real-credential' <<<"$OUT" \
+    && ok "unusable token $shape: existing credential survives" \
+    || no "unusable token $shape: existing credential was destroyed"
+  grep -q 'not valid base64-encoded CodeRabbit auth JSON' <<<"$OUT" \
+    && ok "unusable token $shape: the degrade is announced" || no "unusable token $shape: degraded silently"
+done
+
 # --- 5. Unconfigured is byte-for-byte the old behaviour ---------------------
 CLEAN_HOME="$(mktemp -d)"; chmod 0777 "$CLEAN_HOME"
 OUT="$(docker run --rm -v "$EP:/tmp/ep.sh:ro" -v "$CLEAN_HOME:/paperclip" -e PAPERCLIP_HOME=/paperclip \

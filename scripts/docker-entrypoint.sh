@@ -162,8 +162,12 @@ fi
 # instead of destroying the auth that was already on the volume.
 if [ -n "${CODERABBIT_AUTH_JSON_B64:-}" ]; then
     cr_tmp="${coderabbit_home}/.auth.json.tmp"
+    # The token must be a non-empty STRING, not merely present: `has()` is true
+    # for {"accessToken":null} and {"accessToken":""} alike, either of which
+    # would replace a working credential with one the CLI cannot use -- and,
+    # because the file then exists, also suppress the API-key fallback below.
     if printf '%s' "$CODERABBIT_AUTH_JSON_B64" | base64 -d > "$cr_tmp" 2>/dev/null \
-        && jq -e 'has("accessToken")' "$cr_tmp" >/dev/null 2>&1; then
+        && jq -e '(.accessToken | type == "string") and (.accessToken | length > 0)' "$cr_tmp" >/dev/null 2>&1; then
         mv "$cr_tmp" "${coderabbit_home}/auth.json"
         chown node "${coderabbit_home}/auth.json" 2>/dev/null || true
         getent group agents >/dev/null 2>&1 && chgrp agents "${coderabbit_home}/auth.json" 2>/dev/null || true

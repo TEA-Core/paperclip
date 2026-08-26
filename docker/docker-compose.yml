@@ -34,6 +34,10 @@ services:
       # `coderabbit review --agent` headless. Optional: unset simply leaves the
       # CLI installed and signed out. See .env.example for how to produce it.
       CODERABBIT_AUTH_JSON_B64: "${CODERABBIT_AUTH_JSON_B64:-}"
+      # The API-key fallback, for organizations that issue keys instead. Only
+      # consulted when no credential exists yet; unlike the line above it costs
+      # a call to CodeRabbit at boot, so prefer the pre-authenticated JSON.
+      CODERABBIT_API_KEY: "${CODERABBIT_API_KEY:-}"
     volumes:
       - paperclip-data:/paperclip
     depends_on:
