@@ -11,6 +11,7 @@ import {
   activityLog,
   costEvents,
   financeEvents,
+  heartbeatRunEvents,
   heartbeatRuns,
   issues,
   projects,
@@ -423,6 +424,7 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     await db.delete(financeEvents);
     await db.delete(costEvents);
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(projects);

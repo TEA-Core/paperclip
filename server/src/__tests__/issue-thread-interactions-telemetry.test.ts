@@ -8,6 +8,7 @@ import {
   documentRevisions,
   documents,
   goals,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueDocuments,
@@ -59,6 +60,7 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
     await db.delete(documents);
     await db.delete(issues);
     await db.delete(goals);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);

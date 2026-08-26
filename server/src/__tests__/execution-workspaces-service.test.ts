@@ -13,6 +13,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueReferenceMentions,
@@ -268,6 +269,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);

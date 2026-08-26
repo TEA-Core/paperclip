@@ -8,6 +8,7 @@ import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   issues,
   projectWorkspaces,
@@ -61,6 +62,7 @@ describeEmbeddedPostgres("routine run telemetry", () => {
     await db.delete(routines);
     await db.delete(documents);
     await db.delete(documentRevisions);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(executionWorkspaces);

@@ -16,6 +16,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
@@ -6788,6 +6789,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -7726,6 +7728,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);

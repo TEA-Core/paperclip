@@ -20,6 +20,7 @@ import {
   environmentLeases,
   environments,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   plugins,
   projects,
@@ -156,6 +157,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
     await db.delete(environmentLeases);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(environments);

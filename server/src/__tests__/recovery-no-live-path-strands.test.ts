@@ -8,6 +8,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueLabels,
@@ -53,6 +54,7 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     await db.delete(issueThreadInteractions);
     await db.delete(issueRecoveryActions);
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issueLabels);
     await db.delete(labels);

@@ -16,6 +16,7 @@ import {
   companySkillVersions,
   companySkills,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueThreadInteractions,
   issues,
@@ -153,6 +154,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     await db.delete(agentConfigRevisions);
     await db.delete(activityLog);
     await db.delete(approvals);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(budgetPolicies);

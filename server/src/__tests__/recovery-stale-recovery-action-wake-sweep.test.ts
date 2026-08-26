@@ -6,6 +6,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -40,6 +41,7 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
     await db.delete(activityLog);
     await db.delete(issueComments);
     await db.delete(issueRecoveryActions);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
