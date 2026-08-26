@@ -28,8 +28,20 @@ IMAGE="${IMAGE:-tea-core/paperclip:v2026.722.0-tea}"
 
 PASS=0
 FAIL=0
+SKIP=0
 ok() { PASS=$((PASS + 1)); printf 'ok   - %s\n' "$1"; }
 no() { FAIL=$((FAIL + 1)); printf 'FAIL - %s\n' "$1"; }
+skip() { SKIP=$((SKIP + 1)); printf 'skip - %s\n' "$1"; }
+
+# IMAGE defaults to a pinned tag, as in docker-entrypoint-cap-kill.sh: the
+# working-tree entrypoint is mounted over the image's, so what is under test is
+# always current and the base image only supplies the uid layout, the `agents`
+# group, and the spawn shim -- which you want STABLE. The CLI-presence block at
+# the end is the exception: it inspects the image itself, so on a default run
+# against an image built before this feature it can only skip. Say which image
+# is under test, and count skips into the summary, so a run that skipped that
+# coverage cannot be mistaken for one that proved it.
+printf 'image under test: %s\n\n' "$IMAGE"
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 || {
   echo "image not present: $IMAGE (set IMAGE= to override)" >&2
@@ -37,8 +49,8 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 }
 
 # A structurally valid credential with a worthless token. The entrypoint gates
-# on `accessToken` being present, which is exactly what this exercises; no
-# request is ever made with it.
+# on `accessToken` being a non-empty string, which is exactly what this
+# satisfies; no request is ever made with it.
 FAKE_AUTH='{"accessToken":"test-token-not-a-real-credential","expiresAt":"never","provider":"github","region":"us"}'
 GOOD_B64="$(printf '%s' "$FAKE_AUTH" | base64 -w0)"
 
@@ -159,8 +171,9 @@ if docker run --rm --entrypoint sh "$IMAGE" -c 'command -v coderabbit' >/dev/nul
   docker run --rm --entrypoint bash "$IMAGE" -lc 'command -v coderabbit && command -v cr' >/dev/null 2>&1 \
     && ok "coderabbit and cr resolve in a login shell" || no "coderabbit/cr missing from login-shell PATH"
 else
-  printf 'skip - CLI presence: %s predates the CodeRabbit CLI layer\n' "$IMAGE"
+  skip "CLI presence: $IMAGE predates the CodeRabbit CLI layer -- rerun with IMAGE=<image built from this checkout> to cover the install"
 fi
 
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+[ "$SKIP" -gt 0 ] && printf 'NOTE: %d check(s) skipped -- this run did NOT prove everything.\n' "$SKIP"
 [ "$FAIL" -eq 0 ]
