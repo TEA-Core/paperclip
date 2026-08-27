@@ -597,7 +597,13 @@ async function executeProcess(input: {
   };
 }
 
-async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv }): Promise<string> {
+async function runGit(
+  args: string[],
+  cwd: string,
+  // `raw` returns stdout untrimmed. Required for `-z` output: a path name may
+  // legally begin or end with whitespace, and trimming would silently rename it.
+  opts?: { env?: NodeJS.ProcessEnv; raw?: boolean },
+): Promise<string> {
   const proc = await executeProcess({
     command: "git",
     args,
@@ -607,7 +613,64 @@ async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.Process
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
   }
-  return proc.stdout.trim();
+  return opts?.raw ? proc.stdout : proc.stdout.trim();
+}
+
+/**
+ * Path names out of a NUL-separated git listing, exactly as git spelled them.
+ *
+ * `-z` exists because path names are bytes, not lines. Without it git C-quotes
+ * anything awkward — `"apps/a\nb.sql"`, quotes and escape included — and a name
+ * read that way matches nothing. Splitting on newlines and trimming each value
+ * loses the same names a second way: a path may contain a newline, and may begin
+ * or end with a space. Every git listing whose result is compared to another
+ * git listing has to go through here, or the two disagree on names neither
+ * command had any trouble with.
+ */
+function parseNulSeparatedPaths(stdout: string): string[] {
+  return stdout.split("\0").filter((value) => value.length > 0);
+}
+
+/**
+ * Ceiling on a machine-read path listing. Roughly a quarter of a million paths.
+ *
+ * Deliberately far above any base repo anyone should have, because the point is
+ * not to trim the answer — it is to have a bound at all, so a pathological
+ * checkout cannot exhaust memory. A listing that reaches it is not usable and is
+ * not used.
+ */
+const BASE_REPO_PATH_LISTING_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
+ * A NUL-separated git path listing, or an admission that it could not be read.
+ *
+ * `executeProcess` caps output at 256 KiB and keeps the LAST bytes, prefixed
+ * with `[output truncated to last …]`. For human-read logs that is the right
+ * half to keep. For a machine-read listing it is quietly catastrophic: the
+ * leading paths vanish, the diagnostic prefix fuses onto the first surviving
+ * name with no NUL between them, and the byte-boundary cut can slice a name —
+ * or a UTF-8 sequence — in half. Every one of those produces a plausible list of
+ * paths that is missing the entry we came to find, and a missing entry here is
+ * the silent permanent wedge this whole code path exists to remove.
+ *
+ * So the cap is raised to something no real repo reaches, and reaching it is
+ * reported rather than papered over. A caller that cannot get the whole list
+ * must not act on part of it.
+ */
+async function runGitPathListing(
+  args: string[],
+  cwd: string,
+): Promise<{ paths: string[]; complete: boolean }> {
+  const result = await executeProcess({
+    command: "git",
+    args,
+    cwd,
+    maxStdoutBytes: BASE_REPO_PATH_LISTING_MAX_BYTES,
+  }).catch(() => null);
+  if (!result || result.code !== 0 || result.stdoutTruncated) {
+    return { paths: [], complete: false };
+  }
+  return { paths: parseNulSeparatedPaths(result.stdout), complete: true };
 }
 
 function formatShortSha(value: string | null | undefined) {
@@ -3845,6 +3908,257 @@ async function restoreBaseRepoToDefaultRef(input: {
 }
 
 /**
+ * Untracked base-repo paths that the base ref itself contains.
+ *
+ * These, and only these, are what git refuses to overwrite:
+ *
+ *   error: The following untracked working tree files would be overwritten by merge:
+ *
+ * Derived from git state rather than parsed out of that message, so wording,
+ * locale, and truncation cannot change the answer. `--exclude-standard` keeps
+ * ignored paths out, and the base ref is queried with the untracked paths as a
+ * pathspec, so no tree listing is materialised. Both listings are `-z`, because
+ * the two are compared to each other and only NUL separation spells every path
+ * name the same way in both.
+ *
+ * EVERY eligible untracked path is inspected. The cap on how many files a
+ * quarantine may move belongs to the move, not to the search: a cap applied here
+ * would stop looking after N untracked paths, and a base repo holding N harmless
+ * strays ahead of the one blocking path — alphabetically, which is the order git
+ * lists them in — would stay wedged with nothing reporting why. The pathspec is
+ * chunked instead, so the argument list stays bounded however many there are.
+ */
+const BASE_REPO_LS_TREE_PATHSPEC_CHUNK = 500;
+
+/** Every strict ancestor directory of a repo-relative path, nearest last. */
+function ancestorPathsOf(relativePath: string): string[] {
+  const segments = relativePath.split("/");
+  return segments.slice(0, -1).map((_, index) => segments.slice(0, index + 1).join("/"));
+}
+
+/**
+ * A path and a base-ref entry conflict when either one contains the other.
+ *
+ * Not just equality. Git refuses all three shapes, with two different messages:
+ *
+ *   untracked file `foo`      + `foo` in the ref        → "would be overwritten"
+ *   untracked file `foo`      + `foo/bar` in the ref    → "would be overwritten"
+ *   untracked file `foo/bar`  + blob `foo` in the ref   → "Updating the following
+ *                                                         directories would lose
+ *                                                         untracked files in them"
+ *
+ * The remedy is the same in all three: move the untracked path. The second and
+ * third are why an exact-match test is not enough — `ls-tree -- foo` answers
+ * `foo/bar`, and `ls-tree -- foo/bar` answers nothing at all when `foo` is a blob.
+ */
+function pathsConflict(untrackedPath: string, baseRefPath: string): boolean {
+  return (
+    untrackedPath === baseRefPath ||
+    baseRefPath.startsWith(`${untrackedPath}/`) ||
+    untrackedPath.startsWith(`${baseRefPath}/`)
+  );
+}
+
+async function resolveBaseRepoUntrackedCollisions(input: {
+  repoRoot: string;
+  baseRef: string;
+}): Promise<{ collisions: string[]; untracked: string[]; complete: boolean }> {
+  const listing = await runGitPathListing(
+    ["ls-files", "-z", "--others", "--exclude-standard"],
+    input.repoRoot,
+  );
+  // A partial list of untracked paths cannot be told apart from a short one, and
+  // acting on it would move some files while leaving the blocking one in place.
+  if (!listing.complete) return { collisions: [], untracked: [], complete: false };
+
+  const candidates = listing.paths.filter(isQuarantinableBaseRepoPath);
+  if (candidates.length === 0) {
+    return { collisions: [], untracked: listing.paths, complete: true };
+  }
+
+  const baseRefPaths = new Set<string>();
+
+  // Entries at or under each candidate. A pathspec naming a file matches that
+  // file; a pathspec naming a directory matches everything beneath it, which is
+  // exactly the `foo` versus `foo/bar` case.
+  for (let index = 0; index < candidates.length; index += BASE_REPO_LS_TREE_PATHSPEC_CHUNK) {
+    const chunk = candidates.slice(index, index + BASE_REPO_LS_TREE_PATHSPEC_CHUNK);
+    const found = await runGitPathListing(
+      ["ls-tree", "-r", "--name-only", "-z", input.baseRef, "--", ...chunk],
+      input.repoRoot,
+    );
+    if (!found.complete) return { collisions: [], untracked: listing.paths, complete: false };
+    for (const foundPath of found.paths) baseRefPaths.add(foundPath);
+  }
+
+  // Ancestors that the base ref holds as a FILE, which no pathspec below them can
+  // reach. Deliberately not `-r`: the ancestors are named exactly, so this lists
+  // one entry each rather than descending whole subtrees, and the type column is
+  // what distinguishes a blob `foo` from a directory `foo/`.
+  const ancestors = [...new Set(candidates.flatMap(ancestorPathsOf))];
+  for (let index = 0; index < ancestors.length; index += BASE_REPO_LS_TREE_PATHSPEC_CHUNK) {
+    const chunk = ancestors.slice(index, index + BASE_REPO_LS_TREE_PATHSPEC_CHUNK);
+    const entries = await runGitPathListing(
+      ["ls-tree", "-z", input.baseRef, "--", ...chunk],
+      input.repoRoot,
+    );
+    if (!entries.complete) return { collisions: [], untracked: listing.paths, complete: false };
+    for (const entry of entries.paths) {
+      // "<mode> <type> <sha>\t<path>" — the tab is the only separator that cannot
+      // occur in the fixed-width prefix, so split on the first one.
+      const tab = entry.indexOf("\t");
+      if (tab < 0) continue;
+      const [, type] = entry.slice(0, tab).split(" ");
+      if (type === "blob") baseRefPaths.add(entry.slice(tab + 1));
+    }
+  }
+
+  const collisions = baseRefPaths.size === 0
+    ? []
+    : candidates
+        .filter((candidate) => [...baseRefPaths].some((baseRefPath) => pathsConflict(candidate, baseRefPath)))
+        .slice(0, BASE_REPO_QUARANTINE_MAX_PATHS);
+  return { collisions, untracked: listing.paths, complete: true };
+}
+
+/**
+ * Hard limit on how many paths one quarantine may move.
+ *
+ * A bound on a bulk file move, not on the search that feeds it. Reaching it means
+ * something is very wrong with the base repo, and the fast-forward will refuse
+ * again on whatever is left over — correctly, and now with the moved paths named
+ * in the operation metadata to say what was already tried.
+ */
+const BASE_REPO_QUARANTINE_MAX_PATHS = 200;
+/** How many quarantine directories to keep before pruning the oldest. */
+const BASE_REPO_QUARANTINE_KEEP = 20;
+/** How many drifted path names to store alongside the count. A sample, not a census. */
+const BASE_REPO_UNTRACKED_SAMPLE_SIZE = 50;
+
+/**
+ * Whether an untracked path may be moved out of the way at all.
+ *
+ * The agent worktrees live at `<repoRoot>/.paperclip/worktrees`, and that whole
+ * directory is untracked in at least one repo on this fleet. Nothing under
+ * `.paperclip/` is ever eligible, whatever the base ref claims to contain —
+ * moving a live workspace to unwedge a fast-forward would trade a noisy failure
+ * for a silent one.
+ */
+export function isQuarantinableBaseRepoPath(relativePath: string): boolean {
+  if (!relativePath || path.isAbsolute(relativePath)) return false;
+  const segments = relativePath.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return false;
+  if (segments[0] === ".paperclip" || segments[0] === ".git") return false;
+  return true;
+}
+
+/**
+ * Move untracked base-repo files that block a fast-forward out of the way.
+ *
+ * The motivating incident: the Trading-Signal-Platform base repo sat on main,
+ * tracked-clean and 22 commits behind, holding untracked files an agent errand
+ * had left in it. Two of those paths later landed upstream, so every subsequent
+ * `git merge --ff-only origin/main` aborted — 1,035 recorded worktree_prepare
+ * failures over seven days, and a base repo that could never advance again,
+ * because untracked paths are (correctly) excluded from the hygiene decision and
+ * nothing else ever cleared them.
+ *
+ * Surgical by construction: only paths git state proves are both untracked and
+ * present in the base ref, never a `git clean`, and the files are moved rather
+ * than deleted so the content survives inspection. The destination is inside the
+ * git directory, not the working tree, so a quarantine can never itself become
+ * the untracked file that blocks the next merge.
+ */
+async function quarantineBaseRepoUntrackedCollisions(input: {
+  repoRoot: string;
+  baseRef: string;
+  timestamp: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{
+  quarantined: string[];
+  destination: string | null;
+  untracked: string[];
+  warnings: string[];
+}> {
+  const warnings: string[] = [];
+  const resolved = await resolveBaseRepoUntrackedCollisions(input);
+  const untracked = resolved.untracked;
+  if (!resolved.complete) {
+    warnings.push(
+      "could not read the base repo's untracked paths in full; no path was moved and the fast-forward is left to refuse on its own",
+    );
+    return { quarantined: [], destination: null, untracked, warnings };
+  }
+  const collisions = resolved.collisions;
+  if (collisions.length === 0) return { quarantined: [], destination: null, untracked, warnings };
+
+  const gitDir = await runGit(["rev-parse", "--git-common-dir"], input.repoRoot)
+    .then((value) => path.resolve(input.repoRoot, value))
+    .catch(() => null);
+  if (!gitDir) {
+    warnings.push("could not resolve the base repo git directory; leaving untracked collisions in place");
+    return { quarantined: [], destination: null, untracked, warnings };
+  }
+
+  const destination = path.join(gitDir, "paperclip-base-repo-quarantine", input.timestamp);
+  const quarantined: string[] = [];
+  for (const relativePath of collisions) {
+    const from = path.join(input.repoRoot, relativePath);
+    const to = path.join(destination, relativePath);
+    try {
+      await fs.mkdir(path.dirname(to), { recursive: true });
+      await fs.rename(from, to).catch(async (error) => {
+        // Cross-device or a permission shape rename cannot handle: copy, then unlink.
+        // Only an unlink that succeeds counts, because a file still on disk still blocks.
+        if ((error as NodeJS.ErrnoException)?.code !== "EXDEV") throw error;
+        await fs.cp(from, to, { recursive: true });
+        await fs.rm(from, { recursive: true, force: false });
+      });
+      quarantined.push(relativePath);
+    } catch (error) {
+      warnings.push(
+        `could not quarantine untracked base repo path "${relativePath}": ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  if (quarantined.length > 0) {
+    await pruneBaseRepoQuarantine(path.dirname(destination));
+  }
+
+  if (input.recorder && quarantined.length > 0) {
+    await input.recorder.recordOperation({
+      phase: "worktree_prepare",
+      command: `quarantine ${quarantined.length} untracked base repo path(s)`,
+      cwd: input.repoRoot,
+      metadata: {
+        baseRepoHygiene: true,
+        baseRepoUntrackedQuarantine: true,
+        repoRoot: input.repoRoot,
+        baseRef: input.baseRef,
+        quarantined,
+        destination,
+      },
+      run: async () => ({
+        status: "succeeded",
+        system: `Moved ${quarantined.length} untracked path(s) that ${input.baseRef} also contains to ${destination}:\n${quarantined.join("\n")}`,
+      }),
+    }).catch(() => undefined);
+  }
+
+  return { quarantined, destination, untracked, warnings };
+}
+
+/** Keep the quarantine bounded — it is an audit trail, not a second repository. */
+async function pruneBaseRepoQuarantine(quarantineRoot: string): Promise<void> {
+  const entries = await fs.readdir(quarantineRoot).catch(() => [] as string[]);
+  const stale = entries.sort().slice(0, Math.max(0, entries.length - BASE_REPO_QUARANTINE_KEEP));
+  for (const entry of stale) {
+    await fs.rm(path.join(quarantineRoot, entry), { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
  * Fast-forward a clean base repo to its default ref.
  *
  * Uses `git merge --ff-only`, which advances HEAD only when it is a strict
@@ -3853,19 +4167,31 @@ async function restoreBaseRepoToDefaultRef(input: {
  * be overwritten, which is the desired safety behavior: a refused fast-forward
  * only warns and never blocks the dispatch (same SUP-11285 contract as restore).
  *
+ * Safe, however, is not the same as self-clearing. The untracked-file refusal is
+ * the one refusal that never resolves on its own: the file stays, the base ref
+ * keeps containing it, and the identical abort repeats on every dispatch for as
+ * long as anyone leaves it there. So that case — and only that case — is cleared
+ * first, by `quarantineBaseRepoUntrackedCollisions`. It is asked before the merge
+ * rather than after a refusal: reaching here means HEAD is behind, so an untracked
+ * path the base ref also contains is not a risk of a refusal, it is the refusal
+ * already decided, and the doomed attempt is worth neither running nor recording.
+ * Ahead and diverged still just warn; they mean commits, and commits are
+ * somebody's work.
+ *
  * No rescue ref / snapshot is needed — a fast-forward is non-destructive (old
  * HEAD remains an ancestor of the new tip). Never uses `git reset --hard`,
  * `checkout -f`, `clean`, or `stash -u`: those could overwrite or remove
- * untracked files, including the `.paperclip/worktrees` directory.
+ * untracked files wholesale, including the `.paperclip/worktrees` directory.
  */
 async function fastForwardBaseRepoToDefaultRef(input: {
   repoRoot: string;
   baseRef: string;
+  timestamp: string;
   recorder?: WorkspaceOperationRecorder | null;
-}): Promise<{ fastForwarded: boolean; warnings: string[] }> {
+}): Promise<{ fastForwarded: boolean; quarantined: string[]; warnings: string[] }> {
   const warnings: string[] = [];
-  try {
-    await recordGitOperation(input.recorder, {
+  const merge = (quarantined: string[], untracked: string[]) =>
+    recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["merge", "--ff-only", input.baseRef],
       cwd: input.repoRoot,
@@ -3874,14 +4200,62 @@ async function fastForwardBaseRepoToDefaultRef(input: {
         repoRoot: input.repoRoot,
         baseRef: input.baseRef,
         fastForwardOnly: true,
+        ...(quarantined.length > 0 ? { quarantinedUntrackedPaths: quarantined } : {}),
+        // Files an agent errand left in a checkout that is nobody's workspace.
+        // None of these block anything today; any of them becomes the next wedge
+        // the moment the same path lands on the base ref. Recorded rather than
+        // warned so the drift is queryable without adding noise to every
+        // dispatch, and without new rows — this operation is written regardless.
+        //
+        // The count is separate from the sample on purpose. A checkout with
+        // thousands of strays is exactly the one worth finding, and it is the one
+        // whose path list is least worth storing in full, so the number that
+        // answers "how bad is it" must not be `jsonb_array_length` of a slice.
+        ...(untracked.length > 0
+          ? {
+              untrackedBaseRepoPathCount: untracked.length,
+              untrackedBaseRepoPaths: untracked.slice(0, BASE_REPO_UNTRACKED_SAMPLE_SIZE),
+            }
+          : {}),
       },
       successMessage: `Fast-forwarded base repository at ${input.repoRoot} to ${input.baseRef}\n`,
       failureLabel: `git merge --ff-only ${input.baseRef}`,
     });
-    return { fastForwarded: true, warnings };
+
+  // Clear the one blocker that never clears itself, BEFORE the merge rather than
+  // after it refuses. We are only here because HEAD is behind the base ref, so an
+  // untracked path the base ref also contains is not a risk of a refusal — it is
+  // the refusal, already decided. Asking first costs two plumbing commands and
+  // means the doomed attempt is never run and never recorded as a failure.
+  const quarantine = await quarantineBaseRepoUntrackedCollisions({
+    repoRoot: input.repoRoot,
+    baseRef: input.baseRef,
+    timestamp: input.timestamp,
+    recorder: input.recorder ?? null,
+  }).catch((error) => ({
+    quarantined: [] as string[],
+    destination: null,
+    untracked: [] as string[],
+    warnings: [`could not quarantine untracked base repo paths: ${error instanceof Error ? error.message : String(error)}`],
+  }));
+  warnings.push(...quarantine.warnings);
+  if (quarantine.quarantined.length > 0) {
+    warnings.push(
+      `Moved ${quarantine.quarantined.length} untracked path(s) that ${input.baseRef} also contains to ${quarantine.destination}: ${quarantine.quarantined.join(", ")}.`,
+    );
+  }
+
+  // Reuse the listing the quarantine already took rather than shelling out again,
+  // minus whatever it just moved.
+  const quarantinedPaths = new Set(quarantine.quarantined);
+  const remainingUntracked = quarantine.untracked.filter((candidate) => !quarantinedPaths.has(candidate));
+
+  try {
+    await merge(quarantine.quarantined, remainingUntracked);
+    return { fastForwarded: true, quarantined: quarantine.quarantined, warnings };
   } catch (error) {
     warnings.push(error instanceof Error ? error.message : String(error));
-    return { fastForwarded: false, warnings };
+    return { fastForwarded: false, quarantined: quarantine.quarantined, warnings };
   }
 }
 
@@ -4028,11 +4402,15 @@ export async function prepareBaseRepoForWorkspace(input: {
         const result = await fastForwardBaseRepoToDefaultRef({
           repoRoot: input.repoRoot,
           baseRef,
+          timestamp: new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"),
           recorder: input.recorder ?? null,
         });
         baseRepoHygieneWarnings.push(
           result.fastForwarded
-            ? `Base repository at ${input.repoRoot} was fast-forwarded to ${baseRef}.`
+            ? `Base repository at ${input.repoRoot} was fast-forwarded to ${baseRef}.` +
+                (result.quarantined.length > 0
+                  ? ` ${result.quarantined.length} untracked path(s) it also contains were moved aside: ${result.quarantined.join(", ")}.`
+                  : "")
             : `Could not fast-forward base repository at ${input.repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
         );
       } else if (decision.action === "diverged") {

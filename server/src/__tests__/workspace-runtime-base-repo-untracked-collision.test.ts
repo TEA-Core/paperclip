@@ -1,0 +1,343 @@
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  isQuarantinableBaseRepoPath,
+  prepareBaseRepoForWorkspace,
+} from "../services/workspace-runtime.ts";
+
+// Base-repo hygiene must converge even when an untracked file in the base repo
+// collides with a path that has since landed on the base ref.
+//
+// Production shape (Trading-Signal-Platform, 2026-08-24 onward): the base repo
+// sits on main, clean of tracked modifications, 22 behind origin/main, holding a
+// handful of untracked files an agent errand left behind. Two of those paths then
+// merged upstream. `git merge --ff-only origin/main` refuses:
+//
+//   error: The following untracked working tree files would be overwritten by merge:
+//   	apps/db/supabase/migrations/…sql
+//   	scripts/backfill-….mjs
+//
+// Nothing removes them, so the same fast-forward is attempted and refused on every
+// single dispatch: 1,035 recorded worktree_prepare failures in seven days, 98% of
+// all worktree_prepare failures, and the base repo never advances again.
+//
+// Real git throughout: the defect is git's own refusal semantics plus the fact that
+// untracked paths are deliberately excluded from the hygiene decision, so a mock
+// would have to encode the very behaviour under test.
+
+const execFileAsync = promisify(execFile);
+const tempRoots: string[] = [];
+
+afterEach(async () => {
+  while (tempRoots.length > 0) {
+    const dir = tempRoots.pop();
+    if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+async function git(args: string[], cwd: string): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd,
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+    },
+  });
+  return stdout.trim();
+}
+
+async function writeFile(repo: string, name: string, body: string): Promise<void> {
+  await fs.mkdir(path.dirname(path.join(repo, name)), { recursive: true });
+  await fs.writeFile(path.join(repo, name), body);
+}
+
+async function commit(repo: string, name: string, body = `${name}\n`): Promise<void> {
+  await writeFile(repo, name, body);
+  await git(["add", "-A"], repo);
+  await git(["commit", "-qm", name], repo);
+}
+
+const COLLIDING = [
+  "apps/db/supabase/migrations/20260831000340_backfill.sql",
+  "scripts/backfill-sentiment-history.mjs",
+];
+const INNOCENT = "docs/project-summary-2026-08-26-evening.md";
+
+/**
+ * The production shape: base repo on main, tracked-clean, behind origin/main, with
+ * untracked files two of which have since landed upstream.
+ */
+async function makeUntrackedCollisionRepo(): Promise<{ root: string; work: string }> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "base-repo-untracked-"));
+  tempRoots.push(root);
+  const origin = path.join(root, "origin.git");
+  const seed = path.join(root, "seed");
+  const work = path.join(root, "work");
+
+  await git(["init", "-q", "--bare", "-b", "main", origin], root);
+  await git(["init", "-q", "-b", "main", seed], root);
+  await commit(seed, "c1");
+  await git(["remote", "add", "origin", origin], seed);
+  await git(["push", "-q", "origin", "main"], seed);
+
+  await git(["clone", "-q", `file://${origin}`, work], root);
+
+  // Upstream advances, and the agent's paths land in it.
+  for (const name of COLLIDING) await commit(seed, name, `upstream version of ${name}\n`);
+  await commit(seed, "c2");
+  await git(["push", "-q", "origin", "main"], seed);
+
+  // The base repo carries its own untracked copies plus one that never collides.
+  for (const name of COLLIDING) await writeFile(work, name, `agent version of ${name}\n`);
+  await writeFile(work, INNOCENT, "agent notes\n");
+
+  await git(["fetch", "-q", "origin", "main"], work);
+  return { root, work };
+}
+
+const prepare = (work: string, recorder?: unknown) =>
+  prepareBaseRepoForWorkspace({
+    repoRoot: work,
+    configuredBaseRef: "main",
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    recorder: (recorder ?? null) as any,
+  });
+
+type RecordedOperation = { phase: string; command: string | null; status: string };
+
+/** Collects what a real run would write to workspace_operations. */
+function makeRecorder(): { recorder: unknown; operations: RecordedOperation[] } {
+  const operations: RecordedOperation[] = [];
+  const recorder = {
+    attachExecutionWorkspaceId: async () => {},
+    recordOperation: async (input: {
+      phase: string;
+      command?: string | null;
+      run: () => Promise<{ status?: string }>;
+    }) => {
+      const result = await input.run();
+      operations.push({
+        phase: input.phase,
+        command: input.command ?? null,
+        status: result.status ?? "succeeded",
+      });
+      return {} as never;
+    },
+  };
+  return { recorder, operations };
+}
+
+describe("base repo hygiene with untracked paths that collide with the base ref", () => {
+  it("the fixture really does reproduce git's refusal", async () => {
+    // Guard the guard: if git ever stopped refusing, every assertion below would
+    // pass vacuously.
+    const { work } = await makeUntrackedCollisionRepo();
+    expect(await git(["rev-parse", "--abbrev-ref", "HEAD"], work)).toBe("main");
+    expect(await git(["status", "--porcelain", "--untracked-files=no"], work)).toBe("");
+    await expect(git(["merge", "--ff-only", "origin/main"], work)).rejects.toThrow(
+      /untracked working tree files would be overwritten/,
+    );
+  });
+
+  it("fast-forwards the base repo anyway", async () => {
+    const { work } = await makeUntrackedCollisionRepo();
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+  });
+
+  it("converges — a second dispatch is a no-op, not the same refusal again", async () => {
+    const { work } = await makeUntrackedCollisionRepo();
+    await prepare(work);
+    const { warnings } = await prepare(work);
+    expect(warnings.filter((w) => /untracked working tree files/.test(w))).toEqual([]);
+  });
+
+  it("preserves the colliding files' contents rather than discarding them", async () => {
+    const { work } = await makeUntrackedCollisionRepo();
+    await prepare(work);
+
+    const quarantineRoot = path.join(work, ".git", "paperclip-base-repo-quarantine");
+    const quarantined = await execFileAsync("grep", ["-rl", "agent version of", quarantineRoot])
+      .then(({ stdout }) => stdout.trim().split("\n").filter(Boolean))
+      .catch(() => [] as string[]);
+    expect(quarantined.length).toBe(COLLIDING.length);
+
+    // The quarantine lives in the git directory, never the working tree — a
+    // quarantine inside the tree would be a fresh untracked file, i.e. the next
+    // thing capable of blocking a merge.
+    expect(await git(["status", "--porcelain", "--untracked-files=all"], work))
+      .toBe(`?? ${INNOCENT}`);
+  });
+
+  it("records no failed operation — the doomed merge is never run", async () => {
+    // The wedge was visible as 1,035 failed `git merge --ff-only` rows. A fix that
+    // still ran the refusal first and recovered afterwards would leave the failure
+    // rate, and the alarm fatigue, exactly where it was.
+    const { work } = await makeUntrackedCollisionRepo();
+    const { recorder, operations } = makeRecorder();
+
+    await prepare(work, recorder);
+
+    const merges = operations.filter((op) => op.command?.includes("merge --ff-only"));
+    expect(merges.map((op) => op.status)).toEqual(["succeeded"]);
+    expect(operations.filter((op) => op.status === "failed")).toEqual([]);
+  });
+
+  it("finds a collision hiding behind hundreds of harmless strays", async () => {
+    // The move is capped at 200 paths. Capping the SEARCH at 200 instead would
+    // stop looking after 200 untracked paths, and git lists them alphabetically —
+    // so a base repo carrying enough strays that sort ahead of the blocking path
+    // would stay wedged, with nothing reporting why.
+    const { work } = await makeUntrackedCollisionRepo();
+    for (let index = 0; index < 300; index += 1) {
+      // "aaa…" sorts ahead of both colliding paths, which start "apps/" and
+      // "scripts/", so a truncated search would never reach them.
+      await writeFile(work, `aaa-stray/${String(index).padStart(4, "0")}.txt`, "stray\n");
+    }
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+  });
+
+  it("clears a collision whose path name git has to quote", async () => {
+    // Path names are bytes. Without `-z`, git C-quotes anything awkward, so
+    // `ls-files` answers `"docs/a\\nb.md"` — quotes and escape included — while
+    // `ls-tree -z` answers the real name, and the two never match. A name that
+    // begins or ends with a space is lost the same way by trimming. Either one
+    // leaves the collision undetected and the base repo wedged exactly as before.
+    const { root, work } = await makeUntrackedCollisionRepo();
+    const awkward = "docs/line\none two.md";
+    const spaced = "docs/ padded .md";
+    const seed = path.join(root, "seed");
+
+    for (const name of [awkward, spaced]) await commit(seed, name, `upstream ${name}\n`);
+    await git(["push", "-q", "origin", "main"], seed);
+    await git(["fetch", "-q", "origin", "main"], work);
+    for (const name of [awkward, spaced]) await writeFile(work, name, `agent version of ${name}\n`);
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+    // The tracked upstream content is what is left at those paths.
+    expect(await fs.readFile(path.join(work, awkward), "utf8")).toBe(`upstream ${awkward}\n`);
+    expect(await fs.readFile(path.join(work, spaced), "utf8")).toBe(`upstream ${spaced}\n`);
+  });
+
+  it("clears an untracked FILE where the base ref grew a DIRECTORY", async () => {
+    // git: "The following untracked working tree files would be overwritten by
+    // merge: foo". An exact-match test misses it — `ls-tree -- foo` answers
+    // `foo/bar`, never `foo`.
+    const { root, work } = await makeUntrackedCollisionRepo();
+    const seed = path.join(root, "seed");
+    await commit(seed, "tools/generated/report.txt", "upstream\n");
+    await git(["push", "-q", "origin", "main"], seed);
+    await git(["fetch", "-q", "origin", "main"], work);
+    await writeFile(work, "tools/generated", "agent wrote a file where a directory now lives\n");
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+    expect(await fs.readFile(path.join(work, "tools/generated/report.txt"), "utf8")).toBe("upstream\n");
+  });
+
+  it("clears an untracked path UNDER a base-ref file", async () => {
+    // git: "Updating the following directories would lose untracked files in
+    // them: foo". No pathspec under `foo` can find the blob `foo`, so this needs
+    // the ancestors looked up in their own right.
+    const { root, work } = await makeUntrackedCollisionRepo();
+    const seed = path.join(root, "seed");
+    await commit(seed, "generated", "upstream file, not a directory\n");
+    await git(["push", "-q", "origin", "main"], seed);
+    await git(["fetch", "-q", "origin", "main"], work);
+    await writeFile(work, "generated/nested/agent-note.md", "agent treated it as a directory\n");
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+    expect(await fs.readFile(path.join(work, "generated"), "utf8")).toBe("upstream file, not a directory\n");
+  });
+
+  it("survives an untracked listing larger than the generic output cap", async () => {
+    // `executeProcess` caps output at 256 KiB and keeps the LAST bytes, prefixed
+    // with "[output truncated to last …]". For a human-read log that is the right
+    // half. For a machine-read listing it is quietly catastrophic: leading paths
+    // vanish, the prefix fuses onto the first surviving name with no NUL between
+    // them, and the byte cut can slice a name in half. The result still parses,
+    // still looks like a list of paths, and no longer contains the one that
+    // matters — the exact silent wedge this file exists to prevent.
+    const { work } = await makeUntrackedCollisionRepo();
+    const filler = "z".repeat(180);
+    for (let index = 0; index < 2500; index += 1) {
+      await writeFile(work, `zz-bulk/${filler}-${String(index).padStart(5, "0")}.txt`, "x\n");
+    }
+    const listingBytes = await git(["ls-files", "-z", "--others", "--exclude-standard"], work)
+      .then((value) => Buffer.byteLength(value, "utf8"));
+    // Guard the guard: below the cap this test proves nothing.
+    expect(listingBytes).toBeGreaterThan(256 * 1024);
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+  });
+
+  it("leaves untracked files that do not collide exactly where they are", async () => {
+    const { work } = await makeUntrackedCollisionRepo();
+    await prepare(work);
+    expect(await fs.readFile(path.join(work, INNOCENT), "utf8")).toBe("agent notes\n");
+  });
+});
+
+describe("what may be moved out of the base repo working tree", () => {
+  // The agent worktrees live at <repoRoot>/.paperclip/worktrees and that directory
+  // is untracked in at least one repo on this fleet. Moving one to unwedge a
+  // fast-forward would trade a loud failure for a silent one, so `.paperclip` is
+  // ineligible whatever the base ref contains.
+  it("never touches .paperclip or .git", () => {
+    expect(isQuarantinableBaseRepoPath(".paperclip/worktrees/SUP-1/src/index.ts")).toBe(false);
+    expect(isQuarantinableBaseRepoPath(".paperclip")).toBe(false);
+    expect(isQuarantinableBaseRepoPath(".git/config")).toBe(false);
+  });
+
+  it("never follows a path out of the repo", () => {
+    expect(isQuarantinableBaseRepoPath("../outside.txt")).toBe(false);
+    expect(isQuarantinableBaseRepoPath("apps/../../outside.txt")).toBe(false);
+    expect(isQuarantinableBaseRepoPath("/etc/passwd")).toBe(false);
+    expect(isQuarantinableBaseRepoPath("")).toBe(false);
+  });
+
+  it("allows the ordinary repository paths the incident was made of", () => {
+    expect(isQuarantinableBaseRepoPath("apps/db/supabase/migrations/2026_x.sql")).toBe(true);
+    expect(isQuarantinableBaseRepoPath("scripts/backfill.mjs")).toBe(true);
+    expect(isQuarantinableBaseRepoPath(".gitignore")).toBe(true);
+  });
+});
