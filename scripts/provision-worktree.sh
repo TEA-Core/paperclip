@@ -12,7 +12,7 @@ seed_pending_marker_path="$paperclip_dir/seed-pending"
 seed_complete_marker_path="$paperclip_dir/seed-complete"
 worktree_name="${PAPERCLIP_WORKSPACE_BRANCH:-$(basename "$worktree_cwd")}"
 created_worktree_config=0
-worktree_instance_id="$(WORKTREE_CWD="$worktree_cwd" node <<'EOF'
+worktree_instance_ids="$(WORKTREE_CWD="$worktree_cwd" node <<'EOF'
 const crypto = require("node:crypto");
 const path = require("node:path");
 
@@ -23,11 +23,20 @@ const normalized = path.basename(resolvedWorkspacePath)
   .replace(/[^a-z0-9_-]+/g, "-")
   .replace(/-+/g, "-")
   .replace(/^[-_]+|[-_]+$/g, "");
-const prefix = (normalized || "worktree").slice(0, 48);
+// SUP-14150: the legacy derivation trimmed separators only BEFORE the 48-char
+// slice, so a separator at the slice boundary survived as a trailing
+// hyphen/underscore and the emitted slug carried "--" before the path hash.
+// Strip trailing separators AFTER the slice so the slug is slice-stable, and
+// emit the legacy spelling second so the guard below can accept .env files
+// persisted by pre-fix provisionings instead of forcing a re-init.
+const legacyPrefix = (normalized || "worktree").slice(0, 48);
+const prefix = legacyPrefix.replace(/[-_]+$/, "");
 const pathHash = crypto.createHash("sha256").update(resolvedWorkspacePath).digest("hex").slice(0, 12);
-process.stdout.write(`${prefix}-${pathHash}`);
+process.stdout.write(`${prefix}-${pathHash}\n${legacyPrefix}-${pathHash}`);
 EOF
 )"
+# Two lines: the slice-stable slug first, then the legacy pre-fix spelling.
+{ IFS= read -r worktree_instance_id; IFS= read -r worktree_instance_id_legacy; } <<<"$worktree_instance_ids"
 
 if [[ ! -d "$base_cwd" ]]; then
   echo "Base workspace does not exist: $base_cwd" >&2
@@ -158,6 +167,7 @@ existing_worktree_config_is_usable() {
   WORKTREE_CONFIG_PATH="$worktree_config_path" \
   WORKTREE_ENV_PATH="$worktree_env_path" \
   WORKTREE_INSTANCE_ID="$worktree_instance_id" \
+  WORKTREE_INSTANCE_ID_LEGACY="$worktree_instance_id_legacy" \
   node <<'EOF'
 const fs = require("node:fs");
 const os = require("node:os");
@@ -208,10 +218,17 @@ if (envConfigPath && path.resolve(envConfigPath) !== configPath) {
 const homeDir = expandHomePrefix(env.PAPERCLIP_HOME);
 const instanceId = env.PAPERCLIP_INSTANCE_ID;
 const expectedInstanceId = process.env.WORKTREE_INSTANCE_ID;
+// SUP-14150 compatibility posture (accept both spellings, no on-read
+// migration): slugs persisted by pre-fix provisionings may carry the legacy
+// spelling with a separator at the 48-char boundary (e.g. "…no--<hash>").
+// The instance id is baked into the config paths and the on-disk instance
+// root, so rewriting the persisted id here would strand the data; instead we
+// accept the legacy spelling and leave the existing worktree untouched.
+const legacyInstanceId = process.env.WORKTREE_INSTANCE_ID_LEGACY;
 if (!homeDir || !instanceId) {
   fail("existing worktree env is missing PAPERCLIP_HOME or PAPERCLIP_INSTANCE_ID");
 }
-if (instanceId !== expectedInstanceId) {
+if (instanceId !== expectedInstanceId && instanceId !== legacyInstanceId) {
   fail(`existing worktree env names legacy or mismatched instance ${instanceId}, expected ${expectedInstanceId}`);
 }
 if (!fs.existsSync(homeDir)) {

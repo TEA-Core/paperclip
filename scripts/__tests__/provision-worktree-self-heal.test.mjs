@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import fs from "node:fs";
@@ -90,23 +91,60 @@ process.exit(0);
   return baseCwd;
 }
 
-function runProvision(baseCwd, { pathPrefix } = {}) {
-  const worktreeCwd = makeTempDir("paperclip-provision-worktree-");
+function runProvision(baseCwd, { pathPrefix, worktreeCwd } = {}) {
+  const worktreeDir = worktreeCwd ?? makeTempDir("paperclip-provision-worktree-");
   const worktreesHome = makeTempDir("paperclip-provision-home-");
   const result = spawnSync("bash", [script], {
-    cwd: worktreeCwd,
+    cwd: worktreeDir,
     encoding: "utf8",
     env: {
       PATH: pathPrefix ? `${pathPrefix}:${testPath}` : testPath,
       HOME: os.homedir(),
       PAPERCLIP_WORKSPACE_BASE_CWD: baseCwd,
-      PAPERCLIP_WORKSPACE_CWD: worktreeCwd,
+      PAPERCLIP_WORKSPACE_CWD: worktreeDir,
       PAPERCLIP_WORKSPACE_BRANCH: "feature/provision-test",
       PAPERCLIP_WORKTREES_DIR: worktreesHome,
       PAPERCLIP_HOME: path.join(worktreesHome, "no-such-instance-home"),
     },
   });
-  return { result, worktreeCwd, worktreesHome };
+  return { result, worktreeCwd: worktreeDir, worktreesHome };
+}
+
+// Creates a worktree directory whose basename is EXACTLY `baseName` under a
+// fresh parent. mkdtemp randomises the name, which keeps every existing test
+// far away from the 48-char slice boundary; these tests need the boundary
+// itself, so the name is chosen by the test instead.
+function makeNamedWorktreeDir(prefix, baseName) {
+  const parent = makeTempDir(prefix);
+  const dir = path.join(parent, baseName);
+  fs.mkdirSync(dir);
+  return dir;
+}
+
+// Independent oracle of the SUP-14150 slug spec, not a copy of the script:
+// trim, lowercase, non-slug runs -> "-", collapse "-", trim boundary
+// separators, slice(0, 48), strip trailing separators AFTER the slice, then
+// "-" + first 12 hex of sha256(resolved path). `postSliceTrim: false` yields
+// the legacy pre-fix spelling (separator at the slice boundary survives).
+function deriveWorktreeInstanceId(worktreePath, { postSliceTrim = true } = {}) {
+  const resolvedWorkspacePath = path.resolve(worktreePath);
+  const normalized = path.basename(resolvedWorkspacePath)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  let prefix = (normalized || "worktree").slice(0, 48);
+  if (postSliceTrim) prefix = prefix.replace(/[-_]+$/, "");
+  const pathHash = createHash("sha256").update(resolvedWorkspacePath).digest("hex").slice(0, 12);
+  return `${prefix}-${pathHash}`;
+}
+
+function readPersistedInstanceId(worktreeCwd) {
+  const env = fs.readFileSync(path.join(worktreeCwd, ".paperclip", ".env"), "utf8");
+  const line = env.split("\n").find((value) => value.startsWith("PAPERCLIP_INSTANCE_ID="));
+  assert.ok(line, `expected PAPERCLIP_INSTANCE_ID in ${worktreeCwd}/.paperclip/.env, got:\n${env}`);
+  return JSON.parse(line.slice("PAPERCLIP_INSTANCE_ID=".length));
 }
 
 function runRuntimeProvision(baseCwd, worktreeCwd) {
@@ -332,4 +370,144 @@ test("runtime provisioning leaves seed-pending in place when ensure-seeded fails
   assert.match(result.stderr, /fake worktree ensure-seeded failure/);
   assert.ok(fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-pending")));
   assert.ok(!fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-complete")));
+});
+
+// SUP-14150: the 48-char slice can land on a separator. 47 non-separator
+// chars, then the separator at index 47, then filler so the name exceeds 48.
+const sliceBoundaryHyphenName = `a${"b".repeat(46)}-${"c".repeat(50)}`;
+const sliceBoundaryUnderscoreName = `a${"b".repeat(46)}_${"c".repeat(50)}`;
+
+test("slice(0, 48) can no longer leave a trailing separator in the instance id", () => {
+  // The base CLI cannot boot, so the script takes the fallback path, which is
+  // the one that persists PAPERCLIP_INSTANCE_ID into .paperclip/.env where
+  // these assertions can observe it.
+  const baseCwd = makeBaseWorkspace({ helpExit: 1, initExit: 0 });
+
+  for (const baseName of [sliceBoundaryHyphenName, sliceBoundaryUnderscoreName]) {
+    const worktreeCwd = makeNamedWorktreeDir("paperclip-provision-slice-boundary-", baseName);
+    const { result } = runProvision(baseCwd, { worktreeCwd });
+    assert.equal(result.status, 0, result.stderr);
+
+    const instanceId = readPersistedInstanceId(worktreeCwd);
+    assert.equal(instanceId, deriveWorktreeInstanceId(worktreeCwd));
+    const prefix = instanceId.slice(0, -13); // drop "-<12 hex>"
+    assert.ok(
+      !/[-_]$/.test(prefix),
+      `prefix ${JSON.stringify(prefix)} still ends on a separator`,
+    );
+    assert.ok(
+      !instanceId.includes("--"),
+      `slug ${instanceId} contains a double hyphen`,
+    );
+    // Pin the fixture to the defect boundary: the legacy spelling for this
+    // basename really does carry the trailing separator, so a test that
+    // passed pre-fix would have been measuring nothing.
+    const legacy = deriveWorktreeInstanceId(worktreeCwd, { postSliceTrim: false });
+    assert.notEqual(legacy, instanceId);
+  }
+});
+
+test("the SUP-14139 worktree basename no longer mints a double-hyphen instance id", () => {
+  const baseName =
+    "SUP-14139-execution-workspace-allocation-has-no-path-exclusivity-two-active-rows-over-one-worktree-and-an-issue-bound-to";
+  const baseCwd = makeBaseWorkspace({ helpExit: 1, initExit: 0 });
+  const worktreeCwd = makeNamedWorktreeDir("paperclip-provision-sup14139-", baseName);
+  const { result } = runProvision(baseCwd, { worktreeCwd });
+  assert.equal(result.status, 0, result.stderr);
+
+  const instanceId = readPersistedInstanceId(worktreeCwd);
+  assert.ok(
+    !instanceId.includes("--"),
+    `slug ${instanceId} contains a double hyphen`,
+  );
+  assert.ok(
+    instanceId.startsWith("sup-14139-execution-workspace-allocation-has-no-"),
+    `slug ${instanceId} lost the expected prefix`,
+  );
+  assert.equal(instanceId, deriveWorktreeInstanceId(worktreeCwd));
+});
+
+// A .paperclip/ pair persisted by a pre-fix provisioning carries the legacy
+// spelling (separator at the slice boundary). The guard must accept it and
+// reuse the config instead of forcing a re-init on every run.
+function writePersistedWorktreeConfig(worktreeCwd, homeDir, instanceId) {
+  const paperclipDir = path.join(worktreeCwd, ".paperclip");
+  const instanceRoot = path.join(homeDir, "instances", instanceId);
+  const configPath = path.join(paperclipDir, "config.json");
+  fs.mkdirSync(paperclipDir, { recursive: true });
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      $meta: { version: 1, source: "pre-fix-provisioning" },
+      database: {
+        embeddedPostgresDataDir: path.join(instanceRoot, "db"),
+        backup: { dir: path.join(instanceRoot, "data", "backups") },
+      },
+      logging: { logDir: path.join(instanceRoot, "logs") },
+      storage: { localDisk: { baseDir: path.join(instanceRoot, "data", "storage") } },
+      secrets: { localEncrypted: { keyFilePath: path.join(instanceRoot, "secrets", "master.key") } },
+    }),
+  );
+  fs.writeFileSync(
+    path.join(paperclipDir, ".env"),
+    [
+      `PAPERCLIP_HOME=${JSON.stringify(homeDir)}`,
+      `PAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}`,
+      `PAPERCLIP_CONFIG=${JSON.stringify(configPath)}`,
+      "PAPERCLIP_IN_WORKTREE=true",
+    ].join("\n") + "\n",
+  );
+}
+
+test("reuses a worktree env persisted with the legacy double-hyphen spelling", () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const worktreeCwd = makeNamedWorktreeDir("paperclip-provision-legacy-env-", sliceBoundaryHyphenName);
+  const homeDir = makeTempDir("paperclip-provision-legacy-instance-home-");
+  const legacyId = deriveWorktreeInstanceId(worktreeCwd, { postSliceTrim: false });
+  const expectedId = deriveWorktreeInstanceId(worktreeCwd);
+  assert.match(legacyId, /--[0-9a-f]{12}$/, "fixture must exercise the divergent boundary");
+  assert.notEqual(legacyId, expectedId);
+  writePersistedWorktreeConfig(worktreeCwd, homeDir, legacyId);
+
+  const { result } = runProvision(baseCwd, { worktreeCwd });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /Reusing existing isolated Paperclip worktree config/);
+  // No on-read migration: the persisted id is left in its legacy spelling, and
+  // no init ran over it.
+  assert.equal(readPersistedInstanceId(worktreeCwd), legacyId);
+  const initCalls = readCliInvocations(baseCwd).filter(
+    (args) => args[0] === "worktree" && args[1] === "init",
+  );
+  assert.equal(initCalls.length, 0, `expected no re-init, got ${JSON.stringify(initCalls)}`);
+});
+
+test("reuses a worktree env persisted with the slice-stable spelling", () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const worktreeCwd = makeNamedWorktreeDir("paperclip-provision-stable-env-", sliceBoundaryHyphenName);
+  const homeDir = makeTempDir("paperclip-provision-stable-instance-home-");
+  const expectedId = deriveWorktreeInstanceId(worktreeCwd);
+  writePersistedWorktreeConfig(worktreeCwd, homeDir, expectedId);
+
+  const { result } = runProvision(baseCwd, { worktreeCwd });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /Reusing existing isolated Paperclip worktree config/);
+  assert.equal(readPersistedInstanceId(worktreeCwd), expectedId);
+});
+
+test("still regenerates a worktree env that names an unrelated instance id", () => {
+  // Accepting both spellings must not widen into accepting any id: a .env that
+  // belongs to neither the stable nor the legacy spelling of THIS worktree is
+  // still stale and gets regenerated.
+  const baseCwd = makeBaseWorkspace({ helpExit: 1, initExit: 0 });
+  const worktreeCwd = makeNamedWorktreeDir("paperclip-provision-foreign-env-", sliceBoundaryHyphenName);
+  const homeDir = makeTempDir("paperclip-provision-foreign-instance-home-");
+  writePersistedWorktreeConfig(worktreeCwd, homeDir, "foreign-instance-abc");
+
+  const { result } = runProvision(baseCwd, { worktreeCwd });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /stale for this host; regenerating/);
+  // The mismatch message keeps naming both the found and the expected slug.
+  const expectedId = deriveWorktreeInstanceId(worktreeCwd);
+  assert.match(result.stderr, new RegExp(`mismatched instance foreign-instance-abc, expected ${expectedId}`));
+  assert.equal(readPersistedInstanceId(worktreeCwd), expectedId);
 });
