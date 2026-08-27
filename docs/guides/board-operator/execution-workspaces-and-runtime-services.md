@@ -122,6 +122,8 @@ Agents nonetheless leave files in it. Its path is exported as both `PAPERCLIP_WO
 
 Hygiene now clears that case on its own. Before fast-forwarding, it moves untracked paths that the base ref also contains into `<git dir>/paperclip-base-repo-quarantine/<timestamp>/` and records them on the `worktree_prepare` operation. Files are moved, never deleted, and nothing under `.paperclip` is ever eligible — the live agent worktrees are there.
 
+One quarantine moves at most 200 paths. Every untracked path is inspected, so the cap never hides a conflict; it only bounds a single bulk move. A base repo with more than 200 conflicting paths fast-forwards no further that dispatch, and the operation's `metadata.quarantinedUntrackedPaths` names what was moved. Reaching the cap at all means something is wrong with that checkout, and it needs an operator rather than another dispatch.
+
 What is left behind is recorded rather than acted on, under `metadata.untrackedBaseRepoPaths` on the same operation. To see the drift across a fleet:
 
 ```sql

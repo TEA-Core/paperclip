@@ -3854,8 +3854,17 @@ async function restoreBaseRepoToDefaultRef(input: {
  * Derived from git state rather than parsed out of that message, so wording,
  * locale, and truncation cannot change the answer. `--exclude-standard` keeps
  * ignored paths out, and the base ref is queried with the untracked paths as a
- * pathspec, so this stays one `ls-tree` regardless of repo size.
+ * pathspec, so no tree listing is materialised.
+ *
+ * EVERY eligible untracked path is inspected. The cap on how many files a
+ * quarantine may move belongs to the move, not to the search: a cap applied here
+ * would stop looking after N untracked paths, and a base repo holding N harmless
+ * strays ahead of the one blocking path — alphabetically, which is the order git
+ * lists them in — would stay wedged with nothing reporting why. The pathspec is
+ * chunked instead, so the argument list stays bounded however many there are.
  */
+const BASE_REPO_LS_TREE_PATHSPEC_CHUNK = 500;
+
 async function resolveBaseRepoUntrackedCollisions(input: {
   repoRoot: string;
   baseRef: string;
@@ -3863,20 +3872,34 @@ async function resolveBaseRepoUntrackedCollisions(input: {
   const untracked = await runGit(["ls-files", "--others", "--exclude-standard"], input.repoRoot)
     .then((value) => value.split("\n").map((line) => line.trim()).filter(Boolean))
     .catch(() => [] as string[]);
-  const candidates = untracked.filter(isQuarantinableBaseRepoPath).slice(0, BASE_REPO_QUARANTINE_MAX_PATHS);
+  const candidates = untracked.filter(isQuarantinableBaseRepoPath);
   if (candidates.length === 0) return [];
 
-  const inBaseRef = await runGit(
-    ["ls-tree", "-r", "--name-only", "-z", input.baseRef, "--", ...candidates],
-    input.repoRoot,
-  )
-    .then((value) => new Set(value.split("\0").map((line) => line.trim()).filter(Boolean)))
-    .catch(() => new Set<string>());
+  const inBaseRef = new Set<string>();
+  for (let index = 0; index < candidates.length; index += BASE_REPO_LS_TREE_PATHSPEC_CHUNK) {
+    const chunk = candidates.slice(index, index + BASE_REPO_LS_TREE_PATHSPEC_CHUNK);
+    const found = await runGit(
+      ["ls-tree", "-r", "--name-only", "-z", input.baseRef, "--", ...chunk],
+      input.repoRoot,
+    )
+      .then((value) => value.split("\0").map((line) => line.trim()).filter(Boolean))
+      .catch(() => [] as string[]);
+    for (const path of found) inBaseRef.add(path);
+  }
 
-  return candidates.filter((candidate) => inBaseRef.has(candidate));
+  return candidates
+    .filter((candidate) => inBaseRef.has(candidate))
+    .slice(0, BASE_REPO_QUARANTINE_MAX_PATHS);
 }
 
-/** Hard limit on how many paths one quarantine may move. */
+/**
+ * Hard limit on how many paths one quarantine may move.
+ *
+ * A bound on a bulk file move, not on the search that feeds it. Reaching it means
+ * something is very wrong with the base repo, and the fast-forward will refuse
+ * again on whatever is left over — correctly, and now with the moved paths named
+ * in the operation metadata to say what was already tried.
+ */
 const BASE_REPO_QUARANTINE_MAX_PATHS = 200;
 /** How many quarantine directories to keep before pruning the oldest. */
 const BASE_REPO_QUARANTINE_KEEP = 20;

@@ -197,6 +197,26 @@ describe("base repo hygiene with untracked paths that collide with the base ref"
     expect(operations.filter((op) => op.status === "failed")).toEqual([]);
   });
 
+  it("finds a collision hiding behind hundreds of harmless strays", async () => {
+    // The move is capped at 200 paths. Capping the SEARCH at 200 instead would
+    // stop looking after 200 untracked paths, and git lists them alphabetically —
+    // so a base repo carrying enough strays that sort ahead of the blocking path
+    // would stay wedged, with nothing reporting why.
+    const { work } = await makeUntrackedCollisionRepo();
+    for (let index = 0; index < 300; index += 1) {
+      // "aaa…" sorts ahead of both colliding paths, which start "apps/" and
+      // "scripts/", so a truncated search would never reach them.
+      await writeFile(work, `aaa-stray/${String(index).padStart(4, "0")}.txt`, "stray\n");
+    }
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+  });
+
   it("leaves untracked files that do not collide exactly where they are", async () => {
     const { work } = await makeUntrackedCollisionRepo();
     await prepare(work);
