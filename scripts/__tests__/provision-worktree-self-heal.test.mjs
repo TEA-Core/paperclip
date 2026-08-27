@@ -8,11 +8,6 @@ import path from "node:path";
 const script = new URL("../provision-worktree.sh", import.meta.url).pathname;
 const runtimeScript = new URL("../provision-worktree-runtime.sh", import.meta.url).pathname;
 
-// Keep the PATH minimal so the fallback ladder is deterministic: node must be
-// reachable, but a globally installed `paperclipai` must not shadow the paths
-// under test.
-const testPath = [path.dirname(process.execPath), "/usr/bin", "/bin"].join(":");
-
 const cleanupDirs = [];
 
 function makeTempDir(prefix) {
@@ -20,6 +15,24 @@ function makeTempDir(prefix) {
   cleanupDirs.push(dir);
   return dir;
 }
+
+// Keep the PATH minimal so the fallback ladder is deterministic: node must be
+// reachable, but a globally installed `paperclipai` must not shadow the rung
+// under test.
+//
+// Reaching that by putting `path.dirname(process.execPath)` on the PATH does the
+// opposite of what it reads as. It hands the tests everything else the installer
+// dropped next to node, and on an nvm or Volta layout that is `pnpm`, `corepack`
+// AND `paperclipai`. The ladder then reached a real global CLI instead of the
+// rung being exercised: "falls back to an isolated config" passed for the wrong
+// reason wherever those binaries were absent, and failed with an empty stderr
+// wherever they were present. Symlink the node binary alone so the isolation
+// holds no matter how node was installed — and resolve it through
+// `process.execPath`, which is the real binary rather than a version-manager
+// shim that would need env vars this minimal environment does not pass.
+const nodeOnlyBin = makeTempDir("paperclip-provision-nodebin-");
+fs.symlinkSync(process.execPath, path.join(nodeOnlyBin, "node"));
+const testPath = [nodeOnlyBin, "/usr/bin", "/bin"].join(":");
 
 test.after(() => {
   for (const dir of cleanupDirs) {
@@ -129,6 +142,36 @@ function readWorktreeConfig(worktreeCwd) {
   assert.ok(fs.existsSync(configPath), `expected ${configPath} to exist`);
   return JSON.parse(fs.readFileSync(configPath, "utf8"));
 }
+
+// The isolation above is load-bearing and silent when it breaks: every rung of the
+// fallback ladder is "run some CLI", so a leaked binary does not error, it just
+// answers, and the test goes on passing while measuring nothing. Assert the PATH
+// directly. `bash -c`, not `-lc`: a login shell sources profile scripts that
+// re-add the very directories being excluded.
+//
+// `paperclipai` is the binary the ladder actually dispatches on and the one no
+// test injects, so it must be absent. A real `pnpm` may still come from /usr/bin
+// on some hosts and cannot be excluded without losing git, flock and stat with
+// it — that one is neutralised per test instead, by a fake earlier on the PATH
+// via `pathPrefix`.
+test("the test PATH exposes our node and no paperclipai shadow", () => {
+  const resolve = (binary) =>
+    spawnSync("bash", ["-c", `command -v ${binary}`], { env: { PATH: testPath }, encoding: "utf8" });
+
+  const node = resolve("node");
+  assert.equal(node.status, 0, "node must be reachable on the test PATH");
+  assert.equal(
+    node.stdout.trim(),
+    path.join(nodeOnlyBin, "node"),
+    "node must resolve to the isolated symlink, so nothing else from its install directory is on the PATH",
+  );
+
+  assert.notEqual(
+    resolve("paperclipai").status,
+    0,
+    "a globally installed paperclipai must not be reachable — it shadows the fallback rung under test",
+  );
+});
 
 test("uses the base CLI when its import graph boots", () => {
   const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
