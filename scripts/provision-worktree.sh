@@ -211,7 +211,13 @@ const expectedInstanceId = process.env.WORKTREE_INSTANCE_ID;
 if (!homeDir || !instanceId) {
   fail("existing worktree env is missing PAPERCLIP_HOME or PAPERCLIP_INSTANCE_ID");
 }
-if (instanceId !== expectedInstanceId) {
+// Compare the ids in one spelling. A stored id that differs only in how runs of
+// "-" collapse names the same instance directory — the shape written before the
+// prefix truncation was made canonical — and rejecting it condemns the worktree to
+// a destructive `worktree init --force` on every dispatch. Anything else still fails.
+const canonicalize = (value) =>
+  String(value ?? "").replace(/-+/g, "-").replace(/^[-_]+|[-_]+$/g, "");
+if (canonicalize(instanceId) !== canonicalize(expectedInstanceId)) {
   fail(`existing worktree env names legacy or mismatched instance ${instanceId}, expected ${expectedInstanceId}`);
 }
 if (!fs.existsSync(homeDir)) {

@@ -22,7 +22,13 @@ export function deriveWorktreeInstanceId(workspacePath: string): string {
     .replace(/[^a-z0-9_-]+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^[-_]+|[-_]+$/g, "");
-  const prefix = (normalized || "worktree").slice(0, 48);
+  // Strip a trailing separator the 48-character truncation may have left, exactly
+  // as scripts/provision-worktree.sh does. That script is what names the instance
+  // directory on disk; an id spelled "…-<hash>" here and "…--<hash>" there names a
+  // directory that does not exist, so cleanup would decline to reclaim the instance
+  // it was asked to reclaim and the disk would keep it. The two derivations have to
+  // move together or not at all.
+  const prefix = (normalized || "worktree").slice(0, 48).replace(/-+$/, "");
   const pathHash = createHash("sha256").update(resolvedWorkspacePath).digest("hex").slice(0, 12);
   return `${prefix}-${pathHash}`;
 }
