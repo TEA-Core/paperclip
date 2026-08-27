@@ -7,6 +7,7 @@ import {
   isWorktreeSeedPending,
   isLinkedGitWorktreeCheckout,
   resolveWorktreeEnvFilePath,
+  resolveWorktreeStateDir,
 } from "../dev-runner-worktree.ts";
 
 const tempRoots = new Set<string>();
@@ -34,6 +35,53 @@ describe("dev-runner worktree env bootstrap", () => {
 
     fs.writeFileSync(path.join(root, ".paperclip", "seed-complete"), "{}\n", "utf8");
     expect(isWorktreeSeedPending(root)).toBe(false);
+  });
+
+  it("resolves the uid-scoped state dir when it exists for the running uid, else the canonical dir", () => {
+    const root = createTempRoot("paperclip-dev-runner-scoped-state-");
+    const uid = process.getuid ? process.getuid() : -1;
+    const canonicalDir = path.join(root, ".paperclip");
+    const scopedDir = path.join(canonicalDir, `uid-${uid}`);
+    fs.mkdirSync(canonicalDir, { recursive: true });
+
+    // No scoped state yet: canonical resolution, as before.
+    expect(resolveWorktreeStateDir(root)).toBe(canonicalDir);
+    expect(resolveWorktreeEnvFilePath(root)).toBe(path.join(canonicalDir, ".env"));
+    expect(isWorktreeSeedPending(root)).toBe(false);
+
+    fs.mkdirSync(scopedDir, { recursive: true });
+    fs.writeFileSync(path.join(scopedDir, ".env"), "PAPERCLIP_IN_WORKTREE=true\n", "utf8");
+
+    expect(resolveWorktreeStateDir(root)).toBe(scopedDir);
+    expect(resolveWorktreeEnvFilePath(root)).toBe(path.join(scopedDir, ".env"));
+
+    fs.writeFileSync(path.join(scopedDir, "seed-pending"), "{}\n", "utf8");
+    expect(isWorktreeSeedPending(root)).toBe(true);
+    fs.writeFileSync(path.join(scopedDir, "seed-complete"), "{}\n", "utf8");
+    expect(isWorktreeSeedPending(root)).toBe(false);
+
+    // Once the scoped state dir is active, canonical markers no longer gate
+    // this run — the other uid's pending seed must not block it.
+    fs.writeFileSync(path.join(canonicalDir, "seed-pending"), "{}\n", "utf8");
+    expect(isWorktreeSeedPending(root)).toBe(false);
+  });
+
+  it("keeps canonical seed markers authoritative for a different uid's scoped dir", () => {
+    const root = createTempRoot("paperclip-dev-runner-scoped-other-uid-");
+    const canonicalDir = path.join(root, ".paperclip");
+    fs.mkdirSync(canonicalDir, { recursive: true });
+    fs.writeFileSync(path.join(canonicalDir, "seed-pending"), "{}\n", "utf8");
+
+    const otherUidDir = path.join(canonicalDir, "uid-4242");
+    fs.mkdirSync(otherUidDir, { recursive: true });
+    fs.writeFileSync(path.join(otherUidDir, ".env"), "PAPERCLIP_IN_WORKTREE=true\n", "utf8");
+
+    // The running uid is not 4242, so the other uid's scoped dir is ignored
+    // and the canonical marker still gates.
+    const uid = process.getuid ? process.getuid() : -1;
+    expect(uid).not.toBe(4242);
+    expect(resolveWorktreeStateDir(root)).toBe(canonicalDir);
+    expect(isWorktreeSeedPending(root)).toBe(true);
   });
 
   it("detects linked git worktrees from .git files", () => {

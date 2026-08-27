@@ -5820,15 +5820,31 @@ export function resolveRuntimeProvisionCommand(input: {
     "scripts",
     "provision-worktree-runtime.sh",
   );
-  if (
-    !existsSync(pendingMarker)
-    || existsSync(completeMarker)
-    || !existsSync(provisionScript)
-  ) {
+  if (!existsSync(provisionScript)) {
     return "";
   }
 
-  return "bash ./scripts/provision-worktree-runtime.sh";
+  if (existsSync(pendingMarker) && !existsSync(completeMarker)) {
+    return "bash ./scripts/provision-worktree-runtime.sh";
+  }
+
+  // SUP-14087: cross-uid worktrees keep per-uid state under
+  // .paperclip/uid-<uid>/. The script resolves its own scoped dir by run uid,
+  // so surface the command whenever any uid-scoped dir is still pending.
+  try {
+    for (const entry of readdirSync(stateDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^uid-\d+$/.test(entry.name)) continue;
+      const scopedPending = path.join(stateDir, entry.name, "seed-pending");
+      const scopedComplete = path.join(stateDir, entry.name, "seed-complete");
+      if (existsSync(scopedPending) && !existsSync(scopedComplete)) {
+        return "bash ./scripts/provision-worktree-runtime.sh";
+      }
+    }
+  } catch {
+    return "";
+  }
+
+  return "";
 }
 
 function runtimeProvisionWorkspaceKey(input: StartLocalRuntimeServiceInput) {
@@ -5874,6 +5890,11 @@ async function runRuntimeProvisionWithWorkspaceMutex(input: StartLocalRuntimeSer
       created: input.workspace.created,
     }),
     label: `Runtime provision command "${command}"`,
+    // SUP-14087: the runtime seed script resolves its uid-scoped state dir by
+    // its own execution uid (id -u), so the server seeds the state dir it owns
+    // and the run seeds its own. SUP-14126: no setuid shim here — worktree-init
+    // and the 0o600 config stay at the server uid; the script must not be
+    // dropped to the run's uid as a whole.
     metadata: {
       executionWorkspaceId: input.executionWorkspaceId ?? null,
       projectWorkspaceId: input.workspace.workspaceId,
