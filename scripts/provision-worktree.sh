@@ -66,6 +66,12 @@ base_cli_healthy() {
   (cd "$base_cwd" && node "$base_cli_runner_path" "$base_cli_entry_path" --help >/dev/null 2>&1)
 }
 
+# The owning uid of a path, or empty when it cannot be determined. GNU and BSD
+# stat disagree on the flag, and neither is guaranteed present.
+path_owner_uid() {
+  stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null || true
+}
+
 repair_base_workspace_install() {
   command -v pnpm >/dev/null 2>&1 || return 1
   [[ -f "$base_cwd/package.json" && -f "$base_cwd/pnpm-lock.yaml" ]] || return 1
