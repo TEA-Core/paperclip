@@ -376,13 +376,13 @@ const DEFINITIONS = validateBuiltInAgentDefinitions([
           { name: "maxTargetAgents", label: "Max target agents", type: "number", defaultValue: 8, required: true, options: [] },
           {
             name: "targetAgentMode",
-            label: "Target agent mode",
+            label: "Target selection mode",
             type: "select",
             defaultValue: "recent_active",
-            required: true,
-            options: ["recent_active", "recent_blocked", "recent_completed"],
+            required: false,
+            options: ["recent_active", "all", "explicit"],
           },
-          { name: "excludeAgentIds", label: "Excluded agent ids", type: "text", defaultValue: "", required: false, options: [] },
+          { name: "excludeAgentIds", label: "Agent ids to exclude (comma-separated)", type: "text", defaultValue: null, required: false, options: [] },
         ],
         triggers: [
           {
