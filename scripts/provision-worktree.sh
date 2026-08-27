@@ -23,7 +23,7 @@ const normalized = path.basename(resolvedWorkspacePath)
   .replace(/[^a-z0-9_-]+/g, "-")
   .replace(/-+/g, "-")
   .replace(/^[-_]+|[-_]+$/g, "");
-const prefix = (normalized || "worktree").slice(0, 48);
+const prefix = (normalized || "worktree").slice(0, 48).replace(/-+$/, "");
 const pathHash = crypto.createHash("sha256").update(resolvedWorkspacePath).digest("hex").slice(0, 12);
 process.stdout.write(`${prefix}-${pathHash}`);
 EOF
