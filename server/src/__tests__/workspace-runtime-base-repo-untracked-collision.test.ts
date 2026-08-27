@@ -284,6 +284,32 @@ describe("base repo hygiene with untracked paths that collide with the base ref"
     expect(await fs.readFile(path.join(work, "generated"), "utf8")).toBe("upstream file, not a directory\n");
   });
 
+  it("survives an untracked listing larger than the generic output cap", async () => {
+    // `executeProcess` caps output at 256 KiB and keeps the LAST bytes, prefixed
+    // with "[output truncated to last …]". For a human-read log that is the right
+    // half. For a machine-read listing it is quietly catastrophic: leading paths
+    // vanish, the prefix fuses onto the first surviving name with no NUL between
+    // them, and the byte cut can slice a name in half. The result still parses,
+    // still looks like a list of paths, and no longer contains the one that
+    // matters — the exact silent wedge this file exists to prevent.
+    const { work } = await makeUntrackedCollisionRepo();
+    const filler = "z".repeat(180);
+    for (let index = 0; index < 2500; index += 1) {
+      await writeFile(work, `zz-bulk/${filler}-${String(index).padStart(5, "0")}.txt`, "x\n");
+    }
+    const listingBytes = await git(["ls-files", "-z", "--others", "--exclude-standard"], work)
+      .then((value) => Buffer.byteLength(value, "utf8"));
+    // Guard the guard: below the cap this test proves nothing.
+    expect(listingBytes).toBeGreaterThan(256 * 1024);
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+  });
+
   it("leaves untracked files that do not collide exactly where they are", async () => {
     const { work } = await makeUntrackedCollisionRepo();
     await prepare(work);

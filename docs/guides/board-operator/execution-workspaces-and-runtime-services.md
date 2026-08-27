@@ -126,16 +126,20 @@ Hygiene clears that case on its own. Before fast-forwarding, it moves the confli
 
 One quarantine moves at most 200 paths. Every untracked path is inspected, so the cap never hides a conflict; it only bounds a single bulk move. A base repo with more than 200 conflicting paths does not fast-forward that dispatch, and the operation's `metadata.quarantinedUntrackedPaths` names what was moved. Reaching the cap at all means something is wrong with that checkout, and it needs an operator rather than another dispatch.
 
-What is left behind is recorded rather than acted on, under `metadata.untrackedBaseRepoPaths` on the same operation. To see the drift across a fleet:
+What is left behind is recorded rather than acted on, on the same operation: `metadata.untrackedBaseRepoPathCount` is the total, and `metadata.untrackedBaseRepoPaths` is **a sample of the first 50 names, not the whole list**. Sort on the count — `jsonb_array_length` of the sample tops out at 50 and would rank the worst checkouts level with the merely untidy ones.
 
 ```sql
-select cwd, jsonb_array_length(metadata->'untrackedBaseRepoPaths') as untracked, metadata->'untrackedBaseRepoPaths'
+select cwd,
+       (metadata->>'untrackedBaseRepoPathCount')::int as untracked,
+       metadata->'untrackedBaseRepoPaths' as sample
 from workspace_operations
 where phase = 'worktree_prepare'
-  and metadata ? 'untrackedBaseRepoPaths'
+  and metadata ? 'untrackedBaseRepoPathCount'
   and started_at > now() - interval '1 day'
 order by untracked desc;
 ```
+
+A checkout whose untracked listing is too large to read at all reports neither field: hygiene declines to move anything on a listing it cannot read in full, warns, and leaves the fast-forward to refuse on its own. Partial knowledge here is worse than none — it would move some files while leaving the blocking one in place.
 
 Anything that appears there is a file an agent wrote to a shared checkout. Deleting it is safe once you know which run produced it; leaving it is safe until its path ships upstream.
 

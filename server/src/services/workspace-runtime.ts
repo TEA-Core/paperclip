@@ -631,6 +631,48 @@ function parseNulSeparatedPaths(stdout: string): string[] {
   return stdout.split("\0").filter((value) => value.length > 0);
 }
 
+/**
+ * Ceiling on a machine-read path listing. Roughly a quarter of a million paths.
+ *
+ * Deliberately far above any base repo anyone should have, because the point is
+ * not to trim the answer — it is to have a bound at all, so a pathological
+ * checkout cannot exhaust memory. A listing that reaches it is not usable and is
+ * not used.
+ */
+const BASE_REPO_PATH_LISTING_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
+ * A NUL-separated git path listing, or an admission that it could not be read.
+ *
+ * `executeProcess` caps output at 256 KiB and keeps the LAST bytes, prefixed
+ * with `[output truncated to last …]`. For human-read logs that is the right
+ * half to keep. For a machine-read listing it is quietly catastrophic: the
+ * leading paths vanish, the diagnostic prefix fuses onto the first surviving
+ * name with no NUL between them, and the byte-boundary cut can slice a name —
+ * or a UTF-8 sequence — in half. Every one of those produces a plausible list of
+ * paths that is missing the entry we came to find, and a missing entry here is
+ * the silent permanent wedge this whole code path exists to remove.
+ *
+ * So the cap is raised to something no real repo reaches, and reaching it is
+ * reported rather than papered over. A caller that cannot get the whole list
+ * must not act on part of it.
+ */
+async function runGitPathListing(
+  args: string[],
+  cwd: string,
+): Promise<{ paths: string[]; complete: boolean }> {
+  const result = await executeProcess({
+    command: "git",
+    args,
+    cwd,
+    maxStdoutBytes: BASE_REPO_PATH_LISTING_MAX_BYTES,
+  }).catch(() => null);
+  if (!result || result.code !== 0 || result.stdoutTruncated) {
+    return { paths: [], complete: false };
+  }
+  return { paths: parseNulSeparatedPaths(result.stdout), complete: true };
+}
+
 function formatShortSha(value: string | null | undefined) {
   return value ? value.slice(0, 12) : "unknown";
 }
@@ -3920,12 +3962,19 @@ function pathsConflict(untrackedPath: string, baseRefPath: string): boolean {
 async function resolveBaseRepoUntrackedCollisions(input: {
   repoRoot: string;
   baseRef: string;
-}): Promise<string[]> {
-  const untracked = await runGit(["ls-files", "-z", "--others", "--exclude-standard"], input.repoRoot, { raw: true })
-    .then(parseNulSeparatedPaths)
-    .catch(() => [] as string[]);
-  const candidates = untracked.filter(isQuarantinableBaseRepoPath);
-  if (candidates.length === 0) return [];
+}): Promise<{ collisions: string[]; untracked: string[]; complete: boolean }> {
+  const listing = await runGitPathListing(
+    ["ls-files", "-z", "--others", "--exclude-standard"],
+    input.repoRoot,
+  );
+  // A partial list of untracked paths cannot be told apart from a short one, and
+  // acting on it would move some files while leaving the blocking one in place.
+  if (!listing.complete) return { collisions: [], untracked: [], complete: false };
+
+  const candidates = listing.paths.filter(isQuarantinableBaseRepoPath);
+  if (candidates.length === 0) {
+    return { collisions: [], untracked: listing.paths, complete: true };
+  }
 
   const baseRefPaths = new Set<string>();
 
@@ -3934,14 +3983,12 @@ async function resolveBaseRepoUntrackedCollisions(input: {
   // exactly the `foo` versus `foo/bar` case.
   for (let index = 0; index < candidates.length; index += BASE_REPO_LS_TREE_PATHSPEC_CHUNK) {
     const chunk = candidates.slice(index, index + BASE_REPO_LS_TREE_PATHSPEC_CHUNK);
-    const found = await runGit(
+    const found = await runGitPathListing(
       ["ls-tree", "-r", "--name-only", "-z", input.baseRef, "--", ...chunk],
       input.repoRoot,
-      { raw: true },
-    )
-      .then(parseNulSeparatedPaths)
-      .catch(() => [] as string[]);
-    for (const found_path of found) baseRefPaths.add(found_path);
+    );
+    if (!found.complete) return { collisions: [], untracked: listing.paths, complete: false };
+    for (const foundPath of found.paths) baseRefPaths.add(foundPath);
   }
 
   // Ancestors that the base ref holds as a FILE, which no pathspec below them can
@@ -3951,14 +3998,12 @@ async function resolveBaseRepoUntrackedCollisions(input: {
   const ancestors = [...new Set(candidates.flatMap(ancestorPathsOf))];
   for (let index = 0; index < ancestors.length; index += BASE_REPO_LS_TREE_PATHSPEC_CHUNK) {
     const chunk = ancestors.slice(index, index + BASE_REPO_LS_TREE_PATHSPEC_CHUNK);
-    const listing = await runGit(
+    const entries = await runGitPathListing(
       ["ls-tree", "-z", input.baseRef, "--", ...chunk],
       input.repoRoot,
-      { raw: true },
-    )
-      .then(parseNulSeparatedPaths)
-      .catch(() => [] as string[]);
-    for (const entry of listing) {
+    );
+    if (!entries.complete) return { collisions: [], untracked: listing.paths, complete: false };
+    for (const entry of entries.paths) {
       // "<mode> <type> <sha>\t<path>" — the tab is the only separator that cannot
       // occur in the fixed-width prefix, so split on the first one.
       const tab = entry.indexOf("\t");
@@ -3968,10 +4013,12 @@ async function resolveBaseRepoUntrackedCollisions(input: {
     }
   }
 
-  if (baseRefPaths.size === 0) return [];
-  return candidates
-    .filter((candidate) => [...baseRefPaths].some((baseRefPath) => pathsConflict(candidate, baseRefPath)))
-    .slice(0, BASE_REPO_QUARANTINE_MAX_PATHS);
+  const collisions = baseRefPaths.size === 0
+    ? []
+    : candidates
+        .filter((candidate) => [...baseRefPaths].some((baseRefPath) => pathsConflict(candidate, baseRefPath)))
+        .slice(0, BASE_REPO_QUARANTINE_MAX_PATHS);
+  return { collisions, untracked: listing.paths, complete: true };
 }
 
 /**
@@ -3985,6 +4032,8 @@ async function resolveBaseRepoUntrackedCollisions(input: {
 const BASE_REPO_QUARANTINE_MAX_PATHS = 200;
 /** How many quarantine directories to keep before pruning the oldest. */
 const BASE_REPO_QUARANTINE_KEEP = 20;
+/** How many drifted path names to store alongside the count. A sample, not a census. */
+const BASE_REPO_UNTRACKED_SAMPLE_SIZE = 50;
 
 /**
  * Whether an untracked path may be moved out of the way at all.
@@ -4025,17 +4074,30 @@ async function quarantineBaseRepoUntrackedCollisions(input: {
   baseRef: string;
   timestamp: string;
   recorder?: WorkspaceOperationRecorder | null;
-}): Promise<{ quarantined: string[]; destination: string | null; warnings: string[] }> {
+}): Promise<{
+  quarantined: string[];
+  destination: string | null;
+  untracked: string[];
+  warnings: string[];
+}> {
   const warnings: string[] = [];
-  const collisions = await resolveBaseRepoUntrackedCollisions(input);
-  if (collisions.length === 0) return { quarantined: [], destination: null, warnings };
+  const resolved = await resolveBaseRepoUntrackedCollisions(input);
+  const untracked = resolved.untracked;
+  if (!resolved.complete) {
+    warnings.push(
+      "could not read the base repo's untracked paths in full; no path was moved and the fast-forward is left to refuse on its own",
+    );
+    return { quarantined: [], destination: null, untracked, warnings };
+  }
+  const collisions = resolved.collisions;
+  if (collisions.length === 0) return { quarantined: [], destination: null, untracked, warnings };
 
   const gitDir = await runGit(["rev-parse", "--git-common-dir"], input.repoRoot)
     .then((value) => path.resolve(input.repoRoot, value))
     .catch(() => null);
   if (!gitDir) {
     warnings.push("could not resolve the base repo git directory; leaving untracked collisions in place");
-    return { quarantined: [], destination: null, warnings };
+    return { quarantined: [], destination: null, untracked, warnings };
   }
 
   const destination = path.join(gitDir, "paperclip-base-repo-quarantine", input.timestamp);
@@ -4084,7 +4146,7 @@ async function quarantineBaseRepoUntrackedCollisions(input: {
     }).catch(() => undefined);
   }
 
-  return { quarantined, destination, warnings };
+  return { quarantined, destination, untracked, warnings };
 }
 
 /** Keep the quarantine bounded — it is an audit trail, not a second repository. */
@@ -4144,7 +4206,17 @@ async function fastForwardBaseRepoToDefaultRef(input: {
         // the moment the same path lands on the base ref. Recorded rather than
         // warned so the drift is queryable without adding noise to every
         // dispatch, and without new rows — this operation is written regardless.
-        ...(untracked.length > 0 ? { untrackedBaseRepoPaths: untracked } : {}),
+        //
+        // The count is separate from the sample on purpose. A checkout with
+        // thousands of strays is exactly the one worth finding, and it is the one
+        // whose path list is least worth storing in full, so the number that
+        // answers "how bad is it" must not be `jsonb_array_length` of a slice.
+        ...(untracked.length > 0
+          ? {
+              untrackedBaseRepoPathCount: untracked.length,
+              untrackedBaseRepoPaths: untracked.slice(0, BASE_REPO_UNTRACKED_SAMPLE_SIZE),
+            }
+          : {}),
       },
       successMessage: `Fast-forwarded base repository at ${input.repoRoot} to ${input.baseRef}\n`,
       failureLabel: `git merge --ff-only ${input.baseRef}`,
@@ -4163,6 +4235,7 @@ async function fastForwardBaseRepoToDefaultRef(input: {
   }).catch((error) => ({
     quarantined: [] as string[],
     destination: null,
+    untracked: [] as string[],
     warnings: [`could not quarantine untracked base repo paths: ${error instanceof Error ? error.message : String(error)}`],
   }));
   warnings.push(...quarantine.warnings);
@@ -4172,9 +4245,10 @@ async function fastForwardBaseRepoToDefaultRef(input: {
     );
   }
 
-  const remainingUntracked = await runGit(["ls-files", "-z", "--others", "--exclude-standard"], input.repoRoot, { raw: true })
-    .then((value) => parseNulSeparatedPaths(value).slice(0, 50))
-    .catch(() => [] as string[]);
+  // Reuse the listing the quarantine already took rather than shelling out again,
+  // minus whatever it just moved.
+  const quarantinedPaths = new Set(quarantine.quarantined);
+  const remainingUntracked = quarantine.untracked.filter((candidate) => !quarantinedPaths.has(candidate));
 
   try {
     await merge(quarantine.quarantined, remainingUntracked);
