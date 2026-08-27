@@ -3888,6 +3888,35 @@ async function restoreBaseRepoToDefaultRef(input: {
  */
 const BASE_REPO_LS_TREE_PATHSPEC_CHUNK = 500;
 
+/** Every strict ancestor directory of a repo-relative path, nearest last. */
+function ancestorPathsOf(relativePath: string): string[] {
+  const segments = relativePath.split("/");
+  return segments.slice(0, -1).map((_, index) => segments.slice(0, index + 1).join("/"));
+}
+
+/**
+ * A path and a base-ref entry conflict when either one contains the other.
+ *
+ * Not just equality. Git refuses all three shapes, with two different messages:
+ *
+ *   untracked file `foo`      + `foo` in the ref        → "would be overwritten"
+ *   untracked file `foo`      + `foo/bar` in the ref    → "would be overwritten"
+ *   untracked file `foo/bar`  + blob `foo` in the ref   → "Updating the following
+ *                                                         directories would lose
+ *                                                         untracked files in them"
+ *
+ * The remedy is the same in all three: move the untracked path. The second and
+ * third are why an exact-match test is not enough — `ls-tree -- foo` answers
+ * `foo/bar`, and `ls-tree -- foo/bar` answers nothing at all when `foo` is a blob.
+ */
+function pathsConflict(untrackedPath: string, baseRefPath: string): boolean {
+  return (
+    untrackedPath === baseRefPath ||
+    baseRefPath.startsWith(`${untrackedPath}/`) ||
+    untrackedPath.startsWith(`${baseRefPath}/`)
+  );
+}
+
 async function resolveBaseRepoUntrackedCollisions(input: {
   repoRoot: string;
   baseRef: string;
@@ -3898,7 +3927,11 @@ async function resolveBaseRepoUntrackedCollisions(input: {
   const candidates = untracked.filter(isQuarantinableBaseRepoPath);
   if (candidates.length === 0) return [];
 
-  const inBaseRef = new Set<string>();
+  const baseRefPaths = new Set<string>();
+
+  // Entries at or under each candidate. A pathspec naming a file matches that
+  // file; a pathspec naming a directory matches everything beneath it, which is
+  // exactly the `foo` versus `foo/bar` case.
   for (let index = 0; index < candidates.length; index += BASE_REPO_LS_TREE_PATHSPEC_CHUNK) {
     const chunk = candidates.slice(index, index + BASE_REPO_LS_TREE_PATHSPEC_CHUNK);
     const found = await runGit(
@@ -3908,11 +3941,36 @@ async function resolveBaseRepoUntrackedCollisions(input: {
     )
       .then(parseNulSeparatedPaths)
       .catch(() => [] as string[]);
-    for (const path of found) inBaseRef.add(path);
+    for (const found_path of found) baseRefPaths.add(found_path);
   }
 
+  // Ancestors that the base ref holds as a FILE, which no pathspec below them can
+  // reach. Deliberately not `-r`: the ancestors are named exactly, so this lists
+  // one entry each rather than descending whole subtrees, and the type column is
+  // what distinguishes a blob `foo` from a directory `foo/`.
+  const ancestors = [...new Set(candidates.flatMap(ancestorPathsOf))];
+  for (let index = 0; index < ancestors.length; index += BASE_REPO_LS_TREE_PATHSPEC_CHUNK) {
+    const chunk = ancestors.slice(index, index + BASE_REPO_LS_TREE_PATHSPEC_CHUNK);
+    const listing = await runGit(
+      ["ls-tree", "-z", input.baseRef, "--", ...chunk],
+      input.repoRoot,
+      { raw: true },
+    )
+      .then(parseNulSeparatedPaths)
+      .catch(() => [] as string[]);
+    for (const entry of listing) {
+      // "<mode> <type> <sha>\t<path>" — the tab is the only separator that cannot
+      // occur in the fixed-width prefix, so split on the first one.
+      const tab = entry.indexOf("\t");
+      if (tab < 0) continue;
+      const [, type] = entry.slice(0, tab).split(" ");
+      if (type === "blob") baseRefPaths.add(entry.slice(tab + 1));
+    }
+  }
+
+  if (baseRefPaths.size === 0) return [];
   return candidates
-    .filter((candidate) => inBaseRef.has(candidate))
+    .filter((candidate) => [...baseRefPaths].some((baseRefPath) => pathsConflict(candidate, baseRefPath)))
     .slice(0, BASE_REPO_QUARANTINE_MAX_PATHS);
 }
 

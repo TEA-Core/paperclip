@@ -118,11 +118,13 @@ The invariant is enforced by the "no-remote-git contract" case in `packages/adap
 
 The base repository — `<project workspace cwd>`, the clone that holds `.paperclip/worktrees` — is nobody's workspace. Worktrees are cut from `origin/<base ref>`, never from its HEAD, so its working tree is used by hygiene and by provisioning, and by nothing else.
 
-Agents nonetheless leave files in it. Its path is exported as both `PAPERCLIP_WORKSPACE_BASE_CWD` and `PAPERCLIP_WORKSPACE_REPO_ROOT`, so any main-branch errand has exactly one home. Those leftovers are harmless while they stay untracked and unique. One becomes a wedge the moment the same path lands on the base ref: `git merge --ff-only` then refuses, and refuses identically on every later dispatch.
+Agents nonetheless leave files in it. Its path is exported as both `PAPERCLIP_WORKSPACE_BASE_CWD` and `PAPERCLIP_WORKSPACE_REPO_ROOT`, so any main-branch errand has exactly one home. Those leftovers are harmless while they stay untracked and unique. One becomes a wedge the moment its path collides with the base ref — the same path landing upstream, a file where the base ref grew a directory, or a file written under a path the base ref holds as a file. `git merge --ff-only` refuses all three, and refuses identically on every later dispatch.
 
-Hygiene now clears that case on its own. Before fast-forwarding, it moves untracked paths that the base ref also contains into `<git dir>/paperclip-base-repo-quarantine/<timestamp>/` and records them on the `worktree_prepare` operation. Files are moved, never deleted, and nothing under `.paperclip` is ever eligible — the live agent worktrees are there.
+Hygiene clears that case on its own. Before fast-forwarding, it moves the conflicting untracked paths into `<git dir>/paperclip-base-repo-quarantine/<timestamp>/` and records them on the `worktree_prepare` operation. Files are moved, never deleted, and nothing under `.paperclip` is ever eligible — the live agent worktrees are there.
 
-One quarantine moves at most 200 paths. Every untracked path is inspected, so the cap never hides a conflict; it only bounds a single bulk move. A base repo with more than 200 conflicting paths fast-forwards no further that dispatch, and the operation's `metadata.quarantinedUntrackedPaths` names what was moved. Reaching the cap at all means something is wrong with that checkout, and it needs an operator rather than another dispatch.
+**The fast-forward is attempted once per dispatch, after the quarantine — never retried.** The conflicts are resolved before the merge runs rather than in response to it refusing, so there is nothing to retry. Anything the quarantine could not clear leaves that dispatch's fast-forward refused, and the next dispatch tries again from the beginning.
+
+One quarantine moves at most 200 paths. Every untracked path is inspected, so the cap never hides a conflict; it only bounds a single bulk move. A base repo with more than 200 conflicting paths does not fast-forward that dispatch, and the operation's `metadata.quarantinedUntrackedPaths` names what was moved. Reaching the cap at all means something is wrong with that checkout, and it needs an operator rather than another dispatch.
 
 What is left behind is recorded rather than acted on, under `metadata.untrackedBaseRepoPaths` on the same operation. To see the drift across a fleet:
 

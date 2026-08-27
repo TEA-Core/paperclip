@@ -244,6 +244,46 @@ describe("base repo hygiene with untracked paths that collide with the base ref"
     expect(await fs.readFile(path.join(work, spaced), "utf8")).toBe(`upstream ${spaced}\n`);
   });
 
+  it("clears an untracked FILE where the base ref grew a DIRECTORY", async () => {
+    // git: "The following untracked working tree files would be overwritten by
+    // merge: foo". An exact-match test misses it — `ls-tree -- foo` answers
+    // `foo/bar`, never `foo`.
+    const { root, work } = await makeUntrackedCollisionRepo();
+    const seed = path.join(root, "seed");
+    await commit(seed, "tools/generated/report.txt", "upstream\n");
+    await git(["push", "-q", "origin", "main"], seed);
+    await git(["fetch", "-q", "origin", "main"], work);
+    await writeFile(work, "tools/generated", "agent wrote a file where a directory now lives\n");
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+    expect(await fs.readFile(path.join(work, "tools/generated/report.txt"), "utf8")).toBe("upstream\n");
+  });
+
+  it("clears an untracked path UNDER a base-ref file", async () => {
+    // git: "Updating the following directories would lose untracked files in
+    // them: foo". No pathspec under `foo` can find the blob `foo`, so this needs
+    // the ancestors looked up in their own right.
+    const { root, work } = await makeUntrackedCollisionRepo();
+    const seed = path.join(root, "seed");
+    await commit(seed, "generated", "upstream file, not a directory\n");
+    await git(["push", "-q", "origin", "main"], seed);
+    await git(["fetch", "-q", "origin", "main"], work);
+    await writeFile(work, "generated/nested/agent-note.md", "agent treated it as a directory\n");
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+    expect(await fs.readFile(path.join(work, "generated"), "utf8")).toBe("upstream file, not a directory\n");
+  });
+
   it("leaves untracked files that do not collide exactly where they are", async () => {
     const { work } = await makeUntrackedCollisionRepo();
     await prepare(work);
