@@ -207,6 +207,9 @@ jobs:
       - name: Test worktree provisioning fallback ladder
         run: node --test ./scripts/__tests__/provision-worktree-self-heal.test.mjs
 
+      - name: Test provisioner instance id reuse
+        run: node --test ./scripts/__tests__/provision-worktree-instance-id-reuse.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
