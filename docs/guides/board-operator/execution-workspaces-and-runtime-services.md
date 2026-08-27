@@ -114,6 +114,27 @@ Code state moves between runs through the local execution-workspace cwd alone �
 
 The invariant is enforced by the "no-remote-git contract" case in `packages/adapter-utils/src/ssh-fixture.test.ts`, which asserts a remote-only commit reaches the local worktree with no remote configured at any point.
 
+## Base repository drift
+
+The base repository — `<project workspace cwd>`, the clone that holds `.paperclip/worktrees` — is nobody's workspace. Worktrees are cut from `origin/<base ref>`, never from its HEAD, so its working tree is used by hygiene and by provisioning, and by nothing else.
+
+Agents nonetheless leave files in it. Its path is exported as both `PAPERCLIP_WORKSPACE_BASE_CWD` and `PAPERCLIP_WORKSPACE_REPO_ROOT`, so any main-branch errand has exactly one home. Those leftovers are harmless while they stay untracked and unique. One becomes a wedge the moment the same path lands on the base ref: `git merge --ff-only` then refuses, and refuses identically on every later dispatch.
+
+Hygiene now clears that case on its own. Before fast-forwarding, it moves untracked paths that the base ref also contains into `<git dir>/paperclip-base-repo-quarantine/<timestamp>/` and records them on the `worktree_prepare` operation. Files are moved, never deleted, and nothing under `.paperclip` is ever eligible — the live agent worktrees are there.
+
+What is left behind is recorded rather than acted on, under `metadata.untrackedBaseRepoPaths` on the same operation. To see the drift across a fleet:
+
+```sql
+select cwd, jsonb_array_length(metadata->'untrackedBaseRepoPaths') as untracked, metadata->'untrackedBaseRepoPaths'
+from workspace_operations
+where phase = 'worktree_prepare'
+  and metadata ? 'untrackedBaseRepoPaths'
+  and started_at > now() - interval '1 day'
+order by untracked desc;
+```
+
+Anything that appears there is a file an agent wrote to a shared checkout. Deleting it is safe once you know which run produced it; leaving it is safe until its path ships upstream.
+
 ## Current implementation guarantees
 
 With the current implementation:
