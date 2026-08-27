@@ -518,6 +518,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # The path gate diffs BASE_SHA...HEAD_SHA, so the base commit must
+          # actually exist in the checkout like it does for the policy job.
+          fetch-depth: 0
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
