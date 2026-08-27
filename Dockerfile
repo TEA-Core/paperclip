@@ -4,11 +4,13 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 \
-  # libcap2-bin provides capsh, which the entrypoint uses to hand the server an
-  # ambient CAP_KILL when the agent-uid split is armed — without it the server
-  # cannot signal the agent uid and every run timeout dies with EPERM. It is
-  # currently pulled in transitively by the base image; name it explicitly so a
-  # base bump cannot silently remove it.
+  # libcap2-bin provides capsh, which the entrypoint uses to hand the server
+  # ambient CAP_KILL and CAP_FOWNER when the agent-uid split is armed — without
+  # CAP_KILL the server cannot signal the agent uid (every run timeout dies
+  # with EPERM); without CAP_FOWNER it cannot chmod agent-owned files in mixed
+  # worktrees and pnpm linkBin aborts provisioning (SUP-13977). It is currently
+  # pulled in transitively by the base image; name it explicitly so a base bump
+  # cannot silently remove it.
   && apt-get install -y --no-install-recommends libcap2-bin \
   # Agents run as an unprivileged user with no sudo, so anything they need at
   # runtime has to be baked in here — they cannot apt-get install it themselves.
@@ -299,23 +301,32 @@ RUN groupadd -g ${AGENTS_GID} agents \
        echo "SKIP paperclip-spawn-agent exec probes: BUILDPLATFORM=${BUILDPLATFORM} != TARGETPLATFORM=${TARGETPLATFORM} (setuid bit is not honoured under binfmt emulation)"; \
      fi \
   # capsh is the other half of the uid split: the entrypoint uses it to hand the
-  # server an ambient CAP_KILL, without which the server can create agent
-  # processes but never signal them. It arrives with libcap2-bin. Prove it is
-  # present AND functional in the built image, so a base-image bump that drops
-  # the package fails the build instead of silently degrading every deployment
-  # to a server that cannot enforce a run timeout.
+  # server ambient CAP_KILL and CAP_FOWNER, without which the server can create
+  # agent processes but never signal them, and cannot chmod agent-owned files in
+  # mixed-ownership worktrees (pnpm linkBin EPERMs, SUP-13977). It arrives with
+  # libcap2-bin. Prove it is present AND functional in the built image, so a
+  # base-image bump that drops the package fails the build instead of silently
+  # degrading every deployment to a server that cannot enforce a run timeout or
+  # re-provision a tree an agent has written to.
   #
-  # The grant itself also needs cap_kill in the BOUNDING set, which belongs to
-  # the builder rather than the image — a builder that trims capabilities would
-  # fail this probe for a reason the image cannot fix. So assert the full grant
-  # only when the builder actually has cap_kill, and otherwise assert presence
-  # alone and say so out loud: a probe that quietly downgrades reads as a pass.
+  # The grant itself also needs both capabilities in the BOUNDING set, which
+  # belongs to the builder rather than the image — a builder that trims
+  # capabilities would fail this probe for a reason the image cannot fix. So
+  # assert the full grant only when the builder actually has both, and
+  # otherwise assert presence alone and say so out loud: a probe that quietly
+  # downgrades reads as a pass.
+  #
+  # The probe asserts the resulting capability MASK (cap_fowner+cap_kill =
+  # bits 3+5 = 0x28) and the dropped uid, not the exit status alone — the capsh
+  # grant fails soft and a successful-looking arm can leave the bit absent.
   && command -v capsh >/dev/null \
-  && if capsh --print | sed -n 's/^Bounding set =//p' | grep -q '\bcap_kill\b'; then \
-       [ "$(capsh --keep=1 --user=node --inh=cap_kill --addamb=cap_kill \
-              --shell=/bin/sh -- -c 'id -u')" = "$(id -u node)" ]; \
+  && if capsh --print | sed -n 's/^Bounding set =//p' | grep -q '\bcap_kill\b' \
+     && capsh --print | sed -n 's/^Bounding set =//p' | grep -q '\bcap_fowner\b'; then \
+       [ "$(capsh --keep=1 --user=node --inh=cap_kill,cap_fowner --addamb=cap_kill,cap_fowner \
+              --shell=/bin/sh -- -c 'echo "$(id -u) $(sed -n "s/^CapAmb:[[:space:]]*//p" /proc/self/status)"')" \
+         = "$(id -u node) 0000000000000028" ]; \
      else \
-       echo "SKIP capsh grant probe: cap_kill is not in the builder's bounding set (capsh presence is still asserted)"; \
+       echo "SKIP capsh grant probe: cap_kill/cap_fowner not both in the builder's bounding set (capsh presence is still asserted)"; \
      fi
 
 COPY --from=build /app /app
