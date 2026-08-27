@@ -104,8 +104,37 @@ async function makeUntrackedCollisionRepo(): Promise<{ root: string; work: strin
   return { root, work };
 }
 
-const prepare = (work: string) =>
-  prepareBaseRepoForWorkspace({ repoRoot: work, configuredBaseRef: "main" });
+const prepare = (work: string, recorder?: unknown) =>
+  prepareBaseRepoForWorkspace({
+    repoRoot: work,
+    configuredBaseRef: "main",
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    recorder: (recorder ?? null) as any,
+  });
+
+type RecordedOperation = { phase: string; command: string | null; status: string };
+
+/** Collects what a real run would write to workspace_operations. */
+function makeRecorder(): { recorder: unknown; operations: RecordedOperation[] } {
+  const operations: RecordedOperation[] = [];
+  const recorder = {
+    attachExecutionWorkspaceId: async () => {},
+    recordOperation: async (input: {
+      phase: string;
+      command?: string | null;
+      run: () => Promise<{ status?: string }>;
+    }) => {
+      const result = await input.run();
+      operations.push({
+        phase: input.phase,
+        command: input.command ?? null,
+        status: result.status ?? "succeeded",
+      });
+      return {} as never;
+    },
+  };
+  return { recorder, operations };
+}
 
 describe("base repo hygiene with untracked paths that collide with the base ref", () => {
   it("the fixture really does reproduce git's refusal", async () => {
@@ -152,6 +181,20 @@ describe("base repo hygiene with untracked paths that collide with the base ref"
     // thing capable of blocking a merge.
     expect(await git(["status", "--porcelain", "--untracked-files=all"], work))
       .toBe(`?? ${INNOCENT}`);
+  });
+
+  it("records no failed operation — the doomed merge is never run", async () => {
+    // The wedge was visible as 1,035 failed `git merge --ff-only` rows. A fix that
+    // still ran the refusal first and recovered afterwards would leave the failure
+    // rate, and the alarm fatigue, exactly where it was.
+    const { work } = await makeUntrackedCollisionRepo();
+    const { recorder, operations } = makeRecorder();
+
+    await prepare(work, recorder);
+
+    const merges = operations.filter((op) => op.command?.includes("merge --ff-only"));
+    expect(merges.map((op) => op.status)).toEqual(["succeeded"]);
+    expect(operations.filter((op) => op.status === "failed")).toEqual([]);
   });
 
   it("leaves untracked files that do not collide exactly where they are", async () => {

@@ -4003,10 +4003,13 @@ async function pruneBaseRepoQuarantine(quarantineRoot: string): Promise<void> {
  * Safe, however, is not the same as self-clearing. The untracked-file refusal is
  * the one refusal that never resolves on its own: the file stays, the base ref
  * keeps containing it, and the identical abort repeats on every dispatch for as
- * long as anyone leaves it there. So that case — and only that case — is retried
- * once after moving exactly the offending paths into the git directory, which is
- * what `quarantineBaseRepoUntrackedCollisions` does. Ahead and diverged still
- * just warn; they mean commits, and commits are somebody's work.
+ * long as anyone leaves it there. So that case — and only that case — is cleared
+ * first, by `quarantineBaseRepoUntrackedCollisions`. It is asked before the merge
+ * rather than after a refusal: reaching here means HEAD is behind, so an untracked
+ * path the base ref also contains is not a risk of a refusal, it is the refusal
+ * already decided, and the doomed attempt is worth neither running nor recording.
+ * Ahead and diverged still just warn; they mean commits, and commits are
+ * somebody's work.
  *
  * No rescue ref / snapshot is needed — a fast-forward is non-destructive (old
  * HEAD remains an ancestor of the new tip). Never uses `git reset --hard`,
@@ -4020,7 +4023,7 @@ async function fastForwardBaseRepoToDefaultRef(input: {
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<{ fastForwarded: boolean; quarantined: string[]; warnings: string[] }> {
   const warnings: string[] = [];
-  const merge = (attempt: number) =>
+  const merge = (quarantined: string[], untracked: string[]) =>
     recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["merge", "--ff-only", input.baseRef],
@@ -4030,23 +4033,23 @@ async function fastForwardBaseRepoToDefaultRef(input: {
         repoRoot: input.repoRoot,
         baseRef: input.baseRef,
         fastForwardOnly: true,
-        ...(attempt > 1 ? { afterUntrackedQuarantine: true } : {}),
+        ...(quarantined.length > 0 ? { quarantinedUntrackedPaths: quarantined } : {}),
+        // Files an agent errand left in a checkout that is nobody's workspace.
+        // None of these block anything today; any of them becomes the next wedge
+        // the moment the same path lands on the base ref. Recorded rather than
+        // warned so the drift is queryable without adding noise to every
+        // dispatch, and without new rows — this operation is written regardless.
+        ...(untracked.length > 0 ? { untrackedBaseRepoPaths: untracked } : {}),
       },
       successMessage: `Fast-forwarded base repository at ${input.repoRoot} to ${input.baseRef}\n`,
       failureLabel: `git merge --ff-only ${input.baseRef}`,
     });
 
-  try {
-    await merge(1);
-    return { fastForwarded: true, quarantined: [], warnings };
-  } catch (error) {
-    warnings.push(error instanceof Error ? error.message : String(error));
-  }
-
-  // A refused fast-forward is safe but not self-clearing: when the blocker is an
-  // untracked file the base ref also contains, the identical refusal repeats on
-  // every dispatch forever. Move exactly those paths aside and try once more.
-  // Bounded to a single retry on purpose — hygiene must never become a loop.
+  // Clear the one blocker that never clears itself, BEFORE the merge rather than
+  // after it refuses. We are only here because HEAD is behind the base ref, so an
+  // untracked path the base ref also contains is not a risk of a refusal — it is
+  // the refusal, already decided. Asking first costs two plumbing commands and
+  // means the doomed attempt is never run and never recorded as a failure.
   const quarantine = await quarantineBaseRepoUntrackedCollisions({
     repoRoot: input.repoRoot,
     baseRef: input.baseRef,
@@ -4058,15 +4061,18 @@ async function fastForwardBaseRepoToDefaultRef(input: {
     warnings: [`could not quarantine untracked base repo paths: ${error instanceof Error ? error.message : String(error)}`],
   }));
   warnings.push(...quarantine.warnings);
-  if (quarantine.quarantined.length === 0) {
-    return { fastForwarded: false, quarantined: [], warnings };
+  if (quarantine.quarantined.length > 0) {
+    warnings.push(
+      `Moved ${quarantine.quarantined.length} untracked path(s) that ${input.baseRef} also contains to ${quarantine.destination}: ${quarantine.quarantined.join(", ")}.`,
+    );
   }
 
-  warnings.push(
-    `Moved ${quarantine.quarantined.length} untracked path(s) that ${input.baseRef} also contains to ${quarantine.destination}: ${quarantine.quarantined.join(", ")}.`,
-  );
+  const remainingUntracked = await runGit(["ls-files", "--others", "--exclude-standard"], input.repoRoot)
+    .then((value) => value.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 50))
+    .catch(() => [] as string[]);
+
   try {
-    await merge(2);
+    await merge(quarantine.quarantined, remainingUntracked);
     return { fastForwarded: true, quarantined: quarantine.quarantined, warnings };
   } catch (error) {
     warnings.push(error instanceof Error ? error.message : String(error));
