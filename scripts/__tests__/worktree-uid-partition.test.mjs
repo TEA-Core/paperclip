@@ -57,7 +57,7 @@ test("the harness refuses to run without a way to obtain a second real uid", () 
 test("the child refuses uid-0 and same-uid runs", () => {
   assert.match(
     child,
-    /refusing to run as uid 0/,
+    /refusing to run any phase as uid 0/,
     "root bypasses the 0o600 boundary, so a root run must be a hard refusal",
   );
   assert.match(

@@ -11,17 +11,18 @@
 #   4. resolve + assert as uid A  (the reverse direction, so the probe cannot
 #      pass by uid ordering)
 #
-# The child (scripts/probe-worktree-uid-partition-child.mjs) does the per-uid
-# assertions against the tree's real consumer code
-# (server/src/dev-runner-worktree.ts) via tsx, so this works against both the
-# canonical-only fold-head resolution (RED) and the uid-scoped resolution from
-# SUP-14087/14118 (GREEN).
+# The child (scripts/probe-worktree-uid-partition-child.mjs) is launched as
+# root, imports the tree's REAL consumer code (server/src/dev-runner-worktree.ts)
+# through tsx, then drops itself to the target real uid with process.setuid and
+# performs every assertion as that real uid. The harness first verifies each
+# real uid is obtainable (setpriv --reuid id -u) and the child verifies its own
+# post-drop getuid(), so a probe that cannot run as a second real uid FAILS
+# LOUDLY naming the missing prerequisite — a silently skipped probe reproduces
+# the green-when-skipped failure mode that made the SUP-13977 deploy-workflow
+# conclusion inadmissible.
 #
-# This harness MUST run as root (or be invokable via passwordless sudo): it
-# drops to each real uid with setpriv. If a second real uid cannot be obtained
-# the probe FAILS LOUDLY with the missing prerequisite named — a silently
-# skipped probe reproduces the green-when-skipped failure mode that made the
-# SUP-13977 deploy-workflow conclusion inadmissible.
+# This works against both the canonical-only fold-head resolution (RED) and the
+# uid-scoped resolution from SUP-14087/14118 (GREEN).
 #
 # Local invocation (root or passwordless sudo):
 #   sudo bash scripts/probe-worktree-uid-partition.sh
@@ -48,7 +49,7 @@ if [ "$(id -u)" != "0" ]; then
   if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
     exec sudo -n bash "$0" "$@"
   fi
-  no "second real uid cannot be obtained: this probe needs root or passwordless sudo to run setpriv --reuid, and current uid $(id -u) has no privilege path to it"
+  no "second real uid cannot be obtained: this probe needs root or passwordless sudo to run setuid/setpriv, and current uid $(id -u) has no privilege path to it"
   printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
   exit 1
 fi
@@ -70,11 +71,7 @@ fi
 require setpriv
 require node
 
-TSX_LOADER=""
-for candidate in "$REPO/cli/node_modules/tsx/dist/loader.mjs" "$REPO/node_modules/tsx/dist/loader.mjs"; do
-  [ -f "$candidate" ] && TSX_LOADER="$candidate" && break
-done
-if [ -z "$TSX_LOADER" ]; then
+if [ ! -f "$REPO/cli/node_modules/tsx/dist/loader.mjs" ]; then
   no "cannot find tsx loader under $REPO (expected cli/node_modules/tsx/dist/loader.mjs); run 'pnpm install --frozen-lockfile' first"
   exit 1
 fi
@@ -85,14 +82,12 @@ fi
 for u in "$UID_A" "$UID_B"; do
   got="$(setpriv --reuid="$u" --regid="$u" --clear-groups -- id -u 2>/dev/null || echo OBTAIN_FAILED)"
   if [ "$got" = "$u" ]; then
-    ok "real process under uid $u obtained (setpriv --reuid=$u)"
+    ok "real process under uid $u obtainable (setpriv --reuid=$u -> $got)"
   else
     no "cannot run a real process as uid $u (setpriv returned '$got') — the two-real-uid contract cannot be met; prerequisite missing"
     exit 1
   fi
 done
-
-CHILD="$HERE/probe-worktree-uid-partition-child.mjs"
 
 # --- fixture: a linked worktree whose .paperclip/ is a shared-write state dir --
 FIX="$(mktemp -d /tmp/paperclip-uid-probe-XXXXXX)"
@@ -104,14 +99,24 @@ mkdir -p "$FIX/.paperclip"
 # Shared-write state dir: both uids create their scoped subdirs, canonical
 # 0o600 files owned by the canonical owner are what the kernel protects.
 chmod 1777 "$FIX/.paperclip"
+mkdir -p "$FIX/home"
+chmod 0777 "$FIX/home"
+
+CHILD="$HERE/probe-worktree-uid-partition-child.mjs"
+TSX_LOADER="$REPO/cli/node_modules/tsx/dist/loader.mjs"
 
 run_child() {
-  # $1 = uid, $2 = role. The other uid is derived so the child is symmetric.
+  # $1 = uid, $2 = role. The child drops itself to $1; the other uid is derived
+  # so the probe is symmetric. Runs as root so the live tree and tsx are
+  # readable even under a non-traversable checkout path.
   local target_uid="$1" other
   if [ "$target_uid" = "$UID_A" ]; then other="$UID_B"; else other="$UID_A"; fi
   local out rc
-  out="$(setpriv --reuid="$target_uid" --regid="$target_uid" --clear-groups -- env \
+  out="$(env \
+    HOME="$FIX/home" \
+    XDG_CACHE_HOME="$FIX/home/.cache" \
     PAPERCLIP_PROBE_ROOT="$FIX" \
+    PAPERCLIP_PROBE_TARGET_UID="$target_uid" \
     PAPERCLIP_PROBE_OTHER_UID="$other" \
     PAPERCLIP_PROBE_REPO_ROOT="$REPO" \
     PAPERCLIP_PROBE_CANONICAL_OWNER_UID="$UID_A" \

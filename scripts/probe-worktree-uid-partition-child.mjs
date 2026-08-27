@@ -2,23 +2,28 @@
 // Per-uid half of the two-real-uid worktree state-partition regression probe
 // (SUP-14127, SUP-14126 ruling item 4).
 //
-// This process runs as ONE real uid and performs the partition assertions for
-// that uid: the other uid's 0o600 canonical/scoped config+env must yield a
-// genuine EACCES from a real open(), the current uid's worktree state-dir
-// resolution must land on the current uid's OWN scoped state dir, and the run
-// must never mutate the other uid's files (stat uid + mtime before/after).
-// The root orchestrator (scripts/probe-worktree-uid-partition.sh) runs this
-// child once per real uid, so both directions are exercised in one probe run.
+// This child is launched as root by the harness and drops itself to ONE real
+// target uid via process.setuid() (the harness verifies the drop by reading
+// back process.getuid()). It then performs the partition assertions for that
+// uid: the other uid's 0o600 canonical/scoped config+env must yield a genuine
+// EACCES from a real open(), the current uid's worktree state-dir resolution
+// must land on the current uid's OWN scoped state dir, and the run must never
+// mutate the other uid's files (stat uid + mtime before/after). The root
+// orchestrator (scripts/probe-worktree-uid-partition.sh) runs this child once
+// per real uid, so both directions are exercised in one probe run.
 //
 // The resolution under test is the tree's real consumer code
-// (server/src/dev-runner-worktree.ts), imported through tsx's loader so the
-// probe works against both the fold head (canonical-only resolution) and the
-// uid-scoped resolution (SUP-14087/14118). A hardcoded `uid-<n>` directory
-// name never stands in for a real uid here: every scoped path is derived from
-// process.getuid() and the other real uid passed in the environment.
+// (server/src/dev-runner-worktree.ts), imported through tsx's loader BEFORE the
+// privilege drop (so it is read from the live tree) and CALLED after the drop
+// (so every process.getuid()-derived decision is made as the real target uid).
+// This works against both the fold head (canonical-only resolution) and the
+// uid-scoped resolution (SUP-14087/14118). A hardcoded `uid-<n>` directory name
+// never stands in for a real uid here: every scoped path is derived from the
+// real process uid and the other real uid passed in the environment.
 //
 // Required environment:
 //   PAPERCLIP_PROBE_ROOT                 fixture worktree root
+//   PAPERCLIP_PROBE_TARGET_UID           the real uid to drop to for this run
 //   PAPERCLIP_PROBE_OTHER_UID            the other real uid (numeric)
 //   PAPERCLIP_PROBE_REPO_ROOT            repo root whose resolution code is probed
 //   PAPERCLIP_PROBE_CANONICAL_OWNER_UID  the uid that owns the canonical .paperclip/ state
@@ -29,7 +34,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 
 const ROLE = process.argv[2];
 if (ROLE !== "provision" && ROLE !== "resolve") {
@@ -38,42 +43,29 @@ if (ROLE !== "provision" && ROLE !== "resolve") {
 }
 
 const root = path.resolve(requireEnv("PAPERCLIP_PROBE_ROOT"));
+const targetUid = Number(requireEnv("PAPERCLIP_PROBE_TARGET_UID"));
 const otherUid = Number(requireEnv("PAPERCLIP_PROBE_OTHER_UID"));
 const repoRoot = path.resolve(requireEnv("PAPERCLIP_PROBE_REPO_ROOT"));
 const canonicalOwnerUid = Number(requireEnv("PAPERCLIP_PROBE_CANONICAL_OWNER_UID"));
 
-const uid = typeof process.getuid === "function" ? process.getuid() : -1;
-if (uid < 0) {
-  console.error("probe child: this platform has no process.getuid() — cannot run a real-uid probe");
+if (!Number.isInteger(targetUid) || !Number.isInteger(otherUid) || !Number.isInteger(canonicalOwnerUid)) {
+  console.error("probe child: PAPERCLIP_PROBE_TARGET_UID/OTHER_UID/CANONICAL_OWNER_UID must be numeric uids");
   process.exit(2);
 }
-if (uid === otherUid) {
+if (targetUid === 0 || otherUid === 0 || canonicalOwnerUid === 0) {
   console.error(
-    `probe child: refusing to run — current uid ${uid} equals the other real uid; ` +
+    "probe child: refusing to run any phase as uid 0 — root bypasses the 0o600 permission " +
+      "boundary, so an EACCES assertion under root would be meaningless",
+  );
+  process.exit(2);
+}
+if (targetUid === otherUid) {
+  console.error(
+    `probe child: refusing to run — target uid ${targetUid} equals the other real uid; ` +
       "a probe run needs two DISTINCT real uids",
   );
   process.exit(2);
 }
-if (canonicalOwnerUid === 0 || otherUid === 0 || uid === 0) {
-  console.error(
-    "probe child: refusing to run as uid 0 — root bypasses the 0o600 permission boundary, " +
-      "so an EACCES assertion under root would be meaningless",
-  );
-  process.exit(2);
-}
-
-const canonicalDir = path.resolve(root, ".paperclip");
-const scopedDir = path.resolve(canonicalDir, `uid-${uid}`);
-const otherScopedDir = path.resolve(canonicalDir, `uid-${otherUid}`);
-
-const canonicalFiles = ["config.json", ".env"].map((name) => path.join(canonicalDir, name));
-// The owning uid's provisioned state lives in the canonical dir for the
-// canonical owner and in the uid-scoped dir for every other uid, so the
-// cross-uid EACCES target is selected per direction.
-const crossTargets =
-  uid === canonicalOwnerUid
-    ? ["config.json", ".env"].map((name) => path.join(otherScopedDir, name))
-    : canonicalFiles;
 
 function requireEnv(name) {
   const value = process.env[name];
@@ -112,6 +104,53 @@ async function loadResolutionModule() {
   }
   return import(pathToFileURL(modulePath).href);
 }
+
+// The module is imported while still root so the live tree is readable even
+// under a non-traversable checkout path; every assertion below runs after the
+// drop, with the process's real uid equal to the target.
+const module = ROLE === "resolve" ? await loadResolutionModule() : null;
+if (ROLE === "resolve" && !module) process.exit(1);
+
+if (typeof process.setuid !== "function" || typeof process.getuid !== "function") {
+  console.error("probe child: this platform cannot setuid/getuid — cannot run a real-uid probe");
+  process.exit(2);
+}
+
+// Drop: setgid before setuid (after setuid the gid can no longer be changed),
+// then verify the drop actually took rather than assuming it.
+try {
+  if (typeof process.setgid === "function") process.setgid(targetUid);
+  process.setuid(targetUid);
+} catch (error) {
+  console.error(
+    `probe child: cannot drop to real uid ${targetUid}: ${error.message} — ` +
+      "the two-real-uid contract cannot be met; the harness must run as root",
+  );
+  process.exit(2);
+}
+
+const uid = process.getuid();
+if (uid !== targetUid) {
+  console.error(
+    `probe child: privilege drop failed — after setuid(${targetUid}) the real uid reads ${uid}; ` +
+      "the two-real-uid contract cannot be met",
+  );
+  process.exit(2);
+}
+console.log(`probe child dropped to real uid ${uid} (other uid ${otherUid})`);
+
+const canonicalDir = path.resolve(root, ".paperclip");
+const scopedDir = path.resolve(canonicalDir, `uid-${uid}`);
+const otherScopedDir = path.resolve(canonicalDir, `uid-${otherUid}`);
+
+const canonicalFiles = ["config.json", ".env"].map((name) => path.join(canonicalDir, name));
+// The owning uid's provisioned state lives in the canonical dir for the
+// canonical owner and in the uid-scoped dir for every other uid, so the
+// cross-uid EACCES target is selected per direction.
+const crossTargets =
+  uid === canonicalOwnerUid
+    ? ["config.json", ".env"].map((name) => path.join(otherScopedDir, name))
+    : canonicalFiles;
 
 function snapshot(paths) {
   return Object.fromEntries(
@@ -208,9 +247,6 @@ function provision() {
 }
 
 async function resolve() {
-  const module = await loadResolutionModule();
-  if (!module) return;
-
   const resolveWorktreeEnvFilePath = module.resolveWorktreeEnvFilePath;
   const bootstrapDevRunnerWorktreeEnv = module.bootstrapDevRunnerWorktreeEnv;
   const isWorktreeSeedPending = module.isWorktreeSeedPending;
@@ -220,8 +256,6 @@ async function resolve() {
   if (!isLinkedGitWorktreeCheckout(root)) {
     fail(`resolution module did not recognize ${root} as a linked git worktree`);
   }
-
-  console.log(`probe child running as real uid ${uid} (other uid ${otherUid})`);
 
   // --- EACCES on the owning uid's 0o600 config/env + same-uid control ------
   const controlFiles =
@@ -309,9 +343,7 @@ async function resolve() {
     if (bootstrap.missingEnv) {
       fail(`bootstrapDevRunnerWorktreeEnv reported missingEnv despite a readable ${envPath}`);
     } else if (path.resolve(bootstrap.envPath ?? "") !== path.resolve(envPath)) {
-      fail(
-        `bootstrapDevRunnerWorktreeEnv resolved ${bootstrap.envPath}, expected ${envPath}`,
-      );
+      fail(`bootstrapDevRunnerWorktreeEnv resolved ${bootstrap.envPath}, expected ${envPath}`);
     } else if (!contents.includes(`PAPERCLIP_INSTANCE_ID=probe-instance-${uid}`)) {
       fail(`scoped env at ${envPath} is not the running uid's own env`);
     } else {
