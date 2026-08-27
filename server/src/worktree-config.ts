@@ -684,3 +684,5 @@ export function maybePersistWorktreeRuntimePorts(input: {
   }
 }
 
+
+// SUP-14127 red-evidence trigger: touching this file runs the two-real-uid probe check.
