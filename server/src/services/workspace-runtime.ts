@@ -3845,6 +3845,153 @@ async function restoreBaseRepoToDefaultRef(input: {
 }
 
 /**
+ * Untracked base-repo paths that the base ref itself contains.
+ *
+ * These, and only these, are what git refuses to overwrite:
+ *
+ *   error: The following untracked working tree files would be overwritten by merge:
+ *
+ * Derived from git state rather than parsed out of that message, so wording,
+ * locale, and truncation cannot change the answer. `--exclude-standard` keeps
+ * ignored paths out, and the base ref is queried with the untracked paths as a
+ * pathspec, so this stays one `ls-tree` regardless of repo size.
+ */
+async function resolveBaseRepoUntrackedCollisions(input: {
+  repoRoot: string;
+  baseRef: string;
+}): Promise<string[]> {
+  const untracked = await runGit(["ls-files", "--others", "--exclude-standard"], input.repoRoot)
+    .then((value) => value.split("\n").map((line) => line.trim()).filter(Boolean))
+    .catch(() => [] as string[]);
+  const candidates = untracked.filter(isQuarantinableBaseRepoPath).slice(0, BASE_REPO_QUARANTINE_MAX_PATHS);
+  if (candidates.length === 0) return [];
+
+  const inBaseRef = await runGit(
+    ["ls-tree", "-r", "--name-only", "-z", input.baseRef, "--", ...candidates],
+    input.repoRoot,
+  )
+    .then((value) => new Set(value.split("\0").map((line) => line.trim()).filter(Boolean)))
+    .catch(() => new Set<string>());
+
+  return candidates.filter((candidate) => inBaseRef.has(candidate));
+}
+
+/** Hard limit on how many paths one quarantine may move. */
+const BASE_REPO_QUARANTINE_MAX_PATHS = 200;
+/** How many quarantine directories to keep before pruning the oldest. */
+const BASE_REPO_QUARANTINE_KEEP = 20;
+
+/**
+ * Whether an untracked path may be moved out of the way at all.
+ *
+ * The agent worktrees live at `<repoRoot>/.paperclip/worktrees`, and that whole
+ * directory is untracked in at least one repo on this fleet. Nothing under
+ * `.paperclip/` is ever eligible, whatever the base ref claims to contain —
+ * moving a live workspace to unwedge a fast-forward would trade a noisy failure
+ * for a silent one.
+ */
+export function isQuarantinableBaseRepoPath(relativePath: string): boolean {
+  if (!relativePath || path.isAbsolute(relativePath)) return false;
+  const segments = relativePath.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return false;
+  if (segments[0] === ".paperclip" || segments[0] === ".git") return false;
+  return true;
+}
+
+/**
+ * Move untracked base-repo files that block a fast-forward out of the way.
+ *
+ * The motivating incident: the Trading-Signal-Platform base repo sat on main,
+ * tracked-clean and 22 commits behind, holding untracked files an agent errand
+ * had left in it. Two of those paths later landed upstream, so every subsequent
+ * `git merge --ff-only origin/main` aborted — 1,035 recorded worktree_prepare
+ * failures over seven days, and a base repo that could never advance again,
+ * because untracked paths are (correctly) excluded from the hygiene decision and
+ * nothing else ever cleared them.
+ *
+ * Surgical by construction: only paths git state proves are both untracked and
+ * present in the base ref, never a `git clean`, and the files are moved rather
+ * than deleted so the content survives inspection. The destination is inside the
+ * git directory, not the working tree, so a quarantine can never itself become
+ * the untracked file that blocks the next merge.
+ */
+async function quarantineBaseRepoUntrackedCollisions(input: {
+  repoRoot: string;
+  baseRef: string;
+  timestamp: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ quarantined: string[]; destination: string | null; warnings: string[] }> {
+  const warnings: string[] = [];
+  const collisions = await resolveBaseRepoUntrackedCollisions(input);
+  if (collisions.length === 0) return { quarantined: [], destination: null, warnings };
+
+  const gitDir = await runGit(["rev-parse", "--git-common-dir"], input.repoRoot)
+    .then((value) => path.resolve(input.repoRoot, value))
+    .catch(() => null);
+  if (!gitDir) {
+    warnings.push("could not resolve the base repo git directory; leaving untracked collisions in place");
+    return { quarantined: [], destination: null, warnings };
+  }
+
+  const destination = path.join(gitDir, "paperclip-base-repo-quarantine", input.timestamp);
+  const quarantined: string[] = [];
+  for (const relativePath of collisions) {
+    const from = path.join(input.repoRoot, relativePath);
+    const to = path.join(destination, relativePath);
+    try {
+      await fs.mkdir(path.dirname(to), { recursive: true });
+      await fs.rename(from, to).catch(async (error) => {
+        // Cross-device or a permission shape rename cannot handle: copy, then unlink.
+        // Only an unlink that succeeds counts, because a file still on disk still blocks.
+        if ((error as NodeJS.ErrnoException)?.code !== "EXDEV") throw error;
+        await fs.cp(from, to, { recursive: true });
+        await fs.rm(from, { recursive: true, force: false });
+      });
+      quarantined.push(relativePath);
+    } catch (error) {
+      warnings.push(
+        `could not quarantine untracked base repo path "${relativePath}": ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  if (quarantined.length > 0) {
+    await pruneBaseRepoQuarantine(path.dirname(destination));
+  }
+
+  if (input.recorder && quarantined.length > 0) {
+    await input.recorder.recordOperation({
+      phase: "worktree_prepare",
+      command: `quarantine ${quarantined.length} untracked base repo path(s)`,
+      cwd: input.repoRoot,
+      metadata: {
+        baseRepoHygiene: true,
+        baseRepoUntrackedQuarantine: true,
+        repoRoot: input.repoRoot,
+        baseRef: input.baseRef,
+        quarantined,
+        destination,
+      },
+      run: async () => ({
+        status: "succeeded",
+        system: `Moved ${quarantined.length} untracked path(s) that ${input.baseRef} also contains to ${destination}:\n${quarantined.join("\n")}`,
+      }),
+    }).catch(() => undefined);
+  }
+
+  return { quarantined, destination, warnings };
+}
+
+/** Keep the quarantine bounded — it is an audit trail, not a second repository. */
+async function pruneBaseRepoQuarantine(quarantineRoot: string): Promise<void> {
+  const entries = await fs.readdir(quarantineRoot).catch(() => [] as string[]);
+  const stale = entries.sort().slice(0, Math.max(0, entries.length - BASE_REPO_QUARANTINE_KEEP));
+  for (const entry of stale) {
+    await fs.rm(path.join(quarantineRoot, entry), { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
  * Fast-forward a clean base repo to its default ref.
  *
  * Uses `git merge --ff-only`, which advances HEAD only when it is a strict
@@ -3853,19 +4000,28 @@ async function restoreBaseRepoToDefaultRef(input: {
  * be overwritten, which is the desired safety behavior: a refused fast-forward
  * only warns and never blocks the dispatch (same SUP-11285 contract as restore).
  *
+ * Safe, however, is not the same as self-clearing. The untracked-file refusal is
+ * the one refusal that never resolves on its own: the file stays, the base ref
+ * keeps containing it, and the identical abort repeats on every dispatch for as
+ * long as anyone leaves it there. So that case — and only that case — is retried
+ * once after moving exactly the offending paths into the git directory, which is
+ * what `quarantineBaseRepoUntrackedCollisions` does. Ahead and diverged still
+ * just warn; they mean commits, and commits are somebody's work.
+ *
  * No rescue ref / snapshot is needed — a fast-forward is non-destructive (old
  * HEAD remains an ancestor of the new tip). Never uses `git reset --hard`,
  * `checkout -f`, `clean`, or `stash -u`: those could overwrite or remove
- * untracked files, including the `.paperclip/worktrees` directory.
+ * untracked files wholesale, including the `.paperclip/worktrees` directory.
  */
 async function fastForwardBaseRepoToDefaultRef(input: {
   repoRoot: string;
   baseRef: string;
+  timestamp: string;
   recorder?: WorkspaceOperationRecorder | null;
-}): Promise<{ fastForwarded: boolean; warnings: string[] }> {
+}): Promise<{ fastForwarded: boolean; quarantined: string[]; warnings: string[] }> {
   const warnings: string[] = [];
-  try {
-    await recordGitOperation(input.recorder, {
+  const merge = (attempt: number) =>
+    recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["merge", "--ff-only", input.baseRef],
       cwd: input.repoRoot,
@@ -3874,14 +4030,47 @@ async function fastForwardBaseRepoToDefaultRef(input: {
         repoRoot: input.repoRoot,
         baseRef: input.baseRef,
         fastForwardOnly: true,
+        ...(attempt > 1 ? { afterUntrackedQuarantine: true } : {}),
       },
       successMessage: `Fast-forwarded base repository at ${input.repoRoot} to ${input.baseRef}\n`,
       failureLabel: `git merge --ff-only ${input.baseRef}`,
     });
-    return { fastForwarded: true, warnings };
+
+  try {
+    await merge(1);
+    return { fastForwarded: true, quarantined: [], warnings };
   } catch (error) {
     warnings.push(error instanceof Error ? error.message : String(error));
-    return { fastForwarded: false, warnings };
+  }
+
+  // A refused fast-forward is safe but not self-clearing: when the blocker is an
+  // untracked file the base ref also contains, the identical refusal repeats on
+  // every dispatch forever. Move exactly those paths aside and try once more.
+  // Bounded to a single retry on purpose — hygiene must never become a loop.
+  const quarantine = await quarantineBaseRepoUntrackedCollisions({
+    repoRoot: input.repoRoot,
+    baseRef: input.baseRef,
+    timestamp: input.timestamp,
+    recorder: input.recorder ?? null,
+  }).catch((error) => ({
+    quarantined: [] as string[],
+    destination: null,
+    warnings: [`could not quarantine untracked base repo paths: ${error instanceof Error ? error.message : String(error)}`],
+  }));
+  warnings.push(...quarantine.warnings);
+  if (quarantine.quarantined.length === 0) {
+    return { fastForwarded: false, quarantined: [], warnings };
+  }
+
+  warnings.push(
+    `Moved ${quarantine.quarantined.length} untracked path(s) that ${input.baseRef} also contains to ${quarantine.destination}: ${quarantine.quarantined.join(", ")}.`,
+  );
+  try {
+    await merge(2);
+    return { fastForwarded: true, quarantined: quarantine.quarantined, warnings };
+  } catch (error) {
+    warnings.push(error instanceof Error ? error.message : String(error));
+    return { fastForwarded: false, quarantined: quarantine.quarantined, warnings };
   }
 }
 
@@ -4028,11 +4217,15 @@ export async function prepareBaseRepoForWorkspace(input: {
         const result = await fastForwardBaseRepoToDefaultRef({
           repoRoot: input.repoRoot,
           baseRef,
+          timestamp: new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"),
           recorder: input.recorder ?? null,
         });
         baseRepoHygieneWarnings.push(
           result.fastForwarded
-            ? `Base repository at ${input.repoRoot} was fast-forwarded to ${baseRef}.`
+            ? `Base repository at ${input.repoRoot} was fast-forwarded to ${baseRef}.` +
+                (result.quarantined.length > 0
+                  ? ` ${result.quarantined.length} untracked path(s) it also contains were moved aside: ${result.quarantined.join(", ")}.`
+                  : "")
             : `Could not fast-forward base repository at ${input.repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
         );
       } else if (decision.action === "diverged") {
