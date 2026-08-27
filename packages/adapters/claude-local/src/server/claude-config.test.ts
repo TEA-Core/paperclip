@@ -1,3 +1,4 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,33 @@ import {
   seedAgentSideClaudeConfig,
 } from "./claude-config.js";
 import { runClaudeConfigNormalizerCli } from "./claude-config-normalize.js";
+
+/**
+ * Intercept the descriptor opens the walk performs so tests can fake ownership
+ * (fstat override) or neutralize fchown on hosts without the `agents` group.
+ */
+function wrapOpenHandles(options: {
+  fakeUidFor?: (openedPath: string) => number | undefined;
+  chownNoop?: boolean;
+}): void {
+  const realOpen = fs.open.bind(fs);
+  vi.spyOn(fs, "open").mockImplementation(async (target, ...rest) => {
+    const handle = await realOpen(target, ...rest);
+    const fakeUid = options.fakeUidFor?.(String(target));
+    return new Proxy(handle, {
+      get(obj, prop) {
+        if (fakeUid !== undefined && prop === "stat") {
+          return async () => Object.assign(await obj.stat(), { uid: fakeUid });
+        }
+        if (options.chownNoop && prop === "chown") {
+          return async () => undefined;
+        }
+        const value = Reflect.get(obj, prop);
+        return typeof value === "function" ? value.bind(obj) : value;
+      },
+    });
+  });
+}
 
 describe("prepareClaudeConfigSeed", () => {
   const cleanupDirs: string[] = [];
@@ -228,6 +256,27 @@ describe("normalizeClaudeConfigDirTree", () => {
     }
   });
 
+  it("normalizes nested dirs to 0o2770 and leaves files untouched", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-config-walk-positive-"));
+    cleanupDirs.push(home);
+    const mid = path.join(home, "projects");
+    const deep = path.join(mid, "work");
+    await fs.mkdir(deep, { recursive: true });
+    await fs.chmod(mid, 0o700);
+    await fs.chmod(deep, 0o700);
+    const file = path.join(deep, "state.json");
+    await fs.writeFile(file, "{}");
+    await fs.chmod(file, 0o640);
+
+    const onLog = vi.fn(async () => {});
+    await normalizeClaudeConfigDirTree(home, onLog);
+
+    expect((await fs.stat(home)).mode & 0o7777).toBe(0o2770);
+    expect((await fs.stat(mid)).mode & 0o7777).toBe(0o2770);
+    expect((await fs.stat(deep)).mode & 0o7777).toBe(0o2770);
+    expect((await fs.stat(file)).mode & 0o7777).toBe(0o640);
+  });
+
   it("recurses through a dir owned by another uid without chmodding it and without logging", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-config-walk-foreign-"));
     cleanupDirs.push(root);
@@ -237,23 +286,18 @@ describe("normalizeClaudeConfigDirTree", () => {
     await fs.chmod(foreignDir, 0o700);
     await fs.chmod(innerDir, 0o700);
 
-    const realStat = fs.stat.bind(fs);
-    vi.spyOn(fs, "stat").mockImplementation(async (target, ...rest) => {
-      const out = await realStat(target, ...rest);
-      if (String(target).endsWith(path.join("sessions"))) {
-        return Object.assign(out, { uid: 999_999_999 });
-      }
-      return out;
+    wrapOpenHandles({
+      fakeUidFor: (opened) => (opened.endsWith(`${path.sep}sessions`) ? 999_999_999 : undefined),
+      chownNoop: true,
     });
-    vi.spyOn(fs, "chown").mockResolvedValue(undefined);
 
     const onLog = vi.fn(async () => {});
     await normalizeClaudeConfigDirTree(root, onLog);
 
     // The foreign-owned dir keeps its mode (the pass leaves it to the other uid)...
-    expect((await fs.stat(foreignDir)).mode & 0o7777).toBe(0o700);
+    expect(fsSync.statSync(foreignDir).mode & 0o7777).toBe(0o700);
     // ...but still recursed through it and fixed the owned child...
-    expect((await fs.stat(innerDir)).mode & 0o7777).toBe(0o2770);
+    expect(fsSync.statSync(innerDir).mode & 0o7777).toBe(0o2770);
     // ...and produced no log noise at all.
     expect(onLog).not.toHaveBeenCalled();
   });
@@ -269,9 +313,72 @@ describe("normalizeClaudeConfigDirTree", () => {
     await normalizeClaudeConfigDirTree(home, onLog);
 
     // The link target keeps its owner-only mode — the walk never reached it.
-    expect((await fs.stat(outside)).mode & 0o7777).toBe(0o700);
+    expect(fsSync.statSync(outside).mode & 0o7777).toBe(0o700);
     // The link itself was left untouched.
-    expect((await fs.lstat(path.join(home, "escape"))).isSymbolicLink()).toBe(true);
+    expect(fsSync.lstatSync(path.join(home, "escape")).isSymbolicLink()).toBe(true);
+  });
+
+  it("refuses a root that is a symlink instead of normalizing its target", async () => {
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-config-walk-rootout-"));
+    const rootParent = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-config-walk-root-"));
+    cleanupDirs.push(outside, rootParent);
+    await fs.chmod(outside, 0o700);
+    const root = path.join(rootParent, "claude-config");
+    await fs.symlink(outside, root);
+
+    const onLog = vi.fn(async () => {});
+    await normalizeClaudeConfigDirTree(root, onLog);
+
+    // The target was never reached; the link was left alone.
+    expect(fsSync.statSync(outside).mode & 0o7777).toBe(0o700);
+    expect(fsSync.lstatSync(root).isSymbolicLink()).toBe(true);
+  });
+
+  it("never follows a child swapped for a symlink behind the parent's readdir", async () => {
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-config-walk-outside-"));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-config-walk-race-"));
+    cleanupDirs.push(outside, home);
+    await fs.chmod(outside, 0o700);
+    const swapped = path.join(home, "swapped");
+    await fs.mkdir(swapped, { mode: 0o700 });
+
+    // The attacker move, at the exact seam the old path-string walk exposed:
+    // replace the child with a symlink to a target the walk's uid owns on the
+    // walk's path-stat of the child. The fixed walk never stats children by
+    // path, so this never fires.
+    const realStat = fs.stat.bind(fs);
+    vi.spyOn(fs, "stat").mockImplementation(async (target, ...rest) => {
+      if (String(target) === swapped) {
+        await fs.rm(swapped, { recursive: true, force: true });
+        await fs.symlink(outside, swapped);
+      }
+      return realStat(target, ...rest);
+    });
+    wrapOpenHandles({ chownNoop: true });
+
+    const onLog = vi.fn(async () => {});
+    await normalizeClaudeConfigDirTree(home, onLog);
+
+    // The link target was never reached: still owner-only, never widened.
+    expect(fsSync.statSync(outside).mode & 0o7777).toBe(0o700);
+    // The home entry is still the real directory, normalized by the walk.
+    expect(fsSync.lstatSync(swapped).isSymbolicLink()).toBe(false);
+    expect(fsSync.statSync(swapped).mode & 0o7777).toBe(0o2770);
+  });
+
+  it("resolves silently for a vanished or non-directory root", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-config-walk-gone-"));
+    cleanupDirs.push(home);
+    const file = path.join(home, "afile");
+    await fs.writeFile(file, "x");
+    const fileMode = (await fs.stat(file)).mode & 0o7777;
+
+    const onLog = vi.fn(async () => {});
+    await expect(normalizeClaudeConfigDirTree(path.join(home, "does-not-exist"), onLog)).resolves.toBe(
+      undefined,
+    );
+    await expect(normalizeClaudeConfigDirTree(file, onLog)).resolves.toBeUndefined();
+    expect(fsSync.statSync(file).mode & 0o7777).toBe(fileMode);
   });
 });
 
@@ -424,7 +531,7 @@ describe("runClaudeConfigNormalizerCli", () => {
     await fs.mkdir(path.join(configDir, "sessions"), { recursive: true });
     await fs.chmod(configDir, 0o700);
     await fs.chmod(path.join(configDir, "sessions"), 0o700);
-    vi.spyOn(fs, "chown").mockResolvedValue(undefined);
+    wrapOpenHandles({ chownNoop: true });
 
     const code = await runClaudeConfigNormalizerCli({
       argv: ["node", "claude-config-normalize.js", configDir],

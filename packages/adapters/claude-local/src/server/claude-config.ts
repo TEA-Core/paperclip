@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -312,8 +313,11 @@ export async function seedAgentSideClaudeConfig(
   // mkdir masks the mode with the process umask (and skips existing dirs), so
   // enforce the full 0o2770 explicitly: the agent uid (1001) writes SDK
   // session state into this home through its `agents` group membership.
-  await fs.chmod(configDir, 0o2770);
+  // Group ownership is set BEFORE the widening chmod: the dir may exist under
+  // a foreign group, and 0o2770 must never be opened to a group that is not
+  // `agents`.
   await chownToAgentsGroup(configDir, onLog);
+  await fs.chmod(configDir, 0o2770);
 
   // Pre-create the SDK subdirectories at 0o2770 so a run writing into the home
   // starts from group-writable dirs instead of 0700 SDK-created ones. When the
@@ -331,6 +335,9 @@ export async function seedAgentSideClaudeConfig(
     for (const subdir of subdirs) {
       const subdirPath = path.join(configDir, subdir);
       await fs.mkdir(subdirPath, { recursive: true, mode: 0o2770 });
+      // Group ownership before the widening chmod (same rationale as the
+      // root above); chownToAgentsGroup is itself best-effort.
+      await chownToAgentsGroup(subdirPath, onLog);
       try {
         await fs.chmod(subdirPath, 0o2770);
       } catch (error) {
@@ -343,7 +350,6 @@ export async function seedAgentSideClaudeConfig(
         );
         continue;
       }
-      await chownToAgentsGroup(subdirPath, onLog);
     }
   }
 
@@ -374,8 +380,9 @@ export async function seedAgentSideClaudeConfig(
  * + the group after the turn restores the group-`agents`-reachable shape the
  * agent uid (1001) reaches, keeping zero 0700 dirs in the home.
  *
- * Symlinks are not followed: the dirent type is read, not stat-ed, so a symlink
- * inside the home can never redirect the walk out of it. Best-effort by
+ * Symlinks are not followed: every directory is opened no-follow and mutated
+ * through its open fd, so a symlink — present at readdir time or swapped in
+ * behind it — can never redirect the walk out of the home. Best-effort by
  * construction: a chmod/chgrp fault on one dir is logged and skipped, never
  * thrown — a re-normalize miss degrades to the next run's seed, not a failed
  * run. Files are left untouched (the seeded credentials are already 0o660;
@@ -418,11 +425,23 @@ export function isAgentSideClaudeConfigPath(
  * in-process pass (server uid) and the standalone agent-uid pass, so both
  * walks keep byte-identical semantics:
  *
- *   - dirent-type-only recursion (a symlink is never followed out of the tree),
- *   - per-dir best-effort (a chmod fault is logged and skips that subtree; a
- *     vanished/unreadable dir stops quietly),
+ *   - descriptor-based no-follow recursion: every directory is opened with
+ *     O_NOFOLLOW | O_DIRECTORY and every mutation goes through the open fd
+ *     (fstat/fchmod/fchown), so an entry that is swapped for a symlink after
+ *     the parent's readdir is refused (ELOOP) instead of re-resolved and
+ *     followed — the old path-string recursion re-stat-ed every child from
+ *     scratch, and a second uid writing the home could point that
+ *     stat/chmod/chown at any path the walk's uid owns,
+ *   - on Linux each child is opened against its parent's open fd
+ *     (`/proc/self/fd/<fd>/<name>`, openat semantics), so no component under
+ *     the opened home is ever re-resolved through the filesystem; elsewhere
+ *     the child is opened from the joined path with the same no-follow open
+ *     (the M1 uid split — the only topology where another uid writes the
+ *     home — is docker/Linux, which takes the fd-anchored branch),
+ *   - per-dir best-effort (a fchmod fault is logged and skips that subtree;
+ *     a vanished/unopenable dir stops quietly),
  *   - files untouched,
- *   - stat-and-skip of dirs the running uid does not own, while still
+ *   - fstat-and-skip of dirs the running uid does not own, while still
  *     recursing through them: on a mixed-ownership tree each pass fixes every
  *     dir it owns wherever nested and leaves the other uid's dirs alone, so
  *     neither pass emits EPERM noise on the other's dirs every run.
@@ -431,9 +450,60 @@ export async function normalizeClaudeConfigDirTree(
   dirPath: string,
   onLog: AdapterExecutionContext["onLog"],
 ): Promise<void> {
+  const handle = await openNoFollowDir(dirPath);
+  if (!handle) return;
+  try {
+    await normalizeOpenDirTree(handle, dirPath, onLog);
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+// Child-entry opens are anchored to the parent's open fd only where procfs is
+// available: on Linux `/proc/self/fd/<fd>/<name>` resolves against the inode
+// the fd holds — `openat(parent, name, O_NOFOLLOW)` semantics — so a name the
+// agent uid re-points under the home between the parent's readdir and the
+// child's open cannot redirect the open. The M1 uid split (docker, always
+// Linux, procfs always mounted) is the only topology where another uid writes
+// the home; off-Linux or no-procfs dev hosts fall back to the joined path,
+// which still carries the no-follow open.
+const ANCHOR_CHILD_OPENS_TO_PARENT_FD =
+  process.platform === "linux" && fsSync.existsSync("/proc/self/fd");
+
+/**
+ * O_RDONLY | O_DIRECTORY | O_NOFOLLOW open. Returns null (not a throw) when
+ * the path is gone, not a directory, or a symlink: a symlink is refused with
+ * ELOOP and must never redirect the walk; a vanished entry has nothing left
+ * to normalize.
+ */
+async function openNoFollowDir(dirPath: string): Promise<fs.FileHandle | null> {
+  try {
+    return await fs.open(
+      dirPath,
+      fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** Path a child entry is opened through; see ANCHOR_CHILD_OPENS_TO_PARENT_FD. */
+function openChildPath(dirPath: string, parentHandle: fs.FileHandle, name: string): string {
+  return ANCHOR_CHILD_OPENS_TO_PARENT_FD
+    ? `/proc/self/fd/${parentHandle.fd}/${name}`
+    : path.join(dirPath, name);
+}
+
+async function normalizeOpenDirTree(
+  handle: fs.FileHandle,
+  dirPath: string,
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<void> {
   let self: Awaited<ReturnType<typeof fs.stat>>;
   try {
-    self = await fs.stat(dirPath);
+    // fstat on the held fd: the ownership check targets the inode we hold,
+    // never a path the agent uid can re-point between checks.
+    self = await handle.stat();
   } catch {
     // The dir vanished; nothing left to do here.
     return;
@@ -442,7 +512,7 @@ export async function normalizeClaudeConfigDirTree(
     typeof process.getuid !== "function" || self.uid === process.getuid();
   if (ownsDir) {
     try {
-      await fs.chmod(dirPath, 0o2770);
+      await handle.chmod(0o2770);
     } catch (error) {
       await onLog(
         "stderr",
@@ -450,22 +520,39 @@ export async function normalizeClaudeConfigDirTree(
       );
       return;
     }
-    await chownToAgentsGroup(dirPath, onLog);
+    if (typeof process.getuid === "function") {
+      try {
+        await handle.chown(process.getuid(), AGENTS_GROUP_GID);
+      } catch (error) {
+        await onLog(
+          "stderr",
+          `[paperclip] agent-side Claude config: could not chgrp ${dirPath} to agents (gid ${AGENTS_GROUP_GID}): ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+    }
   }
   let entries: Array<{ name: string; isDirectory(): boolean }>;
   try {
     entries = await fs.readdir(dirPath, { withFileTypes: true });
   } catch {
-    // The dir vanished or is unreadable between the stat and the readdir; the
-    // chmod above already did what it could. Nothing left to walk.
+    // The dir vanished or is unreadable between the fstat and the readdir; the
+    // fchmod above already did what it could. Nothing left to walk.
     return;
   }
   for (const entry of entries) {
     // Only recurse into real directories. A symlink dirent reports
     // isDirectory() === false (the link's own type, not its target's), so the
-    // walk never follows a link out of the home.
+    // walk never follows a link out of the home; and the child open below is
+    // no-follow on the entry's name, so a swap that lands after this readdir
+    // is refused there (ELOOP) instead of re-resolved.
     if (!entry.isDirectory()) continue;
-    await normalizeClaudeConfigDirTree(path.join(dirPath, entry.name), onLog);
+    const child = await openNoFollowDir(openChildPath(dirPath, handle, entry.name));
+    if (!child) continue;
+    try {
+      await normalizeOpenDirTree(child, path.join(dirPath, entry.name), onLog);
+    } finally {
+      await child.close().catch(() => undefined);
+    }
   }
 }
 
