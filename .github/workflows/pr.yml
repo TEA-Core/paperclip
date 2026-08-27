@@ -201,6 +201,9 @@ jobs:
       - name: Test CI lockfile drift handling
         run: node --test ./scripts/__tests__/ci-lockfile-drift.test.mjs
 
+      - name: Test provisioner instance id canonical form
+        run: node --test ./scripts/__tests__/provision-worktree-instance-id.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
