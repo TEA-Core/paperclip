@@ -3008,13 +3008,12 @@ async function runWorkspaceCommand(input: {
   cwd: string;
   env: NodeJS.ProcessEnv;
   label: string;
-  runAsAgentUid?: boolean;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }) {
-  const target = await resolveWorkspaceCommandSpawnTarget(input);
+  const shell = resolveShell();
   const proc = await executeProcess({
-    command: target.command,
-    args: target.args,
+    command: shell,
+    args: ["-c", input.resolvedCommand ?? input.command],
     cwd: input.cwd,
     env: input.env,
   });
@@ -3101,7 +3100,6 @@ async function recordWorkspaceCommandOperation(
     cwd: string;
     env: NodeJS.ProcessEnv;
     label: string;
-    runAsAgentUid?: boolean;
     metadata?: Record<string, unknown> | null;
     successMessage?: string | null;
     onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
@@ -3121,10 +3119,10 @@ async function recordWorkspaceCommandOperation(
     cwd: input.cwd,
     metadata: input.metadata ?? null,
     run: async () => {
-      const target = await resolveWorkspaceCommandSpawnTarget(input);
+      const shell = resolveShell();
       const result = await executeProcess({
-        command: target.command,
-        args: target.args,
+        command: shell,
+        args: ["-c", input.resolvedCommand ?? input.command],
         cwd: input.cwd,
         env: input.env,
       });
@@ -3264,165 +3262,6 @@ export function resolvePnpmLockfileMismatchRetryCommand(
   return retryCommand === command ? null : retryCommand;
 }
 
-/**
- * SUP-13977: provisioning must run as the uid that will execute the workspace.
- *
- * Under the M1 uid split the control-plane server is uid 1000 and agent runs are
- * uid 1001, sharing group `agents` (1002) through setgid directories and umask
- * 002. That shares read and write. It does not — and cannot — share `chmod(2)`,
- * which requires ownership or CAP_FOWNER, and the server holds neither (its
- * CapEff carries CAP_KILL alone). So the moment an agent run builds inside its
- * own worktree, every bin target it produced is un-chmod-able by the server, and
- * pnpm's `linkBins` calls `fixBin` -> `chmod` on each one UNCONDITIONALLY: an
- * already-0755 bin fails exactly as an 0664 one does. The whole dispatch then
- * dies as `workspace_validation_failed`.
- *
- * The provision command exists to prepare a tree the agent will work in, so
- * running it under a different uid than its consumer is the defect. Dropping to
- * the agent uid removes the mixed-ownership state at the source instead of
- * repairing it afterwards.
- *
- * Scope is deliberately the worktree provision only. `runGit` and the rest of
- * `executeProcess` stay at the server uid: git's bookkeeping is the server's,
- * tracked files are never chmod targets (every declared bin in this workspace is
- * a gitignored `dist/*` build output), and dropping them would move the boundary
- * without a reason to.
- */
-const DEFAULT_AGENT_SPAWN_SHIM = "/usr/local/sbin/paperclip-spawn-agent";
-
-/**
- * Bound on provision attempts. Each ownership repair is one attempt, and pnpm
- * reports one EPERM at a time, so a tree whose bins are all foreign-owned needs
- * one attempt per bin. Six workspace packages declare a bin today; the cap sits
- * above that with room, and exists so a repair that keeps "succeeding" without
- * changing the failure can never loop.
- */
-const MAX_PROVISION_ATTEMPTS = 8;
-
-function agentUidGateArmed(): boolean {
-  return (process.env.PAPERCLIP_AGENT_UID ?? "").trim().length > 0;
-}
-
-function resolveAgentSpawnShimPath(): string {
-  return process.env.PAPERCLIP_AGENT_SPAWN_SHIM?.trim() || DEFAULT_AGENT_SPAWN_SHIM;
-}
-
-/**
- * Resolve how a workspace command is spawned.
- *
- * When the uid gate is armed, a command marked `runAsAgentUid` is executed
- * through the setuid shim so it lands on the agent uid. The shim ends in
- * `execvp(argv[1], &argv[1])`, so handing it `<shell> -c <command>` is enough
- * and no quoting changes.
- *
- * A missing shim is fatal rather than a silent fallback. Falling back would
- * reinstate exactly the mixed-ownership provisioning this exists to remove,
- * while reading as success — and the CAP_KILL precedent on this deployment is
- * that a privilege arm which fails soft gets believed for weeks.
- */
-export async function resolveWorkspaceCommandSpawnTarget(input: {
-  command: string;
-  resolvedCommand?: string;
-  runAsAgentUid?: boolean;
-}): Promise<{ command: string; args: string[] }> {
-  const shell = resolveShell();
-  const args = ["-c", input.resolvedCommand ?? input.command];
-  if (!input.runAsAgentUid) return { command: shell, args };
-  if (process.platform === "win32") return { command: shell, args };
-  if (!agentUidGateArmed()) return { command: shell, args };
-
-  const shimPath = resolveAgentSpawnShimPath();
-  try {
-    await fs.access(shimPath, fs.constants.X_OK);
-  } catch {
-    throw new Error(
-      `PAPERCLIP_AGENT_UID is set but the setuid spawn shim is not executable at "${shimPath}". ` +
-        "Workspace provisioning would run as the server uid and leave worktrees with mixed " +
-        "ownership that pnpm cannot chmod. Install the shim or unset PAPERCLIP_AGENT_UID.",
-    );
-  }
-  return { command: shimPath, args: [shell, ...args] };
-}
-
-const PROVISION_CHMOD_EPERM_PATTERN = /EPERM[^\n]*?operation not permitted, chmod ['"]([^'"]+)['"]/i;
-
-/**
- * SUP-13977 part 3: the tree that already carries the other uid's files.
- *
- * Flipping the provision uid fixes every worktree from here on and breaks every
- * worktree that already exists, in mirror image — measured on this deployment,
- * 16 of 18 present bin targets were server-owned at the time of the change. And
- * neither uid can chown: that needs CAP_CHOWN, which nothing here has. A
- * one-shot chown at boot would need root, would re-walk half a million inodes,
- * and would still not cover a tree restored later.
- *
- * So normalise lazily and exactly where it bites: read the path out of pnpm's
- * own EPERM, re-own that one file, retry. Returns null unless the failure names
- * a real path inside this worktree — a chmod EPERM anywhere else is somebody
- * else's bug and must keep failing loudly.
- */
-export function resolveProvisionChmodOwnershipRepairPath(
-  failureOutput: string,
-  worktreePath: string,
-): string | null {
-  const match = PROVISION_CHMOD_EPERM_PATTERN.exec(failureOutput);
-  if (!match) return null;
-  const candidate = path.resolve(match[1]);
-  const worktree = path.resolve(worktreePath);
-  const relative = path.relative(worktree, candidate);
-  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
-  // Git's own bookkeeping is never a build output and never a bin target.
-  if (relative.split(path.sep).includes(".git")) return null;
-  return candidate;
-}
-
-/**
- * Re-own one build artifact by rewriting it in place.
- *
- * chmod cannot cross a uid boundary, but creating a file can: the worktree
- * directories are setgid `agents` and group-writable, so copy-then-rename lands
- * an identical file owned by us. Content and mode are preserved; only the inode
- * and its owner change.
- *
- * Two guards make that safe. The target must be a regular file — a symlink or a
- * directory here means the failure is not the one we are modelling. And it must
- * be ignored by git, which is what makes the rewrite lossless: every declared
- * bin in this workspace is a gitignored `dist/*` build output, and a TRACKED
- * file arriving here would be a different bug that must not be silently
- * rewritten underneath the index.
- */
-export async function reownProvisionBuildArtifact(filePath: string, worktreePath: string): Promise<boolean> {
-  let stat;
-  try {
-    stat = await fs.lstat(filePath);
-  } catch {
-    return false;
-  }
-  if (!stat.isFile()) return false;
-
-  const ignored = await executeProcess({
-    command: "git",
-    args: ["-C", worktreePath, "check-ignore", "-q", "--", filePath],
-    cwd: worktreePath,
-  });
-  if (ignored.code !== 0) return false;
-
-  const tempPath = path.join(path.dirname(filePath), `.paperclip-reown-${randomUUID()}`);
-  try {
-    await fs.copyFile(filePath, tempPath);
-    await fs.chmod(tempPath, stat.mode & 0o7777);
-    await fs.rename(tempPath, filePath);
-    logger.warn(
-      { filePath, worktreePath },
-      "Re-owned a foreign-owned build artifact so workspace provisioning could chmod it (SUP-13977)",
-    );
-    return true;
-  } catch {
-    await fs.rm(tempPath, { force: true }).catch(() => {});
-    return false;
-  }
-}
-
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -3456,7 +3295,6 @@ async function provisionExecutionWorktree(input: {
       cwd: input.worktreePath,
       env,
       label: `Execution workspace provision command "${command}"`,
-      runAsAgentUid: true,
       metadata: {
         repoRoot: input.repoRoot,
         worktreePath: input.worktreePath,
@@ -3469,42 +3307,13 @@ async function provisionExecutionWorktree(input: {
     });
   };
 
-  let command = provisionCommand;
-  let lockfileRetried = false;
-  // Keyed by path: a repair that did not change the outcome must not be retried,
-  // or a file we "fixed" while pnpm keeps rejecting it becomes an infinite loop.
-  const reownedPaths = new Set<string>();
-
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      await runProvisionCommand(command, lockfileRetried);
-      return;
-    } catch (error) {
-      const failureOutput = error instanceof Error ? error.message : String(error);
-
-      if (!lockfileRetried) {
-        const retryCommand = resolvePnpmLockfileMismatchRetryCommand(command, failureOutput);
-        if (retryCommand) {
-          lockfileRetried = true;
-          command = retryCommand;
-          continue;
-        }
-      }
-
-      if (attempt < MAX_PROVISION_ATTEMPTS) {
-        const repairPath = resolveProvisionChmodOwnershipRepairPath(failureOutput, input.worktreePath);
-        if (
-          repairPath &&
-          !reownedPaths.has(repairPath) &&
-          (await reownProvisionBuildArtifact(repairPath, input.worktreePath))
-        ) {
-          reownedPaths.add(repairPath);
-          continue;
-        }
-      }
-
-      throw error;
-    }
+  try {
+    await runProvisionCommand(provisionCommand, false);
+  } catch (error) {
+    const failureOutput = error instanceof Error ? error.message : String(error);
+    const retryCommand = resolvePnpmLockfileMismatchRetryCommand(provisionCommand, failureOutput);
+    if (!retryCommand) throw error;
+    await runProvisionCommand(retryCommand, true);
   }
 }
 

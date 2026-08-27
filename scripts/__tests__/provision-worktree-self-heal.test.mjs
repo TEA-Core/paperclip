@@ -8,6 +8,11 @@ import path from "node:path";
 const script = new URL("../provision-worktree.sh", import.meta.url).pathname;
 const runtimeScript = new URL("../provision-worktree-runtime.sh", import.meta.url).pathname;
 
+// Keep the PATH minimal so the fallback ladder is deterministic: node must be
+// reachable, but a globally installed `paperclipai` must not shadow the paths
+// under test.
+const testPath = [path.dirname(process.execPath), "/usr/bin", "/bin"].join(":");
+
 const cleanupDirs = [];
 
 function makeTempDir(prefix) {
@@ -15,24 +20,6 @@ function makeTempDir(prefix) {
   cleanupDirs.push(dir);
   return dir;
 }
-
-// Keep the PATH minimal so the fallback ladder is deterministic: node must be
-// reachable, but a globally installed `paperclipai` must not shadow the rung
-// under test.
-//
-// Reaching that by putting `path.dirname(process.execPath)` on the PATH does the
-// opposite of what it reads as. It hands the tests everything else the installer
-// dropped next to node, and on an nvm or Volta layout that is `pnpm`, `corepack`
-// AND `paperclipai`. The ladder then reached a real global CLI instead of the
-// rung being exercised: "falls back to an isolated config" passed for the wrong
-// reason wherever those binaries were absent, and failed with an empty stderr
-// wherever they were present. Symlink the node binary alone so the isolation
-// holds no matter how node was installed — and resolve it through
-// `process.execPath`, which is the real binary rather than a version-manager
-// shim that would need env vars this minimal environment does not pass.
-const nodeOnlyBin = makeTempDir("paperclip-provision-nodebin-");
-fs.symlinkSync(process.execPath, path.join(nodeOnlyBin, "node"));
-const testPath = [nodeOnlyBin, "/usr/bin", "/bin"].join(":");
 
 test.after(() => {
   for (const dir of cleanupDirs) {
@@ -142,36 +129,6 @@ function readWorktreeConfig(worktreeCwd) {
   assert.ok(fs.existsSync(configPath), `expected ${configPath} to exist`);
   return JSON.parse(fs.readFileSync(configPath, "utf8"));
 }
-
-// The isolation above is load-bearing and silent when it breaks: every rung of the
-// fallback ladder is "run some CLI", so a leaked binary does not error, it just
-// answers, and the test goes on passing while measuring nothing. Assert the PATH
-// directly. `bash -c`, not `-lc`: a login shell sources profile scripts that
-// re-add the very directories being excluded.
-//
-// `paperclipai` is the binary the ladder actually dispatches on and the one no
-// test injects, so it must be absent. A real `pnpm` may still come from /usr/bin
-// on some hosts and cannot be excluded without losing git, flock and stat with
-// it — that one is neutralised per test instead, by a fake earlier on the PATH
-// via `pathPrefix`.
-test("the test PATH exposes our node and no paperclipai shadow", () => {
-  const resolve = (binary) =>
-    spawnSync("bash", ["-c", `command -v ${binary}`], { env: { PATH: testPath }, encoding: "utf8" });
-
-  const node = resolve("node");
-  assert.equal(node.status, 0, "node must be reachable on the test PATH");
-  assert.equal(
-    node.stdout.trim(),
-    path.join(nodeOnlyBin, "node"),
-    "node must resolve to the isolated symlink, so nothing else from its install directory is on the PATH",
-  );
-
-  assert.notEqual(
-    resolve("paperclipai").status,
-    0,
-    "a globally installed paperclipai must not be reachable — it shadows the fallback rung under test",
-  );
-});
 
 test("uses the base CLI when its import graph boots", () => {
   const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
@@ -332,109 +289,4 @@ test("runtime provisioning leaves seed-pending in place when ensure-seeded fails
   assert.match(result.stderr, /fake worktree ensure-seeded failure/);
   assert.ok(fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-pending")));
   assert.ok(!fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-complete")));
-});
-
-test("refuses to repair a base workspace owned by another uid (SUP-13977)", () => {
-  // The worktree provision now drops to the agent uid, but repair_base_workspace_install
-  // installs into the SHARED BASE WORKSPACE, which the server owns. Running it as the
-  // agent uid either EPERMs on the base's own dist bins — pnpm's linkBins chmods every
-  // bin it links, and chmod needs ownership — or seeds the server's checkout with
-  // agent-owned files, which is the same bug one level up. It must refuse instead.
-  //
-  // A cross-uid base cannot be created without root, so `stat` is faked to report a
-  // foreign owner. That is the exact input the guard reads; everything downstream is real.
-  const baseCwd = makeBaseWorkspace({ helpExit: 1, initExit: 0 });
-  fs.writeFileSync(path.join(baseCwd, "package.json"), "{}\n");
-  fs.writeFileSync(path.join(baseCwd, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
-  spawnSync("git", ["init", "-q", baseCwd], { env: { PATH: testPath } });
-
-  const fakeBin = makeTempDir("paperclip-provision-foreign-uid-bin-");
-  const installLog = path.join(baseCwd, "pnpm-invocations.log");
-  fs.writeFileSync(
-    path.join(fakeBin, "stat"),
-    `#!/usr/bin/env bash\necho 4242\n`,
-    { mode: 0o755 },
-  );
-  fs.writeFileSync(
-    path.join(fakeBin, "pnpm"),
-    `#!/usr/bin/env bash
-if [[ "$1" == "install" ]]; then
-  echo "$@" >> ${JSON.stringify(installLog)}
-  exit 0
-fi
-exit 1
-`,
-    { mode: 0o755 },
-  );
-
-  const { result } = runProvision(baseCwd, { pathPrefix: fakeBin });
-
-  assert.match(result.stderr, /Refusing to repair the base workspace/);
-  assert.match(result.stderr, /owned by uid 4242/);
-  // The whole contract: nothing was installed into the base workspace. Which rung of
-  // the fallback ladder the script lands on afterwards is not this guard's business,
-  // and depends on what else is on PATH.
-  assert.ok(
-    !fs.existsSync(installLog),
-    `expected no install in the base workspace, got: ${fs.existsSync(installLog) ? fs.readFileSync(installLog, "utf8") : ""}`,
-  );
-});
-
-test("still repairs a base workspace it owns (SUP-13977 regression guard)", () => {
-  // The uid guard must not fire on the ordinary same-uid deployment, where the
-  // repair is both safe and load-bearing.
-  const hasTools = ["flock", "git"].every(
-    (tool) => spawnSync("bash", ["-lc", `command -v ${tool}`], { env: { PATH: testPath } }).status === 0,
-  );
-  if (!hasTools) return;
-
-  const baseCwd = makeTempDir("paperclip-provision-same-uid-base-");
-  const healthFlag = path.join(baseCwd, "cli-healthy.flag");
-  const runnerPath = path.join(baseCwd, "cli", "node_modules", "tsx", "dist", "cli.mjs");
-  const entryPath = path.join(baseCwd, "cli", "src", "index.ts");
-  fs.mkdirSync(path.dirname(runnerPath), { recursive: true });
-  fs.mkdirSync(path.dirname(entryPath), { recursive: true });
-  fs.writeFileSync(entryPath, "// fake CLI entry\n");
-  fs.writeFileSync(
-    runnerPath,
-    `
-import fs from "node:fs";
-const cliArgs = process.argv.slice(3);
-if (cliArgs.includes("--help")) {
-  process.exit(fs.existsSync(${JSON.stringify(healthFlag)}) ? 0 : 1);
-}
-if (cliArgs[0] === "worktree" && cliArgs[1] === "init") {
-  fs.mkdirSync(".paperclip", { recursive: true });
-  fs.writeFileSync(".paperclip/config.json", JSON.stringify({ $meta: { source: "fake-cli" } }));
-  fs.writeFileSync(".paperclip/.env", "PAPERCLIP_IN_WORKTREE=true\\n");
-  process.exit(0);
-}
-process.exit(0);
-`,
-  );
-  fs.writeFileSync(path.join(baseCwd, "package.json"), "{}\n");
-  fs.writeFileSync(path.join(baseCwd, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
-  spawnSync("git", ["init", "-q", baseCwd], { env: { PATH: testPath } });
-
-  const fakeBin = makeTempDir("paperclip-provision-same-uid-bin-");
-  const installLog = path.join(baseCwd, "pnpm-invocations.log");
-  fs.writeFileSync(
-    path.join(fakeBin, "pnpm"),
-    `#!/usr/bin/env bash
-if [[ "$1" == "install" ]]; then
-  echo "$@" >> ${JSON.stringify(installLog)}
-  touch ${JSON.stringify(healthFlag)}
-  exit 0
-fi
-exit 1
-`,
-    { mode: 0o755 },
-  );
-
-  const { result, worktreeCwd } = runProvision(baseCwd, { pathPrefix: fakeBin });
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.doesNotMatch(result.stderr, /Refusing to repair the base workspace/);
-  assert.equal(readWorktreeConfig(worktreeCwd).$meta.source, "fake-cli");
-  assert.ok(fs.existsSync(installLog), "expected the same-uid repair install to still run");
 });
