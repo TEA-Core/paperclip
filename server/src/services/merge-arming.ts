@@ -316,6 +316,11 @@ export interface GitHubNodeIdResult extends GitHubFetchResult {
   nodeId: string | null;
 }
 
+/**
+ * Resolves a pull request's GraphQL node id via the REST pulls endpoint.
+ * Exported so the carrier promotion sweep can fall back to it when a cached
+ * external object row has no node id.
+ */
 export async function fetchGitHubNodeId(
   token: string,
   owner: string,

@@ -83,6 +83,7 @@ interface SiblingPullRequest {
 
 type PromotionOutcome = "promoted" | "alreadyReady" | "failed";
 
+/** Reads a positive-integer millisecond env var, falling back to `fallbackMs` on missing or invalid values. */
 function readMsEnv(name: string, fallbackMs: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallbackMs;
@@ -90,16 +91,19 @@ function readMsEnv(name: string, fallbackMs: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallbackMs;
 }
 
+/** Returns the value when it is a non-empty string, else null. */
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+/** Splits a `owner/repo#pull/123` external id into owner/repo/number, or null when not a pull request. */
 function parseExternalPullRequest(externalId: string): { owner: string; repo: string; number: number } | null {
   const match = EXTERNAL_PR_PATTERN.exec(externalId);
   if (!match) return null;
   return { owner: match[1]!, repo: match[2]!, number: Number(match[4]) };
 }
 
+/** Extracts the head branch ref from a cached external object's data (GitHub `head.ref` or `headRefName`). */
 function headRefFromData(data: Record<string, unknown>): string | null {
   const head = data.head;
   if (head && typeof head === "object" && !Array.isArray(head)) {
@@ -109,6 +113,11 @@ function headRefFromData(data: Record<string, unknown>): string | null {
   return readString(data.headRefName);
 }
 
+/**
+ * Builds the carrier promotion sweep service. `sweep` is meant to be fired by
+ * the heartbeat tick every 30s; the min-interval gate inside makes non-due
+ * ticks cheap no-ops.
+ */
 export function createCarrierPromotionSweepService(
   db: Db,
   opts: CarrierPromotionSweepOptions = {},
@@ -118,6 +127,7 @@ export function createCarrierPromotionSweepService(
   const now = opts.now ?? (() => new Date());
   let lastRunAt: number | null = null;
 
+  /** Runs one sweep pass: gate on cadence, then discover, group, guard and promote. */
   async function sweep(): Promise<CarrierPromotionSweepResult> {
     const checkedAt = now();
     // The heartbeat tick fires every 30s; GitHub measurement is expensive, so
@@ -205,6 +215,7 @@ export function createCarrierPromotionSweepService(
     return result;
   }
 
+  /** Evaluates one parent's draft carriers: sequencing guard, triggers, idempotence, then promotion. */
   async function sweepParent(
     parentId: string,
     parentDrafts: DraftCarrierRow[],
@@ -329,6 +340,7 @@ export function createCarrierPromotionSweepService(
     }
   }
 
+  /** Promotes one carrier PR: resolve a working token candidate, resolve the node id if cached, flip to ready, log the activity row. */
   async function promoteCarrier(
     draft: DraftCarrierRow,
     prKey: string,

@@ -1027,6 +1027,7 @@ export async function startServer(): Promise<StartedServer> {
       wakeup: heartbeat.wakeup,
     });
     const carrierPromotionSweep = createCarrierPromotionSweepService(db as any);
+    /** Fires one carrier promotion sweep on the heartbeat tick; logs only when something was dispositioned. */
     const scheduleCarrierPromotionSweep = () => {
       if (heartbeatSchedulerStopped) return;
       trackHeartbeatSchedulerWork(carrierPromotionSweep

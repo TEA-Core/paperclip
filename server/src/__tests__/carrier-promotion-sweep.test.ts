@@ -44,12 +44,14 @@ const STALE_ISO = "2026-08-28T00:00:00Z"; // 4 days before NOW: past the 3-day c
 
 const TOKEN_CANDIDATE = { token: "ghp_test_token_value", scope: "company", secretName: "github_org" };
 
+/** Builds a minimal fetch-style Response stub with an async json() body. */
 function jsonResponse(body: unknown, ok = true, status = 200) {
   return { ok, status, json: async () => body } as unknown as Response;
 }
 
 const GRAPHQL_OK = () => jsonResponse({ data: { markPullRequestReadyForReview: { clientMutationId: "abc" } } });
 
+/** Builds a cached draft pull-request discovery row with sensible defaults and per-test overrides. */
 function draftRow(overrides: {
   number?: number;
   branch?: string | null;
@@ -72,6 +74,7 @@ function draftRow(overrides: {
   };
 }
 
+/** Builds a sibling pull-request row (any state/draft) for the sequencing-guard query. */
 function siblingRow(number: number, state: string, branch = CARRIER_BRANCH) {
   return { externalId: `TEA-Core/paperclip#pull/${number}`, data: { state, head: { ref: branch } } };
 }
@@ -85,6 +88,7 @@ interface TestState {
   activityRows: Array<Record<string, unknown>>;
 }
 
+/** Maps a drizzle select column set to the matching fake-db row list, by column fingerprint. */
 function selectRows(cols: Record<string, unknown>, state: TestState) {
   if ("mentionCreatedAt" in cols) return state.draftRows;
   if ("parentId" in cols) return state.sourceIssues;
@@ -94,6 +98,7 @@ function selectRows(cols: Record<string, unknown>, state: TestState) {
   return state.children;
 }
 
+/** Builds a fake drizzle db whose select() serves rows from the given test state. */
 function makeDb(state: TestState) {
   return {
     select: vi.fn((cols: Record<string, unknown>) => {
@@ -108,6 +113,7 @@ function makeDb(state: TestState) {
   };
 }
 
+/** Wires a sweep service over a fake db and returns both for assertions. */
 function makeService(
   state: TestState,
   opts: { now?: () => Date; sweepIntervalMs?: number } = {},
@@ -120,6 +126,7 @@ function makeService(
   return { db, service };
 }
 
+/** Returns a default single-parent/single-child test state, with per-test overrides. */
 function state(overrides: Partial<TestState> = {}): TestState {
   return {
     draftRows: [],
