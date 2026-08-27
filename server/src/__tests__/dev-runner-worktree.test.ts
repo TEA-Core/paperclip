@@ -1,3 +1,10 @@
+// The authoritative regression probe for the uid-scoped worktree state
+// partition is scripts/probe-worktree-uid-partition.sh (SUP-14127, SUP-14126
+// ruling item 4): it runs the resolution under two DISTINCT REAL uids and
+// asserts a genuine EACCES on the other uid's 0o600 state plus own-scoped-dir
+// resolution. A test that names a directory `uid-<n>` asserts a string
+// convention, not a permission boundary — it must never substitute for that
+// probe, and the probe's CI check is the gate for the SUP-14087/14118 cluster.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";

@@ -183,6 +183,9 @@ jobs:
       - name: Test agent spawn shim invariants
         run: node --test ./scripts/__tests__/agent-spawn-shim.test.mjs
 
+      - name: Test worktree uid partition probe wiring
+        run: node --test ./scripts/__tests__/worktree-uid-partition.test.mjs
+
       - name: Test /app runtime tree ownership invariants
         run: node --test ./scripts/__tests__/dockerfile-app-root-owned.test.mjs
 
@@ -491,6 +494,60 @@ jobs:
 
       - name: Run serialized server test shard
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
+
+  worktree_uid_partition:
+    # Two-real-uid regression probe for the uid-scoped worktree state partition
+    # (SUP-14127, SUP-14126 ruling item 4). This is the merge precondition for
+    # the uid-scoped worktree-state cluster: on any PR touching the resolution
+    # / state code it runs the worktree state-dir resolution under two distinct
+    # real uids (1000 + 1001 via setpriv) and asserts the 0o600 partition holds
+    # in BOTH uid directions (real EACCES, own scoped-dir resolution, no
+    # mutation of the other uid's files). The probe is RED against the current
+    # canonical-only fold head and GREEN once the uid-scoped resolution lands —
+    # that red-then-green is the regression gate. It deliberately does not join
+    # the `verify` aggregate so non-cluster PRs are unaffected; the gate binds
+    # on the cluster PRs that touch these paths.
+    name: Worktree UID partition probe
+    needs: [policy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Restore regenerated PR lockfile (when policy regenerated one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
+        uses: actions/download-artifact@v8
+        with:
+          name: pr-lockfile
+          path: .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run two-real-uid worktree state partition probe
+        run: |
+          changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+          if ! printf '%s\n' "$changed" | grep -qE 'dev-runner-worktree\.ts|worktree-config\.ts|provision-worktree\.sh'; then
+            echo "No uid-scoped worktree-state files changed on this PR — probe not applicable."
+            exit 0
+          fi
+          bash ./scripts/probe-worktree-uid-partition.sh
 
   canary_dry_run:
     name: Canary Dry Run
