@@ -40,7 +40,11 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
-import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
+import {
+  parseProjectExecutionWorkspacePolicy,
+  WORKSPACE_PATH_HELD_CODE,
+  WORKSPACE_PATH_HELD_REMEDIATION,
+} from "./execution-workspace-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { logActivity } from "./activity-log.js";
 import {
@@ -1171,6 +1175,65 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
   >();
   const pullRequestStateCacheTtlMs = 5 * 60 * 1000;
+
+  // SUP-14139: path exclusivity. Two live rows over one worktree path is how two
+  // issues ended up undecidable in a single directory (SUP-13445/SUP-14124). The
+  // allocation must fail loudly instead of minting a second row over a path a
+  // live row already holds.
+  async function assertNoLiveWorkspaceHoldsAllocatedPath(
+    data: Pick<
+      typeof executionWorkspaces.$inferInsert,
+      "companyId" | "projectWorkspaceId" | "strategyType" | "cwd" | "sourceIssueId"
+    >,
+    dbOrTx: Db = db,
+  ) {
+    if (data.strategyType !== "git_worktree" || !data.projectWorkspaceId || !data.cwd) return;
+    const holders = await dbOrTx
+      .select({
+        id: executionWorkspaces.id,
+        sourceIssueId: executionWorkspaces.sourceIssueId,
+      })
+      .from(executionWorkspaces)
+      .where(
+        and(
+          eq(executionWorkspaces.companyId, data.companyId),
+          eq(executionWorkspaces.projectWorkspaceId, data.projectWorkspaceId),
+          eq(executionWorkspaces.cwd, data.cwd),
+          inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+        ),
+      );
+    // An issue re-provisioning its OWN worktree is not contention: fresh-worktree
+    // reuse and branch reconciliation both re-allocate the same path for the same
+    // source issue. Only a holder sourced by a *different* issue (or an unsourced
+    // holder, which nothing can claim) is the SUP-13445/SUP-14124 shape.
+    const holder = holders.find(
+      (row) => !(data.sourceIssueId && row.sourceIssueId && row.sourceIssueId === data.sourceIssueId),
+    );
+    if (!holder) return;
+    const holderIssue = holder.sourceIssueId
+      ? await dbOrTx
+          .select({ identifier: issues.identifier })
+          .from(issues)
+          .where(eq(issues.id, holder.sourceIssueId))
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const holderRef = holderIssue
+      ? `issue ${holderIssue.identifier} (${holder.sourceIssueId})`
+      : `issue ${holder.sourceIssueId}`;
+    throw conflict(
+      `Cannot allocate execution workspace at ${data.cwd}: the path is already held by live execution workspace ${holder.id} of ${holderRef}. ${WORKSPACE_PATH_HELD_REMEDIATION}`,
+      {
+        code: WORKSPACE_PATH_HELD_CODE,
+        field: "cwd",
+        cwd: data.cwd,
+        projectWorkspaceId: data.projectWorkspaceId,
+        holdingWorkspaceId: holder.id,
+        holdingIssueId: holder.sourceIssueId,
+        holdingIssueIdentifier: holderIssue?.identifier ?? null,
+        remediation: WORKSPACE_PATH_HELD_REMEDIATION,
+      },
+    );
+  }
 
   async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
     if (!workspace.sourceIssueId) return [];
@@ -2414,11 +2477,27 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     },
 
     create: async (data: typeof executionWorkspaces.$inferInsert) => {
-      const row = await db
-        .insert(executionWorkspaces)
-        .values(data)
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      // The path-exclusivity check is a read; the insert that follows is a write.
+      // Without serialization two concurrent allocations both pass the read and
+      // both insert — the exact "two active rows over one directory" shape this
+      // guard exists to prevent. AC5 forbids a migration (so no partial unique
+      // index), so the check and its insert share one transaction behind an
+      // advisory lock keyed on the contended path.
+      const pathGuardKey =
+        data.strategyType === "git_worktree" && data.projectWorkspaceId && data.cwd
+          ? `execution-workspace:path:${data.companyId}:${data.projectWorkspaceId}:${data.cwd}`
+          : null;
+      const row = await db.transaction(async (tx) => {
+        if (pathGuardKey) {
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${pathGuardKey}, 0))`);
+        }
+        await assertNoLiveWorkspaceHoldsAllocatedPath(data, tx as unknown as Db);
+        return tx
+          .insert(executionWorkspaces)
+          .values(data)
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
       return row ? toExecutionWorkspace(row) : null;
     },
 

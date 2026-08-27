@@ -22,6 +22,17 @@ export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION =
 export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE =
   `executionWorkspacePreference: "reuse_existing" requires executionWorkspaceId, and none was supplied or inherited. ${WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION}`;
 
+export const WORKSPACE_PATH_HELD_CODE = "workspace_path_held_by_live_workspace";
+export const WORKSPACE_PATH_HELD_REMEDIATION =
+  "Archive the holding execution workspace (or release the source issue's binding to it) and retry the allocation.";
+
+export const WORKSPACE_CROSS_SOURCE_BINDING_CODE = "workspace_cross_source_binding";
+export const WORKSPACE_CROSS_SOURCE_BINDING_REMEDIATION =
+  "Bind only to a workspace sourced by the issue itself or a shared workspace; drop the binding to allocate a fresh workspace, or archive the sourced workspace first.";
+
+export const WORKSPACE_CROSS_SOURCE_BINDING_MESSAGE =
+  `An issue cannot be bound to an execution workspace sourced by a different issue. ${WORKSPACE_CROSS_SOURCE_BINDING_REMEDIATION}`;
+
 export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE = "workspace_issue_override_disallowed";
 export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION =
   "Remove the issue's executionWorkspacePreference/executionWorkspaceId override, or set the project's executionWorkspacePolicy.allowIssueOverride to true.";

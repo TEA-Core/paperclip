@@ -81,6 +81,9 @@ import {
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
   suppliesIssueExecutionWorkspaceOverride,
+  WORKSPACE_CROSS_SOURCE_BINDING_CODE,
+  WORKSPACE_CROSS_SOURCE_BINDING_MESSAGE,
+  WORKSPACE_CROSS_SOURCE_BINDING_REMEDIATION,
   WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE,
   WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_MESSAGE,
   WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION,
@@ -5189,6 +5192,54 @@ export function issueService(db: Db) {
     return workspace;
   }
 
+  // SUP-14139: binding coherence. Binding an issue to a row sourced by another
+  // issue is how execution ran in the other issue's worktree and both issues
+  // wedged undecidable at the first git checkout. Explicit binds to a
+  // cross-source row are refused; the row's own source issue (and shared
+  // workspaces) stay bindable.
+  async function assertExecutionWorkspaceBindingCoherent(
+    companyId: string,
+    executionWorkspaceId: string,
+    bindingIssueId: string | null,
+    dbOrTx: DbReader = db,
+  ) {
+    const workspace = await dbOrTx
+      .select({
+        id: executionWorkspaces.id,
+        mode: executionWorkspaces.mode,
+        sourceIssueId: executionWorkspaces.sourceIssueId,
+      })
+      .from(executionWorkspaces)
+      // Company-scoped: a foreign-company id must fall through to the existing
+      // company-scoped validation rather than surface that company's
+      // sourceIssueId in this error.
+      .where(and(eq(executionWorkspaces.companyId, companyId), eq(executionWorkspaces.id, executionWorkspaceId)))
+      .then((rows) => rows[0] ?? null);
+    if (!workspace) return;
+    if (!workspace.sourceIssueId || workspace.mode === "shared_workspace") return;
+    if (bindingIssueId && workspace.sourceIssueId === bindingIssueId) return;
+    const sourceIssue = await dbOrTx
+      .select({ identifier: issues.identifier })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.id, workspace.sourceIssueId)))
+      .then((rows) => rows[0] ?? null);
+    const sourceRef = sourceIssue
+      ? `${sourceIssue.identifier} (${workspace.sourceIssueId})`
+      : workspace.sourceIssueId;
+    throw unprocessable(
+      `${WORKSPACE_CROSS_SOURCE_BINDING_MESSAGE} This workspace is sourced by ${sourceRef}.`,
+      {
+        code: WORKSPACE_CROSS_SOURCE_BINDING_CODE,
+        field: "executionWorkspaceId",
+        executionWorkspaceId,
+        sourceIssueId: workspace.sourceIssueId,
+        sourceIssueIdentifier: sourceIssue?.identifier ?? null,
+        bindingIssueId,
+        remediation: WORKSPACE_CROSS_SOURCE_BINDING_REMEDIATION,
+      },
+    );
+  }
+
   async function assertValidLabelIds(companyId: string, labelIds: string[], dbOrTx: any = db) {
     if (labelIds.length === 0) return;
     const existing = await dbOrTx
@@ -7335,7 +7386,11 @@ export function issueService(db: Db) {
           await assertAssignableAgent(db, companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
         }
       }
-      return db.transaction(async (tx) => {
+      // Activities logged inside the create transaction must not publish until the
+      // transaction commits: a rollback would otherwise leave a phantom
+      // publication for an issue that never existed. Drained after commit below.
+      const createActivityPublications: ActivityPublication[] = [];
+      const created = await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (allowDuplicate === false) {
@@ -7465,8 +7520,30 @@ export function issueService(db: Db) {
               : null;
             const sourceWorkspaceOwnerIsTerminal =
               sourceWorkspaceOwnerStatus === "done" || sourceWorkspaceOwnerStatus === "cancelled";
+            // SUP-14139: a row sourced by another issue keeps that issue's work
+            // inside that issue's worktree. Inheriting it would bind this new
+            // issue cross-source, so it is declined (and logged) exactly like a
+            // terminal source; the issue gets its own workspace on next run.
+            const sourceWorkspaceSourcedByOtherIssue =
+              Boolean(sourceWorkspace?.sourceIssueId) && sourceWorkspace?.mode !== "shared_workspace";
             if (sourceWorkspace && sourceWorkspaceOwnerIsTerminal) declinedWorkspaceInheritance = true;
-            if (sourceWorkspace && !sourceWorkspaceOwnerIsTerminal) {
+            else if (sourceWorkspace && sourceWorkspaceSourcedByOtherIssue) {
+              declinedWorkspaceInheritance = true;
+              await logActivityInTransaction(tx as unknown as Db, {
+                companyId,
+                actorType: "system",
+                actorId: "workspace_binding_guard",
+                action: "execution_workspace.inheritance_declined_cross_source",
+                entityType: "execution_workspace",
+                entityId: sourceWorkspace.id,
+                details: {
+                  requestedByIssueId: workspaceInheritanceIssueId,
+                  sourceIssueId: sourceWorkspace.sourceIssueId,
+                  reason: "workspace is sourced by a different issue",
+                },
+              }, createActivityPublications);
+            }
+            else if (sourceWorkspace) {
               executionWorkspaceId = sourceWorkspace.id;
               executionWorkspacePreference = "reuse_existing";
               executionWorkspaceSettings = {
@@ -7487,6 +7564,12 @@ export function issueService(db: Db) {
           // is truthy, so clearing the local alone would let the original request
           // survive into the row.
           delete issueData.executionWorkspacePreference;
+        }
+        // SUP-14139: an explicit executionWorkspaceId names the row outright. A
+        // cross-source bind is refused here, at write time, instead of surfacing
+        // as an undecidable checkout at run time.
+        if (issueData.executionWorkspaceId) {
+          await assertExecutionWorkspaceBindingCoherent(companyId, issueData.executionWorkspaceId, null, tx);
         }
         if (issueData.projectId == null && projectWorkspaceId) {
           const workspace = await assertValidProjectWorkspace(companyId, null, projectWorkspaceId, tx);
@@ -7698,6 +7781,8 @@ export function issueService(db: Db) {
         const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
         return withRelations;
       });
+      for (const publication of createActivityPublications) publishActivity(publication);
+      return created;
     },
 
     /**
@@ -8189,6 +8274,23 @@ export function issueService(db: Db) {
         if (!validatedExecutionWorkspace) {
           await assertValidExecutionWorkspace(existing.companyId, nextProjectId, nextExecutionWorkspaceId);
         }
+      }
+      // SUP-14139: a write that establishes a NEW bind to a row sourced by
+      // another issue is refused. Re-binding the issue's own row (or no change)
+      // is untouched, and the provisioning write-back (systemWorkspaceBinding)
+      // only ever binds the row it just persisted for this issue.
+      if (
+        issueData.executionWorkspaceId !== undefined &&
+        issueData.executionWorkspaceId &&
+        issueData.executionWorkspaceId !== existing.executionWorkspaceId &&
+        !systemWorkspaceBinding
+      ) {
+        await assertExecutionWorkspaceBindingCoherent(
+          existing.companyId,
+          issueData.executionWorkspaceId,
+          existing.id,
+          dbOrTx,
+        );
       }
       if (
         issueData.executionWorkspaceId !== undefined ||
