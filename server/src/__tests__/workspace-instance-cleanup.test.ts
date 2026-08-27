@@ -354,3 +354,45 @@ describe("worktree instance cleanup", () => {
     })).resolves.toBe(false);
   });
 });
+
+describe("deriveWorktreeInstanceId agrees with the script that names the directory", () => {
+  // SUP-14156 made `scripts/provision-worktree.sh` strip a trailing separator the
+  // 48-character truncation leaves behind. That script is what creates the
+  // instance directory. This function did not move with it, so it derived an id
+  // spelled "--" for exactly those names — an id naming a directory that does not
+  // exist, so cleanup declined to reclaim the instance it was asked to reclaim.
+  const canonicalizeLikeTheScript = (value: string) =>
+    value.trim().toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^[-_]+|[-_]+$/g, "") || "worktree";
+
+  // 48 characters of this slug end exactly on a "-", which is the precondition.
+  // Taken from the branch that wedged in production.
+  const truncatesOnADash =
+    "/paperclip/worktrees/SUP-14139-execution-workspace-allocation-has-no-path-exclusivity";
+
+  it("never emits a doubled separator", () => {
+    expect(deriveWorktreeInstanceId(truncatesOnADash)).not.toContain("--");
+  });
+
+  it("round-trips through the script's canonical form unchanged", () => {
+    for (const candidate of [
+      truncatesOnADash,
+      "/paperclip/worktrees/short-branch",
+      "/paperclip/worktrees/UPPER_Case.Branch@v2",
+      "/paperclip/worktrees/---leading-and-trailing---",
+    ]) {
+      const derived = deriveWorktreeInstanceId(candidate);
+      expect(canonicalizeLikeTheScript(derived), candidate).toBe(derived);
+    }
+  });
+
+  it("still distinguishes two worktrees whose names truncate identically", () => {
+    // The hash is over the absolute path, so stripping the separator must not
+    // make two different workspaces share one instance directory.
+    const a = deriveWorktreeInstanceId(`${truncatesOnADash}-two-active-rows`);
+    const b = deriveWorktreeInstanceId(`${truncatesOnADash}-and-an-issue-bound`);
+    expect(a).not.toBe(b);
+  });
+});
