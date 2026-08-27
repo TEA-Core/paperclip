@@ -316,7 +316,12 @@ export interface GitHubNodeIdResult extends GitHubFetchResult {
   nodeId: string | null;
 }
 
-async function fetchGitHubNodeId(
+/**
+ * Resolves a pull request's GraphQL node id via the REST pulls endpoint.
+ * Exported so the carrier promotion sweep can fall back to it when a cached
+ * external object row has no node id.
+ */
+export async function fetchGitHubNodeId(
   token: string,
   owner: string,
   repo: string,
@@ -389,6 +394,61 @@ async function enableAutoMerge(
     return { success: true, alreadyQueued: false, error: null, status: response.status };
   } catch {
     return { success: false, alreadyQueued: false, error: "network_error", status: 0 };
+  }
+}
+
+export interface MarkPullRequestReadyForReviewResult {
+  success: boolean;
+  alreadyReady: boolean;
+  error: string | null;
+  status: number;
+}
+
+/**
+ * PR-CARRIER-3: flip a draft carrier PR to ready-for-review. Same GraphQL
+ * transport, URL and bearer-token handling as `enableAutoMerge`. A PR that is
+ * already ready counts as success (GitHub rejects the mutation with
+ * "Pull request is not a draft"), mirroring the already-queued path.
+ */
+export async function markPullRequestReadyForReview(
+  token: string,
+  nodeId: string,
+): Promise<MarkPullRequestReadyForReviewResult> {
+  const query = `mutation { markPullRequestReadyForReview(input: { pullRequestId: "${nodeId}" }) { clientMutationId } }`;
+
+  try {
+    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ query }),
+    });
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+      const errors = body?.errors as Array<{ message?: string }> | undefined;
+      const firstError = errors?.[0]?.message ?? "";
+      if (firstError.toLowerCase().includes("not a draft")) {
+        return { success: true, alreadyReady: true, error: null, status: response.status };
+      }
+      return { success: false, alreadyReady: false, error: firstError || `HTTP ${response.status}`, status: response.status };
+    }
+
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const errors = body?.errors as Array<{ message?: string }> | undefined;
+    if (errors && errors.length > 0) {
+      const firstError = errors[0]?.message ?? "";
+      if (firstError.toLowerCase().includes("not a draft")) {
+        return { success: true, alreadyReady: true, error: null, status: response.status };
+      }
+      return { success: false, alreadyReady: false, error: firstError, status: response.status };
+    }
+
+    return { success: true, alreadyReady: false, error: null, status: response.status };
+  } catch {
+    return { success: false, alreadyReady: false, error: "network_error", status: 0 };
   }
 }
 

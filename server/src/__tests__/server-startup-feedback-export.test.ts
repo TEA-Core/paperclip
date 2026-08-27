@@ -277,6 +277,17 @@ vi.mock("../services/index.js", () => ({
     autoArchive: vi.fn(async () => 0),
     deliverNotifications: vi.fn(async () => ({ notifiedAgents: 0, delivered: 0 })),
   })),
+  createCarrierPromotionSweepService: vi.fn(() => ({
+    sweep: vi.fn(async () => ({
+      due: false,
+      candidates: 0,
+      promoted: 0,
+      alreadyReady: 0,
+      blocked: 0,
+      noTrigger: 0,
+      failed: 0,
+    })),
+  })),
   createDoneCloseLandingBackstopService: vi.fn(() => ({
     sweep: vi.fn(async () => ({ due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0 })),
   })),

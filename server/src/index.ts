@@ -49,6 +49,7 @@ import {
   environmentCustomImageService,
   decisionService,
   decisionRetentionService,
+  createCarrierPromotionSweepService,
   createDoneCloseLandingBackstopService,
   externalObjectService,
   executionWorkspaceService,
@@ -1025,6 +1026,21 @@ export async function startServer(): Promise<StartedServer> {
     const doneCloseLandingBackstop = createDoneCloseLandingBackstopService(db as any, {
       wakeup: heartbeat.wakeup,
     });
+    const carrierPromotionSweep = createCarrierPromotionSweepService(db as any);
+    /** Fires one carrier promotion sweep on the heartbeat tick; logs only when something was dispositioned. */
+    const scheduleCarrierPromotionSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(carrierPromotionSweep
+        .sweep()
+        .then((result) => {
+          if (result.candidates > 0 || result.promoted > 0 || result.blocked > 0 || result.failed > 0) {
+            logger.info(result, "carrier promotion sweep dispositioned draft carrier pull requests");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "carrier promotion sweep failed");
+        }));
+    };
     const scheduleDoneCloseLandingBackstopSweep = () => {
       if (heartbeatSchedulerStopped) return;
       trackHeartbeatSchedulerWork(doneCloseLandingBackstop
@@ -1316,6 +1332,7 @@ export async function startServer(): Promise<StartedServer> {
         scheduleMergedPullRequestConfirmationSweep();
         scheduleTerminalWorkspaceSweep();
         scheduleDoneCloseLandingBackstopSweep();
+        scheduleCarrierPromotionSweep();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines

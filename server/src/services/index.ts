@@ -77,6 +77,11 @@ export { captureDecisionSnapshot, decisionTrainingService } from "./decision-tra
 export { decisionService } from "./decisions.js";
 export { decisionRetentionService } from "./decision-retention.js";
 export {
+  createCarrierPromotionSweepService,
+  type CarrierPromotionSweepOptions,
+  type CarrierPromotionSweepResult,
+} from "./carrier-promotion-sweep.js";
+export {
   createDoneCloseLandingBackstopService,
   type DoneCloseLandingBackstopOptions,
   type DoneCloseLandingSweepResult,
