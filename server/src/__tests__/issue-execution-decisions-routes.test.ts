@@ -115,6 +115,7 @@ async function seedIssue(db: Db, input: {
   projectId?: string | null;
   title: string;
   status?: string;
+  executionPolicy?: Record<string, unknown>;
 }) {
   const [issue] = await db.insert(issues).values({
     companyId: input.companyId,
@@ -125,6 +126,7 @@ async function seedIssue(db: Db, input: {
     priority: "medium",
     assigneeAgentId: null,
     responsibleUserId: "board-user",
+    executionPolicy: input.executionPolicy ?? null,
   }).returning();
   return issue!;
 }
@@ -295,6 +297,56 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toEqual([]);
+  });
+
+  it("returns a decision row whose stageId is no longer in executionPolicy.stages (orphaned completed stage)", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const currentStageId = randomUUID();
+    const orphanStageId = randomUUID();
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Policy rewritten after stage completion",
+      status: "done",
+      // Only one stage in the live policy; the orphan row's stageId is not in it.
+      executionPolicy: {
+        mode: "normal",
+        stages: [{ id: currentStageId, type: "review", participants: [], approvalsNeeded: 1 }],
+        commentRequired: true,
+      },
+    });
+
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: issue.id,
+      stageId: orphanStageId,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "orphan-stage-verdict",
+      createdAt: new Date("2026-08-19T09:00:00Z"),
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: issue.id,
+      stageId: currentStageId,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "current-stage-verdict",
+      createdAt: new Date("2026-08-19T10:00:00Z"),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/execution-decisions`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toHaveLength(2);
+    expect(res.body.map((row: { stageId: string; body: string }) => [row.stageId, row.body])).toEqual([
+      [orphanStageId, "orphan-stage-verdict"],
+      [currentStageId, "current-stage-verdict"],
+    ]);
   });
 
   it("returns 404 for a missing issue id", async () => {
