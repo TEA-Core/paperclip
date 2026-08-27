@@ -40,7 +40,11 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
-import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
+import {
+  parseProjectExecutionWorkspacePolicy,
+  WORKSPACE_PATH_HELD_CODE,
+  WORKSPACE_PATH_HELD_REMEDIATION,
+} from "./execution-workspace-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { logActivity } from "./activity-log.js";
 import {
@@ -1171,6 +1175,55 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
   >();
   const pullRequestStateCacheTtlMs = 5 * 60 * 1000;
+
+  // SUP-14139: path exclusivity. Two live rows over one worktree path is how two
+  // issues ended up undecidable in a single directory (SUP-13445/SUP-14124). The
+  // allocation must fail loudly instead of minting a second row over a path a
+  // live row already holds.
+  async function assertNoLiveWorkspaceHoldsAllocatedPath(
+    data: Pick<typeof executionWorkspaces.$inferInsert, "companyId" | "projectWorkspaceId" | "strategyType" | "cwd">,
+  ) {
+    if (data.strategyType !== "git_worktree" || !data.projectWorkspaceId || !data.cwd) return;
+    const holders = await db
+      .select({
+        id: executionWorkspaces.id,
+        sourceIssueId: executionWorkspaces.sourceIssueId,
+      })
+      .from(executionWorkspaces)
+      .where(
+        and(
+          eq(executionWorkspaces.companyId, data.companyId),
+          eq(executionWorkspaces.projectWorkspaceId, data.projectWorkspaceId),
+          eq(executionWorkspaces.cwd, data.cwd),
+          inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+        ),
+      );
+    const holder = holders[0];
+    if (!holder) return;
+    const holderIssue = holder.sourceIssueId
+      ? await db
+          .select({ identifier: issues.identifier })
+          .from(issues)
+          .where(eq(issues.id, holder.sourceIssueId))
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const holderRef = holderIssue
+      ? `issue ${holderIssue.identifier} (${holder.sourceIssueId})`
+      : `issue ${holder.sourceIssueId}`;
+    throw conflict(
+      `Cannot allocate execution workspace at ${data.cwd}: the path is already held by live execution workspace ${holder.id} of ${holderRef}. ${WORKSPACE_PATH_HELD_REMEDIATION}`,
+      {
+        code: WORKSPACE_PATH_HELD_CODE,
+        field: "cwd",
+        cwd: data.cwd,
+        projectWorkspaceId: data.projectWorkspaceId,
+        holdingWorkspaceId: holder.id,
+        holdingIssueId: holder.sourceIssueId,
+        holdingIssueIdentifier: holderIssue?.identifier ?? null,
+        remediation: WORKSPACE_PATH_HELD_REMEDIATION,
+      },
+    );
+  }
 
   async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
     if (!workspace.sourceIssueId) return [];
@@ -2414,6 +2467,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     },
 
     create: async (data: typeof executionWorkspaces.$inferInsert) => {
+      await assertNoLiveWorkspaceHoldsAllocatedPath(data);
       const row = await db
         .insert(executionWorkspaces)
         .values(data)
