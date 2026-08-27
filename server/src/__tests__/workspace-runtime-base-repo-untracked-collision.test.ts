@@ -217,6 +217,33 @@ describe("base repo hygiene with untracked paths that collide with the base ref"
     ).toBe(await git(["rev-parse", "origin/main"], work));
   });
 
+  it("clears a collision whose path name git has to quote", async () => {
+    // Path names are bytes. Without `-z`, git C-quotes anything awkward, so
+    // `ls-files` answers `"docs/a\\nb.md"` — quotes and escape included — while
+    // `ls-tree -z` answers the real name, and the two never match. A name that
+    // begins or ends with a space is lost the same way by trimming. Either one
+    // leaves the collision undetected and the base repo wedged exactly as before.
+    const { root, work } = await makeUntrackedCollisionRepo();
+    const awkward = "docs/line\none two.md";
+    const spaced = "docs/ padded .md";
+    const seed = path.join(root, "seed");
+
+    for (const name of [awkward, spaced]) await commit(seed, name, `upstream ${name}\n`);
+    await git(["push", "-q", "origin", "main"], seed);
+    await git(["fetch", "-q", "origin", "main"], work);
+    for (const name of [awkward, spaced]) await writeFile(work, name, `agent version of ${name}\n`);
+
+    const { warnings } = await prepare(work);
+
+    expect(
+      await git(["rev-parse", "HEAD"], work),
+      `base repo did not advance; warnings were: ${JSON.stringify(warnings, null, 2)}`,
+    ).toBe(await git(["rev-parse", "origin/main"], work));
+    // The tracked upstream content is what is left at those paths.
+    expect(await fs.readFile(path.join(work, awkward), "utf8")).toBe(`upstream ${awkward}\n`);
+    expect(await fs.readFile(path.join(work, spaced), "utf8")).toBe(`upstream ${spaced}\n`);
+  });
+
   it("leaves untracked files that do not collide exactly where they are", async () => {
     const { work } = await makeUntrackedCollisionRepo();
     await prepare(work);

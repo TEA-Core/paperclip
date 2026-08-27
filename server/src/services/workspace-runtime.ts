@@ -597,7 +597,13 @@ async function executeProcess(input: {
   };
 }
 
-async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv }): Promise<string> {
+async function runGit(
+  args: string[],
+  cwd: string,
+  // `raw` returns stdout untrimmed. Required for `-z` output: a path name may
+  // legally begin or end with whitespace, and trimming would silently rename it.
+  opts?: { env?: NodeJS.ProcessEnv; raw?: boolean },
+): Promise<string> {
   const proc = await executeProcess({
     command: "git",
     args,
@@ -607,7 +613,22 @@ async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.Process
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
   }
-  return proc.stdout.trim();
+  return opts?.raw ? proc.stdout : proc.stdout.trim();
+}
+
+/**
+ * Path names out of a NUL-separated git listing, exactly as git spelled them.
+ *
+ * `-z` exists because path names are bytes, not lines. Without it git C-quotes
+ * anything awkward — `"apps/a\nb.sql"`, quotes and escape included — and a name
+ * read that way matches nothing. Splitting on newlines and trimming each value
+ * loses the same names a second way: a path may contain a newline, and may begin
+ * or end with a space. Every git listing whose result is compared to another
+ * git listing has to go through here, or the two disagree on names neither
+ * command had any trouble with.
+ */
+function parseNulSeparatedPaths(stdout: string): string[] {
+  return stdout.split("\0").filter((value) => value.length > 0);
 }
 
 function formatShortSha(value: string | null | undefined) {
@@ -3854,7 +3875,9 @@ async function restoreBaseRepoToDefaultRef(input: {
  * Derived from git state rather than parsed out of that message, so wording,
  * locale, and truncation cannot change the answer. `--exclude-standard` keeps
  * ignored paths out, and the base ref is queried with the untracked paths as a
- * pathspec, so no tree listing is materialised.
+ * pathspec, so no tree listing is materialised. Both listings are `-z`, because
+ * the two are compared to each other and only NUL separation spells every path
+ * name the same way in both.
  *
  * EVERY eligible untracked path is inspected. The cap on how many files a
  * quarantine may move belongs to the move, not to the search: a cap applied here
@@ -3869,8 +3892,8 @@ async function resolveBaseRepoUntrackedCollisions(input: {
   repoRoot: string;
   baseRef: string;
 }): Promise<string[]> {
-  const untracked = await runGit(["ls-files", "--others", "--exclude-standard"], input.repoRoot)
-    .then((value) => value.split("\n").map((line) => line.trim()).filter(Boolean))
+  const untracked = await runGit(["ls-files", "-z", "--others", "--exclude-standard"], input.repoRoot, { raw: true })
+    .then(parseNulSeparatedPaths)
     .catch(() => [] as string[]);
   const candidates = untracked.filter(isQuarantinableBaseRepoPath);
   if (candidates.length === 0) return [];
@@ -3881,8 +3904,9 @@ async function resolveBaseRepoUntrackedCollisions(input: {
     const found = await runGit(
       ["ls-tree", "-r", "--name-only", "-z", input.baseRef, "--", ...chunk],
       input.repoRoot,
+      { raw: true },
     )
-      .then((value) => value.split("\0").map((line) => line.trim()).filter(Boolean))
+      .then(parseNulSeparatedPaths)
       .catch(() => [] as string[]);
     for (const path of found) inBaseRef.add(path);
   }
@@ -4090,8 +4114,8 @@ async function fastForwardBaseRepoToDefaultRef(input: {
     );
   }
 
-  const remainingUntracked = await runGit(["ls-files", "--others", "--exclude-standard"], input.repoRoot)
-    .then((value) => value.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 50))
+  const remainingUntracked = await runGit(["ls-files", "-z", "--others", "--exclude-standard"], input.repoRoot, { raw: true })
+    .then((value) => parseNulSeparatedPaths(value).slice(0, 50))
     .catch(() => [] as string[]);
 
   try {
