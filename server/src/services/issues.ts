@@ -5210,7 +5210,10 @@ export function issueService(db: Db) {
         sourceIssueId: executionWorkspaces.sourceIssueId,
       })
       .from(executionWorkspaces)
-      .where(eq(executionWorkspaces.id, executionWorkspaceId))
+      // Company-scoped: a foreign-company id must fall through to the existing
+      // company-scoped validation rather than surface that company's
+      // sourceIssueId in this error.
+      .where(and(eq(executionWorkspaces.companyId, companyId), eq(executionWorkspaces.id, executionWorkspaceId)))
       .then((rows) => rows[0] ?? null);
     if (!workspace) return;
     if (!workspace.sourceIssueId || workspace.mode === "shared_workspace") return;
@@ -7383,7 +7386,11 @@ export function issueService(db: Db) {
           await assertAssignableAgent(db, companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
         }
       }
-      return db.transaction(async (tx) => {
+      // Activities logged inside the create transaction must not publish until the
+      // transaction commits: a rollback would otherwise leave a phantom
+      // publication for an issue that never existed. Drained after commit below.
+      const createActivityPublications: ActivityPublication[] = [];
+      const created = await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (allowDuplicate === false) {
@@ -7534,7 +7541,7 @@ export function issueService(db: Db) {
                   sourceIssueId: sourceWorkspace.sourceIssueId,
                   reason: "workspace is sourced by a different issue",
                 },
-              });
+              }, createActivityPublications);
             }
             else if (sourceWorkspace) {
               executionWorkspaceId = sourceWorkspace.id;
@@ -7774,6 +7781,8 @@ export function issueService(db: Db) {
         const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
         return withRelations;
       });
+      for (const publication of createActivityPublications) publishActivity(publication);
+      return created;
     },
 
     /**

@@ -196,6 +196,32 @@ describeEmbeddedPostgres("execution workspace allocation invariants (SUP-14139)"
     expect(rowsOverHeldPath).toHaveLength(1);
   });
 
+  // The guard must not fire on the holder itself: fresh-worktree reuse and
+  // branch reconciliation both re-allocate the same path for the same source
+  // issue, and refusing that wedges the issue out of its own worktree.
+  it("allows the holding issue to re-allocate its own held path", async () => {
+    const companyId = await seedCompany();
+    const { projectId, projectWorkspaceId } = await seedProjectWorkspace(companyId);
+    const { sourceIssueId } = await seedHeldWorktree(companyId, projectId, projectWorkspaceId);
+
+    const row = await workspacesSvc.create({
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "self-reallocated-worktree",
+      status: "active",
+      cwd: HELD_WORKTREE_PATH,
+      providerType: "git_worktree",
+      providerRef: HELD_WORKTREE_PATH,
+      branchName: "tsp/SUP-13445-root-cause",
+    });
+    expect(row?.id).toBeTruthy();
+    expect(row?.cwd).toBe(HELD_WORKTREE_PATH);
+  });
+
   it("allows a second row over a different worktree path", async () => {
     const companyId = await seedCompany();
     const { projectId, projectWorkspaceId } = await seedProjectWorkspace(companyId);

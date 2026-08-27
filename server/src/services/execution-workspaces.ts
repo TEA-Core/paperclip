@@ -1181,10 +1181,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // allocation must fail loudly instead of minting a second row over a path a
   // live row already holds.
   async function assertNoLiveWorkspaceHoldsAllocatedPath(
-    data: Pick<typeof executionWorkspaces.$inferInsert, "companyId" | "projectWorkspaceId" | "strategyType" | "cwd">,
+    data: Pick<
+      typeof executionWorkspaces.$inferInsert,
+      "companyId" | "projectWorkspaceId" | "strategyType" | "cwd" | "sourceIssueId"
+    >,
+    dbOrTx: Db = db,
   ) {
     if (data.strategyType !== "git_worktree" || !data.projectWorkspaceId || !data.cwd) return;
-    const holders = await db
+    const holders = await dbOrTx
       .select({
         id: executionWorkspaces.id,
         sourceIssueId: executionWorkspaces.sourceIssueId,
@@ -1198,10 +1202,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
         ),
       );
-    const holder = holders[0];
+    // An issue re-provisioning its OWN worktree is not contention: fresh-worktree
+    // reuse and branch reconciliation both re-allocate the same path for the same
+    // source issue. Only a holder sourced by a *different* issue (or an unsourced
+    // holder, which nothing can claim) is the SUP-13445/SUP-14124 shape.
+    const holder = holders.find(
+      (row) => !(data.sourceIssueId && row.sourceIssueId && row.sourceIssueId === data.sourceIssueId),
+    );
     if (!holder) return;
     const holderIssue = holder.sourceIssueId
-      ? await db
+      ? await dbOrTx
           .select({ identifier: issues.identifier })
           .from(issues)
           .where(eq(issues.id, holder.sourceIssueId))
@@ -2467,12 +2477,27 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     },
 
     create: async (data: typeof executionWorkspaces.$inferInsert) => {
-      await assertNoLiveWorkspaceHoldsAllocatedPath(data);
-      const row = await db
-        .insert(executionWorkspaces)
-        .values(data)
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      // The path-exclusivity check is a read; the insert that follows is a write.
+      // Without serialization two concurrent allocations both pass the read and
+      // both insert — the exact "two active rows over one directory" shape this
+      // guard exists to prevent. AC5 forbids a migration (so no partial unique
+      // index), so the check and its insert share one transaction behind an
+      // advisory lock keyed on the contended path.
+      const pathGuardKey =
+        data.strategyType === "git_worktree" && data.projectWorkspaceId && data.cwd
+          ? `execution-workspace:path:${data.companyId}:${data.projectWorkspaceId}:${data.cwd}`
+          : null;
+      const row = await db.transaction(async (tx) => {
+        if (pathGuardKey) {
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${pathGuardKey}, 0))`);
+        }
+        await assertNoLiveWorkspaceHoldsAllocatedPath(data, tx as unknown as Db);
+        return tx
+          .insert(executionWorkspaces)
+          .values(data)
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
       return row ? toExecutionWorkspace(row) : null;
     },
 
