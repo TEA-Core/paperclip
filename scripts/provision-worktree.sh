@@ -155,9 +155,12 @@ paperclipai_command_available() {
 }
 
 existing_worktree_config_is_usable() {
-  WORKTREE_CONFIG_PATH="$worktree_config_path" \
-  WORKTREE_ENV_PATH="$worktree_env_path" \
-  WORKTREE_INSTANCE_ID="$worktree_instance_id" \
+  local config_path="${1:-$worktree_config_path}"
+  local env_path="${2:-$worktree_env_path}"
+  local instance_id="${3:-$worktree_instance_id}"
+  WORKTREE_CONFIG_PATH="$config_path" \
+  WORKTREE_ENV_PATH="$env_path" \
+  WORKTREE_INSTANCE_ID="$instance_id" \
   node <<'EOF'
 const fs = require("node:fs");
 const os = require("node:os");
@@ -263,13 +266,18 @@ EOF
 }
 
 write_fallback_worktree_config() {
+  # The config dir and instance id are parameterized so a uid-scoped fallback
+  # (SUP-14087) can be written under .paperclip/uid-<uid>/ without touching the
+  # canonical .paperclip/config.json. Defaults preserve the canonical behavior.
+  local config_dir="${1:-$paperclip_dir}"
+  local instance_id="${2:-$worktree_instance_id}"
   WORKTREE_NAME="$worktree_name" \
   BASE_CWD="$base_cwd" \
   WORKTREE_CWD="$worktree_cwd" \
-  PAPERCLIP_DIR="$paperclip_dir" \
+  PAPERCLIP_DIR="$config_dir" \
   SOURCE_CONFIG_PATH="$source_config_path" \
   SOURCE_ENV_PATH="$source_env_path" \
-  WORKTREE_INSTANCE_ID="$worktree_instance_id" \
+  WORKTREE_INSTANCE_ID="$instance_id" \
   PAPERCLIP_WORKTREES_DIR="${PAPERCLIP_WORKTREES_DIR:-}" \
   node <<'EOF'
 const fs = require("node:fs");
@@ -521,7 +529,65 @@ main().catch((error) => {
 EOF
 }
 
-if [[ -e "$worktree_config_path" && -e "$worktree_env_path" ]] && existing_worktree_config_is_usable; then
+# SUP-14087: the top-level worktree config belongs to another uid. Regenerating
+# in place is not an option: `worktree init --force` unlinks the other uid's
+# config/env/seed marker/instance data and then re-copies git hooks it cannot
+# overwrite (EPERM on cross-uid-owned files), leaving both uids stranded.
+# Instead, write a uid-scoped config under .paperclip/uid-<uid>/ pointing at a
+# uid-scoped instance root in the shared worktree pool, so each uid keeps its
+# own config, env, seed marker, and instance data without ever touching the
+# other's files.
+provision_uid_scoped_worktree_config() {
+  local other_uid="$1"
+  local current_uid scoped_dir scoped_instance_id
+  current_uid="$(id -u)"
+  scoped_dir="$paperclip_dir/uid-${current_uid}"
+  scoped_instance_id="${worktree_instance_id}-uid-${current_uid}"
+
+  echo "provision-worktree: cross-uid worktree config: $worktree_config_path is owned by uid $other_uid but this provision runs as uid $current_uid. The config is not stale; it belongs to another uid. Provisioning a uid-scoped config at $scoped_dir instead of regenerating in place." >&2
+
+  if [[ -e "$scoped_dir/config.json" && -e "$scoped_dir/.env" ]]; then
+    if existing_worktree_config_is_usable "$scoped_dir/config.json" "$scoped_dir/.env" "$scoped_instance_id"; then
+      echo "Reusing existing uid-scoped isolated Paperclip worktree config at $scoped_dir/config.json" >&2
+      seed_pending_marker_path="$scoped_dir/seed-pending"
+      seed_complete_marker_path="$scoped_dir/seed-complete"
+      return 0
+    fi
+    echo "Existing uid-scoped Paperclip worktree config at $scoped_dir/config.json is stale for this host; regenerating." >&2
+  fi
+
+  if ! mkdir -p "$scoped_dir"; then
+    echo "provision-worktree: cross-uid worktree config at $worktree_config_path is owned by uid $other_uid and uid $current_uid cannot create $scoped_dir, so a uid-scoped config cannot be provisioned. This is not a stale config; provision as uid $other_uid instead, or make $paperclip_dir writable by uid $current_uid." >&2
+    return 1
+  fi
+
+  write_fallback_worktree_config "$scoped_dir" "$scoped_instance_id"
+
+  seed_pending_marker_path="$scoped_dir/seed-pending"
+  seed_complete_marker_path="$scoped_dir/seed-complete"
+}
+
+# SUP-14087: a config or env owned by another uid is NOT "stale for this host".
+# Stat ownership before anything else so the cross-uid case gets its own
+# diagnostic and its own repair (a uid-scoped config) instead of falling into
+# the regenerate path, which would clobber and then EPERM on the other uid's
+# files.
+worktree_config_other_uid=""
+current_provision_uid="$(id -u)"
+for worktree_state_path in "$worktree_config_path" "$worktree_env_path"; do
+  if [[ -e "$worktree_state_path" ]]; then
+    worktree_state_owner="$(path_owner_uid "$worktree_state_path")"
+    if [[ -n "$worktree_state_owner" && "$worktree_state_owner" != "$current_provision_uid" ]]; then
+      worktree_config_other_uid="$worktree_state_owner"
+      break
+    fi
+  fi
+done
+
+if [[ -n "$worktree_config_other_uid" ]]; then
+  provision_uid_scoped_worktree_config "$worktree_config_other_uid" || exit 1
+  created_worktree_config=1
+elif [[ -e "$worktree_config_path" && -e "$worktree_env_path" ]] && existing_worktree_config_is_usable; then
   echo "Reusing existing isolated Paperclip worktree config at $worktree_config_path" >&2
 else
   if [[ -e "$worktree_config_path" || -e "$worktree_env_path" ]]; then
@@ -633,6 +699,21 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
 
   if [[ "$needs_install" -eq 0 && "$current_install_fingerprint" != "$previous_install_fingerprint" ]]; then
     needs_install=1
+  fi
+
+  # SUP-14087: a shared worktree node_modules tree owned by another uid cannot be
+  # reinstalled here. pnpm's linkBins chmods every bin it relinks, so an install
+  # over the other uid's tree dies with EPERM mid-flight and leaves a
+  # partially rewritten tree. Refuse the install instead of corrupting the
+  # shared state; the tree stays as the owning uid last installed it. A symlink
+  # is safe to replace (the install would create a fresh tree), so only a real
+  # directory is gated.
+  if [[ "$needs_install" -eq 1 && -d "$worktree_cwd/node_modules" && ! -L "$worktree_cwd/node_modules" ]]; then
+    node_modules_owner_uid="$(path_owner_uid "$worktree_cwd/node_modules")"
+    if [[ -n "$node_modules_owner_uid" && "$node_modules_owner_uid" != "$current_provision_uid" ]]; then
+      echo "provision-worktree: cross-uid worktree node_modules: $worktree_cwd/node_modules is owned by uid $node_modules_owner_uid but this provision runs as uid $current_provision_uid. Skipping pnpm install to avoid EPERM on uid ${node_modules_owner_uid}-owned bins and a partially rewritten tree; the shared install is left as uid $node_modules_owner_uid last left it. Refresh dependencies for this branch by provisioning as uid $node_modules_owner_uid." >&2
+      needs_install=0
+    fi
   fi
 
   if [[ "$needs_install" -eq 1 ]]; then
