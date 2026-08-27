@@ -5,9 +5,9 @@
 # Runs the worktree state-dir resolution path under TWO DISTINCT REAL uids in a
 # single run:
 #   1. provision canonical + uid-A scoped worktree state as uid A
-#   2. resolve + assert as uid B  (EACCES on A's 0o600 files, B's own scoped dir,
+#   2. provision uid-B scoped worktree state as uid B
+#   3. resolve + assert as uid B  (EACCES on A's 0o600 files, B's own scoped dir,
 #      no mutation of A's files)
-#   3. provision uid-B scoped worktree state as uid B
 #   4. resolve + assert as uid A  (the reverse direction, so the probe cannot
 #      pass by uid ordering)
 #
@@ -130,19 +130,19 @@ else
   exit 1
 fi
 
-printf '== phase 2: resolve + assert as uid %s (non-owner of canonical state) ==\n' "$UID_B"
-if run_child "$UID_B" resolve; then
-  ok "direction A->B: uid $UID_B resolves its own scoped state and cannot touch uid $UID_A's files"
-else
-  no "direction A->B: uid $UID_B FAILED the partition assertions"
-fi
-
-printf '== phase 3: provision uid-B scoped state as uid %s ==\n' "$UID_B"
+printf '== phase 2: provision uid-B scoped state as uid %s ==\n' "$UID_B"
 if run_child "$UID_B" provision; then
   ok "uid $UID_B provisioned its scoped worktree state"
 else
   no "uid $UID_B provisioning failed"
   exit 1
+fi
+
+printf '== phase 3: resolve + assert as uid %s (non-owner of canonical state) ==\n' "$UID_B"
+if run_child "$UID_B" resolve; then
+  ok "direction A->B: uid $UID_B resolves its own scoped state and cannot touch uid $UID_A's files"
+else
+  no "direction A->B: uid $UID_B FAILED the partition assertions"
 fi
 
 printf '== phase 4: resolve + assert as uid %s (reverse direction) ==\n' "$UID_A"
