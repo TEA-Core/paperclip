@@ -3093,13 +3093,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     const active = await svc.upsertSourceScoped(baseInput);
     expect(active.status).toBe("active");
-    expect(active.attemptCount).toBe(6);
+    // SUP-14151: the carried count (prev.attemptCount 5 + 1) is clamped to the
+    // default ceiling, so the 6th re-mint lands exactly on it instead of past it.
+    expect(active.attemptCount).toBe(5);
 
     const all = await svc.listAllForIssue(companyId, sourceIssueId);
     expect(all).toHaveLength(6);
     expect(all[0].id).toBe(active.id);
     expect(all[0].status).toBe("active");
-    expect(all[0].attemptCount).toBe(6);
+    expect(all[0].attemptCount).toBe(5);
     expect(all[5].attemptCount).toBe(1);
     expect(all[5].status).toBe("resolved");
 
@@ -3120,7 +3122,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, active.id));
     expect(escalated?.status).toBe("escalated");
     expect(escalated?.outcome).toBe("exhausted");
-    expect(escalated?.attemptCount).toBe(6);
+    expect(escalated?.attemptCount).toBe(5);
+    expect(escalated?.maxAttempts).toBe(5);
   });
 
   it("does not reset an exhausted escalated action to active on re-mint", async () => {
@@ -3163,5 +3166,112 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     const active = await svc.getActiveForIssue(companyId, sourceIssueId);
     expect(active).toMatchObject({ id: action.id, status: "escalated", outcome: "exhausted" });
+  });
+
+  it("clamps a re-minted successor to the default ceiling when the predecessor's maxAttempts is null", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint = "stranded:null-ceiling:fingerprint";
+    const baseInput = {
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue" as const,
+      ownerType: "agent" as const,
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" as const },
+    };
+
+    // Consume the full default sweep budget on a predecessor that never had a
+    // maxAttempts ceiling stamped (the common case: no caller stamps one).
+    const first = await svc.upsertSourceScoped(baseInput);
+    expect(first.attemptCount).toBe(1);
+    await db
+      .update(issueRecoveryActions)
+      .set({ attemptCount: 5 })
+      .where(eq(issueRecoveryActions.id, first.id));
+    await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      fingerprint,
+      status: "resolved",
+      outcome: "false_positive",
+      resolutionNote: "Cycle resolved.",
+    });
+
+    // SUP-14151: pre-fix this minted attemptCount 6 (prev.attemptCount + 1) even
+    // though nothing stamps a ceiling — the successor lands past the budget the
+    // sweep will hold it to the moment it acquires one.
+    const successor = await svc.upsertSourceScoped(baseInput);
+    expect(successor.status).toBe("active");
+    expect(successor.attemptCount).toBe(5);
+    expect(successor.attemptCount).toBeLessThanOrEqual(successor.maxAttempts ?? 5);
+  });
+
+  it("clamps a re-minted successor to an explicit successor ceiling", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint = "stranded:explicit-ceiling:fingerprint";
+    const baseInput = {
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue" as const,
+      ownerType: "agent" as const,
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" as const },
+    };
+
+    const first = await svc.upsertSourceScoped(baseInput);
+    await db
+      .update(issueRecoveryActions)
+      .set({ attemptCount: 5 })
+      .where(eq(issueRecoveryActions.id, first.id));
+    await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      fingerprint,
+      status: "resolved",
+      outcome: "false_positive",
+      resolutionNote: "Cycle resolved.",
+    });
+
+    const successor = await svc.upsertSourceScoped({ ...baseInput, maxAttempts: 3 });
+    expect(successor.status).toBe("active");
+    expect(successor.attemptCount).toBe(3);
+    expect(successor.attemptCount).toBeLessThanOrEqual(successor.maxAttempts ?? 5);
+  });
+
+  it("never bumps an active action past its ceiling on a same-issue re-upsert", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const baseInput = {
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue" as const,
+      ownerType: "agent" as const,
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" as const },
+    };
+
+    const first = await svc.upsertSourceScoped({ ...baseInput, fingerprint: "stranded:ceiling:a" });
+    await db
+      .update(issueRecoveryActions)
+      .set({ attemptCount: 5, maxAttempts: 5 })
+      .where(eq(issueRecoveryActions.id, first.id));
+
+    const bumped = await svc.upsertSourceScoped({ ...baseInput, fingerprint: "stranded:ceiling:b" });
+    expect(bumped.id).toBe(first.id);
+    expect(bumped.status).toBe("active");
+    expect(bumped.attemptCount).toBe(5);
+    expect(bumped.attemptCount).toBeLessThanOrEqual(bumped.maxAttempts ?? 5);
   });
 });

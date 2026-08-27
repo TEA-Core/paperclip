@@ -12,6 +12,18 @@ import type {
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
 
+/**
+ * The attempt ceiling the stale-wake sweep applies to recovery actions that
+ * carry no explicit `maxAttempts`
+ * (`candidate.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS`).
+ *
+ * SUP-14151: also the ceiling a minted/re-minted `attemptCount` is clamped to,
+ * so a successor can never be minted past the budget the sweep will hold it to.
+ * Exported so the sweep's default ceiling and the upsert clamp share one
+ * source of truth instead of drifting apart.
+ */
+export const DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS = 5;
+
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;
@@ -274,7 +286,13 @@ export function issueRecoveryActionService(db: Db) {
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: existing.attemptCount + 1,
+          // SUP-14151: never bump past the effective ceiling — the sweep holds
+          // this row to `maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS`,
+          // so a post-ceiling count would escalate on the very next pass.
+          attemptCount: Math.min(
+            existing.attemptCount + 1,
+            input.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
+          ),
           maxAttempts: input.maxAttempts ?? null,
           timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
@@ -310,6 +328,16 @@ export function issueRecoveryActionService(db: Db) {
       // re-comments on immediately.
       const predecessorBudgetExhausted =
         prev != null && prev.maxAttempts != null && prev.attemptCount >= prev.maxAttempts;
+      const carriedAttemptCount = predecessorBudgetExhausted ? 1 : (prev?.attemptCount ?? 0) + 1;
+      // SUP-14151: clamp the carried count to the effective ceiling. The
+      // predecessor-budget reset above only fires when the predecessor carries
+      // a non-null maxAttempts; where it was null the count carried forward
+      // unbounded and the successor was minted already past a ceiling it later
+      // acquired (the `attemptCount 18 > maxAttempts 5` reading from SUP-14139).
+      const nextAttemptCount = Math.min(
+        carriedAttemptCount,
+        input.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
+      );
       const [created] = await db
         .insert(issueRecoveryActions)
         .values({
@@ -329,7 +357,7 @@ export function issueRecoveryActionService(db: Db) {
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: predecessorBudgetExhausted ? 1 : (prev?.attemptCount ?? 0) + 1,
+          attemptCount: nextAttemptCount,
           maxAttempts: input.maxAttempts ?? null,
           timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,

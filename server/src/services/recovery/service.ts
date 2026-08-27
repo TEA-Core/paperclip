@@ -49,7 +49,7 @@ import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { authorizationService } from "../authorization.js";
-import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import { DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS, issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import {
   IssueDependencyReadiness,
@@ -7044,7 +7044,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
-  const MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS = 5;
+  // SUP-14151: the sweep ceiling is the same default the upsert clamp holds a
+  // minted action to, so the two can never disagree about what "exhausted" is.
+  const MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS = DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS;
 
   async function reconcileBlockedWithoutBlockers(opts?: {
     runId?: string | null;
@@ -7064,6 +7066,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       candidateLimitSkipped: 0,
       deadWorkspaceBindingSkipped: 0,
       rearmCapExhaustedSkipped: 0,
+      exhaustedRecoverySuppressed: 0,
       deadBindingsCleared: 0,
       issueIds: [] as string[],
     };
@@ -7147,6 +7150,47 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         const existingAction = await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
+
+        // SUP-14151 — cross-fingerprint exhaustion suppression: when the
+        // issue's single active/escalated recovery row is the terminal
+        // `escalated` + `outcome: "exhausted"` state, recovery for the
+        // underlying condition has already been handed to the board and is
+        // unrepaired until a board resolution clears it. This sweep must not
+        // re-dispatch the assignee into the same failure (auto-heal) nor
+        // mint/duplicate a second-fingerprint board escalation for it. The
+        // skip is recorded so a board triage does not have to reconstruct it
+        // from repeated rows. (The upsert's no-resurrection rule already
+        // refused the row write; this guard stops the redispatch and the
+        // misleading re-escalation count/activity that rode along with it.)
+        if (
+          existingAction?.status === "escalated" &&
+          (existingAction.outcome as string | null) === "exhausted"
+        ) {
+          result.exhaustedRecoverySuppressed++;
+          await logActivity(db, {
+            companyId,
+            actorType: "system",
+            actorId: "issue_graph_liveness_blocked_without_blockers",
+            runId: opts?.runId ?? null,
+            action: "issue.blocked_without_blockers_suppressed",
+            entityType: "issue",
+            entityId: candidate.id,
+            details: {
+              source,
+              fingerprint: `bwob:${companyId}:${candidate.id}`,
+              suppressedBy: {
+                id: existingAction.id,
+                kind: existingAction.kind,
+                cause: existingAction.cause,
+                fingerprint: existingAction.fingerprint,
+                outcome: existingAction.outcome,
+                attemptCount: existingAction.attemptCount,
+                maxAttempts: existingAction.maxAttempts,
+              },
+            },
+          });
+          continue;
+        }
 
         // Guard 2 — rearm-cap-exhausted: a candidate holding an active
         // `blocked_without_blockers` recovery action whose cause is

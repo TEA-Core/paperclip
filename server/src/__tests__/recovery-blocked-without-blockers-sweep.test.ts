@@ -1483,4 +1483,140 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(second.deadWorkspaceBindingSkipped).toBe(0);
     expect(second.healed).toBe(0);
   });
+
+  async function seedExhaustedWorkspaceValidationAction(companyId: string, agentId: string, issueId: string) {
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId: issueId,
+      kind: "workspace_validation",
+      status: "escalated",
+      ownerType: "board",
+      previousOwnerAgentId: agentId,
+      cause: "workspace_validation_failed",
+      fingerprint: "workspace:provision:failure",
+      attemptCount: 5,
+      maxAttempts: 5,
+      nextAction: "Repair the worktree provisioning failure.",
+      outcome: "exhausted",
+      evidence: { identifier: null },
+      lastAttemptAt: oldDate(),
+    });
+  }
+
+  it("flag ON + exhausted/escalated recovery action on the issue — suppresses the auto-heal redispatch and records the skip", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked behind an exhausted recovery action",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.checked).toBe(1);
+    expect(result.healed).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.exhaustedRecoverySuppressed).toBe(1);
+    expect(result.issueIds).toEqual([]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+
+    // No dispatch back into the identical provisioning failure.
+    const wakeups = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.length);
+    expect(wakeups).toBe(0);
+
+    // No second recovery action row; the exhausted terminal row is untouched.
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      status: "escalated",
+      outcome: "exhausted",
+      attemptCount: 5,
+      maxAttempts: 5,
+    });
+
+    // The skipped redispatch is observable so a board triage does not have to
+    // reconstruct it from repeated rows.
+    const audit = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.find((r) => r.action === "issue.blocked_without_blockers_suppressed"));
+    expect(audit).toBeTruthy();
+    expect((audit!.details as Record<string, unknown>).suppressedBy).toMatchObject({
+      kind: "workspace_validation",
+      outcome: "exhausted",
+      attemptCount: 5,
+      maxAttempts: 5,
+    });
+  });
+
+  it("flag OFF + exhausted/escalated recovery action on the issue — records the skip instead of a duplicate board escalation", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    // auto-heal is OFF by default.
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked behind an exhausted recovery action",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+
+    expect(result.checked).toBe(1);
+    expect(result.healed).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.exhaustedRecoverySuppressed).toBe(1);
+    expect(result.issueIds).toEqual([]);
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ status: "escalated", outcome: "exhausted" });
+
+    const audit = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.find((r) => r.action === "issue.blocked_without_blockers_suppressed"));
+    expect(audit).toBeTruthy();
+  });
 });
