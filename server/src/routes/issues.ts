@@ -8288,6 +8288,35 @@ export function issueRoutes(
     res.json(approvals);
   });
 
+  router.get("/issues/:id/execution-decisions", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const decisions = await db
+      .select({
+        id: issueExecutionDecisions.id,
+        issueId: issueExecutionDecisions.issueId,
+        stageId: issueExecutionDecisions.stageId,
+        stageType: issueExecutionDecisions.stageType,
+        actorAgentId: issueExecutionDecisions.actorAgentId,
+        actorUserId: issueExecutionDecisions.actorUserId,
+        outcome: issueExecutionDecisions.outcome,
+        body: issueExecutionDecisions.body,
+        createdByRunId: issueExecutionDecisions.createdByRunId,
+        createdAt: issueExecutionDecisions.createdAt,
+      })
+      .from(issueExecutionDecisions)
+      .where(
+        and(
+          eq(issueExecutionDecisions.issueId, issue.id),
+          eq(issueExecutionDecisions.companyId, issue.companyId),
+        ),
+      )
+      .orderBy(asc(issueExecutionDecisions.createdAt), asc(issueExecutionDecisions.id));
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, decisions));
+  });
+
   router.post("/issues/:id/approvals", validate(linkIssueApprovalSchema), async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
