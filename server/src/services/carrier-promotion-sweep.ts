@@ -103,8 +103,16 @@ function parseExternalPullRequest(externalId: string): { owner: string; repo: st
   return { owner: match[1]!, repo: match[2]!, number: Number(match[4]) };
 }
 
-/** Extracts the head branch ref from a cached external object's data (GitHub `head.ref` or `headRefName`). */
+/**
+ * Extracts the head branch ref from a cached external object's data. The
+ * canonical shape is the flat `headRef` key the GitHub external-object
+ * provider writes (`pullRequestSnapshot` in
+ * `github-external-object-provider.ts`); nested `head.ref` and flat
+ * `headRefName` are tolerated for legacy cached rows.
+ */
 function headRefFromData(data: Record<string, unknown>): string | null {
+  const flat = readString(data.headRef);
+  if (flat) return flat;
   const head = data.head;
   if (head && typeof head === "object" && !Array.isArray(head)) {
     const ref = (head as Record<string, unknown>).ref;
