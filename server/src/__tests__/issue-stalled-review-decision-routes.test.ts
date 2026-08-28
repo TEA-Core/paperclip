@@ -346,7 +346,10 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       .patch(`/api/issues/${issueId}`)
       .send({ status: "done", comment: DONE_TIER_DECLARATION });
     expect(peerVerdict.status, JSON.stringify(peerVerdict.body)).toBe(403);
-    expect(peerVerdict.body.error).toBe("Issue is outside this actor's authorization boundary");
+    // SUP-14304: the boundary refusal now answers with the shared issue-write
+    // denial copy — still a 403 authorization denial (never the 409 run lock),
+    // and details.code names the wall that fired.
+    expect(peerVerdict.body.details.code).toBe("issue_write_no_grant");
 
     // The policy itself still admits a writer other than the review requester;
     // under the fork that writer is an authenticated operator, not a peer agent.
