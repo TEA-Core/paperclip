@@ -3,7 +3,10 @@ import {
   CARRIER_PROMOTION_READY_ACTION,
   createCarrierPromotionSweepService,
 } from "../services/carrier-promotion-sweep.js";
-import { createHeartbeatSweepLiveness } from "../services/heartbeat-sweep-liveness.js";
+import {
+  createHeartbeatSweepLiveness,
+  HEARTBEAT_SWEEP_NAMES,
+} from "../services/heartbeat-sweep-liveness.js";
 import { markPullRequestReadyForReview } from "../services/merge-arming.js";
 
 const mockGhFetch = vi.hoisted(() => vi.fn());
@@ -536,6 +539,24 @@ describe("createCarrierPromotionSweepService", () => {
 });
 
 describe("heartbeat sweep liveness (SUP-14227)", () => {
+  it("pre-registers all monitored sweeps with null last-run state before any sweep fires", () => {
+    const liveness = createHeartbeatSweepLiveness({
+      logger: { debug: () => {} },
+    });
+
+    const snapshot = liveness.snapshot();
+    expect(Object.keys(snapshot.sweeps).sort()).toEqual([...HEARTBEAT_SWEEP_NAMES].sort());
+    for (const name of HEARTBEAT_SWEEP_NAMES) {
+      expect(snapshot.sweeps[name]).toMatchObject({
+        name,
+        lastFinishedAt: null,
+        lastOutcome: null,
+        totalRuns: 0,
+        lastResult: null,
+      });
+    }
+  });
+
   it("records a trace for an all-zero run and exposes the last-run timestamp", async () => {
     const debugCalls: Array<{ obj: Record<string, unknown>; msg: string }> = [];
     const liveness = createHeartbeatSweepLiveness({

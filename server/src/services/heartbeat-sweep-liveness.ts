@@ -69,6 +69,21 @@ export interface HeartbeatSweepLivenessOptions {
   logger?: Pick<typeof logger, "debug">;
 }
 
+/**
+ * The six periodic scheduler sweeps monitored by this module. Pre-registered at
+ * construction so a fresh process reports each entry with `lastFinishedAt:
+ * null` instead of an empty map: "monitored but never fired" then stays
+ * distinguishable from "not monitored at all".
+ */
+export const HEARTBEAT_SWEEP_NAMES = [
+  "openCodeLogRotation",
+  "externalObjectRefresh",
+  "carrierPromotion",
+  "doneCloseLandingBackstop",
+  "mergedPullRequestConfirmation",
+  "terminalWorkspace",
+] as const;
+
 export function createHeartbeatSweepLiveness(
   options: HeartbeatSweepLivenessOptions = {},
 ): HeartbeatSweepLiveness {
@@ -92,6 +107,10 @@ export function createHeartbeatSweepLiveness(
     }
     return entry;
   };
+
+  for (const name of HEARTBEAT_SWEEP_NAMES) {
+    entryFor(name);
+  }
 
   return {
     recordRun(name, result) {
