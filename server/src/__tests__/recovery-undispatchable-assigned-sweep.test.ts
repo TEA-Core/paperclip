@@ -214,20 +214,22 @@ describeEmbeddedPostgres("recovery sweep reconcileUndispatchableAssignedIssues",
     expect((await issueRow(issueId))?.status).toBe("backlog");
   });
 
-  it("reports the four stranded terminals' shape and not cards owned by dispatchable agents", async () => {
+  it("reports the six fresh-census pull-only todo cards' shape and not cards owned by dispatchable agents", async () => {
+    // Fresh census 2026-08-28T17:50Z (SUP-14281 filer correction): six pull-only
+    // `todo` cards with no continuation path; the "9 dependents" figure is historical.
     const companyId = await seedCompany();
     const pullOnlyAgentId = await seedAgent(companyId, "process");
     const dispatchableAgentId = await seedAgent(companyId, "codex_local");
 
     const terminalIds: string[] = [];
-    for (let n = 0; n < 4; n += 1) {
+    for (let n = 0; n < 6; n += 1) {
       terminalIds.push(await seedCard(companyId, pullOnlyAgentId));
     }
     const dispatchableCardId = await seedCard(companyId, dispatchableAgentId);
 
     const result = await makeSweep().reconcileUndispatchableAssignedIssues();
 
-    expect(result.reported).toBe(4);
+    expect(result.reported).toBe(6);
     expect(result.skipped).toBe(1);
     expect([...result.issueIds].sort()).toEqual([...terminalIds].sort());
     for (const issueId of terminalIds) {
