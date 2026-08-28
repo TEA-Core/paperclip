@@ -147,6 +147,20 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "pi_local",
 ]);
 
+/**
+ * SUP-14225: read the agent id recorded as the issue's execution return
+ * assignee (the executor that owed the next action when it was bounced), if
+ * any. Execution state is free-form jsonb, so every field is type-guarded.
+ */
+function readReturnAssigneeAgentId(executionState: unknown): string | null {
+  if (!executionState || typeof executionState !== "object") return null;
+  const returnAssignee = (executionState as Record<string, unknown>).returnAssignee;
+  if (!returnAssignee || typeof returnAssignee !== "object") return null;
+  const principal = returnAssignee as { type?: unknown; agentId?: unknown };
+  if (principal.type !== "agent" || typeof principal.agentId !== "string") return null;
+  return principal.agentId.length > 0 ? principal.agentId : null;
+}
+
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
 // escalation if the assignee posted a comment or attachment within this window.
@@ -1477,10 +1491,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         skipped += 1;
         continue;
       }
-      const creatorAgent = await getAgent(creatorAgentId);
-      if (!creatorAgent || creatorAgent.companyId !== candidate.companyId || !(await isAgentInvokable(creatorAgent))) {
-        skipped += 1;
-        continue;
+
+      // SUP-14225: prefer the recorded return assignee — the platform's own
+      // record of the agent that owed the next action — over the creator.
+      // The creator is the fallback when no usable return assignee is
+      // recorded (none, not in-company, or not invokable).
+      let nextAgent: typeof agents.$inferSelect | null = null;
+      let reassignSource: "return_assignee" | "creator" = "creator";
+      const returnAssigneeAgentId = readReturnAssigneeAgentId(candidate.executionState);
+      if (returnAssigneeAgentId) {
+        const returnAgent = await getAgent(returnAssigneeAgentId);
+        if (returnAgent && returnAgent.companyId === candidate.companyId && (await isAgentInvokable(returnAgent))) {
+          nextAgent = returnAgent;
+          reassignSource = "return_assignee";
+        }
+      }
+      if (!nextAgent) {
+        const creatorAgent = await getAgent(creatorAgentId);
+        if (!creatorAgent || creatorAgent.companyId !== candidate.companyId || !(await isAgentInvokable(creatorAgent))) {
+          skipped += 1;
+          continue;
+        }
+        nextAgent = creatorAgent;
       }
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
@@ -1488,7 +1520,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // SUP-13526: route this recovery reassignment through the same gate as
       // the PATCH handler and the other recovery paths. A refusal keeps the
       // blocker unassigned instead of making its review stage self-satisfiable.
-      const nextAssigneeAgentId = resolveRecoveryReassignedAssignee(candidate, creatorAgent.id);
+      const nextAssigneeAgentId = resolveRecoveryReassignedAssignee(candidate, nextAgent.id);
       if (!nextAssigneeAgentId) {
         skipped += 1;
         continue;
@@ -1509,7 +1541,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           "",
           `Paperclip found this issue is blocking ${blockingLinks} but had no assignee, so no heartbeat could pick it up.`,
           "",
-          "- Assigned it back to the agent that created the blocker.",
+          reassignSource === "return_assignee"
+            ? "- Assigned it to the recorded return assignee (the executor that owed the next action), not to the creator."
+            : "- Assigned it back to the agent that created the blocker (no usable return assignee was recorded).",
           "- Next action: resolve this blocker or reassign it to the right owner.",
         ].join("\n"),
         {},
@@ -1526,12 +1560,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         entityId: candidate.id,
         details: {
           identifier: candidate.identifier,
-          assigneeAgentId: creatorAgent.id,
+          assigneeAgentId: nextAssigneeAgentId,
+          reassignSource,
           source: "recovery.reconcile_unassigned_blocking_issue",
         },
       });
 
-      const queued = await deps.enqueueWakeup(creatorAgent.id, {
+      const queued = await deps.enqueueWakeup(nextAssigneeAgentId, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_assigned",
