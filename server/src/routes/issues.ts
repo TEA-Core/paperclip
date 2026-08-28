@@ -8314,7 +8314,7 @@ export function issueRoutes(
         ),
       )
       .orderBy(asc(issueExecutionDecisions.createdAt), asc(issueExecutionDecisions.id));
-    res.json(decisions);
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, decisions));
   });
 
   router.post("/issues/:id/approvals", validate(linkIssueApprovalSchema), async (req, res) => {

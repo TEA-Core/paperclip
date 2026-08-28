@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { mkdirSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -6,10 +9,13 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRuns,
   issueExecutionDecisions,
   issues,
   projects,
 } from "@paperclipai/db";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -160,8 +166,14 @@ async function seedDecision(db: Db, input: {
 describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", () => {
   let db!: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  const previousAllowKeyGeneration = process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+  const secretsTmpDir = path.join(os.tmpdir(), `paperclip-exec-decisions-redaction-${randomUUID()}`);
 
   beforeAll(async () => {
+    mkdirSync(secretsTmpDir, { recursive: true });
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
+    process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = "1";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-execution-decisions-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
@@ -169,6 +181,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
   afterEach(async () => {
     await db.delete(issueExecutionDecisions);
     await db.delete(issues);
+    await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(projects);
     await db.delete(companies);
@@ -176,6 +189,11 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
 
   afterAll(async () => {
     await tempDb?.cleanup();
+    if (previousKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
+    if (previousAllowKeyGeneration === undefined) delete process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION;
+    else process.env.PAPERCLIP_SECRETS_ALLOW_KEY_GENERATION = previousAllowKeyGeneration;
+    rmSync(secretsTmpDir, { recursive: true, force: true });
   });
 
   it("returns every decision for a 3-stage ladder, ordered createdAt ascending, with the ten contract fields", async () => {
@@ -347,6 +365,47 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       [orphanStageId, "orphan-stage-verdict"],
       [currentStageId, "current-stage-verdict"],
     ]);
+  });
+
+  it("redacts registered run secrets inside decision bodies (mirrors the comment read surface)", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Secret-laden decision",
+      status: "done",
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: company.id,
+      agentId: agent.id,
+      status: "running",
+      contextSnapshot: { issueId: issue.id },
+    });
+    const secret = "exec-decisions-redaction-secret-value";
+    await createRunSecretRedactionRegistry(db).register(company.id, runId, secret);
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: issue.id,
+      stageId: randomUUID(),
+      stageType: "review",
+      actorAgentId: agent.id,
+      outcome: "approved",
+      body: `agent pasted ${secret} in the verdict`,
+      createdAt: new Date("2026-08-20T10:00:00Z"),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/execution-decisions`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toHaveLength(1);
+    expect(Object.keys(res.body[0])).toEqual([...CONTRACT_FIELDS]);
+    expect(res.body[0].body).toBe(`agent pasted ${REDACTED_EVENT_VALUE} in the verdict`);
+    expect(JSON.stringify(res.body)).not.toContain(secret);
   });
 
   it("returns 404 for a missing issue id", async () => {
