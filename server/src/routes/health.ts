@@ -13,6 +13,10 @@ import {
   type CloudInstanceEnv,
 } from "../services/cloud-instance.js";
 import {
+  isSweepLivenessArmed,
+  sweepLivenessTracker,
+} from "../services/sweep-liveness.js";
+import {
   inspectDatabaseBackupHealth,
   type DatabaseBackupHealthStatus,
   type DatabaseBackupHealthWarning,
@@ -148,6 +152,15 @@ export function healthRoutes(
     const exposeDevServerDetails =
       exposeFullDetails || hasDevServerStatusToken(req.get("x-paperclip-dev-server-status-token"));
 
+    // SUP-14227: expose a last-run-per-sweep timestamp/counter so an operator
+    // can tell "ran, found nothing" from "never fired" without a log window.
+    // Only present in the full-details response, and only once the server
+    // entry has armed the tracker — test apps that build healthRoutes directly
+    // keep their existing response shape byte-identical.
+    const sweepLivenessDetails = isSweepLivenessArmed()
+      ? { sweepLiveness: sweepLivenessTracker.snapshot() }
+      : {};
+
     if (!db) {
       res.json(
         exposeFullDetails
@@ -157,6 +170,7 @@ export function healthRoutes(
               serverVersion: serverVersion,
               commit,
               serverInfo,
+              ...sweepLivenessDetails,
               ...(cloud ? { cloud } : {}),
             }
           : {
@@ -310,6 +324,7 @@ export function healthRoutes(
         companyDeletionEnabled: opts.companyDeletionEnabled,
       },
       serverInfo,
+      ...sweepLivenessDetails,
       ...(databaseBackup ? { databaseBackup } : {}),
       ...(warnings ? { warnings } : {}),
       ...(devServer ? { devServer } : {}),

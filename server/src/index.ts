@@ -66,6 +66,10 @@ import {
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { rotateOpenCodeLog } from "./services/opencode-log-rotation.js";
+import {
+  armSweepLiveness,
+  sweepLivenessTracker,
+} from "./services/sweep-liveness.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
@@ -944,10 +948,27 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
-  const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
+  // SUP-14227: arm the process-wide sweep-liveness registry so the /health
+  // surface exposes a last-run-per-sweep timestamp/counter readable without a
+  // log window. Observability only — no sweep behaviour change.
+  armSweepLiveness();
+  const trackHeartbeatSchedulerWork = (
+    work: Promise<unknown>,
+    liveness?: { name: string },
+  ) => {
     let tracked: Promise<void>;
     tracked = Promise.resolve(work)
-      .then(() => undefined, () => undefined)
+      .then((result: unknown) => {
+        // SUP-14227: every named sweep completion leaves a trace — including an
+        // all-zero result — so "ran, found nothing" is distinguishable from
+        // "never fired." Sweeps that do not pass a name (the outer tick and
+        // the non-sweep helpers) keep the previous no-op behaviour.
+        if (liveness) sweepLivenessTracker.record(liveness.name, result);
+      })
+      .catch(() => {
+        // The wrapped sweep already logs its own error; swallow here so the
+        // in-flight tracking promise never becomes an unhandled rejection.
+      })
       .finally(() => {
         heartbeatSchedulerInFlight.delete(tracked);
       });
@@ -986,10 +1007,11 @@ export async function startServer(): Promise<StartedServer> {
         if (result.rotated) {
           logger.warn({ ...result }, "periodic opencode log rotation truncated an oversized log");
         }
+        return result;
       })
       .catch((err) => {
         logger.error({ err }, "periodic opencode log rotation failed");
-      }));
+      }), { name: "openCodeLogRotation" });
   };
   const scheduleExternalObjectRefreshSweep = (now = new Date()) => {
     if (heartbeatSchedulerStopped) return;
@@ -999,10 +1021,11 @@ export async function startServer(): Promise<StartedServer> {
         if (result.checked > 0 || result.refreshed > 0) {
           logger.info({ ...result }, "external-object scheduler tick refreshed due objects");
         }
+        return result;
       })
       .catch((err) => {
         logger.error({ err }, "external-object scheduler tick failed");
-      }));
+      }), { name: "externalObjectRefresh" });
   };
 
   if (heartbeat) {
@@ -1027,7 +1050,7 @@ export async function startServer(): Promise<StartedServer> {
       wakeup: heartbeat.wakeup,
     });
     const carrierPromotionSweep = createCarrierPromotionSweepService(db as any);
-    /** Fires one carrier promotion sweep on the heartbeat tick; logs only when something was dispositioned. */
+    /** Fires one carrier promotion sweep on the heartbeat tick; logs when something was dispositioned, and the wrapper leaves a per-run liveness trace on every completion (SUP-14227). */
     const scheduleCarrierPromotionSweep = () => {
       if (heartbeatSchedulerStopped) return;
       trackHeartbeatSchedulerWork(carrierPromotionSweep
@@ -1036,10 +1059,11 @@ export async function startServer(): Promise<StartedServer> {
           if (result.candidates > 0 || result.promoted > 0 || result.blocked > 0 || result.failed > 0) {
             logger.info(result, "carrier promotion sweep dispositioned draft carrier pull requests");
           }
+          return result;
         })
         .catch((err) => {
           logger.error({ err }, "carrier promotion sweep failed");
-        }));
+        }), { name: "carrierPromotion" });
     };
     const scheduleDoneCloseLandingBackstopSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1049,10 +1073,11 @@ export async function startServer(): Promise<StartedServer> {
           if (result.candidates > 0 || result.confirmed > 0 || result.failed > 0 || result.deferred > 0) {
             logger.info(result, "done-close landing backstop sweep dispositioned decision-carried skips");
           }
+          return result;
         })
         .catch((err) => {
           logger.error({ err }, "done-close landing backstop sweep failed");
-        }));
+        }), { name: "doneCloseLandingBackstop" });
     };
     const scheduleMergedPullRequestConfirmationSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1062,10 +1087,11 @@ export async function startServer(): Promise<StartedServer> {
           if (result.accepted > 0) {
             logger.info(result, "accepted merge confirmations for merged pull requests");
           }
+          return result;
         })
         .catch((err) => {
           logger.error({ err }, "merged pull-request confirmation sweep failed");
-        }));
+        }), { name: "mergedPullRequestConfirmation" });
     };
     const scheduleTerminalWorkspaceSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1075,10 +1101,11 @@ export async function startServer(): Promise<StartedServer> {
           if (result.archived > 0 || result.cleanupFailed > 0) {
             logger.info(result, "terminal issue workspace reaper changed workspace state");
           }
+          return result;
         })
         .catch((err) => {
           logger.error({ err }, "terminal issue workspace reaper failed");
-        }));
+        }), { name: "terminalWorkspace" });
     };
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
@@ -1707,6 +1734,9 @@ export async function startServer(): Promise<StartedServer> {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
+      // SUP-14227: surface the latch in the liveness snapshot so a reader can
+      // tell "scheduler stopped (all sweeps frozen)" from "ran, found nothing".
+      sweepLivenessTracker.setSchedulerStopped(true);
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
