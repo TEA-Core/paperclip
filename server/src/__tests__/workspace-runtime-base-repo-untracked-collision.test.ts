@@ -204,7 +204,7 @@ describe("base repo hygiene with untracked paths that collide with the base ref"
     expect(operations.filter((op) => op.status === "failed")).toEqual([]);
   });
 
-  it("records the collisions it could not move, so an unwritable quarantine is not silent", async () => {
+  it("records the collisions it could not move, so an unwritable quarantine is not silent", async (ctx) => {
     // The production wedge that motivated this: `paperclip-base-repo-quarantine`
     // was left root-owned and not group-writable, so every `mkdir` beneath it
     // was EACCES. The collisions were found and none could be moved. Nothing in
@@ -216,11 +216,18 @@ describe("base repo hygiene with untracked paths that collide with the base ref"
     const quarantineRoot = path.join(work, ".git", "paperclip-base-repo-quarantine");
     await fs.mkdir(quarantineRoot, { recursive: true });
     await fs.chmod(quarantineRoot, 0o555);
-    // Root ignores the write bit, so the fixture would not reproduce anything.
-    const writable = await fs.mkdir(path.join(quarantineRoot, "probe"), { recursive: true })
-      .then(() => true)
-      .catch(() => false);
-    if (writable) return;
+    // Root ignores the write bit, so the fixture cannot deny the quarantine
+    // anything and there is nothing here to assert. Skip explicitly rather than
+    // returning: a bare `return` reports this as a passing test, which is the
+    // same "looks fine, checked nothing" failure the test exists to catch.
+    const probe = path.join(quarantineRoot, "probe");
+    const writable = await fs.mkdir(probe, { recursive: true }).then(() => true).catch(() => false);
+    if (writable) {
+      await fs.rm(probe, { recursive: true, force: true }).catch(() => {});
+      await fs.chmod(quarantineRoot, 0o755).catch(() => {});
+      ctx.skip("quarantine root stayed writable (running as root); the fixture cannot deny the move");
+      return;
+    }
 
     const { recorder, operations } = makeRecorder();
     try {
