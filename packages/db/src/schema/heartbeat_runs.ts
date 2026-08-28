@@ -104,5 +104,14 @@ export const heartbeatRuns = pgTable(
       sql`(${table.contextSnapshot} ->> 'taskKey')`,
       table.createdAt.desc(),
     ),
+    // Run-secret redaction resolves a run set for an issue by ORing
+    // `issueId` with the nested `paperclipIssue.id`. Without an index on the
+    // nested arm the planner cannot BitmapOr, so it sequentially scans and
+    // detoasts every run snapshot in the company on each issue-scoped
+    // redaction.
+    companyCtxPaperclipIssueIdx: index("heartbeat_runs_company_ctx_paperclip_issue_idx").on(
+      table.companyId,
+      sql`((${table.contextSnapshot} -> 'paperclipIssue') ->> 'id')`,
+    ),
   }),
 );
