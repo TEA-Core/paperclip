@@ -224,9 +224,13 @@ type StrandedRecoveryCause =
   // a plain stranded issue because the fix is to the command the run chose, not
   // to the runtime or the assignment.
   | "opencode_db_growth_limit"
+  // SUP-14184: an assigned `backlog` card that never gained a live execution
+  // path (stillborn at filing). Escalated via the same source-scoped action so
+  // each card escalates at most once instead of re-logging every sweep tick.
+  | "stillborn_assigned_backlog"
   | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
 
-type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
+type StrandedPreviousStatus = "backlog" | "todo" | "in_progress" | "in_review";
 
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
@@ -3909,6 +3913,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ? "recovery.reconcile_execution_review_participant"
       : input.recoveryCause === "opencode_db_growth_limit"
         ? "recovery.reconcile_opencode_db_growth_limit"
+      : input.recoveryCause === "stillborn_assigned_backlog"
+        ? "recovery.reconcile_stillborn_assigned_backlog"
       : "recovery.reconcile_stranded_assigned_issue";
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
@@ -8100,12 +8106,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
 
     const candidates = await db
-      .select({
-        id: issues.id,
-        companyId: issues.companyId,
-        identifier: issues.identifier,
-        assigneeAgentId: issues.assigneeAgentId,
-      })
+      .select()
       .from(issues)
       .where(
         and(
@@ -8134,24 +8135,49 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
+      const updated = await escalateStrandedAssignedIssue({
+        issue: candidate,
+        previousStatus: "backlog",
+        latestRun: null,
+        recoveryCause: "stillborn_assigned_backlog",
+        comment:
+          "Paperclip found this issue parked in `backlog` with an assignee but no live execution path, no pending " +
+          "wake interaction, and no recorded recovery. Moving it to `blocked` so a human or the assignee rules on it " +
+          "instead of leaving it invisible in `backlog`.",
+      });
+      if (!updated) {
+        result.skipped += 1;
+        continue;
+      }
+
       result.reported += 1;
       result.issueIds.push(candidate.id);
 
-      await logActivity(db, {
-        companyId: candidate.companyId,
-        actorType: "system",
-        actorId: "system",
-        agentId: null,
-        runId: null,
-        action: "issue.stillborn_assigned_backlog_detected",
-        entityType: "issue",
-        entityId: candidate.id,
-        details: {
-          source: "recovery.reconcile_stillborn_assigned_backlog",
-          identifier: candidate.identifier,
-          assigneeAgentId: candidate.assigneeAgentId,
-        },
-      });
+      // SUP-14184: the escalation above already records an `issue.updated`
+      // activity row, so the sweep's own detection row is logged only for the
+      // first escalation of this issue. The source-scoped recovery action
+      // upsert reuses the existing active action on later detections (only a
+      // fresh action starts at attemptCount 1), which keeps this to one
+      // detection row per stranded card instead of one per 30s sweep tick.
+      const action = await recoveryActionsSvc.getActiveForIssue(candidate.companyId, candidate.id);
+      if (!action || action.attemptCount === 1) {
+        await logActivity(db, {
+          companyId: candidate.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "issue.stillborn_assigned_backlog_detected",
+          entityType: "issue",
+          entityId: candidate.id,
+          details: {
+            source: "recovery.reconcile_stillborn_assigned_backlog",
+            identifier: candidate.identifier,
+            assigneeAgentId: candidate.assigneeAgentId,
+            recoveryActionId: action?.id ?? null,
+          },
+        });
+      }
     }
 
     const shouldLog =

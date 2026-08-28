@@ -1,26 +1,29 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issueRelations,
+  issueThreadInteractions,
+  issueTreeHolds,
   issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { recoveryService } from "../services/recovery/service.ts";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
-
-import { heartbeatService } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -43,6 +46,10 @@ describeEmbeddedPostgres("recovery sweep reconcileStillbornAssignedBacklog", () 
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(issueThreadInteractions);
+    await db.delete(issueTreeHolds);
+    await db.delete(issueRecoveryActions);
+    await db.delete(agentWakeupRequests);
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
@@ -82,8 +89,7 @@ describeEmbeddedPostgres("recovery sweep reconcileStillbornAssignedBacklog", () 
     return { companyId, agentId };
   }
 
-  it("reports a matching backlog row with an assigneeAgentId", async () => {
-    const { companyId, agentId } = await seed();
+  async function seedStillbornCard(companyId: string, agentId: string) {
     const issueId = randomUUID();
     await db.insert(issues).values({
       id: issueId,
@@ -93,20 +99,65 @@ describeEmbeddedPostgres("recovery sweep reconcileStillbornAssignedBacklog", () 
       priority: "high",
       assigneeAgentId: agentId,
     });
+    return issueId;
+  }
 
-    const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileStillbornAssignedBacklog();
+  function makeSweep() {
+    return recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+  }
+
+  async function detectionRows(issueId: string) {
+    return db
+      .select({ id: activityLog.id, details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.action, "issue.stillborn_assigned_backlog_detected"),
+          eq(activityLog.entityId, issueId),
+        ),
+      );
+  }
+
+  async function recoveryActionRows(issueId: string) {
+    return db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+  }
+
+  async function issueRow(issueId: string) {
+    const rows = await db.select().from(issues).where(eq(issues.id, issueId));
+    return rows[0] ?? null;
+  }
+
+  it("escalates a matching backlog row with an assigneeAgentId exactly once", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await seedStillbornCard(companyId, agentId);
+
+    const result = await makeSweep().reconcileStillbornAssignedBacklog();
 
     expect(result.reported).toBe(1);
     expect(result.skipped).toBe(0);
     expect(result.issueIds).toEqual([issueId]);
 
-    const audit = await db
-      .select({ action: activityLog.action, entityId: activityLog.entityId })
-      .from(activityLog)
-      .where(eq(activityLog.action, "issue.stillborn_assigned_backlog_detected"))
-      .then((rows) => rows[0]);
-    expect(audit?.entityId).toBe(issueId);
+    const issue = await issueRow(issueId);
+    expect(issue?.status).toBe("blocked");
+    expect(issue?.assigneeAgentId).toBe(agentId);
+
+    const actions = await recoveryActionRows(issueId);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].cause).toBe("stillborn_assigned_backlog");
+
+    const audits = await detectionRows(issueId);
+    expect(audits).toHaveLength(1);
+    expect((audits[0].details as Record<string, unknown>).recoveryActionId).toBe(actions[0].id);
+
+    const comments = await db
+      .select({ id: issueComments.id, authorType: issueComments.authorType, body: issueComments.body })
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain("`backlog`");
   });
 
   it("does not report an unassigned backlog row", async () => {
@@ -121,12 +172,13 @@ describeEmbeddedPostgres("recovery sweep reconcileStillbornAssignedBacklog", () 
       assigneeAgentId: null,
     });
 
-    const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileStillbornAssignedBacklog();
+    const result = await makeSweep().reconcileStillbornAssignedBacklog();
 
     expect(result.reported).toBe(0);
     expect(result.skipped).toBe(0);
     expect(result.issueIds).toEqual([]);
+    expect(await recoveryActionRows(issueId)).toHaveLength(0);
+    expect(await detectionRows(issueId)).toHaveLength(0);
   });
 
   it("does not report a todo row", async () => {
@@ -141,39 +193,140 @@ describeEmbeddedPostgres("recovery sweep reconcileStillbornAssignedBacklog", () 
       assigneeAgentId: agentId,
     });
 
-    const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileStillbornAssignedBacklog();
+    const result = await makeSweep().reconcileStillbornAssignedBacklog();
 
     expect(result.reported).toBe(0);
     expect(result.skipped).toBe(0);
     expect(result.issueIds).toEqual([]);
+    expect(await recoveryActionRows(issueId)).toHaveLength(0);
+    expect(await detectionRows(issueId)).toHaveLength(0);
   });
 
-  it("dedup across two ticks — second tick over unchanged population reports 0 new signals", async () => {
+  it("repeated sweeps over the same unchanged candidate escalate at most once", async () => {
     const { companyId, agentId } = await seed();
-    const issueId = randomUUID();
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Stillborn assigned backlog",
-      status: "backlog",
-      priority: "high",
-      assigneeAgentId: agentId,
-    });
+    const issueId = await seedStillbornCard(companyId, agentId);
 
-    const heartbeat = heartbeatService(db);
-    const first = await heartbeat.reconcileStillbornAssignedBacklog();
-    const second = await heartbeat.reconcileStillbornAssignedBacklog();
+    const sweep = makeSweep();
+    const results = [];
+    for (let tick = 0; tick < 3; tick += 1) {
+      // The candidate stays in the stillborn state across sweeps: whatever put
+      // it back (or what kept it there) left status/assignee unchanged.
+      if (tick > 0) {
+        await db
+          .update(issues)
+          .set({ status: "backlog" })
+          .where(eq(issues.id, issueId));
+      }
+      results.push(await sweep.reconcileStillbornAssignedBacklog());
+    }
+
+    expect(results.every((result) => result.reported === 1)).toBe(true);
+    expect(results.every((result) => result.issueIds.includes(issueId))).toBe(true);
+
+    // Verification reads the post-sweep database rows, not the return value:
+    const actions = await recoveryActionRows(issueId);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].cause).toBe("stillborn_assigned_backlog");
+
+    const audits = await detectionRows(issueId);
+    expect(audits).toHaveLength(1);
+
+    const comments = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
+    expect(comments).toHaveLength(1);
+
+    expect((await issueRow(issueId))?.status).toBe("blocked");
+  });
+
+  it("second tick over an escalated population reports nothing new", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await seedStillbornCard(companyId, agentId);
+
+    const sweep = makeSweep();
+    const first = await sweep.reconcileStillbornAssignedBacklog();
+    const second = await sweep.reconcileStillbornAssignedBacklog();
 
     expect(first.reported).toBe(1);
     expect(first.issueIds).toEqual([issueId]);
-    expect(second.reported).toBe(1);
-    expect(second.issueIds).toEqual([issueId]);
+    // After the first tick the card is `blocked`, so it no longer matches the
+    // candidate selection on the next tick.
+    expect(second.reported).toBe(0);
+    expect(second.issueIds).toEqual([]);
 
     const audits = await db
       .select({ id: activityLog.id })
       .from(activityLog)
       .where(eq(activityLog.action, "issue.stillborn_assigned_backlog_detected"));
-    expect(audits).toHaveLength(2);
+    expect(audits).toHaveLength(1);
+  });
+
+  it("skips a candidate with an active execution path before escalating", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await seedStillbornCard(companyId, agentId);
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId },
+    });
+
+    const result = await makeSweep().reconcileStillbornAssignedBacklog();
+
+    expect(result.reported).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+    expect(await recoveryActionRows(issueId)).toHaveLength(0);
+    expect(await detectionRows(issueId)).toHaveLength(0);
+    expect((await issueRow(issueId))?.status).toBe("backlog");
+  });
+
+  it("skips a candidate with a pending wake interaction before escalating", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await seedStillbornCard(companyId, agentId);
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: {},
+    });
+
+    const result = await makeSweep().reconcileStillbornAssignedBacklog();
+
+    expect(result.reported).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+    expect(await recoveryActionRows(issueId)).toHaveLength(0);
+    expect(await detectionRows(issueId)).toHaveLength(0);
+    expect((await issueRow(issueId))?.status).toBe("backlog");
+  });
+
+  it("skips a candidate under an active pause hold before escalating", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await seedStillbornCard(companyId, agentId);
+    await db.insert(issueTreeHolds).values({
+      companyId,
+      rootIssueId: issueId,
+      mode: "pause",
+      status: "active",
+      reason: "manual pause",
+      releasePolicy: { strategy: "manual", note: "stillborn_sweep_test" },
+    });
+
+    const result = await makeSweep().reconcileStillbornAssignedBacklog();
+
+    expect(result.reported).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+    expect(await recoveryActionRows(issueId)).toHaveLength(0);
+    expect(await detectionRows(issueId)).toHaveLength(0);
+    expect((await issueRow(issueId))?.status).toBe("backlog");
   });
 });
