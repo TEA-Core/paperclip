@@ -38,6 +38,7 @@ import {
   unWakeableArchives,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
+import { isPullOnlyAdapterType } from "../../adapters/builtin-adapter-types.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
@@ -137,6 +138,10 @@ const CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = 250;
 const CANCELLED_ONLY_BLOCKER_DEPENDENT_RELOG_INTERVAL_MS = 5 * 60_000;
 let lastStillbornAssignedBacklogLogAt: Date | null = null;
 let lastCancelledOnlyBlockerDependentLogAt: Date | null = null;
+const UNDISPATCHABLE_ASSIGNED_CANDIDATE_LIMIT = 100;
+const UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS = 5 * 60_000;
+const lastUndispatchableAssignedIssueLogAt = new Map<string, Date>();
+let lastUndispatchableAssignedSweepLogAt: Date | null = null;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -8255,6 +8260,110 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  // SUP-14281: a pull-only assignee is never dispatched, so a todo/in_progress
+  // card with no live continuation path will never wake on its own.
+  // Report-only: activity row per detected issue, throttled per issue so
+  // repeated ticks cannot flood; no status writes, no reassignment.
+  async function reconcileUndispatchableAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
+
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        assigneeAdapterType: agents.adapterType,
+      })
+      .from(issues)
+      .innerJoin(agents, eq(agents.id, issues.assigneeAgentId))
+      .where(
+        and(
+          inArray(issues.status, ["todo", "in_progress"]),
+          sql`${issues.assigneeAgentId} is not null`,
+          visibleIssueCondition(),
+          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+        ),
+      )
+      .orderBy(asc(issues.id))
+      .limit(UNDISPATCHABLE_ASSIGNED_CANDIDATE_LIMIT);
+
+    for (const candidate of candidates) {
+      if (!isPullOnlyAdapterType(candidate.assigneeAdapterType)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (
+        await hasActiveExecutionPath(
+          candidate.companyId,
+          candidate.id,
+          candidate.assigneeAgentId,
+          candidate.monitorNextCheckAt,
+        )
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasPendingWakeInteraction(candidate.companyId, candidate.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const lastLoggedAt = lastUndispatchableAssignedIssueLogAt.get(candidate.id) ?? null;
+      if (
+        lastLoggedAt &&
+        Date.now() - lastLoggedAt.getTime() < UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      result.reported += 1;
+      result.issueIds.push(candidate.id);
+      lastUndispatchableAssignedIssueLogAt.set(candidate.id, new Date());
+
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.undispatchable_assignee_detected",
+        entityType: "issue",
+        entityId: candidate.id,
+        details: {
+          source: "recovery.reconcile_undispatchable_assigned",
+          identifier: candidate.identifier,
+          assigneeAgentId: candidate.assigneeAgentId,
+          status: candidate.status,
+        },
+      });
+    }
+
+    const shouldLog =
+      result.reported > 0 &&
+      (!lastUndispatchableAssignedSweepLogAt ||
+        Date.now() - lastUndispatchableAssignedSweepLogAt.getTime() >= UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS);
+    if (shouldLog) {
+      logger.warn(
+        { reported: result.reported, skipped: result.skipped, issueIds: result.issueIds },
+        "undispatchable-assigned sweep reported issues",
+      );
+      lastUndispatchableAssignedSweepLogAt = new Date();
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -8275,5 +8384,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     readRecoveryTimerIntervalMs,
     reconcileStillbornAssignedBacklog,
     reconcileCancelledOnlyBlockerDependents,
+    reconcileUndispatchableAssignedIssues,
   };
 }
