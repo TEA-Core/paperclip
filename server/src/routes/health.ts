@@ -19,6 +19,7 @@ import {
   type InspectDatabaseBackupHealthOptions,
 } from "../services/database-backup-health.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { heartbeatSweepLiveness } from "../services/heartbeat-sweep-liveness.js";
 import { serverVersion } from "../version.js";
 
 function shouldExposeFullHealthDetails(
@@ -124,6 +125,24 @@ export function healthRoutes(
     }
 
     res.status(202).json({ status: "restart_requested" });
+  });
+
+  // Per-sweep liveness readout (SUP-14227). Backed by the in-memory
+  // heartbeat-sweep registry (no DB query), so it still answers "when did
+  // sweep X last run?" while the main `/` probe is 503-ing on an unreachable
+  // database. Callers without full-health access (anonymous in authenticated
+  // mode) get the redacted snapshot: when/whether per sweep, not raw results.
+  router.get("/sweeps", (req, res) => {
+    const actorType = "actor" in req ? req.actor?.type : null;
+    const exposeFullDetails = shouldExposeFullHealthDetails(
+      actorType,
+      opts.deploymentMode,
+    );
+    res.json(
+      exposeFullDetails
+        ? heartbeatSweepLiveness.snapshot()
+        : heartbeatSweepLiveness.redactedSnapshot(),
+    );
   });
 
   router.get("/", async (req, res) => {

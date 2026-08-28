@@ -3,6 +3,7 @@ import {
   CARRIER_PROMOTION_READY_ACTION,
   createCarrierPromotionSweepService,
 } from "../services/carrier-promotion-sweep.js";
+import { createHeartbeatSweepLiveness } from "../services/heartbeat-sweep-liveness.js";
 import { markPullRequestReadyForReview } from "../services/merge-arming.js";
 
 const mockGhFetch = vi.hoisted(() => vi.fn());
@@ -531,5 +532,71 @@ describe("createCarrierPromotionSweepService", () => {
     expect(db.select.mock.calls.length).toBe(selectCallsAfterFirst);
     clock += 61 * 60 * 1000;
     await expect(service.sweep()).resolves.toMatchObject({ due: true });
+  });
+});
+
+describe("heartbeat sweep liveness (SUP-14227)", () => {
+  it("records a trace for an all-zero run and exposes the last-run timestamp", async () => {
+    const debugCalls: Array<{ obj: Record<string, unknown>; msg: string }> = [];
+    const liveness = createHeartbeatSweepLiveness({
+      logger: {
+        debug: (obj: Record<string, unknown>, msg: string) => {
+          debugCalls.push({ obj, msg });
+        },
+      },
+    });
+
+    // A real all-zero sweep pass: no draft carriers exist, so every counter is 0.
+    const { service } = makeService(state({}));
+    const result = await service.sweep();
+    expect(result).toEqual({
+      due: true,
+      candidates: 0,
+      promoted: 0,
+      alreadyReady: 0,
+      blocked: 0,
+      noTrigger: 0,
+      failed: 0,
+    });
+
+    liveness.recordRun("carrierPromotion", result);
+
+    // One debug trace line, carrying the sweep identity and the all-zero result.
+    expect(debugCalls).toHaveLength(1);
+    expect(debugCalls[0].msg).toBe("heartbeat sweep trace: run finished");
+    expect(debugCalls[0].obj).toMatchObject({
+      name: "carrierPromotion",
+      result: { candidates: 0, promoted: 0, blocked: 0, failed: 0 },
+    });
+
+    // The per-sweep last-run state is readable without log access.
+    const snapshot = liveness.snapshot();
+    expect(snapshot.schedulerStopped).toBe(false);
+    expect(snapshot.sweeps.carrierPromotion).toMatchObject({
+      name: "carrierPromotion",
+      lastOutcome: "ok",
+      totalRuns: 1,
+      lastResult: result,
+    });
+    const finishedAtMs = new Date(snapshot.sweeps.carrierPromotion.lastFinishedAt ?? "invalid").getTime();
+    expect(Number.isFinite(finishedAtMs)).toBe(true);
+  });
+
+  it("distinguishes a failed run and a stopped scheduler from a healthy idle one", () => {
+    const liveness = createHeartbeatSweepLiveness({
+      logger: { debug: () => {} },
+    });
+
+    liveness.recordError("carrierPromotion", new Error("boom"));
+    liveness.setSchedulerStopped(true);
+
+    const snapshot = liveness.snapshot();
+    expect(snapshot.schedulerStopped).toBe(true);
+    expect(snapshot.schedulerStoppedAt).toBeTypeOf("string");
+    expect(snapshot.sweeps.carrierPromotion).toMatchObject({
+      lastOutcome: "error",
+      totalRuns: 1,
+      lastResult: { error: "boom" },
+    });
   });
 });

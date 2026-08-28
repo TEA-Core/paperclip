@@ -6,6 +6,7 @@ import express from "express";
 import request from "supertest";
 import type { Db } from "@paperclipai/db";
 import { healthRoutes } from "../routes/health.js";
+import { heartbeatSweepLiveness } from "../services/heartbeat-sweep-liveness.js";
 import * as devServerStatus from "../dev-server-status.js";
 import { serverVersion } from "../version.js";
 
@@ -543,5 +544,63 @@ describe("GET /health", () => {
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
     });
+  });
+});
+
+describe("GET /health/sweeps (heartbeat sweep liveness, SUP-14227)", () => {
+  const allZeroCarrierResult = {
+    due: true,
+    candidates: 0,
+    promoted: 0,
+    alreadyReady: 0,
+    blocked: 0,
+    noTrigger: 0,
+    failed: 0,
+  };
+
+  it("answers from memory with no database, including the last-run timestamp", async () => {
+    heartbeatSweepLiveness.recordRun("carrierPromotion", allZeroCarrierResult);
+
+    const app = express();
+    app.use(
+      "/health",
+      healthRoutes(undefined, { deploymentMode: "local_trusted" }),
+    );
+    const res = await request(app).get("/health/sweeps");
+
+    expect(res.status).toBe(200);
+    expect(res.body.schedulerStopped).toBe(false);
+    expect(res.body.sweeps.carrierPromotion).toMatchObject({
+      name: "carrierPromotion",
+      lastOutcome: "ok",
+      totalRuns: 1,
+    });
+    expect(typeof res.body.sweeps.carrierPromotion.lastFinishedAt).toBe("string");
+    // Full-details caller sees the raw all-zero result verbatim.
+    expect(res.body.sweeps.carrierPromotion.lastResult).toEqual(allZeroCarrierResult);
+  });
+
+  it("redacts per-sweep lastResult for anonymous authenticated callers", async () => {
+    heartbeatSweepLiveness.recordRun("terminalWorkspace", {
+      due: true,
+      reaped: 0,
+    });
+
+    const app = express();
+    app.use(
+      "/health",
+      healthRoutes(undefined, { deploymentMode: "authenticated" }),
+    );
+    const res = await request(app).get("/health/sweeps");
+
+    expect(res.status).toBe(200);
+    const entry = res.body.sweeps.terminalWorkspace;
+    expect(entry).toMatchObject({
+      name: "terminalWorkspace",
+      lastOutcome: "ok",
+      totalRuns: 1,
+    });
+    expect(typeof entry.lastFinishedAt).toBe("string");
+    expect("lastResult" in entry).toBe(false);
   });
 });

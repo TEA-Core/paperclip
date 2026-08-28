@@ -732,6 +732,7 @@ const AUTHENTICATED_SECURITY: Array<Record<string, string[]>> = [
 
 const PUBLIC_OPERATIONS = new Set([
   "GET /api/health",
+  "GET /api/health/sweeps",
   "GET /api/openapi.json",
   "GET /api/board-claim/{token}",
   "POST /api/cli-auth/challenges",
@@ -1178,6 +1179,38 @@ registry.registerPath({
       },
     },
   },
+});
+
+// Per-sweep liveness entry (SUP-14227). `lastResult` carries the sweep's raw
+// return value (counts, a log path, etc.) and is only present on
+// full-details responses; the redacted anonymous view omits it.
+const heartbeatSweepLivenessEntrySchema = z.object({
+  name: z.string(),
+  lastFinishedAt: z.string().nullable(),
+  lastOutcome: z.enum(["ok", "error"]).nullable(),
+  totalRuns: z.number().int().nonnegative(),
+  lastResult: z.unknown().optional(),
+});
+
+const heartbeatSweepLivenessSnapshotSchema = z.object({
+  schedulerStopped: z.boolean(),
+  schedulerStoppedAt: z.string().nullable(),
+  sweeps: z.record(heartbeatSweepLivenessEntrySchema),
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/health/sweeps",
+  tags: ["health"],
+  summary: "Heartbeat sweep liveness",
+  description:
+    "Per-sweep last-run state for the periodic scheduler sweeps (carrier " +
+    "promotion, merged-PR confirmation, terminal workspace, opencode log " +
+    "rotation, done-close backstop, external object refresh). In-memory, so it " +
+    "answers without a database and is readable without log access. Callers " +
+    "without full-health access get the redacted form (no per-sweep " +
+    "lastResult).",
+  responses: { 200: r.ok(heartbeatSweepLivenessSnapshotSchema) },
 });
 
 registry.registerPath({

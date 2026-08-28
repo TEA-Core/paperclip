@@ -66,6 +66,7 @@ import {
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { rotateOpenCodeLog } from "./services/opencode-log-rotation.js";
+import { heartbeatSweepLiveness } from "./services/heartbeat-sweep-liveness.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
@@ -944,10 +945,27 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
-  const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
+  const trackHeartbeatSchedulerWork = (work: Promise<unknown>, name?: string) => {
     let tracked: Promise<void>;
     tracked = Promise.resolve(work)
-      .then(() => undefined, () => undefined)
+      .then(
+        (result) => {
+          if (!name) return;
+          try {
+            heartbeatSweepLiveness.recordRun(name, result);
+          } catch (err) {
+            logger.warn({ err, name }, "heartbeat sweep liveness record failed");
+          }
+        },
+        (err: unknown) => {
+          if (!name) return;
+          try {
+            heartbeatSweepLiveness.recordError(name, err);
+          } catch (recordErr) {
+            logger.warn({ err: recordErr, name }, "heartbeat sweep liveness record failed");
+          }
+        },
+      )
       .finally(() => {
         heartbeatSchedulerInFlight.delete(tracked);
       });
@@ -986,10 +1004,12 @@ export async function startServer(): Promise<StartedServer> {
         if (result.rotated) {
           logger.warn({ ...result }, "periodic opencode log rotation truncated an oversized log");
         }
+        return result;
       })
       .catch((err) => {
         logger.error({ err }, "periodic opencode log rotation failed");
-      }));
+        throw err;
+      }), "openCodeLogRotation");
   };
   const scheduleExternalObjectRefreshSweep = (now = new Date()) => {
     if (heartbeatSchedulerStopped) return;
@@ -999,10 +1019,12 @@ export async function startServer(): Promise<StartedServer> {
         if (result.checked > 0 || result.refreshed > 0) {
           logger.info({ ...result }, "external-object scheduler tick refreshed due objects");
         }
+        return result;
       })
       .catch((err) => {
         logger.error({ err }, "external-object scheduler tick failed");
-      }));
+        throw err;
+      }), "externalObjectRefresh");
   };
 
   if (heartbeat) {
@@ -1036,10 +1058,12 @@ export async function startServer(): Promise<StartedServer> {
           if (result.candidates > 0 || result.promoted > 0 || result.blocked > 0 || result.failed > 0) {
             logger.info(result, "carrier promotion sweep dispositioned draft carrier pull requests");
           }
+          return result;
         })
         .catch((err) => {
           logger.error({ err }, "carrier promotion sweep failed");
-        }));
+          throw err;
+        }), "carrierPromotion");
     };
     const scheduleDoneCloseLandingBackstopSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1049,10 +1073,12 @@ export async function startServer(): Promise<StartedServer> {
           if (result.candidates > 0 || result.confirmed > 0 || result.failed > 0 || result.deferred > 0) {
             logger.info(result, "done-close landing backstop sweep dispositioned decision-carried skips");
           }
+          return result;
         })
         .catch((err) => {
           logger.error({ err }, "done-close landing backstop sweep failed");
-        }));
+          throw err;
+        }), "doneCloseLandingBackstop");
     };
     const scheduleMergedPullRequestConfirmationSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1062,10 +1088,12 @@ export async function startServer(): Promise<StartedServer> {
           if (result.accepted > 0) {
             logger.info(result, "accepted merge confirmations for merged pull requests");
           }
+          return result;
         })
         .catch((err) => {
           logger.error({ err }, "merged pull-request confirmation sweep failed");
-        }));
+          throw err;
+        }), "mergedPullRequestConfirmation");
     };
     const scheduleTerminalWorkspaceSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1075,10 +1103,12 @@ export async function startServer(): Promise<StartedServer> {
           if (result.archived > 0 || result.cleanupFailed > 0) {
             logger.info(result, "terminal issue workspace reaper changed workspace state");
           }
+          return result;
         })
         .catch((err) => {
           logger.error({ err }, "terminal issue workspace reaper failed");
-        }));
+          throw err;
+        }), "terminalWorkspace");
     };
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
@@ -1707,6 +1737,7 @@ export async function startServer(): Promise<StartedServer> {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
+      heartbeatSweepLiveness.setSchedulerStopped(true);
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
