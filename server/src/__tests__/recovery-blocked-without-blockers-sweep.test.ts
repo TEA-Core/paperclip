@@ -1619,4 +1619,159 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       .then((rows) => rows.find((r) => r.action === "issue.blocked_without_blockers_suppressed"));
     expect(audit).toBeTruthy();
   });
+
+  async function countSuppressionRows(issueId: string) {
+    return await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.blocked_without_blockers_suppressed"),
+        ),
+      )
+      .then((rows) => rows.length);
+  }
+
+  it("flag ON + exhausted/escalated recovery action — writes exactly one suppression row across repeated sweep passes (SUP-14244)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked behind an exhausted recovery action",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+
+    // Pass 1: the skip is recorded exactly once, with the unchanged payload.
+    const first = await heartbeat.reconcileBlockedWithoutBlockers();
+    expect(first.exhaustedRecoverySuppressed).toBe(1);
+    expect(await countSuppressionRows(issueId)).toBe(1);
+    const firstAudit = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.blocked_without_blockers_suppressed"),
+        ),
+      )
+      .then((rows) => rows[0]);
+    expect((firstAudit.details as Record<string, unknown>).suppressedBy).toMatchObject({
+      kind: "workspace_validation",
+      outcome: "exhausted",
+      attemptCount: 5,
+      maxAttempts: 5,
+    });
+
+    // Passes 2 and 3: the candidate is still suppressed and the counter still
+    // increments, but no further row is written.
+    for (const pass of [2, 3] as const) {
+      const result = await heartbeat.reconcileBlockedWithoutBlockers();
+      expect(result.exhaustedRecoverySuppressed).toBe(1);
+      expect(result.healed).toBe(0);
+      expect(result.escalated).toBe(0);
+      expect(await countSuppressionRows(issueId)).toBe(1);
+    }
+
+    // The issue is still blocked and the terminal action is untouched.
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+  });
+
+  it("flag ON + replacement exhausted recovery action (different id) — writes a fresh suppression row (SUP-14244)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked behind an exhausted recovery action",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+
+    const firstActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: firstActionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "workspace_validation",
+      status: "escalated",
+      ownerType: "board",
+      previousOwnerAgentId: agentId,
+      cause: "workspace_validation_failed",
+      fingerprint: "workspace:provision:failure",
+      attemptCount: 5,
+      maxAttempts: 5,
+      nextAction: "Repair the worktree provisioning failure.",
+      outcome: "exhausted",
+      evidence: { identifier: null },
+      lastAttemptAt: oldDate(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const first = await heartbeat.reconcileBlockedWithoutBlockers();
+    expect(first.exhaustedRecoverySuppressed).toBe(1);
+    expect(await countSuppressionRows(issueId)).toBe(1);
+
+    // A board resolution clears the terminal action; a new terminal action
+    // (different id) now suppresses the sweep.
+    await db
+      .update(issueRecoveryActions)
+      .set({ status: "resolved" })
+      .where(eq(issueRecoveryActions.id, firstActionId));
+
+    const replacementActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: replacementActionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "workspace_validation",
+      status: "escalated",
+      ownerType: "board",
+      previousOwnerAgentId: agentId,
+      cause: "workspace_validation_failed",
+      fingerprint: "workspace:provision:failure",
+      attemptCount: 5,
+      maxAttempts: 5,
+      nextAction: "Repair the worktree provisioning failure.",
+      outcome: "exhausted",
+      evidence: { identifier: null },
+      lastAttemptAt: oldDate(),
+    });
+
+    const second = await heartbeat.reconcileBlockedWithoutBlockers();
+    expect(second.exhaustedRecoverySuppressed).toBe(1);
+    expect(await countSuppressionRows(issueId)).toBe(2);
+
+    const rows = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.blocked_without_blockers_suppressed"),
+        ),
+      );
+    const suppressorIds = rows
+      .map((r) => ((r.details as { suppressedBy: { id: string } }).suppressedBy.id))
+      .sort();
+    expect(suppressorIds).toEqual([firstActionId, replacementActionId].sort());
+  });
 });

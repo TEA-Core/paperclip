@@ -7173,28 +7173,53 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           (existingAction.outcome as string | null) === "exhausted"
         ) {
           result.exhaustedRecoverySuppressed++;
-          await logActivity(db, {
-            companyId,
-            actorType: "system",
-            actorId: "issue_graph_liveness_blocked_without_blockers",
-            runId: opts?.runId ?? null,
-            action: "issue.blocked_without_blockers_suppressed",
-            entityType: "issue",
-            entityId: candidate.id,
-            details: {
-              source,
-              fingerprint: `bwob:${companyId}:${candidate.id}`,
-              suppressedBy: {
-                id: existingAction.id,
-                kind: existingAction.kind,
-                cause: existingAction.cause,
-                fingerprint: existingAction.fingerprint,
-                outcome: existingAction.outcome,
-                attemptCount: existingAction.attemptCount,
-                maxAttempts: existingAction.maxAttempts,
+
+          // SUP-14244 — record the skip once per (issue, recovery-action) pair.
+          // Nothing clears an exhausted action without board action, so the
+          // candidate stays a candidate and an unconditional row would rewrite
+          // the same fact on every sweep pass, forever. The counter above stays
+          // per-pass; only the activity write is deduplicated. A replacement
+          // suppressor (a different suppressedBy.id) has no prior row for its
+          // id, so a genuinely new terminal state is still recorded.
+          const alreadyRecorded = await db
+            .select({ id: activityLog.id })
+            .from(activityLog)
+            .where(
+              and(
+                eq(activityLog.companyId, companyId),
+                eq(activityLog.entityType, "issue"),
+                eq(activityLog.entityId, candidate.id),
+                eq(activityLog.action, "issue.blocked_without_blockers_suppressed"),
+                sql`${activityLog.details}->'suppressedBy'->>'id' = ${existingAction.id}`,
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows.length > 0);
+
+          if (!alreadyRecorded) {
+            await logActivity(db, {
+              companyId,
+              actorType: "system",
+              actorId: "issue_graph_liveness_blocked_without_blockers",
+              runId: opts?.runId ?? null,
+              action: "issue.blocked_without_blockers_suppressed",
+              entityType: "issue",
+              entityId: candidate.id,
+              details: {
+                source,
+                fingerprint: `bwob:${companyId}:${candidate.id}`,
+                suppressedBy: {
+                  id: existingAction.id,
+                  kind: existingAction.kind,
+                  cause: existingAction.cause,
+                  fingerprint: existingAction.fingerprint,
+                  outcome: existingAction.outcome,
+                  attemptCount: existingAction.attemptCount,
+                  maxAttempts: existingAction.maxAttempts,
+                },
               },
-            },
-          });
+            });
+          }
           continue;
         }
 
