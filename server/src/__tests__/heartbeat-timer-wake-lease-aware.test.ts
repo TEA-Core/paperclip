@@ -406,7 +406,7 @@ describeEmbeddedPostgres("unscoped timer wake: lease-aware actionability (SUP-14
 
       const run = await heartbeat.wakeup(agentId, {
         source: "timer",
-        triggerDetail: "schedule",
+        triggerDetail: "system",
       });
 
       expect(run).toBeNull();
@@ -449,7 +449,7 @@ describeEmbeddedPostgres("unscoped timer wake: lease-aware actionability (SUP-14
         heartbeat: { skipTimerWhenNoActionableWork: true },
       });
 
-      const run = await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "schedule" });
+      const run = await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "system" });
 
       expect(run).toBeNull();
       const [wakeup] = await db
@@ -466,7 +466,7 @@ describeEmbeddedPostgres("unscoped timer wake: lease-aware actionability (SUP-14
       await seedLeasedIssue({ companyId, agentId, status: "running" });
       await seedPlainIssue(companyId, agentId);
 
-      const run = await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "schedule" });
+      const run = await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "system" });
 
       expect(run).not.toBeNull();
       const row = await readRun(run!.id);
@@ -480,7 +480,7 @@ describeEmbeddedPostgres("unscoped timer wake: lease-aware actionability (SUP-14
       });
       await seedLeasedIssue({ companyId, agentId, status: "queued" });
 
-      const run = await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "schedule" });
+      const run = await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "system" });
 
       expect(run).not.toBeNull();
     });
