@@ -4076,6 +4076,7 @@ async function quarantineBaseRepoUntrackedCollisions(input: {
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<{
   quarantined: string[];
+  collisions: string[];
   destination: string | null;
   untracked: string[];
   warnings: string[];
@@ -4087,17 +4088,19 @@ async function quarantineBaseRepoUntrackedCollisions(input: {
     warnings.push(
       "could not read the base repo's untracked paths in full; no path was moved and the fast-forward is left to refuse on its own",
     );
-    return { quarantined: [], destination: null, untracked, warnings };
+    return { quarantined: [], collisions: [], destination: null, untracked, warnings };
   }
   const collisions = resolved.collisions;
-  if (collisions.length === 0) return { quarantined: [], destination: null, untracked, warnings };
+  if (collisions.length === 0) {
+    return { quarantined: [], collisions, destination: null, untracked, warnings };
+  }
 
   const gitDir = await runGit(["rev-parse", "--git-common-dir"], input.repoRoot)
     .then((value) => path.resolve(input.repoRoot, value))
     .catch(() => null);
   if (!gitDir) {
     warnings.push("could not resolve the base repo git directory; leaving untracked collisions in place");
-    return { quarantined: [], destination: null, untracked, warnings };
+    return { quarantined: [], collisions, destination: null, untracked, warnings };
   }
 
   const destination = path.join(gitDir, "paperclip-base-repo-quarantine", input.timestamp);
@@ -4146,7 +4149,7 @@ async function quarantineBaseRepoUntrackedCollisions(input: {
     }).catch(() => undefined);
   }
 
-  return { quarantined, destination, untracked, warnings };
+  return { quarantined, collisions, destination, untracked, warnings };
 }
 
 /** Keep the quarantine bounded — it is an audit trail, not a second repository. */
@@ -4190,7 +4193,11 @@ async function fastForwardBaseRepoToDefaultRef(input: {
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<{ fastForwarded: boolean; quarantined: string[]; warnings: string[] }> {
   const warnings: string[] = [];
-  const merge = (quarantined: string[], untracked: string[]) =>
+  const merge = (
+    quarantined: string[],
+    untracked: string[],
+    blocked: { unquarantined: string[]; warnings: string[] },
+  ) =>
     recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["merge", "--ff-only", input.baseRef],
@@ -4201,6 +4208,26 @@ async function fastForwardBaseRepoToDefaultRef(input: {
         baseRef: input.baseRef,
         fastForwardOnly: true,
         ...(quarantined.length > 0 ? { quarantinedUntrackedPaths: quarantined } : {}),
+        // A quarantine that found collisions and moved none is indistinguishable
+        // — in every row this operation writes — from one that found none at
+        // all, and the two mean opposite things: the second is a healthy repo,
+        // the first is a permanent wedge. It happened: a `paperclip-base-repo-quarantine`
+        // directory left root-owned and not group-writable made every `mkdir`
+        // under it EACCES, so the collisions were detected, none could be moved,
+        // the warnings went only to the caller's return value, and the merge
+        // refused on the same five paths on every dispatch for hours with
+        // nothing in the record naming the cause. Recorded here so the answer is
+        // one query rather than an investigation.
+        ...(blocked.unquarantined.length > 0
+          ? {
+              unquarantinedCollisionCount: blocked.unquarantined.length,
+              unquarantinedCollisionPaths: blocked.unquarantined.slice(
+                0,
+                BASE_REPO_UNTRACKED_SAMPLE_SIZE,
+              ),
+            }
+          : {}),
+        ...(blocked.warnings.length > 0 ? { quarantineWarnings: blocked.warnings } : {}),
         // Files an agent errand left in a checkout that is nobody's workspace.
         // None of these block anything today; any of them becomes the next wedge
         // the moment the same path lands on the base ref. Recorded rather than
@@ -4234,6 +4261,7 @@ async function fastForwardBaseRepoToDefaultRef(input: {
     recorder: input.recorder ?? null,
   }).catch((error) => ({
     quarantined: [] as string[],
+    collisions: [] as string[],
     destination: null,
     untracked: [] as string[],
     warnings: [`could not quarantine untracked base repo paths: ${error instanceof Error ? error.message : String(error)}`],
@@ -4249,9 +4277,13 @@ async function fastForwardBaseRepoToDefaultRef(input: {
   // minus whatever it just moved.
   const quarantinedPaths = new Set(quarantine.quarantined);
   const remainingUntracked = quarantine.untracked.filter((candidate) => !quarantinedPaths.has(candidate));
+  // Collisions the quarantine found but could not move. These, and only these,
+  // are the paths the merge below is already certain to refuse on.
+  const unquarantined = quarantine.collisions.filter((candidate) => !quarantinedPaths.has(candidate));
+  const blocked = { unquarantined, warnings: quarantine.warnings };
 
   try {
-    await merge(quarantine.quarantined, remainingUntracked);
+    await merge(quarantine.quarantined, remainingUntracked, blocked);
     return { fastForwarded: true, quarantined: quarantine.quarantined, warnings };
   } catch (error) {
     warnings.push(error instanceof Error ? error.message : String(error));

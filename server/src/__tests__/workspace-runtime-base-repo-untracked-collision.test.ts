@@ -112,7 +112,12 @@ const prepare = (work: string, recorder?: unknown) =>
     recorder: (recorder ?? null) as any,
   });
 
-type RecordedOperation = { phase: string; command: string | null; status: string };
+type RecordedOperation = {
+  phase: string;
+  command: string | null;
+  status: string;
+  metadata: Record<string, unknown>;
+};
 
 /** Collects what a real run would write to workspace_operations. */
 function makeRecorder(): { recorder: unknown; operations: RecordedOperation[] } {
@@ -122,6 +127,7 @@ function makeRecorder(): { recorder: unknown; operations: RecordedOperation[] } 
     recordOperation: async (input: {
       phase: string;
       command?: string | null;
+      metadata?: Record<string, unknown>;
       run: () => Promise<{ status?: string }>;
     }) => {
       const result = await input.run();
@@ -129,6 +135,7 @@ function makeRecorder(): { recorder: unknown; operations: RecordedOperation[] } 
         phase: input.phase,
         command: input.command ?? null,
         status: result.status ?? "succeeded",
+        metadata: input.metadata ?? {},
       });
       return {} as never;
     },
@@ -195,6 +202,67 @@ describe("base repo hygiene with untracked paths that collide with the base ref"
     const merges = operations.filter((op) => op.command?.includes("merge --ff-only"));
     expect(merges.map((op) => op.status)).toEqual(["succeeded"]);
     expect(operations.filter((op) => op.status === "failed")).toEqual([]);
+  });
+
+  it("records the collisions it could not move, so an unwritable quarantine is not silent", async (ctx) => {
+    // The production wedge that motivated this: `paperclip-base-repo-quarantine`
+    // was left root-owned and not group-writable, so every `mkdir` beneath it
+    // was EACCES. The collisions were found and none could be moved. Nothing in
+    // the recorded operation said so — a quarantine that moves nothing wrote the
+    // same row as a repo with no collisions at all — and the merge refused on the
+    // same five paths on every dispatch until someone read the permissions by
+    // hand. The move failing is acceptable; failing invisibly is not.
+    const { work } = await makeUntrackedCollisionRepo();
+    const quarantineRoot = path.join(work, ".git", "paperclip-base-repo-quarantine");
+    await fs.mkdir(quarantineRoot, { recursive: true });
+    await fs.chmod(quarantineRoot, 0o555);
+    // Root ignores the write bit, so the fixture cannot deny the quarantine
+    // anything and there is nothing here to assert. Skip explicitly rather than
+    // returning: a bare `return` reports this as a passing test, which is the
+    // same "looks fine, checked nothing" failure the test exists to catch.
+    const probe = path.join(quarantineRoot, "probe");
+    const writable = await fs.mkdir(probe, { recursive: true }).then(() => true).catch(() => false);
+    if (writable) {
+      await fs.rm(probe, { recursive: true, force: true }).catch(() => {});
+      await fs.chmod(quarantineRoot, 0o755).catch(() => {});
+      ctx.skip("quarantine root stayed writable (running as root); the fixture cannot deny the move");
+      return;
+    }
+
+    const { recorder, operations } = makeRecorder();
+    try {
+      await prepare(work, recorder);
+
+      const merge = operations.find((op) => op.command?.includes("merge --ff-only"));
+      expect(merge).toBeDefined();
+      expect(merge?.metadata.unquarantinedCollisionCount).toBe(COLLIDING.length);
+      expect(merge?.metadata.unquarantinedCollisionPaths).toEqual(
+        expect.arrayContaining([...COLLIDING]),
+      );
+      expect(String(merge?.metadata.quarantineWarnings)).toContain("could not quarantine");
+      // The colliding files are still in the tree — the merge really is wedged,
+      // which is exactly why the row has to say so.
+      for (const name of COLLIDING) {
+        await expect(fs.access(path.join(work, name))).resolves.toBeUndefined();
+      }
+    } finally {
+      await fs.chmod(quarantineRoot, 0o755).catch(() => {});
+    }
+  });
+
+  it("records nothing about collisions when there are none to record", async () => {
+    // The counterpart assertion: the new keys must stay absent on a healthy
+    // repo, or they become noise on every dispatch and stop meaning anything.
+    const { work } = await makeUntrackedCollisionRepo();
+    const { recorder: first } = makeRecorder();
+    await prepare(work, first);
+
+    const { recorder, operations } = makeRecorder();
+    await prepare(work, recorder);
+    for (const op of operations) {
+      expect(op.metadata.unquarantinedCollisionCount).toBeUndefined();
+      expect(op.metadata.quarantineWarnings).toBeUndefined();
+    }
   });
 
   it("finds a collision hiding behind hundreds of harmless strays", async () => {
