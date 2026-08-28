@@ -1048,6 +1048,8 @@ export async function startServer(): Promise<StartedServer> {
         .then((result) => {
           if (result.candidates > 0 || result.confirmed > 0 || result.failed > 0 || result.deferred > 0) {
             logger.info(result, "done-close landing backstop sweep dispositioned decision-carried skips");
+          } else {
+            logger.debug(result, "done-close landing backstop sweep tick: nothing to disposition");
           }
         })
         .catch((err) => {

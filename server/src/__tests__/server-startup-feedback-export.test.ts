@@ -15,6 +15,7 @@ const {
   createDbMock,
   detectPortMock,
   deriveAuthTrustedOriginsMock,
+  doneCloseLandingBackstopSweepMock,
   environmentCustomImagesServiceMock,
   environmentCustomImagesServiceFactoryMock,
   executionWorkspaceServiceFactoryMock,
@@ -116,6 +117,13 @@ const {
     refreshDueObjectsForActiveCompanies: vi.fn(async () => ({ companies: 0, checked: 0, refreshed: 0 })),
   };
   const externalObjectsServiceFactoryMock = vi.fn(() => externalObjectsServiceMock);
+  const doneCloseLandingBackstopSweepMock = vi.fn(async () => ({
+    due: false,
+    candidates: 0,
+    confirmed: 0,
+    failed: 0,
+    deferred: 0,
+  }));
   const routineServiceMock = {
     tickScheduledTriggers: vi.fn(async () => ({ triggered: 0 })),
   };
@@ -141,6 +149,7 @@ const {
     createDbMock,
     detectPortMock,
     deriveAuthTrustedOriginsMock,
+    doneCloseLandingBackstopSweepMock,
     environmentCustomImagesServiceMock,
     environmentCustomImagesServiceFactoryMock,
     executionWorkspaceServiceFactoryMock,
@@ -246,6 +255,7 @@ vi.mock("../middleware/logger.js", () => ({
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
+    debug: vi.fn(),
   },
 }));
 
@@ -289,7 +299,7 @@ vi.mock("../services/index.js", () => ({
     })),
   })),
   createDoneCloseLandingBackstopService: vi.fn(() => ({
-    sweep: vi.fn(async () => ({ due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0 })),
+    sweep: doneCloseLandingBackstopSweepMock,
   })),
   feedbackService: feedbackServiceFactoryMock,
   bootstrapExecutionPolicyFromEnv: vi.fn(async () => null),
@@ -392,6 +402,7 @@ vi.mock("../auth/better-auth.js", () => ({
 }));
 
 import { startServer } from "../index.ts";
+import { logger } from "../middleware/logger.js";
 import { resolvePaperclipHomeDir } from "@paperclipai/shared/home-paths";
 
 function isInside(candidate: string, directory: string) {
@@ -585,6 +596,41 @@ describe("startServer feedback export wiring", () => {
       expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
       expect(routineServiceMock.tickScheduledTriggers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("emits a debug liveness trace when the done-close landing backstop sweep dispositions nothing", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: HEARTBEAT_SCHEDULER_INTERVAL_MS,
+    }));
+    doneCloseLandingBackstopSweepMock.mockResolvedValueOnce({
+      due: true,
+      candidates: 0,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+    });
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delayMs?: number) => {
+        if (delayMs === HEARTBEAT_SCHEDULER_INTERVAL_MS) intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await vi.waitFor(() => {
+        expect(logger.debug).toHaveBeenCalledWith(
+          expect.objectContaining({ due: true, candidates: 0, confirmed: 0, failed: 0, deferred: 0 }),
+          expect.stringContaining("done-close landing backstop sweep"),
+        );
+      });
     } finally {
       setIntervalSpy.mockRestore();
     }
