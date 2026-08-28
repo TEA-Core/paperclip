@@ -8278,7 +8278,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         assigneeAdapterType: agents.adapterType,
       })
       .from(issues)
-      .innerJoin(agents, eq(agents.id, issues.assigneeAgentId))
+      .innerJoin(
+        agents,
+        and(eq(agents.id, issues.assigneeAgentId), eq(agents.companyId, issues.companyId)),
+      )
       .where(
         and(
           inArray(issues.status, ["todo", "in_progress"]),
