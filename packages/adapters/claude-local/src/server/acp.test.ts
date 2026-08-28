@@ -11,6 +11,7 @@ import {
   nodeVersionMeetsClaudeAcpMinimum,
   prepareClaudeLocalManagedHome,
   resolveClaudeAcpBillingIdentity,
+  resolveClaudeConfigNormalizerEntry,
   resolveClaudeExecutionEngine,
   resolveClaudeExecutionEngineForRun,
   testClaudeAcpEnvironment,
@@ -995,9 +996,25 @@ describe("claude_local ACP lane", () => {
       const argv = argvLogContent.split("\n");
       expect(argv).toContain(`arg=${process.execPath}`);
       expect(argv).toContain(`arg=${agentSideHome}`);
-      expect(
-        argv.some((line) => line.startsWith("arg=") && line.endsWith("claude-config-normalize.js")),
-      ).toBe(true);
+      // The entry must EXIST, not merely be spelled plausibly. The previous
+      // assertion here only checked that some argv entry ended in
+      // `claude-config-normalize.js`, so it stayed green while the shipped
+      // spawn pointed at a file that is not in the running tree: this package
+      // is consumed from `src/`, where the sibling is `.ts`. Every armed run
+      // exited 1 with MODULE_NOT_FOUND, and because the pass is best-effort the
+      // only trace was a log line.
+      const scriptArg = argv
+        .filter((line) => line.startsWith("arg="))
+        .map((line) => line.slice("arg=".length))
+        .find((value) => /claude-config-normalize\.(js|ts)$/.test(value));
+      expect(scriptArg).toBeDefined();
+      await expect(fs.access(scriptArg as string)).resolves.toBeUndefined();
+      // Whatever node flags the resolver decides the entry needs must actually
+      // reach the shim, ahead of the script. (Under vitest there are none —
+      // vitest resolves TypeScript through vite rather than a node loader — so
+      // this asserts consistency, and the forwarding itself is covered below.)
+      const entry = await resolveClaudeConfigNormalizerEntry();
+      for (const nodeArg of entry?.nodeArgs ?? []) expect(argv).toContain(`arg=${nodeArg}`);
       // The scrubbed child env never carried the master key; the host plumbing
       // keys (needed for the path-shape check) did.
       expect(argvLogContent).not.toContain(masterKey);
@@ -1020,6 +1037,40 @@ describe("claude_local ACP lane", () => {
       else process.env.PAPERCLIP_AGENT_SPAWN_SHIM = previousShim;
       if (previousMasterKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
       else process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousMasterKey;
+    }
+  });
+
+  it("forwards the parent's loader flags to a TypeScript normalizer entry, and only those", async () => {
+    // This package's `exports` are TypeScript sources, so a server that imports
+    // it from `src/` runs under `node --import <loader>` and the sibling entry
+    // is `.ts`. Bare node cannot run that entry: type stripping erases
+    // annotations but does not rewrite the entry's own `./claude-config.js`
+    // specifier. The loader flag therefore has to ride along to the child.
+    const previous = process.execArgv;
+    try {
+      process.execArgv = [
+        "--import",
+        "./server/node_modules/tsx/dist/loader.mjs",
+        "--inspect=9229",
+        "--experimental-loader=ts-node/esm",
+      ];
+      const entry = await resolveClaudeConfigNormalizerEntry();
+      expect(entry).not.toBeNull();
+      if (entry?.script.endsWith(".ts")) {
+        expect(entry.nodeArgs).toEqual([
+          "--import",
+          path.resolve(process.cwd(), "./server/node_modules/tsx/dist/loader.mjs"),
+          "--experimental-loader=ts-node/esm",
+        ]);
+        // --inspect must NOT be forwarded: the child would fight the parent for
+        // the debugger port.
+        expect(entry.nodeArgs.join(" ")).not.toContain("--inspect");
+      } else {
+        // Built layout: the compiled sibling runs under bare node.
+        expect(entry?.nodeArgs).toEqual([]);
+      }
+    } finally {
+      process.execArgv = previous;
     }
   });
 

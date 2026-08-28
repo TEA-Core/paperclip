@@ -342,12 +342,88 @@ async function prepareClaudeRemoteManagedHome(
  * the normalizer runs as the agent uid, and handing it the server's
  * `PAPERCLIP_SECRETS_*` env would reopen the exposure the split closes.
  */
-function runAgentUidClaudeConfigNormalizer(input: {
+/**
+ * The normalizer entry next to this module, plus whatever node needs to run it.
+ *
+ * This package declares its `exports` as TypeScript sources, so the server
+ * imports it straight from `src/` under a loader (`node --import
+ * tsx/dist/loader.mjs`) and `moduleDir` is `src/server` at runtime — where the
+ * sibling is `claude-config-normalize.ts`, not `.js`. A built consumer resolves
+ * the same module out of `dist/server`, where it IS `.js`. So the extension has
+ * to be probed rather than assumed: hard-coding `.js` made the spawn exit 1 with
+ * `MODULE_NOT_FOUND` on every armed run, and because this pass is best-effort by
+ * construction the failure only ever reached a log line — the agent-uid half of
+ * the run-end re-normalize never ran at all.
+ *
+ * A `.ts` entry also cannot be run by bare node. Node's type stripping erases
+ * annotations but does not rewrite specifiers, so the entry's own
+ * `./claude-config.js` import resolves to a file that does not exist. The
+ * parent's loader flags are therefore forwarded to the child.
+ *
+ * ONLY loader flags are forwarded. `process.execArgv` may also carry
+ * `--inspect`, and handing that to a child makes it fight the parent for the
+ * debugger port.
+ */
+export async function resolveClaudeConfigNormalizerEntry(): Promise<
+  { script: string; nodeArgs: string[] } | null
+> {
+  const compiled = path.join(moduleDir, "claude-config-normalize.js");
+  if (await fs.stat(compiled).then(() => true).catch(() => false)) {
+    return { script: compiled, nodeArgs: [] };
+  }
+  const source = path.join(moduleDir, "claude-config-normalize.ts");
+  if (!(await fs.stat(source).then(() => true).catch(() => false))) return null;
+  return { script: source, nodeArgs: loaderExecArgv() };
+}
+
+/**
+ * The parent's `--import` / `--loader` flags, with relative specifiers resolved.
+ *
+ * The server is started as `node --import ./server/node_modules/tsx/dist/loader.mjs`
+ * — a cwd-relative specifier. The child inherits this process's cwd today, but
+ * resolving here means the forwarded flag does not silently depend on that.
+ */
+function loaderExecArgv(): string[] {
+  const flags = new Set(["--import", "--loader", "--experimental-loader"]);
+  const forwarded: string[] = [];
+  for (let index = 0; index < process.execArgv.length; index += 1) {
+    const arg = process.execArgv[index];
+    const equals = arg.indexOf("=");
+    const name = equals < 0 ? arg : arg.slice(0, equals);
+    if (!flags.has(name)) continue;
+    if (equals >= 0) {
+      forwarded.push(`${name}=${resolveLoaderSpecifier(arg.slice(equals + 1))}`);
+      continue;
+    }
+    const value = process.execArgv[index + 1];
+    if (value === undefined) continue;
+    index += 1;
+    forwarded.push(name, resolveLoaderSpecifier(value));
+  }
+  return forwarded;
+}
+
+/** Leave URLs and bare package specifiers alone; anchor relative paths to cwd. */
+function resolveLoaderSpecifier(specifier: string): string {
+  if (specifier.startsWith("./") || specifier.startsWith("../")) {
+    return path.resolve(process.cwd(), specifier);
+  }
+  return specifier;
+}
+
+async function runAgentUidClaudeConfigNormalizer(input: {
   shimPath: string;
   configDir: string;
   onLog: AdapterExecutionContext["onLog"];
 }): Promise<void> {
-  const normalizerScript = path.join(moduleDir, "claude-config-normalize.js");
+  const entry = await resolveClaudeConfigNormalizerEntry();
+  if (!entry) {
+    void input.onLog(
+      "stderr",
+      `[paperclip] agent-uid Claude config normalizer: no normalizer entry next to ${moduleDir}\n`,
+    );
+    return;
+  }
   const childEnv: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(childEnv)) {
     if (
@@ -368,7 +444,7 @@ function runAgentUidClaudeConfigNormalizer(input: {
     };
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(input.shimPath, [process.execPath, normalizerScript, input.configDir], {
+      child = spawn(input.shimPath, [process.execPath, ...entry.nodeArgs, entry.script, input.configDir], {
         env: childEnv,
         stdio: ["ignore", "pipe", "pipe"],
       });
