@@ -60,23 +60,57 @@ function draftRow(overrides: {
   sourceIssueId?: string;
 } = {}) {
   const number = overrides.number ?? 400;
+  const headRef = overrides.branch === undefined ? CARRIER_BRANCH : overrides.branch ?? "";
+  const data: Record<string, unknown> = {
+    state: "open",
+    draft: true,
+    node_id: overrides.nodeId === undefined ? `PR_node_${number}` : overrides.nodeId,
+    created_at: overrides.prCreatedAt === undefined ? YOUNG_ISO : overrides.prCreatedAt,
+  };
+  if (headRef) data.headRef = headRef;
   return {
     sourceIssueId: overrides.sourceIssueId ?? CHILD,
     mentionCreatedAt: new Date(YOUNG_ISO),
     externalId: `TEA-Core/paperclip#pull/${number}`,
-    data: {
-      state: "open",
-      draft: true,
-      node_id: overrides.nodeId === undefined ? `PR_node_${number}` : overrides.nodeId,
-      created_at: overrides.prCreatedAt === undefined ? YOUNG_ISO : overrides.prCreatedAt,
-      head: { ref: overrides.branch === undefined ? CARRIER_BRANCH : overrides.branch ?? "" },
-    },
+    data,
   };
 }
 
 /** Builds a sibling pull-request row (any state/draft) for the sequencing-guard query. */
 function siblingRow(number: number, state: string, branch = CARRIER_BRANCH) {
-  return { externalId: `TEA-Core/paperclip#pull/${number}`, data: { state, head: { ref: branch } } };
+  const data: Record<string, unknown> = { state };
+  if (branch) data.headRef = branch;
+  return { externalId: `TEA-Core/paperclip#pull/${number}`, data };
+}
+
+/**
+ * Builds a cached row in the exact data shape the GitHub external-object
+ * provider writes (`pullRequestSnapshot` in
+ * `github-external-object-provider.ts`): flat `headRef` key, no nested
+ * `head`, no cached `node_id` or `created_at` (age anchor falls back to
+ * mentionCreatedAt; node id falls back to the REST lookup).
+ */
+function providerDraftRow(overrides: { number?: number; branch?: string | null } = {}) {
+  const number = overrides.number ?? 400;
+  const headRef = overrides.branch === undefined ? CARRIER_BRANCH : overrides.branch ?? "";
+  const data: Record<string, unknown> = {
+    provider: "github",
+    owner: "TEA-Core",
+    repo: "paperclip",
+    number,
+    state: "open",
+    merged: false,
+    draft: true,
+  };
+  if (headRef) data.headRef = headRef;
+  data.headSha = "7d1f8a2c0b3e4f5a6c7d8e9f0a1b2c3d4e5f6071";
+  data.baseRef = "fold/tea-patches-v2026.722.0";
+  return {
+    sourceIssueId: CHILD,
+    mentionCreatedAt: new Date(YOUNG_ISO),
+    externalId: `TEA-Core/paperclip#pull/${number}`,
+    data,
+  };
 }
 
 interface TestState {
@@ -406,6 +440,55 @@ describe("createCarrierPromotionSweepService", () => {
     const [graphqlUrl, graphqlInit] = mockGhFetch.mock.calls[1]!;
     expect(graphqlUrl).toBe("https://api.github.com/graphql");
     expect(JSON.parse(graphqlInit.body).query).toContain("PR_node_live_400");
+  });
+
+  it("discovers and promotes a draft carrier from a row in the exact shape the GitHub provider writes (flat headRef, no node_id or created_at)", async () => {
+    mockGetWakeable.mockResolvedValue(wakeableParent);
+    const { service } = makeService(state({
+      draftRows: [providerDraftRow()],
+      siblingRows: [siblingRow(400, "open")],
+    }));
+    mockGhFetch
+      .mockResolvedValueOnce(jsonResponse({ node_id: "PR_node_live_400" }))
+      .mockResolvedValueOnce(GRAPHQL_OK());
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      promoted: 1,
+      alreadyReady: 0,
+      blocked: 0,
+      noTrigger: 0,
+      failed: 0,
+    });
+    expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    expect(String(mockGhFetch.mock.calls[0]![0])).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/400");
+    expect(JSON.parse(mockGhFetch.mock.calls[1]![1].body).query).toContain("PR_node_live_400");
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: CARRIER_PROMOTION_READY_ACTION,
+      entityId: PARENT,
+      details: expect.objectContaining({ trigger: "last_child_terminal", pr: "TEA-Core/paperclip#400" }),
+    }));
+  });
+
+  it("still reads the legacy nested head.ref shape from cached rows", async () => {
+    mockGetWakeable.mockResolvedValue(wakeableParent);
+    const { service } = makeService(state({
+      draftRows: [{
+        sourceIssueId: CHILD,
+        mentionCreatedAt: new Date(YOUNG_ISO),
+        externalId: "TEA-Core/paperclip#pull/400",
+        data: { state: "open", draft: true, node_id: "PR_node_400", created_at: YOUNG_ISO, head: { ref: CARRIER_BRANCH } },
+      }],
+      siblingRows: [{
+        externalId: "TEA-Core/paperclip#pull/400",
+        data: { state: "open", head: { ref: CARRIER_BRANCH } },
+      }],
+    }));
+    mockGhFetch.mockResolvedValue(GRAPHQL_OK());
+
+    await expect(service.sweep()).resolves.toMatchObject({ due: true, candidates: 1, promoted: 1 });
   });
 
   it("performs no work when no draft pull request exists", async () => {
