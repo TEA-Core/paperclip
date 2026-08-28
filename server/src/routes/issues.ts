@@ -9347,13 +9347,13 @@ export function issueRoutes(
             explanation: "Allowed because the actor is an org-chain ancestor of the issue assignee.",
           };
         } else {
-          mutationAccess = false;
+          // Authorization denial, not a run-lease conflict (which is a 409
+          // issue_write_assignee_run_lock): answer with the shared issue-write
+          // denial copy so the boundary and the sanctioned path are named.
+          await denyIssueWrite(req, res, existing, issueWriteDenialCodeForDecision(boundaryDecision));
+          return;
         }
       }
-    }
-    if (!mutationAccess) {
-      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
-      return;
     }
     const issueMutationAuthorizationReason = req.actor.type === "agent"
       ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
