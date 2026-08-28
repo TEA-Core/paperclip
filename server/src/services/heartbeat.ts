@@ -82,6 +82,7 @@ export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
+import { resolveLiveExecutionLeases, type LiveExecutionLease } from "./issue-execution-lease.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
@@ -12777,8 +12778,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
-  async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
-    const row = await db
+  type TimerWorkLeaseState = {
+    actionable: boolean;
+    allLeased: boolean;
+    leased: Array<{ issueId: string; holder: LiveExecutionLease }>;
+  };
+
+  /**
+   * Lease-aware actionability for a generic (unscoped) timer wake.
+   *
+   * An assigned `todo|in_progress` issue only counts as actionable when it is
+   * NOT held by a live execution run. When every candidate is leased the agent
+   * has no lease-free work, and booting a run would duplicate work that is
+   * already executing (SUP-14286 / SUP-14299). `allLeased` is only true when
+   * candidates exist, so "nothing assigned" (possible starvation) stays
+   * distinct from "everything assigned is live elsewhere" (healthy).
+   */
+  async function timerWorkLeaseState(agent: typeof agents.$inferSelect): Promise<TimerWorkLeaseState> {
+    const candidates = await db
       .select({ id: issues.id })
       .from(issues)
       .where(
@@ -12789,10 +12806,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           isNull(issues.hiddenAt),
           inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
         ),
-      )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+      );
+    if (candidates.length === 0) {
+      return { actionable: false, allLeased: false, leased: [] };
+    }
+    const leases = await resolveLiveExecutionLeases(
+      db,
+      agent.companyId,
+      candidates.map((row) => row.id),
+    );
+    const leased = candidates
+      .filter((row) => leases.has(row.id))
+      .map((row) => ({ issueId: row.id, holder: leases.get(row.id)! }));
+    return {
+      actionable: leased.length < candidates.length,
+      allLeased: leased.length === candidates.length,
+      leased,
+    };
   }
 
   async function markTimerHeartbeatChecked(agentId: string, source: WakeupOptions["source"]) {
@@ -13101,6 +13131,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.info(
           { runId: run.id, issueId, holderRunId: holder.id },
           "claimQueuedRun: deferring concurrent run for issue already running on agent",
+        );
+        return null;
+      }
+    } else if (
+      run.invocationSource === "timer" &&
+      !readNonEmptyString(context.taskId) &&
+      !readNonEmptyString(context.taskKey)
+    ) {
+      // Generic timer run: the wake may have been queued minutes before a lease
+      // was taken, so the enqueue-time check alone is not sufficient. Re-evaluate
+      // the lease-aware predicate and decline to claim when nothing lease-free
+      // remains. The run stays queued; it is re-evaluated on the next sweep and
+      // starts as soon as a holder finishes.
+      const leaseState = await timerWorkLeaseState(agent);
+      if (leaseState.allLeased) {
+        for (const entry of leaseState.leased) {
+          await recordConcurrentRunDeferral(run, entry.issueId, {
+            id: entry.holder.runId,
+            status: entry.holder.status,
+            startedAt: entry.holder.startedAt,
+          });
+        }
+        logger.info(
+          { runId: run.id, holderRunIds: leaseState.leased.map((entry) => entry.holder.runId) },
+          "claimQueuedRun: deferring generic timer run; all assigned work held by live runs",
         );
         return null;
       }
@@ -18282,12 +18337,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       !wakeCommentId &&
       !readNonEmptyString(enrichedContextSnapshot.taskId) &&
       !readNonEmptyString(enrichedContextSnapshot.taskKey);
-    if (policy.skipTimerWhenNoActionableWork && genericTimerWake && !(await hasActionableTimerWork(agent))) {
-      await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
-        reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
-      });
-      await markTimerHeartbeatChecked(agentId, source);
-      return null;
+    if (policy.skipTimerWhenNoActionableWork && genericTimerWake) {
+      const leaseState = await timerWorkLeaseState(agent);
+      if (!leaseState.actionable) {
+        // Distinct reasons keep telemetry apart: "nothing assigned" (possible
+        // starvation) vs "everything assigned is live elsewhere" (healthy).
+        await writeSkippedHeartbeatRequest(
+          leaseState.allLeased ? "heartbeat.timer.all_work_leased" : "heartbeat.timer.no_actionable_work",
+          leaseState.allLeased
+            ? {
+                reason:
+                  "Every assigned todo or in_progress issue is held by a live execution run; skipping to avoid a duplicate run.",
+                leasedIssueIds: leaseState.leased.map((entry) => entry.issueId),
+                holderRunIds: leaseState.leased.map((entry) => entry.holder.runId),
+              }
+            : {
+                reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
+              },
+        );
+        await markTimerHeartbeatChecked(agentId, source);
+        return null;
+      }
     }
 
     if (issueId) {
