@@ -48,6 +48,16 @@ export type SweepLivenessSnapshot = {
 
 type LogFn = (fields: Record<string, unknown>, message: string) => void;
 
+/**
+ * Deep-copy a recorded result before it leaves the tracker. Sweep results are
+ * plain data objects (the count fields), so structuredClone always succeeds;
+ * null/primitives pass through untouched so the no-op clone is skipped.
+ */
+function cloneResult(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value;
+  return structuredClone(value);
+}
+
 export function createSweepLivenessTracker(opts: {
   now?: () => Date;
   log?: LogFn;
@@ -98,8 +108,15 @@ export function createSweepLivenessTracker(opts: {
     const sweeps: Record<string, SweepLivenessEntry> = {};
     for (const [name, entry] of registry) {
       // Defensive copy per entry so a reader mutating the snapshot (e.g. a
-      // health response builder) cannot corrupt the tracker's state.
-      sweeps[name] = { ...entry };
+      // health response builder) cannot corrupt the tracker's state. The result
+      // is deep-copied: a shallow `{ ...entry }` would still hand the reader a
+      // reference to the stored `lastResult`, so mutating a nested field would
+      // corrupt the tracker between runs.
+      sweeps[name] = {
+        lastRunAt: entry.lastRunAt,
+        runs: entry.runs,
+        lastResult: cloneResult(entry.lastResult),
+      };
     }
     return {
       schedulerStopped,

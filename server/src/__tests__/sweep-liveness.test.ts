@@ -117,6 +117,24 @@ describe("createSweepLivenessTracker", () => {
     snap.sweeps.carrierPromotion.runs = 999;
     expect(t.snapshot().sweeps.carrierPromotion.runs).toBe(1);
   });
+
+  it("snapshot deep-copies lastResult: mutating a nested field does not corrupt the tracker", () => {
+    const { t } = tracker();
+    t.record("carrierPromotion", { candidates: 0, promoted: 0, blocked: 0, failed: 0 });
+    const snap = t.snapshot();
+    // A reader (e.g. the /health response builder) mutates a NESTED field of the
+    // result object. A shallow `{ ...entry }` copy would share the lastResult
+    // reference, so this would corrupt the tracker's stored result — the
+    // regression CodeRabbit flagged on the original shallow copy.
+    const result = snap.sweeps.carrierPromotion.lastResult as { promoted: number };
+    result.promoted = 999;
+    expect(t.snapshot().sweeps.carrierPromotion.lastResult).toEqual({
+      candidates: 0,
+      promoted: 0,
+      blocked: 0,
+      failed: 0,
+    });
+  });
 });
 
 describe("process-wide sweep liveness registry (module singleton)", () => {

@@ -193,7 +193,11 @@ export function healthRoutes(
         serverVersion,
         commit,
         error: "database_unreachable",
-        ...(exposeFullDetails ? { serverInfo } : {}),
+        // Consistent with the other full-details responses: expose the sweep
+        // liveness snapshot here too when full details are allowed, so the
+        // "when did sweep X last run?" answer does not vanish just because the
+        // DB probe failed. Omitted (byte-identical) when the tracker is un-armed.
+        ...(exposeFullDetails ? { serverInfo, ...sweepLivenessDetails } : {}),
         ...(cloud ? { cloud } : {}),
       });
       return;
