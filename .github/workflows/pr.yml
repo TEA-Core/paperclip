@@ -147,6 +147,32 @@ jobs:
       - name: Reject git push in adapter/runtime code
         run: node ./scripts/check-no-git-push.mjs
 
+      - name: PR security gate
+        # Replaces upstream's `.github/scripts/check-pr-security.mjs`, deleted in
+        # paperclipai/paperclip#11828. That gate filed a GitHub draft security
+        # advisory per PR and posted a deliberately non-blocking `neutral` check
+        # run, so its findings went to a queue nobody read: 1,566 bot-authored
+        # drafts against ~99 human-reported ones.
+        #
+        # The sink is what changed. This runs in the `policy` job, which every
+        # required check transitively needs, so a blocking finding fails
+        # `verify` and the merge queue ejects the entry. Non-blocking findings
+        # become inline annotations on the PR diff plus a job-summary table.
+        #
+        # Deliberately NOT gated on `github.event_name == 'pull_request'` like
+        # the lockfile guards above. Those bind on facts a queue entry cannot
+        # change; this one binds on the diff content, which is exactly what the
+        # queue re-tests against the real post-merge state. BASE_SHA/HEAD_SHA
+        # resolve both payload shapes at the job level, and the checkout above
+        # uses fetch-depth: 0, so the merge base is present in either event.
+        run: node ./scripts/check-pr-security.mjs
+
+      - name: Test PR security gate
+        run: node --test ./scripts/check-pr-security.test.mjs
+
+      - name: Test PR security gate wiring
+        run: node --test ./scripts/__tests__/pr-security-gate.test.mjs
+
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 
