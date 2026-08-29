@@ -129,17 +129,26 @@ describeEmbeddedPostgres("agent delete FK policy migration (0222)", () => {
   });
 });
 
-describe("agent delete FK policy migration (0222) static lint", () => {
-  it("adds every FK NOT VALID, validates it, drops the old one, and renames it back to the canonical name", async () => {
-    const raw = await readFile(
-      fileURLToPath(new URL("./migrations/0222_agent_delete_fk_policies.sql", import.meta.url)),
-      "utf8",
-    );
-    const statements = raw
-      .replace(/^--.*$/gm, "")
-      .split("--> statement-breakpoint")
-      .map((statement) => statement.trim())
-      .filter((statement) => statement.length > 0);
+// Staged two-file sequence (SUP-14439): the migration runner applies each
+// migration file in ONE transaction, so the ADD phase (write-blocking
+// SHARE ROW EXCLUSIVE, released at the file's COMMIT) and the VALIDATE
+// phase (SHARE UPDATE EXCLUSIVE, concurrent with writes) must live in
+// separate committed migrations: 0222 = ADD NOT VALID only, 0223 =
+// VALIDATE / DROP / RENAME.
+const migrationStatements = (raw: string) =>
+  raw
+    .replace(/^--.*$/gm, "")
+    .split("--> statement-breakpoint")
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+
+const readMigration = (name: string) =>
+  readFile(fileURLToPath(new URL(`./migrations/${name}`, import.meta.url)), "utf8");
+
+describe("agent delete FK policy migration (0222/0223) staged static lint", () => {
+  it("0222 adds every FK NOT VALID and contains zero VALIDATE/DROP/RENAME statements (those belong to 0223)", async () => {
+    const raw = await readMigration("0222_agent_delete_fk_policies.sql");
+    const statements = migrationStatements(raw);
 
     const addPattern = /^ALTER TABLE "([^"]+)" ADD CONSTRAINT "([^"]+)" FOREIGN KEY .* NOT VALID;$/;
     const adds = statements.filter((statement) => /ADD CONSTRAINT "[^"]+" FOREIGN KEY /i.test(statement));
@@ -153,14 +162,78 @@ describe("agent delete FK policy migration (0222) static lint", () => {
     for (const statement of adds) {
       const match = statement.match(addPattern);
       expect(match, `ADD statement is not in the <table> ADD <tmp> ... NOT VALID shape: ${statement}`).not.toBeNull();
-      const [, table, tempName] = match as [string, string, string, string];
-      expect(statements).toContain(`ALTER TABLE "${table}" VALIDATE CONSTRAINT "${tempName}";`);
-      expect(
-        statements.some((candidate) =>
-          new RegExp(`^ALTER TABLE "${table}" RENAME CONSTRAINT "${tempName}" TO `).test(candidate),
-        ),
-        `missing RENAME of temporary constraint "${tempName}" on "${table}"`,
-      ).toBe(true);
     }
+
+    // The distinguishing assertion: validation must NOT run inside the
+    // ADD-phase transaction. Any VALIDATE here would scan under the
+    // write-blocking lock still held by the ADDs.
+    const validates = statements.filter((statement) => /^ALTER TABLE "[^"]+" VALIDATE CONSTRAINT /i.test(statement));
+    const drops = statements.filter((statement) => /^ALTER TABLE "[^"]+" DROP CONSTRAINT /i.test(statement));
+    const renames = statements.filter((statement) => /^ALTER TABLE "[^"]+" RENAME CONSTRAINT /i.test(statement));
+    expect(
+      [validates.length, drops.length, renames.length],
+      `0222 must contain zero VALIDATE/DROP/RENAME statements - they belong to 0223_agent_delete_fk_policies_validate.sql; found VALIDATE=${validates.length} DROP=${drops.length} RENAME=${renames.length}:\n${[...validates, ...drops, ...renames].join("\n")}`,
+    ).toEqual([0, 0, 0]);
+  });
+
+  it("0223 validates, drops, and renames back every temporary constraint staged in 0222", async () => {
+    const [raw0222, raw0223] = await Promise.all([
+      readMigration("0222_agent_delete_fk_policies.sql"),
+      readMigration("0223_agent_delete_fk_policies_validate.sql"),
+    ]);
+    const staged = migrationStatements(raw0222)
+      .filter((statement) => /ADD CONSTRAINT "[^"]+" FOREIGN KEY /i.test(statement))
+      .map((statement) => {
+        const match = statement.match(/^ALTER TABLE "([^"]+)" ADD CONSTRAINT "([^"]+)" FOREIGN KEY .* NOT VALID;$/);
+        expect(match, `0222 ADD statement is not in the staged shape: ${statement}`).not.toBeNull();
+        const [, table, tempName] = match as [string, string, string, string];
+        return { table, tempName };
+      });
+    const stagedTempNames = new Set(staged.map(({ tempName }) => tempName));
+    expect(stagedTempNames).toHaveLength(30);
+
+    const statements = migrationStatements(raw0223);
+    const validates = statements.filter((statement) => /^ALTER TABLE "[^"]+" VALIDATE CONSTRAINT /i.test(statement));
+    const drops = statements.filter((statement) => /^ALTER TABLE "[^"]+" DROP CONSTRAINT /i.test(statement));
+    const renames = statements.filter((statement) => /^ALTER TABLE "[^"]+" RENAME CONSTRAINT /i.test(statement));
+    expect(validates).toHaveLength(30);
+    expect(drops).toHaveLength(30);
+    expect(renames).toHaveLength(30);
+    expect(statements.length).toBe(90);
+
+    const validateNames = new Set<string>();
+    for (const statement of validates) {
+      const match = statement.match(/^ALTER TABLE "([^"]+)" VALIDATE CONSTRAINT "([^"]+)";$/);
+      expect(match, `0223 VALIDATE statement is not in the <table> VALIDATE <tmp> shape: ${statement}`).not.toBeNull();
+      const [, table, tempName] = match as [string, string, string, string];
+      expect(staged.some(({ table: stagedTable, tempName: stagedTemp }) => stagedTable === table && stagedTemp === tempName), `0223 validates "${tempName}" on "${table}", which 0222 does not stage`).toBe(true);
+      validateNames.add(tempName);
+    }
+    expect(validateNames).toEqual(stagedTempNames);
+
+    const renameTmpNames = new Set<string>();
+    for (const statement of renames) {
+      const match = statement.match(/^ALTER TABLE "([^"]+)" RENAME CONSTRAINT "([^"]+)" TO "([^"]+)";$/);
+      expect(match, `0223 RENAME statement is not in the <table> RENAME <tmp> TO <canonical> shape: ${statement}`).not.toBeNull();
+      const [, table, tempName, canonicalName] = match as [string, string, string, string];
+      expect(staged.some(({ table: stagedTable, tempName: stagedTemp }) => stagedTable === table && stagedTemp === tempName), `0223 renames "${tempName}" on "${table}", which 0222 does not stage`).toBe(true);
+      renameTmpNames.add(tempName);
+      expect(statements, `0223 has no DROP of canonical constraint "${canonicalName}" on "${table}"`).toContain(
+        `ALTER TABLE "${table}" DROP CONSTRAINT "${canonicalName}";`,
+      );
+    }
+    expect(renameTmpNames).toEqual(stagedTempNames);
+
+    const dropNames = new Set<string>();
+    for (const statement of drops) {
+      const match = statement.match(/^ALTER TABLE "([^"]+)" DROP CONSTRAINT "([^"]+)";$/);
+      expect(match, `0223 DROP statement is not in the <table> DROP <canonical> shape: ${statement}`).not.toBeNull();
+      dropNames.add((match as [string, string, string, string])[2]);
+    }
+    const canonicalNames = new Set<string>();
+    for (const statement of renames) {
+      canonicalNames.add((statement.match(/^ALTER TABLE "[^"]+" RENAME CONSTRAINT "[^"]+" TO "([^"]+)";$/) as RegExpMatchArray)[1]);
+    }
+    expect(dropNames).toEqual(canonicalNames);
   });
 });
