@@ -10,6 +10,18 @@ worktree_config_path="$paperclip_dir/config.json"
 seed_pending_marker_path="$paperclip_dir/seed-pending"
 seed_complete_marker_path="$paperclip_dir/seed-complete"
 
+# SUP-14087: on a cross-uid worktree the canonical config/env/seed markers
+# belong to another uid and are 0o600. Provisioning writes a uid-scoped state
+# dir under .paperclip/uid-<uid>/ for exactly that case; resolve it first by
+# the run uid so this run only ever touches its own state dir.
+current_runtime_uid="$(id -u)"
+if [[ -e "$paperclip_dir/uid-${current_runtime_uid}/.env" ]]; then
+  paperclip_dir="$paperclip_dir/uid-${current_runtime_uid}"
+  worktree_config_path="$paperclip_dir/config.json"
+  seed_pending_marker_path="$paperclip_dir/seed-pending"
+  seed_complete_marker_path="$paperclip_dir/seed-complete"
+fi
+
 if [[ ! -d "$base_cwd" ]]; then
   echo "Base workspace does not exist: $base_cwd" >&2
   exit 1

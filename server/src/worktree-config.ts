@@ -208,9 +208,15 @@ function resolveWorktreeRuntimeContext(
   // file while config resolution still points at a non-worktree target (for
   // example the default instance under <home>/instances/default). Only adopt
   // a target as a worktree when its config sits in a `<root>/.paperclip/`
-  // layout and its own persisted env already declares it a worktree;
+  // layout, or in the uid-scoped cross-uid variant `<root>/.paperclip/uid-<uid>/`
+  // (SUP-14087), and its own persisted env already declares it a worktree;
   // otherwise the repair would rewrite main-instance config and env files.
-  if (path.basename(path.dirname(configPath)) !== ".paperclip") return null;
+  const worktreeStateDir = path.dirname(configPath);
+  const isCanonicalWorktreeState = path.basename(worktreeStateDir) === ".paperclip";
+  const isUidScopedWorktreeState =
+    /^uid-\d+$/.test(path.basename(worktreeStateDir))
+    && path.basename(path.dirname(worktreeStateDir)) === ".paperclip";
+  if (!isCanonicalWorktreeState && !isUidScopedWorktreeState) return null;
   if (persistedEnv.PAPERCLIP_IN_WORKTREE !== "true") return null;
 
   const persistedConfigPath = nonEmpty(persistedEnv.PAPERCLIP_CONFIG);
@@ -219,7 +225,9 @@ function resolveWorktreeRuntimeContext(
     path.resolve(expandHomePrefix(persistedConfigPath)) !== path.resolve(configPath) &&
     !fs.existsSync(resolveHomeAwarePath(persistedConfigPath));
   const stablePersistedEnv = persistedConfigLooksStale ? {} : persistedEnv;
-  const worktreeRoot = path.resolve(path.dirname(configPath), "..");
+  const worktreeRoot = isUidScopedWorktreeState
+    ? path.resolve(worktreeStateDir, "..", "..")
+    : path.resolve(worktreeStateDir, "..");
   const worktreeName =
     nonEmpty(stablePersistedEnv.PAPERCLIP_WORKTREE_NAME) ??
     nonEmpty(env.PAPERCLIP_WORKTREE_NAME) ??

@@ -375,6 +375,103 @@ describe("worktree config repair", () => {
     expect(await fs.readFile(configPath, "utf8")).toBe(originalConfig);
   });
 
+  it("repairs a uid-scoped cross-uid worktree config layout in place without touching the canonical dir", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-scoped-uid-"));
+    const worktreeRoot = path.join(tempRoot, "SUP-14087-cross-uid-worktree");
+    const scopedDir = path.join(worktreeRoot, ".paperclip", "uid-1001");
+    const configPath = path.join(scopedDir, "config.json");
+    const envPath = path.join(scopedDir, ".env");
+    const sharedRoot = path.join(tempRoot, "instances", "default");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const instanceId = "sup-14087-cross-uid-worktree-uid-1001";
+    const instanceRoot = path.join(isolatedHome, "instances", instanceId);
+
+    // Simulate the poisoned state: the canonical config/env belong to another
+    // uid (here just present, never to be rewritten).
+    const canonicalDir = path.join(worktreeRoot, ".paperclip");
+    await fs.mkdir(canonicalDir, { recursive: true });
+    await fs.writeFile(path.join(canonicalDir, "config.json"), JSON.stringify(buildLegacyConfig(sharedRoot), null, 2) + "\n", "utf8");
+    const canonicalConfigBefore = await fs.readFile(path.join(canonicalDir, "config.json"), "utf8");
+    await fs.writeFile(path.join(canonicalDir, ".env"), "PAPERCLIP_IN_WORKTREE=true\n", "utf8");
+    const canonicalEnvBefore = await fs.readFile(path.join(canonicalDir, ".env"), "utf8");
+
+    await fs.mkdir(scopedDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(buildLegacyConfig(sharedRoot), null, 2) + "\n", "utf8");
+    await fs.writeFile(
+      envPath,
+      [
+        "# Paperclip environment variables",
+        `PAPERCLIP_HOME=${JSON.stringify(isolatedHome)}`,
+        `PAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}`,
+        `PAPERCLIP_CONFIG=${JSON.stringify(configPath)}`,
+        `PAPERCLIP_CONTEXT=${JSON.stringify(path.join(isolatedHome, "context.json"))}`,
+        "PAPERCLIP_IN_WORKTREE=true",
+        "PAPERCLIP_WORKTREE_NAME=SUP-14087-cross-uid-worktree",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREE_NAME = "SUP-14087-cross-uid-worktree";
+    process.env.PAPERCLIP_CONFIG = configPath;
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+    const repairedConfig = JSON.parse(await fs.readFile(configPath, "utf8"));
+    const repairedEnv = await fs.readFile(envPath, "utf8");
+
+    expect(result).toEqual({ repairedConfig: true, repairedEnv: true });
+    expect(repairedConfig.database.embeddedPostgresDataDir).toBe(path.join(instanceRoot, "db"));
+    expect(repairedConfig.database.backup.enabled).toBe(false);
+    expect(repairedConfig.logging.logDir).toBe(path.join(instanceRoot, "logs"));
+    expect(repairedConfig.storage.localDisk.baseDir).toBe(path.join(instanceRoot, "data", "storage"));
+    expect(repairedConfig.secrets.localEncrypted.keyFilePath).toBe(path.join("/etc/paperclip/worktrees", instanceId, "master.key"));
+    expect(repairedEnv).toContain(`PAPERCLIP_HOME=${JSON.stringify(isolatedHome)}`);
+    expect(repairedEnv).toContain('PAPERCLIP_DB_BACKUP_ENABLED="false"');
+    expect(process.env.PAPERCLIP_HOME).toBe(isolatedHome);
+    expect(process.env.PAPERCLIP_CONFIG).toBe(configPath);
+
+    // The other uid's canonical files are untouched.
+    expect(await fs.readFile(path.join(canonicalDir, "config.json"), "utf8")).toBe(canonicalConfigBefore);
+    expect(await fs.readFile(path.join(canonicalDir, ".env"), "utf8")).toBe(canonicalEnvBefore);
+    expect(fsSync.existsSync(path.join(isolatedHome, "worktree-port-reservations.json"))).toBe(true);
+  });
+
+  it("rejects a uid-named dir that is not under a .paperclip directory", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-scoped-uid-reject-"));
+    const homeDir = path.join(tempRoot, "instances", "default");
+    const configPath = path.join(homeDir, "uid-1001", "config.json");
+    const envPath = path.join(path.dirname(configPath), ".env");
+
+    await fs.mkdir(path.dirname(configPath), { recursive: true });
+    const originalConfig = JSON.stringify(buildLegacyConfig(homeDir), null, 2) + "\n";
+    await fs.writeFile(configPath, originalConfig, "utf8");
+    await fs.writeFile(
+      envPath,
+      ["PAPERCLIP_IN_WORKTREE=true", "PAPERCLIP_CONFIG=uid-1001/config.json"].join("\n"),
+      "utf8",
+    );
+
+    process.chdir(tempRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREE_NAME = "PAP-884-ai-commits-component";
+    process.env.PAPERCLIP_CONFIG = configPath;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(result).toEqual({ repairedConfig: false, repairedEnv: false });
+    expect(await fs.readFile(configPath, "utf8")).toBe(originalConfig);
+  });
+
   it("avoids sibling worktree ports when repairing legacy configs", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-repair-ports-"));
     const worktreeRoot = path.join(tempRoot, "PAP-880-thumbs-capture-for-evals-feature");
