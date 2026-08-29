@@ -58,6 +58,7 @@ import {
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import { resolveLiveExecutionLeases } from "../services/issue-execution-lease.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -2334,28 +2335,43 @@ export function agentRoutes(
       ? rows.filter((issue) => new Date(issue.createdAt) >= new Date(worktreeActivation.cutoff))
       : [];
     const issueIds = eligibleRows.map((issue) => issue.id);
-    const [dependencyReadiness, recoveryActionByIssue] = await Promise.all([
+    const [dependencyReadiness, recoveryActionByIssue, executionLeases] = await Promise.all([
       issuesSvc.listDependencyReadiness(req.actor.companyId, issueIds),
       recoveryActionsSvc.listActiveForIssues(req.actor.companyId, issueIds),
+      resolveLiveExecutionLeases(db, req.actor.companyId, issueIds),
     ]);
+    const callerRunId = req.actor.type === "agent" ? req.actor.runId : undefined;
 
     res.json(
-      eligibleRows.map((issue) => ({
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        status: issue.status,
-        priority: issue.priority,
-        projectId: issue.projectId,
-        goalId: issue.goalId,
-        parentId: issue.parentId,
-        updatedAt: issue.updatedAt,
-        activeRun: issue.activeRun,
-        activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
-        dependencyReady: dependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
-        unresolvedBlockerCount: dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
-        unresolvedBlockerIssueIds: dependencyReadiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [],
-      })),
+      eligibleRows.map((issue) => {
+        const lease = executionLeases.get(issue.id);
+        return {
+          id: issue.id,
+          identifier: issue.identifier,
+          title: issue.title,
+          status: issue.status,
+          priority: issue.priority,
+          projectId: issue.projectId,
+          goalId: issue.goalId,
+          parentId: issue.parentId,
+          updatedAt: issue.updatedAt,
+          activeRun: issue.activeRun,
+          activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
+          dependencyReady: dependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
+          unresolvedBlockerCount: dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
+          unresolvedBlockerIssueIds: dependencyReadiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [],
+          executionLease: lease
+            ? {
+                runId: lease.runId,
+                agentId: lease.agentId,
+                status: lease.status,
+                startedAt: lease.startedAt,
+                heldByAnotherRun:
+                  callerRunId === undefined || lease.runId !== callerRunId,
+              }
+            : null,
+        };
+      }),
     );
   });
 
