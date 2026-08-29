@@ -65,6 +65,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
+import { createMergedOperatorMergeCardSweepService } from "./services/merged-operator-merge-cards.js";
 import { rotateOpenCodeLog } from "./services/opencode-log-rotation.js";
 import {
   armSweepLiveness,
@@ -1045,6 +1046,9 @@ export async function startServer(): Promise<StartedServer> {
     const mergedPullRequestConfirmations = issueThreadInteractionService(db as any, {
       wakeup: heartbeat.wakeup,
     });
+    const mergedOperatorMergeCards = createMergedOperatorMergeCardSweepService(db as any, {
+      enqueueWakeup: heartbeat.wakeup,
+    });
     const terminalWorkspaces = executionWorkspaceService(db as any);
     const doneCloseLandingBackstop = createDoneCloseLandingBackstopService(db as any, {
       wakeup: heartbeat.wakeup,
@@ -1092,6 +1096,21 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "merged pull-request confirmation sweep failed");
         }), { name: "mergedPullRequestConfirmation" });
+    };
+    /** Closes stale operator merge cards whose named pull requests have all merged, then fires issue_blockers_resolved wakes for the dependents they stranded (SUP-14347). */
+    const scheduleMergedOperatorMergeCardSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(mergedOperatorMergeCards
+        .sweepMergedOperatorMergeCards()
+        .then((result) => {
+          if (result.candidates > 0 || result.closed > 0 || result.woken > 0) {
+            logger.info(result, "merged operator merge-card sweep closed satisfied merge gates");
+          }
+          return result;
+        })
+        .catch((err) => {
+          logger.error({ err }, "merged operator merge-card sweep failed");
+        }), { name: "mergedOperatorMergeCard" });
     };
     const scheduleTerminalWorkspaceSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1357,6 +1376,7 @@ export async function startServer(): Promise<StartedServer> {
 
         if (heartbeatSchedulerStopped) return;
         scheduleMergedPullRequestConfirmationSweep();
+        scheduleMergedOperatorMergeCardSweep();
         scheduleTerminalWorkspaceSweep();
         scheduleDoneCloseLandingBackstopSweep();
         scheduleCarrierPromotionSweep();
