@@ -11,6 +11,7 @@ import {
   createDb,
   executionWorkspaces,
   heartbeatRuns,
+  issueComments,
   issues,
   projectWorkspaces,
   projects,
@@ -315,10 +316,16 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     const res = await request(app)
       .patch(`/api/issues/${identifier}`)
-      .send({ status: "done", comment: "Looks good.\n\nkind: review\ndecision: approved" });
+      .send({
+        status: "done",
+        comment:
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+      });
 
     // The approval arms the merge (armMergeOnApproval); blocking it on the
-    // unmerged branch it is approving deadlocked the circuit (SUP-13207).
+    // unmerged branch it is approving deadlocked the circuit (SUP-13207). The
+    // delivery carve-out is intact (SUP-14367 kept it); the tier line above is
+    // what now carries the close evidence.
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(issueId)).toBe("done");
 
@@ -377,7 +384,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     const res = await request(app)
       .patch(`/api/issues/${identifier}`)
-      .send({ status: "done", comment: "Looks good.\n\nkind: review\ndecision: approved" });
+      .send({
+        status: "done",
+        comment:
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 1 (landed, not liveness-probed): delivery guard skipped, no credentials. Liveness unverified.",
+      });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(issueId)).toBe("done");
@@ -395,32 +406,50 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect((rows[0]?.details as Record<string, unknown>).skipReason).toBeTruthy();
   });
 
-  it("PATCH: an approval comment carrying no tier declaration is logged, not rejected (no approval deadlock)", async () => {
-    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185C");
+  it("PATCH: a decision-carrying close without a tier declaration is rejected with 422 (SUP-14367)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D14367A");
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
     mockMergedBranch();
 
-    // A reviewer's approval is a code-quality verdict; they cannot make the
-    // implementer's SUP-12693 liveness claim, so the tier guard must degrade to an
-    // audit row here instead of 409-ing the approval circuit shut.
+    // SUP-14367: the SUP-13290 carve-out scoped to the delivery guard only. A missing
+    // tier declaration is a 422 on the decision-carrying path exactly as on the direct
+    // path — and the waiver audit row must no longer exist.
     const res = await request(app)
       .patch(`/api/issues/${identifier}`)
       .send({ status: "done", comment: "Looks good.\n\nkind: review\ndecision: approved" });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(await statusOf(issueId)).toBe("done");
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
+    expect(await statusOf(issueId)).toBe("in_review");
 
-    const rows = await vi.waitFor(
-      async () => {
-        const found = await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped");
-        if (found.length === 0) throw new Error("waiting for tier audit row");
-        return found;
-      },
-      { timeout: 5000 },
-    );
-    expect(
-      rows.some((r) => (r.details as Record<string, unknown>).skipReason === "decision_carrying_transition"),
-    ).toBe(true);
+    const rows = await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped");
+    expect(rows).toHaveLength(0);
+  });
+
+  it("PATCH: a decision-carrying close carrying a verbatim tier line goes through (SUP-14367)", async () => {
+    for (const [suffix, tierLine] of [
+      [
+        "T2",
+        "Closed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+      ],
+      [
+        "T1",
+        "Closed at Tier 1 (landed, not liveness-probed): delivery guard skipped on auth failure. Liveness unverified.",
+      ],
+    ] as const) {
+      const { companyId, reviewerAgentId, issueId, identifier } =
+        await seedIssueAwaitingReview(`D14367${suffix}`);
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockMergedBranch();
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: `Looks good.\n\nkind: review\ndecision: approved\n\n${tierLine}` });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+    }
   });
 
   it("PATCH: an approval that advances to a LATER stage resolves to in_review and is not delivery-guarded", async () => {
@@ -453,7 +482,9 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
-      .send({ body: "## Review: APPROVED\n\nShip it." });
+      .send({
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+      });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await statusOf(issueId)).toBe("done");
@@ -466,10 +497,31 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
-      .send({ body: "## Review: APPROVED\n\nShip it." });
+      .send({
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 1 (landed, not liveness-probed): nothing to land. Liveness unverified.",
+      });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await statusOf(issueId)).toBe("done");
+  });
+
+  it("POST comment: a decision-carrying approval without a tier declaration 422s with nothing written (SUP-14367)", async () => {
+    // The guard runs BEFORE the comment+status transaction (the pre-transaction
+    // contract): a 422 must leave both the comment and the status change unwritten,
+    // so the close is retryable as-is.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D14367B");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockMergedBranch();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: "## Review: APPROVED\n\nShip it." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(await statusOf(issueId)).toBe("in_review");
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
   });
 
   it("POST comment: auto-approval publishes paperclip/approved and persists the Guard A head (SUP-13904)", async () => {
@@ -518,7 +570,9 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
-      .send({ body: "## Review: APPROVED\n\nShip it." });
+      .send({
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+      });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await statusOf(issueId)).toBe("done");

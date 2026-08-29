@@ -2929,11 +2929,12 @@ export function issueRoutes(
     commentBody: string | null;
     runId: string | null;
     // A review approval decides *code quality*, not merge/land state, so the delivery
-    // guard applies in full on decision-carrying transitions. The tier declaration is
-    // the implementer's obligation under SUP-12693 — a reviewer cannot make a liveness
-    // claim on the implementer's behalf, and the approval comment is a verdict, not a
-    // close-out — so there it degrades to an audit row rather than a 422 that would
-    // deadlock the approval circuit. Either way the transition becomes auditable.
+    // guard degrades to its decision-carrying carve-out here (ADR-074 D6: a card
+    // cannot observe its own merge, so an open linked PR at approve-is-close time
+    // must not block). The tier declaration does NOT degrade: it is a sentence the
+    // closing actor writes in the comment they are already writing, and D6 makes a
+    // Tier-1 substitution always writable — so a missing declaration is a 422 on
+    // both doors alike (SUP-14367, the SUP-13930 ghost-PASS chain).
     decisionCarried: boolean;
     // Board actors close on the board's own judgment (SUP-13939): the tier-evidence
     // requirement is bypassed, but an audit row is written so board closes stay
@@ -3015,16 +3016,12 @@ export function issueRoutes(
       });
     }
     if (!tierResult.allowed) {
-      if (decisionCarried) {
-        // Log-only on the approval path: record the missing declaration so the card is
-        // still countable in the ghost-PASS census, but let the approval through.
-        void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
-          reason: tierResult.reason,
-          skipReason: "decision_carrying_transition",
-          decisionCarried,
-        });
-        return { ok: true };
-      }
+      // Enforced on every door, including decision-carrying ones (SUP-14367): the
+      // SUP-13290 carve-out scoped to the delivery guard only (ADR-074 D6 — a card
+      // cannot observe its own merge). The tier declaration is a sentence the
+      // closing actor writes in the comment they are already writing, and D6 makes
+      // a Tier-1 substitution always writable, so a missing declaration is a 422,
+      // never a deadlock.
       return {
         ok: false,
         status: 422,
