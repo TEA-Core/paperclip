@@ -304,7 +304,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
 
     const res = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, stageRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done", comment: "Stage signoff." });
+      .send({ status: "done", comment: `Stage signoff.\n\n${DONE_TIER_DECLARATION}` });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({ id: issueId, status: "done" });
