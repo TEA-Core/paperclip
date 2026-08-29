@@ -53,9 +53,10 @@ test("install-bearing jobs restore the pr-lockfile artifact only when the policy
   const restores = prWorkflow.match(/- name: Restore regenerated PR lockfile[^\n]*/g) ?? [];
   assert.ok(restores.length > 0, "pr.yml must keep its pr-lockfile restore steps");
 
-  // Six install-bearing jobs (typecheck, general tests, build, serialized
-  // server, canary dry run, e2e shards) each carry one restore step.
-  assert.equal(restores.length, 6, "unexpected number of pr-lockfile restore steps");
+  // Seven install-bearing jobs (typecheck, general tests, build, serialized
+  // server, canary dry run, e2e shards, worktree uid partition probe) each
+  // carry one restore step.
+  assert.equal(restores.length, 7, "unexpected number of pr-lockfile restore steps");
 
   // A restore that runs unconditionally with `continue-on-error: true` silently
   // swallows a missing artifact — exactly the masking that let the broken base
