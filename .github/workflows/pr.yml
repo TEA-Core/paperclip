@@ -386,10 +386,13 @@ jobs:
           fi
 
   verify:
-    # Preserve the legacy required-check name while the underlying work runs in parallel.
+    # Preserve the legacy required-check name while the underlying work runs in
+    # parallel. `if: always()` makes this aggregation job run even when a lane
+    # fails, so the assertions below are what turn a red lane into a red
+    # `verify` (the ruleset's required context) instead of letting it merge.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, general_tests, build]
+    needs: [typecheck_release_registry, general_tests, build, verify_serialized_server, canary_dry_run]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -399,10 +402,14 @@ jobs:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
+          CANARY_DRY_RUN_RESULT: ${{ needs.canary_dry_run.result }}
         run: |
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
+          test "$VERIFY_SERIALIZED_SERVER_RESULT" = "success"
+          test "$CANARY_DRY_RUN_RESULT" = "success"
 
   build:
     name: Build
