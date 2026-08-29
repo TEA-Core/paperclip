@@ -20,64 +20,139 @@
 -- type to a non-null agent FK. agentService.remove() re-labels those rows as
 -- type 'system' (and nulls the agent FK) inside the same transaction before
 -- the FKs detach, so the check constraints stay intact.
+--
+-- Redo (SUP-14424): a plain ADD CONSTRAINT ... FOREIGN KEY acquires an
+-- ACCESS EXCLUSIVE lock on the table and blocks all writers for the whole
+-- validation scan, so replacing 30 FKs in one migration stalled fleet
+-- writes during deploy. Each FK is now replaced online in four steps:
+--   1. ADD the new FK as a temporary constraint with NOT VALID
+--      (SHARE UPDATE EXCLUSIVE: concurrent reads/writes continue),
+--   2. VALIDATE the temporary constraint (shares that lock, scans once),
+--   3. DROP the old constraint (brief catalog-only lock),
+--   4. RENAME the temporary constraint to the canonical name
+--      (catalog-only, does not wait on active writers).
+-- Temporary names are <canonical>_new. Three canonical names exceed
+-- PostgreSQL's 63-byte identifier limit, where the truncated
+-- <canonical>_new would collide with the truncated canonical name, so those
+-- three use the deterministic short form <table>__new instead.
 
+ALTER TABLE "issue_watchdogs" ADD CONSTRAINT "issue_watchdogs_watchdog_agent_id_agents_id_fk_new" FOREIGN KEY ("watchdog_agent_id") REFERENCES "public"."agents"("id") ON DELETE CASCADE ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "issue_watchdogs" VALIDATE CONSTRAINT "issue_watchdogs_watchdog_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "issue_watchdogs" DROP CONSTRAINT "issue_watchdogs_watchdog_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "issue_watchdogs" ADD CONSTRAINT "issue_watchdogs_watchdog_agent_id_agents_id_fk" FOREIGN KEY ("watchdog_agent_id") REFERENCES "public"."agents"("id") ON DELETE CASCADE ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "issue_watchdogs" RENAME CONSTRAINT "issue_watchdogs_watchdog_agent_id_agents_id_fk_new" TO "issue_watchdogs_watchdog_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_bundles" ADD CONSTRAINT "decision_bundles_origin_agent_id_agents_id_fk_new" FOREIGN KEY ("origin_agent_id") REFERENCES "public"."agents"("id") ON DELETE CASCADE ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_bundles" VALIDATE CONSTRAINT "decision_bundles_origin_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_bundles" DROP CONSTRAINT "decision_bundles_origin_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_bundles" ADD CONSTRAINT "decision_bundles_origin_agent_id_agents_id_fk" FOREIGN KEY ("origin_agent_id") REFERENCES "public"."agents"("id") ON DELETE CASCADE ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_bundles" RENAME CONSTRAINT "decision_bundles_origin_agent_id_agents_id_fk_new" TO "decision_bundles_origin_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_bundles" ADD CONSTRAINT "decision_bundles_origin_run_id_heartbeat_runs_id_fk_new" FOREIGN KEY ("origin_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE CASCADE ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_bundles" VALIDATE CONSTRAINT "decision_bundles_origin_run_id_heartbeat_runs_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_bundles" DROP CONSTRAINT "decision_bundles_origin_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_bundles" ADD CONSTRAINT "decision_bundles_origin_run_id_heartbeat_runs_id_fk" FOREIGN KEY ("origin_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE CASCADE ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_bundles" RENAME CONSTRAINT "decision_bundles_origin_run_id_heartbeat_runs_id_fk_new" TO "decision_bundles_origin_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
+ALTER TABLE "decisions" ADD CONSTRAINT "decisions_origin_agent_id_agents_id_fk_new" FOREIGN KEY ("origin_agent_id") REFERENCES "public"."agents"("id") ON DELETE CASCADE ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decisions" VALIDATE CONSTRAINT "decisions_origin_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decisions" DROP CONSTRAINT "decisions_origin_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "decisions" ADD CONSTRAINT "decisions_origin_agent_id_agents_id_fk" FOREIGN KEY ("origin_agent_id") REFERENCES "public"."agents"("id") ON DELETE CASCADE ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decisions" RENAME CONSTRAINT "decisions_origin_agent_id_agents_id_fk_new" TO "decisions_origin_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "decisions" ADD CONSTRAINT "decisions_origin_run_id_heartbeat_runs_id_fk_new" FOREIGN KEY ("origin_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE CASCADE ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decisions" VALIDATE CONSTRAINT "decisions_origin_run_id_heartbeat_runs_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decisions" DROP CONSTRAINT "decisions_origin_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
-ALTER TABLE "decisions" ADD CONSTRAINT "decisions_origin_run_id_heartbeat_runs_id_fk" FOREIGN KEY ("origin_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE CASCADE ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decisions" RENAME CONSTRAINT "decisions_origin_run_id_heartbeat_runs_id_fk_new" TO "decisions_origin_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_archive_notification_outbox" ADD CONSTRAINT "decision_archive_notification_outbox__new" FOREIGN KEY ("origin_agent_id") REFERENCES "public"."agents"("id") ON DELETE CASCADE ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_archive_notification_outbox" VALIDATE CONSTRAINT "decision_archive_notification_outbox__new";--> statement-breakpoint
 ALTER TABLE "decision_archive_notification_outbox" DROP CONSTRAINT "decision_archive_notification_outbox_origin_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_archive_notification_outbox" ADD CONSTRAINT "decision_archive_notification_outbox_origin_agent_id_agents_id_fk" FOREIGN KEY ("origin_agent_id") REFERENCES "public"."agents"("id") ON DELETE CASCADE ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_archive_notification_outbox" RENAME CONSTRAINT "decision_archive_notification_outbox__new" TO "decision_archive_notification_outbox_origin_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "company_skill_test_runs" ADD CONSTRAINT "company_skill_test_runs_agent_id_agents_id_fk_new" FOREIGN KEY ("agent_id") REFERENCES "public"."agents"("id") ON DELETE CASCADE ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "company_skill_test_runs" VALIDATE CONSTRAINT "company_skill_test_runs_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "company_skill_test_runs" DROP CONSTRAINT "company_skill_test_runs_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "company_skill_test_runs" ADD CONSTRAINT "company_skill_test_runs_agent_id_agents_id_fk" FOREIGN KEY ("agent_id") REFERENCES "public"."agents"("id") ON DELETE CASCADE ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "company_skill_test_runs" RENAME CONSTRAINT "company_skill_test_runs_agent_id_agents_id_fk_new" TO "company_skill_test_runs_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "approval_comments" ADD CONSTRAINT "approval_comments_author_agent_id_agents_id_fk_new" FOREIGN KEY ("author_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "approval_comments" VALIDATE CONSTRAINT "approval_comments_author_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "approval_comments" DROP CONSTRAINT "approval_comments_author_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "approval_comments" ADD CONSTRAINT "approval_comments_author_agent_id_agents_id_fk" FOREIGN KEY ("author_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "approval_comments" RENAME CONSTRAINT "approval_comments_author_agent_id_agents_id_fk_new" TO "approval_comments_author_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "approvals" ADD CONSTRAINT "approvals_requested_by_agent_id_agents_id_fk_new" FOREIGN KEY ("requested_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "approvals" VALIDATE CONSTRAINT "approvals_requested_by_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "approvals" DROP CONSTRAINT "approvals_requested_by_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "approvals" ADD CONSTRAINT "approvals_requested_by_agent_id_agents_id_fk" FOREIGN KEY ("requested_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "approvals" RENAME CONSTRAINT "approvals_requested_by_agent_id_agents_id_fk_new" TO "approvals_requested_by_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "assets" ADD CONSTRAINT "assets_created_by_agent_id_agents_id_fk_new" FOREIGN KEY ("created_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "assets" VALIDATE CONSTRAINT "assets_created_by_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "assets" DROP CONSTRAINT "assets_created_by_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "assets" ADD CONSTRAINT "assets_created_by_agent_id_agents_id_fk" FOREIGN KEY ("created_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "assets" RENAME CONSTRAINT "assets_created_by_agent_id_agents_id_fk_new" TO "assets_created_by_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "goals" ADD CONSTRAINT "goals_owner_agent_id_agents_id_fk_new" FOREIGN KEY ("owner_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "goals" VALIDATE CONSTRAINT "goals_owner_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "goals" DROP CONSTRAINT "goals_owner_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "goals" ADD CONSTRAINT "goals_owner_agent_id_agents_id_fk" FOREIGN KEY ("owner_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "goals" RENAME CONSTRAINT "goals_owner_agent_id_agents_id_fk_new" TO "goals_owner_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "projects" ADD CONSTRAINT "projects_lead_agent_id_agents_id_fk_new" FOREIGN KEY ("lead_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "projects" VALIDATE CONSTRAINT "projects_lead_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "projects" DROP CONSTRAINT "projects_lead_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "projects" ADD CONSTRAINT "projects_lead_agent_id_agents_id_fk" FOREIGN KEY ("lead_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "projects" RENAME CONSTRAINT "projects_lead_agent_id_agents_id_fk_new" TO "projects_lead_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "routines" ADD CONSTRAINT "routines_assignee_agent_id_agents_id_fk_new" FOREIGN KEY ("assignee_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "routines" VALIDATE CONSTRAINT "routines_assignee_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "routines" DROP CONSTRAINT "routines_assignee_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "routines" ADD CONSTRAINT "routines_assignee_agent_id_agents_id_fk" FOREIGN KEY ("assignee_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "routines" RENAME CONSTRAINT "routines_assignee_agent_id_agents_id_fk_new" TO "routines_assignee_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "join_requests" ADD CONSTRAINT "join_requests_created_agent_id_agents_id_fk_new" FOREIGN KEY ("created_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "join_requests" VALIDATE CONSTRAINT "join_requests_created_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "join_requests" DROP CONSTRAINT "join_requests_created_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "join_requests" ADD CONSTRAINT "join_requests_created_agent_id_agents_id_fk" FOREIGN KEY ("created_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "join_requests" RENAME CONSTRAINT "join_requests_created_agent_id_agents_id_fk_new" TO "join_requests_created_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "issue_thread_interactions" ADD CONSTRAINT "issue_thread_interactions_created_by_agent_id_agents_id_fk_new" FOREIGN KEY ("created_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "issue_thread_interactions" VALIDATE CONSTRAINT "issue_thread_interactions_created_by_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "issue_thread_interactions" DROP CONSTRAINT "issue_thread_interactions_created_by_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "issue_thread_interactions" ADD CONSTRAINT "issue_thread_interactions_created_by_agent_id_agents_id_fk" FOREIGN KEY ("created_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "issue_thread_interactions" RENAME CONSTRAINT "issue_thread_interactions_created_by_agent_id_agents_id_fk_new" TO "issue_thread_interactions_created_by_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "issue_thread_interactions" ADD CONSTRAINT "issue_thread_interactions_resolved_by_agent_id_agents_id_fk_new" FOREIGN KEY ("resolved_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "issue_thread_interactions" VALIDATE CONSTRAINT "issue_thread_interactions_resolved_by_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "issue_thread_interactions" DROP CONSTRAINT "issue_thread_interactions_resolved_by_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "issue_thread_interactions" ADD CONSTRAINT "issue_thread_interactions_resolved_by_agent_id_agents_id_fk" FOREIGN KEY ("resolved_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "issue_thread_interactions" RENAME CONSTRAINT "issue_thread_interactions_resolved_by_agent_id_agents_id_fk_new" TO "issue_thread_interactions_resolved_by_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_queues" ADD CONSTRAINT "decision_queues_created_by_agent_id_agents_id_fk_new" FOREIGN KEY ("created_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_queues" VALIDATE CONSTRAINT "decision_queues_created_by_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_queues" DROP CONSTRAINT "decision_queues_created_by_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_queues" ADD CONSTRAINT "decision_queues_created_by_agent_id_agents_id_fk" FOREIGN KEY ("created_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_queues" RENAME CONSTRAINT "decision_queues_created_by_agent_id_agents_id_fk_new" TO "decision_queues_created_by_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_queue_items" ADD CONSTRAINT "decision_queue_items_added_by_agent_id_agents_id_fk_new" FOREIGN KEY ("added_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_queue_items" VALIDATE CONSTRAINT "decision_queue_items_added_by_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_queue_items" DROP CONSTRAINT "decision_queue_items_added_by_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_queue_items" ADD CONSTRAINT "decision_queue_items_added_by_agent_id_agents_id_fk" FOREIGN KEY ("added_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_queue_items" RENAME CONSTRAINT "decision_queue_items_added_by_agent_id_agents_id_fk_new" TO "decision_queue_items_added_by_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_triage" ADD CONSTRAINT "decision_triage_set_by_agent_id_agents_id_fk_new" FOREIGN KEY ("set_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_triage" VALIDATE CONSTRAINT "decision_triage_set_by_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_triage" DROP CONSTRAINT "decision_triage_set_by_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_triage" ADD CONSTRAINT "decision_triage_set_by_agent_id_agents_id_fk" FOREIGN KEY ("set_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_triage" RENAME CONSTRAINT "decision_triage_set_by_agent_id_agents_id_fk_new" TO "decision_triage_set_by_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_triage_events" ADD CONSTRAINT "decision_triage_events_actor_agent_id_agents_id_fk_new" FOREIGN KEY ("actor_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_triage_events" VALIDATE CONSTRAINT "decision_triage_events_actor_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_triage_events" DROP CONSTRAINT "decision_triage_events_actor_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_triage_events" ADD CONSTRAINT "decision_triage_events_actor_agent_id_agents_id_fk" FOREIGN KEY ("actor_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_triage_events" RENAME CONSTRAINT "decision_triage_events_actor_agent_id_agents_id_fk_new" TO "decision_triage_events_actor_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_retention" ADD CONSTRAINT "decision_retention_archived_by_agent_id_agents_id_fk_new" FOREIGN KEY ("archived_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_retention" VALIDATE CONSTRAINT "decision_retention_archived_by_agent_id_agents_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_retention" DROP CONSTRAINT "decision_retention_archived_by_agent_id_agents_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_retention" ADD CONSTRAINT "decision_retention_archived_by_agent_id_agents_id_fk" FOREIGN KEY ("archived_by_agent_id") REFERENCES "public"."agents"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_retention" RENAME CONSTRAINT "decision_retention_archived_by_agent_id_agents_id_fk_new" TO "decision_retention_archived_by_agent_id_agents_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_queues" ADD CONSTRAINT "decision_queues_created_by_run_id_heartbeat_runs_id_fk_new" FOREIGN KEY ("created_by_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_queues" VALIDATE CONSTRAINT "decision_queues_created_by_run_id_heartbeat_runs_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_queues" DROP CONSTRAINT "decision_queues_created_by_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_queues" ADD CONSTRAINT "decision_queues_created_by_run_id_heartbeat_runs_id_fk" FOREIGN KEY ("created_by_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_queues" RENAME CONSTRAINT "decision_queues_created_by_run_id_heartbeat_runs_id_fk_new" TO "decision_queues_created_by_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_queue_items" ADD CONSTRAINT "decision_queue_items_added_by_run_id_heartbeat_runs_id_fk_new" FOREIGN KEY ("added_by_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_queue_items" VALIDATE CONSTRAINT "decision_queue_items_added_by_run_id_heartbeat_runs_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_queue_items" DROP CONSTRAINT "decision_queue_items_added_by_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_queue_items" ADD CONSTRAINT "decision_queue_items_added_by_run_id_heartbeat_runs_id_fk" FOREIGN KEY ("added_by_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_queue_items" RENAME CONSTRAINT "decision_queue_items_added_by_run_id_heartbeat_runs_id_fk_new" TO "decision_queue_items_added_by_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_triage" ADD CONSTRAINT "decision_triage_set_by_run_id_heartbeat_runs_id_fk_new" FOREIGN KEY ("set_by_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_triage" VALIDATE CONSTRAINT "decision_triage_set_by_run_id_heartbeat_runs_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_triage" DROP CONSTRAINT "decision_triage_set_by_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_triage" ADD CONSTRAINT "decision_triage_set_by_run_id_heartbeat_runs_id_fk" FOREIGN KEY ("set_by_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_triage" RENAME CONSTRAINT "decision_triage_set_by_run_id_heartbeat_runs_id_fk_new" TO "decision_triage_set_by_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_triage_events" ADD CONSTRAINT "decision_triage_events_actor_run_id_heartbeat_runs_id_fk_new" FOREIGN KEY ("actor_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_triage_events" VALIDATE CONSTRAINT "decision_triage_events_actor_run_id_heartbeat_runs_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_triage_events" DROP CONSTRAINT "decision_triage_events_actor_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_triage_events" ADD CONSTRAINT "decision_triage_events_actor_run_id_heartbeat_runs_id_fk" FOREIGN KEY ("actor_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_triage_events" RENAME CONSTRAINT "decision_triage_events_actor_run_id_heartbeat_runs_id_fk_new" TO "decision_triage_events_actor_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_retention" ADD CONSTRAINT "decision_retention_archived_by_run_id_heartbeat_runs_id_fk_new" FOREIGN KEY ("archived_by_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_retention" VALIDATE CONSTRAINT "decision_retention_archived_by_run_id_heartbeat_runs_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_retention" DROP CONSTRAINT "decision_retention_archived_by_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_retention" ADD CONSTRAINT "decision_retention_archived_by_run_id_heartbeat_runs_id_fk" FOREIGN KEY ("archived_by_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_retention" RENAME CONSTRAINT "decision_retention_archived_by_run_id_heartbeat_runs_id_fk_new" TO "decision_retention_archived_by_run_id_heartbeat_runs_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_queues" ADD CONSTRAINT "decision_queues__new" FOREIGN KEY ("created_by_agent_api_key_id") REFERENCES "public"."agent_api_keys"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_queues" VALIDATE CONSTRAINT "decision_queues__new";--> statement-breakpoint
 ALTER TABLE "decision_queues" DROP CONSTRAINT "decision_queues_created_by_agent_api_key_id_agent_api_keys_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_queues" ADD CONSTRAINT "decision_queues_created_by_agent_api_key_id_agent_api_keys_id_fk" FOREIGN KEY ("created_by_agent_api_key_id") REFERENCES "public"."agent_api_keys"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_queues" RENAME CONSTRAINT "decision_queues__new" TO "decision_queues_created_by_agent_api_key_id_agent_api_keys_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_queue_items" ADD CONSTRAINT "decision_queue_items__new" FOREIGN KEY ("added_by_agent_api_key_id") REFERENCES "public"."agent_api_keys"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_queue_items" VALIDATE CONSTRAINT "decision_queue_items__new";--> statement-breakpoint
 ALTER TABLE "decision_queue_items" DROP CONSTRAINT "decision_queue_items_added_by_agent_api_key_id_agent_api_keys_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_queue_items" ADD CONSTRAINT "decision_queue_items_added_by_agent_api_key_id_agent_api_keys_id_fk" FOREIGN KEY ("added_by_agent_api_key_id") REFERENCES "public"."agent_api_keys"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_queue_items" RENAME CONSTRAINT "decision_queue_items__new" TO "decision_queue_items_added_by_agent_api_key_id_agent_api_keys_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_triage" ADD CONSTRAINT "decision_triage_set_by_agent_api_key_id_agent_api_keys_id_fk_new" FOREIGN KEY ("set_by_agent_api_key_id") REFERENCES "public"."agent_api_keys"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_triage" VALIDATE CONSTRAINT "decision_triage_set_by_agent_api_key_id_agent_api_keys_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_triage" DROP CONSTRAINT "decision_triage_set_by_agent_api_key_id_agent_api_keys_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_triage" ADD CONSTRAINT "decision_triage_set_by_agent_api_key_id_agent_api_keys_id_fk" FOREIGN KEY ("set_by_agent_api_key_id") REFERENCES "public"."agent_api_keys"("id") ON DELETE SET NULL ON UPDATE NO ACTION;--> statement-breakpoint
+ALTER TABLE "decision_triage" RENAME CONSTRAINT "decision_triage_set_by_agent_api_key_id_agent_api_keys_id_fk_new" TO "decision_triage_set_by_agent_api_key_id_agent_api_keys_id_fk";--> statement-breakpoint
+ALTER TABLE "decision_triage_events" ADD CONSTRAINT "decision_triage_events_agent_api_key_id_agent_api_keys_id_fk_new" FOREIGN KEY ("agent_api_key_id") REFERENCES "public"."agent_api_keys"("id") ON DELETE SET NULL ON UPDATE NO ACTION NOT VALID;--> statement-breakpoint
+ALTER TABLE "decision_triage_events" VALIDATE CONSTRAINT "decision_triage_events_agent_api_key_id_agent_api_keys_id_fk_new";--> statement-breakpoint
 ALTER TABLE "decision_triage_events" DROP CONSTRAINT "decision_triage_events_agent_api_key_id_agent_api_keys_id_fk";--> statement-breakpoint
-ALTER TABLE "decision_triage_events" ADD CONSTRAINT "decision_triage_events_agent_api_key_id_agent_api_keys_id_fk" FOREIGN KEY ("agent_api_key_id") REFERENCES "public"."agent_api_keys"("id") ON DELETE SET NULL ON UPDATE NO ACTION;
+ALTER TABLE "decision_triage_events" RENAME CONSTRAINT "decision_triage_events_agent_api_key_id_agent_api_keys_id_fk_new" TO "decision_triage_events_agent_api_key_id_agent_api_keys_id_fk";

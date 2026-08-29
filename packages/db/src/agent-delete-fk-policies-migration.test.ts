@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 import { applyPendingMigrations } from "./client.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./test-embedded-postgres.js";
@@ -12,7 +14,7 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-type FkActionRow = { conname: string; confdeltype: string };
+type FkActionRow = { conname: string; confdeltype: string; convalidated: boolean };
 
 // PostgreSQL truncates identifiers to NAMEDATALEN-1 (63) bytes, so constraint
 // names longer than that are stored truncated.
@@ -102,7 +104,7 @@ describeEmbeddedPostgres("agent delete FK policy migration (0222)", () => {
         "decision_retention",
       ];
       const rows = await sql<FkActionRow[]>`
-        SELECT conname, confdeltype
+        SELECT conname, confdeltype, convalidated
         FROM pg_constraint
         WHERE conrelid = ANY (${tables}::regclass[])
           AND contype = 'f'
@@ -110,13 +112,55 @@ describeEmbeddedPostgres("agent delete FK policy migration (0222)", () => {
         ORDER BY conname
       `;
 
+      // Every FK on these tables must be fully validated. Re-adding an FK with
+      // NOT VALID (the online replacement pattern) without a VALIDATE step
+      // leaves the constraint enforced-but-unvalidated, which this catches.
+      const unvalidated = rows.filter((row) => row.convalidated !== true);
+      expect(unvalidated, `FKs left NOT VALID: ${JSON.stringify(unvalidated)}`).toEqual([]);
+
       expect(rows).toEqual(
         Object.entries(EXPECTED_FK_ACTIONS)
-          .map(([conname, confdeltype]) => ({ conname: pgIdent(conname), confdeltype }))
+          .map(([conname, confdeltype]) => ({ conname: pgIdent(conname), confdeltype, convalidated: true }))
           .sort((a, b) => (a.conname < b.conname ? -1 : a.conname > b.conname ? 1 : 0)),
       );
     } finally {
       await sql.end();
+    }
+  });
+});
+
+describe("agent delete FK policy migration (0222) static lint", () => {
+  it("adds every FK NOT VALID, validates it, drops the old one, and renames it back to the canonical name", async () => {
+    const raw = await readFile(
+      fileURLToPath(new URL("./migrations/0222_agent_delete_fk_policies.sql", import.meta.url)),
+      "utf8",
+    );
+    const statements = raw
+      .replace(/^--.*$/gm, "")
+      .split("--> statement-breakpoint")
+      .map((statement) => statement.trim())
+      .filter((statement) => statement.length > 0);
+
+    const addPattern = /^ALTER TABLE "([^"]+)" ADD CONSTRAINT "([^"]+)" FOREIGN KEY .* NOT VALID;$/;
+    const adds = statements.filter((statement) => /ADD CONSTRAINT "[^"]+" FOREIGN KEY /i.test(statement));
+    const plainAdds = adds.filter((statement) => !addPattern.test(statement));
+    expect(
+      plainAdds,
+      `plain (write-blocking) ADD CONSTRAINT ... FOREIGN KEY statements found; each must carry NOT VALID:\n${plainAdds.join("\n")}`,
+    ).toEqual([]);
+    expect(adds).toHaveLength(30);
+
+    for (const statement of adds) {
+      const match = statement.match(addPattern);
+      expect(match, `ADD statement is not in the <table> ADD <tmp> ... NOT VALID shape: ${statement}`).not.toBeNull();
+      const [, table, tempName] = match as [string, string, string, string];
+      expect(statements).toContain(`ALTER TABLE "${table}" VALIDATE CONSTRAINT "${tempName}";`);
+      expect(
+        statements.some((candidate) =>
+          new RegExp(`^ALTER TABLE "${table}" RENAME CONSTRAINT "${tempName}" TO `).test(candidate),
+        ),
+        `missing RENAME of temporary constraint "${tempName}" on "${table}"`,
+      ).toBe(true);
     }
   });
 });
