@@ -135,6 +135,7 @@ const mockExternalObjectService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockObserveCrossIssueInfluence = vi.hoisted(() => vi.fn(async () => null));
+const mockIsTerminalOrMissingHeartbeatRun = vi.hoisted(() => vi.fn(async () => false));
 
 function registerRouteMocks() {
   vi.doMock("@paperclipai/shared/telemetry", () => ({
@@ -162,6 +163,8 @@ function registerRouteMocks() {
   vi.doMock("../services/issues.js", () => ({
     issueService: () => mockIssueService,
     ORPHANED_DUPLICATE_RUN_CONFLICT_CODE: "orphaned_duplicate_run",
+    TERMINAL_HEARTBEAT_RUN_STATUSES: new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]),
+    isTerminalOrMissingHeartbeatRun: mockIsTerminalOrMissingHeartbeatRun,
   }));
 
   vi.doMock("../services/work-products.js", () => ({
@@ -391,7 +394,25 @@ function holderRunRow(status: string = "running") {
     companyId,
     agentId: holderAgentId,
     status,
+    startedAt: new Date(),
+    finishedAt: null,
   };
+}
+
+function duplicateRunRow(status: string = "running") {
+  return {
+    id: duplicateRunId,
+    companyId,
+    agentId: holderAgentId,
+    status,
+    startedAt: new Date(),
+    finishedAt: null,
+  };
+}
+
+function liveHolderAndDuplicateRuns() {
+  return async (runId: string) =>
+    runId === holderRunId ? holderRunRow("running") : runId === duplicateRunId ? duplicateRunRow() : null;
 }
 
 describe("SUP-14303 duplicate same-agent run first-write refusal", () => {
@@ -413,6 +434,8 @@ describe("SUP-14303 duplicate same-agent run first-write refusal", () => {
     vi.doUnmock("../middleware/index.js");
     registerRouteMocks();
     vi.clearAllMocks();
+    mockIsTerminalOrMissingHeartbeatRun.mockReset();
+    mockIsTerminalOrMissingHeartbeatRun.mockResolvedValue(false);
     mockAccessService.canUser.mockReset();
     mockAccessService.decide.mockReset();
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
@@ -551,9 +574,7 @@ describe("SUP-14303 duplicate same-agent run first-write refusal", () => {
     mockIssueService.getById.mockResolvedValue(
       makeIssue({ status: "in_progress", executionRunId: holderRunId }),
     );
-    mockHeartbeatService.getRun.mockImplementation(async (runId: string) =>
-      runId === holderRunId ? holderRunRow("running") : null,
-    );
+    mockHeartbeatService.getRun.mockImplementation(liveHolderAndDuplicateRuns());
 
     const res = await request(await createApp(duplicateActor()))
       .post(`/api/issues/${issueId}/comments`)
@@ -561,9 +582,19 @@ describe("SUP-14303 duplicate same-agent run first-write refusal", () => {
 
     expect(res.status).toBe(409);
     expect(res.body.error).toBe("Issue run ownership conflict");
+    expect(res.body.code).toBe("orphaned_duplicate_run");
     expect(res.body.details.code).toBe("orphaned_duplicate_run");
     expect(res.body.details.holderRunId).toBe(holderRunId);
     expect(res.body.details.actorRunId).toBe(duplicateRunId);
+    expect(res.body.details.checkoutRun).toMatchObject({
+      id: holderRunId,
+      agentId: holderAgentId,
+      status: "running",
+    });
+    expect(res.body.details.actorRun).toMatchObject({
+      id: duplicateRunId,
+      status: "running",
+    });
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
@@ -573,9 +604,7 @@ describe("SUP-14303 duplicate same-agent run first-write refusal", () => {
       mockIssueService.getById.mockResolvedValue(
         makeIssue({ status, executionRunId: holderRunId }),
       );
-      mockHeartbeatService.getRun.mockImplementation(async (runId: string) =>
-        runId === holderRunId ? holderRunRow("running") : null,
-      );
+      mockHeartbeatService.getRun.mockImplementation(liveHolderAndDuplicateRuns());
 
       const res = await request(await createApp(duplicateActor()))
         .patch(`/api/issues/${issueId}`)
@@ -583,9 +612,11 @@ describe("SUP-14303 duplicate same-agent run first-write refusal", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(409);
       expect(res.body.error).toBe("Issue run ownership conflict");
+      expect(res.body.code).toBe("orphaned_duplicate_run");
       expect(res.body.details.code).toBe("orphaned_duplicate_run");
       expect(res.body.details.holderRunId).toBe(holderRunId);
       expect(res.body.details.status).toBe(status);
+      expect(res.body.details.checkoutRun?.status).toBe("running");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     },
   );
@@ -648,6 +679,49 @@ describe("SUP-14303 duplicate same-agent run first-write refusal", () => {
       expect(mockIssueService.update).toHaveBeenCalled();
     },
   );
+
+  it("leaves the stale-lock adoption path intact when the holder run is stillborn", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "todo", executionRunId: holderRunId }),
+    );
+    mockHeartbeatService.getRun.mockImplementation(async (runId: string) =>
+      runId === holderRunId ? holderRunRow("running") : null,
+    );
+    mockIsTerminalOrMissingHeartbeatRun.mockResolvedValue(true);
+
+    const res = await request(await createApp(duplicateActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Adopting a stillborn execution lock" });
+
+    // A stillborn holder is a dead lock, not a live duplicate: the write keeps
+    // the existing stale-execution-lock adoption path (SUP-9864).
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.details?.code).not.toBe("orphaned_duplicate_run");
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("does not code a terminal actor run as a duplicate", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "in_progress", executionRunId: holderRunId }),
+    );
+    mockHeartbeatService.getRun.mockImplementation(async (runId: string) =>
+      runId === holderRunId
+        ? holderRunRow("running")
+        : runId === duplicateRunId
+          ? duplicateRunRow("failed")
+          : null,
+    );
+
+    const res = await request(await createApp(duplicateActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Straggler write after losing the race" });
+
+    // A terminal run losing a race with a live holder is a straggler, not a
+    // concurrently-dispatched duplicate: the guard stays out of the way and the
+    // pre-existing close-time ownership conflict handles it.
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.details?.code).not.toBe("orphaned_duplicate_run");
+  });
 
   it("leaves the holder run's own writes unaffected", async () => {
     mockIssueService.getById.mockResolvedValue(

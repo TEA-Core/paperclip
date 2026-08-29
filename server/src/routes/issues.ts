@@ -199,6 +199,8 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
   ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+  isTerminalOrMissingHeartbeatRun,
   readAcceptedPlanConfirmationTarget,
 } from "../services/issues.js";
 import {
@@ -4418,11 +4420,12 @@ export function issueRoutes(
 
   /**
    * SUP-14303: a same-agent duplicate run stands down at its first write,
-   * not at close. Fires only when all four hold: the actor is an agent with
-   * a run id on the request; the issue's `executionRunId` resolves to a
-   * `running` heartbeat run; that holder belongs to the same agent; and the
-   * actor's run is a different one. Cross-agent live leases, actors without
-   * a run id, and holders in any other status keep their existing paths.
+   * not at close. Fires only when all hold: the actor is an agent with a
+   * live run id on the request; the issue's `executionRunId` resolves to a
+   * `running` heartbeat run of the same agent that is not stillborn; and the
+   * actor's run is a different, live one. Cross-agent live leases, actors
+   * without a run id, stillborn/terminal/queued holders, and terminal actor
+   * runs (a losing straggler, not a duplicate) keep their existing paths.
    */
   async function assertNotOrphanedDuplicateRunWrite(
     req: Request,
@@ -4430,6 +4433,8 @@ export function issueRoutes(
     issue: {
       id: string;
       status: string;
+      assigneeAgentId: string | null;
+      checkoutRunId?: string | null;
       executionRunId?: string | null;
     },
   ) {
@@ -4442,16 +4447,41 @@ export function issueRoutes(
     const holderRun = await heartbeat.getRun(holderRunId);
     if (!holderRun || holderRun.status !== "running") return true;
     if (holderRun.agentId !== actorAgentId) return true;
+    // A stillborn or missing holder keeps the stale-lock adoption path
+    // (SUP-9864) instead of being refused as a duplicate.
+    if (await isTerminalOrMissingHeartbeatRun(holderRunId, db)) return true;
+    // The actor must itself be live: a terminal run losing a race with a live
+    // holder is a straggler, not a concurrently-dispatched duplicate.
+    const actorRun = await heartbeat.getRun(actorRunId);
+    if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status)) return true;
+    const liveness = (run: {
+      id: string;
+      agentId: string;
+      status: string;
+      startedAt: Date | null;
+      finishedAt: Date | null;
+    }) => ({
+      id: run.id,
+      agentId: run.agentId,
+      status: run.status,
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt,
+    });
     res.status(409).json({
       error: "Issue run ownership conflict",
+      code: ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
       details: {
         code: ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
         holderRunId,
-        holderAgentId: holderRun.agentId,
-        actorAgentId,
-        actorRunId,
         issueId: issue.id,
         status: issue.status,
+        assigneeAgentId: issue.assigneeAgentId,
+        checkoutRunId: issue.checkoutRunId,
+        executionRunId: holderRunId,
+        actorAgentId,
+        actorRunId,
+        checkoutRun: liveness(holderRun),
+        actorRun: liveness(actorRun),
       },
     });
     return false;

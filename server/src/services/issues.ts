@@ -881,6 +881,43 @@ function isUnstartedScheduledRetry(run: { status: string; startedAt: Date | null
   return run.status === "scheduled_retry" && run.startedAt == null;
 }
 
+/**
+ * True when the heartbeat run is missing, in a terminal status, an unstarted
+ * scheduled retry, or — for adapters that spawn a tracked local child —
+ * stillborn. Distinguishes a stale execution lock that may be adopted from a
+ * live one that must keep its lock.
+ */
+export async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader) {
+  const run = await dbOrTx
+    .select({
+      adapterType: agents.adapterType,
+      status: heartbeatRuns.status,
+      finishedAt: heartbeatRuns.finishedAt,
+      startedAt: heartbeatRuns.startedAt,
+      createdAt: heartbeatRuns.createdAt,
+      processPid: heartbeatRuns.processPid,
+      processGroupId: heartbeatRuns.processGroupId,
+      processStartedAt: heartbeatRuns.processStartedAt,
+      lastOutputAt: heartbeatRuns.lastOutputAt,
+      lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+      livenessState: heartbeatRuns.livenessState,
+      logBytes: heartbeatRuns.logBytes,
+      usageJson: heartbeatRuns.usageJson,
+      resultJson: heartbeatRuns.resultJson,
+    })
+    .from(heartbeatRuns)
+    .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+    .where(eq(heartbeatRuns.id, runId))
+    .then((rows) => rows[0] ?? null);
+  if (!run) return true;
+  if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+  if (isUnstartedScheduledRetry({ status: run.status, startedAt: run.startedAt })) return true;
+  // Same gate as the reaper: the stillborn signature only proves anything for
+  // adapters that spawn a tracked local child. Declaring a live gateway run
+  // dead here would let an assignee take a lock out from under it.
+  return canDetectStillbornRun(run.adapterType) && isStillbornRun(run, new Date());
+}
+
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -5496,37 +5533,6 @@ export function issueService(db: Db) {
    * and anyone else for not being the assignee. That intersection is empty, which is what made the
    * condition unrecoverable without operator help.
    */
-  async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
-    const run = await dbOrTx
-      .select({
-        adapterType: agents.adapterType,
-        status: heartbeatRuns.status,
-        finishedAt: heartbeatRuns.finishedAt,
-        startedAt: heartbeatRuns.startedAt,
-        createdAt: heartbeatRuns.createdAt,
-        processPid: heartbeatRuns.processPid,
-        processGroupId: heartbeatRuns.processGroupId,
-        processStartedAt: heartbeatRuns.processStartedAt,
-        lastOutputAt: heartbeatRuns.lastOutputAt,
-        lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
-        livenessState: heartbeatRuns.livenessState,
-        logBytes: heartbeatRuns.logBytes,
-        usageJson: heartbeatRuns.usageJson,
-        resultJson: heartbeatRuns.resultJson,
-      })
-      .from(heartbeatRuns)
-      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
-    if (!run) return true;
-    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
-    if (isUnstartedScheduledRetry({ status: run.status, startedAt: run.startedAt })) return true;
-    // Same gate as the reaper: the stillborn signature only proves anything for adapters that
-    // spawn a tracked local child. Declaring a live gateway run dead here would let an assignee
-    // take a lock out from under it.
-    return canDetectStillbornRun(run.adapterType) && isStillbornRun(run, new Date());
-  }
-
   async function adoptStaleCheckoutRun(input: {
     issueId: string;
     actorAgentId: string;
@@ -8855,7 +8861,7 @@ export function issueService(db: Db) {
         current.executionRunId !== checkoutRunId &&
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
-        const stale = await isTerminalOrMissingHeartbeatRun(current.executionRunId);
+        const stale = await isTerminalOrMissingHeartbeatRun(current.executionRunId, db);
         if (stale) {
           const now = new Date();
           const adoptionSet: Record<string, unknown> = {
