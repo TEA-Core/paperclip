@@ -445,11 +445,24 @@ export async function evaluateDoneTierDeclaration(
   }
 
   if (!runId) {
-    return fallback(
-      "No accompanying comment and no run id to look up same-run comment; transition allowed",
-      true,
-      "no_accompanying_comment_no_run_id",
-    );
+    // SUP-14368: no comment and no run id means there is no evidence to verify — a
+    // missing declaration, not a verified pass. The bare no-evidence allow rendered
+    // "cannot verify" as "transition allowed", the fail-open exec-CTO ruled against
+    // on SUP-13094. It is now treated on the same terms as any other missing
+    // declaration: a 422 done_transition_missing_tier_declaration whose remedy names
+    // the accepted forms (the declaration is always writable, so no close deadlocks).
+    return {
+      allowed: false,
+      reason:
+        "No accompanying comment and no run id to look up a same-run comment; no done-tier declaration found. " +
+        `Accepted forms: "Closed at Tier 2 (live): <probe evidence>"` +
+        ` or ` +
+        `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+        ` — per SUP-12693.`,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
   }
 
   let comments: IssueComment[];
