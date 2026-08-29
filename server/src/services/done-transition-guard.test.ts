@@ -2025,7 +2025,7 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe(null);
     });
 
-    it("rejects when no run id and no accompanying comment", async () => {
+    it("rejects when no run id and no accompanying comment (no bare no-evidence allow)", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         tierIssue,
@@ -2033,9 +2033,13 @@ describe("evaluateDoneTierDeclaration", () => {
         null,
         () => Promise.resolve([]),
       );
-      expect(result.allowed).toBe(true);
-      expect(result.skipped).toBe(true);
-      expect(result.skipReason).toContain("no_accompanying_comment_no_run_id");
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.skipped).toBe(false);
+      expect(result.skipReason).toBeNull();
+      expect(result.reason).toContain("no done-tier declaration found");
+      expect(result.reason).toContain("Closed at Tier 2 (live)");
+      expect(result.reason).toContain("Liveness unverified");
     });
   });
 
