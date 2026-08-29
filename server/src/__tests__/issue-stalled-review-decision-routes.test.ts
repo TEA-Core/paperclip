@@ -22,6 +22,8 @@ import {
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -53,6 +55,12 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
 
   afterEach(async () => {
     enqueueWakeup.mockClear();
+    // SUP-14359: a successful non-self commented PATCH dispatches an
+    // issue_commented wake fire-and-forget (routes/issues.ts); the in-flight
+    // wake can still be inserting heartbeat_runs / agent_wakeup_requests rows
+    // while this cleanup deletes. Drain it (module-level, shared across
+    // heartbeatService instances) before the deletes.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
