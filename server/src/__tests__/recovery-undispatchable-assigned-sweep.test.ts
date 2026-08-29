@@ -170,6 +170,27 @@ describeEmbeddedPostgres("recovery sweep reconcileUndispatchableAssignedIssues",
     expect(await commentRows(issueId)).toHaveLength(0);
   });
 
+  it("reports an in_progress pull-only assigned card with no continuation path", async () => {
+    const companyId = await seedCompany();
+    const pullOnlyAgentId = await seedAgent(companyId, "process");
+    const issueId = await seedCard(companyId, pullOnlyAgentId, { status: "in_progress" });
+
+    const result = await makeSweep().reconcileUndispatchableAssignedIssues();
+
+    expect(result.reported).toBe(1);
+    expect(result.skipped).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const audits = await detectionRows(issueId);
+    expect(audits).toHaveLength(1);
+    const details = audits[0].details as Record<string, unknown>;
+    expect(details.status).toBe("in_progress");
+
+    const issue = await issueRow(issueId);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.assigneeAgentId).toBe(pullOnlyAgentId);
+  });
+
   it("skips a pull-only assigned card with a future monitorNextCheckAt", async () => {
     const companyId = await seedCompany();
     const pullOnlyAgentId = await seedAgent(companyId, "process");
@@ -237,6 +258,41 @@ describeEmbeddedPostgres("recovery sweep reconcileUndispatchableAssignedIssues",
     }
     expect(await detectionRows(dispatchableCardId)).toHaveLength(0);
     expect((await issueRow(dispatchableCardId))?.status).toBe("todo");
+  });
+
+  it("rotates past the candidate window so higher-id cards are scanned on later passes", async () => {
+    // Board reopen 2026-08-29: the sweep's fixed limit on asc(id) pinned the scan
+    // to the lowest candidate ids forever once 100 cards stay perpetually
+    // eligible (report-only cards never leave the candidate set). Regression:
+    // a keyset cursor advances the window, so no stranded card is never scanned.
+    const companyId = await seedCompany();
+    const pullOnlyAgentId = await seedAgent(companyId, "process");
+
+    const ids: string[] = [];
+    for (let n = 0; n < 105; n += 1) {
+      ids.push(await seedCard(companyId, pullOnlyAgentId));
+    }
+    const sortedIds = [...ids].sort();
+    const expectedFirstWindow = sortedIds.slice(0, 100);
+    const expectedRemainder = sortedIds.slice(100);
+
+    const sweep = makeSweep();
+
+    const first = await sweep.reconcileUndispatchableAssignedIssues();
+    expect(first.scanned).toBe(100);
+    expect(first.reported).toBe(100);
+    expect([...first.issueIds].sort()).toEqual(expectedFirstWindow);
+
+    const second = await sweep.reconcileUndispatchableAssignedIssues();
+    expect(second.scanned).toBe(expectedRemainder.length);
+    expect(second.reported).toBe(expectedRemainder.length);
+    expect([...second.issueIds].sort()).toEqual(expectedRemainder);
+
+    // Cursor wrapped: the window re-scans the lowest ids, and the per-issue
+    // re-log throttle keeps the pass report-only instead of re-flooding.
+    const third = await sweep.reconcileUndispatchableAssignedIssues();
+    expect(third.scanned).toBe(100);
+    expect(third.reported).toBe(0);
   });
 
   it("does not re-report the same issue within the re-log interval", async () => {

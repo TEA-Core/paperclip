@@ -943,6 +943,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   const authz = authorizationService(db);
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
+  let undispatchableAssignedScanCursor: string | null = null;
 
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -8264,34 +8265,54 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   // card with no live continuation path will never wake on its own.
   // Report-only: activity row per detected issue, throttled per issue so
   // repeated ticks cannot flood; no status writes, no reassignment.
+  // The candidate window rotates with a keyset cursor (same pattern as the
+  // resolved-dependency-wake backstop): report-only cards stay perpetually
+  // eligible, so a fixed limit on asc(id) would permanently starve any stranded
+  // card whose id sorts past the first window.
   async function reconcileUndispatchableAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
-    const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
+    const result = { reported: 0, skipped: 0, scanned: 0, issueIds: [] as string[] };
 
-    const candidates = await db
-      .select({
-        id: issues.id,
-        companyId: issues.companyId,
-        identifier: issues.identifier,
-        status: issues.status,
-        assigneeAgentId: issues.assigneeAgentId,
-        monitorNextCheckAt: issues.monitorNextCheckAt,
-        assigneeAdapterType: agents.adapterType,
-      })
-      .from(issues)
-      .innerJoin(
-        agents,
-        and(eq(agents.id, issues.assigneeAgentId), eq(agents.companyId, issues.companyId)),
-      )
-      .where(
-        and(
-          inArray(issues.status, ["todo", "in_progress"]),
-          sql`${issues.assigneeAgentId} is not null`,
-          visibleIssueCondition(),
-          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
-        ),
-      )
-      .orderBy(asc(issues.id))
-      .limit(UNDISPATCHABLE_ASSIGNED_CANDIDATE_LIMIT);
+    const queryCandidates = (afterIssueId: string | null) => {
+      const filters = [
+        inArray(issues.status, ["todo", "in_progress"]),
+        sql`${issues.assigneeAgentId} is not null`,
+        visibleIssueCondition(),
+      ];
+      if (afterIssueId) filters.push(gt(issues.id, afterIssueId));
+      if (opts?.issueCreatedAtGte) filters.push(gte(issues.createdAt, opts.issueCreatedAtGte));
+
+      return db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          assigneeAdapterType: agents.adapterType,
+          totalCount: sql<number>`count(*) over()::int`,
+        })
+        .from(issues)
+        .innerJoin(
+          agents,
+          and(eq(agents.id, issues.assigneeAgentId), eq(agents.companyId, issues.companyId)),
+        )
+        .where(and(...filters))
+        .orderBy(asc(issues.id))
+        .limit(UNDISPATCHABLE_ASSIGNED_CANDIDATE_LIMIT);
+    };
+
+    let candidateRows = await queryCandidates(undispatchableAssignedScanCursor);
+    if (candidateRows.length === 0 && undispatchableAssignedScanCursor) {
+      undispatchableAssignedScanCursor = null;
+      candidateRows = await queryCandidates(null);
+    }
+    const totalCandidateCount = candidateRows[0]?.totalCount ?? 0;
+    const candidates = candidateRows.map(({ totalCount: _totalCount, ...candidate }) => candidate);
+    const lastCandidate = candidates[candidates.length - 1] ?? null;
+    undispatchableAssignedScanCursor =
+      candidates.length < totalCandidateCount && lastCandidate ? lastCandidate.id : null;
+    result.scanned = candidates.length;
 
     for (const candidate of candidates) {
       if (!isPullOnlyAdapterType(candidate.assigneeAdapterType)) {
@@ -8358,7 +8379,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         Date.now() - lastUndispatchableAssignedSweepLogAt.getTime() >= UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS);
     if (shouldLog) {
       logger.warn(
-        { reported: result.reported, skipped: result.skipped, issueIds: result.issueIds },
+        { reported: result.reported, skipped: result.skipped, scanned: result.scanned, issueIds: result.issueIds },
         "undispatchable-assigned sweep reported issues",
       );
       lastUndispatchableAssignedSweepLogAt = new Date();
