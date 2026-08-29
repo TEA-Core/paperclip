@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   ALLOW_MARKER,
@@ -8,6 +13,7 @@ import {
   MAX_REPORTED_NEW_DEPENDENCIES,
   MIN_SECRET_LENGTH,
   analyzeDiff,
+  defaultWriteSummary,
   formatAnnotation,
   formatSummary,
   characterClassCount,
@@ -884,4 +890,53 @@ test("readDiff compares head against the merge base with zero context", () => {
     "--no-ext-diff",
     "base1...head1",
   ]);
+});
+
+// ── Summary sink ─────────────────────────────────────────────────────────────
+
+test("defaultWriteSummary writes before it returns", () => {
+  // This was `import("node:fs").then(({appendFileSync}) => ...)`. The dynamic
+  // import had not resolved by the time the entry point called `process.exit`,
+  // so GITHUB_STEP_SUMMARY stayed empty on every CI run while the exit code
+  // still looked correct — a silently dead reporting channel. Reading the file
+  // immediately after the call is what pins the write as synchronous.
+  const dir = mkdtempSync(path.join(os.tmpdir(), "pr-security-summary-"));
+  const target = path.join(dir, "summary.md");
+  const previous = process.env.GITHUB_STEP_SUMMARY;
+  process.env.GITHUB_STEP_SUMMARY = target;
+  try {
+    defaultWriteSummary("## PR security gate\n\nNo security findings in this diff.");
+    assert.match(readFileSync(target, "utf8"), /No security findings/);
+  } finally {
+    if (previous === undefined) delete process.env.GITHUB_STEP_SUMMARY;
+    else process.env.GITHUB_STEP_SUMMARY = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("defaultWriteSummary is a no-op outside Actions", () => {
+  const previous = process.env.GITHUB_STEP_SUMMARY;
+  delete process.env.GITHUB_STEP_SUMMARY;
+  try {
+    assert.doesNotThrow(() => defaultWriteSummary("ignored"));
+  } finally {
+    if (previous !== undefined) process.env.GITHUB_STEP_SUMMARY = previous;
+  }
+});
+
+test("the entry point reports a usage error without shas", () => {
+  // Also covers the flush path: `process.exit()` tears the process down without
+  // draining buffered output, so the entry point sets `process.exitCode` and
+  // lets node exit on its own.
+  const script = fileURLToPath(new URL("./check-pr-security.mjs", import.meta.url));
+  try {
+    execFileSync(process.execPath, [script], {
+      encoding: "utf8",
+      env: { PATH: process.env.PATH ?? "" },
+    });
+    assert.fail("expected a non-zero exit");
+  } catch (error) {
+    assert.equal(error.status, 2);
+    assert.match(error.stderr, /base and head shas required/);
+  }
 });

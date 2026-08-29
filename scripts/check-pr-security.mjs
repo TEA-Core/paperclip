@@ -43,6 +43,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -886,18 +887,22 @@ export function runCheck({
   return 0;
 }
 
-function defaultWriteSummary(text) {
+export function defaultWriteSummary(text) {
   const target = process.env.GITHUB_STEP_SUMMARY;
   if (!target) return;
-  // Imported lazily so unit tests never touch the filesystem.
-  import("node:fs").then(({ appendFileSync }) => appendFileSync(target, `${text}\n`));
+  // Must be synchronous. This was a `import("node:fs").then(...)` and the
+  // summary silently never landed: the dynamic import had not resolved by the
+  // time the entry point called `process.exit`, so the file stayed empty on
+  // every run while the exit code still looked correct. Unit tests inject
+  // their own `writeSummary`, so nothing here needs deferring.
+  appendFileSync(target, `${text}\n`);
 }
 
 function isMainModule() {
   return process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 }
 
-if (isMainModule()) {
+function main() {
   const baseSha =
     process.env.PAPERCLIP_SECURITY_BASE_SHA || process.env.BASE_SHA || process.argv[2];
   const headSha =
@@ -908,8 +913,15 @@ if (isMainModule()) {
       "ERROR: base and head shas required. In CI they come from pr.yml's BASE_SHA/HEAD_SHA;\n" +
         "locally run: node scripts/check-pr-security.mjs <base-sha> <head-sha>",
     );
-    process.exit(2);
+    return 2;
   }
 
-  process.exit(runCheck({ diffText: readDiff({ baseSha, headSha }) }));
+  return runCheck({ diffText: readDiff({ baseSha, headSha }) });
+}
+
+if (isMainModule()) {
+  // `process.exitCode`, not `process.exit()`: the latter tears the process down
+  // without flushing buffered stdout, which can truncate the annotations that
+  // are this gate's whole reporting channel.
+  process.exitCode = main();
 }
