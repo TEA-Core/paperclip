@@ -198,6 +198,9 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+  isTerminalOrMissingHeartbeatRun,
   readAcceptedPlanConfirmationTarget,
 } from "../services/issues.js";
 import {
@@ -4415,6 +4418,75 @@ export function issueRoutes(
     return null;
   }
 
+  /**
+   * SUP-14303: a same-agent duplicate run stands down at its first write,
+   * not at close. Fires only when all hold: the actor is an agent with a
+   * live run id on the request; the issue's `executionRunId` resolves to a
+   * `running` heartbeat run of the same agent that is not stillborn; and the
+   * actor's run is a different, live one. Cross-agent live leases, actors
+   * without a run id, stillborn/terminal/queued holders, and terminal actor
+   * runs (a losing straggler, not a duplicate) keep their existing paths.
+   */
+  async function assertNotOrphanedDuplicateRunWrite(
+    req: Request,
+    res: Response,
+    issue: {
+      id: string;
+      status: string;
+      assigneeAgentId: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+    },
+  ) {
+    if (req.actor.type !== "agent") return true;
+    const actorAgentId = req.actor.agentId;
+    const actorRunId = req.actor.runId?.trim();
+    if (!actorAgentId || !actorRunId) return true;
+    const holderRunId = issue.executionRunId?.trim();
+    if (!holderRunId || holderRunId === actorRunId) return true;
+    const holderRun = await heartbeat.getRun(holderRunId);
+    if (!holderRun || holderRun.status !== "running") return true;
+    if (holderRun.agentId !== actorAgentId) return true;
+    // A stillborn or missing holder keeps the stale-lock adoption path
+    // (SUP-9864) instead of being refused as a duplicate.
+    if (await isTerminalOrMissingHeartbeatRun(holderRunId, db)) return true;
+    // The actor must itself be live: a terminal run losing a race with a live
+    // holder is a straggler, not a concurrently-dispatched duplicate.
+    const actorRun = await heartbeat.getRun(actorRunId);
+    if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status)) return true;
+    const liveness = (run: {
+      id: string;
+      agentId: string;
+      status: string;
+      startedAt: Date | null;
+      finishedAt: Date | null;
+    }) => ({
+      id: run.id,
+      agentId: run.agentId,
+      status: run.status,
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt,
+    });
+    res.status(409).json({
+      error: "Issue run ownership conflict",
+      code: ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
+      details: {
+        code: ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
+        holderRunId,
+        issueId: issue.id,
+        status: issue.status,
+        assigneeAgentId: issue.assigneeAgentId,
+        checkoutRunId: issue.checkoutRunId,
+        executionRunId: holderRunId,
+        actorAgentId,
+        actorRunId,
+        checkoutRun: liveness(holderRun),
+        actorRun: liveness(actorRun),
+      },
+    });
+    return false;
+  }
+
   async function hasActiveCheckoutManagementOverride(
     actorAgentId: string,
     companyId: string,
@@ -4441,6 +4513,7 @@ export function issueRoutes(
       assigneeUserId: string | null;
       createdByAgentId: string | null;
       checkoutRunId?: string | null;
+      executionRunId?: string | null;
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
     },
@@ -4513,6 +4586,10 @@ export function issueRoutes(
       }
       return true;
     }
+    // SUP-14303: a same-agent duplicate run is refused at its first write on
+    // every assignee write surface, in every status — ahead of the
+    // in_progress early return that previously let it write until close.
+    if (!(await assertNotOrphanedDuplicateRunWrite(req, res, issue))) return false;
     if (issue.status !== "in_progress") {
       return true;
     }
@@ -12151,6 +12228,7 @@ export function issueRoutes(
     }
     const commentAccessDecision = await assertAgentIssueCommentAllowed(req, res, issue);
     if (!commentAccessDecision) return;
+    if (!(await assertNotOrphanedDuplicateRunWrite(req, res, issue))) return;
     const commentAuthorizationReason = issueWriteAuthorizationReason(req, commentAccessDecision);
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
