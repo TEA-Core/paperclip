@@ -508,10 +508,6 @@ jobs:
       - name: Run serialized server test shard
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
 
-      - name: TEMPORARY forced failure for gate-closure evidence
-        if: matrix.shard_label == '5/5'
-        run: exit 1
-
   canary_dry_run:
     name: Canary Dry Run
     needs: [policy]
