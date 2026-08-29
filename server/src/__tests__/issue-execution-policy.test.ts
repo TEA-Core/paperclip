@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -2465,6 +2465,119 @@ describe("issue execution policy transitions", () => {
           monitorExplicitlyUpdated: true,
         }),
       ).toThrow("Monitor bounds are already exhausted");
+    });
+
+    describe("stripMonitorFromExecutionPolicy (SUP-14374)", () => {
+      const fullPolicy = () =>
+        normalizeIssueExecutionPolicy({
+          stages: [],
+          monitor: {
+            nextCheckAt: "2026-04-11T12:30:00.000Z",
+            scheduledBy: "assignee",
+          },
+          returnAssigneeAgentId: ctoAgentId,
+          reviewPreset: {
+            id: "low_trust_review",
+            version: 1,
+            rawOutputDisposition: "quarantine",
+          },
+          authorizationPolicy: {
+            trustBoundary: {
+              mode: "low_trust_review",
+              allowedAgentIds: [qaAgentId],
+            },
+          },
+          maxReviewRounds: 3,
+        })!;
+
+      it("removes only the monitor key, preserving every other policy field", () => {
+        const policy = fullPolicy();
+        const stripped = stripMonitorFromExecutionPolicy(policy)!;
+        expect(stripped.monitor).toBeUndefined();
+        expect(stripped.returnAssigneeAgentId).toBe(ctoAgentId);
+        expect(stripped.reviewPreset).toEqual({
+          id: "low_trust_review",
+          version: 1,
+          rawOutputDisposition: "quarantine",
+        });
+        expect(stripped.authorizationPolicy).toEqual({
+          trustBoundary: {
+            mode: "low_trust_review",
+            allowedAgentIds: [qaAgentId],
+          },
+        });
+        expect(stripped.maxReviewRounds).toBe(3);
+        expect(stripped.mode).toBe("normal");
+        expect(stripped.commentRequired).toBe(true);
+        expect(stripped.stages).toEqual([]);
+      });
+
+      it("passes null through as null and returns policies without a monitor unchanged", () => {
+        expect(stripMonitorFromExecutionPolicy(null)).toBeNull();
+        const noMonitor = normalizeIssueExecutionPolicy({
+          stages: [],
+          returnAssigneeAgentId: ctoAgentId,
+        })!;
+        expect(stripMonitorFromExecutionPolicy(noMonitor)).toBe(noMonitor);
+      });
+    });
+
+    it("monitor fire preserves executionPolicy fields (buildIssueMonitorTriggeredPatch, SUP-14374)", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+        },
+        returnAssigneeAgentId: ctoAgentId,
+        reviewPreset: {
+          id: "low_trust_review",
+          version: 1,
+          rawOutputDisposition: "quarantine",
+        },
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: "low_trust_review",
+            allowedAgentIds: [qaAgentId],
+          },
+        },
+        maxReviewRounds: 2,
+      })!;
+
+      const patch = buildIssueMonitorTriggeredPatch({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+          monitorAttemptCount: 0,
+          monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        policy,
+        triggeredAt: new Date("2026-04-11T12:35:00.000Z"),
+      });
+
+      expect(patch.monitorLastTriggeredAt).toEqual(new Date("2026-04-11T12:35:00.000Z"));
+      expect(patch.monitorAttemptCount).toBe(1);
+      const firedPolicy = patch.executionPolicy as Record<string, unknown>;
+      expect(firedPolicy.monitor).toBeUndefined();
+      expect(firedPolicy.returnAssigneeAgentId).toBe(ctoAgentId);
+      expect(firedPolicy.reviewPreset).toEqual({
+        id: "low_trust_review",
+        version: 1,
+        rawOutputDisposition: "quarantine",
+      });
+      expect(firedPolicy.authorizationPolicy).toEqual({
+        trustBoundary: {
+          mode: "low_trust_review",
+          allowedAgentIds: [qaAgentId],
+        },
+      });
+      expect(firedPolicy.maxReviewRounds).toBe(2);
     });
   });
 
