@@ -319,6 +319,212 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
+    // SUP-14429 (mechanism B): the decisionCarried carve-out must not waive an
+    // open linked PR held by an undismissed external CHANGES_REQUESTED review.
+    // The hydration pass now resolves the live GraphQL reviewDecision; only that
+    // exact decision refuses. Everything else keeps the D6 waiver (fail open on
+    // unknown — a GitHub outage must never fail the guard closed).
+    describe("open linked PR held by CHANGES_REQUESTED (SUP-14429)", () => {
+      const openPr = {
+        id: "pr-1",
+        owner: "TEA-Core",
+        repo: "paperclip-agent-tools",
+        number: 274,
+        nodeId: null,
+        headRefName: null,
+        title: null,
+        displayName: "TEA-Core/paperclip-agent-tools#274",
+        cachedState: "open",
+        lastErrorCode: null,
+        reviewDecision: null,
+      };
+
+      /** Open PR #274 with a review decision resolved via the GraphQL mock. */
+      function mockOpenPr274(decision: string | null) {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([{ ...openPr }]);
+        ghFetchMock.mockImplementation(async (url: string) => {
+          if (url.includes("/pulls/274")) {
+            return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+          }
+          if (url === "https://api.github.com/graphql") {
+            if (decision === null) {
+              return new Response(
+                JSON.stringify({ data: { repository: { pullRequest: null } } }),
+                { status: 200 },
+              );
+            }
+            return new Response(
+              JSON.stringify({ data: { repository: { pullRequest: { reviewDecision: decision } } } }),
+              { status: 200 },
+            );
+          }
+          return new Response(JSON.stringify({}), { status: 404 });
+        });
+      }
+
+      it("REFUSES a decision-carrying close when an open linked PR is held by an undismissed CHANGES_REQUESTED review (AC2)", async () => {
+        mockOpenPr274("CHANGES_REQUESTED");
+        const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+        expect(result.allowed).toBe(false);
+        expect(result.skipped).toBe(false);
+        expect(result.skipReason).toBe("open_linked_prs_changes_requested:1");
+        expect(result.reason).toContain("CHANGES_REQUESTED");
+        expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+        expect(result.reason).toContain("re-approve");
+        expect(result.reason).toContain("doneTransitionOverride");
+        expect(logActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.done_transition_guard_skipped",
+            details: expect.objectContaining({
+              reason: "open_linked_prs_changes_requested:1",
+              skipReason: "open_linked_prs_changes_requested:1",
+              prs: "TEA-Core/paperclip-agent-tools#274",
+            }),
+          }),
+        );
+      });
+
+      it.each(["APPROVED", "REVIEW_REQUIRED"] as const)(
+        "keeps the D6 waiver for a decision-carrying close over an open PR whose review decision is %s (AC3, SUP-13207 regression)",
+        async (decision) => {
+          mockOpenPr274(decision);
+          const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+          expect(result.allowed).toBe(true);
+          expect(result.skipped).toBe(false);
+          expect(result.reason).toContain("arms the merge");
+          expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+          expect(logActivity).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({
+              action: "issue.done_transition_guard_skipped",
+              details: expect.objectContaining({
+                reason: "open_linked_prs_decision_carried:1",
+                skipReason: "open_linked_prs_decision_carried:1",
+                prs: "TEA-Core/paperclip-agent-tools#274",
+              }),
+            }),
+          );
+        },
+      );
+
+      it("keeps the D6 waiver when the GraphQL review decision resolves to null (AC3/AC4)", async () => {
+        mockOpenPr274(null);
+        const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+        expect(result.allowed).toBe(true);
+        expect(result.reason).toContain("arms the merge");
+        expect(logActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.done_transition_guard_skipped",
+            details: expect.objectContaining({ reason: "open_linked_prs_decision_carried:1" }),
+          }),
+        );
+      });
+
+      it.each([
+        ["a non-2xx GraphQL response", 500, false],
+        ["a GraphQL errors array", 200, true],
+      ] as const)(
+        "fails OPEN (waiver applies) when the review decision cannot be resolved via %s (AC4)",
+        async (_label, status, withErrors) => {
+          mockResolveLinkedPullRequestsWithState.mockResolvedValue([{ ...openPr }]);
+          ghFetchMock.mockImplementation(async (url: string) => {
+            if (url.includes("/pulls/274")) {
+              return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+            }
+            if (url === "https://api.github.com/graphql") {
+              return new Response(
+                JSON.stringify(withErrors ? { errors: [{ message: "boom" }] } : {}),
+                { status },
+              );
+            }
+            return new Response(JSON.stringify({}), { status: 404 });
+          });
+          const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+          expect(result.allowed).toBe(true);
+          expect(result.skipped).toBe(false);
+          expect(result.reason).toContain("arms the merge");
+          expect(logActivity).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({
+              action: "issue.done_transition_guard_skipped",
+              details: expect.objectContaining({ reason: "open_linked_prs_decision_carried:1" }),
+            }),
+          );
+        },
+      );
+
+      it("does NOT refuse a plain (non-decision-carrying) close — the open_linked_prs block is unchanged (AC6)", async () => {
+        mockOpenPr274("CHANGES_REQUESTED");
+        const result = await evaluateDoneTransitionGuard(mockDb, issue, null, false);
+        expect(result.allowed).toBe(false);
+        expect(result.skipped).toBe(false);
+        expect(result.skipReason).toBeNull();
+        expect(result.reason).toContain("1 open linked PR");
+        expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+        expect(logActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.done_transition_guard_skipped",
+            details: expect.objectContaining({
+              reason: "open_linked_prs:1",
+              skipReason: "open_linked_prs:1",
+            }),
+          }),
+        );
+      });
+
+      it("counts and names ONLY the held PRs when open PRs mix refused and unrefused decisions", async () => {
+        const pr2 = {
+          id: "pr-2",
+          owner: "TEA-Core",
+          repo: "Trading-Signal-Platform",
+          number: 3124,
+          nodeId: null,
+          headRefName: null,
+          title: null,
+          displayName: "TEA-Core/Trading-Signal-Platform#3124",
+          cachedState: "open",
+          lastErrorCode: null,
+          reviewDecision: null,
+        };
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([{ ...openPr }, { ...pr2 }]);
+        ghFetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url.includes("/pulls/274") || url.includes("/pulls/3124")) {
+            return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+          }
+          if (url === "https://api.github.com/graphql") {
+            const variables = (JSON.parse(String(init?.body)) as {
+              variables: { number: number };
+            }).variables;
+            const decision = variables.number === 274 ? "CHANGES_REQUESTED" : "APPROVED";
+            return new Response(
+              JSON.stringify({ data: { repository: { pullRequest: { reviewDecision: decision } } } }),
+              { status: 200 },
+            );
+          }
+          return new Response(JSON.stringify({}), { status: 404 });
+        });
+        const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+        expect(result.allowed).toBe(false);
+        expect(result.skipReason).toBe("open_linked_prs_changes_requested:1");
+        expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+        expect(result.reason).not.toContain("Trading-Signal-Platform#3124");
+        expect(logActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.done_transition_guard_skipped",
+            details: expect.objectContaining({
+              reason: "open_linked_prs_changes_requested:1",
+              skipReason: "open_linked_prs_changes_requested:1",
+              prs: "TEA-Core/paperclip-agent-tools#274",
+            }),
+          }),
+        );
+      });
+    });
+
     it("does NOT block on an unhydrated linked PR (cachedState null) — a bare URL mention must not freeze done under the 401", async () => {
       // externalObjects rows are inserted from a URL mention with `data` NULL and are
       // hydrated later by a GitHub API refresh — the same call that 401s under

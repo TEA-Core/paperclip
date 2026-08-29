@@ -80,6 +80,14 @@ export interface LinkedPullRequest {
    * positively proven open (SUP-13234).
    */
   lastErrorCode: string | null;
+  /**
+   * The live GraphQL `reviewDecision` of the PR, resolved during hydration for
+   * open PRs (e.g. "CHANGES_REQUESTED", "APPROVED", "REVIEW_REQUIRED"), or null
+   * when it could not be resolved (no token, non-2xx, network failure, PR not
+   * fetchable). Callers must fail open on null: an unresolvable decision is an
+   * unknown, not a refusal (SUP-14429).
+   */
+  reviewDecision: string | null;
 }
 
 export interface IssueRepoContext {
@@ -177,7 +185,7 @@ export async function resolveIssueRepoContext(
   return null;
 }
 
-const GITHUB_GRAPHQL_URL = "https://api.github.com/graphql";
+export const GITHUB_GRAPHQL_URL = "https://api.github.com/graphql";
 
 export async function resolveLinkedPullRequests(
   db: Db,
@@ -237,6 +245,7 @@ export async function resolveLinkedPullRequests(
         displayName: `${owner}/${repo}#${number}`,
         cachedState: state ?? null,
         lastErrorCode: row.lastErrorCode ?? null,
+        reviewDecision: null,
       });
   }
 
@@ -300,6 +309,7 @@ export async function resolveLinkedPullRequestsWithState(
         displayName: `${owner}/${repo}#${number}`,
         cachedState: state ?? null,
         lastErrorCode: row.lastErrorCode ?? null,
+        reviewDecision: null,
       });
   }
 

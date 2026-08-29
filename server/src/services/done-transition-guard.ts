@@ -8,6 +8,7 @@ import {
 import { logActivity } from "./activity-log.js";
 import {
   fetchOpenPullRequests,
+  GITHUB_GRAPHQL_URL,
   parseRepoUrl,
   resolveIssueRepoContext,
   resolveLinkedPullRequestsWithState,
@@ -314,6 +315,54 @@ async function writeAuditLog(
   }
 }
 
+/**
+ * SUP-14429 (mechanism B): resolve the live GraphQL `reviewDecision` of an open
+ * linked PR. This is the only signal that an external reviewer is currently
+ * holding the PR open — an undismissed CHANGES_REQUESTED is a pre-existing,
+ * externally-visible refusal, not the card observing its own merge (the
+ * SUP-13207 deadlock the decision-carrying waiver exists for).
+ *
+ * Every unresolvable outcome — no token handled by the caller, non-2xx, GraphQL
+ * errors, a null pullRequest, malformed body, transport throw — returns null.
+ * Callers must treat null as "not refused" and fail open, matching the
+ * `stale_open_unverifiable` precedent: never fail closed on a GitHub outage.
+ */
+async function fetchPullRequestReviewDecision(
+  pr: LinkedPullRequest,
+  token: string,
+): Promise<string | null> {
+  const query =
+    "query prReviewDecision($owner: String!, $name: String!, $number: Int!) { " +
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewDecision } } }";
+  try {
+    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "paperclip-done-transition-guard",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query,
+        variables: { owner: pr.owner, name: pr.repo, number: pr.number },
+      }),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body) return null;
+    if (Array.isArray(body.errors) && body.errors.length > 0) return null;
+    const repository = (body.data as Record<string, unknown> | null | undefined)?.repository as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const pullRequest = repository?.pullRequest as Record<string, unknown> | null | undefined;
+    const reviewDecision = pullRequest?.reviewDecision;
+    return typeof reviewDecision === "string" ? reviewDecision : null;
+  } catch {
+    return null;
+  }
+}
+
 async function hydrateLinkedPrState(
   pr: LinkedPullRequest,
   token: string,
@@ -336,8 +385,12 @@ async function hydrateLinkedPrState(
     if (typeof state === "string") {
       // The live call just succeeded: the persisted refresh error code (if any)
       // no longer describes this object, and the PR state below is positively
-      // proven again.
-      return { ...pr, cachedState: state, lastErrorCode: null };
+      // proven again. For open PRs, resolve the review decision in the same
+      // hydration pass (SUP-14429) — a PR that is not open owes no decision
+      // probe, and any probe failure degrades to null (fail open).
+      const reviewDecision =
+        state === "open" ? await fetchPullRequestReviewDecision(pr, token) : null;
+      return { ...pr, cachedState: state, lastErrorCode: null, reviewDecision };
     }
     return pr;
   } catch {
@@ -614,6 +667,7 @@ async function liveDiscoverOpenLinkedPullRequests(
       displayName: `${parsed.owner}/${parsed.repo}#${item.number}`,
       cachedState: "open",
       lastErrorCode: null,
+      reviewDecision: null,
     });
   }
   return { prs, error: null };
@@ -751,6 +805,42 @@ export async function evaluateDoneTransitionGuard(
   if (openPrs.length > 0) {
     const prNames = openPrs.map((p) => p.displayName).join(", ");
     if (decisionCarried) {
+      // SUP-14429 (mechanism B): narrow the D6 waiver to what it actually covers.
+      // An open linked PR held by an undismissed external CHANGES_REQUESTED review
+      // is a pre-existing, externally-visible refusal — it is NOT the card
+      // observing its own merge (the SUP-13207 deadlock the waiver below exists
+      // for). Waiving it would close the card done over a PR that can never merge
+      // and arm a merge against a head that will not land, leaving the PR open
+      // forever with no trace on the issue. Only a live GraphQL reviewDecision of
+      // exactly CHANGES_REQUESTED refuses; every other outcome (APPROVED,
+      // REVIEW_REQUIRED, null — including "could not be resolved") keeps the
+      // waiver, per the fail-open-on-unknown contract (SUP-14429 AC4).
+      const refused = openPrs.filter((p) => p.reviewDecision === "CHANGES_REQUESTED");
+      if (refused.length > 0) {
+        const refusalToken = `open_linked_prs_changes_requested:${refused.length}`;
+        const refusedNames = refused.map((p) => p.displayName).join(", ");
+        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          reason: refusalToken,
+          skipReason: refusalToken,
+          prs: refusedNames,
+        });
+        return {
+          allowed: false,
+          reason:
+            `Issue has ${refused.length} open linked PR${refused.length === 1 ? "" : "s"} ` +
+            `held unmergeable by an undismissed external CHANGES_REQUESTED review (${refusedNames}). ` +
+            "Dismiss or resolve the external review and re-approve, or set doneTransitionOverride to a " +
+            `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}). ` +
+            "The decision-carrying carve-out does not waive a PR an external reviewer is refusing.",
+          aheadBy: null,
+          branch: null,
+          defaultRef: null,
+          owner: null,
+          repo: null,
+          skipped: false,
+          skipReason: refusalToken,
+        };
+      }
       // A review approval is exactly what arms the merge (armMergeOnApproval):
       // blocking the approval on the open PR it approves deadlocks the
       // approval circuit (SUP-13207, board direction B). Plain (non-decision)
