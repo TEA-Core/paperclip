@@ -198,6 +198,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
   readAcceptedPlanConfirmationTarget,
 } from "../services/issues.js";
 import {
@@ -4415,6 +4416,47 @@ export function issueRoutes(
     return null;
   }
 
+  /**
+   * SUP-14303: a same-agent duplicate run stands down at its first write,
+   * not at close. Fires only when all four hold: the actor is an agent with
+   * a run id on the request; the issue's `executionRunId` resolves to a
+   * `running` heartbeat run; that holder belongs to the same agent; and the
+   * actor's run is a different one. Cross-agent live leases, actors without
+   * a run id, and holders in any other status keep their existing paths.
+   */
+  async function assertNotOrphanedDuplicateRunWrite(
+    req: Request,
+    res: Response,
+    issue: {
+      id: string;
+      status: string;
+      executionRunId?: string | null;
+    },
+  ) {
+    if (req.actor.type !== "agent") return true;
+    const actorAgentId = req.actor.agentId;
+    const actorRunId = req.actor.runId?.trim();
+    if (!actorAgentId || !actorRunId) return true;
+    const holderRunId = issue.executionRunId?.trim();
+    if (!holderRunId || holderRunId === actorRunId) return true;
+    const holderRun = await heartbeat.getRun(holderRunId);
+    if (!holderRun || holderRun.status !== "running") return true;
+    if (holderRun.agentId !== actorAgentId) return true;
+    res.status(409).json({
+      error: "Issue run ownership conflict",
+      details: {
+        code: ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
+        holderRunId,
+        holderAgentId: holderRun.agentId,
+        actorAgentId,
+        actorRunId,
+        issueId: issue.id,
+        status: issue.status,
+      },
+    });
+    return false;
+  }
+
   async function hasActiveCheckoutManagementOverride(
     actorAgentId: string,
     companyId: string,
@@ -4441,6 +4483,7 @@ export function issueRoutes(
       assigneeUserId: string | null;
       createdByAgentId: string | null;
       checkoutRunId?: string | null;
+      executionRunId?: string | null;
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
     },
@@ -4513,6 +4556,10 @@ export function issueRoutes(
       }
       return true;
     }
+    // SUP-14303: a same-agent duplicate run is refused at its first write on
+    // every assignee write surface, in every status — ahead of the
+    // in_progress early return that previously let it write until close.
+    if (!(await assertNotOrphanedDuplicateRunWrite(req, res, issue))) return false;
     if (issue.status !== "in_progress") {
       return true;
     }
@@ -12151,6 +12198,7 @@ export function issueRoutes(
     }
     const commentAccessDecision = await assertAgentIssueCommentAllowed(req, res, issue);
     if (!commentAccessDecision) return;
+    if (!(await assertNotOrphanedDuplicateRunWrite(req, res, issue))) return;
     const commentAuthorizationReason = issueWriteAuthorizationReason(req, commentAccessDecision);
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
