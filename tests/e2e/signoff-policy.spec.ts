@@ -457,7 +457,7 @@ test.describe("Signoff execution policy", () => {
     // Step 5: Approver approves → should complete
     const step5Res = await agentPatch(
       ctx.boardRequest, ctx.approver, issueId,
-      { status: "done", comment: "Approved. Ship it." },
+      { status: "done", comment: "Approved. Ship it.\n\nClosed at Tier 2 (live): e2e signoff flow re-read the issue post-close on the live deployment and verified done." },
     );
     expect(step5Res.ok()).toBe(true);
     const step5Issue = await step5Res.json();
@@ -574,7 +574,7 @@ test.describe("Signoff execution policy", () => {
     // Reviewer approves → should complete immediately (no approval stage)
     const approveRes = await agentPatch(
       ctx.boardRequest, ctx.reviewer, issue.id,
-      { status: "done", comment: "LGTM." },
+      { status: "done", comment: "LGTM.\n\nClosed at Tier 2 (live): e2e signoff flow re-read the issue post-close on the live deployment and verified done." },
     );
     expect(approveRes.ok()).toBe(true);
     const doneIssue = await approveRes.json();

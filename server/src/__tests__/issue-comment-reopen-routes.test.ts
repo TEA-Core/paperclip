@@ -2378,7 +2378,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-1",
@@ -2463,7 +2463,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "kind: review\ndecision: approved\nsummary: ship it";
+    const reviewBody = "kind: review\ndecision: approved\nsummary: ship it\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-2",
@@ -2550,7 +2550,7 @@ describe.sequential("issue comment reopen routes", () => {
       },
       parentId: null,
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-3",
@@ -2637,7 +2637,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: APPROVED";
+    const reviewBody = "## Review: APPROVED\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-5",
@@ -3053,11 +3053,11 @@ describe.sequential("issue comment reopen routes", () => {
   });
 
   describe.each([
-    { name: "uppercase approval", body: "## Review: APPROVED" },
-    { name: "trailing punctuation", body: "## Review: APPROVED!" },
-    { name: "ticketed approval", body: "## Review: PAP-580 - APPROVED" },
-    { name: "lowercase approval", body: "## Review: LGTM, approved" },
-    { name: "approval with body context", body: "## Review: APPROVED\n\nReady to ship." },
+    { name: "uppercase approval", body: "## Review: APPROVED\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface." },
+    { name: "trailing punctuation", body: "## Review: APPROVED!\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface." },
+    { name: "ticketed approval", body: "## Review: PAP-580 - APPROVED\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface." },
+    { name: "lowercase approval", body: "## Review: LGTM, approved\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface." },
+    { name: "approval with body context", body: "## Review: APPROVED\n\nReady to ship.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface." },
   ])("auto-approves positive approval phrasings ($name)", ({ body }) => {
     it("triggers the auto-approval transition", async () => {
       const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
@@ -3169,7 +3169,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-atomic",
@@ -3239,7 +3239,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-missing",
