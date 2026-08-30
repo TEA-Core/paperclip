@@ -17,6 +17,7 @@ import {
 } from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
+import { parseIssueExecutionState } from "./issue-execution-policy.js";
 
 export class GitHubAuthError extends Error {
   readonly status: number;
@@ -673,6 +674,82 @@ async function liveDiscoverOpenLinkedPullRequests(
   return { prs, error: null };
 }
 
+/**
+ * SUP-14446 mechanism C: a close to `done` must account for the issue's own
+ * review ladder. An issue carrying a populated `executionPolicy.stages` can
+ * otherwise reach `done` with zero stage decisions recorded (SUP-8098: parked
+ * pending on stage 1; SUP-13253: `executionState` never initialised). A
+ * null/absent or unparseable `executionState` is the empty case — zero
+ * completed/skipped stages — exactly the shape these issues landed with.
+ *
+ * `decisionCarried` covers the in-flight final-stage approval: both call sites
+ * only invoke the guard with `decisionCarried=true` when this very transition
+ * records the last stage's `approved` decision, whose write (the one this
+ * guard precedes) appends the stage to `completedStageIds`. Until that write
+ * lands, the state's `currentStageId` would read as unsatisfied and deadlock
+ * the approval circuit — so a policy stage currently pending is treated as
+ * satisfied in that case only.
+ *
+ * Returns null when the issue carries no ladder (out of scope for this
+ * mechanism; the pre-existing null-policy path is unchanged).
+ */
+function evaluateReviewLadderSatisfaction(
+  executionPolicy: unknown,
+  executionState: unknown,
+  decisionCarried: boolean,
+): {
+  satisfied: boolean;
+  totalStages: number;
+  firstUnsatisfiedIndex: number;
+  firstUnsatisfiedStage: { id: string; type: string } | null;
+  unsatisfiedStageIds: string[];
+  completedStageIds: string[];
+  skippedStageIds: string[];
+} | null {
+  const rawStages =
+    executionPolicy != null && typeof executionPolicy === "object"
+      ? (executionPolicy as { stages?: unknown }).stages
+      : undefined;
+  if (!Array.isArray(rawStages)) return null;
+  const stages = rawStages
+    .filter(
+      (stage): stage is { id: string; type?: string } =>
+        stage != null &&
+        typeof stage === "object" &&
+        typeof (stage as { id?: unknown }).id === "string",
+    )
+    .map((stage) => ({
+      id: stage.id,
+      type: typeof stage.type === "string" ? stage.type : "unknown",
+    }));
+  if (stages.length === 0) return null;
+
+  const state = parseIssueExecutionState(executionState);
+  const completed = new Set<string>(state?.completedStageIds ?? []);
+  const skipped = new Set<string>(state?.skippedStageIds ?? []);
+
+  if (decisionCarried && state !== null && state.status === "pending" && state.currentStageId !== null) {
+    if (stages.some((stage) => stage.id === state.currentStageId)) {
+      completed.add(state.currentStageId);
+    }
+  }
+
+  const unsatisfied = stages
+    .map((stage, index) => ({ stage, index }))
+    .filter(({ stage }) => !completed.has(stage.id) && !skipped.has(stage.id));
+
+  const first = unsatisfied[0];
+  return {
+    satisfied: unsatisfied.length === 0,
+    totalStages: stages.length,
+    firstUnsatisfiedIndex: first ? first.index : -1,
+    firstUnsatisfiedStage: first ? { id: first.stage.id, type: first.stage.type } : null,
+    unsatisfiedStageIds: unsatisfied.map(({ stage }) => stage.id),
+    completedStageIds: [...completed],
+    skippedStageIds: [...skipped],
+  };
+}
+
 export async function evaluateDoneTransitionGuard(
   db: Db,
   issue: {
@@ -682,6 +759,8 @@ export async function evaluateDoneTransitionGuard(
     projectId: string | null;
     projectWorkspaceId: string | null;
     executionWorkspaceId: string | null;
+    executionPolicy?: unknown;
+    executionState?: unknown;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
@@ -698,15 +777,78 @@ export async function evaluateDoneTransitionGuard(
     skipReason: skipReason && prSkipReason ? `${skipReason}; ${prSkipReason}` : (skipReason ?? prSkipReason),
   });
 
+  const reviewLadder = evaluateReviewLadderSatisfaction(
+    issue.executionPolicy,
+    issue.executionState,
+    decisionCarried,
+  );
+
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
     void writeAuditLog(db, issue, "issue.done_transition_override", {
       disposition: override.disposition,
       overrideReason: override.reason ?? null,
       source: "done_transition_guard",
     });
+    if (reviewLadder !== null && !reviewLadder.satisfied) {
+      void writeAuditLog(db, issue, "issue.done_transition_ladder_override", {
+        disposition: override.disposition,
+        overrideReason: override.reason ?? null,
+        reason: `review_ladder_unsatisfied:${reviewLadder.firstUnsatisfiedStage?.id ?? "unknown"}`,
+        unsatisfiedStageIds: reviewLadder.unsatisfiedStageIds,
+        completedStageIds: reviewLadder.completedStageIds,
+        skippedStageIds: reviewLadder.skippedStageIds,
+        source: "done_transition_guard",
+      });
+      return {
+        allowed: true,
+        reason:
+          `Override accepted: ${override.disposition} ` +
+          `(review ladder bypassed — unsatisfied stages: ${reviewLadder.unsatisfiedStageIds.join(", ")})`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
     return {
       allowed: true,
       reason: `Override accepted: ${override.disposition}`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // SUP-14446 mechanism C: fail closed on an unrun review ladder. This runs
+  // before any GitHub/network path so an unsatisfied ladder can never be
+  // waved through by a credential-less or network-fail-open configuration.
+  if (reviewLadder !== null && !reviewLadder.satisfied) {
+    const first = reviewLadder.firstUnsatisfiedStage;
+    void writeAuditLog(db, issue, "issue.done_transition_ladder_refused", {
+      reason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
+      skipReason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
+      stageIndex: reviewLadder.firstUnsatisfiedIndex,
+      stageType: first?.type ?? null,
+      unsatisfiedStageIds: reviewLadder.unsatisfiedStageIds,
+      completedStageIds: reviewLadder.completedStageIds,
+      skippedStageIds: reviewLadder.skippedStageIds,
+      decisionCarried,
+    });
+    return {
+      allowed: false,
+      reason:
+        `Review ladder unsatisfied: stage ${reviewLadder.firstUnsatisfiedIndex + 1} of ` +
+        `${reviewLadder.totalStages} (${first?.type ?? "unknown"}, ${first?.id ?? "unknown"}) has no recorded decision — ` +
+        "its id is in neither completedStageIds nor skippedStageIds. " +
+        "Complete or skip the stage before marking done, or set doneTransitionOverride to a " +
+        `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
       aheadBy: null,
       branch: null,
       defaultRef: null,
