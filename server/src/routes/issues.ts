@@ -106,6 +106,7 @@ import {
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
+import { isPullOnlyAdapterType } from "../adapters/builtin-adapter-types.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
 import { validate } from "../middleware/validate.js";
@@ -9770,7 +9771,7 @@ export function issueRoutes(
           let targetIsPullOnly = false;
           try {
             const tgt = await agentsSvc.getById(normalizedAssigneeAgentId);
-            targetIsPullOnly = !!tgt && tgt.adapterType === "process";
+            targetIsPullOnly = isPullOnlyAdapterType(tgt?.adapterType);
           } catch {
             /* best-effort adapterType probe */
           }
