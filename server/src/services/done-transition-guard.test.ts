@@ -246,6 +246,263 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
+  describe("review ladder refusal (SUP-14446 mechanism C)", () => {
+    const stageA = "11111111-1111-4111-8111-111111111111";
+    const stageB = "22222222-2222-4222-8222-222222222222";
+    const stageC = "33333333-3333-4333-8333-333333333333";
+    const agentId = "44444444-4444-4444-8444-444444444444";
+    const ladderPolicy = {
+      stages: [
+        { id: stageA, type: "review" },
+        { id: stageB, type: "review" },
+        { id: stageC, type: "approval" },
+      ],
+    };
+
+    // Schema-valid state (uuid stage ids / principal) for the satisfied-paths tests.
+    const validExecutionState = (overrides: Record<string, unknown> = {}) => ({
+      status: "pending",
+      currentStageId: stageC,
+      currentStageIndex: 2,
+      currentStageType: "approval",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: null,
+      reviewRequest: null,
+      completedStageIds: [stageA, stageB],
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      ...overrides,
+    });
+
+    it("refuses done for the literal SUP-13253 shape: 3-stage ladder with executionState {} (AC1)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: ladderPolicy, executionState: {} },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("stage 1 of 3");
+      expect(result.reason).toContain(stageA);
+      expect(result.reason).toContain("neither completedStageIds nor skippedStageIds");
+      // Fail closed BEFORE any external probe: no GitHub call, no PR resolution.
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_refused",
+          details: expect.objectContaining({
+            reason: `review_ladder_unsatisfied:${stageA}`,
+            stageIndex: 0,
+            stageType: "review",
+            unsatisfiedStageIds: [stageA, stageB, stageC],
+            completedStageIds: [],
+            skippedStageIds: [],
+          }),
+        }),
+      );
+    });
+
+    it("refuses done for the literal SUP-8098 shape: parked pending on stage 1 with zero decisions (AC2)", async () => {
+      // The state as it landed on SUP-8098: pending at stage index 0, no
+      // completedStageIds. It does not round-trip the state schema (the
+      // persisted row predates returnAssignee), so it parses to the empty case —
+      // which is exactly why the ladder had to be checked on the close path.
+      const sup8098State = {
+        status: "pending",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentStageId: "62250a6c-b08f-47da-8222-bafbb9f4f5c8",
+        currentParticipant: { type: "agent", agentId: "<support-QAE>" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      };
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: {
+            stages: [
+              { id: "62250a6c-b08f-47da-8222-bafbb9f4f5c8", type: "review" },
+              { id: stageC, type: "approval" },
+            ],
+          },
+          executionState: sup8098State,
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("stage 1 of 2");
+      expect(result.reason).toContain("62250a6c-b08f-47da-8222-bafbb9f4f5c8");
+    });
+
+    it("allows done when every stage id is in completedStageIds or skippedStageIds (AC3)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: ladderPolicy,
+          executionState: validExecutionState({
+            status: "completed",
+            completedStageIds: [stageA, stageC],
+            skippedStageIds: [stageB],
+          }),
+        },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_refused" }),
+      );
+    });
+
+    it("allows done when every stage id is in completedStageIds (no skipped stages)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: ladderPolicy,
+          executionState: validExecutionState({
+            status: "completed",
+            completedStageIds: [stageA, stageB, stageC],
+          }),
+        },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+    });
+
+    it("does not change behaviour for an issue with no executionPolicy (AC4)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_refused" }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_override" }),
+      );
+    });
+
+    it("lets a sanctioned override land the close and records the ladder bypass with the authorising disposition (AC5)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: ladderPolicy, executionState: {} },
+        { disposition: "merged-elsewhere", reason: "PR merged on main by ops" },
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("Override accepted: merged-elsewhere");
+      expect(result.reason).toContain("review ladder bypassed");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_override",
+          details: expect.objectContaining({
+            disposition: "merged-elsewhere",
+            overrideReason: "PR merged on main by ops",
+          }),
+        }),
+      );
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_override",
+          details: expect.objectContaining({
+            disposition: "merged-elsewhere",
+            overrideReason: "PR merged on main by ops",
+            reason: `review_ladder_unsatisfied:${stageA}`,
+            unsatisfiedStageIds: [stageA, stageB, stageC],
+          }),
+        }),
+      );
+    });
+
+    it("does not deadlock the in-flight final-stage approval: decisionCarried=true satisfies the pending current stage", async () => {
+      // The review approval IS what records the last stage's decision; the guard
+      // runs before that write lands, so state.currentStageId (stageC) must be
+      // treated as satisfied or the approval circuit deadlocks.
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: ladderPolicy,
+          executionState: validExecutionState({
+            status: "pending",
+            currentStageId: stageC,
+            currentStageIndex: 2,
+            completedStageIds: [stageA, stageB],
+          }),
+        },
+        null,
+        true,
+      );
+      expect(result.allowed).toBe(true);
+    });
+
+    it("refuses a plain close while the final stage is still pending (same state, no decision carried)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: ladderPolicy,
+          executionState: validExecutionState({
+            status: "pending",
+            currentStageId: stageC,
+            currentStageIndex: 2,
+            completedStageIds: [stageA, stageB],
+          }),
+        },
+        null,
+        false,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("stage 3 of 3");
+      expect(result.reason).toContain(stageC);
+    });
+
+    it("names the first unsatisfied stage when an earlier stage is missing its decision", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: ladderPolicy,
+          executionState: validExecutionState({
+            currentStageId: stageC,
+            currentStageIndex: 2,
+            completedStageIds: [stageA],
+          }),
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("stage 2 of 3");
+      expect(result.reason).toContain(stageB);
+    });
+
+    it("refuses the ladder before the open-linked-PR block, so the ladder reason wins", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 279, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#279", cachedState: "open", lastErrorCode: null },
+      ]);
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: ladderPolicy, executionState: {} },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Review ladder unsatisfied");
+      expect(result.reason).not.toContain("open linked PR");
+    });
+  });
+
   describe("open linked PRs block", () => {
     it("blocks transition when a linked PR is cached open, no GitHub token configured, and the last refresh succeeded (zero outbound fetch)", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([

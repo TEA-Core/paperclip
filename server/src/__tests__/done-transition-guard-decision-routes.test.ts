@@ -348,6 +348,10 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
   it("PATCH: a final-stage PLAIN close (no decision) on an UNMERGED branch is still blocked (SUP-13290)", async () => {
     const { companyId, issueId, identifier } = await seedIssueAwaitingReview("D13185G");
+    // SUP-14446 mechanism C: the seeded ladder (parked pending, no decisions) would
+    // now be refused by the review-ladder guard before the delivery check. Null the
+    // policy so this test keeps exercising the delivery guard in isolation.
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
     // A board close carries no execution-policy decision, so the carve-out must
     // not apply: the plain close still must land the branch first.
     currentActor = {
