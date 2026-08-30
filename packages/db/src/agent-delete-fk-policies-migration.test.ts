@@ -236,4 +236,28 @@ describe("agent delete FK policy migration (0222/0223) staged static lint", () =
     }
     expect(dropNames).toEqual(canonicalNames);
   });
+
+  it("0223 runs all VALIDATE scans before any DROP/RENAME (an early ACCESS EXCLUSIVE DROP would block later scans to COMMIT)", async () => {
+    const raw0223 = await readMigration("0223_agent_delete_fk_policies_validate.sql");
+    const statements = migrationStatements(raw0223);
+
+    const indexesOf = (re: RegExp) =>
+      statements.map((statement, index) => (re.test(statement) ? index : -1)).filter((index) => index >= 0);
+    const validateIndexes = indexesOf(/^ALTER TABLE "[^"]+" VALIDATE CONSTRAINT /i);
+    const dropIndexes = indexesOf(/^ALTER TABLE "[^"]+" DROP CONSTRAINT /i);
+    const renameIndexes = indexesOf(/^ALTER TABLE "[^"]+" RENAME CONSTRAINT /i);
+    expect(validateIndexes).toHaveLength(30);
+    expect(dropIndexes).toHaveLength(30);
+    expect(renameIndexes).toHaveLength(30);
+
+    // The migration runner wraps the whole file in ONE transaction, so a
+    // DROP CONSTRAINT's ACCESS EXCLUSIVE lock is held to COMMIT. If any DROP
+    // preceded a later VALIDATE scan, its table would be read+write-blocked
+    // for the duration of every remaining scan. All scans must come first.
+    expect(
+      Math.max(...validateIndexes),
+      `0223 interleaves DROP/RENAME before VALIDATE; the ACCESS EXCLUSIVE from an early DROP is held to COMMIT across later scans:\n${statements.join("\n")}`,
+    ).toBeLessThan(Math.min(...dropIndexes));
+    expect(Math.max(...dropIndexes)).toBeLessThan(Math.min(...renameIndexes));
+  });
 });
