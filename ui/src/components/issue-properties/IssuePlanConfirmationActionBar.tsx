@@ -31,7 +31,7 @@ interface IssuePlanConfirmationActionBarProps {
 }
 
 /**
- * Sticky action bar for the Plan pane (flag: enableTaskChatRedesign): while a
+ * Sticky action bar for the Plan pane (shown unless enableClassicTaskInterface): while a
  * plan confirmation is pending, its CTAs stay pinned below the pane's scroll
  * area so the board can approve or send back the plan without hunting for the
  * card in the thread. Mirrors the thread card's semantics (accept/reject labels

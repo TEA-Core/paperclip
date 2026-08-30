@@ -56,3 +56,13 @@ export function parseHeartbeatPolicy(agent: Pick<typeof agents.$inferSelect, "ru
     ),
   };
 }
+
+/**
+ * Upstream's narrower entry point, kept so its callers in `heartbeat.ts` and
+ * `recovery/service.ts` keep resolving. It is the same value `parseHeartbeatPolicy`
+ * already computes — the fallback chain below is identical — so the two APIs cannot
+ * disagree about whether an agent may be woken on demand.
+ */
+export function isHeartbeatWakeOnDemandEnabled(agent: Pick<typeof agents.$inferSelect, "runtimeConfig">) {
+  return parseHeartbeatPolicy(agent).wakeOnDemand;
+}

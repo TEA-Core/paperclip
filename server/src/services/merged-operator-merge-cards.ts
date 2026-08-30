@@ -10,9 +10,10 @@ import {
   type GitHubPullRequestReference,
 } from "./github-pull-request-merge.js";
 import {
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeEmittedActivity,
-  buildIssueBlockersResolvedWakeup,
-  findExistingIssueBlockersResolvedWake,
+  buildIssueBlockersResolvedWakeStateKey,
+  findExistingIssueBlockersResolvedWakeForReadyState,
   type IssueBlockersResolvedWakeup,
 } from "./issue-dependency-wakeups.js";
 import { issueService } from "./issues.js";
@@ -333,19 +334,42 @@ export function createMergedOperatorMergeCardSweepService(
         wakeup: IssueBlockersResolvedWakeup;
       }> = [];
       for (const dependent of dependents) {
-        const { idempotencyKey, wakeup } = buildIssueBlockersResolvedWakeup({
+        // Upstream's level-triggered ready-state key: one wake per dependency-ready
+        // state, rather than one per resolved blocker edge. The wake body itself is
+        // unchanged, so `issue.blockers_resolved_wake_emitted` consumers still match.
+        const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: dependent.id,
-          resolvedBlockerIssueId: row.id,
           blockerIssueIds: dependent.blockerIssueIds,
-          source: MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE,
-          mutation: "blocker_done",
+          blockedTransitionAt: dependent.blockedTransitionAt,
+        });
+        const wakeup: IssueBlockersResolvedWakeup = {
+          source: "automation",
+          triggerDetail: "system",
+          reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          payload: {
+            issueId: dependent.id,
+            resolvedBlockerIssueId: row.id,
+            blockerIssueIds: dependent.blockerIssueIds,
+            mutation: "blocker_done",
+          },
+          idempotencyKey,
           requestedByActorType: "system",
           requestedByActorId: MERGED_OPERATOR_MERGE_CARDS_ACTOR_ID,
-        });
+          contextSnapshot: {
+            issueId: dependent.id,
+            taskId: dependent.id,
+            wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+            source: MERGED_OPERATOR_MERGE_CARDS_WAKE_SOURCE,
+            resolvedBlockerIssueId: row.id,
+            blockerIssueIds: dependent.blockerIssueIds,
+          },
+        };
         try {
-          const existingWake = await findExistingIssueBlockersResolvedWake(db, {
+          const existingWake = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
             companyId: row.companyId,
-            idempotencyKey,
+            dependentIssueId: dependent.id,
+            blockerIssueIds: dependent.blockerIssueIds,
+            blockedTransitionAt: dependent.blockedTransitionAt,
           });
           if (existingWake) continue;
         } catch (err) {

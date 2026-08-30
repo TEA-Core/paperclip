@@ -82,7 +82,7 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       name: "Attribution Company",
       issuePrefix: `AT${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`,
     }).returning().then((rows) => rows[0]!);
-    const [actorAgent] = await db.insert(agents).values(["Actor", "Target"].map((name) => ({
+    const [actorAgent, targetAgent] = await db.insert(agents).values(["Actor", "Target"].map((name) => ({
       companyId: company.id,
       name,
       role: "engineer",
@@ -134,10 +134,7 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
         title: "Foreign issue",
         status: "done" as const,
         priority: "medium" as const,
-        // Foreign to the *run* (which is anchored on the source issue), which is
-        // what makes this a cross-issue write. The actor still owns the target,
-        // because the fork does not grant writes on visibility alone.
-        assigneeAgentId: actorAgent.id,
+        assigneeAgentId: targetAgent.id,
       },
     ]).returning();
     const run = await db.insert(heartbeatRuns).values({
@@ -180,7 +177,7 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       onBehalfOfUserId: fixture.responsibleUserId,
       createdByRunId: fixture.run.id,
       metadata: {
-        authorizationReason: "allow_self",
+        authorizationReason: "allow_visible_issue_write",
       },
     });
 
@@ -220,7 +217,7 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
         runId: fixture.run.id,
         responsibleUserId: fixture.responsibleUserId,
         details: expect.objectContaining({
-          authorizationReason: "allow_self",
+          authorizationReason: "allow_visible_issue_write",
           changes: expect.objectContaining({
             priority: { from: "medium", to: "high" },
           }),
@@ -247,7 +244,7 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       expect.objectContaining({
         action: "issue.updated",
         responsibleUserId: fixture.responsibleUserId,
-        details: expect.objectContaining({ authorizationReason: "allow_self" }),
+        details: expect.objectContaining({ authorizationReason: "allow_visible_issue_write" }),
       }),
     ]));
   }, 30_000);

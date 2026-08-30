@@ -6,7 +6,7 @@ import {
   GripVertical,
   LogOut,
   Plus,
-  Settings,
+  RefreshCw,
   UserPlus,
 } from "lucide-react";
 import {
@@ -20,7 +20,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import type { Company } from "@paperclipai/shared";
+import { hidesCompanyPage, type Company } from "@paperclipai/shared";
 import { Link, useLocation, useNavigate } from "@/lib/router";
 import { authApi } from "@/api/auth";
 import { cloudApi, type CloudStackSummary } from "@/api/cloud";
@@ -36,6 +36,7 @@ import {
 import { useCompany } from "@/context/CompanyContext";
 import { useDialogActions } from "@/context/DialogContext";
 import { useCloudInstance } from "@/hooks/useCloudInstance";
+import { useHiddenSettings } from "@/hooks/useHiddenSettings";
 import { useCompanyOrder } from "@/hooks/useCompanyOrder";
 import { useSignOut } from "@/hooks/useSignOut";
 import { navigateTopLevel } from "@/lib/browserNavigation";
@@ -59,7 +60,6 @@ function WorkspaceIcon({ company }: { company: Company }) {
     <CompanyPatternIcon
       companyName={company.name}
       logoUrl={company.logoUrl}
-      brandColor={company.brandColor}
       className={WORKSPACE_ICON_CLASS}
     />
   );
@@ -91,7 +91,6 @@ function CurrentStackIcon({
     <CompanyPatternIcon
       companyName={displayName}
       logoUrl={company?.logoUrl}
-      brandColor={company?.brandColor}
       className={WORKSPACE_ICON_CLASS}
     />
   );
@@ -199,7 +198,8 @@ function SortableCompanyItem({
 export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: SidebarCompanyMenuProps = {}) {
   const [internalOpen, setInternalOpen] = useState(false);
   const [isEditingOrder, setIsEditingOrder] = useState(false);
-  const { companies, selectedCompany, setSelectedCompanyId } = useCompany();
+  const { companies, selectedCompany, setSelectedCompanyId, companyListUnavailable, retryCompanies } =
+    useCompany();
   const { openOnboarding } = useDialogActions();
   const { isMobile, setSidebarOpen, collapsed, peeking } = useSidebar();
   const rail = collapsed && !peeking;
@@ -235,6 +235,14 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
   // exactly one company, and switching means leaving this tenant host entirely.
   const cloud = useCloudInstance();
   const isCloud = Boolean(cloud);
+  // Invites now live on the Members page; hide the shortcut when the hosting
+  // operator hides either surface. Until the health response resolves, the
+  // hidden set is unknown — keep the shortcut out rather than flash it.
+  const { hidden: hiddenSettings, loaded: hiddenSettingsLoaded } = useHiddenSettings();
+  const showInvitePeople =
+    hiddenSettingsLoaded &&
+    !hidesCompanyPage(hiddenSettings, "company.members") &&
+    !hidesCompanyPage(hiddenSettings, "company.invites");
   const cloudBaseUrl = cloud?.cloudBaseUrl ?? null;
   const stacksQuery = useQuery({
     queryKey: queryKeys.cloud.stacks,
@@ -250,7 +258,7 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
       ?? null
     : null;
   const createStackUrl = isCloud ? cloudStackCreateUrl(cloudBaseUrl) : null;
-  const switcherNoun = isCloud ? "organization" : "company";
+  const switcherNoun = "organization";
   // The one name the chrome shows for "where am I": the stack in cloud, the
   // company when self-hosted.
   const currentName = isCloud
@@ -309,7 +317,10 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
       if (createStackUrl) navigateTopLevel(createStackUrl);
       return;
     }
-    openOnboarding();
+    // Skip the front-door "how would you like to get started?" choice and land
+    // directly on "Name your organization" — this entry point is unambiguously
+    // "create a new company" (PAP-431).
+    openOnboarding({ initialStep: 1 });
   }
 
   const handleDragEnd = useCallback(
@@ -364,7 +375,7 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
               )}
               title={currentName ?? undefined}
             >
-              {currentName ?? (isCloud ? "Select organization" : "Select company")}
+              {currentName ?? `Select ${switcherNoun}`}
             </span>
           </span>
           {!rail && <ChevronsUpDown className="size-3.5 shrink-0 text-muted-foreground" />}
@@ -373,7 +384,7 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
       <DropdownMenuContent align="start" sideOffset={8} className="w-64 p-1">
         <div className="flex items-center justify-between gap-2 px-2 py-1.5">
           <DropdownMenuLabel className="p-0 text-(length:--text-micro) font-semibold uppercase text-muted-foreground">
-            {isCloud ? "Switch organization" : "Switch company"}
+            {`Switch ${switcherNoun}`}
           </DropdownMenuLabel>
           {/* Stack order is owned by cloud's own portfolio in v1, so the
               drag-to-reorder affordance stays self-hosted-only. */}
@@ -435,7 +446,27 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
                 </SortableContext>
               </DndContext>
               {orderedCompanies.length === 0 ? (
-                <DropdownMenuItem disabled>No companies</DropdownMenuItem>
+                // "No companies" is a claim about the account. After a failed
+                // list request it is one we cannot make, and this menu is the
+                // only place the customer can act on it — say what happened and
+                // offer the way back.
+                companyListUnavailable ? (
+                  <>
+                    <DropdownMenuItem disabled>Couldn&apos;t load organizations</DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={(event) => {
+                        // Keep the menu open so the result of the retry is visible.
+                        event.preventDefault();
+                        void retryCompanies();
+                      }}
+                    >
+                      <RefreshCw className="h-4 w-4 mr-2" />
+                      Try again
+                    </DropdownMenuItem>
+                  </>
+                ) : (
+                  <DropdownMenuItem disabled>No organizations</DropdownMenuItem>
+                )
               ) : null}
             </>
           )}
@@ -451,43 +482,30 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
               disabled={isEditingOrder}
             >
               <Plus className="size-4" />
-              <span>{isCloud ? "Create new organization..." : "Create new company..."}</span>
+              <span>Create new organization...</span>
             </DropdownMenuItem>
             <DropdownMenuSeparator />
           </>
         )}
-        <DropdownMenuItem asChild disabled={isEditingOrder}>
-          <Link
-            to="/company/settings/invites"
-            onClick={(event) => {
-              if (isEditingOrder) {
-                event.preventDefault();
-                return;
-              }
-              closeNavigationChrome();
-            }}
-          >
-            <UserPlus className="size-4" />
-            <span className="truncate">
-              {currentName ? `Invite people to ${currentName}` : "Invite people"}
-            </span>
-          </Link>
-        </DropdownMenuItem>
-        <DropdownMenuItem asChild disabled={isEditingOrder}>
-          <Link
-            to="/company/settings"
-            onClick={(event) => {
-              if (isEditingOrder) {
-                event.preventDefault();
-                return;
-              }
-              closeNavigationChrome();
-            }}
-          >
-            <Settings className="size-4" />
-            <span>{isCloud ? "Organization settings" : "Company settings"}</span>
-          </Link>
-        </DropdownMenuItem>
+        {showInvitePeople ? (
+          <DropdownMenuItem asChild disabled={isEditingOrder}>
+            <Link
+              to="/company/settings/members?tab=invites"
+              onClick={(event) => {
+                if (isEditingOrder) {
+                  event.preventDefault();
+                  return;
+                }
+                closeNavigationChrome();
+              }}
+            >
+              <UserPlus className="size-4" />
+              <span className="truncate">
+                {currentName ? `Invite people to ${currentName}` : "Invite people"}
+              </span>
+            </Link>
+          </DropdownMenuItem>
+        ) : null}
         {session?.session ? (
           <>
             <DropdownMenuSeparator />

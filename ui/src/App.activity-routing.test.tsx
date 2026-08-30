@@ -111,12 +111,16 @@ function renderAppAt(container: HTMLElement, path: string) {
   return root;
 }
 
+/**
+ * Waits on the condition, not on a fixed number of turns. The previous version
+ * yielded at most five macrotasks before asserting, which is ample on an idle
+ * machine and not when the suite is running many workers in parallel — the
+ * container was still empty and the assertion failed on a route that resolves
+ * perfectly well. `vi.waitFor` retries against a time budget instead, so a
+ * loaded worker gets more turns rather than a failure.
+ */
 async function waitForRoute(container: HTMLElement, text: string) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    if (container.textContent?.includes(text)) return;
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  expect(container.textContent).toContain(text);
+  await vi.waitFor(() => expect(container.textContent).toContain(text));
 }
 
 describe("App Activity routing (PAP-16302)", () => {
@@ -137,7 +141,7 @@ describe("App Activity routing (PAP-16302)", () => {
   it("serves the merged Activity page at /:company/activity", async () => {
     const root = renderAppAt(container, "/PAP/activity");
     await waitForRoute(container, "ACTIVITY_PAGE@/PAP/activity");
-    expect(container.textContent).not.toContain("No company matches prefix");
+    expect(container.textContent).not.toContain("No organization matches prefix");
     flushSync(() => root.unmount());
   });
 
@@ -165,7 +169,7 @@ describe("App Activity routing (PAP-16302)", () => {
   it("redirects the bare /audit deep link through to the prefixed Activity page", async () => {
     const root = renderAppAt(container, "/audit");
     await waitForRoute(container, "ACTIVITY_PAGE@/PAP/activity?mode=agents");
-    expect(container.textContent).not.toContain("No company matches prefix");
+    expect(container.textContent).not.toContain("No organization matches prefix");
     flushSync(() => root.unmount());
   });
 });

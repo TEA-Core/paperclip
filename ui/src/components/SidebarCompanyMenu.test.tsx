@@ -54,28 +54,35 @@ vi.mock("@/lib/router", () => ({
   useNavigate: () => mockNavigate,
 }));
 
+// Overridable so the list-unavailable branch can be exercised; null means "use
+// the default three companies below".
+const mockCompanyState = vi.hoisted(() => ({
+  companies: null as unknown[] | null,
+  companyListUnavailable: false,
+  retryCompanies: vi.fn(),
+}));
+
 vi.mock("@/context/CompanyContext", () => ({
   useCompany: () => ({
-    companies: [
+    companyListUnavailable: mockCompanyState.companyListUnavailable,
+    retryCompanies: mockCompanyState.retryCompanies,
+    companies: mockCompanyState.companies ?? [
       {
         id: "company-1",
         issuePrefix: "PAP",
         name: "Acme Labs",
-        brandColor: "#3366ff",
         status: "active",
       },
       {
         id: "company-2",
         issuePrefix: "STR",
         name: "Strata",
-        brandColor: "#36a269",
         status: "active",
       },
       {
         id: "company-3",
         issuePrefix: "ANA",
         name: "Anachronist Wiki",
-        brandColor: "#a36a21",
         status: "active",
       },
     ],
@@ -83,7 +90,6 @@ vi.mock("@/context/CompanyContext", () => ({
       id: "company-1",
       issuePrefix: "PAP",
       name: "Acme Labs",
-      brandColor: "#3366ff",
       logoUrl: "/api/assets/logo-asset-1/content",
       status: "active",
     },
@@ -180,6 +186,8 @@ describe("SidebarCompanyMenu", () => {
       updatedAt: null,
     });
     mockLocation.pathname = "/PAP/dashboard";
+    mockCompanyState.companies = null;
+    mockCompanyState.companyListUnavailable = false;
   });
 
   afterEach(() => {
@@ -218,6 +226,55 @@ describe("SidebarCompanyMenu", () => {
     await flushReact();
   }
 
+  // This menu is the one the app renders, so it is the only place a customer can
+  // act on a failed company list. Saying "No companies" there states something
+  // about the account that a failed request cannot support, and leaves the tab
+  // with no way back short of a browser reload.
+  it("offers a way back when the company list could not be loaded", async () => {
+    mockCompanyState.companies = [];
+    mockCompanyState.companyListUnavailable = true;
+
+    const { root } = renderMenu();
+    await flushReact();
+    await openMenu("Open Acme Labs organization switcher");
+
+    expect(document.body.textContent).toContain("Couldn't load organizations");
+    expect(document.body.textContent).not.toContain("No organizations");
+
+    const retryItem = Array.from(document.body.querySelectorAll('[role="menuitem"]')).find(
+      (item) => item.textContent?.includes("Try again"),
+    );
+    expect(retryItem).not.toBeUndefined();
+
+    act(() => {
+      retryItem?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+      retryItem?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(mockCompanyState.retryCompanies).toHaveBeenCalled();
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("still reports an account that owns no companies as empty, not broken", async () => {
+    mockCompanyState.companies = [];
+    mockCompanyState.companyListUnavailable = false;
+
+    const { root } = renderMenu();
+    await flushReact();
+    await openMenu("Open Acme Labs organization switcher");
+
+    expect(document.body.textContent).toContain("No organizations");
+    expect(document.body.textContent).not.toContain("Couldn't load organizations");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
   it("uses company-centric create copy without the chat flag", async () => {
     const root = createRoot(container);
     const queryClient = new QueryClient({
@@ -234,7 +291,7 @@ describe("SidebarCompanyMenu", () => {
     await flushReact();
     await flushReact();
 
-    const trigger = container.querySelector('button[aria-label="Open Acme Labs company switcher"]');
+    const trigger = container.querySelector('button[aria-label="Open Acme Labs organization switcher"]');
     expect(trigger).not.toBeNull();
     act(() => {
       trigger?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
@@ -242,7 +299,7 @@ describe("SidebarCompanyMenu", () => {
     });
     await flushReact();
 
-    expect(document.body.textContent).toContain("Create new company...");
+    expect(document.body.textContent).toContain("Create new organization...");
     expect(document.body.textContent).not.toContain("Add company...");
 
     act(() => {
@@ -255,6 +312,9 @@ describe("SidebarCompanyMenu", () => {
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
+    // The invite shortcut waits for the health response before it shows, so
+    // resolve it here the way CloudAccessGate does in the app.
+    queryClient.setQueryData(queryKeys.health, { status: "ok" });
 
     act(() => {
       root.render(
@@ -268,7 +328,7 @@ describe("SidebarCompanyMenu", () => {
 
     expect(container.textContent).toContain("Acme Labs");
 
-    const trigger = container.querySelector('button[aria-label="Open Acme Labs company switcher"]');
+    const trigger = container.querySelector('button[aria-label="Open Acme Labs organization switcher"]');
     expect(trigger).not.toBeNull();
 
     act(() => {
@@ -277,13 +337,13 @@ describe("SidebarCompanyMenu", () => {
     });
     await flushReact();
 
-    expect(document.body.textContent).toContain("Switch company");
+    expect(document.body.textContent).toContain("Switch organization");
     expect(document.body.textContent).toContain("Edit");
     expect(document.body.textContent).toContain("Strata");
     expect(document.body.textContent).toContain("ANA");
-    expect(document.body.textContent).toContain("Create new company...");
+    expect(document.body.textContent).toContain("Create new organization...");
     expect(document.body.textContent).toContain("Invite people to Acme Labs");
-    expect(document.body.textContent).toContain("Company settings");
+    expect(document.body.textContent).not.toContain("Company settings");
     expect(document.body.textContent).toContain("Sign out");
 
     const signOutButton = Array.from(document.body.querySelectorAll('[data-slot="dropdown-menu-item"]'))
@@ -298,7 +358,58 @@ describe("SidebarCompanyMenu", () => {
     expect(mockAuthApi.signOut).toHaveBeenCalledTimes(1);
     expect(mockNavigateTopLevel).not.toHaveBeenCalled();
     expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(true);
-    expect(document.body.textContent).not.toContain("Switch company");
+    expect(document.body.textContent).not.toContain("Switch organization");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("keeps the invite shortcut out of the menu until hidden settings resolve", async () => {
+    // No health data in the cache: the hidden-settings set is unknown, so the
+    // shortcut must not flash in and then disappear once the response lands.
+    const { root } = renderMenu();
+    await flushReact();
+    await flushReact();
+
+    await openMenu("Open Acme Labs organization switcher");
+
+    expect(document.body.textContent).toContain("Switch organization");
+    expect(document.body.textContent).not.toContain("Invite people");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("hides the invite shortcut when the operator hides the invites surface", async () => {
+    const { root } = renderMenu({
+      health: { status: "ok", hiddenSettings: ["company.invites"] },
+    });
+    await flushReact();
+    await flushReact();
+
+    await openMenu("Open Acme Labs organization switcher");
+
+    expect(document.body.textContent).toContain("Switch organization");
+    expect(document.body.textContent).not.toContain("Invite people");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("hides the invite shortcut when the operator hides the members page", async () => {
+    const { root } = renderMenu({
+      health: { status: "ok", hiddenSettings: ["company.members"] },
+    });
+    await flushReact();
+    await flushReact();
+
+    await openMenu("Open Acme Labs organization switcher");
+
+    expect(document.body.textContent).toContain("Switch organization");
+    expect(document.body.textContent).not.toContain("Invite people");
 
     act(() => {
       root.unmount();
@@ -321,7 +432,7 @@ describe("SidebarCompanyMenu", () => {
     await flushReact();
     await flushReact();
 
-    const trigger = container.querySelector('button[aria-label="Open Acme Labs company switcher"]');
+    const trigger = container.querySelector('button[aria-label="Open Acme Labs organization switcher"]');
     expect(trigger).not.toBeNull();
 
     act(() => {
@@ -378,7 +489,7 @@ describe("SidebarCompanyMenu", () => {
     await flushReact();
     await flushReact();
 
-    const trigger = container.querySelector('button[aria-label="Open Acme Labs company switcher"]');
+    const trigger = container.querySelector('button[aria-label="Open Acme Labs organization switcher"]');
     expect(trigger).not.toBeNull();
 
     act(() => {
@@ -409,10 +520,10 @@ describe("SidebarCompanyMenu", () => {
     await flushReact();
     await flushReact();
 
-    await openMenu("Open Acme Labs company switcher");
+    await openMenu("Open Acme Labs organization switcher");
 
     const createItem = Array.from(document.body.querySelectorAll('[data-slot="dropdown-menu-item"]'))
-      .find((element) => element.textContent?.includes("Create new company..."));
+      .find((element) => element.textContent?.includes("Create new organization..."));
     expect(createItem).toBeTruthy();
 
     act(() => {
@@ -439,7 +550,7 @@ describe("SidebarCompanyMenu", () => {
     const { root } = renderMenu();
     await flushReact();
 
-    const trigger = container.querySelector('button[aria-label="Open Acme Labs company switcher"]');
+    const trigger = container.querySelector('button[aria-label="Open Acme Labs organization switcher"]');
     expect(trigger).not.toBeNull();
     expect(trigger?.className).toContain("min-w-0");
 
@@ -494,7 +605,7 @@ describe("SidebarCompanyMenu", () => {
 
       expect(document.body.textContent).toContain("Switch organization");
       expect(document.body.textContent).toContain("Create new organization...");
-      expect(document.body.textContent).toContain("Organization settings");
+      expect(document.body.textContent).not.toContain("Organization settings");
       expect(document.body.textContent).not.toContain("Switch company");
       expect(document.body.textContent).not.toContain("Create new company...");
       expect(document.body.textContent).not.toContain("Company settings");
