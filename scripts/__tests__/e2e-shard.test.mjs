@@ -25,19 +25,15 @@ function runShard(args) {
   return result.stdout.trim().split(/\s+/).filter(Boolean);
 }
 
+// TEA-Core fork: upstream's pr.yml delegates the whole PR run to a reusable
+// `pr-trusted.yml` pinned at an immutable SHA, and upstream's tests read the
+// workflow back out of git at that SHA. This fork does not adopt that shape --
+// its pr.yml runs the jobs directly so it can gate `fold/**` branches and report
+// the required checks on merge_group entries (see the comments in pr.yml). There
+// is therefore no pinned SHA to resolve, so the assertions below read the
+// working-tree pr-trusted.yml the fold brought in rather than a pinned copy.
 function readPinnedTrustedPrWorkflow() {
-  const caller = readFileSync(prCallerWorkflow, "utf8");
-  const pin = caller.match(
-    /uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@([0-9a-f]{40})/,
-  );
-  assert.ok(pin, "pr.yml must call the trusted workflow at a full commit SHA");
-
-  const result = spawnSync("git", ["show", `${pin[1]}:${trustedPrWorkflowPath}`], {
-    cwd: repoRoot,
-    encoding: "utf8",
-  });
-  assert.equal(result.status, 0, `cannot read the pinned trusted workflow: ${result.stderr}`);
-  return result.stdout;
+  return readFileSync(trustedPrWorkflow, "utf8");
 }
 
 function readWorkflowJobs(workflow) {
@@ -157,10 +153,6 @@ test("shard arguments are validated", () => {
     const result = spawnSync(process.execPath, [script, ...args], { cwd: repoRoot, encoding: "utf8" });
     assert.notEqual(result.status, 0, `expected failure for ${args.join(" ")}`);
   }
-});
-
-test("pr.yml calls the trusted PR workflow at an immutable SHA", () => {
-  assert.ok(readPinnedTrustedPrWorkflow().length > 0);
 });
 
 test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {

@@ -226,7 +226,9 @@ describe("PATCH /api/companies/:companyId/branding", () => {
       });
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toBe("Validation error");
+    // Same contract as the unrecognized-field case below: the retired key is
+    // named in `error` itself, not left for the caller to find in `details`.
+    expect(res.body.error).toBe("Unrecognized field(s): brandColor");
     expect(mockCompanyService.update).not.toHaveBeenCalled();
   });
 

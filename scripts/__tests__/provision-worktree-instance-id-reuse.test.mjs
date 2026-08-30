@@ -93,6 +93,13 @@ function runProvision({ worktreeCwd, worktreesHome }, branch) {
   // No CLI anywhere on the PATH: the reuse decision is made before any CLI is
   // reached, so this keeps the run short and the signal specific to the check.
   const baseCwd = makeTempDir("paperclip-instance-reuse-base-");
+  // The base workspace is a plain checkout, so provision-worktree.sh falls back
+  // to the control plane's own registered instance config -- which it now
+  // requires to exist as a canonical file. Seed it, exactly as the self-heal
+  // fixture does; the reuse decision under test happens after this check.
+  const registeredInstanceDir = path.join(worktreesHome, "instances", "default");
+  fs.mkdirSync(registeredInstanceDir, { recursive: true });
+  fs.writeFileSync(path.join(registeredInstanceDir, "config.json"), "{}\n");
   return spawnSync("bash", [script], {
     cwd: worktreeCwd,
     encoding: "utf8",

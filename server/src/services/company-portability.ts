@@ -71,7 +71,6 @@ import {
 import { requireOpenCodeModelId } from "@paperclipai/adapter-opencode-local/server";
 import { findServerAdapter } from "../adapters/index.js";
 import { formatAttachmentSize, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
-import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
 import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
 import type { StorageService } from "../storage/types.js";
@@ -5282,7 +5281,6 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       id: string;
       name: string;
       requireBoardApprovalForNewAgents?: boolean | null;
-      attachmentMaxBytes?: number | null;
     } | null = null;
     let companyAction: "created" | "updated" | "unchanged" = "unchanged";
 
@@ -5949,7 +5947,10 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         const parentSlugBySlug = new Map<string, string>();
         let unarmedMonitorCount = 0;
         let attachmentsSkippedNoStorage = 0;
-        const attachmentMaxBytes = normalizeIssueAttachmentMaxBytes(targetCompany.attachmentMaxBytes ?? null);
+        // Migration 0267 dropped companies.attachment_max_bytes, so there is no
+        // per-company override left to read; the deployment ceiling in
+        // attachment-types.ts is the single limit every upload path shares.
+        const attachmentMaxBytes = MAX_ATTACHMENT_BYTES;
 
         // Import writes every issue and its children as a single batch instead
         // of one network round-trip per row. The loop below resolves each
@@ -6226,7 +6227,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
               throw unprocessable(`Attachment blob ${blobPath} does not match its declared sha256; the package is corrupted or was tampered with.`);
             }
             if (body.length > attachmentMaxBytes) {
-              warnings.push(`Task ${manifestIssue.slug} attachment ${attachmentLabel} was skipped because it exceeds this board's attachment size limit of ${attachmentMaxBytes} bytes.`);
+              warnings.push(`Task ${manifestIssue.slug} attachment ${attachmentLabel} was skipped because it exceeds this deployment's attachment size limit of ${attachmentMaxBytes} bytes.`);
               continue;
             }
             let issueCommentId: string | null = null;

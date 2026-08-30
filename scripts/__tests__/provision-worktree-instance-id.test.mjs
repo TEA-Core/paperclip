@@ -122,6 +122,13 @@ function runProvision(worktreeName, { helpExit = 0 } = {}) {
   const worktreeCwd = path.join(parent, worktreeName);
   fs.mkdirSync(worktreeCwd);
   const worktreesHome = makeTempDir("paperclip-instance-id-home-");
+  // provision-worktree.sh now refuses unless the registered seed source config
+  // exists as a canonical file. The base workspace here is a plain checkout, so
+  // that source is the control plane's own instance config; seed it so the run
+  // reaches the instance-id derivation this test is about.
+  const instanceHome = path.join(worktreesHome, "instance-home");
+  fs.mkdirSync(path.join(instanceHome, "instances", "default"), { recursive: true });
+  fs.writeFileSync(path.join(instanceHome, "instances", "default", "config.json"), "{}\n");
   const result = spawnSync("bash", [script], {
     cwd: worktreeCwd,
     encoding: "utf8",
@@ -132,7 +139,7 @@ function runProvision(worktreeName, { helpExit = 0 } = {}) {
       PAPERCLIP_WORKSPACE_CWD: worktreeCwd,
       PAPERCLIP_WORKSPACE_BRANCH: "feature/instance-id-test",
       PAPERCLIP_WORKTREES_DIR: worktreesHome,
-      PAPERCLIP_HOME: path.join(worktreesHome, "no-such-instance-home"),
+      PAPERCLIP_HOME: instanceHome,
     },
   });
   return { result, worktreeCwd, baseCwd, worktreesHome };

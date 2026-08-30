@@ -1878,7 +1878,15 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await enableAutoRecovery();
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
-    const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`;
+    // The fork's re-arm window is keyed on the level-triggered cycle key. A
+    // COMPLETED wake under the legacy per-edge key only ever covers while it is
+    // in flight (see wakeCoversIssueBlockersResolvedReadyState), so seeding the
+    // legacy spelling here would skip the window logic this test is named for.
+    const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId,
+      blockerIssueIds: [blockerIssueId],
+      blockedTransitionAt: null,
+    });
     const windowMs = 6 * 60 * 60 * 1000;
     const withinWindow = new Date(Date.now() - 30 * 60 * 1000);
     await db.insert(agentWakeupRequests).values({

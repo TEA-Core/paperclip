@@ -11,8 +11,6 @@ const runtimeScript = new URL("../provision-worktree-runtime.sh", import.meta.ur
 // Keep the PATH minimal so the fallback ladder is deterministic: node must be
 // reachable, but a globally installed `paperclipai` must not shadow the paths
 // under test.
-const testPath = [path.dirname(process.execPath), "/usr/bin", "/bin"].join(":");
-
 const cleanupDirs = [];
 
 function makeTempDir(prefix) {
@@ -20,6 +18,14 @@ function makeTempDir(prefix) {
   cleanupDirs.push(dir);
   return dir;
 }
+
+// Upstream puts `path.dirname(process.execPath)` on the PATH directly, which also
+// exposes everything else installed beside node -- including a global
+// `paperclipai`, the very shadow the fallback ladder below is meant to exclude.
+// Expose node through an otherwise-empty directory instead.
+const nodeOnlyBin = makeTempDir("paperclip-provision-nodebin-");
+fs.symlinkSync(process.execPath, path.join(nodeOnlyBin, "node"));
+const testPath = [nodeOnlyBin, "/usr/bin", "/bin"].join(":");
 
 /**
  * A control plane's own instance home. A managed project checkout carries no
@@ -523,6 +529,8 @@ test("every pnpm install call site silences DEP0169 without overwriting NODE_OPT
       assert.equal(match, disableWarningFlag);
     }
   }
+});
+
 test("the test PATH exposes our node and no paperclipai shadow", () => {
   const resolve = (binary) =>
     spawnSync("bash", ["-c", `command -v ${binary}`], { env: { PATH: testPath }, encoding: "utf8" });
@@ -540,6 +548,4 @@ test("the test PATH exposes our node and no paperclipai shadow", () => {
     0,
     "a globally installed paperclipai must not be reachable — it shadows the fallback rung under test",
   );
-});
-
 });

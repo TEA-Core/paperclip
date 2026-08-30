@@ -159,9 +159,12 @@ const ATTACHMENT_SIZE_UNITS: readonly string[] = ["KB", "MB", "GB"];
  * "10485760 bytes". Sub-kilobyte values stay in bytes so a tiny configured cap
  * does not collapse to "0 KB".
  */
-// Fork: per-company attachment cap. Upstream removed this in favour of one
-// global MAX_ATTACHMENT_BYTES, but the fork still stores and enforces a
-// per-company `attachmentMaxBytes`, so the normaliser has to stay.
+// The fork's per-company attachment cap is retired: migration 0267 drops
+// companies.attachment_max_bytes and the company validators no longer accept it,
+// so MAX_ATTACHMENT_BYTES above is the single ceiling every upload path uses.
+// This normaliser is kept only because it is exported API; it currently has no
+// callers. Do NOT read the previous note here as evidence that a per-company cap
+// still exists -- it does not.
 export function normalizeIssueAttachmentMaxBytes(value: number | null | undefined): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     return Math.min(DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES, MAX_ATTACHMENT_BYTES);
