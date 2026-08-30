@@ -7,6 +7,7 @@ import {
   isAgentSideClaudeConfigPath,
   normalizeClaudeConfigDirTree,
   prepareClaudeConfigSeed,
+  probeClaudeConfigCredentialHealth,
   seedAgentSideClaudeConfig,
 } from "./claude-config.js";
 import { runClaudeConfigNormalizerCli } from "./claude-config-normalize.js";
@@ -541,5 +542,113 @@ describe("runClaudeConfigNormalizerCli", () => {
     expect(code).toBe(0);
     expect((await fs.stat(configDir)).mode & 0o7777).toBe(0o2770);
     expect((await fs.stat(path.join(configDir, "sessions"))).mode & 0o7777).toBe(0o2770);
+  });
+});
+
+describe("probeClaudeConfigCredentialHealth", () => {
+  const cleanupDirs: string[] = [];
+
+  afterEach(async () => {
+    while (cleanupDirs.length > 0) {
+      const dir = cleanupDirs.pop();
+      if (!dir) continue;
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  async function makeDir(): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-credential-health-"));
+    cleanupDirs.push(dir);
+    return dir;
+  }
+
+  async function writeCredentials(dir: string, fileName: string, oauth: Record<string, unknown>) {
+    await fs.writeFile(path.join(dir, fileName), JSON.stringify({ claudeAiOauth: oauth }), "utf8");
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  it("returns ok when access and refresh tokens are in the future", async () => {
+    const dir = await makeDir();
+    await writeCredentials(dir, ".credentials.json", {
+      accessToken: "opaque-access-token",
+      refreshToken: "opaque-refresh-token",
+      expiresAt: nowSec + 8 * 60 * 60,
+      refreshTokenExpiresAt: nowSec + 30 * 24 * 60 * 60,
+    });
+    const health = await probeClaudeConfigCredentialHealth(dir);
+    expect(health.status).toBe("ok");
+    expect(health.accessExpiresAtMs).toBeGreaterThan(Date.now());
+    expect(health.refreshExpiresAtMs).toBeGreaterThan(Date.now());
+  });
+
+  it("returns access_expired when the access token is past expiry", async () => {
+    const dir = await makeDir();
+    await writeCredentials(dir, ".credentials.json", {
+      accessToken: "opaque-access-token",
+      refreshToken: "opaque-refresh-token",
+      expiresAt: nowSec - 60,
+      refreshTokenExpiresAt: nowSec + 30 * 24 * 60 * 60,
+    });
+    const health = await probeClaudeConfigCredentialHealth(dir);
+    expect(health.status).toBe("access_expired");
+    expect(health.accessExpiresAtMs).toBeLessThan(Date.now());
+    expect(health.refreshExpiresAtMs).toBeGreaterThan(Date.now());
+  });
+
+  it("returns refresh_expiring when the refresh window is within 24 hours", async () => {
+    const dir = await makeDir();
+    await writeCredentials(dir, ".credentials.json", {
+      accessToken: "opaque-access-token",
+      refreshToken: "opaque-refresh-token",
+      expiresAt: nowSec + 8 * 60 * 60,
+      refreshTokenExpiresAt: nowSec + 12 * 60 * 60,
+    });
+    const health = await probeClaudeConfigCredentialHealth(dir);
+    expect(health.status).toBe("refresh_expiring");
+  });
+
+  it("returns refresh_expired when the refresh window is past", async () => {
+    const dir = await makeDir();
+    await writeCredentials(dir, ".credentials.json", {
+      accessToken: "opaque-access-token",
+      refreshToken: "opaque-refresh-token",
+      expiresAt: nowSec - 60,
+      refreshTokenExpiresAt: nowSec - 60,
+    });
+    const health = await probeClaudeConfigCredentialHealth(dir);
+    expect(health.status).toBe("refresh_expired");
+  });
+
+  it("falls back to credentials.json when .credentials.json is absent", async () => {
+    const dir = await makeDir();
+    await writeCredentials(dir, "credentials.json", {
+      accessToken: "opaque-access-token",
+      refreshToken: "opaque-refresh-token",
+      expiresAt: nowSec + 60 * 60,
+      refreshTokenExpiresAt: nowSec + 7 * 24 * 60 * 60,
+    });
+    const health = await probeClaudeConfigCredentialHealth(dir);
+    expect(health.status).toBe("ok");
+  });
+
+  it("returns missing for an empty config directory", async () => {
+    const dir = await makeDir();
+    const health = await probeClaudeConfigCredentialHealth(dir);
+    expect(health.status).toBe("missing");
+  });
+
+  it("returns unparseable for invalid JSON", async () => {
+    const dir = await makeDir();
+    await fs.writeFile(path.join(dir, ".credentials.json"), "not-json", "utf8");
+    const health = await probeClaudeConfigCredentialHealth(dir);
+    expect(health.status).toBe("unparseable");
+  });
+
+  it("returns no_oauth_token when the oauth section is absent", async () => {
+    const dir = await makeDir();
+    await fs.writeFile(path.join(dir, ".credentials.json"), JSON.stringify({ other: true }), "utf8");
+    const health = await probeClaudeConfigCredentialHealth(dir);
+    expect(health.status).toBe("no_oauth_token");
   });
 });

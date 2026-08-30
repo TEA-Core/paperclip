@@ -2883,6 +2883,17 @@ function describeErrorDiagnostics(err: unknown): {
   return { errorName, acpCode, causeMessage, retryable, stackPreview };
 }
 
+function acpErrorFromTerminalError(error: {
+  message: string;
+  code?: string;
+  retryable?: boolean;
+}): Error & { code?: string; retryable?: boolean } {
+  const err = new Error(error.message) as Error & { code?: string; retryable?: boolean };
+  if (error.code != null) err.code = error.code;
+  if (error.retryable != null) err.retryable = error.retryable;
+  return err;
+}
+
 function classifyError(
   err: unknown,
   phase?: AcpxExecutionPhase,
@@ -3998,11 +4009,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
           : resultErrorMessage(terminal);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
+        const terminalFailureClassification =
+          terminal.status === "failed" ? classifyError(acpErrorFromTerminalError(terminal.error), "turn") : null;
         await emitAcpxLog(ctx, {
           type: terminal.status === "completed" ? "acpx.result" : "acpx.error",
           summary: terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
+          ...(terminalFailureClassification ? { errorCode: terminalFailureClassification.errorCode } : {}),
         });
         await cleanupRemoteBridges(prepared);
         flushChildStderr(childStderrState);
@@ -4025,7 +4039,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           signal: timedOut ? "SIGTERM" : null,
           timedOut,
           errorMessage,
-          errorCode: terminal.status === "failed" ? "acpx_turn_failed" : timedOut ? "acpx_timeout" : null,
+          errorCode: terminalFailureClassification
+            ? terminalFailureClassification.errorCode
+            : timedOut
+              ? "acpx_timeout"
+              : null,
           ...(orphanedProcess ? { errorMeta: { orphanedProcess } } : {}),
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
           sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
