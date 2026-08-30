@@ -288,14 +288,23 @@ describeEmbeddedPostgres("recovery sweep reconcileUndispatchableAssignedIssues",
     expect(second.reported).toBe(expectedRemainder.length);
     expect([...second.issueIds].sort()).toEqual(expectedRemainder);
 
-    // Cursor wrapped: the window re-scans the lowest ids, and the per-issue
-    // re-log throttle keeps the pass report-only instead of re-flooding.
+    // Cursor wrapped: the window re-scans the lowest ids. Emission is
+    // edge-triggered on the durable record (SUP-14539), so the re-scan reports
+    // the set but writes no second row per issue.
     const third = await sweep.reconcileUndispatchableAssignedIssues();
     expect(third.scanned).toBe(100);
-    expect(third.reported).toBe(0);
+    expect(third.reported).toBe(100);
+
+    // One detection row per seeded card (first window + remainder); the
+    // wrapped re-scan of the first 100 ids writes no second row per issue.
+    const allRows = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.undispatchable_assignee_detected"));
+    expect(allRows).toHaveLength(105);
   });
 
-  it("does not re-report the same issue within the re-log interval", async () => {
+  it("repeated ticks over the same unchanged card report the set but emit one row", async () => {
     const companyId = await seedCompany();
     const pullOnlyAgentId = await seedAgent(companyId, "process");
     const issueId = await seedCard(companyId, pullOnlyAgentId);
@@ -306,9 +315,9 @@ describeEmbeddedPostgres("recovery sweep reconcileUndispatchableAssignedIssues",
 
     expect(first.reported).toBe(1);
     expect(first.issueIds).toEqual([issueId]);
-    expect(second.reported).toBe(0);
-    expect(second.skipped).toBe(1);
-    expect(second.issueIds).toEqual([]);
+    expect(second.reported).toBe(1);
+    expect(second.skipped).toBe(0);
+    expect(second.issueIds).toEqual([issueId]);
 
     // One detection row total despite repeated ticks over the same unchanged card.
     expect(await detectionRows(issueId)).toHaveLength(1);
