@@ -18,6 +18,9 @@ permissions:
   pull-requests: write
   checks: write
   contents: read
+# `security-events: write` is gone with the draft-advisory gate it existed for.
+# The diff-based replacement runs in pr.yml's policy job and reports through
+# annotations and a job-summary table, so nothing here needs advisory scope.
 
 jobs:
   review:

@@ -348,6 +348,10 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
   it("PATCH: a final-stage PLAIN close (no decision) on an UNMERGED branch is still blocked (SUP-13290)", async () => {
     const { companyId, issueId, identifier } = await seedIssueAwaitingReview("D13185G");
+    // SUP-14446 mechanism C: the seeded ladder (parked pending, no decisions) would
+    // now be refused by the review-ladder guard before the delivery check. Null the
+    // policy so this test keeps exercising the delivery guard in isolation.
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
     // A board close carries no execution-policy decision, so the carve-out must
     // not apply: the plain close still must land the branch first.
     currentActor = {
@@ -505,24 +509,173 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(await statusOf(issueId)).toBe("done");
   });
 
-  it("POST comment: a decision-carrying approval without a tier declaration 422s with nothing written (SUP-14367)", async () => {
-    // The guard runs BEFORE the comment+status transaction (the pre-transaction
-    // contract): a 422 must leave both the comment and the status change unwritten,
-    // so the close is retryable as-is.
-    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D14367B");
-    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
-    mockMergedBranch();
+    it("POST comment: a decision-carrying approval without a tier declaration 422s with nothing written (SUP-14367)", async () => {
+      // The guard runs BEFORE the comment+status transaction (the pre-transaction
+      // contract): a 422 must leave both the comment and the status change unwritten,
+      // so the close is retryable as-is.
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D14367B");
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockMergedBranch();
 
-    const res = await request(app)
-      .post(`/api/issues/${identifier}/comments`)
-      .send({ body: "## Review: APPROVED\n\nShip it." });
+      const res = await request(app)
+        .post(`/api/issues/${identifier}/comments`)
+        .send({ body: "## Review: APPROVED\n\nShip it." });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(422);
-    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
-    expect(await statusOf(issueId)).toBe("in_review");
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments).toHaveLength(0);
-  });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(await statusOf(issueId)).toBe("in_review");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(0);
+    });
+
+    // SUP-14429 (mechanism B): an open linked PR held by an undismissed external
+    // CHANGES_REQUESTED review must NOT be waived by the decision-carrying
+    // carve-out. The refusal leaves both the comment and the status change
+    // unwritten on both doors (pre-transaction contract), and the audit row
+    // carries the stable refusal token the retroactive audit keys on.
+    function mockOpenPrHeldByChangesRequested(branchName: string, identifier: string) {
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        if (url.includes("/pulls?")) {
+          return new Response(
+            JSON.stringify([
+              { number: 42, draft: false, head: { ref: branchName }, title: `${identifier}: the carrier PR`, body: null },
+            ]),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/pulls/42")) return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+        if (url === "https://api.github.com/graphql") {
+          return new Response(
+            JSON.stringify({ data: { repository: { pullRequest: { reviewDecision: "CHANGES_REQUESTED" } } } }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+    }
+
+    it("PATCH: a final-stage approval over an open PR held by CHANGES_REQUESTED is refused 409 with nothing written (SUP-14429 AC2/AC5)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D14429A");
+      const branchName = `${identifier}-test-branch`;
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockOpenPrHeldByChangesRequested(branchName, identifier);
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment:
+            "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("done_transition_missing_delivery");
+      expect(res.body.details.decisionCarried).toBe(true);
+      expect(await statusOf(issueId)).toBe("in_review");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(0);
+
+      // The retroactive-audit consume-contract: the stable refusal token on both
+      // reason and skipReason, with the held PR display name.
+      const rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_guard_skipped");
+          const hit = found.filter(
+            (r) => (r.details as Record<string, unknown>).reason === "open_linked_prs_changes_requested:1",
+          );
+          if (hit.length === 0) throw new Error("waiting for refusal audit row");
+          return hit;
+        },
+        { timeout: 5000 },
+      );
+      expect((rows[0]!.details as Record<string, unknown>).skipReason).toBe("open_linked_prs_changes_requested:1");
+      expect(String((rows[0]!.details as Record<string, unknown>).prs)).toContain("TEA-Core/paperclip#42");
+    });
+
+    it("POST comment: auto-approval over an open PR held by CHANGES_REQUESTED is refused 409 with nothing written (SUP-14429 AC5)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D14429B");
+      const branchName = `${identifier}-test-branch`;
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockOpenPrHeldByChangesRequested(branchName, identifier);
+
+      const res = await request(app)
+        .post(`/api/issues/${identifier}/comments`)
+        .send({
+          body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("done_transition_missing_delivery");
+      expect(await statusOf(issueId)).toBe("in_review");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(0);
+
+      const rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_guard_skipped");
+          const hit = found.filter(
+            (r) => (r.details as Record<string, unknown>).reason === "open_linked_prs_changes_requested:1",
+          );
+          if (hit.length === 0) throw new Error("waiting for refusal audit row");
+          return hit;
+        },
+        { timeout: 5000 },
+      );
+      expect((rows[0]!.details as Record<string, unknown>).skipReason).toBe("open_linked_prs_changes_requested:1");
+    });
+
+    it("PATCH: a final-stage approval over an open PR whose review decision is APPROVED keeps the D6 waiver (SUP-14429 AC3, SUP-13207 regression)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D14429C");
+      const branchName = `${identifier}-test-branch`;
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/pulls?")) {
+          return new Response(
+            JSON.stringify([
+              { number: 42, draft: false, head: { ref: branchName }, title: `${identifier}: the carrier PR`, body: null },
+            ]),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/pulls/42")) return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+        if (url === "https://api.github.com/graphql") {
+          return new Response(
+            JSON.stringify({ data: { repository: { pullRequest: { reviewDecision: "APPROVED" } } } }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment:
+            "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint.",
+        });
+
+      // The open mergeable PR stays open until the merge lands (ADR-074 D6):
+      // the waiver fires and the close goes through.
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      const rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_guard_skipped");
+          if (found.length === 0) throw new Error("waiting for waiver audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(
+        rows.some((r) => (r.details as Record<string, unknown>).reason === "open_linked_prs_decision_carried:1"),
+      ).toBe(true);
+    });
 
   it("POST comment: auto-approval publishes paperclip/approved and persists the Guard A head (SUP-13904)", async () => {
     // The comment door is a second door onto an approved review decision. Before

@@ -3276,6 +3276,17 @@ function describeErrorDiagnostics(err: unknown): {
   return { errorName, acpCode, causeMessage, retryable, stackPreview };
 }
 
+function acpErrorFromTerminalError(error: {
+  message: string;
+  code?: string;
+  retryable?: boolean;
+}): Error & { code?: string; retryable?: boolean } {
+  const err = new Error(error.message) as Error & { code?: string; retryable?: boolean };
+  if (error.code != null) err.code = error.code;
+  if (error.retryable != null) err.retryable = error.retryable;
+  return err;
+}
+
 function classifyError(
   err: unknown,
   phase?: AcpxExecutionPhase,
@@ -4810,11 +4821,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           });
         }
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
+        const terminalFailureClassification =
+          terminal.status === "failed" ? classifyError(acpErrorFromTerminalError(terminal.error), "turn") : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
           summary: channelLost ? "duplex_channel_lost" : terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
+          ...(terminalFailureClassification ? { errorCode: terminalFailureClassification.errorCode } : {}),
         });
         // The one clean-completion path clears the run failure flag; every other
         // path keeps it set, so the run root span closes with error status. A
@@ -4825,8 +4839,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           signal: timedOut ? "SIGTERM" : null,
           timedOut,
           errorMessage,
-          errorCode: terminal.status === "failed"
-            ? "acpx_turn_failed"
+          // SUP-13716 refines the failed-terminal code (classifyError falls back
+          // to "acpx_turn_failed", so this subsumes the plain failed branch);
+          // the duplex channel-lost tail is upstream's and stays last.
+          errorCode: terminalFailureClassification
+            ? terminalFailureClassification.errorCode
             : timedOut
               ? "acpx_timeout"
               : channelLost

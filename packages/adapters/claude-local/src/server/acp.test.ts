@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -191,6 +191,23 @@ async function makeTempRoot(prefix: string) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   tempRoots.push(root);
   return root;
+}
+
+/** Seed a valid OAuth credentials file into the server's shared Claude home. */
+async function seedValidOauthCredentials(serverHome: string): Promise<void> {
+  const configDir = path.join(serverHome, ".claude");
+  await fs.mkdir(configDir, { recursive: true });
+  const now = Date.now();
+  const inMs = 48 * 60 * 60 * 1000;
+  const credentials = {
+    claudeAiOauth: {
+      accessToken: "test-access-token",
+      refreshToken: "test-refresh-token",
+      expiresAt: now + inMs,
+      refreshTokenExpiresAt: now + inMs,
+    },
+  };
+  await fs.writeFile(path.join(configDir, ".credentials.json"), JSON.stringify(credentials), "utf8");
 }
 
 async function createRuntimeSkill(root: string) {
@@ -516,6 +533,7 @@ describe("claude_local ACP lane", () => {
     process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
     process.env.PAPERCLIP_INSTANCE_ID = "test";
     process.env.HOME = path.join(root, "server-home");
+    await seedValidOauthCredentials(path.join(root, "server-home"));
     const runtimes: FakeRuntime[] = [];
     const meta: AdapterInvocationMeta[] = [];
     const execute = createClaudeAcpExecutor({
@@ -848,7 +866,16 @@ describe("claude_local ACP lane", () => {
     const serverHome = path.join(root, "server-home");
     const sharedClaudeConfig = path.join(serverHome, ".claude");
     await fs.mkdir(sharedClaudeConfig, { recursive: true });
-    const credentialsBody = JSON.stringify({ fake: "credential-artifact" });
+    // A real OAuth credentials body so the pre-turn credential-health probe
+    // (SUP-13716) sees a valid claudeAiOauth section and does not trip.
+    const credentialsBody = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "fake-access-token",
+        refreshToken: "fake-refresh-token",
+        expiresAt: Date.now() + 48 * 60 * 60 * 1000,
+        refreshTokenExpiresAt: Date.now() + 48 * 60 * 60 * 1000,
+      },
+    });
     const claudeJsonBody = JSON.stringify({ fake: "state-artifact" });
     await fs.writeFile(path.join(sharedClaudeConfig, ".credentials.json"), credentialsBody, "utf8");
     await fs.writeFile(path.join(sharedClaudeConfig, ".claude.json"), claudeJsonBody, "utf8");
@@ -1004,6 +1031,20 @@ describe("claude_local ACP lane", () => {
     // The server's shared home: where the server uid keeps its credentials.
     const serverHome = path.join(root, "server-home");
     await fs.mkdir(path.join(serverHome, ".claude"), { recursive: true });
+    // The SUP-13716 credential probe runs after the seed: without a live OAuth
+    // credential in the shared home it reports "missing" and refuses the run.
+    await fs.writeFile(
+      path.join(serverHome, ".claude", ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "test-access-token",
+          refreshToken: "test-refresh-token",
+          expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+          refreshTokenExpiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
+        },
+      }),
+      "utf8",
+    );
 
     const previousHome = process.env.HOME;
     const previousPaperclipHome = process.env.PAPERCLIP_HOME;
@@ -1075,6 +1116,20 @@ describe("claude_local ACP lane", () => {
     const root = await makeTempRoot("paperclip-claude-acp-local-armed-");
     const serverHome = path.join(root, "server-home");
     await fs.mkdir(path.join(serverHome, ".claude"), { recursive: true });
+    // The SUP-13716 credential probe runs after the seed: without a live OAuth
+    // credential in the shared home it reports "missing" and refuses the run.
+    await fs.writeFile(
+      path.join(serverHome, ".claude", ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "test-access-token",
+          refreshToken: "test-refresh-token",
+          expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+          refreshTokenExpiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
+        },
+      }),
+      "utf8",
+    );
 
     // Fake setuid shim: records its argv and the env it saw, then exits 0.
     const shimPath = path.join(root, "fake-spawn-shim");
@@ -1245,6 +1300,20 @@ describe("claude_local ACP lane", () => {
     const root = await makeTempRoot("paperclip-claude-acp-local-armed-fail-");
     const serverHome = path.join(root, "server-home");
     await fs.mkdir(path.join(serverHome, ".claude"), { recursive: true });
+    // The SUP-13716 credential probe runs after the seed: without a live OAuth
+    // credential in the shared home it reports "missing" and refuses the run.
+    await fs.writeFile(
+      path.join(serverHome, ".claude", ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "test-access-token",
+          refreshToken: "test-refresh-token",
+          expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+          refreshTokenExpiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
+        },
+      }),
+      "utf8",
+    );
 
     const shimPath = path.join(root, "fake-spawn-shim");
     await fs.writeFile(
@@ -1511,6 +1580,7 @@ describe("claude_local ACP lane", () => {
     process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
     process.env.PAPERCLIP_INSTANCE_ID = "test";
     process.env.HOME = path.join(root, "server-home");
+    await seedValidOauthCredentials(path.join(root, "server-home"));
     const runtimes: FakeRuntime[] = [];
     const execute = createClaudeAcpExecutor({
       createRuntime: (options: FakeRuntimeOptions) => {
@@ -1591,6 +1661,7 @@ describe("claude_local ACP lane", () => {
     process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
     process.env.PAPERCLIP_INSTANCE_ID = "test";
     process.env.HOME = path.join(root, "server-home");
+    await seedValidOauthCredentials(path.join(root, "server-home"));
     const runtimes: FakeRuntime[] = [];
     const execute = createClaudeAcpExecutor({
       createRuntime: (options: FakeRuntimeOptions) => {
@@ -1661,5 +1732,147 @@ describe("resolveClaudeAcpBillingIdentity", () => {
         executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/work" },
       } as never).billingType,
     ).toBe("subscription");
+  });
+});
+
+describe("prepareClaudeLocalManagedHome", () => {
+  async function setupTestHome() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-local-managed-home-"));
+    tempRoots.push(root);
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    delete process.env.CLAUDE_CONFIG_DIR;
+    return root;
+  }
+
+  function createOnLog() {
+    return vi.fn(async (_stream: "stdout" | "stderr", _chunk: string) => {});
+  }
+
+  it("throws an auth-like error when OAuth credentials are missing in the agent-side home", async () => {
+    const root = await setupTestHome();
+    await fs.mkdir(path.join(root, ".claude"), { recursive: true });
+
+    const env: NodeJS.ProcessEnv = {};
+    const onLog = createOnLog();
+    await expect(
+      prepareClaudeLocalManagedHome({
+        env,
+        companyId: "company-1",
+        agentId: "agent-1",
+        config: {},
+        onLog,
+      } as never),
+    ).rejects.toThrow(/Re-login is required/);
+
+    expect(env.CLAUDE_CONFIG_DIR).toBeTruthy();
+    expect(onLog.mock.calls).toEqual(
+      expect.arrayContaining([
+        [
+          "stderr",
+          expect.stringMatching(/claude-credential-health: missing:/),
+        ],
+      ]),
+    );
+  });
+
+  it("skips the OAuth probe when a CLAUDE_CODE_OAUTH_TOKEN is configured", async () => {
+    // A configured subscription token authenticates Claude without any stored
+    // credentials file, so an empty shared home must not trip the probe.
+    const root = await setupTestHome();
+    await fs.mkdir(path.join(root, ".claude"), { recursive: true });
+
+    const env: NodeJS.ProcessEnv = { CLAUDE_CODE_OAUTH_TOKEN: "claude-subscription-token" };
+    const onLog = createOnLog();
+    await prepareClaudeLocalManagedHome({
+      env,
+      companyId: "company-1",
+      agentId: "agent-1",
+      config: {},
+      onLog,
+    } as never);
+
+    expect(env.CLAUDE_CONFIG_DIR).toBeTruthy();
+    expect(onLog.mock.calls).not.toEqual(
+      expect.arrayContaining([
+        [
+          "stderr",
+          expect.stringMatching(/claude-credential-health:/),
+        ],
+      ]),
+    );
+  });
+
+  it("skips the OAuth probe when an API key is configured", async () => {
+    const root = await setupTestHome();
+    await fs.mkdir(path.join(root, ".claude"), { recursive: true });
+
+    const env: NodeJS.ProcessEnv = { ANTHROPIC_API_KEY: "sk-ant-test" };
+    const onLog = createOnLog();
+    await prepareClaudeLocalManagedHome({
+      env,
+      companyId: "company-1",
+      agentId: "agent-1",
+      config: {},
+      onLog,
+    } as never);
+
+    expect(env.CLAUDE_CONFIG_DIR).toBeTruthy();
+    expect(onLog.mock.calls).toEqual(
+      expect.arrayContaining([
+        [
+          "stdout",
+          expect.stringMatching(/Local ACP run will use the agent-side Claude config home/),
+        ],
+      ]),
+    );
+    expect(onLog.mock.calls).not.toEqual(
+      expect.arrayContaining([
+        [
+          "stderr",
+          expect.stringMatching(/claude-credential-health:/),
+        ],
+      ]),
+    );
+  });
+
+  it("succeeds when valid OAuth credentials are present in the shared home", async () => {
+    const root = await setupTestHome();
+    const nowSec = Math.floor(Date.now() / 1000);
+    const sharedHome = path.join(root, ".claude");
+    await fs.mkdir(sharedHome, { recursive: true });
+    await fs.writeFile(
+      path.join(sharedHome, ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "opaque-access-token",
+          refreshToken: "opaque-refresh-token",
+          expiresAt: nowSec + 8 * 60 * 60,
+          refreshTokenExpiresAt: nowSec + 30 * 24 * 60 * 60,
+        },
+      }),
+      "utf8",
+    );
+
+    const env: NodeJS.ProcessEnv = {};
+    const onLog = createOnLog();
+    await prepareClaudeLocalManagedHome({
+      env,
+      companyId: "company-1",
+      agentId: "agent-1",
+      config: {},
+      onLog,
+    } as never);
+
+    expect(env.CLAUDE_CONFIG_DIR).toBeTruthy();
+    expect(onLog.mock.calls).toEqual(
+      expect.arrayContaining([
+        [
+          "stdout",
+          expect.stringMatching(/Local ACP run will use the agent-side Claude config home/),
+        ],
+      ]),
+    );
   });
 });

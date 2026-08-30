@@ -1482,6 +1482,14 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        const undispatchableAssigned = await heartbeat.reconcileUndispatchableAssignedIssues();
+        if (undispatchableAssigned.reported > 0) {
+          logger.warn(
+            { ...undispatchableAssigned },
+            "startup undispatchable-assigned sweep reported issues",
+          );
+        }
+
         const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
         if (taskWatchdogsReconciled.triggered > 0) {
           logger.warn(
@@ -1783,6 +1791,15 @@ export async function startServer(): Promise<StartedServer> {
                 logger.warn(
                   { ...cancelledOnlyBlockerDependents },
                   "periodic cancelled-only-blocker-dependent sweep reported issues",
+                );
+              }
+            })
+            .then(async () => {
+              const undispatchableAssigned = await heartbeat.reconcileUndispatchableAssignedIssues();
+              if (undispatchableAssigned.reported > 0) {
+                logger.warn(
+                  { ...undispatchableAssigned },
+                  "periodic undispatchable-assigned sweep reported issues",
                 );
               }
             })

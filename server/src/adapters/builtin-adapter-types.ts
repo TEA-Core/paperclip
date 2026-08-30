@@ -19,3 +19,9 @@ export const BUILTIN_ADAPTER_TYPES = new Set([
   "process",
   "http",
 ]);
+
+export const PULL_ONLY_ADAPTER_TYPES = new Set(["process"]);
+
+export function isPullOnlyAdapterType(adapterType: string | null | undefined): boolean {
+  return !!adapterType && PULL_ONLY_ADAPTER_TYPES.has(adapterType);
+}

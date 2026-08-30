@@ -246,6 +246,263 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
+  describe("review ladder refusal (SUP-14446 mechanism C)", () => {
+    const stageA = "11111111-1111-4111-8111-111111111111";
+    const stageB = "22222222-2222-4222-8222-222222222222";
+    const stageC = "33333333-3333-4333-8333-333333333333";
+    const agentId = "44444444-4444-4444-8444-444444444444";
+    const ladderPolicy = {
+      stages: [
+        { id: stageA, type: "review" },
+        { id: stageB, type: "review" },
+        { id: stageC, type: "approval" },
+      ],
+    };
+
+    // Schema-valid state (uuid stage ids / principal) for the satisfied-paths tests.
+    const validExecutionState = (overrides: Record<string, unknown> = {}) => ({
+      status: "pending",
+      currentStageId: stageC,
+      currentStageIndex: 2,
+      currentStageType: "approval",
+      currentParticipant: { type: "agent", agentId },
+      returnAssignee: null,
+      reviewRequest: null,
+      completedStageIds: [stageA, stageB],
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      ...overrides,
+    });
+
+    it("refuses done for the literal SUP-13253 shape: 3-stage ladder with executionState {} (AC1)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: ladderPolicy, executionState: {} },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("stage 1 of 3");
+      expect(result.reason).toContain(stageA);
+      expect(result.reason).toContain("neither completedStageIds nor skippedStageIds");
+      // Fail closed BEFORE any external probe: no GitHub call, no PR resolution.
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_refused",
+          details: expect.objectContaining({
+            reason: `review_ladder_unsatisfied:${stageA}`,
+            stageIndex: 0,
+            stageType: "review",
+            unsatisfiedStageIds: [stageA, stageB, stageC],
+            completedStageIds: [],
+            skippedStageIds: [],
+          }),
+        }),
+      );
+    });
+
+    it("refuses done for the literal SUP-8098 shape: parked pending on stage 1 with zero decisions (AC2)", async () => {
+      // The state as it landed on SUP-8098: pending at stage index 0, no
+      // completedStageIds. It does not round-trip the state schema (the
+      // persisted row predates returnAssignee), so it parses to the empty case —
+      // which is exactly why the ladder had to be checked on the close path.
+      const sup8098State = {
+        status: "pending",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentStageId: "62250a6c-b08f-47da-8222-bafbb9f4f5c8",
+        currentParticipant: { type: "agent", agentId: "<support-QAE>" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      };
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: {
+            stages: [
+              { id: "62250a6c-b08f-47da-8222-bafbb9f4f5c8", type: "review" },
+              { id: stageC, type: "approval" },
+            ],
+          },
+          executionState: sup8098State,
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("stage 1 of 2");
+      expect(result.reason).toContain("62250a6c-b08f-47da-8222-bafbb9f4f5c8");
+    });
+
+    it("allows done when every stage id is in completedStageIds or skippedStageIds (AC3)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: ladderPolicy,
+          executionState: validExecutionState({
+            status: "completed",
+            completedStageIds: [stageA, stageC],
+            skippedStageIds: [stageB],
+          }),
+        },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_refused" }),
+      );
+    });
+
+    it("allows done when every stage id is in completedStageIds (no skipped stages)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: ladderPolicy,
+          executionState: validExecutionState({
+            status: "completed",
+            completedStageIds: [stageA, stageB, stageC],
+          }),
+        },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+    });
+
+    it("does not change behaviour for an issue with no executionPolicy (AC4)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_refused" }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_override" }),
+      );
+    });
+
+    it("lets a sanctioned override land the close and records the ladder bypass with the authorising disposition (AC5)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: ladderPolicy, executionState: {} },
+        { disposition: "merged-elsewhere", reason: "PR merged on main by ops" },
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("Override accepted: merged-elsewhere");
+      expect(result.reason).toContain("review ladder bypassed");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_override",
+          details: expect.objectContaining({
+            disposition: "merged-elsewhere",
+            overrideReason: "PR merged on main by ops",
+          }),
+        }),
+      );
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_override",
+          details: expect.objectContaining({
+            disposition: "merged-elsewhere",
+            overrideReason: "PR merged on main by ops",
+            reason: `review_ladder_unsatisfied:${stageA}`,
+            unsatisfiedStageIds: [stageA, stageB, stageC],
+          }),
+        }),
+      );
+    });
+
+    it("does not deadlock the in-flight final-stage approval: decisionCarried=true satisfies the pending current stage", async () => {
+      // The review approval IS what records the last stage's decision; the guard
+      // runs before that write lands, so state.currentStageId (stageC) must be
+      // treated as satisfied or the approval circuit deadlocks.
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: ladderPolicy,
+          executionState: validExecutionState({
+            status: "pending",
+            currentStageId: stageC,
+            currentStageIndex: 2,
+            completedStageIds: [stageA, stageB],
+          }),
+        },
+        null,
+        true,
+      );
+      expect(result.allowed).toBe(true);
+    });
+
+    it("refuses a plain close while the final stage is still pending (same state, no decision carried)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: ladderPolicy,
+          executionState: validExecutionState({
+            status: "pending",
+            currentStageId: stageC,
+            currentStageIndex: 2,
+            completedStageIds: [stageA, stageB],
+          }),
+        },
+        null,
+        false,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("stage 3 of 3");
+      expect(result.reason).toContain(stageC);
+    });
+
+    it("names the first unsatisfied stage when an earlier stage is missing its decision", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: ladderPolicy,
+          executionState: validExecutionState({
+            currentStageId: stageC,
+            currentStageIndex: 2,
+            completedStageIds: [stageA],
+          }),
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("stage 2 of 3");
+      expect(result.reason).toContain(stageB);
+    });
+
+    it("refuses the ladder before the open-linked-PR block, so the ladder reason wins", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 279, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#279", cachedState: "open", lastErrorCode: null },
+      ]);
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: ladderPolicy, executionState: {} },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Review ladder unsatisfied");
+      expect(result.reason).not.toContain("open linked PR");
+    });
+  });
+
   describe("open linked PRs block", () => {
     it("blocks transition when a linked PR is cached open, no GitHub token configured, and the last refresh succeeded (zero outbound fetch)", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
@@ -317,6 +574,212 @@ describe("evaluateDoneTransitionGuard", () => {
           }),
         }),
       );
+    });
+
+    // SUP-14429 (mechanism B): the decisionCarried carve-out must not waive an
+    // open linked PR held by an undismissed external CHANGES_REQUESTED review.
+    // The hydration pass now resolves the live GraphQL reviewDecision; only that
+    // exact decision refuses. Everything else keeps the D6 waiver (fail open on
+    // unknown — a GitHub outage must never fail the guard closed).
+    describe("open linked PR held by CHANGES_REQUESTED (SUP-14429)", () => {
+      const openPr = {
+        id: "pr-1",
+        owner: "TEA-Core",
+        repo: "paperclip-agent-tools",
+        number: 274,
+        nodeId: null,
+        headRefName: null,
+        title: null,
+        displayName: "TEA-Core/paperclip-agent-tools#274",
+        cachedState: "open",
+        lastErrorCode: null,
+        reviewDecision: null,
+      };
+
+      /** Open PR #274 with a review decision resolved via the GraphQL mock. */
+      function mockOpenPr274(decision: string | null) {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([{ ...openPr }]);
+        ghFetchMock.mockImplementation(async (url: string) => {
+          if (url.includes("/pulls/274")) {
+            return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+          }
+          if (url === "https://api.github.com/graphql") {
+            if (decision === null) {
+              return new Response(
+                JSON.stringify({ data: { repository: { pullRequest: null } } }),
+                { status: 200 },
+              );
+            }
+            return new Response(
+              JSON.stringify({ data: { repository: { pullRequest: { reviewDecision: decision } } } }),
+              { status: 200 },
+            );
+          }
+          return new Response(JSON.stringify({}), { status: 404 });
+        });
+      }
+
+      it("REFUSES a decision-carrying close when an open linked PR is held by an undismissed CHANGES_REQUESTED review (AC2)", async () => {
+        mockOpenPr274("CHANGES_REQUESTED");
+        const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+        expect(result.allowed).toBe(false);
+        expect(result.skipped).toBe(false);
+        expect(result.skipReason).toBe("open_linked_prs_changes_requested:1");
+        expect(result.reason).toContain("CHANGES_REQUESTED");
+        expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+        expect(result.reason).toContain("re-approve");
+        expect(result.reason).toContain("doneTransitionOverride");
+        expect(logActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.done_transition_guard_skipped",
+            details: expect.objectContaining({
+              reason: "open_linked_prs_changes_requested:1",
+              skipReason: "open_linked_prs_changes_requested:1",
+              prs: "TEA-Core/paperclip-agent-tools#274",
+            }),
+          }),
+        );
+      });
+
+      it.each(["APPROVED", "REVIEW_REQUIRED"] as const)(
+        "keeps the D6 waiver for a decision-carrying close over an open PR whose review decision is %s (AC3, SUP-13207 regression)",
+        async (decision) => {
+          mockOpenPr274(decision);
+          const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+          expect(result.allowed).toBe(true);
+          expect(result.skipped).toBe(false);
+          expect(result.reason).toContain("arms the merge");
+          expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+          expect(logActivity).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({
+              action: "issue.done_transition_guard_skipped",
+              details: expect.objectContaining({
+                reason: "open_linked_prs_decision_carried:1",
+                skipReason: "open_linked_prs_decision_carried:1",
+                prs: "TEA-Core/paperclip-agent-tools#274",
+              }),
+            }),
+          );
+        },
+      );
+
+      it("keeps the D6 waiver when the GraphQL review decision resolves to null (AC3/AC4)", async () => {
+        mockOpenPr274(null);
+        const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+        expect(result.allowed).toBe(true);
+        expect(result.reason).toContain("arms the merge");
+        expect(logActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.done_transition_guard_skipped",
+            details: expect.objectContaining({ reason: "open_linked_prs_decision_carried:1" }),
+          }),
+        );
+      });
+
+      it.each([
+        ["a non-2xx GraphQL response", 500, false],
+        ["a GraphQL errors array", 200, true],
+      ] as const)(
+        "fails OPEN (waiver applies) when the review decision cannot be resolved via %s (AC4)",
+        async (_label, status, withErrors) => {
+          mockResolveLinkedPullRequestsWithState.mockResolvedValue([{ ...openPr }]);
+          ghFetchMock.mockImplementation(async (url: string) => {
+            if (url.includes("/pulls/274")) {
+              return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+            }
+            if (url === "https://api.github.com/graphql") {
+              return new Response(
+                JSON.stringify(withErrors ? { errors: [{ message: "boom" }] } : {}),
+                { status },
+              );
+            }
+            return new Response(JSON.stringify({}), { status: 404 });
+          });
+          const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+          expect(result.allowed).toBe(true);
+          expect(result.skipped).toBe(false);
+          expect(result.reason).toContain("arms the merge");
+          expect(logActivity).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({
+              action: "issue.done_transition_guard_skipped",
+              details: expect.objectContaining({ reason: "open_linked_prs_decision_carried:1" }),
+            }),
+          );
+        },
+      );
+
+      it("does NOT refuse a plain (non-decision-carrying) close — the open_linked_prs block is unchanged (AC6)", async () => {
+        mockOpenPr274("CHANGES_REQUESTED");
+        const result = await evaluateDoneTransitionGuard(mockDb, issue, null, false);
+        expect(result.allowed).toBe(false);
+        expect(result.skipped).toBe(false);
+        expect(result.skipReason).toBeNull();
+        expect(result.reason).toContain("1 open linked PR");
+        expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+        expect(logActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.done_transition_guard_skipped",
+            details: expect.objectContaining({
+              reason: "open_linked_prs:1",
+              skipReason: "open_linked_prs:1",
+            }),
+          }),
+        );
+      });
+
+      it("counts and names ONLY the held PRs when open PRs mix refused and unrefused decisions", async () => {
+        const pr2 = {
+          id: "pr-2",
+          owner: "TEA-Core",
+          repo: "Trading-Signal-Platform",
+          number: 3124,
+          nodeId: null,
+          headRefName: null,
+          title: null,
+          displayName: "TEA-Core/Trading-Signal-Platform#3124",
+          cachedState: "open",
+          lastErrorCode: null,
+          reviewDecision: null,
+        };
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([{ ...openPr }, { ...pr2 }]);
+        ghFetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url.includes("/pulls/274") || url.includes("/pulls/3124")) {
+            return new Response(JSON.stringify({ state: "open" }), { status: 200 });
+          }
+          if (url === "https://api.github.com/graphql") {
+            const variables = (JSON.parse(String(init?.body)) as {
+              variables: { number: number };
+            }).variables;
+            const decision = variables.number === 274 ? "CHANGES_REQUESTED" : "APPROVED";
+            return new Response(
+              JSON.stringify({ data: { repository: { pullRequest: { reviewDecision: decision } } } }),
+              { status: 200 },
+            );
+          }
+          return new Response(JSON.stringify({}), { status: 404 });
+        });
+        const result = await evaluateDoneTransitionGuard(mockDb, issue, null, true);
+        expect(result.allowed).toBe(false);
+        expect(result.skipReason).toBe("open_linked_prs_changes_requested:1");
+        expect(result.reason).toContain("TEA-Core/paperclip-agent-tools#274");
+        expect(result.reason).not.toContain("Trading-Signal-Platform#3124");
+        expect(logActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.done_transition_guard_skipped",
+            details: expect.objectContaining({
+              reason: "open_linked_prs_changes_requested:1",
+              skipReason: "open_linked_prs_changes_requested:1",
+              prs: "TEA-Core/paperclip-agent-tools#274",
+            }),
+          }),
+        );
+      });
     });
 
     it("does NOT block on an unhydrated linked PR (cachedState null) — a bare URL mention must not freeze done under the 401", async () => {

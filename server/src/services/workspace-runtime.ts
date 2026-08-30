@@ -1065,6 +1065,36 @@ async function resolveBaseRefSha(repoRoot: string, baseRef: string): Promise<str
   return await runGit(["rev-parse", "--verify", `${baseRef}^{commit}`], repoRoot).catch(() => null);
 }
 
+/**
+ * SUP-14458: resolve the remote-tracking tip for a base ref. When the base ref is already a
+ * remote-tracking ref (e.g. `origin/main`), refresh and resolve it directly. When it is a local
+ * branch name (e.g. `main`), resolve `origin/<baseRef>` instead. Returns null when no verified
+ * remote tip can be obtained — the caller must then refuse to base a worktree on the local ref.
+ */
+async function resolveRemoteTrackingBaseTip(
+  repoRoot: string,
+  baseRef: string,
+  resolveGitAuth?: GitRemoteAuthProvider | null,
+): Promise<{ ref: string; sha: string } | null> {
+  const parsed = parseRemoteTrackingRef(baseRef);
+  if (parsed && (await remoteExists(repoRoot, parsed.remote))) {
+    // SUP-14458: refreshRemoteTrackingBaseRef returns [] on success and a
+    // non-empty warning array ONLY when the fetch itself failed. A failed fetch
+    // leaves the cached origin/<branch> ref stale, so resolving it below would
+    // hand back a tip we could not verify against the remote. Refuse instead.
+    const refreshWarnings = await refreshRemoteTrackingBaseRef(repoRoot, baseRef, resolveGitAuth);
+    if (refreshWarnings.length > 0) return null;
+    const sha = await resolveBaseRefSha(repoRoot, baseRef);
+    return sha ? { ref: baseRef, sha } : null;
+  }
+  if (!(await remoteExists(repoRoot, "origin"))) return null;
+  const remoteCandidate = `origin/${baseRef}`;
+  const refreshWarnings = await refreshRemoteTrackingBaseRef(repoRoot, remoteCandidate, resolveGitAuth);
+  if (refreshWarnings.length > 0) return null;
+  const sha = await resolveBaseRefSha(repoRoot, remoteCandidate);
+  return sha ? { ref: remoteCandidate, sha } : null;
+}
+
 function readRecordedBaseRefSha(metadata: Record<string, unknown> | null | undefined): string | null {
   const snapshot = parseObject(metadata?.baseRefSnapshot);
   const resolvedSha = snapshot.resolvedSha;
@@ -4823,7 +4853,16 @@ export async function prepareBaseRepoForWorkspace(input: {
   configuredBaseRef: string | null;
   resolveGitAuth?: GitRemoteAuthProvider | null;
   recorder?: WorkspaceOperationRecorder | null;
-}): Promise<{ baseRef: string; baseRefSha: string | null; warnings: string[] }> {
+}): Promise<{
+  baseRef: string;
+  baseRefSha: string | null;
+  warnings: string[];
+  // SUP-14458 surfaces the ref/sha the worktree should actually be cut from,
+  // which is the verified remote tip when the local base has diverged.
+  worktreeBaseRef: string;
+  worktreeBaseSha: string | null;
+  localBaseUnsafe: boolean;
+}> {
   const resolution = await resolveAuthoritativeBaseRef(
     input.repoRoot,
     input.configuredBaseRef,
@@ -4849,6 +4888,9 @@ export async function prepareBaseRepoForWorkspace(input: {
     ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(input.repoRoot, baseRef, input.resolveGitAuth)),
   ];
   const currentBaseRefSha = await resolveBaseRefSha(input.repoRoot, baseRef);
+  let worktreeBaseRef = baseRef;
+  let worktreeBaseSha = currentBaseRefSha;
+  let localBaseUnsafe = false;
 
   // SUP-11285: tidy the base repo before cutting from it. Strictly best-effort —
   // the dispatch proceeds whatever happens here, because the issue being run did
@@ -4971,10 +5013,23 @@ export async function prepareBaseRepoForWorkspace(input: {
           const subjects = decision.aheadCommitSubjects.length > 0
             ? decision.aheadCommitSubjects.join(", ")
             : "(no subjects)";
-          const message =
+          let message =
             `Base repository at ${input.repoRoot} has diverged from ${baseRef}: ` +
             `${decision.aheadCount} ahead, ${decision.behindCount} behind. ` +
             `Ahead commits: ${subjects}. Local commits preserved — no reset performed.`;
+          // SUP-14458: the worktree must not be based on the local ref that carries
+          // unpushed commits. Resolve the verified remote tip and rebase the worktree
+          // base onto it. When the remote tip cannot be resolved the caller must refuse.
+          localBaseUnsafe = true;
+          const remoteTip = await resolveRemoteTrackingBaseTip(input.repoRoot, baseRef, input.resolveGitAuth);
+          if (remoteTip) {
+            worktreeBaseRef = remoteTip.ref;
+            worktreeBaseSha = remoteTip.sha;
+            message += ` New worktrees are based on ${remoteTip.sha.slice(0, 12)} (${remoteTip.ref}), the verified remote tip, not the local branch.`;
+          } else {
+            worktreeBaseSha = null;
+            message += ` No verified remote tip could be resolved for ${baseRef}; the worktree checkout will be refused.`;
+          }
           baseRepoHygieneWarnings.push(message);
           logger.warn(message);
         }
@@ -4984,10 +5039,22 @@ export async function prepareBaseRepoForWorkspace(input: {
         const grafts = decision.graftCommits.length > 0
           ? decision.graftCommits.map((sha) => sha.slice(0, 12)).join(", ")
           : `none recorded — HEAD and ${baseRef} share no merge base`;
-        const message =
+        let message =
           `Base repository at ${input.repoRoot} has an indeterminate (shallow) relationship to ${baseRef}: ` +
           `ancestry between HEAD and ${baseRef} cannot be computed, so no ahead/behind counts are reported ` +
           `and no reset was performed. Graft commits: ${grafts}.`;
+        // SUP-14458: same guard as diverged — the worktree must not be based on a
+        // local ref whose ancestry relative to the remote is unknown.
+        localBaseUnsafe = true;
+        const remoteTip = await resolveRemoteTrackingBaseTip(input.repoRoot, baseRef, input.resolveGitAuth);
+        if (remoteTip) {
+          worktreeBaseRef = remoteTip.ref;
+          worktreeBaseSha = remoteTip.sha;
+          message += ` New worktrees are based on ${remoteTip.sha.slice(0, 12)} (${remoteTip.ref}), the verified remote tip, not the local branch.`;
+        } else {
+          worktreeBaseSha = null;
+          message += ` No verified remote tip could be resolved for ${baseRef}; the worktree checkout will be refused.`;
+        }
         baseRepoHygieneWarnings.push(message);
         logger.warn(message);
       } else if (decision.action === "ok") {
@@ -5022,6 +5089,9 @@ export async function prepareBaseRepoForWorkspace(input: {
     baseRef,
     baseRefSha: currentBaseRefSha,
     warnings: [...baseRepoHygieneWarnings, ...baseRefreshWarnings],
+    worktreeBaseRef,
+    worktreeBaseSha,
+    localBaseUnsafe,
   };
 }
 
@@ -5166,6 +5236,9 @@ export async function realizeExecutionWorkspace(input: {
   // for an unresolvable ref, so by here the ref is resolved and its warnings are
   // whatever the hygiene pass collected.
   const baseRefreshWarnings = baseRepoHygiene.warnings;
+  const worktreeBaseRef = baseRepoHygiene.worktreeBaseRef;
+  const worktreeBaseSha = baseRepoHygiene.worktreeBaseSha;
+  const localBaseUnsafe = baseRepoHygiene.localBaseUnsafe;
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
   // Repair the whole chain, not just the leaf. The recursive mkdir above can
@@ -5421,16 +5494,23 @@ export async function realizeExecutionWorkspace(input: {
 
   let branchCreatedByRuntime = true;
   try {
+    if (localBaseUnsafe && !worktreeBaseSha) {
+      throw new Error(
+        `Cannot create worktree: base repository at ${repoRoot} is diverged from ${baseRef} ` +
+        `and no verified remote tip could be resolved. The local branch has unpushed commits ` +
+        `that would contaminate the worktree. Push or reset the local branch, then retry.`,
+      );
+    }
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
-      args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+      args: ["worktree", "add", "-b", branchName, worktreePath, worktreeBaseRef],
       cwd: repoRoot,
       metadata: {
         repoRoot,
         worktreePath,
         branchName,
         baseRef,
-        baseRefSha: currentBaseRefSha,
+        baseRefSha: worktreeBaseSha,
         created: true,
       },
       successMessage: `Created git worktree at ${worktreePath}\n`,
@@ -5451,7 +5531,7 @@ export async function realizeExecutionWorkspace(input: {
           worktreePath,
           branchName,
           baseRef,
-          baseRefSha: currentBaseRefSha,
+          baseRefSha: worktreeBaseSha,
           created: false,
           reusedExistingBranch: true,
         },
@@ -5487,7 +5567,7 @@ export async function realizeExecutionWorkspace(input: {
 
   return {
     ...input.base,
-    repoRef: baseRef,
+    repoRef: worktreeBaseRef,
     strategy: "git_worktree",
     cwd: worktreePath,
     branchName,
@@ -5495,7 +5575,9 @@ export async function realizeExecutionWorkspace(input: {
     warnings: baseRepoHygiene.warnings,
     created: true,
     branchCreatedByRuntime,
-    baseRefSha: currentBaseRefSha,
+    // SUP-14458: record the sha the worktree was actually cut from, which is the
+    // verified remote tip when the local base had diverged -- not the local sha.
+    baseRefSha: worktreeBaseSha,
   };
 }
 
@@ -5636,7 +5718,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           resolveGitAuth: input.resolveGitAuth ?? null,
           recorder: input.recorder ?? null,
         })
-      : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [] };
+      : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: reuseBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false };
     const currentBaseRefSha = baseRepoHygiene.baseRefSha;
     // An unstarted-worktree refresh can fast-forward the checked-out branch.
     // Never run it for an attached operator-owned ref.
@@ -5694,8 +5776,11 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         resolveGitAuth: input.resolveGitAuth ?? null,
         recorder: input.recorder ?? null,
       })
-    : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [] };
+    : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: restoreBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false };
   const restoreCurrentBaseRefSha = baseRepoHygiene.baseRefSha;
+  const restoreWorktreeBaseRef = baseRepoHygiene.worktreeBaseRef;
+  const restoreWorktreeBaseSha = baseRepoHygiene.worktreeBaseSha;
+  const restoreLocalBaseUnsafe = baseRepoHygiene.localBaseUnsafe;
 
   let created = false;
   try {
@@ -5734,8 +5819,24 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         `Execution workspace "${worktreePath}" cannot be restored because its operator-owned branch "${branchName}" no longer exists.`,
       );
     }
-    const baseRef = baseRepoHygiene.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
-    const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
+    // SUP-14458: a diverged local base with no verified remote tip would
+    // contaminate the recreated worktree with unpushed local commits.
+    if (restoreLocalBaseUnsafe && !restoreWorktreeBaseSha) {
+      throw new Error(
+        `Cannot restore worktree: base repository at ${repoRoot} is diverged from ${baseRepoHygiene.baseRef} ` +
+        `and no verified remote tip could be resolved. The local branch has unpushed commits ` +
+        `that would contaminate the worktree. Push or reset the local branch, then retry.`,
+      );
+    }
+    // With a configured base ref, cut from the verified tip SUP-14458 resolved.
+    // With none, `prepareBaseRepoForWorkspace` was never called, so fall back to
+    // upstream's default-branch detection rather than a bare "HEAD".
+    const baseRef = restoreBaseRef
+      ? restoreWorktreeBaseRef
+      : (await detectDefaultBranch(repoRoot) ?? "HEAD");
+    const recreatedBaseRefSha = restoreBaseRef
+      ? restoreWorktreeBaseSha
+      : await resolveBaseRefSha(repoRoot, baseRef);
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
@@ -5789,7 +5890,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     branchCreatedByRuntime: realized.branchCreatedByRuntime || created,
     baseRefSha:
       recordedBaseRefSha
-      ?? (created ? restoreCurrentBaseRefSha : baseDrift.branchBaseRefSha)
+      ?? (created ? restoreWorktreeBaseSha : baseDrift.branchBaseRefSha)
       ?? baseDrift.currentBaseRefSha,
   };
 }
@@ -7723,12 +7824,43 @@ export function resolveRuntimeProvisionCommand(input: {
     "scripts",
     "provision-worktree-runtime.sh",
   );
-  const needsSeed = !existsSync(manifestPath) || !hasVerifiedWorktreeSeedManifest(manifestPath);
-  if (!needsSeed || !existsSync(provisionScript)) {
+  if (!existsSync(provisionScript)) {
     return "";
   }
 
-  return BUILTIN_WORKSPACE_SEED_COMMAND;
+  // SUP-14087: cross-uid worktrees keep per-uid state under .paperclip/uid-<uid>/.
+  // When any scoped dir exists, IT describes what still needs seeding and the
+  // canonical manifest does not: that manifest belongs to whichever uid owns the
+  // canonical dir and says nothing about this run. Scoped state is marker-based
+  // (the seed manifest is written per state dir, but a scoped dir provisioned
+  // before the manifest landed has markers only), so fall back to markers there.
+  let scopedStateDirs: string[] = [];
+  try {
+    scopedStateDirs = readdirSync(stateDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^uid-\d+$/.test(entry.name))
+      .map((entry) => path.join(stateDir, entry.name));
+  } catch {
+    scopedStateDirs = [];
+  }
+
+  if (scopedStateDirs.length > 0) {
+    for (const scopedDir of scopedStateDirs) {
+      const scopedManifest = path.join(scopedDir, "seed-manifest.json");
+      if (existsSync(scopedManifest)) {
+        if (!hasVerifiedWorktreeSeedManifest(scopedManifest)) return BUILTIN_WORKSPACE_SEED_COMMAND;
+        continue;
+      }
+      const scopedPending = path.join(scopedDir, "seed-pending");
+      const scopedComplete = path.join(scopedDir, "seed-complete");
+      if (existsSync(scopedPending) && !existsSync(scopedComplete)) {
+        return BUILTIN_WORKSPACE_SEED_COMMAND;
+      }
+    }
+    return "";
+  }
+
+  const needsSeed = !existsSync(manifestPath) || !hasVerifiedWorktreeSeedManifest(manifestPath);
+  return needsSeed ? BUILTIN_WORKSPACE_SEED_COMMAND : "";
 }
 
 function resolveRuntimeProvision(input: {
@@ -7791,6 +7923,11 @@ async function runRuntimeProvisionWithWorkspaceMutex(input: StartLocalRuntimeSer
     label: workspaceSeed
       ? `Workspace seed command "${command}"`
       : `Runtime provision command "${command}"`,
+    // SUP-14087: the runtime seed script resolves its uid-scoped state dir by
+    // its own execution uid (id -u), so the server seeds the state dir it owns
+    // and the run seeds its own. SUP-14126: no setuid shim here — worktree-init
+    // and the 0o600 config stay at the server uid; the script must not be
+    // dropped to the run's uid as a whole.
     metadata: {
       executionWorkspaceId: input.executionWorkspaceId ?? null,
       projectWorkspaceId: input.workspace.workspaceId,

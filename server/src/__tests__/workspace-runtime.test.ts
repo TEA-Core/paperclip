@@ -852,6 +852,39 @@ describe("resolveRuntimeProvisionCommand", () => {
       await fs.rm(baseCwd, { recursive: true, force: true });
     }
   });
+
+  it("surfaces the runtime provision command for a pending uid-scoped worktree state dir", async () => {
+    // SUP-14087: on a cross-uid worktree each uid keeps its state under
+    // .paperclip/uid-<uid>/. When a scoped seed-pending has no sibling
+    // seed-complete, the command must be returned even though the canonical
+    // markers say nothing is pending.
+    const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-scoped-"));
+    const cwd = path.join(baseCwd, "worktree");
+    try {
+      await fs.mkdir(path.join(baseCwd, "scripts"), { recursive: true });
+      await fs.writeFile(
+        path.join(baseCwd, "scripts", "provision-worktree-runtime.sh"),
+        "#!/usr/bin/env bash\n",
+      );
+      await fs.mkdir(path.join(cwd, ".paperclip", "uid-1001"), { recursive: true });
+      await fs.writeFile(path.join(cwd, ".paperclip", "uid-1001", "seed-pending"), "{}\n");
+      const workspace = {
+        ...buildWorkspace(cwd),
+        baseCwd,
+        strategy: "git_worktree" as const,
+        worktreePath: cwd,
+      };
+
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
+
+      await fs.writeFile(path.join(cwd, ".paperclip", "uid-1001", "seed-complete"), "{}\n");
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+    } finally {
+      await fs.rm(baseCwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("refreshRemoteTrackingBaseRef git auth", () => {

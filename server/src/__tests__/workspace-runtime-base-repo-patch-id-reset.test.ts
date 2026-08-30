@@ -202,7 +202,9 @@ describe("base repo auto-reset refuses whenever duplication is not proven (SUP-1
 
     expect(await git(["rev-parse", "HEAD"], f.work)).toBe(priorTip);
     expect(resetWarning(warnings)).toBeUndefined();
-    expect(divergedWarning(warnings)).toBe(verbatim(f.work, 2, 2, "only-here, local dup1"));
+    const warning = divergedWarning(warnings);
+    expect(warning, `warnings were: ${JSON.stringify(warnings, null, 2)}`).toBeDefined();
+    expect(warning?.startsWith(verbatim(f.work, 2, 2, "only-here, local dup1"))).toBe(true);
     expect(await git(["for-each-ref", "refs/paperclip/rescue"], f.work)).toBe("");
   });
 

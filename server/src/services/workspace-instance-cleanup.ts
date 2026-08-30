@@ -55,6 +55,23 @@ export function readWorktreeInstanceId(workspacePath: string): string | null {
   return instanceId;
 }
 
+// Legacy pre-slice-trim spelling (pre-SUP-14150): the 48-character slice kept any
+// separator it left behind, so a boundary basename minted a doubled "-" before the
+// path hash. .env files of boundary worktrees provisioned before the shell fix
+// still carry that spelling; teardown accepts it as well.
+export function deriveLegacyWorktreeInstanceId(workspacePath: string): string {
+  const resolvedWorkspacePath = path.resolve(workspacePath);
+  const normalized = path.basename(resolvedWorkspacePath)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  const prefix = (normalized || "worktree").slice(0, 48);
+  const pathHash = createHash("sha256").update(resolvedWorkspacePath).digest("hex").slice(0, 12);
+  return `${prefix}-${pathHash}`;
+}
+
 export type WorktreeInstancePointer = {
   envPath: string;
   envContents: string;
@@ -202,7 +219,7 @@ export async function readWorktreeInstancePointer(workspacePath: string): Promis
   }
 }
 
-function resolveConfiguredInstanceRoot(pointer: WorktreeInstancePointer, expectedInstanceId?: string):
+function resolveConfiguredInstanceRoot(pointer: WorktreeInstancePointer, expectedInstanceIds?: string[]):
   | { instanceRoot: string; instanceId: string }
   | { warning: string; instanceRoot: string | null; refusalReason: string | null } {
   const env = parseEnvContents(pointer.envContents);
@@ -228,10 +245,10 @@ function resolveConfiguredInstanceRoot(pointer: WorktreeInstancePointer, expecte
     };
   }
   const instanceRoot = path.resolve(expandedHome, "instances", instanceId);
-  if (expectedInstanceId && instanceId !== expectedInstanceId) {
+  if (expectedInstanceIds && !expectedInstanceIds.includes(instanceId)) {
     return {
       instanceRoot,
-      warning: `Refusing worktree instance cleanup from ${pointer.envPath}: PAPERCLIP_INSTANCE_ID "${instanceId}" does not match the expected workspace instance "${expectedInstanceId}".`,
+      warning: `Refusing worktree instance cleanup from ${pointer.envPath}: PAPERCLIP_INSTANCE_ID "${instanceId}" does not match the expected workspace instance ${expectedInstanceIds.map((id) => JSON.stringify(id)).join(" or ")}.`,
       refusalReason: "instance_id_mismatch",
     };
   }
@@ -279,7 +296,10 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   worktreesDir?: string;
   dependencies?: WorktreeInstanceCleanupDependencies;
 }): Promise<WorktreeInstanceCleanupResult> {
-  const configured = resolveConfiguredInstanceRoot(input.pointer, input.expectedInstanceId);
+  const expectedInstanceIds = Array.from(
+    new Set([input.expectedInstanceId, deriveLegacyWorktreeInstanceId(input.workspacePath)]),
+  );
+  const configured = resolveConfiguredInstanceRoot(input.pointer, expectedInstanceIds);
   if ("warning" in configured && !configured.warning) return { status: "not_configured" };
 
   const managedInstancesDir = resolveManagedInstancesDir(input.worktreesDir);
@@ -317,6 +337,13 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
   }
 
+  // Upstream tightened the persisted instance root from an optional cross-check
+  // into a precondition: without it, ownership of the directory is not proven by
+  // anything the DB recorded, and cleanup must fail closed. Safe in this fork
+  // because provisioning backfills WORKTREE_INSTANCE_ROOT for every git_worktree
+  // workspace that lacks it (see execution-workspace-provisioning.ts), so a null
+  // here is exceptional rather than the norm, and it surfaces as an operator
+  // warning instead of a silent deletion.
   const expectedInstanceRoot = input.expectedInstanceRoot ? path.resolve(input.expectedInstanceRoot) : null;
   if (!expectedInstanceRoot) {
     warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because execution workspace ${input.workspaceId} has no persisted instance root.`;

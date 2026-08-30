@@ -15137,6 +15137,10 @@ function pendingCleanupAttemptsSql() {
     return recovery.reconcileCancelledOnlyBlockerDependents({ issueCreatedAtGte: await getWorktreeExecutionCutoff(), ...(opts ?? {}) });
   }
 
+  async function reconcileUndispatchableAssignedIssues() {
+    return recovery.reconcileUndispatchableAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+  }
+
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
   }
@@ -21072,6 +21076,8 @@ function pendingCleanupAttemptsSql() {
     reconcileStillbornAssignedBacklog,
 
     reconcileCancelledOnlyBlockerDependents,
+
+    reconcileUndispatchableAssignedIssues,
 
     scanSilentActiveRuns,
     scanTerminableSilentActiveRuns,

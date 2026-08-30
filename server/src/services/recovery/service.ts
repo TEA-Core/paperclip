@@ -39,6 +39,7 @@ import {
   unWakeableArchives,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
+import { isPullOnlyAdapterType } from "../../adapters/builtin-adapter-types.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
@@ -147,6 +148,10 @@ const CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = 250;
 const CANCELLED_ONLY_BLOCKER_DEPENDENT_RELOG_INTERVAL_MS = 5 * 60_000;
 let lastStillbornAssignedBacklogLogAt: Date | null = null;
 let lastCancelledOnlyBlockerDependentLogAt: Date | null = null;
+const UNDISPATCHABLE_ASSIGNED_CANDIDATE_LIMIT = 100;
+const UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS = 5 * 60_000;
+const lastUndispatchableAssignedIssueLogAt = new Map<string, Date>();
+let lastUndispatchableAssignedSweepLogAt: Date | null = null;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -157,6 +162,20 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
+
+/**
+ * SUP-14225: read the agent id recorded as the issue's execution return
+ * assignee (the executor that owed the next action when it was bounced), if
+ * any. Execution state is free-form jsonb, so every field is type-guarded.
+ */
+function readReturnAssigneeAgentId(executionState: unknown): string | null {
+  if (!executionState || typeof executionState !== "object") return null;
+  const returnAssignee = (executionState as Record<string, unknown>).returnAssignee;
+  if (!returnAssignee || typeof returnAssignee !== "object") return null;
+  const principal = returnAssignee as { type?: unknown; agentId?: unknown };
+  if (principal.type !== "agent" || typeof principal.agentId !== "string") return null;
+  return principal.agentId.length > 0 ? principal.agentId : null;
+}
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -464,6 +483,14 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   // trips on one issue inside four minutes. Nothing retries its way out of this;
   // the command has to change first.
   OPENCODE_DB_GROWTH_LIMIT_ERROR_CODE,
+  // SUP-13716: once ACP lane OAuth credentials become unrefreshable, every retry
+  // burns an identical failed turn. Stop the storm and put the issue in a
+  // board-visible blocked state so the operator can re-login. Both the ACP lane's
+  // own code and the CLI lane's claude_auth_required (reached when a default-ACP
+  // agent falls back to CLI after a prepare-time credential failure) are covered:
+  // neither can refresh its way out of expired OAuth credentials.
+  "acpx_auth_required",
+  "claude_auth_required",
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
@@ -919,6 +946,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   const authz = authorizationService(db);
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
+  let undispatchableAssignedScanCursor: string | null = null;
 
   async function getAgent(agentId: string) {
     return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
@@ -1468,10 +1496,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         skipped += 1;
         continue;
       }
-      const creatorAgent = await getAgent(creatorAgentId);
-      if (!creatorAgent || creatorAgent.companyId !== candidate.companyId || !(await isAgentInvokable(creatorAgent))) {
-        skipped += 1;
-        continue;
+
+      // SUP-14225: prefer the recorded return assignee — the platform's own
+      // record of the agent that owed the next action — over the creator.
+      // The creator is the fallback when no usable return assignee is
+      // recorded (none, not in-company, or not invokable).
+      let nextAgent: typeof agents.$inferSelect | null = null;
+      let reassignSource: "return_assignee" | "creator" = "creator";
+      const returnAssigneeAgentId = readReturnAssigneeAgentId(candidate.executionState);
+      if (returnAssigneeAgentId) {
+        const returnAgent = await getAgent(returnAssigneeAgentId);
+        if (returnAgent && returnAgent.companyId === candidate.companyId && (await isAgentInvokable(returnAgent))) {
+          nextAgent = returnAgent;
+          reassignSource = "return_assignee";
+        }
+      }
+      if (!nextAgent) {
+        const creatorAgent = await getAgent(creatorAgentId);
+        if (!creatorAgent || creatorAgent.companyId !== candidate.companyId || !(await isAgentInvokable(creatorAgent))) {
+          skipped += 1;
+          continue;
+        }
+        nextAgent = creatorAgent;
       }
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
@@ -1479,7 +1525,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // SUP-13526: route this recovery reassignment through the same gate as
       // the PATCH handler and the other recovery paths. A refusal keeps the
       // blocker unassigned instead of making its review stage self-satisfiable.
-      const nextAssigneeAgentId = resolveRecoveryReassignedAssignee(candidate, creatorAgent.id);
+      const nextAssigneeAgentId = resolveRecoveryReassignedAssignee(candidate, nextAgent.id);
       if (!nextAssigneeAgentId) {
         skipped += 1;
         continue;
@@ -1500,7 +1546,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           "",
           `Paperclip found this issue is blocking ${blockingLinks} but had no assignee, so no heartbeat could pick it up.`,
           "",
-          "- Assigned it back to the agent that created the blocker.",
+          reassignSource === "return_assignee"
+            ? "- Assigned it to the recorded return assignee (the executor that owed the next action), not to the creator."
+            : "- Assigned it back to the agent that created the blocker (no usable return assignee was recorded).",
           "- Next action: resolve this blocker or reassign it to the right owner.",
         ].join("\n"),
         {},
@@ -1517,12 +1565,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         entityId: candidate.id,
         details: {
           identifier: candidate.identifier,
-          assigneeAgentId: creatorAgent.id,
+          assigneeAgentId: nextAssigneeAgentId,
+          reassignSource,
           source: "recovery.reconcile_unassigned_blocking_issue",
         },
       });
 
-      const queued = await deps.enqueueWakeup(creatorAgent.id, {
+      const queued = await deps.enqueueWakeup(nextAssigneeAgentId, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_assigned",
@@ -8415,6 +8464,133 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  // SUP-14281: a pull-only assignee is never dispatched, so a todo/in_progress
+  // card with no live continuation path will never wake on its own.
+  // Report-only: activity row per detected issue, throttled per issue so
+  // repeated ticks cannot flood; no status writes, no reassignment.
+  // The candidate window rotates with a keyset cursor (same pattern as the
+  // resolved-dependency-wake backstop): report-only cards stay perpetually
+  // eligible, so a fixed limit on asc(id) would permanently starve any stranded
+  // card whose id sorts past the first window.
+  async function reconcileUndispatchableAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    const result = { reported: 0, skipped: 0, scanned: 0, issueIds: [] as string[] };
+
+    const queryCandidates = (afterIssueId: string | null) => {
+      const filters = [
+        inArray(issues.status, ["todo", "in_progress"]),
+        sql`${issues.assigneeAgentId} is not null`,
+        visibleIssueCondition(),
+      ];
+      if (afterIssueId) filters.push(gt(issues.id, afterIssueId));
+      if (opts?.issueCreatedAtGte) filters.push(gte(issues.createdAt, opts.issueCreatedAtGte));
+
+      return db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          assigneeAdapterType: agents.adapterType,
+          totalCount: sql<number>`count(*) over()::int`,
+        })
+        .from(issues)
+        .innerJoin(
+          agents,
+          and(eq(agents.id, issues.assigneeAgentId), eq(agents.companyId, issues.companyId)),
+        )
+        .where(and(...filters))
+        .orderBy(asc(issues.id))
+        .limit(UNDISPATCHABLE_ASSIGNED_CANDIDATE_LIMIT);
+    };
+
+    let candidateRows = await queryCandidates(undispatchableAssignedScanCursor);
+    if (candidateRows.length === 0 && undispatchableAssignedScanCursor) {
+      undispatchableAssignedScanCursor = null;
+      candidateRows = await queryCandidates(null);
+    }
+    const totalCandidateCount = candidateRows[0]?.totalCount ?? 0;
+    const candidates = candidateRows.map(({ totalCount: _totalCount, ...candidate }) => candidate);
+    const lastCandidate = candidates[candidates.length - 1] ?? null;
+    undispatchableAssignedScanCursor =
+      candidates.length < totalCandidateCount && lastCandidate ? lastCandidate.id : null;
+    result.scanned = candidates.length;
+
+    for (const candidate of candidates) {
+      if (!isPullOnlyAdapterType(candidate.assigneeAdapterType)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (
+        await hasActiveExecutionPath(
+          candidate.companyId,
+          candidate.id,
+          candidate.assigneeAgentId,
+          candidate.monitorNextCheckAt,
+        )
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasPendingWakeInteraction(candidate.companyId, candidate.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const lastLoggedAt = lastUndispatchableAssignedIssueLogAt.get(candidate.id) ?? null;
+      if (
+        lastLoggedAt &&
+        Date.now() - lastLoggedAt.getTime() < UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      result.reported += 1;
+      result.issueIds.push(candidate.id);
+      lastUndispatchableAssignedIssueLogAt.set(candidate.id, new Date());
+
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.undispatchable_assignee_detected",
+        entityType: "issue",
+        entityId: candidate.id,
+        details: {
+          source: "recovery.reconcile_undispatchable_assigned",
+          identifier: candidate.identifier,
+          assigneeAgentId: candidate.assigneeAgentId,
+          status: candidate.status,
+        },
+      });
+    }
+
+    const shouldLog =
+      result.reported > 0 &&
+      (!lastUndispatchableAssignedSweepLogAt ||
+        Date.now() - lastUndispatchableAssignedSweepLogAt.getTime() >= UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS);
+    if (shouldLog) {
+      logger.warn(
+        { reported: result.reported, skipped: result.skipped, scanned: result.scanned, issueIds: result.issueIds },
+        "undispatchable-assigned sweep reported issues",
+      );
+      lastUndispatchableAssignedSweepLogAt = new Date();
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -8435,5 +8611,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     readRecoveryTimerIntervalMs,
     reconcileStillbornAssignedBacklog,
     reconcileCancelledOnlyBlockerDependents,
+    reconcileUndispatchableAssignedIssues,
   };
 }

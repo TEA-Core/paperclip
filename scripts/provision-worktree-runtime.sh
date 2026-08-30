@@ -7,6 +7,18 @@ worktree_cwd="${PAPERCLIP_WORKSPACE_CWD:?PAPERCLIP_WORKSPACE_CWD is required}"
 paperclip_home="${PAPERCLIP_HOME:-$HOME/.paperclip}"
 paperclip_instance_id="${PAPERCLIP_INSTANCE_ID:-default}"
 paperclip_dir="$worktree_cwd/.paperclip"
+
+# SUP-14087: on a cross-uid worktree the canonical config/env/seed state belongs
+# to another uid and is 0o600. Provisioning writes a uid-scoped state dir under
+# .paperclip/uid-<uid>/ for exactly that case; resolve it first by the run uid so
+# this run only ever touches its own state dir. Every path below is derived after
+# the redirect -- the seed manifest is part of that state, so a scoped run must
+# read and write its own manifest, not the canonical one.
+current_runtime_uid="$(id -u)"
+if [[ -e "$paperclip_dir/uid-${current_runtime_uid}/.env" ]]; then
+  paperclip_dir="$paperclip_dir/uid-${current_runtime_uid}"
+fi
+
 worktree_config_path="$paperclip_dir/config.json"
 seed_manifest_path="$paperclip_dir/seed-manifest.json"
 
