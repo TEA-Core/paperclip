@@ -737,6 +737,36 @@ async function resolveBaseRefSha(repoRoot: string, baseRef: string): Promise<str
   return await runGit(["rev-parse", "--verify", `${baseRef}^{commit}`], repoRoot).catch(() => null);
 }
 
+/**
+ * SUP-14458: resolve the remote-tracking tip for a base ref. When the base ref is already a
+ * remote-tracking ref (e.g. `origin/main`), refresh and resolve it directly. When it is a local
+ * branch name (e.g. `main`), resolve `origin/<baseRef>` instead. Returns null when no verified
+ * remote tip can be obtained — the caller must then refuse to base a worktree on the local ref.
+ */
+async function resolveRemoteTrackingBaseTip(
+  repoRoot: string,
+  baseRef: string,
+  resolveGitAuth?: GitRemoteAuthProvider | null,
+): Promise<{ ref: string; sha: string } | null> {
+  const parsed = parseRemoteTrackingRef(baseRef);
+  if (parsed && (await remoteExists(repoRoot, parsed.remote))) {
+    // SUP-14458: refreshRemoteTrackingBaseRef returns [] on success and a
+    // non-empty warning array ONLY when the fetch itself failed. A failed fetch
+    // leaves the cached origin/<branch> ref stale, so resolving it below would
+    // hand back a tip we could not verify against the remote. Refuse instead.
+    const refreshWarnings = await refreshRemoteTrackingBaseRef(repoRoot, baseRef, resolveGitAuth);
+    if (refreshWarnings.length > 0) return null;
+    const sha = await resolveBaseRefSha(repoRoot, baseRef);
+    return sha ? { ref: baseRef, sha } : null;
+  }
+  if (!(await remoteExists(repoRoot, "origin"))) return null;
+  const remoteCandidate = `origin/${baseRef}`;
+  const refreshWarnings = await refreshRemoteTrackingBaseRef(repoRoot, remoteCandidate, resolveGitAuth);
+  if (refreshWarnings.length > 0) return null;
+  const sha = await resolveBaseRefSha(repoRoot, remoteCandidate);
+  return sha ? { ref: remoteCandidate, sha } : null;
+}
+
 function readRecordedBaseRefSha(metadata: Record<string, unknown> | null | undefined): string | null {
   const snapshot = parseObject(metadata?.baseRefSnapshot);
   const resolvedSha = snapshot.resolvedSha;
@@ -4345,7 +4375,7 @@ export async function prepareBaseRepoForWorkspace(input: {
   configuredBaseRef: string | null;
   resolveGitAuth?: GitRemoteAuthProvider | null;
   recorder?: WorkspaceOperationRecorder | null;
-}): Promise<{ baseRef: string; baseRefSha: string | null; warnings: string[] }> {
+}): Promise<{ baseRef: string; baseRefSha: string | null; warnings: string[]; worktreeBaseRef: string; worktreeBaseSha: string | null; localBaseUnsafe: boolean }> {
   const {
     baseRef,
     warnings: baseRefResolutionWarnings,
@@ -4356,6 +4386,9 @@ export async function prepareBaseRepoForWorkspace(input: {
     ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(input.repoRoot, baseRef, input.resolveGitAuth)),
   ];
   const currentBaseRefSha = await resolveBaseRefSha(input.repoRoot, baseRef);
+  let worktreeBaseRef = baseRef;
+  let worktreeBaseSha = currentBaseRefSha;
+  let localBaseUnsafe = false;
 
   // SUP-11285: tidy the base repo before cutting from it. Strictly best-effort —
   // the dispatch proceeds whatever happens here, because the issue being run did
@@ -4478,10 +4511,23 @@ export async function prepareBaseRepoForWorkspace(input: {
           const subjects = decision.aheadCommitSubjects.length > 0
             ? decision.aheadCommitSubjects.join(", ")
             : "(no subjects)";
-          const message =
+          let message =
             `Base repository at ${input.repoRoot} has diverged from ${baseRef}: ` +
             `${decision.aheadCount} ahead, ${decision.behindCount} behind. ` +
             `Ahead commits: ${subjects}. Local commits preserved — no reset performed.`;
+          // SUP-14458: the worktree must not be based on the local ref that carries
+          // unpushed commits. Resolve the verified remote tip and rebase the worktree
+          // base onto it. When the remote tip cannot be resolved the caller must refuse.
+          localBaseUnsafe = true;
+          const remoteTip = await resolveRemoteTrackingBaseTip(input.repoRoot, baseRef, input.resolveGitAuth);
+          if (remoteTip) {
+            worktreeBaseRef = remoteTip.ref;
+            worktreeBaseSha = remoteTip.sha;
+            message += ` New worktrees are based on ${remoteTip.sha.slice(0, 12)} (${remoteTip.ref}), the verified remote tip, not the local branch.`;
+          } else {
+            worktreeBaseSha = null;
+            message += ` No verified remote tip could be resolved for ${baseRef}; the worktree checkout will be refused.`;
+          }
           baseRepoHygieneWarnings.push(message);
           logger.warn(message);
         }
@@ -4491,10 +4537,22 @@ export async function prepareBaseRepoForWorkspace(input: {
         const grafts = decision.graftCommits.length > 0
           ? decision.graftCommits.map((sha) => sha.slice(0, 12)).join(", ")
           : `none recorded — HEAD and ${baseRef} share no merge base`;
-        const message =
+        let message =
           `Base repository at ${input.repoRoot} has an indeterminate (shallow) relationship to ${baseRef}: ` +
           `ancestry between HEAD and ${baseRef} cannot be computed, so no ahead/behind counts are reported ` +
           `and no reset was performed. Graft commits: ${grafts}.`;
+        // SUP-14458: same guard as diverged — the worktree must not be based on a
+        // local ref whose ancestry relative to the remote is unknown.
+        localBaseUnsafe = true;
+        const remoteTip = await resolveRemoteTrackingBaseTip(input.repoRoot, baseRef, input.resolveGitAuth);
+        if (remoteTip) {
+          worktreeBaseRef = remoteTip.ref;
+          worktreeBaseSha = remoteTip.sha;
+          message += ` New worktrees are based on ${remoteTip.sha.slice(0, 12)} (${remoteTip.ref}), the verified remote tip, not the local branch.`;
+        } else {
+          worktreeBaseSha = null;
+          message += ` No verified remote tip could be resolved for ${baseRef}; the worktree checkout will be refused.`;
+        }
         baseRepoHygieneWarnings.push(message);
         logger.warn(message);
       } else if (decision.action === "ok") {
@@ -4529,6 +4587,9 @@ export async function prepareBaseRepoForWorkspace(input: {
     baseRef,
     baseRefSha: currentBaseRefSha,
     warnings: [...baseRepoHygieneWarnings, ...baseRefreshWarnings],
+    worktreeBaseRef,
+    worktreeBaseSha,
+    localBaseUnsafe,
   };
 }
 
@@ -4607,6 +4668,9 @@ export async function realizeExecutionWorkspace(input: {
   });
   const baseRef = baseRepoHygiene.baseRef;
   const currentBaseRefSha = baseRepoHygiene.baseRefSha;
+  const worktreeBaseRef = baseRepoHygiene.worktreeBaseRef;
+  const worktreeBaseSha = baseRepoHygiene.worktreeBaseSha;
+  const localBaseUnsafe = baseRepoHygiene.localBaseUnsafe;
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
   // Repair the whole chain, not just the leaf. The recursive mkdir above can
@@ -4756,16 +4820,23 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   try {
+    if (localBaseUnsafe && !worktreeBaseSha) {
+      throw new Error(
+        `Cannot create worktree: base repository at ${repoRoot} is diverged from ${baseRef} ` +
+        `and no verified remote tip could be resolved. The local branch has unpushed commits ` +
+        `that would contaminate the worktree. Push or reset the local branch, then retry.`,
+      );
+    }
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
-      args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+      args: ["worktree", "add", "-b", branchName, worktreePath, worktreeBaseRef],
       cwd: repoRoot,
       metadata: {
         repoRoot,
         worktreePath,
         branchName,
         baseRef,
-        baseRefSha: currentBaseRefSha,
+        baseRefSha: worktreeBaseSha,
         created: true,
       },
       successMessage: `Created git worktree at ${worktreePath}\n`,
@@ -4786,7 +4857,7 @@ export async function realizeExecutionWorkspace(input: {
           worktreePath,
           branchName,
           baseRef,
-          baseRefSha: currentBaseRefSha,
+          baseRefSha: worktreeBaseSha,
           created: false,
           reusedExistingBranch: true,
         },
@@ -4819,14 +4890,14 @@ export async function realizeExecutionWorkspace(input: {
 
   return {
     ...input.base,
-    repoRef: baseRef,
+    repoRef: worktreeBaseRef,
     strategy: "git_worktree",
     cwd: worktreePath,
     branchName,
     worktreePath,
     warnings: baseRepoHygiene.warnings,
     created: true,
-    baseRefSha: currentBaseRefSha,
+    baseRefSha: worktreeBaseSha,
   };
 }
 
@@ -4940,7 +5011,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           resolveGitAuth: input.resolveGitAuth ?? null,
           recorder: input.recorder ?? null,
         })
-      : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [] };
+      : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: reuseBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false };
     const currentBaseRefSha = baseRepoHygiene.baseRefSha;
     const refresh = currentBaseRefSha
       ? await refreshUnstartedWorktreeToBase({
@@ -4998,8 +5069,11 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         resolveGitAuth: input.resolveGitAuth ?? null,
         recorder: input.recorder ?? null,
       })
-    : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [] };
+    : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: restoreBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false };
   const restoreCurrentBaseRefSha = baseRepoHygiene.baseRefSha;
+  const restoreWorktreeBaseRef = baseRepoHygiene.worktreeBaseRef;
+  const restoreWorktreeBaseSha = baseRepoHygiene.worktreeBaseSha;
+  const restoreLocalBaseUnsafe = baseRepoHygiene.localBaseUnsafe;
 
   let created = false;
   try {
@@ -5028,8 +5102,15 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ) {
       throw error;
     }
-    const baseRef = baseRepoHygiene.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
-    const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
+    if (restoreLocalBaseUnsafe && !restoreWorktreeBaseSha) {
+      throw new Error(
+        `Cannot restore worktree: base repository at ${repoRoot} is diverged from ${baseRepoHygiene.baseRef} ` +
+        `and no verified remote tip could be resolved. The local branch has unpushed commits ` +
+        `that would contaminate the worktree. Push or reset the local branch, then retry.`,
+      );
+    }
+    const baseRef = restoreWorktreeBaseRef;
+    const recreatedBaseRefSha = restoreWorktreeBaseSha;
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
@@ -5082,7 +5163,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     created,
     baseRefSha:
       recordedBaseRefSha
-      ?? (created ? restoreCurrentBaseRefSha : baseDrift.branchBaseRefSha)
+      ?? (created ? restoreWorktreeBaseSha : baseDrift.branchBaseRefSha)
       ?? baseDrift.currentBaseRefSha,
   };
 }
