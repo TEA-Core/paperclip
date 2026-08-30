@@ -7,7 +7,6 @@ import { MemoryRouter } from "react-router-dom";
 import type { Issue, RequestConfirmationInteraction } from "@paperclipai/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { queryKeys } from "@/lib/queryKeys";
-import { IssuePropertiesPlansTab } from "./IssuePropertiesPlansTab";
 import { IssuePlanConfirmationActionBar } from "./IssuePlanConfirmationActionBar";
 
 const mockIssuesApi = vi.hoisted(() => ({
@@ -90,13 +89,13 @@ afterEach(() => {
 });
 
 describe("IssuePlanConfirmationActionBar", () => {
-  it("renders a pending plan confirmation even before its plan document exists", () => {
-    const rendered = render(<IssuePropertiesPlansTab issue={issue} />);
-
-    expect(rendered.querySelector('[data-testid="plan-pane-action-bar"]')).not.toBeNull();
-    expect(rendered.textContent).toContain("Approve plan");
-    expect(rendered.textContent).toContain("Request changes");
-  });
+  // The fork's "the Plans tab renders the action bar even before the plan
+  // document exists" test is retired here, not ported. Upstream's PAP-418
+  // consolidated plan approval into the single action control on the
+  // confirmation card in the conversation thread, and IssuePropertiesPlansTab
+  // deliberately stopped rendering its own duplicate (see the note on its
+  // `inline` prop). Approval is still reachable, so nothing regresses; keeping
+  // the assertion would have pinned the tab to the pre-consolidation shape.
 
   it("moves into a footer slot that mounts on the next paint", () => {
     let resolveNextPaint: FrameRequestCallback | undefined;

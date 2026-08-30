@@ -161,8 +161,10 @@ describe("InteractionGovernancePanel", () => {
 
   it("renders a select for every interaction kind", () => {
     const { host } = renderPanel();
-    expect(host.querySelectorAll('[data-testid$="-default"]')).toHaveLength(5);
-    expect(host.querySelectorAll('[data-testid$="-cap"]')).toHaveLength(5);
+    // Derived, not hardcoded: this fork adds `request_board_approval`, so the
+    // count is 6 here and 5 upstream. The panel renders one row per kind.
+    expect(host.querySelectorAll('[data-testid$="-default"]')).toHaveLength(INTERACTION_KINDS.length);
+    expect(host.querySelectorAll('[data-testid$="-cap"]')).toHaveLength(INTERACTION_KINDS.length);
   });
 
   it("surfaces a save failure", () => {

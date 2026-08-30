@@ -1044,13 +1044,18 @@ describe("IssueThreadInteractionCard tool-action card", () => {
     expect(host.textContent).not.toContain("Technical details");
   });
 
-  it("renders the addressee chip without the removed policy badge", () => {
+  // Fork divergence: upstream removed the "Agents may resolve" policy badge under
+  // PAP-440 as dead UI ("never rendered"). It is live here, because this fork
+  // drives it from `effectiveResolverPolicy === "anyone"` and its cards are open
+  // by default (PAP-17280). Both assertions below are inverted from upstream's
+  // deliberately, so the divergence stays guarded rather than silently re-removed.
+  it("renders the addressee chip alongside the agents-may-resolve policy badge", () => {
     const host = renderCard({
       interaction: agentAddressedRequestConfirmationInteraction,
     });
 
-    // PAP-440: the "Agents may resolve" policy badge was pure noise — never rendered.
-    expect(host.querySelector('[data-testid="interaction-policy-badge"]')).toBeNull();
+    expect(host.querySelector('[data-testid="interaction-policy-badge"]')?.textContent)
+      .toContain("Agents may resolve");
 
     const addresseeBadge = host.querySelector('[data-testid="interaction-addressee-badge"]');
     expect(addresseeBadge?.textContent).toContain("For ");
@@ -1061,7 +1066,8 @@ describe("IssueThreadInteractionCard tool-action card", () => {
       interaction: pendingRequestConfirmationInteraction,
     });
 
-    expect(host.querySelector('[data-testid="interaction-policy-badge"]')).toBeNull();
+    // Open by default, so the policy badge shows; no addressee, so that chip does not.
+    expect(host.querySelector('[data-testid="interaction-policy-badge"]')).not.toBeNull();
     expect(host.querySelector('[data-testid="interaction-addressee-badge"]')).toBeNull();
   });
 
