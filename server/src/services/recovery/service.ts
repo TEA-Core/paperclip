@@ -46,7 +46,7 @@ import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
-import { logActivity } from "../activity-log.js";
+import { logActivity, redactActivityDetails } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { authorizationService } from "../authorization.js";
@@ -140,7 +140,6 @@ let lastStillbornAssignedBacklogLogAt: Date | null = null;
 let lastCancelledOnlyBlockerDependentLogAt: Date | null = null;
 const UNDISPATCHABLE_ASSIGNED_CANDIDATE_LIMIT = 100;
 const UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS = 5 * 60_000;
-const lastUndispatchableAssignedIssueLogAt = new Map<string, Date>();
 let lastUndispatchableAssignedSweepLogAt: Date | null = null;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
@@ -8042,6 +8041,64 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  // SUP-14539: edge-trigger gate shared by the report-only recovery sweeps.
+  // A sweep writes one detection row when an (issue, condition) pair enters the
+  // reported set, or when its `details` payload changes materially — never on a
+  // timer. The state-change check is derived from the durable record: the most
+  // recent activity row for this entityId + action. When that row's details are
+  // equivalent to the would-be details, the condition is unchanged and no row
+  // is written. Because the check reads the activity_log table instead of
+  // in-memory state, a control-plane restart cannot reset it.
+  function stableSweepDetailsKey(value: unknown): string {
+    if (value === null || value === undefined) return "null";
+    if (Array.isArray(value)) return `[${value.map((v) => stableSweepDetailsKey(v)).join(",")}]`;
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      const keys = Object.keys(record).sort();
+      return `{${keys.map((key) => `${JSON.stringify(key)}:${stableSweepDetailsKey(record[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(value) ?? "null";
+  }
+
+  async function emitSweepDetectionRowIfChanged(params: {
+    companyId: string;
+    entityId: string;
+    action: string;
+    details: Record<string, unknown>;
+  }): Promise<boolean> {
+    // Compare against the value that will actually be stored: logActivity
+    // redacts details before persisting, so the durable row is the redacted
+    // form and the comparison must be too.
+    const redactedDetails = await redactActivityDetails(db, params.details);
+    const [latest] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, params.entityId),
+          eq(activityLog.action, params.action),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1);
+    if (latest && stableSweepDetailsKey(latest.details) === stableSweepDetailsKey(redactedDetails)) {
+      return false;
+    }
+    await logActivity(db, {
+      companyId: params.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: params.action,
+      entityType: "issue",
+      entityId: params.entityId,
+      details: params.details,
+    });
+    return true;
+  }
+
   async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null; limit?: number }) {
     const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
     const seen = new Set<string>();
@@ -8145,15 +8202,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       result.reported += 1;
       result.issueIds.push(candidate.id);
 
-      await logActivity(db, {
+      await emitSweepDetectionRowIfChanged({
         companyId: candidate.companyId,
-        actorType: "system",
-        actorId: "system",
-        agentId: null,
-        runId: null,
-        action: "issue.cancelled_blocker_dependent_detected",
-        entityType: "issue",
         entityId: candidate.id,
+        action: "issue.cancelled_blocker_dependent_detected",
         details: {
           identifier: candidate.identifier,
           source: "recovery.reconcile_cancelled_only_blocker_dependents",
@@ -8228,30 +8280,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       result.issueIds.push(candidate.id);
 
       // SUP-14184: the escalation above already records an `issue.updated`
-      // activity row, so the sweep's own detection row is logged only for the
-      // first escalation of this issue. The source-scoped recovery action
-      // upsert reuses the existing active action on later detections (only a
-      // fresh action starts at attemptCount 1), which keeps this to one
-      // detection row per stranded card instead of one per 30s sweep tick.
+      // activity row, so the sweep's own detection row is emitted only when the
+      // (issue, condition) pair enters the reported set or its details change
+      // materially (SUP-14539 edge trigger). The durable record is the most
+      // recent detection row, so repeated detections and control-plane
+      // restarts cannot re-arm it; a replaced recovery action is a material
+      // details change and re-emits.
       const action = await recoveryActionsSvc.getActiveForIssue(candidate.companyId, candidate.id);
-      if (!action || action.attemptCount === 1) {
-        await logActivity(db, {
-          companyId: candidate.companyId,
-          actorType: "system",
-          actorId: "system",
-          agentId: null,
-          runId: null,
-          action: "issue.stillborn_assigned_backlog_detected",
-          entityType: "issue",
-          entityId: candidate.id,
-          details: {
-            source: "recovery.reconcile_stillborn_assigned_backlog",
-            identifier: candidate.identifier,
-            assigneeAgentId: candidate.assigneeAgentId,
-            recoveryActionId: action?.id ?? null,
-          },
-        });
-      }
+      await emitSweepDetectionRowIfChanged({
+        companyId: candidate.companyId,
+        entityId: candidate.id,
+        action: "issue.stillborn_assigned_backlog_detected",
+        details: {
+          source: "recovery.reconcile_stillborn_assigned_backlog",
+          identifier: candidate.identifier,
+          assigneeAgentId: candidate.assigneeAgentId,
+          recoveryActionId: action?.id ?? null,
+        },
+      });
     }
 
     const shouldLog =
@@ -8271,8 +8317,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   // SUP-14281: a pull-only assignee is never dispatched, so a todo/in_progress
   // card with no live continuation path will never wake on its own.
-  // Report-only: activity row per detected issue, throttled per issue so
-  // repeated ticks cannot flood; no status writes, no reassignment.
+  // Report-only: detection row emitted edge-triggered (on entry into the
+  // reported set or a material details change — SUP-14539), never on a timer;
+  // no status writes, no reassignment.
   // The candidate window rotates with a keyset cursor (same pattern as the
   // resolved-dependency-wake backstop): report-only cards stay perpetually
   // eligible, so a fixed limit on asc(id) would permanently starve any stranded
@@ -8350,28 +8397,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      const lastLoggedAt = lastUndispatchableAssignedIssueLogAt.get(candidate.id) ?? null;
-      if (
-        lastLoggedAt &&
-        Date.now() - lastLoggedAt.getTime() < UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS
-      ) {
-        result.skipped += 1;
-        continue;
-      }
-
       result.reported += 1;
       result.issueIds.push(candidate.id);
-      lastUndispatchableAssignedIssueLogAt.set(candidate.id, new Date());
 
-      await logActivity(db, {
+      await emitSweepDetectionRowIfChanged({
         companyId: candidate.companyId,
-        actorType: "system",
-        actorId: "system",
-        agentId: null,
-        runId: null,
-        action: "issue.undispatchable_assignee_detected",
-        entityType: "issue",
         entityId: candidate.id,
+        action: "issue.undispatchable_assignee_detected",
         details: {
           source: "recovery.reconcile_undispatchable_assigned",
           identifier: candidate.identifier,
