@@ -750,13 +750,19 @@ async function resolveRemoteTrackingBaseTip(
 ): Promise<{ ref: string; sha: string } | null> {
   const parsed = parseRemoteTrackingRef(baseRef);
   if (parsed && (await remoteExists(repoRoot, parsed.remote))) {
-    await refreshRemoteTrackingBaseRef(repoRoot, baseRef, resolveGitAuth);
+    // SUP-14458: refreshRemoteTrackingBaseRef returns [] on success and a
+    // non-empty warning array ONLY when the fetch itself failed. A failed fetch
+    // leaves the cached origin/<branch> ref stale, so resolving it below would
+    // hand back a tip we could not verify against the remote. Refuse instead.
+    const refreshWarnings = await refreshRemoteTrackingBaseRef(repoRoot, baseRef, resolveGitAuth);
+    if (refreshWarnings.length > 0) return null;
     const sha = await resolveBaseRefSha(repoRoot, baseRef);
     return sha ? { ref: baseRef, sha } : null;
   }
   if (!(await remoteExists(repoRoot, "origin"))) return null;
   const remoteCandidate = `origin/${baseRef}`;
-  await refreshRemoteTrackingBaseRef(repoRoot, remoteCandidate, resolveGitAuth);
+  const refreshWarnings = await refreshRemoteTrackingBaseRef(repoRoot, remoteCandidate, resolveGitAuth);
+  if (refreshWarnings.length > 0) return null;
   const sha = await resolveBaseRefSha(repoRoot, remoteCandidate);
   return sha ? { ref: remoteCandidate, sha } : null;
 }

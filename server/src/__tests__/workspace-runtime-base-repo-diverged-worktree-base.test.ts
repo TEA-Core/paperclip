@@ -203,3 +203,78 @@ describe("diverged base repo with unresolvable remote tip: checkout is refused (
     expect(warning).toContain("No verified remote tip could be resolved");
   });
 });
+
+describe("stale remote tip after a failed fetch must not be trusted (SUP-14458)", () => {
+  // Primary finding: resolveRemoteTrackingBaseTip discarded the failure warnings from
+  // refreshRemoteTrackingBaseRef, so when a fetch fails the cached origin/<branch> ref is
+  // still stale — yet it was resolved and handed back as the "verified" remote tip. When the
+  // refresh cannot be completed the stale ref must NOT be promoted; the caller must refuse.
+
+  /** Point `origin` at a nonexistent path so every fetch fails while the cached
+   *  refs/remotes/origin/main ref remains resolvable locally (stale). */
+  async function severOrigin(f: Fixture): Promise<void> {
+    await gitVoid(["remote", "set-url", "origin", `file://${f.root}/does-not-exist.git`], f.work);
+  }
+
+  it("prepareBaseRepoForWorkspace refuses to base on the stale ref when the fetch fails", async () => {
+    const f = await makeOriginAndClone();
+
+    // Diverge: a local-only ahead commit + an origin advance so the local branch is ahead+behind.
+    await commit(f.work, "only-here");
+    await commit(f.seed, "c4");
+    await publish(f);
+    const staleTip = await git(["rev-parse", "origin/main"], f.work);
+
+    // Break the fetch. The stale remote-tracking ref must still resolve locally.
+    await severOrigin(f);
+    expect(await git(["rev-parse", "origin/main"], f.work)).toBe(staleTip);
+
+    const result = await prepareBaseRepoForWorkspace({ repoRoot: f.work, configuredBaseRef: "main" });
+
+    // The stale ref is present but unverified: refuse to base the worktree on it.
+    expect(result.localBaseUnsafe).toBe(true);
+    expect(result.worktreeBaseSha).toBeNull();
+    const warning = result.warnings.find((w) => w.includes("No verified remote tip could be resolved"));
+    expect(warning, `warnings were: ${JSON.stringify(result.warnings)}`).toBeDefined();
+    expect(warning).not.toContain(staleTip);
+  });
+
+  it("realizeExecutionWorkspace throws when the base ref resolves to a stale ref after a failed fetch", async () => {
+    const f = await makeOriginAndClone();
+    await commit(f.work, "only-here");
+    await commit(f.seed, "c4");
+    await publish(f);
+    await severOrigin(f);
+
+    // Force the remote-tracking base-ref path (repoRef "main" -> "origin/main"), where the
+    // stale cached ref is present but the fetch now fails.
+    await expect(
+      realizeExecutionWorkspace({
+        base: {
+          baseCwd: f.work,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-stale",
+          repoUrl: null,
+          repoRef: "main",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: {
+          id: "issue-stale",
+          identifier: "PAP-998",
+          title: "Stale Tip",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Test Agent",
+          companyId: "company-1",
+        },
+      }),
+    ).rejects.toThrow(/no verified remote tip could be resolved/i);
+  });
+});
