@@ -471,7 +471,12 @@ export function issueRecoveryActionService(db: Db) {
       // a non-null maxAttempts; where it was null the count carried forward
       // unbounded and the successor was minted already past a ceiling it later
       // acquired (the `attemptCount 18 > maxAttempts 5` reading from SUP-14139).
-      const nextAttemptCount = Math.min(
+      // An explicit `attemptCount` is authoritative: the bounded disposition
+      // repair is the one caller that supplies it, and it has already resolved
+      // the true count for this fingerprint (run stamp, persisted action, or
+      // legacy park history). Every carry-forward caller above passes none, so
+      // the SUP-13698/SUP-14151 clamp still governs each of them.
+      const nextAttemptCount = input.attemptCount ?? Math.min(
         carriedAttemptCount,
         input.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
       );

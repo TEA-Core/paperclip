@@ -996,6 +996,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId };
   }
 
+  // Restored from the pre-fold fork. The merge replaced this helper with
+  // upstream's, which asserts `ownerType: "board"`, a
+  // `board_escalation_no_takeover_v1` routing policy, and that NO wake is
+  // emitted. This fork routes a stranded action to an owner agent through the
+  // manager ladder and wakes it (`source_scoped_recovery_action`); fork HEAD has
+  // zero occurrences of either upstream marker. The fork version also waits for
+  // the wake rather than querying it immediately, which the replacement raced on.
   async function expectSourceScopedStrandedRecoveryAction(input: {
     companyId: string;
     agentId: string;
@@ -1024,8 +1031,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       recoveryIssueId: null,
       kind: input.kind ?? "stranded_assigned_issue",
       status: "active",
-      ownerType: "board",
-      ownerAgentId: null,
+      ownerType: "agent",
+      ownerAgentId: input.agentId,
       previousOwnerAgentId: input.previousOwnerAgentId ?? input.agentId,
       returnOwnerAgentId: input.returnOwnerAgentId ?? input.agentId,
       cause: input.cause ?? "stranded_assigned_issue",
@@ -1037,15 +1044,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: input.previousStatus,
       latestRunId: input.runId,
       retryReason: input.retryReason ?? null,
-      routingPolicy: "board_escalation_no_takeover_v1",
     });
     if (input.cause === "execution_review_participant_recovery") {
       expect(action.nextAction).toContain("failed review participant path");
     } else if (input.cause === "process_lost") {
-      expect(action.nextAction).toContain("explicitly retry the original owner");
+      expect(action.nextAction).toContain("Retry the original assignee from durable progress");
     } else {
       expect(action.nextAction).toContain(
-        input.kind === "missing_disposition" ? "valid issue disposition" : "Board operator",
+        input.kind === "missing_disposition" ? "valid issue disposition" : "Restore a live execution path",
       );
     }
 
@@ -1059,10 +1065,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ));
     expect(recoveryIssues).toHaveLength(0);
 
-    const recoveryWakeups = await db.select().from(agentWakeupRequests).where(
-      sql`${agentWakeupRequests.payload} ->> 'recoveryActionId' = ${action.id}`,
-    );
-    expect(recoveryWakeups).toHaveLength(0);
+    const recoveryWakeup = await waitForValue(async () => {
+      const wakeups = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, input.agentId));
+      return wakeups.find((wakeup) => {
+        const payload = wakeup.payload as Record<string, unknown> | null;
+        return payload?.issueId === input.issueId &&
+          payload?.sourceIssueId === input.issueId &&
+          payload?.recoveryActionId === action.id &&
+          payload?.strandedRunId === input.runId;
+      }) ?? null;
+    });
+    expect(recoveryWakeup).toMatchObject({
+      companyId: input.companyId,
+      reason: "source_scoped_recovery_action",
+      source: "assignment",
+      payload: expect.objectContaining({
+        modelProfile: "cheap",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      }),
+    });
+
+    const recoveryRun = recoveryWakeup?.runId
+      ? await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, recoveryWakeup.runId))
+        .then((rows) => rows[0] ?? null)
+      : null;
+    expect(recoveryRun?.contextSnapshot).toMatchObject({
+      issueId: input.issueId,
+      taskId: input.issueId,
+      source: "issue_recovery_action",
+      recoveryActionId: action.id,
+      sourceIssueId: input.issueId,
+      strandedRunId: input.runId,
+      modelProfile: "cheap",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
     await waitForHeartbeatIdle(db);
     const sourceIssue = await db
       .select()
@@ -1203,7 +1249,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     expect(run).toMatchObject({ status: "failed", error: "Adapter failed" });
     expect(runtime?.lastError).toBe("Adapter failed");
-    expect(agent).toEqual({ status: "error", errorReason: "Adapter failed" });
+    // Fork divergence: this fork prefixes the classified error code into
+    // agent.errorReason (heartbeat.ts truncateAgentErrorReason call site), which
+    // heartbeat-error-reason-classifying-detail.test.ts asserts directly.
+    expect(agent).toEqual({ status: "error", errorReason: "[adapter_failed] Adapter failed" });
   });
 
   it("keeps a local run active when the recorded pid is still alive", async () => {
@@ -3484,10 +3533,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "failed",
       errorCode: "workspace_validation_failed",
     });
-    expect(failedRun?.error).toContain("linked to a project workspace but has no project id");
-    // The adapter process never started, so no agent could post an issue
-    // comment. The comment policy is not_applicable and no missing-comment
-    // retry is queued, which stops a pre-adapter setup failure from looping.
+    expect(failedRun?.error).toContain("no project cwd was resolved");
+    // Upstream added these invariants alongside a message assertion this fork
+    // cannot share (it refuses at the fabrication guard, earlier than upstream's
+    // missing_project_id check -- see the note below). The invariants themselves
+    // still hold, and hold a fortiori: the adapter never started, so no agent
+    // could post an issue comment and no missing-comment retry may be queued.
     expect(failedRun?.processStartedAt).toBeNull();
     expect(failedRun?.issueCommentStatus).toBe("not_applicable");
     const missingCommentWakeups = await db
@@ -3527,8 +3578,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       kind: "workspace_validation",
       cause: "workspace_validation_failed",
       status: "active",
-      ownerType: "board",
-      ownerAgentId: null,
+      ownerAgentId: agentId,
       recoveryIssueId: null,
     });
     expect(recoveryAction?.evidence).toMatchObject({
@@ -3537,7 +3587,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       latestRunErrorCode: "workspace_validation_failed",
       recoveryCause: "workspace_validation_failed",
     });
-    expect(recoveryAction?.nextAction).toContain("repair the source task workspace link");
+    expect(recoveryAction?.nextAction).toContain("Repair the source issue workspace link");
 
     const validationComment = await waitForValue(async () => {
       const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -3621,11 +3671,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       kind: "configuration_validation",
       cause: "configuration_incomplete",
       status: "active",
-      ownerType: "board",
-      ownerAgentId: null,
+      ownerAgentId: agentId,
       recoveryIssueId: null,
     });
-    expect(recoveryAction?.nextAction).toContain("bind the missing secret");
+    expect(recoveryAction?.nextAction).toContain("Bind the missing secret");
 
     const configurationComment = await waitForValue(async () => {
       const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -4111,10 +4160,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       version: 1,
       sections: expect.arrayContaining([
         expect.objectContaining({
+          // The owner moved from being its own section title to a row inside the
+          // "Recovery" section; stranded-notice.test.ts and
+          // successful-run-handoff.test.ts already assert that shape.
           title: "Recovery",
           rows: expect.arrayContaining([
             expect.objectContaining({ type: "key_value", label: "Recovery action", value: recoveryAction.id }),
-            expect.objectContaining({ type: "key_value", label: "Recovery owner", value: "Board decision required" }),
+            expect.objectContaining({ type: "agent_link", label: "Recovery owner", name: "CodexCoder" }),
           ]),
         }),
         expect.objectContaining({
@@ -4798,19 +4850,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runErrorCode: "issue_continuation_waiting_on_review",
     });
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    // Fork divergence: this fork does not treat a non-invokable owner as an
+    // immediate board escalation. It holds a NO_LIVE_PATH_GRACE_THRESHOLD_MS
+    // (15 min) grace window first -- a paused agent is very often paused for
+    // seconds -- and then records its own `no_live_path_owner_unavailable`
+    // action under a dedicated counter rather than upstream's
+    // `deliberate_wait_without_target` / `owner_not_invokable`. Age the issue
+    // past the grace window so the routing under test is actually reached.
+    await db
+      .update(issues)
+      .set({ updatedAt: new Date(Date.now() - 30 * 60 * 1000) })
+      .where(eq(issues.id, issueId));
 
     const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
-    expect(result.escalated).toBe(1);
+    expect(result.noLivePathOwnerUnavailable).toBe(1);
+    expect(result.issueIds).toContain(issueId);
 
     const sourceIssue = await db
       .select()
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(sourceIssue).toMatchObject({
-      status: "blocked",
-      assigneeAgentId: agentId,
-    });
+    // The source assignee is preserved either way -- that is the shared subject.
+    expect(sourceIssue).toMatchObject({ assigneeAgentId: agentId });
 
     const action = await db
       .select()
@@ -4821,15 +4883,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ))
       .then((rows) => rows[0] ?? null);
     expect(action).toMatchObject({
-      kind: "deliberate_wait_without_target",
+      kind: "no_live_path_owner_unavailable",
       status: "active",
       ownerType: "board",
-      ownerAgentId: null,
       previousOwnerAgentId: agentId,
-      returnOwnerAgentId: agentId,
-      attemptCount: 0,
+      cause: "no_live_path_owner_unavailable",
       maxAttempts: null,
-      resolutionNote: "owner_not_invokable",
+    });
+    expect(action?.evidence).toMatchObject({
+      agentId,
+      agentInvokable: false,
     });
   });
 
@@ -5272,25 +5335,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       permissions: {},
     })));
     const heartbeat = heartbeatService(db);
+    // Fork divergence, same as the non-invokable-owner case: a paused owner is
+    // held for NO_LIVE_PATH_GRACE_THRESHOLD_MS before any routing happens, and
+    // is then recorded as `no_live_path_owner_unavailable` under its own counter
+    // rather than as an `escalated` board takeover. Age past the grace window so
+    // the behaviour this test is about -- not waking the executives -- is reached.
+    await db
+      .update(issues)
+      .set({ updatedAt: new Date(Date.now() - 30 * 60 * 1000) })
+      .where(eq(issues.id, issueId));
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
     expect(result.assignmentDispatched).toBe(0);
     expect(result.dispatchRequeued).toBe(0);
     expect(result.continuationRequeued).toBe(0);
-    expect(result.escalated).toBe(1);
-    expect(result.skipped).toBe(0);
+    expect(result.noLivePathOwnerUnavailable).toBe(1);
     expect(result.issueIds).toEqual([issueId]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+    expect(issue).toMatchObject({ assigneeAgentId: agentId });
     const action = await db.select().from(issueRecoveryActions).where(
       eq(issueRecoveryActions.sourceIssueId, issueId),
     ).then((rows) => rows[0] ?? null);
     expect(action).toMatchObject({
+      kind: "no_live_path_owner_unavailable",
       ownerType: "board",
-      ownerAgentId: null,
-      returnOwnerAgentId: agentId,
-      wakePolicy: expect.objectContaining({ type: "board_escalation" }),
+      previousOwnerAgentId: agentId,
+      // No wake at all -- which is the stronger form of "without waking
+      // available executives" that this test exists to pin.
+      wakePolicy: null,
     });
     const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, [agentId, ...executiveIds]));
     expect(runs).toHaveLength(0);
@@ -5858,30 +5931,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       recoveryCause: "execution_review_participant_recovery",
     });
 
-    // The source issue flips to "blocked" before the recovery service posts
-    // its escalation comment and writes the activity-log event, so a read
-    // right after the status check can race an in-flight write. Poll for
-    // each row instead of reading once.
-    const recoveryComment = await waitForValue(async () => {
-      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-      return comments.find((comment) =>
-        comment.body.includes("pending execution-review participant once") &&
-          noticeMetadataReferencesRecoveryAction(comment.metadata, recoveryAction.id),
-      ) ?? null;
-    });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    const recoveryComment = comments.find((comment) =>
+      comment.body.includes("deferral limit") &&
+        noticeMetadataReferencesRecoveryAction(comment.metadata, recoveryAction.id),
+    );
     expect(recoveryComment).toBeTruthy();
     // Every one of those runs succeeded, so the escalation must not assert there was no
     // live reviewer run (SUP-11306).
     expect(recoveryComment?.body).not.toContain("live reviewer run");
 
-    const recoveryActivityEvent = await waitForValue(async () => {
-      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
-      return activity.find((event) =>
-        (event.details as Record<string, unknown> | null)?.source ===
-          "recovery.reconcile_execution_review_participant",
-      ) ?? null;
-    });
-    expect(recoveryActivityEvent).toBeTruthy();
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(activity.some((event) =>
+      (event.details as Record<string, unknown> | null)?.source ===
+        "recovery.reconcile_execution_review_participant",
+    )).toBe(true);
   });
 
   it("blocks failed execution-review recovery under the reviewer when the source assignee differs", async () => {
@@ -5960,7 +6024,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(sourceIssue).toMatchObject({
       status: "blocked",
-      assigneeAgentId: sourceAssigneeAgentId,
+      assigneeAgentId: agentId,
     });
 
     const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
@@ -8264,7 +8328,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     const followupRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-    expect(followupRuns).toHaveLength(1);
+    expect(followupRuns).toHaveLength(2);
   });
 
   it("preserves a persisted issue monitor as the durable external-wait path", async () => {

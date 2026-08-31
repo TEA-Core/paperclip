@@ -2873,6 +2873,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ),
         routingFallbackReason: routing.routingFallbackReason,
       },
+      // Stamped once, at creation, so a later upsert cannot rewrite how the
+      // action was originally routed. This fork usually resolves an owner agent
+      // instead, so the marker belongs only on the board fall-through -- an
+      // agent takeover is not a no-takeover park. The condition mirrors the
+      // `ownerType` ternary above: stamped exactly when it resolves to "board".
+      evidenceOnCreate: !ownerAgentId && recoveryCause !== "provider_quota"
+        ? { routingPolicy: STRANDED_BOARD_ESCALATION_POLICY }
+        : {},
       nextAction: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
         ? "Choose and record a valid issue disposition without copying transcript content."
         : recoveryCause === "process_lost"
@@ -4601,6 +4609,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       latestRun = await getLatestIssueRun(issue.companyId, issue.id);
       if (isOperatorCancelledRun(latestRun)) {
         result.operatorCancelExempted += 1;
+        continue;
+      }
+      if (await isInvocationBudgetBlocked(issue, agentId)) {
+        const budgetClassification = classifyContinuationFailure(latestRun);
+        if (
+          budgetClassification.kind === "deliberate_wait_without_target" ||
+          readDispositionRepairAttempt(latestRun)
+        ) {
+          const outcome = await reconcileDispositionRepair(issue, latestRun);
+          if (outcome === "escalated") {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+        } else {
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: issue.status as StrandedPreviousStatus,
+            latestRun,
+            recoveryCause: issue.status === "in_review"
+              ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON
+              : undefined,
+            comment:
+              "Paperclip cannot safely continue automatic recovery because the original recovery target is over budget. " +
+              "The source assignment is unchanged and the board must choose the next action.",
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+        }
         continue;
       }
       if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
