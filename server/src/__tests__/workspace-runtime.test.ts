@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -69,6 +69,8 @@ import {
   readLocalServicePortOwner,
   writeLocalServiceRegistryRecord,
 } from "../services/local-service-supervisor.ts";
+import { logger } from "../middleware/logger.js";
+import type { EnsureSharedGroupOwnershipOptions } from "../services/shared-group-ownership.js";
 import {
   buildWorkspaceRealizationRecord,
   buildWorkspaceRealizationRequest,
@@ -87,6 +89,34 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+
+// SUP-14642: route the validator's shared-group self-repair through a hook so
+// the repair-path tests can drive ensureSharedGroupOwnership without re-importing
+// the (large) workspace-runtime module. When no hook is armed, the real helper
+// runs, so every other test in this file is unaffected.
+const sharedGroupRepairHook = vi.hoisted(() => ({
+  current:
+    null as
+      | null
+      | ((target: string, opts?: unknown) => Promise<void>),
+}));
+vi.mock("../services/shared-group-ownership.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../services/shared-group-ownership.js")>();
+  return {
+    ...actual,
+    ensureSharedGroupOwnership: async (
+      target: string,
+      opts?: EnsureSharedGroupOwnershipOptions,
+    ) => {
+      if (sharedGroupRepairHook.current) {
+        await sharedGroupRepairHook.current(target, opts);
+      } else {
+        await actual.ensureSharedGroupOwnership(target, opts);
+      }
+    },
+  };
+});
 
 const RUNTIME_OWNED_GIT_BRANCH_METADATA = {
   createdByRuntime: true,
@@ -548,6 +578,15 @@ describe("assertWorktreeWritableByProcessUser", () => {
     await expect(assertWorktreeWritableByProcessUser(worktreePath)).resolves.toBeUndefined();
   });
 
+  // SUP-14642: the validator now attempts a shared-group self-repair before
+  // throwing. These tests assert the throw path, so they inject a repair that
+  // cannot run (unknown group, silenced warnings) — otherwise the outcome
+  // would depend on whether the test host happens to have the shared group.
+  const noOpSharedGroupRepair = {
+    resolveGid: async () => null,
+    warn: () => {},
+  };
+
   it("throws when the worktree directory itself is not writable", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "PAP-10633-dir-not-writable";
@@ -557,7 +596,9 @@ describe("assertWorktreeWritableByProcessUser", () => {
     await fs.chmod(worktreePath, 0o555);
 
     try {
-      await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(/not writable/);
+      await expect(
+        assertWorktreeWritableByProcessUser(worktreePath, noOpSharedGroupRepair),
+      ).rejects.toThrow(/not writable/);
     } finally {
       await fs.chmod(worktreePath, 0o755);
     }
@@ -573,7 +614,9 @@ describe("assertWorktreeWritableByProcessUser", () => {
     await fs.chmod(path.join(worktreePath, "README.md"), 0o444);
 
     try {
-      await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(/not writable/);
+      await expect(
+        assertWorktreeWritableByProcessUser(worktreePath, noOpSharedGroupRepair),
+      ).rejects.toThrow(/not writable/);
     } finally {
       await fs.chmod(path.join(worktreePath, "README.md"), 0o644);
     }
@@ -622,12 +665,137 @@ describe("assertWorktreeWritableByProcessUser", () => {
 
     try {
       // The deletion is ignored; the real permission failure is still reported.
-      await expect(assertWorktreeWritableByProcessUser(worktreePath)).rejects.toThrow(
+      await expect(
+        assertWorktreeWritableByProcessUser(worktreePath, noOpSharedGroupRepair),
+      ).rejects.toThrow(
         /1 files not writable/,
       );
     } finally {
       await fs.chmod(path.join(worktreePath, "locked.md"), 0o644);
     }
+  });
+
+  // SUP-14642: the common unwritable-tracked-file case is a setgid escape —
+  // the file carries a foreign group and the server user is not in it, even
+  // though the mode is already group-writable. The validator must repair it
+  // via the shared-group helper and pass without throwing.
+  //
+  // A non-root test cannot manufacture a foreign owner or a group the process
+  // is not in (chown/chgrp need root), so the helper is armed through
+  // sharedGroupRepairHook to "make the path writable" — the validator's
+  // orchestration (probe, repair, re-probe, pass) is what is under test here.
+  // The helper's own chgrp/chmod behavior is covered in
+  // shared-group-ownership.test.ts.
+  const makeWritableRepair = async (target: string) => {
+    const stat = await fs.stat(target);
+    await fs.chmod(target, stat.isDirectory() ? 0o755 : 0o644);
+  };
+
+  it("repairs a tracked file the process user cannot write when the shared-group repair applies", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "SUP-14642-group-mismatch-repair";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    const tracked = path.join(worktreePath, "README.md");
+    await fs.chmod(tracked, 0o444); // no owner write: unwritable for the process user
+
+    const repairCalls: string[] = [];
+    sharedGroupRepairHook.current = async (target) => {
+      repairCalls.push(target);
+      await makeWritableRepair(target);
+    };
+    try {
+      await expect(
+        assertWorktreeWritableByProcessUser(worktreePath, {
+          resolveGid: async () => process.getgid(),
+        }),
+      ).resolves.toBeUndefined();
+    } finally {
+      sharedGroupRepairHook.current = null;
+    }
+
+    expect(repairCalls).toContain(worktreePath);
+    expect(repairCalls).toContain(tracked);
+  });
+
+  it("repairs a non-writable worktree root directory via the shared-group repair", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "SUP-14642-root-repair";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await fs.chmod(worktreePath, 0o555);
+
+    const repairCalls: string[] = [];
+    sharedGroupRepairHook.current = async (target) => {
+      repairCalls.push(target);
+      await fs.chmod(target, 0o755);
+    };
+    try {
+      await expect(
+        assertWorktreeWritableByProcessUser(worktreePath, {
+          resolveGid: async () => process.getgid(),
+        }),
+      ).resolves.toBeUndefined();
+    } finally {
+      sharedGroupRepairHook.current = null;
+    }
+
+    expect(repairCalls).toContain(worktreePath);
+  });
+
+  it("logs the repaired paths when the shared-group self-repair succeeds", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "SUP-14642-repair-log";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    const tracked = path.join(worktreePath, "README.md");
+    await fs.chmod(tracked, 0o444);
+
+    sharedGroupRepairHook.current = makeWritableRepair;
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    try {
+      await assertWorktreeWritableByProcessUser(worktreePath, {
+        resolveGid: async () => process.getgid(),
+      });
+      // Assert before the spy is restored — mockRestore() clears mock.calls.
+      const call = warnSpy.mock.calls.find(
+        (args) => typeof args[1] === "string" && args[1].includes("self-repair"),
+      );
+      expect(call?.[0]).toMatchObject({ worktreePath });
+      expect((call?.[0] as Record<string, unknown>).repairedPaths).toContain(tracked);
+    } finally {
+      sharedGroupRepairHook.current = null;
+      warnSpy.mockRestore();
+      await fs.chmod(tracked, 0o644);
+    }
+  });
+
+  it("throws with the chgrp/chmod g+w remediation ahead of any chown suggestion when the repair cannot fix the file", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "SUP-14642-repair-failure-message";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+    await fs.chmod(path.join(worktreePath, "README.md"), 0o444);
+
+    let message = "";
+    try {
+      await assertWorktreeWritableByProcessUser(worktreePath, noOpSharedGroupRepair);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    } finally {
+      await fs.chmod(path.join(worktreePath, "README.md"), 0o644);
+    }
+
+    expect(message).toMatch(/not writable/);
+    expect(message).toMatch(/chgrp -R/);
+    expect(message).toMatch(/chmod -R g\+w/);
+    expect(message.indexOf("chgrp")).toBeLessThan(message.indexOf("chown"));
   });
 
   it("throws when the path is not a valid git repository", async () => {

@@ -3731,7 +3731,10 @@ async function recordWorkspaceCommandOperation(
   );
 }
 
-export async function assertWorktreeWritableByProcessUser(worktreePath: string): Promise<void> {
+export async function assertWorktreeWritableByProcessUser(
+  worktreePath: string,
+  sharedGroupRepairOptions: EnsureSharedGroupOwnershipOptions = {},
+): Promise<void> {
   await assertGitIndexIntegrity(worktreePath);
   let trackedPaths: string[];
   try {
@@ -3752,48 +3755,85 @@ export async function assertWorktreeWritableByProcessUser(worktreePath: string):
 
   const uid = process.getuid != null ? process.getuid() : null;
   const gid = process.getgid != null ? process.getgid() : null;
-  const failures: string[] = [];
-  let totalFailures = 0;
   const MAX_FAILURES = 10;
 
-  if (await fs.access(worktreePath, fs.constants.W_OK).then(() => true, () => false)) {
-    // writable
-  } else {
-    failures.push(worktreePath);
-    totalFailures++;
-  }
-
-  for (const relPath of trackedPaths) {
-    const fullPath = path.join(worktreePath, relPath);
-    const writable = await fs.access(fullPath, fs.constants.W_OK).then(
-      () => true,
-      (err: NodeJS.ErrnoException) =>
-        // A tracked file that is absent is an uncommitted deletion — ordinary
-        // work in progress — and says nothing about whether we can write here.
-        // Treating ENOENT as a permission failure blocked provisioning for any
-        // issue whose agent had deleted a file, and told the operator to run a
-        // `chown` that could not have fixed it. Only real permission failures
-        // count; everything else this check exists for still reports.
-        err?.code === "ENOENT",
-    );
-    if (!writable) {
-      totalFailures++;
-      if (failures.length < MAX_FAILURES) {
-        failures.push(fullPath);
+  const probeUnwritablePaths = async (): Promise<string[]> => {
+    const unwritable: string[] = [];
+    if (!(await fs.access(worktreePath, fs.constants.W_OK).then(() => true, () => false))) {
+      unwritable.push(worktreePath);
+    }
+    for (const relPath of trackedPaths) {
+      const fullPath = path.join(worktreePath, relPath);
+      const writable = await fs.access(fullPath, fs.constants.W_OK).then(
+        () => true,
+        (err: NodeJS.ErrnoException) =>
+          // A tracked file that is absent is an uncommitted deletion — ordinary
+          // work in progress — and says nothing about whether we can write here.
+          // Treating ENOENT as a permission failure blocked provisioning for any
+          // issue whose agent had deleted a file, and told the operator to run a
+          // `chown` that could not have fixed it. Only real permission failures
+          // count; everything else this check exists for still reports.
+          err?.code === "ENOENT",
+      );
+      if (!writable) {
+        unwritable.push(fullPath);
       }
     }
+    return unwritable;
+  };
+
+  let unwritable = await probeUnwritablePaths();
+
+  if (unwritable.length > 0) {
+    // SUP-14642: the common cause of an unwritable tracked file here is NOT a
+    // foreign owner — it is a foreign GROUP. Worktree roots are setgid, so
+    // files normally inherit the shared group and the server user writes them
+    // through the group bit; a rename/mv into place preserves the source
+    // group and drops the file out of that model (664, group not the shared
+    // one, writable only to the owning agent uid). Prescribing `chown -R`
+    // was the wrong remediation twice over: agents do not hold root, and
+    // running it would strip every file out of the shared-group model. The
+    // shared-group repair the provisioning path already runs at four other
+    // sites in this module is the right one, so attempt it here and re-probe
+    // before anyone is told to touch the host.
+    await ensureSharedGroupOwnership(worktreePath, sharedGroupRepairOptions);
+    for (const fullPath of unwritable) {
+      if (fullPath === worktreePath) continue;
+      await ensureSharedGroupOwnership(fullPath, sharedGroupRepairOptions);
+    }
+    const surviving = await probeUnwritablePaths();
+    if (surviving.length === 0) {
+      logger.warn(
+        {
+          worktreePath,
+          repairedPathCount: unwritable.length,
+          repairedPaths: unwritable.slice(0, MAX_FAILURES),
+        },
+        "worktree writability self-repair: shared-group repair (chgrp + group write) restored server-user write access; continuing provisioning",
+      );
+      return;
+    }
+    unwritable = surviving;
   }
 
-  if (totalFailures > 0) {
+  if (unwritable.length > 0) {
+    const shown = unwritable.slice(0, MAX_FAILURES);
     const uidPart = uid != null ? `uid ${uid}` : "current user";
     const gidPart = gid != null ? `:${gid}` : "";
+    const sharedGroupName = sharedGroupRepairOptions.groupName ?? "agents";
     throw new Error(
-      `Execution worktree at ${worktreePath} contains ${totalFailures} files not writable by the server user (${uidPart}${gidPart}) (showing first ${failures.length}): ${failures.join(", ")}. A host-side process likely wrote them as another user (e.g. root). Repair on the host with: chown -R ${uid != null ? uid : ""}${gidPart} ${worktreePath} — then retry provisioning.`,
+      `Execution worktree at ${worktreePath} still contains ${unwritable.length} files not writable by the server user (${uidPart}${gidPart}) after a shared-group self-repair attempt (showing first ${shown.length}): ${shown.join(", ")}. ` +
+        `Most likely cause: a tracked file escaped the worktree root's setgid inheritance and carries a group the server user is not in (its mode is usually already group-writable). Repair on the host with: chgrp -R ${sharedGroupName} ${worktreePath} && chmod -R g+w ${worktreePath} — then retry provisioning. ` +
+        `Fall back to chown only when a path is genuinely owned by another user (e.g. root) that the group repair cannot reach: chown -R ${uid != null ? uid : ""}${gidPart} ${worktreePath}.`,
     );
   }
 }
 
-import { ensureSharedGroupOwnership, ensureSharedGroupTraversalPath } from "./shared-group-ownership.js";
+import {
+  ensureSharedGroupOwnership,
+  ensureSharedGroupTraversalPath,
+  type EnsureSharedGroupOwnershipOptions,
+} from "./shared-group-ownership.js";
 
 /**
  * SUP-13090: pnpm refuses a frozen install when the committed lockfile disagrees
