@@ -51,10 +51,19 @@ const execFileAsync = promisify(execFile);
 
 describe("execution workspace delivery state", () => {
   it.each([
-    [{ sourceIssueTerminal: true, mergedPullRequest: true, pullRequestStateUnknown: false, isMergedIntoBase: false }, "merged_via_pr"],
-    [{ sourceIssueTerminal: false, mergedPullRequest: false, pullRequestStateUnknown: false, isMergedIntoBase: true }, "merged_by_ancestry"],
-    [{ sourceIssueTerminal: true, mergedPullRequest: false, pullRequestStateUnknown: false, isMergedIntoBase: false }, "unmerged"],
-    [{ sourceIssueTerminal: true, mergedPullRequest: false, pullRequestStateUnknown: true, isMergedIntoBase: false }, "unknown"],
+    // AC2: a recorded merged marker is the only path to merged_via_pr, and it
+    // wins even when an unmerged record is also present.
+    [{ hasMergedPullRequestProduct: true, hasUnmergedPullRequestProduct: false, aheadOfBase: false }, "merged_via_pr"],
+    [{ hasMergedPullRequestProduct: true, hasUnmergedPullRequestProduct: true, aheadOfBase: true }, "merged_via_pr"],
+    // AC3: unmerged requires BOTH a branch ahead of base AND a recorded
+    // non-merged PR.
+    [{ hasMergedPullRequestProduct: false, hasUnmergedPullRequestProduct: true, aheadOfBase: true }, "unmerged"],
+    // Ahead but no unmerged record, or a record but the branch is not ahead:
+    // neither is enough for unmerged.
+    [{ hasMergedPullRequestProduct: false, hasUnmergedPullRequestProduct: true, aheadOfBase: false }, "unknown"],
+    [{ hasMergedPullRequestProduct: false, hasUnmergedPullRequestProduct: false, aheadOfBase: true }, "unknown"],
+    // AC4: absent PR record fails safe to unknown.
+    [{ hasMergedPullRequestProduct: false, hasUnmergedPullRequestProduct: false, aheadOfBase: false }, "unknown"],
   ] as const)("derives %s as %s", (input, expected) => {
     expect(deriveExecutionWorkspaceDeliveryState(input)).toBe(expected);
   });
@@ -247,20 +256,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   let svc!: ReturnType<typeof executionWorkspaceService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const tempDirs = new Set<string>();
-  const pullRequestDetailsByKey = new Map<string, {
-    state: "merged" | "open" | "unknown";
-    headRef: string | null;
-    headSha: string | null;
-  }>();
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-execution-workspaces-service-");
     db = createDb(tempDb.connectionString);
     svc = executionWorkspaceService(db, {
-      resolvePullRequestDetails: vi.fn(async (companyId, reference) =>
-        pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
-        ?? { state: "unknown", headRef: null, headSha: null }
-      ),
       // Disable the reaper cooldown for the delivery, terminal, race, and
       // cleanup tests. They assert immediate reaping. The cooldown gets its own
       // tests further down.
@@ -283,7 +283,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
-    pullRequestDetailsByKey.clear();
 
     for (const dir of tempDirs) {
       await fs.rm(dir, { recursive: true, force: true });
@@ -322,7 +321,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
-    expect(readiness?.deliveryState).toBe("unmerged");
+    // The parent's source issue has no recorded PR, so its delivery state is
+    // unknown; the descendant's merged PR is not evidence for the parent.
+    expect(readiness?.deliveryState).toBe("unknown");
     expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
     expect(parentWorkspace?.status).toBe("active");
   });
@@ -410,23 +411,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         title: "Delivered PR",
         url: "https://github.com/paperclipai/paperclip/pull/10623",
         status: "merged",
+        metadata: { mergedAt: "2026-01-01T00:00:00Z" },
       });
     }
-    pullRequestDetailsByKey.set(`${companyId}:10623`, {
-      state: "merged",
-      headRef: "PAP-16015-delivery",
-      headSha,
-    });
-    pullRequestDetailsByKey.set(`${companyId}:10624`, {
-      state: "merged",
-      headRef: "unrelated-delivery",
-      headSha,
-    });
-    pullRequestDetailsByKey.set(`${companyId}:10625`, {
-      state: "merged",
-      headRef: "descendant-delivery",
-      headSha,
-    });
     if (options.activeRun) {
       const agentId = randomUUID();
       const runId = randomUUID();
@@ -464,11 +451,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await runGit(worktreePath, ["commit", "-m", "Delivered change"]);
 
     const seeded = await seedTerminalWorkspace();
-    pullRequestDetailsByKey.set(`${seeded.companyId}:10623`, {
-      state: "merged",
-      headRef: "PAP-16015-delivery",
-      headSha: await readGit(worktreePath, ["rev-parse", "HEAD"]),
-    });
     await db.update(executionWorkspaces).set({
       cwd: worktreePath,
       providerRef: worktreePath,
@@ -485,6 +467,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Cross-branch delivery",
       url: "https://github.com/paperclipai/paperclip/pull/10623",
       status: "merged",
+      metadata: { mergedAt: "2026-01-01T00:00:00Z" },
     });
 
     const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
@@ -511,10 +494,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(archived?.cleanupEligibleAt).toBeInstanceOf(Date);
   }, 20_000);
 
-  async function seedAncestryTerminalWorkspace(overrides: { updatedAt?: Date } = {}) {
-    // Build a worktree whose HEAD equals the base ref, so HEAD is an ancestor
-    // of the base. This workspace landed by ancestry and carries no tracked
-    // pull request, so delivery derives to merged_by_ancestry.
+  async function seedAncestryTerminalWorkspace(overrides: { updatedAt?: Date; mergedPr?: boolean } = {}) {
+    // Build a worktree whose HEAD equals the base ref (zero commits ahead).
+    // With no recorded PR the delivery verdict is unknown — ancestry is no
+    // longer a verdict input (SUP-14644). Pass mergedPr to attach a recorded
+    // merged marker so the workspace is reapeable via merged_via_pr.
     const repoRoot = await createTempRepo();
     tempDirs.add(repoRoot);
     const worktreePath = path.join(path.dirname(repoRoot), `paperclip-ancestry-${randomUUID()}`);
@@ -569,24 +553,38 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       .update(executionWorkspaces)
       .set({ sourceIssueId, ...(overrides.updatedAt ? { updatedAt: overrides.updatedAt } : {}) })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    if (overrides.mergedPr) {
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId: sourceIssueId,
+        type: "pull_request",
+        provider: "github",
+        title: "Ancestry delivery PR",
+        url: "https://github.com/paperclipai/paperclip/pull/10626",
+        status: "merged",
+        metadata: { mergedAt: "2026-01-01T00:00:00Z" },
+      });
+    }
     return { companyId, projectId, executionWorkspaceId, sourceIssueId, worktreePath };
   }
 
-  it("archives a terminal workspace delivered by ancestry with no pull request", async () => {
+  it("leaves a terminal workspace with no recorded PR verdict as unknown and does not archive it", async () => {
     const seeded = await seedAncestryTerminalWorkspace();
 
     const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
-    expect(readiness?.deliveryState).toBe("merged_by_ancestry");
+    expect(readiness?.deliveryState).toBe("unknown");
     expect(readiness?.blockingReasons).toEqual([]);
 
     const sweep = await svc.sweepTerminalWorkspaces();
     const [workspace] = await db
-      .select({ status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
+      .select({ status: executionWorkspaces.status })
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
-    expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
-    expect(workspace).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
+    // Ancestry is no longer a verdict input, so a no-PR terminal workspace is
+    // unknown and the reaper must not archive it.
+    expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    expect(workspace?.status).toBe("active");
   }, 20_000);
 
   it("fails closed before archive when git status inspection is unavailable", async () => {
@@ -618,7 +616,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   }, 20_000);
 
   it("fails the final cleanup fence when a later git status scan is unavailable", async () => {
-    const seeded = await seedAncestryTerminalWorkspace();
+    const seeded = await seedAncestryTerminalWorkspace({ mergedPr: true });
     const originalRun = workspaceGitOperationScheduler.run.bind(workspaceGitOperationScheduler);
     let statusScanCount = 0;
     const statusSpy = vi.spyOn(workspaceGitOperationScheduler, "run")
@@ -641,7 +639,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // The scheduler can start a second sweep before the first one finishes. The
     // sweeps share the cursor and the boundary. A concurrent sweep must skip
     // instead of running, so it cannot corrupt the shared rotation state.
-    const seeded = await seedAncestryTerminalWorkspace();
+    const seeded = await seedAncestryTerminalWorkspace({ mergedPr: true });
 
     // Start the first sweep and do not wait. An async function runs its body up
     // to the first await, so the in-progress flag is set before the second call
@@ -719,13 +717,12 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         .where(eq(executionWorkspaces.id, workspaceId));
     }
     // The eligible workspace is newest, so it sorts after the whole skipped page.
-    const eligible = await seedAncestryTerminalWorkspace({ updatedAt: new Date(Date.UTC(2020, 0, 9)) });
+    const eligible = await seedAncestryTerminalWorkspace({ mergedPr: true, updatedAt: new Date(Date.UTC(2020, 0, 9)) });
 
     // A fresh service starts with an empty scan cursor, so each call inspects
     // one row and advances. A single-row page never lands on the eligible
     // workspace first.
     const service = executionWorkspaceService(db, {
-      resolvePullRequestDetails: async () => ({ state: "unknown", headRef: null, headSha: null }),
       workspaceReaperCooldownDays: 0,
     });
 
@@ -765,14 +762,13 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // cover a finite set, so the cursor resets and the workspace is archived.
     let clockMs = Date.UTC(2021, 6, 1);
     const service = executionWorkspaceService(db, {
-      resolvePullRequestDetails: async () => ({ state: "unknown", headRef: null, headSha: null }),
       now: () => new Date(clockMs),
       workspaceReaperCooldownDays: 0,
     });
 
     // An eligible ancestry workspace with an old updatedAt. Its source issue
     // starts non-terminal, so the first sweeps skip it and pass the cursor.
-    const eligible = await seedAncestryTerminalWorkspace({ updatedAt: new Date(Date.UTC(2021, 0, 2)) });
+    const eligible = await seedAncestryTerminalWorkspace({ mergedPr: true, updatedAt: new Date(Date.UTC(2021, 0, 2)) });
     await db
       .update(issues)
       .set({ status: "in_progress" })
@@ -876,9 +872,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
     function cooldownService(cooldownDays: number) {
       return executionWorkspaceService(db, {
-        resolvePullRequestDetails: async (companyId, reference) =>
-          pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
-          ?? { state: "unknown", headRef: null, headSha: null },
         now: () => new Date(nowMs),
         workspaceReaperCooldownDays: cooldownDays,
       });
@@ -1011,7 +1004,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
-    expect(readiness?.deliveryState).toBe("unmerged");
+    // The source issue has no recorded PR of its own, so its delivery state is
+    // unknown; the unrelated issue's PR is not delivery evidence for it.
+    expect(readiness?.deliveryState).toBe("unknown");
     expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
     expect(workspace).toMatchObject({
       status: "active",
@@ -1057,8 +1052,8 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(workspace?.status).toBe("active");
   });
 
-  it("does not trust a previously merged PR after new workspace commits", async () => {
-    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+  it("does not reap undelivered committed work without a recorded merge marker", async () => {
+    const seeded = await seedTerminalWorkspace();
     await fs.writeFile(path.join(seeded.worktreePath, "new-work.txt"), "not delivered\n", "utf8");
     await runGit(seeded.worktreePath, ["add", "new-work.txt"]);
     await runGit(seeded.worktreePath, ["commit", "-m", "New undelivered work"]);
@@ -1070,7 +1065,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
-    expect(readiness?.deliveryState).toBe("unmerged");
+    expect(readiness?.deliveryState).toBe("unknown");
     expect(readiness?.warnings).toContain(
       "This workspace is 2 commits ahead of main and is not merged.",
     );
@@ -1104,8 +1099,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       },
     }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
     const racingService = executionWorkspaceService(db, {
-      resolvePullRequestDetails: async (_companyId, reference) =>
-        pullRequestDetailsByKey.get(`${seeded.companyId}:${reference.number}`) ?? { state: "unknown" },
       beforeTerminalWorkspaceCleanup: async () => {
         await fs.writeFile(path.join(seeded.worktreePath, "late-work.txt"), "not delivered\n", "utf8");
       },
@@ -1134,8 +1127,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
     const newerReason = "newer_archive_lifecycle_marker";
     const racingService = executionWorkspaceService(db, {
-      resolvePullRequestDetails: async (_companyId, reference) =>
-        pullRequestDetailsByKey.get(`${seeded.companyId}:${reference.number}`) ?? { state: "unknown" },
       workspaceReaperCooldownDays: 0,
       beforeTerminalWorkspaceCleanup: async (workspace) => {
         // Stand in for a reopen and a fresh archive that ran after this sweep
@@ -1738,8 +1729,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     const failSeed = await seedTerminalWorkspace({ mergedPr: true });
     const newerReason = "newer_archive_lifecycle_marker";
     const racingService = executionWorkspaceService(db, {
-      resolvePullRequestDetails: async (_companyId, reference) =>
-        pullRequestDetailsByKey.get(`${failSeed.companyId}:${reference.number}`) ?? { state: "unknown" },
       workspaceReaperCooldownDays: 0,
       beforeTerminalWorkspaceCleanup: async (workspace) => {
         await db
@@ -1784,8 +1773,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     let commitFailure = "";
     let refUpdateFailure = "";
     const lockingService = executionWorkspaceService(db, {
-      resolvePullRequestDetails: async (_companyId, reference) =>
-        pullRequestDetailsByKey.get(`${seeded.companyId}:${reference.number}`) ?? { state: "unknown" },
       beforeTerminalWorkspaceCleanup: async () => {
         try {
           await runGit(seeded.worktreePath, ["commit", "--allow-empty", "-m", "Late commit"]);
@@ -5017,7 +5004,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
     expect(readiness).toMatchObject({
       workspaceId: executionWorkspaceId,
-      deliveryState: "unmerged",
+      deliveryState: "unknown",
       state: "ready_with_warnings",
       isSharedWorkspace: false,
       isProjectPrimaryWorkspace: false,

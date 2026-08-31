@@ -48,13 +48,6 @@ import {
 } from "./execution-workspace-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { logActivity } from "./activity-log.js";
-import {
-  createPullRequestMergeDetailsResolver,
-  extractGitHubPullRequestReferences,
-  setBoundedPullRequestCacheEntry,
-  type GitHubPullRequestReference,
-  type PullRequestMergeDetailsResolver,
-} from "./github-pull-request-merge.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { createGitRemoteAuthProvider } from "./git-credentials.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
@@ -229,7 +222,6 @@ export type ReopenClosedIsolatedExecutionWorkspaceResult =
   | { ok: false; code: "not_reopenable" | "rebuild_failed"; message: string };
 
 export type ExecutionWorkspaceServiceOptions = {
-  resolvePullRequestDetails?: PullRequestMergeDetailsResolver;
   now?: () => Date;
   beforeTerminalWorkspaceCleanup?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
   // The terminal-workspace reaper waits this many days after an issue tree
@@ -238,34 +230,21 @@ export type ExecutionWorkspaceServiceOptions = {
   workspaceReaperCooldownDays?: number;
 };
 
-function parseGitHubRepository(repoUrl: string | null) {
-  if (!repoUrl) return null;
-  const match = /^(?:https?:\/\/(?:www\.)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(repoUrl.trim());
-  if (!match) return null;
-  return { owner: match[1]!.toLowerCase(), repo: match[2]!.toLowerCase() };
-}
-
-function pullRequestMatchesWorkspaceRepository(
-  reference: GitHubPullRequestReference,
-  workspace: Pick<ExecutionWorkspaceRow, "repoUrl">,
-) {
-  const repository = parseGitHubRepository(workspace.repoUrl);
-  return Boolean(
-    repository
-    && repository.owner === reference.owner.toLowerCase()
-    && repository.repo === reference.repo.toLowerCase(),
-  );
-}
-
 export function deriveExecutionWorkspaceDeliveryState(input: {
-  sourceIssueTerminal: boolean;
-  mergedPullRequest: boolean;
-  pullRequestStateUnknown: boolean;
-  isMergedIntoBase: boolean | null;
+  hasMergedPullRequestProduct: boolean;
+  hasUnmergedPullRequestProduct: boolean;
+  aheadOfBase: boolean;
 }): ExecutionWorkspaceDeliveryState {
-  if (input.sourceIssueTerminal && input.mergedPullRequest) return "merged_via_pr";
-  if (input.isMergedIntoBase === true) return "merged_by_ancestry";
-  if (input.isMergedIntoBase === false && !input.pullRequestStateUnknown) return "unmerged";
+  // SUP-14644 (ruling SUP-14643): the verdict is recorded-state only.
+  // R2: a recorded merged marker (status "merged" + non-null mergedAt) is the
+  // only path to merged_via_pr; a PR row without the marker never suffices.
+  // R3: unmerged requires both an unmerged branch and a recorded non-merged
+  // PR; without a PR record the answer is not unmerged.
+  // R4: everything else fails safe to unknown.
+  // R1: ancestry-derived merged verdicts are retired; the ancestor test
+  // survives only as a git-readiness corroborator, never as a verdict input.
+  if (input.hasMergedPullRequestProduct) return "merged_via_pr";
+  if (input.aheadOfBase && input.hasUnmergedPullRequestProduct) return "unmerged";
   return "unknown";
 }
 
@@ -1366,7 +1345,6 @@ type WorkspaceOverviewIssueRow = WorkspaceOverviewLinkedIssue & {
 
 export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServiceOptions = {}) {
   const recoveryActionsSvc = issueRecoveryActionService(db);
-  const resolvePullRequestDetails = opts.resolvePullRequestDetails ?? createPullRequestMergeDetailsResolver(db);
   const now = opts.now ?? (() => new Date());
   // The reaper waits this long after an issue tree becomes terminal before it
   // archives the workspace. A value of 0 disables the cooldown, so the reaper
@@ -1376,14 +1354,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     0,
     (opts.workspaceReaperCooldownDays ?? 7) * 24 * 60 * 60 * 1000,
   );
-  const pullRequestStateCache = new Map<
-    string,
-    {
-      details: Awaited<ReturnType<PullRequestMergeDetailsResolver>>;
-      checkedAtMs: number;
-    }
-  >();
-  const pullRequestStateCacheTtlMs = 5 * 60 * 1000;
 
   // SUP-14139: path exclusivity. Two live rows over one worktree path is how two
   // issues ended up undecidable in a single directory (SUP-13445/SUP-14124). The
@@ -1510,6 +1480,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         externalId: issueWorkProducts.externalId,
         title: issueWorkProducts.title,
         summary: issueWorkProducts.summary,
+        status: issueWorkProducts.status,
         metadata: issueWorkProducts.metadata,
       })
       .from(issueWorkProducts)
@@ -1541,66 +1512,33 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         cooldownAnchor = terminalAt;
       }
     }
-    let mergedPullRequest = false;
-    let pullRequestStateUnknown = false;
     const workspaceHeadSha = git?.repoRoot && git.workspacePath
       ? await runGit(["rev-parse", "HEAD"], git.workspacePath)
         .then((result) => result.stdout.trim() || null)
         .catch(() => null)
       : null;
 
-    if (sourceIssueTerminal) {
-      const products = await listDeliveryPullRequestProducts(workspace);
-      for (const product of products) {
-        const references = extractGitHubPullRequestReferences([
-          product.url,
-          product.externalId,
-          product.title,
-          product.summary,
-          product.metadata ? JSON.stringify(product.metadata) : null,
-        ]);
-        if (references.length === 0) continue;
-        for (const reference of references) {
-          if (!pullRequestMatchesWorkspaceRepository(reference, workspace)) continue;
-          const key = `${workspace.companyId}:${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`;
-          const cached = pullRequestStateCache.get(key);
-          let details;
-          if (cached && now().getTime() - cached.checkedAtMs < pullRequestStateCacheTtlMs) {
-            details = cached.details;
-          } else {
-            details = await resolvePullRequestDetails(workspace.companyId, reference);
-            setBoundedPullRequestCacheEntry(
-              pullRequestStateCache,
-              key,
-              { details, checkedAtMs: now().getTime() },
-            );
-          }
-          if (
-            details.state === "merged"
-            && details.headRef === workspace.branchName
-            && details.headSha === workspaceHeadSha
-            && workspaceHeadSha !== null
-          ) {
-            mergedPullRequest = true;
-            break;
-          }
-          if (
-            details.state === "unknown"
-            || (details.state === "merged" && (!details.headRef || !details.headSha || !workspaceHeadSha))
-          ) {
-            pullRequestStateUnknown = true;
-          }
-        }
-        if (mergedPullRequest) break;
-      }
-    }
+    // SUP-14644 (ruling SUP-14643): the delivery verdict is derived from
+    // recorded work-product state only. A recorded merged marker
+    // (status "merged" + a non-empty metadata.mergedAt) is the sole path to
+    // merged_via_pr. Any pull_request product without the full merged marker
+    // counts as an unmerged record. No live GitHub resolution and no ancestry
+    // inference feed the verdict; absent a PR record the state fails safe to
+    // unknown downstream.
+    const deliveryPullRequestProducts = await listDeliveryPullRequestProducts(workspace);
+    const hasMergedMarker = (product: (typeof deliveryPullRequestProducts)[number]): boolean =>
+      product.status === "merged"
+      && product.metadata?.mergedAt != null
+      && product.metadata?.mergedAt !== "";
+    const hasMergedPullRequestProduct = deliveryPullRequestProducts.some((product) => hasMergedMarker(product));
+    const hasUnmergedPullRequestProduct = deliveryPullRequestProducts.some((product) => !hasMergedMarker(product));
+    const aheadOfBase = typeof git?.aheadCount === "number" && git.aheadCount > 0;
 
     return {
       deliveryState: deriveExecutionWorkspaceDeliveryState({
-        sourceIssueTerminal,
-        mergedPullRequest,
-        pullRequestStateUnknown,
-        isMergedIntoBase: git?.isMergedIntoBase ?? null,
+        hasMergedPullRequestProduct,
+        hasUnmergedPullRequestProduct,
+        aheadOfBase,
       }),
       sourceIssueTerminal,
       subtreeTerminal,
