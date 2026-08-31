@@ -140,6 +140,7 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
   no_live_path_owner_unavailable: "Owner Unavailable",
   blocked_without_blockers: "Blocked Without Blockers",
   pending_review_rearm_cap_exhausted: "Review Re-arm Cap Exhausted",
+  undispatchable_assignee: "Undispatchable Assignee",
 };
 
 const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
@@ -167,6 +168,8 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "This task is marked blocked, but nothing is blocking it any more.",
   pending_review_rearm_cap_exhausted:
     "This task's review has been re-surfaced the maximum number of times without a decision.",
+  undispatchable_assignee:
+    "This task's assigned agent can never be dispatched to (pull-only). A human needs to reassign it to a dispatchable agent or take it over.",
 };
 
 /** Shared shell for the retry-timing pill so every timing state reads as the same control. */

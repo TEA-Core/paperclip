@@ -10,6 +10,11 @@ import {
   agentWakeupRequests,
   activityLog,
   costEvents,
+  decisionQueueItems,
+  decisionQueues,
+  decisionRetention,
+  decisionTriage,
+  decisionTriageEvents,
   heartbeatRunEvents,
   heartbeatRuns,
   issueExecutionDecisions,
@@ -965,6 +970,29 @@ export function agentService(db: Db) {
         );
         await tx.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.actorAgentId, id));
         await tx.delete(issueComments).where(eq(issueComments.authorAgentId, id));
+        // Decision-table actor rows carry check constraints tying the 'agent'
+        // actor type to a non-null agent FK. Re-label this agent's rows as
+        // system-owned before the FKs detach (migration 0222) so the rows
+        // survive agent deletion with their history intact.
+        await tx
+          .update(decisionQueues)
+          .set({ createdByType: "system", createdByAgentId: null })
+          .where(eq(decisionQueues.createdByAgentId, id));
+        await tx
+          .update(decisionQueueItems)
+          .set({ addedByType: "system", addedByAgentId: null })
+          .where(eq(decisionQueueItems.addedByAgentId, id));
+        // decision_triage_actor_check has no 'system' branch, so triage state
+        // rows this agent set cannot be re-labeled; delete them instead.
+        await tx.delete(decisionTriage).where(eq(decisionTriage.setByAgentId, id));
+        await tx
+          .update(decisionTriageEvents)
+          .set({ actorType: "system", actorAgentId: null })
+          .where(eq(decisionTriageEvents.actorAgentId, id));
+        await tx
+          .update(decisionRetention)
+          .set({ archivedByType: "system", archivedByAgentId: null })
+          .where(eq(decisionRetention.archivedByAgentId, id));
         await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, id));
         await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
         await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));

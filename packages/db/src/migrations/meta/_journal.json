@@ -1674,6 +1674,20 @@
       "when": 1787780685406,
       "tag": "0268_better_auth_account_issuer",
       "breakpoints": true
+    },
+    {
+      "idx": 239,
+      "version": "7",
+      "when": 1787953983365,
+      "tag": "0222_agent_delete_fk_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 240,
+      "version": "7",
+      "when": 1788040950632,
+      "tag": "0223_agent_delete_fk_policies_validate",
+      "breakpoints": true
     }
   ]
 }

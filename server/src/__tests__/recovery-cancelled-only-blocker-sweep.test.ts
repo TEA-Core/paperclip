@@ -237,7 +237,7 @@ describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents
     expect(result.issueIds).toEqual([]);
   });
 
-  it("idempotent: two consecutive calls report the same set and mutate nothing", async () => {
+  it("idempotent: two consecutive calls report the same set and emit exactly one detection row", async () => {
     const { companyId, agentId } = await seed();
     const blockedId = await createBlockedIssue(companyId, agentId, "Blocked dependent");
     const blockerId = await createBlocker(companyId, "cancelled", "Cancelled blocker");
@@ -252,11 +252,13 @@ describeEmbeddedPostgres("recovery sweep reconcileCancelledOnlyBlockerDependents
     expect(second.reported).toBe(1);
     expect(second.issueIds).toEqual([blockedId]);
 
+    // SUP-14539: emission is edge-triggered on the durable record, so the
+    // unchanged second call reports the set again but writes no second row.
     const audits = await db
       .select({ id: activityLog.id })
       .from(activityLog)
       .where(eq(activityLog.action, "issue.cancelled_blocker_dependent_detected"));
-    expect(audits).toHaveLength(2);
+    expect(audits).toHaveLength(1);
   });
 
   it("invariant probe: before/after snapshot of issues.status and issue_blockers rows is byte-equal", async () => {

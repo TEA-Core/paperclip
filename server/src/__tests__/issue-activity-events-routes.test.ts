@@ -559,10 +559,18 @@ describe("issue activity event routes", () => {
     const dbMock = {
       transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({}),
       select: () => ({
-        from: () => ({
-          where: () => ({
-            orderBy: async () => [handoffActivityRow],
-          }),
+        from: (table: unknown) => ({
+          where: () => {
+            const tableName = getTableName(table as Parameters<typeof getTableName>[0]);
+            if (tableName === "issues") {
+              // SUP-14561 mechanism A: the guard counts this issue's laddered
+              // children on a plain issues-table select. This issue has none.
+              return Promise.resolve([]);
+            }
+            return {
+              orderBy: async () => [handoffActivityRow],
+            };
+          },
           // The done-transition guard resolves linked pull requests with a
           // joined select. This issue has none.
           innerJoin: () => ({ where: async () => [] }),

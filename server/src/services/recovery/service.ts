@@ -47,7 +47,7 @@ import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
-import { logActivity } from "../activity-log.js";
+import { logActivity, redactActivityDetails } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { authorizationService } from "../authorization.js";
@@ -150,7 +150,16 @@ let lastStillbornAssignedBacklogLogAt: Date | null = null;
 let lastCancelledOnlyBlockerDependentLogAt: Date | null = null;
 const UNDISPATCHABLE_ASSIGNED_CANDIDATE_LIMIT = 100;
 const UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS = 5 * 60_000;
-const lastUndispatchableAssignedIssueLogAt = new Map<string, Date>();
+// SUP-14565: the first-class recovery action the undispatchable-assigned
+// sweep opens once the condition is confirmed across two sweep cycles.
+const UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND = "undispatchable_assignee" as const;
+const UNDISPATCHABLE_ASSIGNEE_RECOVERY_CAUSE = "undispatchable_assignee";
+// Bounded memory guard for the per-issue two-cycle confirmation counter: the
+// map only ever holds cards observed with the condition true, and entries are
+// deleted when a card is observed cleared or its action is resolved. A full
+// reset is safe (it only delays escalation one cycle for tracked cards; open
+// actions live in the DB, not here).
+const UNDISPATCHABLE_ASSIGNED_SIGHT_COUNTS_LIMIT = 10_000;
 let lastUndispatchableAssignedSweepLogAt: Date | null = null;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
@@ -947,6 +956,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
   let undispatchableAssignedScanCursor: string | null = null;
+  // Two-cycle confirmation counter (SUP-14565): issueId -> number of sweep
+  // cycles the card has been observed with the undispatchable-assigned
+  // condition true. Per service instance, so a control-plane restart counts
+  // first-sight again; open recovery actions themselves are persisted and
+  // unaffected by the restart.
+  const undispatchableAssignedSightCounts = new Map<string, number>();
 
   async function getAgent(agentId: string) {
     return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
@@ -8279,6 +8294,64 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  // SUP-14539: edge-trigger gate shared by the report-only recovery sweeps.
+  // A sweep writes one detection row when an (issue, condition) pair enters the
+  // reported set, or when its `details` payload changes materially — never on a
+  // timer. The state-change check is derived from the durable record: the most
+  // recent activity row for this entityId + action. When that row's details are
+  // equivalent to the would-be details, the condition is unchanged and no row
+  // is written. Because the check reads the activity_log table instead of
+  // in-memory state, a control-plane restart cannot reset it.
+  function stableSweepDetailsKey(value: unknown): string {
+    if (value === null || value === undefined) return "null";
+    if (Array.isArray(value)) return `[${value.map((v) => stableSweepDetailsKey(v)).join(",")}]`;
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      const keys = Object.keys(record).sort();
+      return `{${keys.map((key) => `${JSON.stringify(key)}:${stableSweepDetailsKey(record[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(value) ?? "null";
+  }
+
+  async function emitSweepDetectionRowIfChanged(params: {
+    companyId: string;
+    entityId: string;
+    action: string;
+    details: Record<string, unknown>;
+  }): Promise<boolean> {
+    // Compare against the value that will actually be stored: logActivity
+    // redacts details before persisting, so the durable row is the redacted
+    // form and the comparison must be too.
+    const redactedDetails = await redactActivityDetails(db, params.details);
+    const [latest] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, params.entityId),
+          eq(activityLog.action, params.action),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1);
+    if (latest && stableSweepDetailsKey(latest.details) === stableSweepDetailsKey(redactedDetails)) {
+      return false;
+    }
+    await logActivity(db, {
+      companyId: params.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: params.action,
+      entityType: "issue",
+      entityId: params.entityId,
+      details: params.details,
+    });
+    return true;
+  }
+
   async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null; limit?: number }) {
     const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
     const seen = new Set<string>();
@@ -8382,15 +8455,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       result.reported += 1;
       result.issueIds.push(candidate.id);
 
-      await logActivity(db, {
+      await emitSweepDetectionRowIfChanged({
         companyId: candidate.companyId,
-        actorType: "system",
-        actorId: "system",
-        agentId: null,
-        runId: null,
-        action: "issue.cancelled_blocker_dependent_detected",
-        entityType: "issue",
         entityId: candidate.id,
+        action: "issue.cancelled_blocker_dependent_detected",
         details: {
           identifier: candidate.identifier,
           source: "recovery.reconcile_cancelled_only_blocker_dependents",
@@ -8465,30 +8533,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       result.issueIds.push(candidate.id);
 
       // SUP-14184: the escalation above already records an `issue.updated`
-      // activity row, so the sweep's own detection row is logged only for the
-      // first escalation of this issue. The source-scoped recovery action
-      // upsert reuses the existing active action on later detections (only a
-      // fresh action starts at attemptCount 1), which keeps this to one
-      // detection row per stranded card instead of one per 30s sweep tick.
+      // activity row, so the sweep's own detection row is emitted only when the
+      // (issue, condition) pair enters the reported set or its details change
+      // materially (SUP-14539 edge trigger). The durable record is the most
+      // recent detection row, so repeated detections and control-plane
+      // restarts cannot re-arm it; a replaced recovery action is a material
+      // details change and re-emits.
       const action = await recoveryActionsSvc.getActiveForIssue(candidate.companyId, candidate.id);
-      if (!action || action.attemptCount === 1) {
-        await logActivity(db, {
-          companyId: candidate.companyId,
-          actorType: "system",
-          actorId: "system",
-          agentId: null,
-          runId: null,
-          action: "issue.stillborn_assigned_backlog_detected",
-          entityType: "issue",
-          entityId: candidate.id,
-          details: {
-            source: "recovery.reconcile_stillborn_assigned_backlog",
-            identifier: candidate.identifier,
-            assigneeAgentId: candidate.assigneeAgentId,
-            recoveryActionId: action?.id ?? null,
-          },
-        });
-      }
+      await emitSweepDetectionRowIfChanged({
+        companyId: candidate.companyId,
+        entityId: candidate.id,
+        action: "issue.stillborn_assigned_backlog_detected",
+        details: {
+          source: "recovery.reconcile_stillborn_assigned_backlog",
+          identifier: candidate.identifier,
+          assigneeAgentId: candidate.assigneeAgentId,
+          recoveryActionId: action?.id ?? null,
+        },
+      });
     }
 
     const shouldLog =
@@ -8508,14 +8570,67 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   // SUP-14281: a pull-only assignee is never dispatched, so a todo/in_progress
   // card with no live continuation path will never wake on its own.
-  // Report-only: activity row per detected issue, throttled per issue so
-  // repeated ticks cannot flood; no status writes, no reassignment.
+  // Report-only: detection row emitted edge-triggered (on entry into the
+  // reported set or a material details change — SUP-14539), never on a timer;
+  // no status writes, no reassignment.
   // The candidate window rotates with a keyset cursor (same pattern as the
   // resolved-dependency-wake backstop): report-only cards stay perpetually
   // eligible, so a fixed limit on asc(id) would permanently starve any stranded
   // card whose id sorts past the first window.
   async function reconcileUndispatchableAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
-    const result = { reported: 0, skipped: 0, scanned: 0, issueIds: [] as string[] };
+    const result = { reported: 0, skipped: 0, scanned: 0, escalated: 0, resolved: 0, issueIds: [] as string[] };
+
+    // Backstop: resolve open undispatchable-assignee actions whose condition
+    // has since cleared (assignee re-assigned to a dispatchable agent or a
+    // user, card left todo/in_progress, or source issue gone). Driven by the
+    // persisted action rows — not the in-memory sight counter — so it
+    // survives control-plane restarts and also covers cards that fell outside
+    // the candidate window below. Exhausted (terminal) rows are left alone:
+    // only an explicit board resolution may clear those.
+    const openUndispatchableActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.kind, UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ),
+      );
+    for (const action of openUndispatchableActions) {
+      const [source] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, action.sourceIssueId));
+      let resolutionNote: string | null = null;
+      if (!source) {
+        resolutionNote = "Recovery action became stale because the source issue no longer exists.";
+      } else if (source.status !== "todo" && source.status !== "in_progress") {
+        resolutionNote = `Recovery action became stale because the source issue left the stranded set and is now ${source.status}.`;
+      } else if (!source.assigneeAgentId) {
+        resolutionNote = "Recovery action became stale because the source issue no longer has an agent assignee.";
+      } else {
+        const [assignee] = await db
+          .select({ adapterType: agents.adapterType })
+          .from(agents)
+          .where(eq(agents.id, source.assigneeAgentId));
+        if (!assignee || !isPullOnlyAdapterType(assignee.adapterType)) {
+          resolutionNote = "Recovery action became stale because the source issue assignee is no longer a pull-only adapter agent.";
+        }
+      }
+      if (!resolutionNote) continue;
+      const resolvedAction = await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: action.companyId,
+        sourceIssueId: action.sourceIssueId,
+        actionId: action.id,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote,
+      });
+      if (resolvedAction) {
+        result.resolved += 1;
+        undispatchableAssignedSightCounts.delete(action.sourceIssueId);
+      }
+    }
 
     const queryCandidates = (afterIssueId: string | null) => {
       const filters = [
@@ -8560,7 +8675,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.scanned = candidates.length;
 
     for (const candidate of candidates) {
+      // Every guard that clears the condition also resets the confirmation
+      // counter, so a card that recovers between cycles counts first-sight
+      // again from the next confirmed cycle.
       if (!isPullOnlyAdapterType(candidate.assigneeAdapterType)) {
+        undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
         continue;
       }
@@ -8573,47 +8692,108 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           candidate.monitorNextCheckAt,
         )
       ) {
+        undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
         continue;
       }
 
       if (await hasPendingWakeInteraction(candidate.companyId, candidate.id)) {
+        undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
         continue;
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
-        result.skipped += 1;
-        continue;
-      }
-
-      const lastLoggedAt = lastUndispatchableAssignedIssueLogAt.get(candidate.id) ?? null;
-      if (
-        lastLoggedAt &&
-        Date.now() - lastLoggedAt.getTime() < UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS
-      ) {
+        undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
         continue;
       }
 
       result.reported += 1;
       result.issueIds.push(candidate.id);
-      lastUndispatchableAssignedIssueLogAt.set(candidate.id, new Date());
+
+      await emitSweepDetectionRowIfChanged({
+        companyId: candidate.companyId,
+        entityId: candidate.id,
+        action: "issue.undispatchable_assignee_detected",
+        details: {
+          source: "recovery.reconcile_undispatchable_assigned",
+          identifier: candidate.identifier,
+          assigneeAgentId: candidate.assigneeAgentId,
+          status: candidate.status,
+        },
+      });
+
+      // Two-cycle confirmation: the condition must hold on this sweep AND on
+      // a prior one before the sweep escalates. First sight stays report-only
+      // so a card mid-reassignment (assignee just set, dispatch state not yet
+      // settled) cannot trip the escalation. From the second confirmed
+      // cycle on, the card owns a first-class board recovery action instead
+      // of being re-reported forever with activeRecoveryAction null.
+      let confirmedCycles = (undispatchableAssignedSightCounts.get(candidate.id) ?? 0) + 1;
+      if (confirmedCycles === 1 && undispatchableAssignedSightCounts.size >= UNDISPATCHABLE_ASSIGNED_SIGHT_COUNTS_LIMIT) {
+        // Bounded-memory reset: only un-escalated cards are affected, and it
+        // just delays their escalation one cycle (open actions are persisted
+        // in the DB and re-confirmed idempotently, not via this counter).
+        undispatchableAssignedSightCounts.clear();
+      }
+      undispatchableAssignedSightCounts.set(candidate.id, confirmedCycles);
+      if (confirmedCycles < 2) continue;
+
+      const openAction = await recoveryActionsSvc.getActiveForIssue(candidate.companyId, candidate.id);
+      if (openAction) {
+        if (openAction.kind === UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND) {
+          // Idempotent: this sweep already owns an open (or terminal
+          // escalated) action for the same condition. Re-confirmation must
+          // not mint a second one or bump its attempt budget.
+          continue;
+        }
+        if (openAction.status === "escalated" && (openAction.outcome as string | null) === "exhausted") {
+          // A terminal action for a different condition blocks a new mint on
+          // the same source (platform invariant). Board must resolve it first.
+          continue;
+        }
+      }
+
+      const escalatedAction = await recoveryActionsSvc.upsertSourceScoped({
+        companyId: candidate.companyId,
+        sourceIssueId: candidate.id,
+        kind: UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND,
+        ownerType: "board",
+        ownerAgentId: null,
+        previousOwnerAgentId: candidate.assigneeAgentId,
+        cause: UNDISPATCHABLE_ASSIGNEE_RECOVERY_CAUSE,
+        fingerprint: `undispatchable_assignee:${candidate.companyId}:${candidate.id}`,
+        evidence: {
+          source: "recovery.reconcile_undispatchable_assigned",
+          identifier: candidate.identifier,
+          assigneeAgentId: candidate.assigneeAgentId,
+          assigneeAdapterType: candidate.assigneeAdapterType,
+          status: candidate.status,
+        },
+        nextAction:
+          "Reassign the card to a dispatchable agent or a human owner: the current assignee is a pull-only (process) adapter agent that can never be woken, so the card has no wake path.",
+        wakePolicy: null,
+        monitorPolicy: null,
+        maxAttempts: null,
+      });
+      if (escalatedAction.kind !== UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND) continue;
+      result.escalated += 1;
 
       await logActivity(db, {
         companyId: candidate.companyId,
         actorType: "system",
-        actorId: "system",
+        actorId: "recovery.reconcile_undispatchable_assigned",
         agentId: null,
         runId: null,
-        action: "issue.undispatchable_assignee_detected",
+        action: "issue.undispatchable_assignee_escalated",
         entityType: "issue",
         entityId: candidate.id,
         details: {
           source: "recovery.reconcile_undispatchable_assigned",
           identifier: candidate.identifier,
           assigneeAgentId: candidate.assigneeAgentId,
-          status: candidate.status,
+          recoveryActionId: escalatedAction.id,
         },
       });
     }
@@ -8624,7 +8804,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         Date.now() - lastUndispatchableAssignedSweepLogAt.getTime() >= UNDISPATCHABLE_ASSIGNED_RELOG_INTERVAL_MS);
     if (shouldLog) {
       logger.warn(
-        { reported: result.reported, skipped: result.skipped, scanned: result.scanned, issueIds: result.issueIds },
+        {
+          reported: result.reported,
+          skipped: result.skipped,
+          scanned: result.scanned,
+          escalated: result.escalated,
+          resolved: result.resolved,
+          issueIds: result.issueIds,
+        },
         "undispatchable-assigned sweep reported issues",
       );
       lastUndispatchableAssignedSweepLogAt = new Date();
