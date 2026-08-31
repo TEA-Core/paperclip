@@ -775,6 +775,60 @@ describe("assertWorktreeWritableByProcessUser", () => {
     }
   });
 
+  // SUP-14642 (security, redo SUP-14667): the self-repair must never mutate
+  // anything the worktree does not own. A tracked symlink (git mode 120000)
+  // whose target sits outside the worktree used to be passed to
+  // ensureSharedGroupOwnership, which stats/chowns/chmods symlink-following
+  // while its denied-dir guard compares only the lexical path — chgrp'ing the
+  // external target to the shared group and handing every agent uid group
+  // rwx on it. The validator must detect the symlink as unwritable but NEVER
+  // pass it to the repair helper, and still fail closed when the target is
+  // genuinely unwritable.
+  it("never passes a tracked symlink to the shared-group repair even when its external target is unwritable", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "SUP-14642-symlink-escape";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    // External target OUTSIDE the worktree (sibling of .paperclip/ in the
+    // repo root), so repairing it would grant the shared group rwx on a
+    // path the worktree does not own.
+    const externalTarget = path.join(repoRoot, "external-secret.txt");
+    await fs.writeFile(externalTarget, "secret\n", "utf8");
+    const linkPath = path.join(worktreePath, "link-to-secret");
+    await fs.symlink(externalTarget, linkPath);
+    await execFileAsync("git", ["add", "link-to-secret"], { cwd: worktreePath });
+    await execFileAsync("git", ["commit", "-m", "add tracked symlink"], { cwd: worktreePath });
+
+    // The target is genuinely unwritable, so the symlink surfaces as
+    // unwritable in the probe.
+    await fs.chmod(externalTarget, 0o000);
+
+    const repairCalls: string[] = [];
+    sharedGroupRepairHook.current = async (target) => {
+      repairCalls.push(target);
+    };
+    try {
+      // The symlink's target is unwritable and the symlink itself is skipped
+      // by the repair, so it survives the re-probe and the validator throws.
+      await expect(
+        assertWorktreeWritableByProcessUser(worktreePath, {
+          resolveGid: async () => process.getgid(),
+        }),
+      ).rejects.toThrow(/not writable/);
+    } finally {
+      sharedGroupRepairHook.current = null;
+      await fs.chmod(externalTarget, 0o600);
+    }
+
+    // The distinguishing assertion: the symlink's path is NEVER handed to the
+    // repair helper, so its external target is never chowned/chmod'd.
+    expect(repairCalls).not.toContain(linkPath);
+    // ...while the worktree root still goes through the repair as before.
+    expect(repairCalls).toContain(worktreePath);
+  });
+
   it("throws with the chgrp/chmod g+w remediation ahead of any chown suggestion when the repair cannot fix the file", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "SUP-14642-repair-failure-message";

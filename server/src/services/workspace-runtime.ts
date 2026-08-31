@@ -3799,6 +3799,15 @@ export async function assertWorktreeWritableByProcessUser(
     await ensureSharedGroupOwnership(worktreePath, sharedGroupRepairOptions);
     for (const fullPath of unwritable) {
       if (fullPath === worktreePath) continue;
+      // SUP-14642 (security): a tracked symlink (git mode 120000) must never be
+      // passed to ensureSharedGroupOwnership — it stats/chowns/chmods
+      // symlink-following while its denied-dir guard compares only the lexical
+      // path, so a symlink whose target lies outside the worktree (server
+      // secrets master-key dir, embedded-Postgres data, a backup) would escape
+      // the guard and grant the shared group rwx on the target. lstat (no
+      // follow) and skip; the path still surfaces in the failure list below.
+      const linkStat = await fs.lstat(fullPath);
+      if (linkStat.isSymbolicLink()) continue;
       await ensureSharedGroupOwnership(fullPath, sharedGroupRepairOptions);
     }
     const surviving = await probeUnwritablePaths();
