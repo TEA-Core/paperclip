@@ -818,18 +818,21 @@ async function countLadderedChildren(
  * execution policy, report which of the three ADR-072 close-ladder stages
  * (review:support-QAE, review:coder-LE, approval:exec-CTO) are absent.
  *
- * A stage satisfies a requirement when its `type` matches the required stage
- * type AND at least one of its agent participants resolves to the required
- * agent urlKey. Stages carry participant agent ids, not names, so the agent
- * names are resolved in a single indexed read over the union of all
- * participant agent ids, then compared via `normalizeAgentUrlKey`.
- *
- * Returns the labels of the missing requirements; an empty array means the
- * ladder carries the full close-ladder shape. A missing/stages-less policy
- * reports every requirement as missing.
- */
+  * A stage satisfies a requirement when its `type` matches the required stage
+  * type AND at least one of its agent participants resolves to the required
+  * agent urlKey. Stages carry participant agent ids, not names, so the agent
+  * names are resolved in a single indexed read over the union of all
+  * participant agent ids, then compared via `normalizeAgentUrlKey`. That read
+  * is scoped to the issue's company so an agent from another company can never
+  * be counted as satisfying a close-ladder stage.
+  *
+  * Returns the labels of the missing requirements; an empty array means the
+  * ladder carries the full close-ladder shape. A missing/stages-less policy
+  * reports every requirement as missing.
+  */
 async function findMissingAdr072CloseLadderStages(
   db: Db,
+  companyId: string,
   executionPolicy: unknown,
 ): Promise<string[]> {
   const rawStages =
@@ -869,7 +872,7 @@ async function findMissingAdr072CloseLadderStages(
     const agentRows = await db
       .select({ id: agents.id, name: agents.name })
       .from(agents)
-      .where(inArray(agents.id, [...agentIds]));
+      .where(and(inArray(agents.id, [...agentIds]), eq(agents.companyId, companyId)));
     for (const row of agentRows) {
       agentIdToUrlKey.set(row.id, normalizeAgentUrlKey(row.name));
     }
@@ -900,6 +903,17 @@ async function findMissingAdr072CloseLadderStages(
   return missing;
 }
 
+/**
+ * Gate an issue's transition to `done`. Runs the pre-network fail-closed gates
+ * first — a sanctioned no-deliverable-head `override` (which lands the close
+ * with an audit row), mechanism C (an unrun review ladder, SUP-14446),
+ * mechanism A (a ladder-less decomposed parent over 2+ laddered children,
+ * SUP-14561), and mechanism D (a shape-incomplete ADR-072 close ladder,
+ * SUP-14579) — then verifies the PR/GitHub delivery and tier declaration and
+ * applies the open-PR block. `decisionCarried` applies the ADR-074 D6
+ * carve-out for decision-carrying board closes. Every refusal, override, and
+ * skip records an audit row.
+ */
 export async function evaluateDoneTransitionGuard(
   db: Db,
   issue: {
@@ -959,6 +973,7 @@ export async function evaluateDoneTransitionGuard(
     if (laddered.count >= 2) {
       const missingStageLabels = await findMissingAdr072CloseLadderStages(
         db,
+        issue.companyId,
         issue.executionPolicy,
       );
       if (missingStageLabels.length > 0) {

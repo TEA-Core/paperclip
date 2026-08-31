@@ -80,6 +80,12 @@ function mockProjectRow(row: Partial<Record<string, unknown>> = {}) {
   };
 }
 
+/**
+ * Build the shared `db` mock. Selects are dispatched by table identity when the
+ * matching `rows.<table>` is seeded; otherwise every
+ * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
+ * as the legacy positional chain did, so pre-existing tests are untouched.
+ */
 function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; agents?: Record<string, unknown>[] }) {
   // SUP-14561: the guard now also reads the issues table (child ladder scan).
   // Dispatch by table identity when `rows.issues` is seeded; otherwise every
@@ -554,6 +560,7 @@ describe("evaluateDoneTransitionGuard", () => {
       ],
     };
 
+    /** A completed execution state over the given stage ids (ladder satisfied). */
     const satisfiedState = (stageIds: string[]) => ({
       status: "completed",
       currentStageId: null,
@@ -567,6 +574,7 @@ describe("evaluateDoneTransitionGuard", () => {
       lastDecisionOutcome: null,
     });
 
+    /** One laddered child: a satisfied single-stage ladder under `identifier`. */
     const ladderedChild = (identifier: string, childStageId: string) => ({
       identifier,
       executionPolicy: { stages: [{ id: childStageId, type: "review" }] },
