@@ -82,6 +82,25 @@ export {
   type CarrierPromotionSweepResult,
 } from "./carrier-promotion-sweep.js";
 export {
+  CARRIER_ORPHAN_JANITOR_ACTOR_ID,
+  CARRIER_ORPHAN_JANITOR_CLOSED_ACTION,
+  closeGitHubPullRequest,
+  createCarrierOrphanJanitorService,
+  deleteGitHubBranch,
+  fetchGitHubPullRequestState,
+  type CarrierOrphanJanitorOptions,
+  type CarrierOrphanJanitorSweepResult,
+} from "./carrier-orphan-janitor.js";
+export {
+  CARRIER_STRANDED_SURFACE_ACTOR_ID,
+  CARRIER_STRANDED_SURFACE_ACTION,
+  buildStrandedCardDescription,
+  buildStrandedCardTitle,
+  createCarrierStrandedSurfaceService,
+  type CarrierStrandedSurfaceOptions,
+  type CarrierStrandedSurfaceSweepResult,
+} from "./carrier-stranded-surface.js";
+export {
   createDoneCloseLandingBackstopService,
   type DoneCloseLandingBackstopOptions,
   type DoneCloseLandingSweepResult,

@@ -288,6 +288,27 @@ vi.mock("../services/index.js", () => ({
       failed: 0,
     })),
   })),
+  createCarrierOrphanJanitorService: vi.fn(() => ({
+    sweep: vi.fn(async () => ({
+      due: false,
+      candidates: 0,
+      skippedNonTerminalTree: 0,
+      stranded: 0,
+      alreadyClosed: 0,
+      closed: 0,
+      failed: 0,
+    })),
+  })),
+  createCarrierStrandedSurfaceService: vi.fn(() => ({
+    sweep: vi.fn(async () => ({
+      due: false,
+      candidates: 0,
+      surfaced: 0,
+      alreadySurfaced: 0,
+      prNotOpen: 0,
+      failed: 0,
+    })),
+  })),
   createDoneCloseLandingBackstopService: vi.fn(() => ({
     sweep: vi.fn(async () => ({ due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0 })),
   })),
