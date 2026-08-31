@@ -155,14 +155,16 @@ beforeEach(() => {
 });
 
 describe("closeGitHubPullRequest", () => {
-  it("POSTs the close endpoint with a bearer token and reports success", async () => {
-    mockGhFetch.mockResolvedValue(jsonResponse({ number: 400, state: "closed" }, true, 204));
+  it("PATCHes the update-pull-request endpoint with state closed and reports success", async () => {
+    mockGhFetch.mockResolvedValue(jsonResponse({ number: 400, state: "closed" }, true, 200));
     const result = await closeGitHubPullRequest("ghp_test", "TEA-Core", "paperclip", 400);
-    expect(result).toEqual({ success: true, status: 204, error: null });
+    expect(result).toEqual({ success: true, status: 200, error: null });
 
     const [url, init] = mockGhFetch.mock.calls[0]!;
-    expect(url).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/400/close");
-    expect(init.method).toBe("POST");
+    expect(url).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/400");
+    expect(init.method).toBe("PATCH");
+    expect(init.body).toBe(JSON.stringify({ state: "closed" }));
+    expect(init.headers["content-type"]).toBe("application/json");
     expect(init.headers.authorization).toBe("Bearer ghp_test");
   });
 
@@ -318,7 +320,7 @@ describe("createCarrierOrphanJanitorService", () => {
     mockGhFetch
       .mockResolvedValueOnce(liveOpenResponse())
       .mockResolvedValueOnce(jsonResponse({ ref: `refs/heads/${CARRIER_BRANCH}` }, true, 200))
-      .mockResolvedValueOnce(jsonResponse({ number: 400, state: "closed" }, true, 204));
+      .mockResolvedValueOnce(jsonResponse({ number: 400, state: "closed" }, true, 200));
 
     await expect(service.sweep()).resolves.toEqual({
       due: true,
@@ -334,8 +336,9 @@ describe("createCarrierOrphanJanitorService", () => {
     expect(String(mockGhFetch.mock.calls[0]![0])).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/400");
     expect(mockGhFetch.mock.calls[1]![0]).toBe(`https://api.github.com/repos/TEA-Core/paperclip/git/refs/heads/${CARRIER_BRANCH}`);
     expect(mockGhFetch.mock.calls[1]![1].method).toBe("DELETE");
-    expect(mockGhFetch.mock.calls[2]![0]).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/400/close");
-    expect(mockGhFetch.mock.calls[2]![1].method).toBe("POST");
+    expect(mockGhFetch.mock.calls[2]![0]).toBe("https://api.github.com/repos/TEA-Core/paperclip/pulls/400");
+    expect(mockGhFetch.mock.calls[2]![1].method).toBe("PATCH");
+    expect(mockGhFetch.mock.calls[2]![1].body).toBe(JSON.stringify({ state: "closed" }));
     for (const call of mockGhFetch.mock.calls) {
       expect(call[1].headers.authorization).toBe(`Bearer ${TOKEN_CANDIDATE.token}`);
     }
@@ -462,7 +465,7 @@ describe("createCarrierOrphanJanitorService", () => {
       .mockResolvedValueOnce(jsonResponse({ message: "Bad credentials" }, false, 401))
       .mockResolvedValueOnce(liveOpenResponse())
       .mockResolvedValueOnce(jsonResponse({ ref: `refs/heads/${CARRIER_BRANCH}` }, true, 200))
-      .mockResolvedValueOnce(jsonResponse({ number: 400, state: "closed" }, true, 204));
+      .mockResolvedValueOnce(jsonResponse({ number: 400, state: "closed" }, true, 200));
 
     await expect(service.sweep()).resolves.toMatchObject({ due: true, closed: 1, failed: 0 });
     expect(mockGhFetch).toHaveBeenCalledTimes(4);
@@ -543,7 +546,7 @@ describe("createCarrierOrphanJanitorService", () => {
     mockGhFetch
       .mockResolvedValueOnce(liveOpenResponse())
       .mockResolvedValueOnce(jsonResponse({ ref: `refs/heads/${CARRIER_BRANCH}` }, true, 200))
-      .mockResolvedValueOnce(jsonResponse({ number: 400, state: "closed" }, true, 204));
+      .mockResolvedValueOnce(jsonResponse({ number: 400, state: "closed" }, true, 200));
 
     await expect(service.sweep()).resolves.toMatchObject({ due: true, closed: 1 });
     const selectCallsAfterFirst = db.select.mock.calls.length;
@@ -672,6 +675,28 @@ describe("createCarrierStrandedSurfaceService", () => {
       prNotOpen: 1,
       failed: 0,
     });
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it("counts a non-measurable live PR state (non-OK response) as failed, not prNotOpen", async () => {
+    const { service } = makeSurface(state({
+      openPrRows: [openPrRow()],
+      treeResponses: [tree(
+        { id: PARENT, status: "cancelled", identifier: PARENT_IDENTIFIER },
+        { id: CHILD_DONE, status: "done", identifier: "SUP-7701a" },
+      )],
+    }));
+    mockGhFetch.mockResolvedValue(jsonResponse({ message: "Bad credentials" }, false, 401));
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 0,
+      surfaced: 0,
+      alreadySurfaced: 0,
+      prNotOpen: 0,
+      failed: 1,
+    });
+    expect(mockGhFetch).toHaveBeenCalledTimes(1);
     expect(mockCreate).not.toHaveBeenCalled();
   });
 

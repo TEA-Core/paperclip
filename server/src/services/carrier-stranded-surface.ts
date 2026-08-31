@@ -58,8 +58,9 @@ export interface CarrierStrandedSurfaceSweepResult {
   surfaced: number;
   /** Candidates that already carry an open card: one card per stranded parent. */
   alreadySurfaced: number;
-  /** Candidates whose live carrier PR does not read open (or could not be measured open). */
+  /** Candidates whose live carrier PR measured a 200 that does not read open: a genuinely closed or merged carrier. */
   prNotOpen: number;
+  /** Candidates whose live state could not be measured: no token candidate, a network error, or a non-OK response. */
   failed: number;
 }
 
@@ -378,7 +379,12 @@ export function createCarrierStrandedSurfaceService(db: Db, opts: CarrierStrande
       }
     }
     if (!live.open) {
-      result.prNotOpen += 1;
+      // A 200 that does not read open is a genuinely closed/merged carrier
+      // (prNotOpen); a 0 or non-OK status is a measurement failure. The two
+      // must not share a counter or operator reporting cannot distinguish
+      // a closed carrier from an unmeasurable one.
+      if (live.status === 200) result.prNotOpen += 1;
+      else result.failed += 1;
       return;
     }
     result.candidates += 1;

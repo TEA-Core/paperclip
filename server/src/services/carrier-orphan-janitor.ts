@@ -146,9 +146,10 @@ function headRefFromData(data: Record<string, unknown>): string | null {
 }
 
 /**
- * Closes an open pull request. The first PR-close write the control plane
- * owns (ADR-083 D14); the caller is responsible for the descendant-guard
- * re-check that makes this safe.
+ * Closes an open pull request via the "Update a pull request" endpoint
+ * (`PATCH /pulls/{number}` with `{"state":"closed"}`) — the first PR-close
+ * write the control plane owns (ADR-083 D14). The caller is responsible
+ * for the descendant-guard re-check that makes this safe.
  */
 export async function closeGitHubPullRequest(
   token: string,
@@ -157,9 +158,10 @@ export async function closeGitHubPullRequest(
   number: number,
   hostname: string = "github.com",
 ): Promise<ClosePullRequestResult> {
-  const url = `${gitHubApiBase(hostname)}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/close`;
+  const url = `${gitHubApiBase(hostname)}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
+    "content-type": "application/json",
     "user-agent": "paperclip-carrier-orphan-janitor",
     "x-github-api-version": "2022-11-28",
     authorization: `Bearer ${token}`,
@@ -167,7 +169,7 @@ export async function closeGitHubPullRequest(
 
   let response: Response;
   try {
-    response = await ghFetch(url, { method: "POST", headers });
+    response = await ghFetch(url, { method: "PATCH", headers, body: JSON.stringify({ state: "closed" }) });
   } catch {
     return { success: false, status: 0, error: "network_error" };
   }
