@@ -142,6 +142,15 @@ function pullRequestBody(body: Record<string, unknown>, status = 200): Response 
   });
 }
 
+/**
+ * Builds the opt-in `Merge-gate:` marker line naming the gating pull request(s).
+ * The sweep only closes cards that carry this marker; a PR cited anywhere else
+ * in the body is prose and must not make the card a candidate (SUP-14588).
+ */
+function mergeGateMarker(numbers: number[]): string {
+  return `Merge-gate: ${numbers.map((number) => `TEA-Core/paperclip#${number}`).join(", ")}\n`;
+}
+
 describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -171,7 +180,8 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
       cardTitle: "Merge approved PR TEA-Core/paperclip#404 into fold/tea-patches-v2026.722.0",
       cardDescription:
-        "**Operator card — merge an approved PR. No agent executes this.**\n\nMerge https://github.com/TEA-Core/paperclip/pull/404 into `fold/tea-patches-v2026.722.0`.\n",
+        "**Operator card — merge an approved PR. No agent executes this.**\n\nMerge https://github.com/TEA-Core/paperclip/pull/404 into `fold/tea-patches-v2026.722.0`.\n\n" +
+        mergeGateMarker([404]),
     });
 
     const resolvePullRequest = vi.fn(async () => ({ ...MERGED_EVIDENCE }));
@@ -251,6 +261,7 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     const { companyId, goalId, agentId } = await seedCompany(db);
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
       cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+      cardDescription: mergeGateMarker([404]),
     });
 
     const resolvePullRequest = vi.fn(async () => ({ ...MERGED_EVIDENCE }));
@@ -277,9 +288,11 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     const { companyId, goalId, agentId } = await seedCompany(db);
     const openCard = await seedOperatorCard(db, { companyId, goalId, agentId }, {
       cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/41",
+      cardDescription: mergeGateMarker([41]),
     });
     const closedCard = await seedOperatorCard(db, { companyId, goalId, agentId }, {
       cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/42",
+      cardDescription: mergeGateMarker([42]),
     });
 
     const resolvePullRequest = vi.fn(async (_companyId: string, reference: { number: number }) =>
@@ -384,7 +397,7 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
       cardTitle: "Merge both pull requests",
       cardDescription:
-        "Merge https://github.com/TEA-Core/paperclip/pull/40 and TEA-Core/paperclip#41 once CI is green.\n",
+        "Merge both once CI is green.\n\n" + mergeGateMarker([40, 41]),
     });
 
     const resolvePullRequest = vi.fn(async (_companyId: string, reference: { number: number }) =>
@@ -425,6 +438,8 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
         "## Action",
         "",
         "Merge https://github.com/TEA-Core/paperclip/pull/404 into `fold/tea-patches-v2026.722.0`.",
+        "",
+        "Merge-gate: TEA-Core/paperclip#404",
         "",
         "## State at filing (2026-08-28 ~23:45 UTC, fresh)",
         "",
@@ -472,10 +487,112 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 
+  it("SUP-14580: a card citing a merged PR only in Out-of-scope prose is not a candidate and survives", async () => {
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    // Mirrors the shape of the card that was wrongly closed in 111s: a merged
+    // PR cited purely as background context, with no opt-in marker.
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "OPERATOR: enable data_checksums on paperclip-db-1",
+      cardDescription: [
+        "**Operator card — enable data_checksums on paperclip-db-1. No agent executes this.**",
+        "",
+        "## Action",
+        "",
+        "Enable `data_checksums` on paperclip-db-1.",
+        "",
+        "## Out of scope",
+        "",
+        "- This card is **not** about the TEA-Core/paperclip#399 checksum migration; that PR is cited only as background.",
+      ].join("\n"),
+    });
+
+    // Even though the cited PR is merged, the card must NOT be treated as a
+    // merge-card candidate because it carries no Merge-gate marker.
+    const resolvePullRequest = vi.fn(async () => ({ ...MERGED_EVIDENCE }));
+    const enqueueWakeup = vi.fn(async () => ({ id: "wake-1" }));
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest,
+      enqueueWakeup,
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 0,
+      closed: 0,
+      woken: 0,
+    });
+
+    const card = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, fixture.cardId))
+      .then((rows) => rows[0] ?? null);
+    expect(card?.status).toBe("todo");
+
+    expect(resolvePullRequest).not.toHaveBeenCalled();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, fixture.cardId));
+    expect(comments).toEqual([]);
+  });
+
+  it("closes only on the marker PRs and ignores a merged PR cited elsewhere in prose", async () => {
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    // The card opts in on #450 via the marker. A *different*, still-open PR
+    // (#399) is cited in the body prose. A whole-body scan would see #399 open
+    // and defer; the marker-scoped scan must resolve only #450 and close.
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "OPERATOR: merge approved PR TEA-Core/paperclip#450",
+      cardDescription: [
+        "Merge the approved PR into `fold/tea-patches-v2026.722.0`.",
+        "",
+        mergeGateMarker([450]).trim(),
+        "",
+        "Prior art (unrelated gate): TEA-Core/paperclip#399 was a different card.",
+      ].join("\n"),
+    });
+
+    const resolvePullRequest = vi.fn(async (_cid: string, reference: { number: number }) =>
+      reference.number === 450
+        ? { ...MERGED_EVIDENCE }
+        : { state: "open" as const, mergeCommitSha: null, mergedAt: null }
+    );
+    const enqueueWakeup = vi.fn(async () => ({ id: "wake-1" }));
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest,
+      enqueueWakeup,
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      closed: 1,
+      woken: 1,
+    });
+
+    // Only the marker-named PR is consulted; the prose-cited open PR is not.
+    expect(resolvePullRequest).toHaveBeenCalledTimes(1);
+    expect(resolvePullRequest).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({ owner: "TEA-Core", repo: "paperclip", number: 450 }),
+    );
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+
+    const card = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, fixture.cardId))
+      .then((rows) => rows[0] ?? null);
+    expect(card?.status).toBe("done");
+  });
+
   it("does not re-enqueue a wake that already exists in an idempotent status", async () => {
     const { companyId, goalId, agentId } = await seedCompany(db);
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
       cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+      cardDescription: mergeGateMarker([404]),
     });
     await db.insert(agentWakeupRequests).values({
       companyId,
@@ -515,6 +632,7 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     const { companyId, goalId, agentId } = await seedCompany(db);
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
       cardTitle: "Merge https://github.com/TEA-Core/paperclip/pull/404",
+      cardDescription: mergeGateMarker([404]),
     });
 
     const resolvePullRequest = vi.fn(async () => ({
@@ -548,7 +666,7 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
       cardTitle: "Merge both pull requests",
       cardDescription:
-        "Merge https://github.com/TEA-Core/paperclip/pull/40 and TEA-Core/paperclip#41 once CI is green.\n",
+        "Merge both once CI is green.\n\n" + mergeGateMarker([40, 41]),
     });
 
     let nowMs = Date.parse("2026-08-29T00:00:00Z");
