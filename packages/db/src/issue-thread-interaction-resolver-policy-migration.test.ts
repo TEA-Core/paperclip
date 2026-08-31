@@ -18,7 +18,7 @@ afterEach(async () => {
 
 async function resolverPolicyMigrationStatements(): Promise<string[]> {
   const migrationSql = await readFile(
-    fileURLToPath(new URL("./migrations/0256_mushy_jack_murdock.sql", import.meta.url)),
+    fileURLToPath(new URL("./migrations/0230_mushy_jack_murdock.sql", import.meta.url)),
     "utf8",
   );
   return migrationSql

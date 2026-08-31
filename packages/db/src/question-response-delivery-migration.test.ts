@@ -18,7 +18,7 @@ afterEach(async () => {
 async function migrationStatements(): Promise<string[]> {
   const migrationSql = await readFile(
     fileURLToPath(
-      new URL("./migrations/0266_nasty_grim_reaper.sql", import.meta.url),
+      new URL("./migrations/0240_nasty_grim_reaper.sql", import.meta.url),
     ),
     "utf8",
   );
