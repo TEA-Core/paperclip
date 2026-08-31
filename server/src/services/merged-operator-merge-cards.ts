@@ -47,7 +47,12 @@ export type MergedOperatorMergeCardEnqueueWakeup = (
 export interface MergedOperatorMergeCardsSweepResult {
   /** Non-terminal, agent-unassigned issues the sweep scanned. */
   checked: number;
-  /** Candidates passing the full gate: no agent assignee, blocking a non-terminal dependent, naming at least one pull request. */
+  /**
+   * Candidates passing the full gate: no agent assignee, blocking a non-terminal
+   * dependent, and opting in via a `Merge-gate:` marker that names at least one
+   * gating pull request. Cards that only cite pull requests in prose (no marker)
+   * are excluded and never counted here.
+   */
   candidates: number;
   closed: number;
   woken: number;
@@ -175,12 +180,44 @@ export function createMergedOperatorMergeCardPullRequestResolver(
 }
 
 /**
+ * Marker a merge card carries to opt in to the sweep. A card is a merge-card
+ * candidate only when it names its gating pull request(s) on a line beginning
+ * with `Merge-gate:` (case-insensitive, optional list bullet or markdown
+ * emphasis). A PR cited anywhere else in the body — Out-of-scope, Context,
+ * Supersedes, background prose, a cited precedent — is context, not a gate, and
+ * must not make the card a candidate. Absence of the marker means "not a merge
+ * card"; the sweep fails closed rather than closing a card on prose context.
+ *
+ * Reuses `extractGitHubPullRequestReferences` over the marker payload(s) so the
+ * accepted reference shapes (owner/repo#N shorthand, full pull URL) are
+ * unchanged; only the SOURCE of the references narrows from the whole body to
+ * the opt-in marker.
+ */
+const MERGE_GATE_MARKER_LINE =
+  /^\s*(?:[-*+]\s+)?\*{0,2}merge[-_ ]?gate\*{0,2}\s*[:：]\s*(\S.*)$/i;
+
+export function extractMergedOperatorMergeCardGateReferences(
+  values: readonly unknown[],
+): GitHubPullRequestReference[] {
+  const payloads: string[] = [];
+  for (const value of values) {
+    if (typeof value !== "string" || value.length === 0) continue;
+    for (const line of value.split(/\r?\n/)) {
+      const match = line.match(MERGE_GATE_MARKER_LINE);
+      if (match) payloads.push(match[1]!);
+    }
+  }
+  if (payloads.length === 0) return [];
+  return extractGitHubPullRequestReferences(payloads);
+}
+
+/**
  * Closes satisfied operator merge cards: non-terminal, agent-unassigned issues
- * whose body names pull requests, every one of which has merged, and which are
- * blocking at least one non-terminal dependent. The card is a stale gate — the
- * operator merge already happened — so the sweep records the evidence, closes
- * the card, and fires the standard issue_blockers_resolved wake for each
- * wakeable dependent.
+ * that opt in via a `Merge-gate:` marker naming one or more pull requests, every
+ * one of which has merged, and which are blocking at least one non-terminal
+ * dependent. The card is a stale gate — the operator merge already happened —
+ * so the sweep records the evidence, closes the card, and fires the standard
+ * issue_blockers_resolved wake for each wakeable dependent.
  */
 export function createMergedOperatorMergeCardSweepService(
   db: Db,
@@ -277,7 +314,10 @@ export function createMergedOperatorMergeCardSweepService(
       .filter((row) => blockingCardIds.has(row.id))
       .map((row) => ({
         row,
-        references: extractGitHubPullRequestReferences([row.title, row.description]),
+        references: extractMergedOperatorMergeCardGateReferences([
+          row.title,
+          row.description,
+        ]),
       }))
       .filter((candidate) => candidate.references.length > 0);
     result.candidates = candidates.length;
