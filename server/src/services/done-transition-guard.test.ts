@@ -728,6 +728,70 @@ describe("evaluateDoneTransitionGuard", () => {
         }),
       );
     });
+
+    it("refuses a branchless parent even when the branch/PR skip would otherwise fire (AC7 / SUP-14362 shape)", async () => {
+      // SUP-14362's exact live shape: top-level, branchless (branch absent on the
+      // remote), a 1-stage review ladder whose single participant is a non-ADR-072
+      // agent (support-CR), over 4 laddered children. The shape check must refuse
+      // the close BEFORE the branch/PR zone is reached — i.e. even though
+      // branch_absent_on_remote would otherwise fail the guard open.
+      const supportCrId = "ddddddd4-0000-4000-8000-000000000004";
+      const crAgent = { id: supportCrId, name: "support-CR", role: "support" };
+      const oneCrStageLadder = {
+        stages: [{ id: stage1, type: "review", participants: [{ type: "agent", agentId: supportCrId }] }],
+      };
+      const fourLadderedChildren = [
+        ladderedChild("SUP-14362-a", "60000000-0000-4000-8000-000000000001"),
+        ladderedChild("SUP-14362-b", "60000001-0000-4000-8000-000000000002"),
+        ladderedChild("SUP-14362-c", "60000002-0000-4000-8000-000000000003"),
+        ladderedChild("SUP-14362-d", "60000003-0000-4000-8000-000000000004"),
+      ];
+      // A resolvable branch context is available; if the guard ever reached the
+      // branch/PR zone, the compare API would 404 -> branch_absent_on_remote.
+      setupDbMock({
+        issues: fourLadderedChildren,
+        agents: [crAgent],
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        projectWorkspaces: [mockProjectWorkspaceRow()],
+        projects: [mockProjectRow()],
+      });
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: oneCrStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.skipReason).toBeNull();
+      expect(result.reason).toContain("Mechanism D");
+      expect(result.reason).toContain("ADR-072 close-ladder shape");
+      // A non-ADR-072 single stage matches none of the three close-ladder
+      // requirements, so all three are named missing.
+      expect(result.reason).toContain("review:support-QAE");
+      expect(result.reason).toContain("review:coder-LE");
+      expect(result.reason).toContain("approval:exec-CTO");
+      // The refusal preempts the branch/PR zone: no compare call, no PR resolution.
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            reason: "adr072_close_ladder_shape_incomplete",
+            missingStageLabels: ["review:support-QAE", "review:coder-LE", "approval:exec-CTO"],
+            ladderedChildCount: 4,
+            ladderedChildIdentifiers: ["SUP-14362-a", "SUP-14362-b", "SUP-14362-c", "SUP-14362-d"],
+          }),
+        }),
+      );
+    });
   });
 
   describe("ungated decomposed parent (SUP-14561 mechanism A)", () => {
