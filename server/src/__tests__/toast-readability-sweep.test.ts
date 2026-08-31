@@ -166,6 +166,45 @@ describe("toast readability sweep (control flow, mocked db client)", () => {
     expect(fake.calls.length).toBe(callsAfterFirst);
   });
 
+  it("does not launch a second overlapping scan while one is in flight", async () => {
+    // A probe that stays blocked forever simulates a full scan that outlives the
+    // interval (a 6 GB scan can exceed sweepIntervalMs on a degraded DB). The
+    // start-to-start cadence gate cannot stop a second scan in that state, so
+    // the in-flight guard must: the second due tick is a no-op that starts no
+    // new database work (SUP-14582 finding 3).
+    const fake = makeFakeDb((sqlText: string) => {
+      if (sqlText.includes("pg_attribute")) return TARGETS;
+      if (sqlText.includes("CREATE OR REPLACE FUNCTION")) return [];
+      if (sqlText.includes("DROP FUNCTION")) return [];
+      if (sqlText.includes("paperclip_toast_probe($1")) {
+        return new Promise<unknown>(() => {}); // never settles
+      }
+      throw new Error(`unexpected SQL: ${sqlText}`);
+    });
+    const base = Date.UTC(2026, 7, 31, 0, 0, 0);
+    let offsetMs = 0;
+    const service = createToastReadabilitySweepService(fake.db, {
+      sweepIntervalMs: 60_000,
+      now: () => new Date(base + offsetMs),
+    });
+
+    const first = service.sweep(); // due: passes the gates, starts the scan
+    // Let the in-flight scan progress to its (blocked) probe call.
+    await new Promise((resolve) => setImmediate(resolve));
+    const callsAfterFirst = fake.calls.length;
+    expect(callsAfterFirst).toBeGreaterThan(0);
+
+    // Advance past the interval so the cadence gate WOULD allow a second scan;
+    // only the in-flight guard stops it.
+    offsetMs = 61_000;
+    const second = await service.sweep();
+    expect(second.due).toBe(false);
+    expect(second.tablesScanned).toBe(0);
+    expect(second.sweepError).toBeNull();
+    expect(fake.calls.length).toBe(callsAfterFirst); // no second scan started
+    void first; // first stays pending on the blocked probe by design
+  });
+
   it("defaults to a daily cadence when no interval env var is set", async () => {
     const base = Date.UTC(2026, 7, 31, 0, 0, 0);
     let offsetMs = 0;

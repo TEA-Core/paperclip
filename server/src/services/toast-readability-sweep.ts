@@ -56,7 +56,7 @@ export interface ToastReadabilityFailedTable {
 }
 
 export interface ToastReadabilitySweepResult {
-  /** False when the sweep is disabled or the min-interval gate short-circuited the tick (no-op). */
+  /** False when the sweep is disabled, a scan is already in flight, or the min-interval gate short-circuited the tick (no-op). */
   due: boolean;
   /** Distinct tables scanned on this run. */
   tablesScanned: number;
@@ -165,6 +165,12 @@ export function createToastReadabilitySweepService(
   const sweepIntervalMs = opts.sweepIntervalMs ?? readMsEnv(INTERVAL_ENV, DEFAULT_SWEEP_INTERVAL_MS);
   const now = opts.now ?? (() => new Date());
   let lastRunAt: number | null = null;
+  // Guards against a second full scan launching while one is still running. The
+  // cadence gate below compares start-to-start elapsed time only, so a scan that
+  // outlives `sweepIntervalMs` (plausible on a degraded 6 GB DB, where this
+  // sweep exists to help) would otherwise pass the gate on the next due tick and
+  // pin a second pool connection into an overlapping scan (SUP-14582 finding 3).
+  let inFlight = false;
 
   /** Runs one sweep pass: gate on cadence, then probe every TOAST-bearing column of every `public` table. */
   async function sweep(): Promise<ToastReadabilitySweepResult> {
@@ -178,12 +184,16 @@ export function createToastReadabilitySweepService(
       sweepError: null,
     };
     if (isDisabledByEnv()) return skipped;
+    // A scan in flight wins over the cadence gate: never launch an overlapping
+    // full scan just because the start-to-start interval has elapsed.
+    if (inFlight) return skipped;
     // The heartbeat tick fires every 30 s; a full scan is expensive, so every
     // non-due tick is a no-op.
     if (lastRunAt !== null && checkedAt.getTime() - lastRunAt < sweepIntervalMs) {
       return skipped;
     }
     lastRunAt = checkedAt.getTime();
+    inFlight = true;
 
     const result: ToastReadabilitySweepResult = {
       due: true,
@@ -237,6 +247,7 @@ export function createToastReadabilitySweepService(
     } catch (err) {
       result.sweepError = errorMessage(err);
     } finally {
+      inFlight = false;
       if (reserved !== null) {
         try {
           await reserved.unsafe(PROBE_DROP_SQL);
