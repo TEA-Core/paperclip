@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { hasVerifiedWorktreeSeedManifest } from "./worktree-seed-manifest.js";
 
 function parseEnvFile(contents: string): Record<string, string> {
   const entries: Record<string, string> = {};
@@ -67,7 +68,13 @@ export function resolveWorktreeEnvFilePath(rootDir: string): string {
 }
 
 export function isWorktreeSeedPending(rootDir: string): boolean {
+  // SUP-14087 partitions the marker dir per uid; upstream's seed-manifest
+  // verification runs inside that partition rather than a fixed `.paperclip`.
   const markerDir = resolveWorktreeStateDir(rootDir);
+  const manifestPath = path.join(markerDir, "seed-manifest.json");
+  if (existsSync(manifestPath)) {
+    return !hasVerifiedWorktreeSeedManifest(manifestPath);
+  }
   return existsSync(path.join(markerDir, "seed-pending"))
     && !existsSync(path.join(markerDir, "seed-complete"));
 }

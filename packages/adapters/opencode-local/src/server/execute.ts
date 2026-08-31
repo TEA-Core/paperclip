@@ -15,6 +15,8 @@ import {
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   prepareAdapterExecutionTargetRuntime,
+  adapterExecutionTargetDuplexObservabilityRecorder,
+  adapterExecutionTargetEnablesSandboxDuplexBridge,
   readAdapterExecutionTarget,
   readAdapterExecutionTargetHomeDir,
   resolveAdapterExecutionTargetTimeoutSec,
@@ -43,6 +45,7 @@ import {
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
+  isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
@@ -50,6 +53,7 @@ import {
   signalRunningProcess,
   runningProcesses,
   type OrphanedProcessEvidence,
+  resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   describeIncompleteOpenCodeStream,
@@ -81,6 +85,7 @@ import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-share
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { redactCommandText } from "@paperclipai/adapter-utils/command-redaction";
+import { resolveOpenCodeSkillsHome } from "./skills.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -283,24 +288,34 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
     },
   );
 
+  // The remote availability probe is a best-effort pre-flight guard, not a gate.
+  // If `opencode models` itself cannot run on the target — timeout, transient CLI
+  // error, provider hiccup — do NOT abort the run. The real invocation is
+  // authoritative, so a probe that can't execute must never be fatal. (Previously
+  // these threw and crashed runs mid-flight, losing the agent's work + disposition.)
   if (probe.timedOut) {
-    throw new Error(`\`opencode models\` timed out on the remote execution target after ${probeTimeoutSec}s.`);
+    console.warn(
+      `[opencode-local] Remote model availability probe for "${model}" timed out after ${probeTimeoutSec}s; proceeding with the configured model.`,
+    );
+    return;
   }
 
   if ((probe.exitCode ?? 1) !== 0) {
     const detail = firstNonEmptyLine(probe.stderr) || firstNonEmptyLine(probe.stdout);
-    throw new Error(
-      detail
-        ? `\`opencode models\` failed on the remote execution target: ${detail}`
-        : "`opencode models` failed on the remote execution target.",
+    console.warn(
+      `[opencode-local] Remote \`opencode models\` could not run for "${model}"${
+        detail ? ` (${detail})` : ""
+      }; proceeding with the configured model.`,
     );
+    return;
   }
 
   const models = parseOpenCodeModelsOutput(probe.stdout);
   if (models.length === 0) {
-    throw new Error(
-      "OpenCode returned no models on the remote execution target. Run `opencode models` there and verify provider auth.",
+    console.warn(
+      `[opencode-local] Remote \`opencode models\` returned no models; proceeding with the configured model "${model}".`,
     );
+    return;
   }
 
   if (!models.some((entry) => entry.id === model)) {
@@ -311,16 +326,12 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   }
 }
 
-function claudeSkillsHome(): string {
-  return path.join(os.homedir(), ".claude", "skills");
-}
-
 async function ensureOpenCodeSkillsInjected(
   onLog: AdapterExecutionContext["onLog"],
   skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
   desiredSkillNames?: string[],
+  skillsHome = resolveOpenCodeSkillsHome({}),
 ) {
-  const skillsHome = claudeSkillsHome();
   await fs.mkdir(skillsHome, { recursive: true });
   const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
   const selectedEntries = skillsEntries.filter((entry) => desiredSet.has(entry.key));
@@ -362,9 +373,10 @@ async function buildOpenCodeSkillsDir(config: Record<string, unknown>): Promise<
   await fs.mkdir(target, { recursive: true });
   await ensureAgentAccessibleDir(target);
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredNames = new Set(resolvePaperclipDesiredSkillNames(config, availableEntries));
+  const desiredNames = new Set(resolveLegacyPaperclipDesiredSkillNames(config, availableEntries));
   for (const entry of availableEntries) {
     if (!desiredNames.has(entry.key)) continue;
+    if (isPaperclipSkillSourceMissing(entry)) continue;
     await fs.symlink(entry.source, path.join(target, entry.runtimeName));
   }
   return target;
@@ -470,12 +482,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   const openCodeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredOpenCodeSkillNames = resolvePaperclipDesiredSkillNames(config, openCodeSkillEntries);
+  const desiredOpenCodeSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, openCodeSkillEntries);
   if (!executionTargetIsRemote) {
     await ensureOpenCodeSkillsInjected(
       onLog,
       openCodeSkillEntries,
       desiredOpenCodeSkillNames,
+      resolveOpenCodeSkillsHome(config),
     );
   }
 
@@ -689,6 +702,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
         runId,
         target: runtimeExecutionTarget,
+        enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(runtimeExecutionTarget),
+        duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(runtimeExecutionTarget),
         runtimeRootDir: remoteRuntimeRootDir,
         adapterKey: "opencode",
         timeoutSec,
@@ -949,6 +964,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           onRuntimeProgress: ctx.onRuntimeProgress,
           onLog: earlyAbortOnLog,
           runLogTail: paperclipBridge?.runLogTail,
+          settleRunDisposition: paperclipBridge?.settleRunDisposition,
         });
         return {
           proc,
@@ -984,6 +1000,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stdout: string;
           stderr: string;
           orphanedProcess?: OrphanedProcessEvidence | null;
+          // Transport-level error code from the run-disposition seam; a lost
+          // duplex control channel surfaces `duplex_channel_lost` here.
+          errorCode?: string | null;
         };
         rawStderr: string;
         parsed: ReturnType<typeof parseOpenCodeJsonl>;
@@ -1134,7 +1153,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage:
           errorMessageOverride ??
           ((synthesizedExitCode ?? 0) === 0 ? null : stripAnsi(fallbackErrorMessage)),
-        errorCode: errorCode ?? classifiedErrorCode,
+        errorCode: errorCode ?? classifiedErrorCode ?? attempt.proc.errorCode ?? null,
         errorMeta: Object.keys(errorMeta).length > 0 ? errorMeta : undefined,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
@@ -1154,7 +1173,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: attempt.proc.stderr,
           paperclipToolCallCount: attempt.parsed.paperclipToolCallCount,
           exitCode: synthesizedExitCode,
-          errorCode: errorCode ?? classifiedErrorCode,
+          errorCode: errorCode ?? classifiedErrorCode ?? attempt.proc.errorCode ?? null,
           ...(Object.keys(errorMeta).length > 0 ? { errorMeta } : {}),
         },
         summary: attempt.parsed.summary,
@@ -1163,6 +1182,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await emitAdapterFailureLog(result);
       return result;
     };
+
 
     // A guard-tripped attempt must never be retried: the retry would replay the
     // same runaway message and write the same bytes again. This short-circuits

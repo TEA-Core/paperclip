@@ -155,7 +155,7 @@ chmod 2775 "$WTR" "$WTR/sub"
 chown 1000:1002 "$WTR"
 chown 1001:1002 "$WTR/agent-sgdir"
 chmod 2770 "$WTR/agent-sgdir"
-cat >/tmp/norm-probe.sh <<'PROBE_EOF'
+cat >/tmp/norm-probe.sh <<'"'"'PROBE_EOF'"'"'
 echo "FILE=$(stat -c %u:%g /paperclip/instances/default/projects/p1/w1/paperclip/.paperclip/worktrees/SUP-mixed/node_modules/.bin/some-bin)"
 echo "ROOT=$(stat -c %u:%g /paperclip/instances/default/projects/p1/w1/paperclip/.paperclip/worktrees/SUP-mixed)"
 echo "MODE_SUB=$(stat -c %a /paperclip/instances/default/projects/p1/w1/paperclip/.paperclip/worktrees/SUP-mixed/sub)"

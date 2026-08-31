@@ -95,24 +95,17 @@ const createActivitySchema = z.object({
   action: z.string().min(1),
   entityType: z.string().min(1),
   entityId: z.string().min(1),
-  agentId: z.string().uuid().optional().nullable(),
-  details: z.record(z.unknown()).optional().nullable(),
+  agentId: z.string().guid().optional().nullable(),
+  details: z.record(z.string(), z.unknown()).optional().nullable(),
 });
 
 const agentActionAuditActorScopeSchema = z.enum(["agents", "all"]);
 
-const companyActivityQuerySchema = z.object({
-  action: z.string().optional(),
-  actorType: z.enum(["agent", "user", "system", "plugin"]).optional(),
-  from: z.coerce.date().optional(),
-  to: z.coerce.date().optional(),
-});
-
 const agentActionAuditQuerySchema = z.object({
   actorScope: agentActionAuditActorScopeSchema.default("agents"),
-  agentId: z.string().uuid().optional(),
+  agentId: z.string().guid().optional(),
   responsibleUserId: z.string().min(1).optional(),
-  runId: z.string().uuid().optional(),
+  runId: z.string().guid().optional(),
   entityType: z.string().min(1).optional(),
   entityId: z.string().min(1).optional(),
   action: z.string().min(1).optional(),
@@ -121,6 +114,13 @@ const agentActionAuditQuerySchema = z.object({
   to: z.coerce.date().optional(),
   cursor: z.string().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+
+const companyActivityQuerySchema = z.object({
+  action: z.string().optional(),
+  actorType: z.enum(["agent", "user", "system", "plugin"]).optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
 });
 
 export function activityRoutes(db: Db) {

@@ -23,6 +23,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -80,6 +82,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   }, 60_000);
 
   afterAll(async () => {
+    // SUP-14359 class: a terminal PATCH expires pending thread interactions
+    // after the response is sent, so that query can still be in flight when the
+    // embedded database goes away -- surfacing as a CONNECTION_ENDED unhandled
+    // rejection that fails the file while every test passes. Drain first.
+    if (db) await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     await tempDb?.cleanup();
     if (previousSchedulingSuppression === undefined) {
       delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;

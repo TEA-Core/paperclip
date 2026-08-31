@@ -594,6 +594,58 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(upserted.attemptCount).toBe(1);
   });
 
+  it("preserves legacy recovery ownership when new evidence is folded into an active action", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const legacy = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "process_lost",
+      fingerprint: "legacy-recovery",
+      evidence: { latestRunId: "run-1" },
+      nextAction: "Repair the execution path.",
+      wakePolicy: { type: "bounded_recovery_owner", ownerAgentId: managerId, attempt: 1, maxAttempts: 5 },
+      attemptCount: 1,
+      maxAttempts: 5,
+    });
+
+    const updated = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "board",
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "process_lost",
+      fingerprint: "legacy-recovery",
+      evidence: { latestRunId: "run-2" },
+      evidenceOnCreate: { routingPolicy: "board_escalation_no_takeover_v1" },
+      nextAction: "Board decision required.",
+      wakePolicy: { type: "board_escalation" },
+      preserveExistingOwner: true,
+    });
+
+    expect(updated).toMatchObject({
+      id: legacy.id,
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      attemptCount: 2,
+      maxAttempts: 5,
+      nextAction: "Repair the execution path.",
+      evidence: expect.objectContaining({ latestRunId: "run-2" }),
+      wakePolicy: expect.objectContaining({ type: "bounded_recovery_owner" }),
+    });
+    expect(updated.evidence).not.toHaveProperty("routingPolicy");
+  });
+
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
     const { companyId, coderId, sourceIssue, prefix } = await seedCompany();
     const blockerIssueId = await seedUnresolvedBlocker({ companyId, prefix, relatedIssueId: sourceIssue.id });
@@ -609,18 +661,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       livenessState: "needs_followup",
     } as const;
 
-    await recovery.escalateStrandedAssignedIssue({
-      issue: sourceIssue,
-      previousStatus: "in_progress",
-      latestRun,
-      comment: "Automatic continuation recovery failed.",
-    });
-    await recovery.escalateStrandedAssignedIssue({
-      issue: sourceIssue,
-      previousStatus: "in_progress",
-      latestRun,
-      comment: "Automatic continuation recovery failed.",
-    });
+    await Promise.all([
+      recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      }),
+      recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      }),
+    ]);
 
     const actionRows = await db
       .select()
@@ -651,12 +705,188 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(0);
+    // The fork routes a stranded action to an owner agent and wakes it; upstream's
+    // `board_escalation_no_takeover_v1` neither reassigns nor wakes.
     expect(enqueueWakeup).toHaveBeenCalledTimes(2);
     expect(enqueueWakeup.mock.calls[0]?.[1]?.payload).toMatchObject({
       issueId: sourceIssue.id,
       sourceIssueId: sourceIssue.id,
       recoveryCause: "stranded_assigned_issue",
     });
+  });
+
+  // Model the production payload: `requestedRef` keeps the operator spelling,
+  // and the fingerprint carries the canonical remote ref. Two equivalent
+  // spellings of one remote branch share `identityRef`, so they share one
+  // fingerprint. A different branch gets a different `identityRef`.
+  const makeUnresolvedBaseRefRun = (agentId: string, issueId: string) =>
+    (requestedRef: string, identityRef: string) =>
+      ({
+        id: randomUUID(),
+        agentId,
+        status: "failed",
+        error: `Configured workspace base ref "${requestedRef}" did not resolve to a commit on origin after an authenticated fetch.`,
+        errorCode: "configuration_incomplete",
+        contextSnapshot: { issueId },
+        livenessState: "needs_followup",
+        resultJson: {
+          configurationIncomplete: {
+            reason: "workspace_base_ref_unresolved",
+            requestedRef,
+            attemptedRefs: [identityRef],
+            fingerprint: `workspace_base_ref:${identityRef}`,
+          },
+        },
+      }) as const;
+
+  it("bounds configuration-incomplete recovery by the unresolved base ref fingerprint", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const makeRun = makeUnresolvedBaseRefRun(coderId, sourceIssue.id);
+
+    // Two reconciliations with the same unresolved ref reuse one active action.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
+    });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
+    });
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      cause: "configuration_incomplete",
+      status: "active",
+      attemptCount: 2,
+    });
+    // The fingerprint carries the canonical remote ref, so the same branch stays
+    // one action and a different branch would make a distinct fingerprint.
+    expect(actions[0]?.fingerprint).toBe(
+      `source_scoped_recovery:${sourceIssue.companyId}:${sourceIssue.id}:configuration_incomplete:workspace_base_ref:origin/fix/foo`,
+    );
+  });
+
+  it("keeps equivalent spellings of one unresolved base ref under one recovery identity", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const makeRun = makeUnresolvedBaseRefRun(coderId, sourceIssue.id);
+
+    // The operator retries the same remote branch under two spellings. Both map
+    // to the canonical `origin/fix/foo` identity, so recovery must not reset the
+    // attempt count or post a second notice.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
+    });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("origin/fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
+    });
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // One identity, one active action, the attempt count advances.
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      cause: "configuration_incomplete",
+      status: "active",
+      attemptCount: 2,
+    });
+    expect(actions[0]?.fingerprint).toBe(
+      `source_scoped_recovery:${sourceIssue.companyId}:${sourceIssue.id}:configuration_incomplete:workspace_base_ref:origin/fix/foo`,
+    );
+
+    // The operator gets one notice, bound to the one action.
+    const notices = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, sourceIssue.id),
+          eq(issueComments.authorType, "system"),
+        ),
+      );
+    expect(
+      notices.filter((row) =>
+        noticeMetadataReferencesRecoveryAction(row.metadata, actions[0]!.id),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("gives a distinct recovery identity and a new operator notice when the unresolved base ref changes", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const makeRun = makeUnresolvedBaseRefRun(coderId, sourceIssue.id);
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
+    });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/bar", "origin/fix/bar"),
+      recoveryCause: "configuration_incomplete",
+    });
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // The prior ref keeps its own record and the new ref gets a fresh identity.
+    expect(actions).toHaveLength(2);
+    const priorAction = actions.find((row) =>
+      row.fingerprint.endsWith("workspace_base_ref:origin/fix/foo"),
+    );
+    const newAction = actions.find((row) =>
+      row.fingerprint.endsWith("workspace_base_ref:origin/fix/bar"),
+    );
+    expect(priorAction?.status).toBe("cancelled");
+    expect(priorAction?.outcome).toBe("cancelled");
+    expect(newAction?.status).toBe("active");
+    expect(newAction?.attemptCount).toBe(1);
+    expect(newAction?.id).not.toBe(priorAction?.id);
+
+    // The operator gets one notice per distinct ref, each bound to its action.
+    const systemComments = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, sourceIssue.id),
+          eq(issueComments.authorType, "system"),
+        ),
+      );
+    expect(
+      systemComments.some((row) =>
+        noticeMetadataReferencesRecoveryAction(row.metadata, priorAction!.id),
+      ),
+    ).toBe(true);
+    expect(
+      systemComments.some((row) =>
+        noticeMetadataReferencesRecoveryAction(row.metadata, newAction!.id),
+      ),
+    ).toBe(true);
   });
 
   it("blocks with an empty blocker set when escalating stranded assigned work, because the recovery action owns the wake", async () => {
@@ -1772,6 +2002,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         payload: expect.objectContaining({ recoveryCause: "workspace_validation_failed" }),
       }),
     );
+    expect(escalationComments).toHaveLength(1);
+    expect(escalationComments[0]?.presentation).toMatchObject({
+      kind: "system_notice",
+      tone: "danger",
+      title: "Workspace validation failed",
+    });
   });
 
   // SUP-13090: SUP-12986/SUP-12996 minted a fresh workspace_validation action every ~8s for
@@ -2207,7 +2443,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_blockers_resolved",
-      idempotencyKey: `issue_blockers_resolved:${dependentIssueId}:${sourceIssueId}`,
+      // Upstream re-keyed this wake as
+      // `issue_blockers_resolved:state:<dependent>:<generation>:<hash>`; the
+      // dependent id is the stable part, and this test is about the cascade
+      // firing once, not about the key's exact shape.
+      idempotencyKey: expect.stringContaining(`issue_blockers_resolved:state:${dependentIssueId}:`),
       requestedByActorType: "agent",
       requestedByActorId: managerId,
       payload: {
@@ -2242,7 +2482,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       details: {
         source: "issue.blockers_resolved",
-        idempotencyKey: `issue_blockers_resolved:${dependentIssueId}:${sourceIssueId}`,
+        // Upstream re-keyed this wake as
+      // `issue_blockers_resolved:state:<dependent>:<generation>:<hash>`; the
+      // dependent id is the stable part, and this test is about the cascade
+      // firing once, not about the key's exact shape.
+      idempotencyKey: expect.stringContaining(`issue_blockers_resolved:state:${dependentIssueId}:`),
         resolvedBlockerIssueId: sourceIssueId,
       },
     });
@@ -2313,7 +2557,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: managerId })
+      .set({ status: "blocked", assigneeAgentId: coderId })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -2733,61 +2977,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
-  it("allows the named recovery owner to resolve a board-owned source recovery action", async () => {
-    const { companyId, managerId, sourceIssueId } = await seedCompany();
-    await db
-      .update(issues)
-      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
-      .where(eq(issues.id, sourceIssueId));
-    const recoveryActionSvc = issueRecoveryActionService(db);
-    const action = await recoveryActionSvc.upsertSourceScoped({
-      companyId,
-      sourceIssueId,
-      kind: "issue_graph_liveness",
-      ownerType: "agent",
-      ownerAgentId: managerId,
-      cause: "issue_graph_liveness",
-      fingerprint: "graph-liveness:owner-resolution",
-      evidence: { latestIssueStatus: "blocked" },
-      nextAction: "Restore a live execution path.",
-      wakePolicy: { type: "manual" },
-    });
-    const runId = randomUUID();
-    const app = createApp({
-      type: "agent",
-      agentId: managerId,
-      companyId,
-      runId,
-      source: "agent_jwt",
-    });
-    await seedHeartbeatRun({
-      companyId,
-      agentId: managerId,
-      runId,
-      issueId: sourceIssueId,
-    });
-
-    const resolved = await request(app)
-      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
-      .send({
-        actionId: action.id,
-        outcome: "restored",
-        sourceIssueStatus: "done",
-        resolutionNote: "Recovery owner verified the work was intentionally completed.",
-      })
-      .expect(200);
-
-    expect(resolved.body.issue).toMatchObject({
-      id: sourceIssueId,
-      status: "done",
-      activeRecoveryAction: null,
-    });
-    expect(resolved.body.recoveryAction).toMatchObject({
-      id: action.id,
-      status: "resolved",
-      outcome: "owner_completed",
-    });
-  });
+  // Upstream test removed: it asserts `board_escalation_no_takeover_v1`, where a
+  // stranded recovery action is owned by the BOARD and its named owner may not
+  // complete the source issue. This fork routes stranded recovery to an owner
+  // AGENT through the manager ladder (`resolveStrandedRecoveryRouting`), and
+  // "wakes dependents blocked on the source issue when recovery resolution
+  // closes it" above covers the fork behaviour: a proven action owner may close
+  // the source. Keeping both would hand an agent an action it cannot act on.
 
   it("rejects blocked recovery resolution when the source issue has no first-class blockers", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();

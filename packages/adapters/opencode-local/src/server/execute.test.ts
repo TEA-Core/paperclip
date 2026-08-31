@@ -65,18 +65,17 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
   };
 });
 
-vi.mock("./models.js", () => ({
-  ensureOpenCodeModelConfiguredAndAvailable: vi.fn(async () => []),
-  isTruthyEnvFlag: (value: unknown) => value === "true" || value === "1",
-  parseOpenCodeModelsOutput: (stdout: string) => [],
-  requireOpenCodeModelId: (model: unknown) => {
-    const s = typeof model === "string" ? model.trim() : "";
-    if (!s || !s.includes("/")) {
-      throw new Error("OpenCode requires `adapterConfig.model` in provider/model format.");
-    }
-    return s;
-  },
-}));
+// Only the network-touching availability check is stubbed. The pure helpers
+// (`parseOpenCodeModelsOutput`, `requireOpenCodeModelId`, `isTruthyEnvFlag`) stay
+// real: re-declaring them here as empty stubs made the remote probe's
+// model-absent guard unreachable, so its regression test could never fail.
+vi.mock("./models.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    ensureOpenCodeModelConfiguredAndAvailable: vi.fn(async () => []),
+  };
+});
 
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { runningProcesses, sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
@@ -282,6 +281,67 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
         graceSec: 5,
       }),
     ).rejects.toThrow();
+  });
+});
+
+// The remote availability probe is a pre-flight hint, not a gate: when
+// `opencode models` itself cannot run on the target the run must proceed, or a
+// transient CLI hiccup aborts a run mid-flight and loses the agent's work.
+describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal when it cannot run", () => {
+  const target = { kind: "remote", transport: "ssh" } as never;
+  const base = {
+    runId: "run-probe",
+    executionTarget: target,
+    command: "opencode",
+    cwd: "/tmp",
+    env: {} as Record<string, string>,
+    timeoutSec: 30,
+    graceSec: 5,
+  };
+
+  function probeResult(overrides: Record<string, unknown>) {
+    return {
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+      ...overrides,
+    } as never;
+  }
+
+  beforeEach(() => {
+    runAdapterExecutionTargetProcessMock.mockReset();
+  });
+
+  it("proceeds when the remote probe exits non-zero (e.g. a transient `Unexpected error`)", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 1, stderr: "Unexpected error" }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("proceeds when the remote probe times out", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ timedOut: true, exitCode: null }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("proceeds when the remote probe returns no models", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 0, stdout: "" }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("still rejects when the probe succeeds but the configured model is absent (guard retained)", async () => {
+    runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 0, stdout: "openai/gpt-4.1\n" }));
+    await expect(
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, model: "openai/gpt-5" }),
+    ).rejects.toThrow("Configured OpenCode model is unavailable on the remote execution target");
   });
 });
 

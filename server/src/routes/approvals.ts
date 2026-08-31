@@ -467,6 +467,14 @@ export function approvalRoutes(
         lostIssueIds: lostReviewIssueIds,
         requestedByUserId: req.actor.userId ?? "board",
       });
+      await queueAdditionalApprovalReviewPathWakes({
+        approvalId: approval.id,
+        approvalStatus: approval.status,
+        companyId: approval.companyId,
+        linkedIssues,
+        lostIssueIds: lostReviewIssueIds,
+        requestedByUserId: req.actor.userId ?? "board",
+      });
     }
 
     res.json(redactApprovalPayload(approval));

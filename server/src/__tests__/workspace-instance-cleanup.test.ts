@@ -147,7 +147,7 @@ describe("worktree instance cleanup", () => {
       workspaceId: "workspace-1",
       workspacePath,
       expectedInstanceId: instanceId,
-      expectedInstanceRoot: null,
+      expectedInstanceRoot: instanceRoot,
       worktreesDir,
     });
 
@@ -174,7 +174,7 @@ describe("worktree instance cleanup", () => {
       workspaceId: "workspace-1",
       workspacePath,
       expectedInstanceId: stableInstanceId,
-      expectedInstanceRoot: null,
+      expectedInstanceRoot: instanceRoot,
       worktreesDir,
     });
 
@@ -239,7 +239,7 @@ describe("worktree instance cleanup", () => {
     await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("falls back to deterministic instance ownership when persisted root metadata is absent", async () => {
+  it("preserves a collision-resistant active instance when persisted ownership is absent", async () => {
     const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
     const workspacePath = await makeTempRoot("paperclip-cleanup-workspace-");
     const instanceId = deriveWorktreeInstanceId(workspacePath);
@@ -258,8 +258,9 @@ describe("worktree instance cleanup", () => {
       worktreesDir,
     });
 
-    expect(result).toMatchObject({ status: "removed", instanceRoot });
-    await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(result).toMatchObject({ status: "refused", instanceRoot });
+    expect((result as { warning: string }).warning).toContain("no persisted instance root");
+    await expect(fs.readFile(path.join(instanceRoot, "marker"), "utf8")).resolves.toBe("remove me");
   });
 
   it("refuses and logs an instance pointer outside the managed worktree root", async () => {
@@ -478,6 +479,12 @@ describe("worktree instance cleanup", () => {
       wait: async () => {},
     })).resolves.toBe(false);
   });
+  // Upstream test removed here: the "deterministic ownership fallback" this
+  // asserted is inherited upstream code (de08d947e), and upstream has since
+  // replaced it with a fail-closed refusal (#11651) -- covered by "refuses ...
+  // no persisted instance root" above. Deleting an instance directory the
+  // workspace row cannot prove it owns is not a fallback worth keeping.
+
 });
 
 describe("deriveWorktreeInstanceId agrees with the script that names the directory", () => {
@@ -485,7 +492,6 @@ describe("deriveWorktreeInstanceId agrees with the script that names the directo
   // 48-character truncation leaves behind. That script is what creates the
   // instance directory. This function did not move with it, so it derived an id
   // spelled "--" for exactly those names — an id naming a directory that does not
-  // exist, so cleanup declined to reclaim the instance it was asked to reclaim.
   const canonicalizeLikeTheScript = (value: string) =>
     value.trim().toLowerCase()
       .replace(/[^a-z0-9_-]+/g, "-")
@@ -496,6 +502,7 @@ describe("deriveWorktreeInstanceId agrees with the script that names the directo
   // Taken from the branch that wedged in production.
   const truncatesOnADash =
     "/paperclip/worktrees/SUP-14139-execution-workspace-allocation-has-no-path-exclusivity";
+
 
   it("never emits a doubled separator", () => {
     expect(deriveWorktreeInstanceId(truncatesOnADash)).not.toContain("--");
@@ -520,4 +527,5 @@ describe("deriveWorktreeInstanceId agrees with the script that names the directo
     const b = deriveWorktreeInstanceId(`${truncatesOnADash}-and-an-issue-bound`);
     expect(a).not.toBe(b);
   });
+
 });

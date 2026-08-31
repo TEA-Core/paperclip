@@ -1,5 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import type { ExternalObjectCanonicalUrl } from "@paperclipai/shared";
+import { DEFAULT_GITHUB_TOKEN_SECRET_NAMES } from "./git-credentials.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { isGitHubTokenResolution, resolveGitHubTokenForRepo } from "./github-credential.js";
 import type {

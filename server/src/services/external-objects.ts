@@ -996,9 +996,6 @@ export function externalObjectService(
       return { object: toObjectPayload(object, now), refreshed: false, reason: "backoff" as const };
     }
 
-    const existingRefresh = objectRefreshesInFlight.get(refreshKey);
-    if (existingRefresh) return existingRefresh;
-
     const claimed = await claimObjectRefresh(object, input, now);
     if (!claimed) {
       const latest = await db
