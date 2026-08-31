@@ -837,12 +837,6 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .from(issues)
       .where(eq(issues.id, issueId));
     const approvalStatus = (stateRows[0]?.executionState as Record<string, any> | null)?.approvalStatus;
-    // DEBUG-BEGIN
-    const dbgComments = await db.select({ body: issueComments.body }).from(issueComments).where(eq(issueComments.issueId, issueId));
-    console.error("DEBUG-EXEC-STATE", JSON.stringify(stateRows[0]?.executionState, null, 1));
-    console.error("DEBUG-COMMENTS", JSON.stringify(dbgComments.map((c) => c.body)));
-    console.error("DEBUG-GH-URLS", JSON.stringify(mockGhFetch.mock.calls.map((c) => String(c[0]))));
-    // DEBUG-END
     expect(approvalStatus?.pendingCandidates).toEqual([
       { owner: "TEA-Core", repo: "paperclip", number: 42, headShaAtApproval: headSha42 },
       { owner: "TEA-Core", repo: "paperclip", number: 43, headShaAtApproval: headSha43 },
