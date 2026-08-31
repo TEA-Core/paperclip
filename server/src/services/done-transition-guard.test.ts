@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { issues as issuesTable } from "@paperclipai/db";
+import { agents as agentsTable, issues as issuesTable } from "@paperclipai/db";
 import {
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
@@ -80,7 +80,13 @@ function mockProjectRow(row: Partial<Record<string, unknown>> = {}) {
   };
 }
 
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[] }) {
+/**
+ * Build the shared `db` mock. Selects are dispatched by table identity when the
+ * matching `rows.<table>` is seeded; otherwise every
+ * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
+ * as the legacy positional chain did, so pre-existing tests are untouched.
+ */
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; agents?: Record<string, unknown>[] }) {
   // SUP-14561: the guard now also reads the issues table (child ladder scan).
   // Dispatch by table identity when `rows.issues` is seeded; otherwise every
   // select().from().where() resolves to the executionWorkspaces rows exactly
@@ -89,6 +95,14 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.issues ?? []),
     then: vi.fn().mockResolvedValue(rows.issues ?? []),
+  };
+  // SUP-14579: the guard now also reads the agents table (close-ladder shape
+  // check resolves participant agent ids to urlKeys). Dispatched by table
+  // identity when `rows.agents` is seeded.
+  const agentsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.agents ?? []),
+    then: vi.fn().mockResolvedValue(rows.agents ?? []),
   };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
@@ -116,6 +130,7 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     return {
       from: function (table: unknown) {
         if (table === issuesTable && rows.issues !== undefined) return issuesChain;
+        if (table === agentsTable && rows.agents !== undefined) return agentsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -512,6 +527,206 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("Review ladder unsatisfied");
       expect(result.reason).not.toContain("open linked PR");
+    });
+  });
+
+  describe("ADR-072 close-ladder shape (SUP-14579 mechanism D)", () => {
+    const supportQaeId = "aaaaaaa1-0000-4000-8000-000000000001";
+    const coderLeId = "bbbbbbb2-0000-4000-8000-000000000002";
+    const execCtoId = "ccccccc3-0000-4000-8000-000000000003";
+    const stage1 = "10000000-0000-4000-8000-000000000001";
+    const stage2 = "20000000-0000-4000-8000-000000000002";
+    const stage3 = "30000000-0000-4000-8000-000000000003";
+
+    const agents = [
+      { id: supportQaeId, name: "support-QAE", role: "support" },
+      { id: coderLeId, name: "coder-LE", role: "engineer" },
+      { id: execCtoId, name: "exec-CTO", role: "executive" },
+    ];
+
+    // The literal SUP-14306 shape: a single review stage (support-QAE only).
+    const singleStageLadder = {
+      stages: [
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+      ],
+    };
+
+    // The full ADR-072 close-ladder shape.
+    const fullLadder = {
+      stages: [
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+        { id: stage2, type: "review", participants: [{ type: "agent", agentId: coderLeId }] },
+        { id: stage3, type: "approval", participants: [{ type: "agent", agentId: execCtoId }] },
+      ],
+    };
+
+    /** A completed execution state over the given stage ids (ladder satisfied). */
+    const satisfiedState = (stageIds: string[]) => ({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: stageIds,
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+
+    /** One laddered child: a satisfied single-stage ladder under `identifier`. */
+    const ladderedChild = (identifier: string, childStageId: string) => ({
+      identifier,
+      executionPolicy: { stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    const twoLadderedChildren = [
+      ladderedChild("SUP-9001", "40000000-0000-4000-8000-000000000001"),
+      ladderedChild("SUP-9002", "50000000-0000-4000-8000-000000000002"),
+    ];
+
+    it("refuses done for the literal SUP-14306 shape: 1-stage ladder over 2+ laddered children (AC1)", async () => {
+      setupDbMock({ issues: twoLadderedChildren, agents });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("Mechanism D");
+      expect(result.reason).toContain("ADR-072 close-ladder shape");
+      // Fail closed before any external probe: no GitHub call, no PR resolution.
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            reason: "adr072_close_ladder_shape_incomplete",
+            missingStageLabels: ["review:coder-LE", "approval:exec-CTO"],
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-9001", "SUP-9002"],
+          }),
+        }),
+      );
+    });
+
+    it("names the specific missing stages in the refusal reason (AC2)", async () => {
+      setupDbMock({ issues: twoLadderedChildren, agents });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("review:coder-LE");
+      expect(result.reason).toContain("approval:exec-CTO");
+      // The stage that IS present is not named as missing.
+      expect(result.reason).not.toContain("review:support-QAE");
+    });
+
+    it("allows done when the full 3-stage close ladder is present over 2+ laddered children (AC3)", async () => {
+      setupDbMock({ issues: twoLadderedChildren, agents });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: fullLadder, executionState: satisfiedState([stage1, stage2, stage3]) },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("exempts a non-top-level issue (has a parent) from the shape check (AC4a)", async () => {
+      setupDbMock({ issues: twoLadderedChildren, agents });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: "99999999-9999-4999-8999-999999999999", executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("exempts a parent with fewer than two laddered children from the shape check (AC4b)", async () => {
+      setupDbMock({ issues: [twoLadderedChildren[0]] });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("does not fire the shape check for a ladder-less parent (AC4c)", async () => {
+      setupDbMock({ issues: twoLadderedChildren });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("keeps mechanism A refusing a null-policy parent over 2+ laddered children (AC5 regression)", async () => {
+      setupDbMock({ issues: twoLadderedChildren });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism A");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_null_policy_refused",
+          details: expect.objectContaining({ ladderedChildCount: 2 }),
+        }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("lets a sanctioned override land the close and records the shape bypass with the authorising disposition (AC6)", async () => {
+      setupDbMock({ issues: twoLadderedChildren, agents });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        { disposition: "merged-elsewhere", reason: "closed out by ops" },
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("Override accepted: merged-elsewhere");
+      expect(result.reason).toContain("ADR-072 close-ladder shape bypassed");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_override",
+          details: expect.objectContaining({
+            disposition: "merged-elsewhere",
+            overrideReason: "closed out by ops",
+            missingStageLabels: ["review:coder-LE", "approval:exec-CTO"],
+          }),
+        }),
+      );
     });
   });
 
