@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import type { Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { issues, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -750,6 +751,52 @@ function evaluateReviewLadderSatisfaction(
   };
 }
 
+/**
+ * SUP-14561 (mechanism A): count this issue's child issues that each ran a
+ * review ladder — the child carries a non-null execution policy and its
+ * execution state has a non-empty completedStageIds or skippedStageIds.
+ *
+ * A ladder-less parent (executionPolicy null, or `stages: []` — either way
+ * `evaluateReviewLadderSatisfaction` reports no ladder) sitting over two or
+ * more such children is a decomposed body of reviewed engineering work: the
+ * work was gated at the children, so closing the parent with `done` would
+ * ship it through no review, no Definition-of-Done gate, and no approval
+ * (SUP-14306 / SUP-14309 / SUP-14023 / SUP-13777). One-off ops/reflection
+ * cards whose children carry no policy of their own count 0 and stay legal.
+ *
+ * This is a local indexed read (issues_company_parent_idx). Like mechanism C
+ * it runs before any GitHub path, and it fails closed on a throw: the
+ * transition write targets the same store, so a Postgres error must not be
+ * waved through.
+ */
+async function countLadderedChildren(
+  db: Db,
+  companyId: string,
+  parentId: string,
+): Promise<{ count: number; identifiers: string[] }> {
+  const rows = await db
+    .select({
+      identifier: issues.identifier,
+      executionPolicy: issues.executionPolicy,
+      executionState: issues.executionState,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), eq(issues.parentId, parentId)));
+  let count = 0;
+  const identifiers: string[] = [];
+  for (const row of rows) {
+    if (row.executionPolicy == null) continue;
+    const state = parseIssueExecutionState(row.executionState);
+    const completed = state?.completedStageIds?.length ?? 0;
+    const skipped = state?.skippedStageIds?.length ?? 0;
+    if (completed > 0 || skipped > 0) {
+      count += 1;
+      identifiers.push(row.identifier ?? "<unnamed>");
+    }
+  }
+  return { count, identifiers };
+}
+
 export async function evaluateDoneTransitionGuard(
   db: Db,
   issue: {
@@ -783,6 +830,14 @@ export async function evaluateDoneTransitionGuard(
     decisionCarried,
   );
 
+  // SUP-14561 (mechanism A): a ladder-less parent is only suspect when its
+  // children demonstrably ran ladders. Query the decomposition only in that
+  // case; a parent that carries its own ladder is governed by mechanism C.
+  const mechanismA =
+    reviewLadder === null
+      ? await countLadderedChildren(db, issue.companyId, issue.id)
+      : null;
+
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
     void writeAuditLog(db, issue, "issue.done_transition_override", {
       disposition: override.disposition,
@@ -804,6 +859,29 @@ export async function evaluateDoneTransitionGuard(
         reason:
           `Override accepted: ${override.disposition} ` +
           `(review ladder bypassed — unsatisfied stages: ${reviewLadder.unsatisfiedStageIds.join(", ")})`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    if (mechanismA !== null && mechanismA.count >= 2) {
+      void writeAuditLog(db, issue, "issue.done_transition_null_policy_override", {
+        disposition: override.disposition,
+        overrideReason: override.reason ?? null,
+        ladderedChildCount: mechanismA.count,
+        ladderedChildIdentifiers: mechanismA.identifiers,
+        source: "done_transition_guard",
+      });
+      return {
+        allowed: true,
+        reason:
+          `Override accepted: ${override.disposition} ` +
+          `(ungated decomposed-parent close bypassed — ${mechanismA.count} laddered children: ` +
+          `${mechanismA.identifiers.join(", ")})`,
         aheadBy: null,
         branch: null,
         defaultRef: null,
@@ -849,6 +927,37 @@ export async function evaluateDoneTransitionGuard(
         "its id is in neither completedStageIds nor skippedStageIds. " +
         "Complete or skip the stage before marking done, or set doneTransitionOverride to a " +
         `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // SUP-14561 (mechanism A): refuse a ladder-less parent over a decomposed
+  // body of work. No execution policy (or an empty one) was attached to this
+  // issue, yet two or more children each ran a review ladder — the work was
+  // gated at the children and the parent would close ungated. Fail closed
+  // here, in the same pre-network zone as mechanism C.
+  if (mechanismA !== null && mechanismA.count >= 2) {
+    void writeAuditLog(db, issue, "issue.done_transition_null_policy_refused", {
+      reason: "ungated_decomposed_parent",
+      ladderedChildCount: mechanismA.count,
+      ladderedChildIdentifiers: mechanismA.identifiers,
+      source: "done_transition_guard",
+    });
+    return {
+      allowed: false,
+      reason:
+        `Mechanism A (ungated decomposed parent) refused: this issue carries no review ladder, ` +
+        `but ${mechanismA.count} child issues each ran one (${mechanismA.identifiers.join(", ")}). ` +
+        "The decomposed work was gated at the children; closing the parent ungated would ship it " +
+        "with no verification gate and no approval. Attach an execution policy with a review ladder " +
+        "to this issue, or set doneTransitionOverride to a sanctioned no-deliverable-head disposition " +
+        `(${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
       aheadBy: null,
       branch: null,
       defaultRef: null,

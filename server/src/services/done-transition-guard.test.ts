@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { issues as issuesTable } from "@paperclipai/db";
 import {
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
@@ -6,6 +7,7 @@ import {
   type DoneTransitionOverride,
 } from "./done-transition-guard.js";
 import { logActivity } from "./activity-log.js";
+import { mechanismACorpus } from "./done-transition-guard-mechanism-a-fixtures.js";
 
 const mockDb = {
   select: vi.fn(),
@@ -78,7 +80,16 @@ function mockProjectRow(row: Partial<Record<string, unknown>> = {}) {
   };
 }
 
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[] }) {
+  // SUP-14561: the guard now also reads the issues table (child ladder scan).
+  // Dispatch by table identity when `rows.issues` is seeded; otherwise every
+  // select().from().where() resolves to the executionWorkspaces rows exactly
+  // as the legacy chain did, so pre-existing tests are untouched.
+  const issuesChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.issues ?? []),
+    then: vi.fn().mockResolvedValue(rows.issues ?? []),
+  };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
@@ -103,7 +114,8 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     let callCount = 0;
     const chains = [selectChain, selectChain2, selectChain3, selectChain4];
     return {
-      from: function() {
+      from: function (table: unknown) {
+        if (table === issuesTable && rows.issues !== undefined) return issuesChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -500,6 +512,220 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("Review ladder unsatisfied");
       expect(result.reason).not.toContain("open linked PR");
+    });
+  });
+
+  describe("ungated decomposed parent (SUP-14561 mechanism A)", () => {
+    const stageId = "55555555-5555-4555-8555-555555555555";
+
+    const fixtureIssue = (f: (typeof mechanismACorpus)[number]) => ({
+      ...issue,
+      identifier: f.identifier,
+      executionPolicy: f.executionPolicy,
+      executionState: f.executionState,
+    });
+
+    const childState = (completed: string[] = [], skipped: string[] = []) => ({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: completed,
+      skippedStageIds: skipped,
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+
+    it("refuses the literal SUP-14306 shape and names the mechanism (AC1)", async () => {
+      const f = mechanismACorpus.find((x) => x.identifier === "SUP-14306");
+      expect(f).toBeDefined();
+      setupDbMock({ issues: f!.children });
+      const result = await evaluateDoneTransitionGuard(mockDb, fixtureIssue(f!), null);
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("Mechanism A");
+      expect(result.reason).not.toContain("Review ladder unsatisfied");
+      // Fail closed BEFORE any external probe: no GitHub call, no PR resolution.
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_null_policy_refused",
+          details: expect.objectContaining({
+            reason: "ungated_decomposed_parent",
+            ladderedChildCount: 5,
+          }),
+        }),
+      );
+    });
+
+    it("allows the literal SUP-13791 shape: null policy over one null-policy child (AC2)", async () => {
+      const f = mechanismACorpus.find((x) => x.identifier === "SUP-13791");
+      expect(f).toBeDefined();
+      setupDbMock({ issues: f!.children });
+      const result = await evaluateDoneTransitionGuard(mockDb, fixtureIssue(f!), null);
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+    });
+
+    it("refuses all 4 historical leak shapes and allows all 11 legitimate ladder-less closes (AC3)", async () => {
+      const expectedCounts: Record<string, number> = {
+        "SUP-13777": 3,
+        "SUP-14023": 3,
+        "SUP-14306": 5,
+        "SUP-14309": 6,
+      };
+      const refused = mechanismACorpus.filter((f) => f.expected === "refused");
+      const allowed = mechanismACorpus.filter((f) => f.expected === "allowed");
+      expect(refused.map((f) => f.identifier).sort()).toEqual(Object.keys(expectedCounts).sort());
+      expect(allowed).toHaveLength(11);
+
+      for (const f of refused) {
+        vi.mocked(logActivity).mockClear();
+        setupDbMock({ issues: f.children });
+        const result = await evaluateDoneTransitionGuard(mockDb, fixtureIssue(f), null);
+        expect(result.allowed, `${f.identifier} should refuse`).toBe(false);
+        expect(result.reason, `${f.identifier} should name the mechanism`).toContain("Mechanism A");
+        expect(logActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.done_transition_null_policy_refused",
+            details: expect.objectContaining({
+              ladderedChildCount: expectedCounts[f.identifier],
+            }),
+          }),
+        );
+      }
+      for (const f of allowed) {
+        vi.mocked(logActivity).mockClear();
+        setupDbMock({ issues: f.children });
+        const result = await evaluateDoneTransitionGuard(mockDb, fixtureIssue(f), null);
+        expect(result.allowed, `${f.identifier} should allow`).toBe(true);
+        expect(logActivity).not.toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+        );
+      }
+    });
+
+    it("writes an audit row distinct from mechanism C's action names (AC4)", async () => {
+      const f = mechanismACorpus.find((x) => x.identifier === "SUP-14309");
+      expect(f).toBeDefined();
+      setupDbMock({ issues: f!.children });
+      await evaluateDoneTransitionGuard(mockDb, fixtureIssue(f!), null);
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_refused" }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_override" }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_override" }),
+      );
+    });
+
+    it("lets a sanctioned override land the close and records the mechanism-A bypass (AC5)", async () => {
+      const f = mechanismACorpus.find((x) => x.identifier === "SUP-14023");
+      expect(f).toBeDefined();
+      setupDbMock({ issues: f!.children });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        fixtureIssue(f!),
+        { disposition: "merged-elsewhere", reason: "children merged; parent is the rollout record" },
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("Override accepted: merged-elsewhere");
+      expect(result.reason).toContain("ungated decomposed-parent close bypassed");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_override",
+          details: expect.objectContaining({ disposition: "merged-elsewhere" }),
+        }),
+      );
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_null_policy_override",
+          details: expect.objectContaining({
+            disposition: "merged-elsewhere",
+            ladderedChildCount: 3,
+          }),
+        }),
+      );
+    });
+
+    it("does not fire when the parent carries its own ladder (mechanism C governs)", async () => {
+      const f = mechanismACorpus.find((x) => x.identifier === "SUP-14306");
+      expect(f).toBeDefined();
+      setupDbMock({ issues: f!.children });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: { stages: [{ id: stageId, type: "review" }] }, executionState: {} },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Review ladder unsatisfied");
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+    });
+
+    it("keeps a null-policy parent legal with exactly one laddered child (count boundary)", async () => {
+      setupDbMock({
+        issues: [
+          { identifier: "SUP-1", executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] }, executionState: childState([stageId]) },
+          { identifier: "SUP-2", executionPolicy: null, executionState: null },
+        ],
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+    });
+
+    it("does not count children whose policy never fired a stage (no completed/skipped ids)", async () => {
+      setupDbMock({
+        issues: [
+          { identifier: "SUP-9A", executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] }, executionState: childState() },
+          { identifier: "SUP-9B", executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] }, executionState: childState() },
+        ],
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+    });
+
+    it("fails closed when the child read throws (same store as the transition write)", async () => {
+      const f = mechanismACorpus.find((x) => x.identifier === "SUP-14306");
+      expect(f).toBeDefined();
+      (mockDb.select as any).mockImplementation(() => ({
+        from: () => ({
+          where: () => {
+            throw new Error("postgres down");
+          },
+        }),
+      }));
+      await expect(evaluateDoneTransitionGuard(mockDb, fixtureIssue(f!), null)).rejects.toThrow("postgres down");
     });
   });
 
