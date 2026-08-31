@@ -214,6 +214,18 @@ async function flush() {
   });
 }
 
+// `flush()` advances exactly one macrotask. That is enough for a synchronous
+// re-render, but the editor ref becomes ready asynchronously, so a value applied
+// on ref-ready can land a tick or more later and a single flush races it. Retry
+// the flush until the expectation is satisfiable, then let the assertion itself
+// decide. Bounded, so a genuine regression still fails rather than hanging.
+async function flushUntil(predicate: () => boolean, attempts = 50) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (predicate()) return;
+    await flush();
+  }
+}
+
 function clickRetryRichEditor(scope: HTMLElement) {
   const button = Array.from(scope.querySelectorAll("button")).find((candidate) =>
     candidate.textContent?.includes("Retry rich editor"),
@@ -343,7 +355,7 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
+    await flushUntil(() => container.textContent?.includes("Loaded plan body") ?? false);
     expect(container.textContent).toContain("Loaded plan body");
 
     await act(async () => {
