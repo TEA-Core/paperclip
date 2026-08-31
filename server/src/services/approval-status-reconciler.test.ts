@@ -1150,6 +1150,49 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(postStatusCalls()).toHaveLength(0);
       });
 
+      it("refuses recovery when the only open pending candidate is not the live target PR (zero writes)", async () => {
+        // The live target (#42) was never an approval-time candidate, but
+        // candidate #43 is still open. Guard A must not pair #43's certified
+        // head with #42's live diff — that would compare two different PRs
+        // and could post a misleading void warning on #42.
+        const issueId = await insertIssue({
+          executionState: {
+            ...pendingCandidatesState(),
+            approvalStatus: {
+              skipReason: "skipped:ambiguous",
+              certifiedAt: APPROVED_AT,
+              pendingCandidates: [
+                { owner: "TEA-Core", repo: "paperclip", number: 43, headShaAtApproval: APPROVED_HEAD },
+                { owner: "TEA-Core", repo: "paperclip", number: 44, headShaAtApproval: MOVED_HEAD },
+              ],
+            },
+          },
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId, { number: 42, state: "open" });
+        // Stale cached state: #43 is cached closed but is in fact still open.
+        await insertMention(issueId, { number: 43, state: "closed" });
+        await insertMention(issueId, { number: 44, state: "closed" });
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: PR_43_URL, body: OPEN_43_BODY },
+          { url: PR_44_URL, body: MERGED_44_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.republished).toBe(0);
+        expect(summary.skipped["guard-a:candidate-not-target"]).toBe(1);
+        expect(postStatusCalls()).toHaveLength(0);
+
+        // No publishedHeadSha was persisted — the card stays unrecovered.
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        expect(approvalStatus.publishedHeadSha).toBeUndefined();
+      });
+
       it("refuses recovery when the surviving candidate has no persisted head anchor (zero writes)", async () => {
         const issueId = await insertIssue({
           executionState: {

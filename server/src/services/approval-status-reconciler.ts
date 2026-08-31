@@ -234,7 +234,9 @@ type PendingCandidateSelection =
 /**
  * SUP-14602: pick the certified head for a card that was approved on the
  * skipped:ambiguous path. Exactly one pending candidate must be positively
- * proven open and unmerged; the target has already been live-verified open
+ * proven open and unmerged, and it must be the target itself — a certified
+ * head from a different PR must never be paired with the target's live
+ * diff. The target has already been live-verified open
  * and unmerged earlier in the tick, so only the other candidates are re-read.
  * Anything the live read cannot positively prove refuses with a recorded
  * reason — zero writes.
@@ -294,6 +296,20 @@ async function selectOpenPendingCandidate(
     };
   }
   const surviving = openUnmerged[0]!;
+  if (candidateKey(surviving) !== targetKey) {
+    // The live target is open but was never an approval-time candidate, while
+    // exactly one certified candidate is still open. Pairing that candidate's
+    // certified head with the target's live diff would compare two different
+    // PRs — refuse with a recorded reason instead of a misleading
+    // changed-blob / void warning on the target.
+    return {
+      reason: "guard-a:candidate-not-target",
+      detail:
+        `guard-a: the only open pending candidate (${candidateDisplayName(surviving)}) is not the ` +
+        `live target (${candidateDisplayName(target)}); its certified head belongs to a different PR; ` +
+        `refusing to pair a foreign approved head`,
+    };
+  }
   if (!surviving.headShaAtApproval) {
     return {
       reason: "guard-a:no-approved-head",
