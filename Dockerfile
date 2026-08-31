@@ -362,7 +362,6 @@ RUN chown -R root:root /app \
     && chmod -R go-w /app
 # Self-contained MCP server tree with resolved dependencies (npm pack + install).
 COPY --chown=node:node --from=build /opt/paperclip-mcp /opt/paperclip-mcp
-COPY --chown=node:node --from=build /app /app
 
 ENV NODE_ENV=production \
   HOME=/paperclip \
