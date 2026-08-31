@@ -5674,10 +5674,6 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
-    return heartbeatRunIsTerminalOrMissing(dbOrTx, runId);
-  }
-
   /**
    * True when a run cannot be executing any more: it is terminal, gone, or stillborn — a row that
    * says `running` but never produced a process, output, usage or liveness.

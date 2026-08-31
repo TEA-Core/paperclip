@@ -70,7 +70,6 @@ import {
   updateIssueObjectSchema,
   updateIssueSchema,
   stripCreateOnlyIssueAttribution,
-  getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
   isMarkdownArtifactWorkProduct,
   isMarkdownAttachmentContent,
@@ -6413,16 +6412,6 @@ export function issueRoutes(
     }
   }
 
-  function respondClosedIssueExecutionWorkspace(
-    res: Response,
-    workspace: Pick<ExecutionWorkspace, "closedAt" | "id" | "mode" | "name" | "status">,
-  ) {
-    res.status(409).json({
-      error: getClosedIsolatedExecutionWorkspaceMessage(workspace),
-      executionWorkspace: workspace,
-    });
-  }
-
   async function destroyReusableSandboxLeasesForTerminalIssue(issue: {
     id: string;
     companyId: string;
@@ -6867,6 +6856,10 @@ export function issueRoutes(
         res.status(422).json({ error: "pendingReviewParticipantAgentId must be a UUID or 'me'" });
         return;
       }
+    }
+    if (rawUpdatedSince !== undefined && !Number.isFinite(new Date(rawUpdatedSince).getTime())) {
+      res.status(400).json({ error: "updatedSince must be a valid ISO 8601 timestamp when provided" });
+      return;
     }
     const offset = parsedOffset ?? 0;
 
@@ -10673,10 +10666,6 @@ export function issueRoutes(
       req.actor.type === "agent" &&
       (Object.keys(updateFields).length > 0 || reviewRequest !== undefined || hiddenAtRaw !== undefined);
 
-    if (closedExecutionWorkspace && (commentBody || isAgentWorkUpdate)) {
-      respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
-      return;
-    }
     if (
       isAgentWorkUpdate &&
       !(await assertCrossIssueInfluenceWithinRunCap(req, res, existing, "update"))
@@ -11303,12 +11292,6 @@ export function issueRoutes(
               createdByRunId: actor.runId ?? null,
             });
           }
-
-          if (shouldRelayStop) {
-            stopRelayResult.value = await svc.addStopRelayCommentIfNeeded(updated, tx);
-          }
-
-          await persistReviewTransitionActivity(tx, updated);
 
           if (shouldRelayStop) {
             stopRelayResult.value = await svc.addStopRelayCommentIfNeeded(updated, tx);

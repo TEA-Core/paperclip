@@ -2006,20 +2006,11 @@ describe.sequential("issue comment reopen routes", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "restart someone else's work", resume: true });
 
-    expect(res.status).toBe(201);
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      { status: "todo" },
-    );
-    expect(mockIssueService.addComment).toHaveBeenCalled();
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      "22222222-2222-4222-8222-222222222222",
-      expect.objectContaining({
-        requestedByActorType: "agent",
-        reason: "issue_reopened_via_comment",
-        payload: expect.objectContaining({ resumeIntent: true }),
-      }),
-    );
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("bounds a cross-agent reply loop: peer comments wake and assignee self-replies do not", async () => {

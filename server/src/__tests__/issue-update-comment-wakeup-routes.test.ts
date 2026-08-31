@@ -194,9 +194,24 @@ async function createApp() {
     };
     next();
   });
-  app.use("/api", issueRoutes({
-    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
-  } as any, {} as any));
+  // This fork gates `done` transitions behind `evaluateDoneTransitionGuards`,
+  // which upstream does not have, so the guard reads the database (linked pull
+  // requests via merge-arming) on a path upstream's thin stub never exercised.
+  // Resolving every query to no rows means "no linked PRs", which lets the guard
+  // pass and keeps this test on its actual subject: which wakes are emitted.
+  const emptyQuery: any = new Proxy(() => emptyQuery, {
+    get: (_target, prop) =>
+      prop === "then"
+        ? (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([]).then(onFulfilled, onRejected)
+        : emptyQuery,
+    apply: () => emptyQuery,
+  });
+  const stubDb: any = {
+    select: () => emptyQuery,
+    transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(stubDb),
+  };
+  app.use("/api", issueRoutes(stubDb as any, {} as any));
   app.use(errorHandler);
   return app;
 }
