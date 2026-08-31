@@ -64,6 +64,7 @@ describe("prepareSandboxClaudeProbeRuntime managed-config redaction", () => {
   it("never copies a materialization error into a Test-result check", async () => {
     // A materialization failure can carry a credential. Inject a secret marker
     // through the thrown error and assert no check text repeats it.
+    // paperclip:allow-security secret-literal: synthetic marker asserted to be redacted from probe output; not a credential
     const secret = "sk-ant-MANAGEDMARKER0123456789abcdef";
     resolveInstanceRoot.throwError = new Error(`materialize failed with ${secret}`);
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});

@@ -48,6 +48,7 @@ const OTHER_ENVIRONMENT_ID = "33333333-3333-4333-8333-333333333333";
 const BROWSER_CODE = "CODESECRETqrs321";
 const URL_CODE_QUERY = "QUERYSECRETabc123";
 const URL_STATE_QUERY = "STATESECRETdef456";
+// paperclip:allow-security secret-literal: synthetic minted-token fixture for the setup-token route; not a credential
 const MINTED_TOKEN = "sk-ant-oat01-TOKENSECRETxyz789aaaaaaaaaaaa";
 
 // The full authorization URL the transport surfaces. Its query holds the two

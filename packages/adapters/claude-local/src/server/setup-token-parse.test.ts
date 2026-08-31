@@ -548,6 +548,7 @@ describe("parseSetupTokenCredential", () => {
   });
 
   it("returns null for a wrong token prefix in a bare carriage-return record", () => {
+    // paperclip:allow-security secret-literal: synthetic success-screen fixture for the setup-token parser; not a credential
     const text = successScreenJoined(["sk-ant-api03-AAAABBBBCCCCDDDDEEEE1111"], "\r");
     expect(parseSetupTokenCredential(text)).toBeNull();
   });
@@ -663,6 +664,7 @@ describe("parseSetupTokenCredential", () => {
   });
 
   it("returns null for a wrong token prefix between the anchors", () => {
+    // paperclip:allow-security secret-literal: synthetic success-screen fixture for the setup-token parser; not a credential
     const text = successScreen(["sk-ant-api03-AAAABBBBCCCCDDDDEEEE1111"]);
     expect(parseSetupTokenCredential(text)).toBeNull();
   });

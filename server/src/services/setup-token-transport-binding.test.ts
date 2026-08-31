@@ -696,6 +696,7 @@ const DIAGNOSTIC_ALLOWLIST = new Set<string>([
 // Synthetic sentinels. No real secret is present. The tests assert that no
 // captured diagnostic line carries any of these values, so the binding never
 // leaks the token, the browser code, or the authorization URL to a log.
+// paperclip:allow-security secret-literal: synthetic sentinel asserted not to cross the transport boundary; not a credential
 const TOKEN_SENTINEL = "sk-ant-oat01-SENTINELTOKENAAAAAAAAAAAA";
 const BROWSER_CODE_SENTINEL = "SENTINEL-BROWSER-CODE";
 const URL_CLIENT_SENTINEL = "sentinelurlclient";
@@ -888,6 +889,7 @@ void isTerminalSessionState;
 
 // A synthetic token. No real token is present. The tests assert the token never
 // reaches a log or an error message.
+// paperclip:allow-security secret-literal: synthetic session-token fixture; not a credential
 const SYNTH_TOKEN = "sk-ant-oat01-SYNTHETICSYNTHETICSYNTHETIC01";
 
 describe("buildClaudeOAuthWriteInput", () => {

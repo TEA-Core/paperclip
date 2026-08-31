@@ -159,6 +159,7 @@ describe("claude sandbox hello probe diagnostics", () => {
   it("never copies a credential-bearing stderr failure line into a check or the log", async () => {
     // A verbose CLI can print a credential to stderr on failure. The check and
     // the log must not repeat it.
+    // paperclip:allow-security secret-literal: synthetic marker asserted to be redacted from stderr; not a credential
     const secret = "sk-ant-STDERRLEAK0123456789abcdef";
     probeResult.value = {
       exitCode: 1,

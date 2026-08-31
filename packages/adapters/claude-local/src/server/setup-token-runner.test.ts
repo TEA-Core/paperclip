@@ -30,6 +30,7 @@ const BROWSER_CODE = "SENTINEL-CODE-9182";
 
 // A synthetic OAuth token, wrapped across two physical lines the way the
 // terminal wraps a real token. No real token is present.
+// paperclip:allow-security secret-literal: synthetic token fragment used to test split-write reassembly; not a credential
 const TOKEN_FRAGMENT_A = "sk-ant-oat01-AAAABBBBCCCCDDDDEEEE1111";
 const TOKEN_FRAGMENT_B = "2222FFFFGGGG_HHHH-IIII";
 const FULL_TOKEN = `${TOKEN_FRAGMENT_A}${TOKEN_FRAGMENT_B}`;

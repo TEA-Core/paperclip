@@ -45,6 +45,7 @@ const FULL_LOGIN_URL =
 
 // A synthetic token. The session passes the token through in memory; it does not
 // parse it. No real token is present.
+// paperclip:allow-security secret-literal: synthetic session-token fixture; not a credential
 const SYNTH_TOKEN = "sk-ant-oat01-SYNTHETICSYNTHETICSYNTHETIC01";
 
 const OWNER_SCOPE: SetupTokenSessionScope = {
