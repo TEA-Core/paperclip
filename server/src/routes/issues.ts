@@ -3045,6 +3045,36 @@ export function issueRoutes(
             },
           })
           .where(eq(issueRows.id, issue.id));
+      } else if (
+        statusOutcome.kind === "skipped" &&
+        Array.isArray(statusOutcome.skipCandidates) &&
+        statusOutcome.skipCandidates.length > 0
+      ) {
+        // SUP-14602: an ambiguous skip must not discard the certification the
+        // producer had in hand at approval time. Persist the per-candidate
+        // approval-time heads so that, once the ambiguity resolves (a human or
+        // agent closes the duplicate PR), the approval-status reconciler can
+        // re-run the unmodified Guard A diff-vs-base check against a certified
+        // head instead of failing closed forever on guard-a:no-approved-head.
+        // publishedHeadSha semantics are untouched — it still means "published",
+        // never "considered".
+        const currentState = (issue.executionState ?? {}) as Record<string, unknown>;
+        const existingApprovalStatus =
+          (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
+        await db
+          .update(issueRows)
+          .set({
+            executionState: {
+              ...currentState,
+              approvalStatus: {
+                ...existingApprovalStatus,
+                pendingCandidates: statusOutcome.skipCandidates,
+                skipReason: statusOutcome.message,
+                certifiedAt: new Date().toISOString(),
+              },
+            },
+          })
+          .where(eq(issueRows.id, issue.id));
       }
 
       await svc.addComment(

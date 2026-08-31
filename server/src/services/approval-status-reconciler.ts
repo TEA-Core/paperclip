@@ -16,6 +16,7 @@ import {
   postPullRequestComment,
   publishApprovalStatus,
   resolveLinkedPullRequestsWithState,
+  type ApprovalCandidateAnchor,
   type LinkedPullRequest,
 } from "./merge-arming.js";
 
@@ -49,6 +50,20 @@ import {
 //     (failure, missing file list, truncated), or any map difference refuses
 //     the re-publish — the paperclip/approved stamp is an authorization, and
 //     may only certify content that was actually reviewed.
+//
+// SUP-14602. When the approval transition itself was skipped as ambiguous
+// (two linked open PRs), no publishedHeadSha was ever persisted and Guard A
+// could never fire. The producer now persists the per-candidate approval-time
+// heads in executionState.approvalStatus.pendingCandidates. When
+// publishedHeadSha is absent but pendingCandidates is present, the reconciler
+// live-checks every candidate: exactly one still open and unmerged selects
+// that candidate's headShaAtApproval as the approved head and the UNMODIFIED
+// Guard A diff-vs-base comparison runs against it. Every other shape — zero
+// open, still more than one open, an unverifiable live state, or a candidate
+// without a persisted anchor — refuses with a recorded reason and zero writes.
+// A successful recovery re-publish persists publishedHeadSha for that head so
+// the normal path takes over; the idempotency pre-check keeps re-runs at zero
+// writes.
 //
 // The write itself is delegated to publishApprovalStatus() from merge-arming.
 // The TOCTOU window (the delegated write re-resolves the head live) is closed
@@ -159,6 +174,135 @@ function readApprovedHead(state: Record<string, unknown> | null | undefined): Ap
     publishedHeadSha,
     publishedAt: typeof approvalStatus.publishedAt === "string" ? approvalStatus.publishedAt : undefined,
   };
+}
+
+/**
+ * SUP-14602: the pending candidate anchors persisted by an ambiguous
+ * approval-time skip (executionState.approvalStatus.pendingCandidates). Any
+ * entry that does not carry a positive owner/repo/number is dropped — a
+ * partially-shaped record is indistinguishable from a tampered one and must
+ * fail closed, not be inferred.
+ */
+function readPendingCandidates(state: Record<string, unknown> | null | undefined): ApprovalCandidateAnchor[] {
+  const approvalStatus = state?.approvalStatus as Record<string, unknown> | null | undefined;
+  if (!approvalStatus || typeof approvalStatus !== "object") return [];
+  const raw = approvalStatus.pendingCandidates;
+  if (!Array.isArray(raw)) return [];
+  const out: ApprovalCandidateAnchor[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (
+      typeof record.owner !== "string" ||
+      typeof record.repo !== "string" ||
+      record.owner.length === 0 ||
+      record.repo.length === 0 ||
+      typeof record.number !== "number" ||
+      !Number.isInteger(record.number)
+    ) {
+      continue;
+    }
+    const key = `${record.owner.toLowerCase()}/${record.repo.toLowerCase()}#${record.number}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      owner: record.owner,
+      repo: record.repo,
+      number: record.number,
+      headShaAtApproval:
+        typeof record.headShaAtApproval === "string" && record.headShaAtApproval.length > 0
+          ? record.headShaAtApproval
+          : null,
+    });
+  }
+  return out;
+}
+
+function candidateKey(pr: { owner: string; repo: string; number: number }): string {
+  return `${pr.owner.toLowerCase()}/${pr.repo.toLowerCase()}#${pr.number}`;
+}
+
+function candidateDisplayName(pr: { owner: string; repo: string; number: number }): string {
+  return `${pr.owner}/${pr.repo}#${pr.number}`;
+}
+
+type PendingCandidateSelection =
+  | { anchor: string }
+  | { reason: string; detail: string };
+
+/**
+ * SUP-14602: pick the certified head for a card that was approved on the
+ * skipped:ambiguous path. Exactly one pending candidate must be positively
+ * proven open and unmerged; the target has already been live-verified open
+ * and unmerged earlier in the tick, so only the other candidates are re-read.
+ * Anything the live read cannot positively prove refuses with a recorded
+ * reason — zero writes.
+ */
+async function selectOpenPendingCandidate(
+  db: Db,
+  row: CandidateRow,
+  pending: ApprovalCandidateAnchor[],
+  target: LinkedPullRequest,
+): Promise<PendingCandidateSelection> {
+  const targetKey = candidateKey(target);
+  const openUnmerged: ApprovalCandidateAnchor[] = [];
+
+  for (const candidate of pending) {
+    if (candidateKey(candidate) === targetKey) {
+      openUnmerged.push(candidate);
+      continue;
+    }
+    const read = await ghReadJson(
+      db,
+      row.companyId,
+      candidate.owner,
+      candidate.repo,
+      `/pulls/${candidate.number}`,
+    );
+    const body = (read.body ?? null) as Record<string, unknown> | null;
+    const state = typeof body?.state === "string" ? (body.state as string) : null;
+    if (!read.ok || state === null) {
+      const suffix = read.message ? `${read.message}`.trim() : "";
+      return {
+        reason: "guard-a:ambiguity-unresolved",
+        detail:
+          `guard-a: live state of pending candidate ${candidateDisplayName(candidate)} is ` +
+          `unverifiable (HTTP ${read.status}${suffix ? ` ${suffix}` : ""}); ` +
+          `cannot prove exactly one candidate open; refusing`,
+      };
+    }
+    if (body?.merged === true || state !== "open") continue;
+    openUnmerged.push(candidate);
+  }
+
+  if (openUnmerged.length === 0) {
+    return {
+      reason: "guard-a:candidate-resolved",
+      detail:
+        `guard-a: all ${pending.length} pending candidate(s) are closed or merged; ` +
+        `nothing was approved that can be recovered — refusing to stamp unreviewed content`,
+    };
+  }
+  if (openUnmerged.length > 1) {
+    return {
+      reason: "guard-a:ambiguity-unresolved",
+      detail:
+        `guard-a: ${openUnmerged.length} pending candidates still open ` +
+        `(${openUnmerged.map(candidateDisplayName).join(", ")}); refusing until a human or ` +
+        `agent closes the duplicate PR`,
+    };
+  }
+  const surviving = openUnmerged[0]!;
+  if (!surviving.headShaAtApproval) {
+    return {
+      reason: "guard-a:no-approved-head",
+      detail:
+        `guard-a: surviving candidate ${candidateDisplayName(surviving)} has no persisted ` +
+        `approval-time head anchor; refusing to re-publish unverified head`,
+    };
+  }
+  return { anchor: surviving.headShaAtApproval };
 }
 
 /**
@@ -595,14 +739,26 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   // added/removed file. Any case we cannot positively verify is a refusal with
   // a recorded reason — never a re-publish.
   const approvedHead = readApprovedHead(row.executionState);
-  if (!approvedHead) {
-    return {
-      kind: "skipped",
-      reason: "guard-a:no-approved-head",
-      detail: `guard-a: no persisted approved head for ${label}; refusing to re-publish unverified head ${headSha.slice(0, 7)}`,
-    };
+  let approvedHeadSha: string | null = approvedHead ? approvedHead.publishedHeadSha : null;
+  if (approvedHeadSha === null) {
+    // SUP-14602: no published head, but the approval-time certification may
+    // have survived the skipped:ambiguous transition as pending candidates.
+    const pending = readPendingCandidates(row.executionState);
+    if (pending.length === 0) {
+      return {
+        kind: "skipped",
+        reason: "guard-a:no-approved-head",
+        detail: `guard-a: no persisted approved head for ${label}; refusing to re-publish unverified head ${headSha.slice(0, 7)}`,
+      };
+    }
+    const selection = await selectOpenPendingCandidate(db, row, pending, target);
+    if ("anchor" in selection) {
+      approvedHeadSha = selection.anchor;
+    } else {
+      return { kind: "skipped", reason: selection.reason, detail: selection.detail };
+    }
   }
-  if (approvedHead.publishedHeadSha !== headSha) {
+  if (approvedHeadSha !== headSha) {
     const baseSha = ((prBody?.base as Record<string, unknown> | undefined)?.sha as string | undefined) ?? null;
     if (!baseSha) {
       return {
@@ -616,13 +772,13 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
       row.companyId,
       target.owner,
       target.repo,
-      `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(approvedHead.publishedHeadSha)}`,
+      `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(approvedHeadSha)}`,
     );
     if (!approvedDiff.ok) {
       return {
         kind: "skipped",
         reason: "guard-a:compare-failed",
-        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHead.publishedHeadSha.slice(0, 7)} failed (HTTP ${approvedDiff.status} ${approvedDiff.message ?? ""}); refusing to re-publish`,
+        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHeadSha.slice(0, 7)} failed (HTTP ${approvedDiff.status} ${approvedDiff.message ?? ""}); refusing to re-publish`,
       };
     }
     const approvedFiles = fileMapFromCompare(approvedDiff.body);
@@ -630,7 +786,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
       return {
         kind: "skipped",
         reason: "guard-a:unverifiable",
-        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHead.publishedHeadSha.slice(0, 7)} returned no usable file list; cannot prove ${headSha.slice(0, 7)} was reviewed; refusing to re-publish`,
+        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHeadSha.slice(0, 7)} returned no usable file list; cannot prove ${headSha.slice(0, 7)} was reviewed; refusing to re-publish`,
       };
     }
     const liveDiff = await ghReadJson(
@@ -663,7 +819,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
         db,
         row,
         target,
-        approvedHead.publishedHeadSha,
+        approvedHeadSha,
         headSha,
         substanceChange,
       );
@@ -689,6 +845,28 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     expectedHeadSha: headSha,
   });
   if (outcome.kind === "armed") {
+    if (approvedHead === null) {
+      // SUP-14602: the recovery path certified this head through the same
+      // unmodified Guard A comparison, so the normal publishedHeadSha path
+      // takes over from here. pendingCandidates stays as the historical
+      // record; the idempotency pre-check keeps re-runs at zero writes.
+      const currentState = row.executionState ?? {};
+      const existingApprovalStatus =
+        (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            ...currentState,
+            approvalStatus: {
+              ...existingApprovalStatus,
+              publishedHeadSha: headSha,
+              publishedAt: new Date().toISOString(),
+            },
+          },
+        })
+        .where(eq(issues.id, row.id));
+    }
     return { kind: "republished", detail: `republished ${target.displayName}: ${outcome.message}` };
   }
   if (outcome.kind === "skipped") {

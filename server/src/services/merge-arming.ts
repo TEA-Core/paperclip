@@ -47,6 +47,24 @@ export interface ArmingOutcome {
    * verify content identity before any re-publish (SUP-13714 Guard A).
    */
   headSha?: string | null;
+  /**
+   * SUP-14602: for a `skipped:ambiguous` outcome, every candidate PR that made
+   * the card ambiguous, each carrying the head SHA captured at approval time
+   * (null when no resolvable credential could fetch it). The approval
+   * transition persists these in executionState.approvalStatus.pendingCandidates
+   * so that after a human or agent closes the duplicate PR, the
+   * approval-status reconciler can re-run Guard A against a certified head
+   * instead of failing closed forever on guard-a:no-approved-head.
+   */
+  skipCandidates?: ApprovalCandidateAnchor[];
+}
+
+export interface ApprovalCandidateAnchor {
+  owner: string;
+  repo: string;
+  number: number;
+  /** The PR head SHA captured at approval time, or null when unresolvable. */
+  headShaAtApproval: string | null;
 }
 
 export interface LinkedPullRequest {
@@ -785,9 +803,22 @@ export async function publishApprovalStatus(
 
     if (matched.length > 1) {
       const prList = matched.map((pr) => pr.displayName).join(", ");
+      // SUP-14602: certify every candidate head at approval time. The skip
+      // must not discard the certification the producer had in hand — once the
+      // ambiguity resolves, the reconciler needs a head Guard A can verify.
+      const skipCandidates: ApprovalCandidateAnchor[] = [];
+      for (const pr of matched) {
+        skipCandidates.push({
+          owner: pr.owner,
+          repo: pr.repo,
+          number: pr.number,
+          headShaAtApproval: await fetchHeadShaAcrossCandidates([pr.candidate], pr.owner, pr.repo, pr.number),
+        });
+      }
       return {
         kind: "skipped",
         message: `status:skipped:ambiguous: Multiple linked PRs (${matched.length}): ${prList}`,
+        skipCandidates,
       };
     }
 
@@ -848,9 +879,28 @@ export async function publishApprovalStatus(
 
   if (authorizingPRs.length > 1) {
     const prList = authorizingPRs.map((pr) => pr.displayName).join(", ");
+    // SUP-14602: certify every candidate head at approval time (see the live
+    // re-resolve branch above) so the skip is recoverable by the reconciler.
+    // Certify the AUTHORIZING (post delivery-identity-narrowing) candidates —
+    // the same set the ambiguity was decided on — so the reconciler recovers
+    // against exactly the PRs the producer considered.
+    const skipCandidates: ApprovalCandidateAnchor[] = [];
+    for (const pr of authorizingPRs) {
+      const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
+      skipCandidates.push({
+        owner: pr.owner,
+        repo: pr.repo,
+        number: pr.number,
+        headShaAtApproval:
+          candidates.length > 0
+            ? await fetchHeadShaAcrossCandidates(candidates, pr.owner, pr.repo, pr.number)
+            : null,
+      });
+    }
     return {
       kind: "skipped",
       message: `status:skipped:ambiguous: Multiple linked PRs (${authorizingPRs.length}): ${prList}`,
+      skipCandidates,
     };
   }
 
@@ -1176,6 +1226,27 @@ export interface HeadShaFailure extends GitHubFetchResult {
 }
 
 export type HeadShaResult = HeadShaSuccess | HeadShaFailure;
+
+/**
+ * SUP-14602: resolve one PR's live head SHA across a list of token candidates
+ * (401/403 advances to the next candidate), or null when none could fetch it.
+ * Used to certify each candidate of an ambiguous skip at approval time so the
+ * certification is not thrown away with the skip.
+ */
+async function fetchHeadShaAcrossCandidates(
+  candidates: GitHubTokenResolution[],
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<string | null> {
+  for (let i = 0; i < candidates.length; i++) {
+    const headShaResult = await fetchPullRequestHeadSha(candidates[i]!.token, owner, repo, number);
+    if (headShaResult.ok) return headShaResult.headSha;
+    if ((headShaResult.status === 401 || headShaResult.status === 403) && i < candidates.length - 1) continue;
+    return null;
+  }
+  return null;
+}
 
 async function fetchPullRequestHeadSha(
   token: string,

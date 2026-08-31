@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -60,6 +61,8 @@ const AGENT_LEAD = "33333333-3333-3333-3333-333333333333";
 const USER_REVIEWER = "reviewer-user";
 
 const PR_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/42";
+const PR_43_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/43";
+const PR_44_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/44";
 const COMBINED_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/status`;
 const POST_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/statuses/${NEW_HEAD}`;
 const BASE_SHA = "base00000000000000000000000000000000000000003";
@@ -67,6 +70,9 @@ const APPROVED_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compa
 const LIVE_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${NEW_HEAD}`;
 const COMMENT_LIST_URL = "https://api.github.com/repos/TEA-Core/paperclip/issues/42/comments?per_page=100&direction=desc";
 const COMMENT_POST_URL = "https://api.github.com/repos/TEA-Core/paperclip/issues/42/comments";
+const CLOSED_43_BODY = { state: "closed", merged: false, head: { ref: "dup-branch", sha: "closed430000000000000000000000000000000000" }, base: { ref: "main", sha: BASE_SHA } };
+const MERGED_44_BODY = { state: "closed", merged: true, head: { ref: "dup-branch-44", sha: "merged440000000000000000000000000000000000" }, base: { ref: "main", sha: BASE_SHA } };
+const OPEN_43_BODY = { state: "open", merged: false, head: { ref: "dup-branch", sha: "open43000000000000000000000000000000000000" }, base: { ref: "main", sha: BASE_SHA } };
 
 const OPEN_PR_BODY = {
   state: "open",
@@ -963,6 +969,260 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(mockGhFetch.mock.calls.map((call) => String(call[0]))).not.toContain(
         "https://api.github.com/repos/TEA-Core/paperclip/pulls/44",
       );
+    });
+
+    describe("pending candidate recovery (SUP-14602)", () => {
+      const STABLE_DIFF = [
+        { filename: "server/src/a.ts", sha: "blobaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", status: "modified" },
+      ];
+
+      function pendingCandidatesState() {
+        return {
+          status: "completed",
+          completedStageIds: [APPROVAL_STAGE_ID],
+          lastDecisionOutcome: "approved",
+          currentStageId: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          // The approval transition was skipped:ambiguous — no publishedHeadSha,
+          // but the per-candidate approval-time heads survived.
+          approvalStatus: {
+            skipReason: "skipped:ambiguous",
+            certifiedAt: APPROVED_AT,
+            pendingCandidates: [
+              { owner: "TEA-Core", repo: "paperclip", number: 42, headShaAtApproval: APPROVED_HEAD },
+              { owner: "TEA-Core", repo: "paperclip", number: 43, headShaAtApproval: MOVED_HEAD },
+            ],
+          },
+        };
+      }
+
+      it("republishes the surviving candidate's approved head when ambiguity resolves to exactly one open PR", async () => {
+        const issueId = await insertIssue({ executionState: pendingCandidatesState() });
+        await insertDecision(issueId);
+        await insertMention(issueId, { number: 42, state: "open" });
+        await insertMention(issueId, { number: 43, state: "closed" });
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: PR_43_URL, body: CLOSED_43_BODY },
+          { url: APPROVED_DIFF_URL, body: { status: "ahead", ahead_by: 1, files: STABLE_DIFF } },
+          { url: LIVE_DIFF_URL, body: { status: "ahead", ahead_by: 1, files: STABLE_DIFF } },
+          { url: POST_STATUS_URL, body: { id: 12345 } },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.scanned).toBe(1);
+        expect(summary.republished).toBe(1);
+        expect(summary.failed).toBe(0);
+        expect(Object.keys(summary.skipped)).toEqual([]);
+        const calls = postStatusCalls();
+        expect(calls).toHaveLength(1);
+        expect(calls[0]![0]).toBe(POST_STATUS_URL);
+        expect(postStatusBodies()[0]).toMatchObject({
+          state: "success",
+          context: PAPERCLIP_APPROVED,
+        });
+
+        // The recovery persisted publishedHeadSha for the certified head so
+        // the normal path takes over from here.
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
+      });
+
+      it("refuses recovery when the surviving candidate's diff-vs-base changed in substance (zero writes)", async () => {
+        const issueId = await insertIssue({ executionState: pendingCandidatesState() });
+        await insertDecision(issueId);
+        await insertMention(issueId, { number: 42, state: "open" });
+        await insertMention(issueId, { number: 43, state: "closed" });
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: PR_43_URL, body: CLOSED_43_BODY },
+          {
+            url: APPROVED_DIFF_URL,
+            body: {
+              status: "ahead",
+              ahead_by: 1,
+              files: [{ filename: "server/src/a.ts", sha: "blob0000000000000000000000000000000000000000000000000001", status: "modified" }],
+            },
+          },
+          {
+            url: LIVE_DIFF_URL,
+            body: {
+              status: "ahead",
+              ahead_by: 2,
+              files: [{ filename: "server/src/a.ts", sha: "blob0000000000000000000000000000000000000000000000000002", status: "modified" }],
+            },
+          },
+          { url: COMMENT_LIST_URL, body: [] },
+          { url: COMMENT_POST_URL, body: { id: 9001 } },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.republished).toBe(0);
+        expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+        expect(summary.voidWarnings).toBe(1);
+        expect(postStatusCalls()).toHaveLength(0);
+
+        // No publishedHeadSha was persisted — the card stays unrecovered.
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        expect(approvalStatus.publishedHeadSha).toBeUndefined();
+      });
+
+      it("refuses recovery while more than one pending candidate is still open (zero writes)", async () => {
+        const issueId = await insertIssue({ executionState: pendingCandidatesState() });
+        await insertDecision(issueId);
+        await insertMention(issueId, { number: 42, state: "open" });
+        // Stale cached state: #43 is cached closed but is in fact still open.
+        await insertMention(issueId, { number: 43, state: "closed" });
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: PR_43_URL, body: OPEN_43_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.republished).toBe(0);
+        expect(summary.skipped["guard-a:ambiguity-unresolved"]).toBe(1);
+        expect(postStatusCalls()).toHaveLength(0);
+      });
+
+      it("refuses recovery when a pending candidate's live state is unverifiable (zero writes)", async () => {
+        const issueId = await insertIssue({ executionState: pendingCandidatesState() });
+        await insertDecision(issueId);
+        await insertMention(issueId, { number: 42, state: "open" });
+        await insertMention(issueId, { number: 43, state: "closed" });
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: PR_43_URL, ok: false, status: 500, body: { message: "server error" } },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.republished).toBe(0);
+        expect(summary.skipped["guard-a:ambiguity-unresolved"]).toBe(1);
+        expect(postStatusCalls()).toHaveLength(0);
+      });
+
+      it("refuses recovery when no pending candidate is open or matches the live target (zero writes)", async () => {
+        const issueId = await insertIssue({
+          executionState: {
+            ...pendingCandidatesState(),
+            approvalStatus: {
+              skipReason: "skipped:ambiguous",
+              certifiedAt: APPROVED_AT,
+              pendingCandidates: [
+                { owner: "TEA-Core", repo: "paperclip", number: 43, headShaAtApproval: APPROVED_HEAD },
+                { owner: "TEA-Core", repo: "paperclip", number: 44, headShaAtApproval: MOVED_HEAD },
+              ],
+            },
+          },
+        });
+        await insertDecision(issueId);
+        // The only open linked PR (#42) was never an approval candidate: the
+        // candidates are #43 (closed) and #44 (merged).
+        await insertMention(issueId, { number: 42, state: "open" });
+        await insertMention(issueId, { number: 43, state: "closed" });
+        await insertMention(issueId, { number: 44, state: "closed" });
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: PR_43_URL, body: CLOSED_43_BODY },
+          { url: PR_44_URL, body: MERGED_44_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.republished).toBe(0);
+        expect(summary.skipped["guard-a:candidate-resolved"]).toBe(1);
+        expect(postStatusCalls()).toHaveLength(0);
+      });
+
+      it("refuses recovery when the surviving candidate has no persisted head anchor (zero writes)", async () => {
+        const issueId = await insertIssue({
+          executionState: {
+            ...pendingCandidatesState(),
+            approvalStatus: {
+              skipReason: "skipped:ambiguous",
+              certifiedAt: APPROVED_AT,
+              pendingCandidates: [
+                { owner: "TEA-Core", repo: "paperclip", number: 42, headShaAtApproval: null },
+                { owner: "TEA-Core", repo: "paperclip", number: 43, headShaAtApproval: MOVED_HEAD },
+              ],
+            },
+          },
+        });
+        await insertDecision(issueId);
+        await insertMention(issueId, { number: 42, state: "open" });
+        await insertMention(issueId, { number: 43, state: "closed" });
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: PR_43_URL, body: CLOSED_43_BODY },
+        ]);
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+
+        expect(summary.republished).toBe(0);
+        expect(summary.skipped["guard-a:no-approved-head"]).toBe(1);
+        expect(postStatusCalls()).toHaveLength(0);
+      });
+
+      it("performs zero writes on the re-run after a successful recovery republish", async () => {
+        const issueId = await insertIssue({ executionState: pendingCandidatesState() });
+        await insertDecision(issueId);
+        await insertMention(issueId, { number: 42, state: "open" });
+        await insertMention(issueId, { number: 43, state: "closed" });
+
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+          { url: PR_43_URL, body: CLOSED_43_BODY },
+          { url: APPROVED_DIFF_URL, body: { status: "ahead", ahead_by: 1, files: STABLE_DIFF } },
+          { url: LIVE_DIFF_URL, body: { status: "ahead", ahead_by: 1, files: STABLE_DIFF } },
+          { url: POST_STATUS_URL, body: { id: 12345 } },
+        ]);
+
+        const first = await runApprovalStatusReconcilerTick(db);
+        expect(first.republished).toBe(1);
+
+        const callsBeforeSecondTick = mockGhFetch.mock.calls.length;
+        installRoutes([
+          { url: PR_URL, body: OPEN_PR_BODY },
+          {
+            url: COMBINED_STATUS_URL,
+            body: {
+              state: "success",
+              statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }],
+            },
+          },
+        ]);
+
+        const second = await runApprovalStatusReconcilerTick(db);
+
+        expect(second.republished).toBe(0);
+        expect(second.skipped["already-success"]).toBe(1);
+        // Zero writes on the re-run — and the pending-candidate walk is no
+        // longer needed now that publishedHeadSha is persisted.
+        const secondTickUrls = mockGhFetch.mock.calls
+          .slice(callsBeforeSecondTick)
+          .map((call) => String(call[0]));
+        expect(secondTickUrls).not.toContain(PR_43_URL);
+        expect(postStatusCalls()).toHaveLength(1);
+      });
     });
   });
 
