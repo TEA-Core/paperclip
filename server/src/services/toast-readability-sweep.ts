@@ -7,13 +7,14 @@ import { logger } from "../middleware/logger.js";
  * Corrupt pglz TOAST values (observed in production, SUP-14272) are otherwise
  * discovered only when the exact row happens to be read. This sweep discovers
  * them proactively: on a configurable cadence (default daily) it enumerates
- * every TOAST-bearing column (`typstorage IN ('m','x')`) across `public`
- * tables, forces a detoast of every row of every such column, and reports the
+ * every column that can carry pglz-compressed TOAST data (`typstorage IN
+ * ('m','x')`) across `public` tables, forces a full detoast of every row of
+ * every such column, and reports the
  * (table, column, ctid) of each value that cannot be read. Detection only: it
  * never repairs, rewrites, or otherwise mutates any data.
  *
  * Probe shape: a session-local PL/pgSQL function in `pg_temp` iterates ctids
- * and runs a per-row single-row `pg_column_size` probe inside a
+ * and runs a per-row `length(column::text)` probe inside a
  * `BEGIN ... EXCEPTION WHEN OTHERS` block, so a corrupt row is recorded and
  * the scan of the remaining rows continues. (A PL/pgSQL FOR-loop fetch error
  * propagates to the *enclosing* block handler, so the per-row isolation must
@@ -78,7 +79,12 @@ interface ProbeFailureRow {
   probe_error: string;
 }
 
-/** Enumerates every TOAST-bearing column of every ordinary `public` table. */
+/**
+ * Enumerates every column that can carry pglz-compressed TOAST data: MAIN or
+ * EXTENDED storage (`typstorage IN ('m','x')`). EXTERNAL storage (`'e'`) is
+ * also TOAST-bearing but uncompressed, so it cannot carry pglz corruption and
+ * is excluded on purpose.
+ */
 const ENUMERATE_TARGETS_SQL = `
   SELECT n.nspname AS schema_name, c.relname AS table_name, a.attname AS column_name
   FROM pg_class c
@@ -95,9 +101,12 @@ const ENUMERATE_TARGETS_SQL = `
 
 /**
  * Session-local probe function. For each row of one table and one column it
- * forces a full detoast (`pg_column_size` materializes the value) inside a
- * per-row exception handler: an unreadable value becomes a failure row and
- * the scan of the remaining rows continues.
+ * forces a full detoast and pglz decompression: `length(column::text)`
+ * materializes the entire value. `pg_column_size` must not be used here — it
+ * reports the stored/compressed size and never runs `pglz_decompress`, so a
+ * corrupt pglz value (the in-scope failure, SUP-14272) would probe clean. The
+ * per-row exception handler turns an unreadable value into a failure row and
+ * keeps the scan of the remaining rows going.
  */
 const PROBE_FUNCTION_SQL = `
   CREATE OR REPLACE FUNCTION pg_temp.paperclip_toast_probe(schema_name text, table_name text, column_name text)
@@ -112,7 +121,7 @@ BEGIN
     EXECUTE format('SELECT ctid FROM %I.%I', schema_name, table_name)
   LOOP
     BEGIN
-      EXECUTE format('SELECT pg_column_size(%I) FROM %I.%I WHERE ctid = $1', column_name, schema_name, table_name)
+      EXECUTE format('SELECT length(%I::text) FROM %I.%I WHERE ctid = $1', column_name, schema_name, table_name)
         INTO probe_result
         USING row.ctid;
     EXCEPTION WHEN OTHERS THEN

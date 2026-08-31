@@ -110,6 +110,22 @@ describe("toast readability sweep (control flow, mocked db client)", () => {
     expect(fake.released).toBe(1);
   });
 
+  it("pins the probe to a decompressing expression: length(column::text), never pg_column_size", async () => {
+    const fake = makeFakeDb(sweepHandler({}, {}));
+    await createToastReadabilitySweepService(fake.db, { sweepIntervalMs: 60_000 }).sweep();
+
+    const ddl = fake.calls.find((call) => call.sql.includes("CREATE OR REPLACE FUNCTION"))?.sql;
+    expect(ddl).toBeDefined();
+    // Regression pin for the round-1 bounce (finding 2): pg_column_size
+    // reports the stored/compressed size and never runs pglz_decompress, so
+    // the in-scope corruption (SUP-14272, "compressed pglz data is corrupt")
+    // would probe clean and the sweep would be a silent no-op.
+    // length(column::text) forces the full detoast + decompression.
+    expect(ddl).toContain("length(");
+    expect(ddl).toContain("::text");
+    expect(ddl).not.toContain("pg_column_size");
+  });
+
   it("never rejects out of the entry point and records infrastructure failures", async () => {
     const fake = makeFakeDb(() => {
       throw new Error("connection closed");
