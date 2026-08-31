@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { and, eq } from "drizzle-orm";
-import { issues, type Db } from "@paperclipai/db";
+import { and, eq, inArray } from "drizzle-orm";
+import { agents, issues, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -18,6 +18,7 @@ import {
 } from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
+import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 
 export class GitHubAuthError extends Error {
@@ -41,6 +42,21 @@ const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "child-delivery-parent-close",
   "merged-elsewhere",
 ]);
+
+// SUP-14579 (ADR-072 close-ladder shape): the three stages a top-level
+// decomposed parent's review ladder must include before it may close. Each
+// requirement is a (stage type, agent urlKey) pair; agent identity is matched
+// by the participant agent's urlKey (see normalizeAgentUrlKey), not by a
+// literal name string.
+const ADR072_CLOSE_LADDER: {
+  stageType: string;
+  agentUrlKey: string;
+  label: string;
+}[] = [
+  { stageType: "review", agentUrlKey: "support-qae", label: "review:support-QAE" },
+  { stageType: "review", agentUrlKey: "coder-le", label: "review:coder-LE" },
+  { stageType: "approval", agentUrlKey: "exec-cto", label: "approval:exec-CTO" },
+];
 
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
@@ -797,6 +813,93 @@ async function countLadderedChildren(
   return { count, identifiers };
 }
 
+/**
+ * SUP-14579 (mechanism D / ADR-072 close-ladder shape): given a parent's
+ * execution policy, report which of the three ADR-072 close-ladder stages
+ * (review:support-QAE, review:coder-LE, approval:exec-CTO) are absent.
+ *
+ * A stage satisfies a requirement when its `type` matches the required stage
+ * type AND at least one of its agent participants resolves to the required
+ * agent urlKey. Stages carry participant agent ids, not names, so the agent
+ * names are resolved in a single indexed read over the union of all
+ * participant agent ids, then compared via `normalizeAgentUrlKey`.
+ *
+ * Returns the labels of the missing requirements; an empty array means the
+ * ladder carries the full close-ladder shape. A missing/stages-less policy
+ * reports every requirement as missing.
+ */
+async function findMissingAdr072CloseLadderStages(
+  db: Db,
+  executionPolicy: unknown,
+): Promise<string[]> {
+  const rawStages =
+    executionPolicy != null && typeof executionPolicy === "object"
+      ? (executionPolicy as { stages?: unknown }).stages
+      : undefined;
+  if (!Array.isArray(rawStages)) {
+    return ADR072_CLOSE_LADDER.map((requirement) => requirement.label);
+  }
+
+  const stages = rawStages
+    .filter(
+      (stage): stage is { type?: unknown; participants?: unknown } =>
+        stage != null && typeof stage === "object",
+    )
+    .map((stage) => ({
+      type: typeof stage.type === "string" ? stage.type : null,
+      participants: Array.isArray(stage.participants) ? stage.participants : [],
+    }));
+
+  const agentIds = new Set<string>();
+  for (const stage of stages) {
+    for (const participant of stage.participants) {
+      if (
+        participant != null &&
+        typeof participant === "object" &&
+        (participant as { type?: unknown }).type === "agent" &&
+        typeof (participant as { agentId?: unknown }).agentId === "string"
+      ) {
+        agentIds.add((participant as { agentId: string }).agentId);
+      }
+    }
+  }
+
+  const agentIdToUrlKey = new Map<string, string | null>();
+  if (agentIds.size > 0) {
+    const agentRows = await db
+      .select({ id: agents.id, name: agents.name })
+      .from(agents)
+      .where(inArray(agents.id, [...agentIds]));
+    for (const row of agentRows) {
+      agentIdToUrlKey.set(row.id, normalizeAgentUrlKey(row.name));
+    }
+  }
+
+  const missing: string[] = [];
+  for (const requirement of ADR072_CLOSE_LADDER) {
+    const satisfied = stages.some(
+      (stage) =>
+        stage.type === requirement.stageType &&
+        stage.participants.some((participant) => {
+          if (
+            participant == null ||
+            typeof participant !== "object" ||
+            (participant as { type?: unknown }).type !== "agent" ||
+            typeof (participant as { agentId?: unknown }).agentId !== "string"
+          ) {
+            return false;
+          }
+          return (
+            agentIdToUrlKey.get((participant as { agentId: string }).agentId) ===
+            requirement.agentUrlKey
+          );
+        }),
+    );
+    if (!satisfied) missing.push(requirement.label);
+  }
+  return missing;
+}
+
 export async function evaluateDoneTransitionGuard(
   db: Db,
   issue: {
@@ -806,6 +909,7 @@ export async function evaluateDoneTransitionGuard(
     projectId: string | null;
     projectWorkspaceId: string | null;
     executionWorkspaceId: string | null;
+    parentId?: string | null;
     executionPolicy?: unknown;
     executionState?: unknown;
   },
@@ -837,6 +941,35 @@ export async function evaluateDoneTransitionGuard(
     reviewLadder === null
       ? await countLadderedChildren(db, issue.companyId, issue.id)
       : null;
+
+  // SUP-14579 (mechanism D / ADR-072 close-ladder shape): a top-level decomposed
+  // parent whose review ladder is satisfied but shape-incomplete (missing one of
+  // the three close-ladder stages) must not close ungated. Only a parent with no
+  // parent of its own sitting over two or more laddered children is subject to
+  // the shape check; the agent-resolution read happens here so the override path
+  // below can record its own audit action. Computed eagerly — it is a local
+  // indexed read and only runs in the pre-network zone.
+  let ladderShape: {
+    ladderedChildCount: number;
+    ladderedChildIdentifiers: string[];
+    missingStageLabels: string[];
+  } | null = null;
+  if (reviewLadder !== null && reviewLadder.satisfied && issue.parentId === null) {
+    const laddered = await countLadderedChildren(db, issue.companyId, issue.id);
+    if (laddered.count >= 2) {
+      const missingStageLabels = await findMissingAdr072CloseLadderStages(
+        db,
+        issue.executionPolicy,
+      );
+      if (missingStageLabels.length > 0) {
+        ladderShape = {
+          ladderedChildCount: laddered.count,
+          ladderedChildIdentifiers: laddered.identifiers,
+          missingStageLabels,
+        };
+      }
+    }
+  }
 
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
     void writeAuditLog(db, issue, "issue.done_transition_override", {
@@ -882,6 +1015,30 @@ export async function evaluateDoneTransitionGuard(
           `Override accepted: ${override.disposition} ` +
           `(ungated decomposed-parent close bypassed — ${mechanismA.count} laddered children: ` +
           `${mechanismA.identifiers.join(", ")})`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    if (ladderShape !== null) {
+      void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_override", {
+        disposition: override.disposition,
+        overrideReason: override.reason ?? null,
+        missingStageLabels: ladderShape.missingStageLabels,
+        ladderedChildCount: ladderShape.ladderedChildCount,
+        ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
+        source: "done_transition_guard",
+      });
+      return {
+        allowed: true,
+        reason:
+          `Override accepted: ${override.disposition} ` +
+          `(ADR-072 close-ladder shape bypassed — missing stages: ` +
+          `${ladderShape.missingStageLabels.join(", ")})`,
         aheadBy: null,
         branch: null,
         defaultRef: null,
@@ -957,6 +1114,37 @@ export async function evaluateDoneTransitionGuard(
         "The decomposed work was gated at the children; closing the parent ungated would ship it " +
         "with no verification gate and no approval. Attach an execution policy with a review ladder " +
         "to this issue, or set doneTransitionOverride to a sanctioned no-deliverable-head disposition " +
+        `(${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // SUP-14579 (mechanism D / ADR-072 close-ladder shape): fail closed when a
+  // top-level decomposed parent's review ladder is satisfied but shape-
+  // incomplete. Runs in the same pre-network zone as mechanisms A and C.
+  if (ladderShape !== null) {
+    void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_refused", {
+      reason: "adr072_close_ladder_shape_incomplete",
+      missingStageLabels: ladderShape.missingStageLabels,
+      ladderedChildCount: ladderShape.ladderedChildCount,
+      ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
+      source: "done_transition_guard",
+    });
+    return {
+      allowed: false,
+      reason:
+        `Mechanism D (ADR-072 close-ladder shape) refused: this issue is a top-level ` +
+        `decomposed parent over ${ladderShape.ladderedChildCount} laddered children ` +
+        `(${ladderShape.ladderedChildIdentifiers.join(", ")}), but its review ladder is missing ` +
+        `the ADR-072 close-ladder stage(s): ${ladderShape.missingStageLabels.join(", ")}. ` +
+        "Add the missing review/approval stages to this issue's execution policy, or set " +
+        `doneTransitionOverride to a sanctioned no-deliverable-head disposition ` +
         `(${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
       aheadBy: null,
       branch: null,
