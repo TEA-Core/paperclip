@@ -3198,6 +3198,10 @@ describe("realizeExecutionWorkspace", () => {
 
     try {
       await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
+      // Upstream added a registered-seed-source guard to provision-worktree.sh that the
+      // fork lane's script did not have, and it exits before the pnpm phase this test is
+      // about. Give the base workspace a canonical config, as the sibling pnpm tests do.
+      await writeRegisteredSourceConfig(baseRoot);
       await fs.mkdir(worktreeRoot, { recursive: true });
       await fs.mkdir(fakeBin, { recursive: true });
       await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
@@ -3243,12 +3247,17 @@ describe("realizeExecutionWorkspace", () => {
         "utf8",
       );
       await fs.chmod(fakePnpmPath, 0o755);
+      // Isolate PATH to the stubs plus a node symlink. Inheriting the repo PATH leaks
+      // `paperclipai` from node_modules/.bin, and upstream's script then runs a real
+      // `worktree init` against the stub config instead of taking the no-CLI fallback
+      // and reaching the pnpm phase this test is about.
+      await fs.symlink(process.execPath, path.join(fakeBin, "node"));
 
       const result = await execFileAsync(scriptPath, [], {
         cwd: worktreeRoot,
         env: {
           ...process.env,
-          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
           PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
           PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
         },
@@ -3275,6 +3284,10 @@ describe("realizeExecutionWorkspace", () => {
 
     try {
       await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
+      // Upstream added a registered-seed-source guard to provision-worktree.sh that the
+      // fork lane's script did not have, and it exits before the pnpm phase this test is
+      // about. Give the base workspace a canonical config, as the sibling pnpm tests do.
+      await writeRegisteredSourceConfig(baseRoot);
       await fs.mkdir(worktreeRoot, { recursive: true });
       await fs.mkdir(fakeBin, { recursive: true });
       await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
@@ -3319,12 +3332,17 @@ describe("realizeExecutionWorkspace", () => {
         "utf8",
       );
       await fs.chmod(fakePnpmPath, 0o755);
+      // Isolate PATH to the stubs plus a node symlink. Inheriting the repo PATH leaks
+      // `paperclipai` from node_modules/.bin, and upstream's script then runs a real
+      // `worktree init` against the stub config instead of taking the no-CLI fallback
+      // and reaching the pnpm phase this test is about.
+      await fs.symlink(process.execPath, path.join(fakeBin, "node"));
 
       const failure = await execFileAsync(scriptPath, [], {
         cwd: worktreeRoot,
         env: {
           ...process.env,
-          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
           PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
           PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
         },
