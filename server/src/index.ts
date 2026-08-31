@@ -54,7 +54,9 @@ import {
   environmentCustomImageService,
   decisionService,
   decisionRetentionService,
+  createCarrierOrphanJanitorService,
   createCarrierPromotionSweepService,
+  createCarrierStrandedSurfaceService,
   createDoneCloseLandingBackstopService,
   externalObjectService,
   executionWorkspaceService,
@@ -1204,6 +1206,8 @@ export async function startServer(): Promise<StartedServer> {
       wakeup: heartbeat.wakeup,
     });
     const carrierPromotionSweep = createCarrierPromotionSweepService(db as any);
+    const carrierOrphanJanitor = createCarrierOrphanJanitorService(db as any);
+    const carrierStrandedSurface = createCarrierStrandedSurfaceService(db as any);
     /** Fires one carrier promotion sweep on the heartbeat tick; logs when something was dispositioned, and the wrapper leaves a per-run liveness trace on every completion (SUP-14227). */
     const scheduleCarrierPromotionSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1218,6 +1222,36 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "carrier promotion sweep failed");
         }), { name: "carrierPromotion" });
+    };
+    /** Fires one carrier orphan janitor sweep on the heartbeat tick; logs when an orphan carrier was disposed (ADR-083 D14 deletion path, separately disableable from the surface path). */
+    const scheduleCarrierOrphanJanitor = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(carrierOrphanJanitor
+        .sweep()
+        .then((result) => {
+          if (result.candidates > 0 || result.skippedNonTerminalTree > 0 || result.stranded > 0 || result.closed > 0 || result.failed > 0) {
+            logger.info(result, "carrier orphan janitor evaluated orphaned carrier pull requests");
+          }
+          return result;
+        })
+        .catch((err) => {
+          logger.error({ err }, "carrier orphan janitor failed");
+        }), { name: "carrierOrphanJanitor" });
+    };
+    /** Fires one carrier stranded surface sweep on the heartbeat tick; logs when a stranded carrier was surfaced to an operator (ADR-083 D14 surface path, never a deletion). */
+    const scheduleCarrierStrandedSurface = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(carrierStrandedSurface
+        .sweep()
+        .then((result) => {
+          if (result.candidates > 0 || result.surfaced > 0 || result.prNotOpen > 0 || result.failed > 0) {
+            logger.info(result, "carrier stranded surface evaluated cancelled carrier pull requests");
+          }
+          return result;
+        })
+        .catch((err) => {
+          logger.error({ err }, "carrier stranded surface failed");
+        }), { name: "carrierStrandedSurface" });
     };
     const scheduleDoneCloseLandingBackstopSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1646,6 +1680,8 @@ export async function startServer(): Promise<StartedServer> {
         scheduleAdapterLoginReaperSweep();
         scheduleSetupTokenReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();
+        scheduleCarrierOrphanJanitor();
+        scheduleCarrierStrandedSurface();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
