@@ -594,6 +594,66 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(upserted.attemptCount).toBe(1);
   });
 
+  it("lets the board dispose of a terminal-orphan recovery action on a cancelled source issue without corrupting the card", async () => {
+    // SUP-13874 / SUP-14035: a swept-exhausted (escalated + outcome:exhausted, attemptCount at
+    // the ceiling) recovery action sitting on a source issue that is already `cancelled` had no
+    // legal resolve body — `done` would falsely mark abandoned work complete, `in_review` would
+    // resurrect a terminal card, `todo`/`blocked` were rejected by the refine. Admitting
+    // `cancelled` makes the board's disposition a truthful no-op on the issue.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const fingerprint = "recovery:terminal-orphan:fingerprint";
+    // The source issue was deliberately cancelled — the terminal state the matrix must now represent.
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, sourceIssueId));
+    const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const svc = issueRecoveryActionService(db);
+
+    const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+    expect(sweep.maxAttemptsReached).toBe(1);
+    const [stuck] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+    expect(stuck).toMatchObject({ status: "escalated", outcome: "exhausted", attemptCount: 5 });
+
+    // The terminal-orphan shape is still sticky against an ordinary (non-board) resolution ...
+    const ordinaryClear = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      fingerprint,
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Source revalidation claims the issue recovered.",
+    });
+    expect(ordinaryClear).toBeNull();
+
+    // ... but the board can dispose of it with a body that leaves the card exactly where it is.
+    const app = createApp();
+    const res = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        outcome: "cancelled",
+        sourceIssueStatus: "cancelled",
+        resolutionNote: "Board dismissed the alert; the source issue was already cancelled.",
+      })
+      .expect(200);
+
+    expect(res.body.recoveryAction).toMatchObject({
+      id: actionId,
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+
+    // The source issue stayed cancelled: the disposition did not flip it to done (falsely marking
+    // abandoned work complete) or resurrect it into in_review. No status change as a side effect.
+    expect(res.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "cancelled",
+      activeRecoveryAction: null,
+    });
+    const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(after.status).toBe("cancelled");
+    expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
   it("preserves legacy recovery ownership when new evidence is folded into an active action", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     const svc = issueRecoveryActionService(db);
