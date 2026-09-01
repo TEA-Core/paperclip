@@ -203,4 +203,117 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     expect(refreshed.rows.every((row) => row.found === false)).toBe(true);
     expect(await readRows()).toHaveLength(0);
   });
+
+  it("recordCarrierFanOut mirrors the source row onto every descendant, never the source", async () => {
+    const service = prDeliveryService(db);
+    const result = await service.recordCarrierFanOut({
+      companyId,
+      sourceIssueId,
+      externalId: EXTERNAL_ID,
+      url: PR_URL,
+      title: `PR #${PR_NUMBER} ${REPOSITORY}`,
+      status: "ready_for_review",
+      reviewState: "none",
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY },
+    });
+
+    // Four children, not the source, written.
+    expect(result.writtenIssueIds.sort()).toEqual(childIds.sort());
+    const rows = await readRows();
+    expect(rows).toHaveLength(4);
+    for (const row of rows) {
+      expect(row.issueId).not.toBe(sourceIssueId);
+      expect(row.externalId).toBe(EXTERNAL_ID);
+      expect(row.status).toBe("ready_for_review");
+      expect(row.isPrimary).toBe(false);
+      expect(row.url).toBe(PR_URL);
+    }
+  });
+
+  it("recordCarrierFanOut is idempotent: re-fanning does not duplicate descendant rows", async () => {
+    const service = prDeliveryService(db);
+    const fanIn = {
+      companyId,
+      sourceIssueId,
+      externalId: EXTERNAL_ID,
+      url: PR_URL,
+      title: `PR #${PR_NUMBER} ${REPOSITORY}`,
+      status: "ready_for_review",
+      reviewState: "none",
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY },
+    };
+    await service.recordCarrierFanOut(fanIn);
+    await service.recordCarrierFanOut(fanIn);
+
+    const rows = await readRows();
+    expect(rows).toHaveLength(4);
+    expect(new Set(rows.map((row) => row.issueId)).size).toBe(4);
+  });
+
+  it("sweepMergeState flips every delivery row to merged with mergedAt + mergeCommitSha", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "merged",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+        mergedAt: "2026-08-31T17:26:58Z",
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+      })),
+    });
+    await service.recordAtOpen(input());
+    expect((await readRows()).every((row) => row.status === "ready_for_review")).toBe(true);
+
+    const swept = await service.sweepMergeState();
+    expect(swept.checked).toBe(5);
+    expect(swept.flipped).toBe(5);
+
+    const rows = await readRows();
+    expect(rows).toHaveLength(5);
+    for (const row of rows) {
+      expect(row.status).toBe("merged");
+      const metadata = row.metadata as Record<string, unknown>;
+      expect(metadata.mergedAt).toBe("2026-08-31T17:26:58Z");
+      expect(metadata.mergeCommitSha).toBe("3fc37fe91c6190ab695a651224ad057db0a38aba");
+      expect(metadata.prNumber).toBe(PR_NUMBER);
+      expect(metadata.mergeStateCheckedAt).toBeTruthy();
+    }
+  });
+
+  it("sweepMergeState never merges an open PR and stamps a cooldown marker", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "open",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+      })),
+    });
+    await service.recordAtOpen(input());
+
+    const swept = await service.sweepMergeState();
+    expect(swept.flipped).toBe(0);
+
+    const rows = await readRows();
+    expect(rows).toHaveLength(5);
+    for (const row of rows) {
+      expect(row.status).toBe("ready_for_review");
+      expect((row.metadata as Record<string, unknown>).mergeStateCheckedAt).toBeTruthy();
+      expect((row.metadata as Record<string, unknown>).mergedAt).toBeUndefined();
+    }
+  });
+
+  it("sweepMergeState honors the cooldown: a just-checked row is not re-resolved", async () => {
+    const resolve = vi.fn(async () => ({
+      state: "open",
+      headRef: "carrier-branch",
+      headSha: "abc123",
+    }));
+    const service = prDeliveryService(db, { resolvePullRequestDetails: resolve });
+    await service.recordAtOpen(input());
+
+    expect((await service.sweepMergeState()).checked).toBe(5);
+    // Within the 5-minute cooldown window the same rows are skipped; the live
+    // resolver is not called again.
+    expect((await service.sweepMergeState()).checked).toBe(0);
+    expect(resolve).toHaveBeenCalledTimes(5);
+  });
 });

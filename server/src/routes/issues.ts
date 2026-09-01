@@ -155,6 +155,7 @@ import {
 } from "../services/merge-arming.js";
 import { evaluateStageIntegrity, type CandidateRow } from "../services/approval-status-reconciler.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
+import { prDeliveryService } from "../services/pr-delivery.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
 import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
@@ -500,6 +501,44 @@ function requiresPaperclipAttachmentMetadata(input: {
   const type = typeof input.type === "string" ? input.type : fallback?.type ?? null;
   const provider = typeof input.provider === "string" ? input.provider : fallback?.provider ?? null;
   return type === "artifact" && provider === "paperclip";
+}
+
+/**
+ * Detect a delivery-shaped `pull_request` work product and normalize its
+ * externalId to the canonical `owner/repo#N` form (SUP-14645). The signature
+ * is the delivery metadata (repository + prNumber) or a GitHub pull URL; a
+ * resolvable reference is what lets the merge sweep re-check it later. Returns
+ * null for non-PR work products or PRs with no resolvable GitHub reference, in
+ * which case the work product is recorded with no carrier fan-out.
+ */
+function prDeliverySignature(input: {
+  type?: unknown;
+  externalId?: string | null;
+  url?: string | null;
+  metadata?: Record<string, unknown> | null;
+}): { repository: string; prNumber: number; externalId: string } | null {
+  if (input.type !== "pull_request") return null;
+  const metadata = input.metadata ?? {};
+  let repository =
+    typeof metadata.repository === "string" && metadata.repository ? metadata.repository : null;
+  let prNumber =
+    typeof metadata.prNumber === "number" && Number.isInteger(metadata.prNumber)
+      ? metadata.prNumber
+      : null;
+  if ((!repository || !prNumber) && typeof input.url === "string") {
+    const match = input.url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+    if (match) {
+      repository ??= match[1];
+      prNumber ??= Number(match[2]);
+    }
+  }
+  if (!repository || !prNumber) return null;
+  const existing = typeof input.externalId === "string" ? input.externalId : null;
+  const externalId =
+    existing && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/.test(existing)
+      ? existing
+      : `${repository}#${prNumber}`;
+  return { repository, prNumber, externalId };
 }
 
 const attachmentArtifactMetadataInputSchema = z.object({
@@ -3400,6 +3439,7 @@ export function issueRoutes(
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
+  const prDeliverySvc = prDeliveryService(db);
   const documentsSvc = documentService(db);
   const artifactReviewDocumentsSvc = artifactReviewDocumentService(db, storage);
   const companySkillsSvc = companySkillService(db);
@@ -9107,10 +9147,32 @@ export function issueRoutes(
         metadata: req.body.metadata ?? null,
       });
     }
+    const prDelivery = createInput.type === "pull_request" ? prDeliverySignature(createInput) : null;
+    if (prDelivery) {
+      // Canonical externalId (owner/repo#N) so the source row, the carrier
+      // child fan-out, and the one-shot backfill all de-duplicate on the same
+      // key (SUP-14645).
+      createInput.externalId = prDelivery.externalId;
+    }
     const product = await workProductsSvc.createForIssue(issue.id, issue.companyId, createInput);
     if (!product) {
       res.status(422).json({ error: "Invalid work product payload" });
       return;
+    }
+    if (prDelivery) {
+      // Carrier delivery: mirror the source row onto every descendant so each
+      // issue owns its own `pull_request` work product (SUP-14645). A no-op when
+      // the source issue has no descendants.
+      await prDeliverySvc.recordCarrierFanOut({
+        companyId: issue.companyId,
+        sourceIssueId: issue.id,
+        externalId: prDelivery.externalId,
+        url: product.url,
+        title: product.title,
+        status: product.status,
+        reviewState: product.reviewState,
+        metadata: product.metadata,
+      });
     }
     await logActivity(db, {
       companyId: issue.companyId,

@@ -19,6 +19,9 @@ const mockWorkProductService = vi.hoisted(() => ({
   getById: vi.fn(),
   update: vi.fn(),
 }));
+const mockPrDeliveryService = vi.hoisted(() => ({
+  recordCarrierFanOut: vi.fn(async () => ({ writtenIssueIds: [] })),
+}));
 const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(async () => ({
     allowed: true,
@@ -42,6 +45,10 @@ function registerRouteMocks() {
 
   vi.doMock("../services/issues.js", () => ({
     issueService: () => mockIssueService,
+  }));
+
+  vi.doMock("../services/pr-delivery.js", () => ({
+    prDeliveryService: () => mockPrDeliveryService,
   }));
 
   vi.doMock("../services/activity-log.js", () => ({
@@ -257,6 +264,7 @@ describe("issue attachment routes", () => {
     mockWorkProductService.createForIssue.mockReset();
     mockWorkProductService.getById.mockReset();
     mockWorkProductService.update.mockReset();
+    mockPrDeliveryService.recordCarrierFanOut.mockReset();
   });
 
   it("accepts zip uploads for issue attachments", async () => {
@@ -695,6 +703,63 @@ describe("issue attachment routes", () => {
           downloadPath: "/api/attachments/22222222-2222-4222-8222-222222222222/content?download=1",
           originalFilename: "clip.mp4",
         },
+      }),
+    );
+  });
+
+  it("fans a delivery pull request out to descendants with a canonical externalId on the live path", async () => {
+    const storage = createStorageService();
+    const issue = {
+      id: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      identifier: "PAP-3",
+      projectId: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockWorkProductService.createForIssue.mockResolvedValue({
+      id: "work-product-438",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      type: "pull_request",
+      provider: "github",
+      externalId: "TEA-Core/Trading-Signal-Platform#438",
+      title: "PR #438 wire pr-delivery into delivery path",
+      url: "https://github.com/TEA-Core/Trading-Signal-Platform/pull/438",
+      status: "ready_for_review",
+      reviewState: "none",
+      metadata: { repository: "TEA-Core/Trading-Signal-Platform", prNumber: 438 },
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .post(`/api/issues/${issue.id}/work-products`)
+      .send({
+        type: "pull_request",
+        provider: "github",
+        title: "PR #438 wire pr-delivery into delivery path",
+        url: "https://github.com/TEA-Core/Trading-Signal-Platform/pull/438",
+        externalId: "438",
+        status: "ready_for_review",
+        metadata: { repository: "TEA-Core/Trading-Signal-Platform", prNumber: 438 },
+      });
+
+    expect(res.status).toBe(201);
+    // The bare "438" externalId is normalized to the canonical owner/repo#N form.
+    expect(mockWorkProductService.createForIssue).toHaveBeenCalledWith(
+      issue.id,
+      issue.companyId,
+      expect.objectContaining({
+        type: "pull_request",
+        externalId: "TEA-Core/Trading-Signal-Platform#438",
+      }),
+    );
+    // The live delivery path fans the same row out to every descendant.
+    expect(mockPrDeliveryService.recordCarrierFanOut).toHaveBeenCalledWith(
+      expect.objectContaining({
+        companyId: "company-1",
+        sourceIssueId: issue.id,
+        externalId: "TEA-Core/Trading-Signal-Platform#438",
+        status: "ready_for_review",
       }),
     );
   });
