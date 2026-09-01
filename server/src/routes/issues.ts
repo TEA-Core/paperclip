@@ -11447,6 +11447,27 @@ export function issueRoutes(
     }
     for (const publication of postCommitActivityPublications) publishActivity(publication);
 
+    if (transition.droppedStageIds?.length) {
+      void logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "execution-stage-prune",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "issue.execution_stage_ids_pruned",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          issueId: id,
+          droppedStageIds: transition.droppedStageIds,
+        },
+      }).catch((err) => {
+        logger.warn({ err, issueId: id }, "failed to write execution stage prune audit log");
+      });
+    }
+
     await runApprovalMergeArming({
       issue,
       decision: transition.decision,
@@ -14005,6 +14026,26 @@ export function issueRoutes(
         throw err;
       }
       for (const publication of postCommitActivityPublications) publishActivity(publication);
+      if (transition.droppedStageIds?.length) {
+        void logActivity(db, {
+          companyId: currentIssue.companyId,
+          actorType: "system",
+          actorId: "execution-stage-prune",
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+          action: "issue.execution_stage_ids_pruned",
+          entityType: "issue",
+          entityId: currentIssue.id,
+          details: {
+            identifier: currentIssue.identifier,
+            issueId: id,
+            droppedStageIds: transition.droppedStageIds,
+          },
+        }).catch((err) => {
+          logger.warn({ err, issueId: id }, "failed to write execution stage prune audit log");
+        });
+      }
       comment = txResult.comment;
       currentIssue = txResult.issue;
       // Mirror the normal status-change audit trail: every other in_review -> done path

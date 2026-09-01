@@ -1649,11 +1649,16 @@ describe("issue execution policy transitions", () => {
       });
 
       // Must terminate the policy, not wrap around to the first stage.
+      // SUP-14590: the stale ids from a prior policy revision are pruned out of the
+      // carried-forward completedStageIds (they are not part of this revision's
+      // stages); only the current revision's final stage id survives. Termination
+      // is unchanged — the final-stage approval still completes the policy.
       expect(result.patch.executionState).toMatchObject({
         status: "completed",
-        completedStageIds: expect.arrayContaining([...staleStageIds, approvalStageId]),
+        completedStageIds: [approvalStageId],
         lastDecisionOutcome: "approved",
       });
+      expect(result.droppedStageIds).toEqual(staleStageIds);
       expect(result.patch.status).toBeUndefined();
       expect(result.patch.assigneeAgentId).toBeUndefined();
       expect(result.decision).toMatchObject({
@@ -1772,7 +1777,28 @@ describe("issue execution policy transitions", () => {
       });
 
       // No rewind to the first stage — the caller's done is allowed through.
-      expect(result.patch).toEqual({});
+      // SUP-14590: the stale ids from a prior policy revision are pruned even on
+      // this no-op transition, so the persisted state stays scoped to the
+      // current policy and the drop is surfaced for the audit log.
+      expect(result.droppedStageIds).toEqual([
+        "99999999-9999-4999-8999-999999999991",
+        "99999999-9999-4999-8999-999999999992",
+        "99999999-9999-4999-8999-999999999993",
+      ]);
+      expect(result.patch).toEqual({
+        executionState: {
+          status: "completed",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: "approved",
+        },
+      });
     });
   });
 
