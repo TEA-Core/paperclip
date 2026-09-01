@@ -260,6 +260,7 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       ...(headSha ? { headSha } : {}),
       ...(baseRef ? { baseRef } : {}),
       ...(asString(body.merged_at) ? { merged_at: asString(body.merged_at) } : {}),
+      ...(asString(body.merge_commit_sha) ? { merge_commit_sha: asString(body.merge_commit_sha) } : {}),
       ...(asString(body.closed_at) ? { closed_at: asString(body.closed_at) } : {}),
       ...(reviewDecision ? { reviewDecision } : {}),
     },
