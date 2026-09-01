@@ -754,4 +754,97 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(approvalStatus?.publishedHeadSha).toBe(headSha);
     expect(typeof approvalStatus?.publishedAt).toBe("string");
   });
+
+  it("POST comment: an ambiguous two-PR approval persists pendingCandidates instead of discarding the certification (SUP-14602)", async () => {
+    // The card is approved while two linked PRs are open. The producer skips
+    // as ambiguous and publishes nothing. Before SUP-14602 the transition
+    // persisted NO approvalStatus at all — the card was structurally
+    // unrecoverable: the approval-status reconciler failed closed on
+    // guard-a:no-approved-head on every tick (the live SUP-14549/PR #3408
+    // incident, which cost a hand-built carrier PR). The skipped path must
+    // persist one approval-time head per candidate PR so the reconciler can
+    // re-run the unmodified Guard A once the ambiguity resolves.
+    // Prefix "S14602A": the identifier (`S14602A-1`) is the match needle the
+    // producer searches in the live PR list; companies.issue_prefix is unique
+    // per test database, so the prefix must not collide with "SUP" (used by
+    // the armed-branch test above).
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("S14602A");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const branchName = `${identifier}-test-branch`;
+    const headSha42 = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
+    const headSha43 = "0a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f";
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      // done-guard delivery probe: branch ahead of the default ref, nothing merged.
+      if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+      if (url.includes("/pulls?")) {
+        // Two linked open PRs -> producer's ambiguous skip.
+        return new Response(
+          JSON.stringify([
+            {
+              number: 42,
+              draft: false,
+              merged: false,
+              merged_at: null,
+              head: { ref: branchName },
+              title: `${identifier}: the carrier PR`,
+              body: null,
+            },
+            {
+              number: 43,
+              draft: false,
+              merged: false,
+              merged_at: null,
+              head: { ref: branchName },
+              title: `${identifier}: the duplicate PR`,
+              body: null,
+            },
+          ]),
+          { status: 200 },
+        );
+      }
+      // Per-candidate head fetches certify each candidate at approval time.
+      if (url.includes(`/pulls/42`)) {
+        return new Response(JSON.stringify({ state: "open", head: { sha: headSha42 } }), { status: 200 });
+      }
+      if (url.includes(`/pulls/43`)) {
+        return new Response(JSON.stringify({ state: "open", head: { sha: headSha43 } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+
+    // The ambiguous skip publishes nothing: zero commit-status writes.
+    const statusCalls = mockGhFetch.mock.calls.filter(
+      ([url, init]) => String(url).includes("/statuses/") && (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(statusCalls.length).toBe(0);
+
+    // Guard A persistence on the skipped:ambiguous path: one approval-time
+    // head per candidate PR, plus the skip reason and certification time.
+    const stateRows = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const approvalStatus = (stateRows[0]?.executionState as Record<string, any> | null)?.approvalStatus;
+    expect(approvalStatus?.pendingCandidates).toEqual([
+      { owner: "TEA-Core", repo: "paperclip", number: 42, headShaAtApproval: headSha42 },
+      { owner: "TEA-Core", repo: "paperclip", number: 43, headShaAtApproval: headSha43 },
+    ]);
+    expect(typeof approvalStatus?.skipReason).toBe("string");
+    expect(approvalStatus.skipReason).toMatch(/^status:skipped:head_unresolvable:.*ambiguous/);
+    expect(typeof approvalStatus?.certifiedAt).toBe("string");
+    // publishedHeadSha must still mean "published" — nothing was published.
+    expect(approvalStatus?.publishedHeadSha).toBeUndefined();
+  });
 });

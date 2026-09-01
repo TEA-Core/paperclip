@@ -2974,12 +2974,19 @@ export function issueRoutes(
     decision,
     closingTransition,
   }: {
-    issue: { id: string; companyId: string; issueNumber: number | null; executionState: unknown };
+    issue: { id: string; companyId: string; issueNumber: number | null; identifier: string | null; executionState: unknown };
     decision: MergeArmingDecision | null | undefined;
     closingTransition: boolean;
   }): Promise<void> => {
     if (!shouldPublishApprovalStatus(decision)) return;
-    const issueIdentifier = `SUP-${issue.issueNumber}`;
+    // SUP-14602: the live-discovery / decision-head needle must be the issue's
+    // REAL identifier (company issuePrefix + number), not a hardcoded "SUP-".
+    // Both resolveApprovalDecisionHead and publishApprovalStatus search open PRs
+    // for this string; for any company whose prefix is not "SUP" the literal
+    // needle matches none of its own PRs, so the producer re-resolves 0 PRs (or
+    // the wrong company's) and returns skipped:no-pr instead of certifying the
+    // card. issue.identifier is authoritative (stored issuePrefix-issueNumber).
+    const issueIdentifier = issue.identifier ?? `SUP-${issue.issueNumber}`;
     try {
       // ADR-091 D2a: pin the FIRST publish to the head the approving decision
       // was rendered against. Resolve it up front, then hand it to
@@ -3045,6 +3052,48 @@ export function issueRoutes(
             },
           })
           .where(eq(issueRows.id, issue.id));
+      } else {
+        // SUP-14602: an ambiguous decision cannot resolve a single certifiable
+        // head, but the certification the producer had in hand must not be
+        // discarded. Two sources carry the candidate heads: the decision-time
+        // resolver (ADR-091 D2a intercepts ambiguity BEFORE publishApprovalStatus
+        // runs, so the candidates come from decisionHead.pendingCandidates) and
+        // the publisher itself (ambiguity reached only at write time ->
+        // statusOutcome.skipCandidates). Persist the per-candidate approval-time
+        // heads so that, once the ambiguity resolves (a human or agent closes the
+        // duplicate PR), the approval-status reconciler can re-run the unmodified
+        // Guard A diff-vs-base check against a certified head instead of failing
+        // closed forever on guard-a:no-approved-head. publishedHeadSha semantics
+        // are untouched — it still means "published", never "considered".
+        const pendingCandidates =
+          statusOutcome.kind === "skipped" &&
+          Array.isArray(statusOutcome.skipCandidates) &&
+          statusOutcome.skipCandidates.length > 0
+            ? statusOutcome.skipCandidates
+            : decisionHead.kind === "unresolvable" &&
+                Array.isArray(decisionHead.pendingCandidates) &&
+                decisionHead.pendingCandidates.length > 0
+              ? decisionHead.pendingCandidates
+              : null;
+        if (pendingCandidates !== null) {
+          const currentState = (issue.executionState ?? {}) as Record<string, unknown>;
+          const existingApprovalStatus =
+            (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
+          await db
+            .update(issueRows)
+            .set({
+              executionState: {
+                ...currentState,
+                approvalStatus: {
+                  ...existingApprovalStatus,
+                  pendingCandidates,
+                  skipReason: statusOutcome.message,
+                  certifiedAt: new Date().toISOString(),
+                },
+              },
+            })
+            .where(eq(issueRows.id, issue.id));
+        }
       }
 
       await svc.addComment(
