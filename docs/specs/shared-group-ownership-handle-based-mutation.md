@@ -31,7 +31,7 @@ The escape is not theoretical. Probed on this platform (Node v24.20.0, linux) by
 redo-2 containment check, then renaming the intermediate directory and symlinking it at a
 protected tree:
 
-```
+```text
 check passes containment: true
 post-swap fs.stat(lexical) resolves to: .../protected/file.txt
   -> today's chown/chmod would hit: OUTSIDE TARGET (escape)
@@ -68,20 +68,39 @@ the fix, not the fix.
 ### 3. The primitive: open once, verify the OPENED INODE, mutate through the handle
 
 ```js
-const handle = await fs.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+let handle;
 try {
+  // The open itself is inside the guarded section: ELOOP on a leaf symlink, EACCES,
+  // and ENOENT all throw here, and §4 requires every one of them to skip, not fall back.
+  handle = await fs.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   // Containment is checked on the object we are holding, not on a name that can
   // be re-pointed. /proc/self/fd/<fd> names the inode this fd actually refers to.
   const verified = await fs.realpath(`/proc/self/fd/${handle.fd}`);
   if (containmentRoot && !isWithin(verified, containmentRoot)) return; // skip + warn
-  if (isDeniedServerOwnedDir(verified)) return;                        // skip + warn
+  if (
+    isDeniedServerOwnedDirOrAncestor(verified, [
+      resolveMasterKeyDir,
+      resolvePostgresDataDir,
+      resolveDatabaseBackupDir,
+    ])
+  ) {
+    return; // skip + warn
+  }
   const st = await handle.stat();
   await handle.chown(st.uid, gid);            // fchown — no path resolution
   await handle.chmod((st.mode & 0o7777) | 0o2070); // fchmod — no path resolution
+} catch (err) {
+  warn(...); // §4: skip the repair. No path-based fallback on any error.
 } finally {
-  await handle.close();
+  await handle?.close();
 }
 ```
+
+`isDeniedServerOwnedDirOrAncestor` and the three resolver locals are the existing symbols in
+`server/src/services/shared-group-ownership.ts` — the guard at `:30-39` and the `resolveMasterKeyDir` /
+`resolvePostgresDataDir` / `resolveDatabaseBackupDir` locals bound at `:123-125`. This is the same
+guard §5 hardens, called on the **verified** path instead of the lexical `dirPath`; the call shape
+above and §5 name one symbol, not two.
 
 Why this closes the race: after the `open`, the fd names one fixed inode. Any rename or symlink
 swap that lands afterwards cannot change what the fd refers to, and `fchown`/`fchmod` resolve
@@ -90,7 +109,7 @@ back out of `/proc/self/fd`. Check and mutation are finally on the same object.
 
 Probed working on this platform:
 
-```
+```text
 platform: linux O_NOFOLLOW: 131072
 handle path via /proc/self/fd: .../protected/file.txt
 containment on OPENED inode: OUTSIDE -> skip (fail closed)
