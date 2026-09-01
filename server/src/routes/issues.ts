@@ -3033,22 +3033,38 @@ export function issueRoutes(
         };
       }
 
-      // SUP-13714 Guard A persistence: record which head this approval
-      // certified so the reconciler can verify content identity before
+      // SUP-13714 Guard A persistence + SUP-14715 D-B: record which head this
+      // approval certified so the reconciler can verify content identity before
       // subsequent re-publishes. Stored in issues.executionState (no migration;
       // the stage machine only rebuilds this blob on a subsequent transition,
       // which for an approved card is a new review cycle and is re-persisted).
-      if (statusOutcome.kind === "armed" && typeof statusOutcome.headSha === "string") {
+      //
+      // D-B: approvedHeadSha is written on EVERY outcome that positively
+      // resolved a head, so a skipped/failed FIRST publish leaves a real anchor
+      // the reconciler can later recover — it re-publishes by content identity
+      // and treats that first publish as a delivery-identity-gated write. It is
+      // deliberately distinct from publishedHeadSha: "certified at this head"
+      // (approvedHeadSha) vs "the paperclip/approved status was actually
+      // written at this head" (publishedHeadSha). A refusal that resolved no
+      // head (delivery_identity_unresolved, not_delivered, no-pr, ambiguous,
+      // ...) records nothing — an unverifiable head must not be anchored.
+      const resolvedHeadSha = decisionHead.kind === "resolved" ? decisionHead.headSha : null;
+      if (resolvedHeadSha !== null) {
         const currentState = (issue.executionState ?? {}) as Record<string, unknown>;
+        const approvalStatus: Record<string, unknown> = {
+          approvedHeadSha: resolvedHeadSha,
+          approvedAt: new Date().toISOString(),
+        };
+        if (statusOutcome.kind === "armed" && typeof statusOutcome.headSha === "string") {
+          approvalStatus.publishedHeadSha = statusOutcome.headSha;
+          approvalStatus.publishedAt = new Date().toISOString();
+        }
         await db
           .update(issueRows)
           .set({
             executionState: {
               ...currentState,
-              approvalStatus: {
-                publishedHeadSha: statusOutcome.headSha,
-                publishedAt: new Date().toISOString(),
-              },
+              approvalStatus,
             },
           })
           .where(eq(issueRows.id, issue.id));

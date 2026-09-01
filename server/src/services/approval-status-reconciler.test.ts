@@ -5,10 +5,12 @@ import {
   agents,
   companies,
   createDb,
+  executionWorkspaces,
   externalObjectMentions,
   externalObjects,
   issueExecutionDecisions,
   issues,
+  projects,
   type Db,
 } from "@paperclipai/db";
 import {
@@ -187,6 +189,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     await db.delete(externalObjects);
     await db.delete(issueExecutionDecisions);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
 
@@ -206,6 +210,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     await db.delete(externalObjects);
     await db.delete(issueExecutionDecisions);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -293,6 +299,38 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       providerKey: "github",
     });
     return externalObj;
+  }
+
+  /**
+   * SUP-14715 D-B: give the card a resolvable delivery identity (its execution
+   * workspace's branch + repo) so the ADR-091 D1 delivery-identity gate that a
+   * first publish now enforces can pass or fail on the card's own branch. The
+   * seeded branch/repo match the cached mention's head ref and TEA-Core/paperclip
+   * so the linked PR is "delivered by the card".
+   */
+  async function seedDeliveryIdentity(issueId: string, branch: string, repoUrl: string) {
+    const [projectRow] = await db
+      .insert(projects)
+      .values({ id: randomUUID(), companyId, name: "TEA-Core/paperclip", status: "in_progress" })
+      .returning();
+    const [ewRow] = await db
+      .insert(executionWorkspaces)
+      .values({
+        id: randomUUID(),
+        companyId,
+        projectId: projectRow!.id,
+        mode: "isolated",
+        strategyType: "git_worktree",
+        name: "card-workspace",
+        status: "active",
+        branchName: branch,
+        repoUrl,
+      })
+      .returning();
+    await db
+      .update(issues)
+      .set({ projectId: projectRow!.id, executionWorkspaceId: ewRow!.id })
+      .where(eq(issues.id, issueId));
   }
 
   describe("runApprovalStatusReconcilerTick", () => {
@@ -1266,6 +1304,145 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         expect(secondTickUrls).not.toContain(PR_43_URL);
         expect(postStatusCalls()).toHaveLength(1);
       });
+    });
+  });
+
+  describe("first publish anchored on approvedHeadSha (SUP-14715 D-B)", () => {
+    it("certifies a first publish when the live head still equals approvedHeadSha and the card delivered its own PR", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: NEW_HEAD, approvedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      // The card's delivery identity matches the linked PR (branch + repo), so
+      // the first publish's delivery-identity gate passes.
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12348 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(Object.keys(summary.skipped)).toEqual([]);
+      const calls = postStatusCalls();
+      expect(calls).toHaveLength(1);
+      expect(calls[0]![0]).toBe(POST_STATUS_URL);
+      expect(postStatusBodies()[0]).toMatchObject({ state: "success", context: PAPERCLIP_APPROVED });
+    });
+
+    it("enforces the delivery-identity gate on a first publish — refuses when no delivery branch is recorded", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: NEW_HEAD, approvedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      // No execution workspace: the card's delivery identity is unresolvable.
+      // The live head equals the anchor (no Guard A compare), so the only thing
+      // that can stop the publish is the D1 delivery-identity gate — which this
+      // first publish now enforces (a re-publish would have stamped here).
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["publish:skipped"]).toBe(1);
+      expect(summary.skippedDetails[0]).toContain("delivery_identity_unresolved");
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("gates a first publish through Guard A when the live head moved off approvedHeadSha (changed blob refuses)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: APPROVED_HEAD, approvedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        {
+          url: APPROVED_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 1,
+            files: [{ filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000001", status: "modified" }],
+          },
+        },
+        {
+          url: LIVE_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 2,
+            files: [{ filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000002", status: "modified" }],
+          },
+        },
+        { url: COMMENT_LIST_URL, body: [] },
+        { url: COMMENT_POST_URL, body: { id: 9001 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+      // The voided-anchor warning still surfaces on the PR for the first-publish
+      // anchor, exactly as it does for a re-publish.
+      expect(summary.voidWarnings).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("refuses guard-a:no-approved-head when neither publishedHeadSha nor approvedHeadSha is recorded", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:no-approved-head"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("still fires the stage-integrity (self-approval) refusal on a first-publish-anchored card", async () => {
+      await insertAgent(AGENT_AUTHOR, "Author");
+      const issueId = await insertIssue({
+        createdByAgentId: AGENT_AUTHOR,
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: NEW_HEAD, approvedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId, { actorAgentId: AGENT_AUTHOR });
+      await insertMention(issueId);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["guard-b:decision-by-author-or-return-assignee"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+      // Guard B refuses before any GitHub read.
+      expect(mockGhFetch).not.toHaveBeenCalled();
     });
   });
 
