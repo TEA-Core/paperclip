@@ -219,10 +219,12 @@ function readPendingCandidates(state: Record<string, unknown> | null | undefined
   return out;
 }
 
+/** Stable, case-insensitive identity key for a candidate PR (used to compare candidate sets). */
 function candidateKey(pr: { owner: string; repo: string; number: number }): string {
   return `${pr.owner.toLowerCase()}/${pr.repo.toLowerCase()}#${pr.number}`;
 }
 
+/** Human-readable owner/repo#number label for a candidate PR, used in skip/fail reason strings. */
 function candidateDisplayName(pr: { owner: string; repo: string; number: number }): string {
   return `${pr.owner}/${pr.repo}#${pr.number}`;
 }
