@@ -2365,6 +2365,104 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     );
   });
 
+  it("lets a board declare a live (todo) card a false positive without force-closing it", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    // A live card: the alert fired while the work is legitimately still open.
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:false-positive-live",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp(); // default board actor
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "false_positive",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Board declared the alert a false positive.",
+      })
+      .expect(200);
+
+    // The verdict is recorded as a resolved false positive...
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "false_positive",
+    });
+    // ...and the live card is left at todo (not force-closed), assignee intact.
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "todo",
+      assigneeAgentId: coderId,
+      activeRecoveryAction: null,
+    });
+    const [live] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(live).toMatchObject({ status: "todo", assigneeAgentId: coderId });
+  });
+
+  it("still refuses an agent actor resolving a recovery action as false_positive or cancelled (board-only gate unchanged)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:board-gate",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    // Hand the source issue to the board so the assignee clause of
+    // assertRecoveryActionAuthority cannot fire; the agent gets through only as the
+    // recovery action's owner and must still be refused by assertBoard for these
+    // board-only outcomes.
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
+
+    for (const outcome of ["false_positive", "cancelled"] as const) {
+      const runId = randomUUID();
+      const app = createApp({ type: "agent", agentId: managerId, companyId, runId, source: "agent_jwt" });
+      await seedHeartbeatRun({ companyId, agentId: managerId, runId, issueId: sourceIssueId });
+
+      const rejected = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome,
+          sourceIssueStatus: "todo",
+          resolutionNote: "Board declared the alert a false positive.",
+        })
+        .expect(403);
+      // Distinct from a generic mutation denial: this is the board-only gate itself.
+      expect(rejected.body.error).toBe("Board access required");
+    }
+
+    // Both attempts were refused, so the active action and its live status are untouched.
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+      status: "active",
+    });
+    const [live] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(live?.status).toBe("todo");
+  });
+
   it("wakes dependents blocked on the source issue when recovery resolution closes it", async () => {
     const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
     const dependentIssueId = randomUUID();
