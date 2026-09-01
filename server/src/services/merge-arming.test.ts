@@ -196,9 +196,18 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
   async function insertMention(
     issueId: string,
-    overrides: { state?: string | null; draft?: boolean; number?: number; headRefName?: string } = {},
+    overrides: {
+      state?: string | null;
+      draft?: boolean;
+      number?: number;
+      headRefName?: string;
+      owner?: string;
+      repo?: string;
+    } = {},
   ) {
     const number = overrides.number ?? 42;
+    const owner = overrides.owner ?? OWNER;
+    const repo = overrides.repo ?? REPO;
     const data: Record<string, unknown> = {
       state: overrides.state ?? "open",
       draft: overrides.draft ?? false,
@@ -212,7 +221,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         companyId,
         providerKey: "github",
         objectType: "pull_request",
-        externalId: `${OWNER}/${REPO}#pull/${number}`,
+        externalId: `${owner}/${repo}#pull/${number}`,
         data,
       })
       .returning();
@@ -321,6 +330,83 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(result.reason).toMatch(/^not_delivered:/);
         expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
       }
+    });
+
+    // ADR-091 D5 (SUP-14734): the not_delivered refusal must name the mismatched
+    // half. The two halves: a REPO mismatch (head branch can equal the delivery
+    // branch yet the head repo differs) vs a REF mismatch (repo matches, ref
+    // differs). The repo half must not read as "branch X is not branch X".
+    it("names the repo mismatch (not a branch-vs-itself sentence) when the head branch equals the delivery branch but the head repo differs", async () => {
+      const issueId = await insertIssue();
+      // Same branch as the card's delivery branch, but in a DIFFERENT repo.
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch", owner: "other-org", repo: "other-repo" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          `not_delivered: other-org/other-repo#42 head repo other-org/other-repo is not this card's delivery repo ${OWNER}/${REPO}; a deliverable in other-org/other-repo must be filed under a project bound to that repo (ADR-091 D5)`,
+        );
+        expect(result.reason).not.toContain("is not this card's delivery branch");
+      }
+    });
+
+    it("keeps branch language when the head repo matches but the head ref differs", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-99-other-branch" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          `not_delivered: ${OWNER}/${REPO}#42 head ${OWNER}/${REPO}:SUP-99-other-branch is not this card's delivery branch SUP-42-branch`,
+        );
+      }
+    });
+
+    it("names the repo mismatch (the decisive half) when BOTH the head repo and head ref differ", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-99-other-branch", owner: "other-org", repo: "other-repo" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          `not_delivered: other-org/other-repo#42 head repo other-org/other-repo is not this card's delivery repo ${OWNER}/${REPO}; a deliverable in other-org/other-repo must be filed under a project bound to that repo (ADR-091 D5)`,
+        );
+        expect(result.reason).not.toContain("is not this card's delivery branch");
+      }
+    });
+
+    it("emits the SAME not_delivered fragment from resolveApprovalDecisionHead and publishApprovalStatus (one fixture)", async () => {
+      const issueId = await insertIssue();
+      // One repo-mismatch candidate; both entry points must surface the same text.
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch", owner: "other-org", repo: "other-repo" });
+      installRoutes([]);
+
+      const decision = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(decision.kind).toBe("unresolvable");
+      const decisionReason = decision.kind === "unresolvable" ? decision.reason : "";
+      expect(decisionReason.startsWith("not_delivered: ")).toBe(true);
+      const decisionFragment = decisionReason.slice("not_delivered: ".length);
+
+      const publish = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        enforceDeliveryIdentity: true,
+      });
+      expect(publish.kind).toBe("skipped");
+      expect(publish.message.startsWith("status:skipped:not_delivered: ")).toBe(true);
+      const publishFragment = publish.message.slice("status:skipped:not_delivered: ".length);
+
+      expect(publishFragment).toBe(decisionFragment);
+      expect(decisionFragment).toBe(
+        `other-org/other-repo#42 head repo other-org/other-repo is not this card's delivery repo ${OWNER}/${REPO}; a deliverable in other-org/other-repo must be filed under a project bound to that repo (ADR-091 D5)`,
+      );
     });
 
     it("refuses with delivery_identity_unresolved when the card's delivery identity cannot be resolved", async () => {
