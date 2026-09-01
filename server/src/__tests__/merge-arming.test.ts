@@ -2572,5 +2572,110 @@ describeEmbeddedPostgres(
         expect(mockGhFetch).not.toHaveBeenCalled();
       },
     );
+
+    // The live-discovery path (SUP-13313/SUP-13831) is reached with ZERO cached
+    // mentions and authorizes by identifier SUBSTRING on head ref / title / body.
+    // It is a second stamp path and takes the same gate — a gate on only one of
+    // the two paths is not a gate.
+    it(
+      "refuses a zero-mention card whose live-discovered PR only CITES its identifier — not_delivered, zero status writes",
+      async () => {
+        await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+        // No cached mentions at all: a coordination card. The open PR in the
+        // project repo carries this card's identifier in its body only — it was
+        // delivered from another card's branch.
+        mockGhFetch.mockResolvedValueOnce(
+          createMockResponse([
+            {
+              number: 99,
+              draft: false,
+              head: { ref: "SUP-14671-other-card-branch" },
+              title: "coordination follow-up",
+              body: "Rolls up SUP-14676 and its siblings.",
+            },
+          ]),
+        );
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("skipped");
+        expect(result.message).toBe(
+          "status:skipped:not_delivered: TEA-Core/paperclip#99 head TEA-Core/paperclip:SUP-14671-other-card-branch is not this card's delivery branch SUP-14676-own-delivery-branch",
+        );
+        // Only the open-PR listing; no head-SHA read and no status POST.
+        expect(mockGhFetch).toHaveBeenCalledTimes(1);
+        expect(mockGhFetch.mock.calls[0]![0]).toBe(
+          "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100",
+        );
+      },
+    );
+
+    it(
+      "fails closed on the live path when no delivery branch is recorded — never falls back to identifier-substring authorization",
+      async () => {
+        await seedDeliveryIdentity(null, DELIVERY_REPO_URL);
+        mockGhFetch.mockResolvedValueOnce(
+          createMockResponse([
+            {
+              number: 99,
+              draft: false,
+              head: { ref: "SUP-14676-looks-like-ours" },
+              title: "SUP-14676 deliver",
+              body: null,
+            },
+          ]),
+        );
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("skipped");
+        expect(result.message).toBe(
+          "status:skipped:delivery_identity_unresolved: no delivery branch recorded on this card's execution workspace; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+        );
+        expect(mockGhFetch).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it(
+      "still publishes on the live path when the discovered PR head ref IS the card's delivery branch (SUP-13313 happy path preserved)",
+      async () => {
+        await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+        mockGhFetch
+          .mockResolvedValueOnce(
+            createMockResponse([
+              {
+                number: 99,
+                draft: false,
+                head: { ref: DELIVERY_BRANCH },
+                title: "deliver SUP-14676",
+                body: null,
+              },
+            ]),
+          )
+          .mockResolvedValueOnce(
+            createMockResponse({
+              head: { sha: HEAD_SHA },
+              html_url: "https://github.com/TEA-Core/paperclip/pull/99",
+            }),
+          )
+          .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("armed");
+        expect(result.message).toContain("live re-resolve");
+        expect(result.headSha).toBe(HEAD_SHA);
+        expect(mockGhFetch).toHaveBeenCalledTimes(3);
+        expect(mockGhFetch.mock.calls[2]![0]).toBe(
+          `https://api.github.com/repos/TEA-Core/paperclip/statuses/${HEAD_SHA}`,
+        );
+      },
+    );
   },
 );

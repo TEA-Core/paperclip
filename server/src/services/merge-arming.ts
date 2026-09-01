@@ -497,6 +497,74 @@ export interface PublishApprovalStatusOptions {
   enforceDeliveryIdentity?: boolean;
 }
 
+/**
+ * ADR-091 D1 (SUP-14676): the card's own delivery identity — the repo it was
+ * assigned and the branch it delivered on. Both the cached-mention path and the
+ * SUP-13313/SUP-13831 live-discovery path authorize against this, so it is
+ * resolved through one helper: a gate that only covers one of the two stamp
+ * paths is not a gate.
+ */
+async function resolveDeliveryIdentity(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<{ branch: string | null; repo: { owner: string; repo: string } | null }> {
+  const [issueRow] = await db
+    .select({
+      projectId: issues.projectId,
+      projectWorkspaceId: issues.projectWorkspaceId,
+      executionWorkspaceId: issues.executionWorkspaceId,
+    })
+    .from(issues)
+    .where(eq(issues.id, issueId));
+  const ctx = await resolveIssueRepoContext(db, {
+    companyId,
+    projectId: issueRow?.projectId ?? null,
+    projectWorkspaceId: issueRow?.projectWorkspaceId ?? null,
+    executionWorkspaceId: issueRow?.executionWorkspaceId ?? null,
+  });
+  return {
+    branch: ctx?.branch ?? null,
+    repo: ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null,
+  };
+}
+
+/** ADR-091 D4: the fail-closed refusal when delivery identity is unresolvable. */
+function deliveryIdentityUnresolvedOutcome(branch: string | null): ArmingOutcome {
+  const missing = !branch
+    ? "no delivery branch recorded on this card's execution workspace"
+    : "no delivery repo resolvable for this card's execution workspace";
+  return {
+    kind: "skipped",
+    message: `status:skipped:delivery_identity_unresolved: ${missing}; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)`,
+  };
+}
+
+/** True when the PR's head repo AND head ref are this card's delivery identity. */
+function isDeliveredByCard(
+  pr: { owner: string; repo: string; headRefName: string | null },
+  deliveryRepo: { owner: string; repo: string },
+  deliveryBranch: string,
+): boolean {
+  if (pr.owner.toLowerCase() !== deliveryRepo.owner.toLowerCase()) return false;
+  if (pr.repo.toLowerCase() !== deliveryRepo.repo.toLowerCase()) return false;
+  return pr.headRefName !== null && pr.headRefName.toLowerCase() === deliveryBranch.toLowerCase();
+}
+
+/** The named `not_delivered` refusal, listing every candidate that failed the gate. */
+function notDeliveredOutcome(
+  rejected: Array<{ displayName: string; owner: string; repo: string; headRefName: string | null }>,
+  deliveryBranch: string,
+): ArmingOutcome {
+  const failed = rejected
+    .map(
+      (pr) =>
+        `${pr.displayName} head ${pr.owner}/${pr.repo}:${pr.headRefName ?? "(unreadable)"} is not this card's delivery branch ${deliveryBranch}`,
+    )
+    .join("; ");
+  return { kind: "skipped", message: `status:skipped:not_delivered: ${failed}` };
+}
+
 export async function publishApprovalStatus(
   db: Db,
   companyId: string,
@@ -517,55 +585,21 @@ export async function publishApprovalStatus(
   // leaves enforceDeliveryIdentity unset.
   let authorizingPRs = linkedPRs;
   if (options?.enforceDeliveryIdentity && linkedPRs.length > 0) {
-    const [issueRow] = await db
-      .select({
-        projectId: issues.projectId,
-        projectWorkspaceId: issues.projectWorkspaceId,
-        executionWorkspaceId: issues.executionWorkspaceId,
-      })
-      .from(issues)
-      .where(eq(issues.id, issueId));
-    const ctx = await resolveIssueRepoContext(db, {
+    const { branch: deliveryBranch, repo: deliveryRepo } = await resolveDeliveryIdentity(
+      db,
       companyId,
-      projectId: issueRow?.projectId ?? null,
-      projectWorkspaceId: issueRow?.projectWorkspaceId ?? null,
-      executionWorkspaceId: issueRow?.executionWorkspaceId ?? null,
-    });
-    const deliveryBranch = ctx?.branch ?? null;
-    const deliveryRepo = ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null;
+      issueId,
+    );
 
     // ADR-091 D4: fail closed when the card's delivery identity cannot be
     // positively resolved — refuse to stamp on an unverified branch.
     if (!deliveryBranch || !deliveryRepo) {
-      const missing = !deliveryBranch
-        ? "no delivery branch recorded on this card's execution workspace"
-        : "no delivery repo resolvable for this card's execution workspace";
-      return {
-        kind: "skipped",
-        message: `status:skipped:delivery_identity_unresolved: ${missing}; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)`,
-      };
+      return deliveryIdentityUnresolvedOutcome(deliveryBranch);
     }
 
-    const delivered = linkedPRs.filter((pr) => {
-      if (pr.owner.toLowerCase() !== deliveryRepo.owner.toLowerCase()) return false;
-      if (pr.repo.toLowerCase() !== deliveryRepo.repo.toLowerCase()) return false;
-      return (
-        pr.headRefName !== null &&
-        pr.headRefName.toLowerCase() === deliveryBranch.toLowerCase()
-      );
-    });
-
+    const delivered = linkedPRs.filter((pr) => isDeliveredByCard(pr, deliveryRepo, deliveryBranch));
     if (delivered.length === 0) {
-      const failed = linkedPRs
-        .map(
-          (pr) =>
-            `${pr.displayName} head ${pr.owner}/${pr.repo}:${pr.headRefName ?? "(unreadable)"} is not this card's delivery branch ${deliveryBranch}`,
-        )
-        .join("; ");
-      return {
-        kind: "skipped",
-        message: `status:skipped:not_delivered: ${failed}`,
-      };
+      return notDeliveredOutcome(linkedPRs, deliveryBranch);
     }
 
     authorizingPRs = delivered;
@@ -613,11 +647,12 @@ export async function publishApprovalStatus(
       }
     }
 
-    const matched: Array<{
+    let matched: Array<{
       owner: string;
       repo: string;
       number: number;
       displayName: string;
+      headRefName: string | null;
       candidate: GitHubTokenResolution;
     }> = [];
     const needle = issueIdentifier.toLowerCase();
@@ -681,11 +716,37 @@ export async function publishApprovalStatus(
             repo: pair.repo,
             number: item.number,
             displayName: `${pair.owner}/${pair.repo}#${item.number}`,
+            headRefName: item.headRef ?? null,
             candidate,
           });
         }
         break;
       }
+    }
+
+    // ADR-091 D1 (SUP-14676): the live-discovery candidates above are matched by
+    // identifier SUBSTRING on head ref / title / body — pure citation. They are
+    // authorizing candidates just like the cached mentions, so they take the same
+    // delivery-identity gate, applied BEFORE the length arithmetic. Without this a
+    // card with zero cached mentions could stamp any open PR whose prose merely
+    // names it — the exact failure D1 exists to kill. A card that delivered its own
+    // PR has head ref === its delivery branch, so the SUP-13313 happy path stands.
+    if (options?.enforceDeliveryIdentity && matched.length > 0) {
+      const { branch: deliveryBranch, repo: deliveryRepo } = await resolveDeliveryIdentity(
+        db,
+        companyId,
+        issueId,
+      );
+      // ADR-091 D4: no branch (or no repo) recorded → refuse, never fall back to
+      // identifier-substring authorization.
+      if (!deliveryBranch || !deliveryRepo) {
+        return deliveryIdentityUnresolvedOutcome(deliveryBranch);
+      }
+      const delivered = matched.filter((pr) => isDeliveredByCard(pr, deliveryRepo, deliveryBranch));
+      if (delivered.length === 0) {
+        return notDeliveredOutcome(matched, deliveryBranch);
+      }
+      matched = delivered;
     }
 
     if (matched.length > 1) {
