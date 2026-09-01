@@ -18910,33 +18910,44 @@ function pendingCleanupAttemptsSql() {
         // directly, bypassing enqueueWakeup) never consulted.
         const deferredIsUserWake = deferred.requestedByActorType === "user";
 
+        // A bare `blocked` card (status "blocked" with NO unresolved blocker
+        // edge) is not gated: the dispatch path intentionally still wakes it so
+        // the assignee can re-evaluate. Only `blocked` WITH an unresolved
+        // blocker edge is a card that cannot progress until someone else acts.
+        // Mirror that exact gate here — the same readiness primitive the
+        // dispatch path relies on (issuesSvc listDependencyReadiness) — so a
+        // promotion is drained precisely when a fresh dispatch would be
+        // suppressed, and a board/operator (user) wake always reaches the agent.
         if (issue.status === "blocked" && !deferredIsUserWake) {
-          // A blocked card is waiting on an unblock owner the agent cannot be.
-          // A deferred wake the agent or system re-armed against it just
-          // restates the blocked state; only a board/operator (user) wake should
-          // reach the agent. Draining it means blocking a card drains the
-          // deferred queue instead of leaving the promotion armed.
-          await tx
-            .update(agentWakeupRequests)
-            .set({
-              status: "skipped",
-              reason: "issue_deferred_promotion_drained_blocked",
-              finishedAt: new Date(),
-              error: "Deferred wake drained: issue is blocked and the wake is not board/operator input",
-              updatedAt: new Date(),
-            })
-            .where(eq(agentWakeupRequests.id, deferred.id));
-          logger.info(
-            {
-              runId: run.id,
-              agentId: deferred.agentId,
-              issueId: issue.id,
-              issueStatus: issue.status,
-              deferredWakeupId: deferred.id,
-            },
-            "deferred wake drained: blocked card, non-board input",
-          );
-          continue;
+          const readinessMap = await issuesSvc.listDependencyReadiness(run.companyId, [issue.id], tx);
+          const unresolvedBlockerCount = readinessMap.get(issue.id)?.unresolvedBlockerCount ?? 0;
+          if (unresolvedBlockerCount > 0) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "skipped",
+                reason: "issue_deferred_promotion_drained_blocked",
+                finishedAt: new Date(),
+                error: "Deferred wake drained: issue is blocked on an unresolved blocker and the wake is not board/operator input",
+                updatedAt: new Date(),
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            logger.info(
+              {
+                runId: run.id,
+                agentId: deferred.agentId,
+                issueId: issue.id,
+                issueStatus: issue.status,
+                unresolvedBlockerCount,
+                deferredWakeupId: deferred.id,
+              },
+              "deferred wake drained: blocked on unresolved blocker, non-board input",
+            );
+            continue;
+          }
+          // Bare-blocked with no unresolved blocker is still actionable: fall
+          // through to the self-loop damp / normal promotion so the assignee
+          // can re-evaluate the card.
         }
 
         const deferredIsSelfLoop = deferred.agentId === run.agentId;

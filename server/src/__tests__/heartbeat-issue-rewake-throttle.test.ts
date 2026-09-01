@@ -15,6 +15,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueRelations,
   issues,
 } from "@paperclipai/db";
 import {
@@ -495,8 +496,26 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       expect(await runsForWakeup(companyId, wakeId)).toEqual([]);
     });
 
-    it("drains a deferred wake sitting on a blocked card that is not board input", async () => {
+    it("drains a deferred wake on a blocked card with an unresolved blocker that is not board input", async () => {
       const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+      // The blocker edge is what gates dispatch: `blocked` alone is still
+      // actionable (the assignee re-evaluates), so the drain only fires when
+      // the card cannot progress — i.e. it has an unresolved blocker edge.
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Unresolved blocker",
+        status: "in_progress",
+        priority: "high",
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
       await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
 
       const endingRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 0 });
@@ -514,6 +533,28 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       expect(wake?.status).toBe("skipped");
       expect(wake?.reason).toBe("issue_deferred_promotion_drained_blocked");
       expect(await runsForWakeup(companyId, wakeId)).toEqual([]);
+    });
+
+    it("does NOT drain a deferred wake on a bare blocked card (no unresolved blocker): it promotes so the assignee can re-evaluate", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+
+      const endingRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 0 });
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        requestedByActorType: "agent",
+      });
+
+      const [endingRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, endingRunId));
+      await heartbeat.releaseIssueExecutionAndPromote(endingRun);
+
+      const wake = await fetchWakeRow(wakeId);
+      expect(wake?.reason).toBe("issue_execution_promoted");
+      expect(["queued", "claimed", "processing"]).toContain(wake?.status);
+      const promoted = await runsForWakeup(companyId, wakeId);
+      expect(promoted).toHaveLength(1);
     });
 
     it("lets a promotion through when genuine new user input arrived after the last run", async () => {
