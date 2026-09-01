@@ -14051,7 +14051,39 @@ export function issueRoutes(
             actor,
           })
         : null;
-      const reopenedIssue = await svc.update(id, { status: "todo" });
+      // The implicit comment-reopen historically wrote `status: "todo"` with a bare
+      // `svc.update`, bypassing `applyIssueExecutionPolicyTransition` (SUP-14756).
+      // That left a reopened `done`/`cancelled` card carrying its pre-reopen
+      // `executionState` (e.g. `status: "completed"`); because the done/cancelled
+      // -> non-terminal reset is keyed on the pre-reopen status, no later PATCH could
+      // ever clear it. Route the status write through the same transition the PATCH
+      // route uses so the reset lands in this single write.
+      const reopenPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+      const reopenTransition = applyIssueExecutionPolicyTransition({
+        issue,
+        policy: reopenPolicy,
+        previousPolicy: reopenPolicy,
+        requestedStatus: "todo",
+        requestedAssigneePatch: {},
+        actor: {
+          agentId: actor.agentId ?? null,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        commentBody: req.body.body,
+      });
+      if (reopenTransition.decision) {
+        // A reopen moves the card back to `todo`; the transition should never mint
+        // a stage decision here. Fail loud rather than silently drop it.
+        throw new Error("Comment-reopen unexpectedly produced an execution stage decision");
+      }
+      const reopenedExecutionState =
+        reopenTransition.patch.executionState !== undefined
+          ? reopenTransition.patch.executionState
+          : issue.executionState;
+      const reopenedIssue = await svc.update(id, {
+        status: "todo",
+        ...reopenTransition.patch,
+      });
       if (!reopenedIssue) {
         res.status(404).json({ error: "Issue not found" });
         return;
@@ -14059,6 +14091,30 @@ export function issueRoutes(
       reopened = isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers);
       reopenFromStatus = reopened ? issue.status : null;
       currentIssue = reopenedIssue;
+
+      // Audit parity with the PATCH route and auto-approve path: the transition's
+      // done/cancelled reset prunes retired-revision stage ids out of the stale
+      // executionState; record that prune so the reopen is auditable (ADR-073 D4).
+      if (reopenTransition.droppedStageIds?.length) {
+        void logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "execution-stage-prune",
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+          action: "issue.execution_stage_ids_pruned",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            issueId: id,
+            droppedStageIds: reopenTransition.droppedStageIds,
+          },
+        }).catch((err) => {
+          logger.warn({ err, issueId: id }, "failed to write execution stage prune audit log");
+        });
+      }
 
       await logActivity(db, {
         companyId: currentIssue.companyId,
@@ -14072,6 +14128,7 @@ export function issueRoutes(
         entityId: currentIssue.id,
         details: {
           status: "todo",
+          executionState: reopenedExecutionState,
           ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
           ...(scheduledRetrySupersededByComment
             ? {
