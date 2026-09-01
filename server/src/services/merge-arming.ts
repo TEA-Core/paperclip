@@ -187,6 +187,30 @@ export async function resolveIssueRepoContext(
 
 export const GITHUB_GRAPHQL_URL = "https://api.github.com/graphql";
 
+/** Returns the value when it is a non-empty string, else null. */
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Extracts the head branch ref from a cached external object's data. The
+ * canonical shape is the flat `headRef` key the GitHub external-object
+ * provider writes (`pullRequestSnapshot` in
+ * `github-external-object-provider.ts`); nested `head.ref` and flat
+ * `headRefName` are tolerated for legacy cached rows.
+ */
+function headRefFromData(data: Record<string, unknown> | null | undefined): string | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const flat = readString(data.headRef);
+  if (flat) return flat;
+  const head = data.head;
+  if (head && typeof head === "object" && !Array.isArray(head)) {
+    const ref = (head as Record<string, unknown>).ref;
+    if (typeof ref === "string" && ref.length > 0) return ref;
+  }
+  return readString(data.headRefName);
+}
+
 export async function resolveLinkedPullRequests(
   db: Db,
   companyId: string,
@@ -230,9 +254,7 @@ export async function resolveLinkedPullRequests(
     seen.add(key);
 
     const nodeId = row.data?.node_id as string | undefined | null;
-    const headRefName =
-      (row.data?.head as Record<string, unknown> | undefined | null)?.ref as string | undefined ??
-      (row.data?.headRefName as string | undefined);
+    const headRefName = headRefFromData(row.data);
 
       results.push({
         id: row.id,
@@ -294,9 +316,7 @@ export async function resolveLinkedPullRequestsWithState(
     seen.add(key);
 
     const nodeId = row.data?.node_id as string | undefined | null;
-    const headRefName =
-      (row.data?.head as Record<string, unknown> | undefined | null)?.ref as string | undefined ??
-      (row.data?.headRefName as string | undefined);
+    const headRefName = headRefFromData(row.data);
 
       results.push({
         id: row.id,
