@@ -829,6 +829,68 @@ describe("assertWorktreeWritableByProcessUser", () => {
     expect(repairCalls).toContain(worktreePath);
   });
 
+  // SUP-14642 (security, redo 2): containment is a property of the WHOLE
+  // resolved path, not just the leaf. A tracked file whose PARENT directory is
+  // a symlink to an external directory still resolves through that ancestor to
+  // a regular file outside the worktree, so a leaf-only lstat guard cannot see
+  // it. The validator must never hand such a path to the shared-group repair
+  // (its external target would be chowned/chmod'd), and must still fail closed
+  // when the external target is genuinely unwritable.
+  it("never passes a tracked file beneath a symlinked worktree directory to the shared-group repair even when its external target is unwritable", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "SUP-14642-ancestor-symlink-escape";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    // A tracked file under a REAL subdir.
+    await fs.mkdir(path.join(worktreePath, "subdir"));
+    await fs.writeFile(path.join(worktreePath, "subdir", "file.txt"), "payload\n", "utf8");
+    await execFileAsync("git", ["add", "subdir/file.txt"], { cwd: worktreePath });
+    await execFileAsync("git", ["commit", "-m", "add tracked file under subdir"], { cwd: worktreePath });
+
+    // An external directory OUTSIDE the worktree containing the same relative
+    // file — repairing it would grant the shared group rwx on a path the
+    // worktree does not own.
+    const externalDir = path.join(repoRoot, "external-dir");
+    await fs.mkdir(externalDir, { recursive: true });
+    await fs.writeFile(path.join(externalDir, "file.txt"), "secret\n", "utf8");
+
+    // Swap the real subdir for a symlink to the external dir. git ls-files
+    // still returns subdir/file.txt (the index path is lexical), but the
+    // on-disk path now resolves to externalDir/file.txt.
+    await fs.rm(path.join(worktreePath, "subdir"), { recursive: true });
+    await fs.symlink(externalDir, path.join(worktreePath, "subdir"));
+
+    // The external target is genuinely unwritable, so the path through the
+    // symlinked ancestor surfaces as unwritable in the probe.
+    await fs.chmod(path.join(externalDir, "file.txt"), 0o000);
+
+    const repairCalls: string[] = [];
+    sharedGroupRepairHook.current = async (target) => {
+      repairCalls.push(target);
+    };
+    try {
+      // The external target is unwritable and the escaping path is skipped by
+      // the repair, so it survives the re-probe and the validator throws.
+      await expect(
+        assertWorktreeWritableByProcessUser(worktreePath, {
+          resolveGid: async () => process.getgid(),
+        }),
+      ).rejects.toThrow(/not writable/);
+    } finally {
+      sharedGroupRepairHook.current = null;
+      await fs.chmod(path.join(externalDir, "file.txt"), 0o600);
+    }
+
+    // The distinguishing assertion: the lexical path through the symlinked
+    // ancestor is NEVER handed to the repair helper, so its external target is
+    // never chowned/chmod'd...
+    expect(repairCalls).not.toContain(path.join(worktreePath, "subdir", "file.txt"));
+    // ...while the worktree root still goes through the repair as before.
+    expect(repairCalls).toContain(worktreePath);
+  });
+
   it("throws with the chgrp/chmod g+w remediation ahead of any chown suggestion when the repair cannot fix the file", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "SUP-14642-repair-failure-message";

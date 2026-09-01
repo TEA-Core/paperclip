@@ -3797,17 +3797,33 @@ export async function assertWorktreeWritableByProcessUser(
     // sites in this module is the right one, so attempt it here and re-probe
     // before anyone is told to touch the host.
     await ensureSharedGroupOwnership(worktreePath, sharedGroupRepairOptions);
+    const resolvedWorktreePath = await fs.realpath(worktreePath);
     for (const fullPath of unwritable) {
       if (fullPath === worktreePath) continue;
-      // SUP-14642 (security): a tracked symlink (git mode 120000) must never be
-      // passed to ensureSharedGroupOwnership — it stats/chowns/chmods
-      // symlink-following while its denied-dir guard compares only the lexical
-      // path, so a symlink whose target lies outside the worktree (server
-      // secrets master-key dir, embedded-Postgres data, a backup) would escape
-      // the guard and grant the shared group rwx on the target. lstat (no
-      // follow) and skip; the path still surfaces in the failure list below.
-      const linkStat = await fs.lstat(fullPath);
-      if (linkStat.isSymbolicLink()) continue;
+      // SUP-14642 (security, redo 2): containment is a property of the WHOLE
+      // resolved path, not just the leaf. fs.lstat skips following only the
+      // final component, so a tracked file whose PARENT directory is a symlink
+      // still resolves through it to an external target as a regular file and
+      // isSymbolicLink() is false; ensureSharedGroupOwnership stats/chowns/
+      // chmods symlink-following while its denied-dir guard compares only the
+      // lexical path, so the external target would be chgrp'd to the shared
+      // group + group rwx. Require the realpath of the candidate to stay inside
+      // the realpath of the worktree; otherwise skip. The path still surfaces
+      // in the failure list below.
+      let resolvedFullPath: string;
+      try {
+        resolvedFullPath = await fs.realpath(fullPath);
+      } catch {
+        // Un-resolvable (e.g. vanished mid-probe): never repair what we cannot
+        // prove is inside the worktree; it still surfaces in the failure list.
+        continue;
+      }
+      if (
+        resolvedFullPath !== resolvedWorktreePath &&
+        !resolvedFullPath.startsWith(resolvedWorktreePath + path.sep)
+      ) {
+        continue;
+      }
       await ensureSharedGroupOwnership(fullPath, sharedGroupRepairOptions);
     }
     const surviving = await probeUnwritablePaths();
