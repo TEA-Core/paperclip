@@ -283,6 +283,31 @@ async function findFreeExposureAppPort(startAt: number): Promise<number> {
   throw new Error("no free app/HMR port pair available in the dedicated runtime exposure range");
 }
 
+/**
+ * Picks a free app/HMR pair from the dedicated range with a randomised start
+ * offset so that parallel CI shards do not all converge on 42000.
+ *
+ * The three PAP-17256 loopback-bind tests pin the port so the allocator's
+ * `claimIfFree(preferredAppPort)` re-probes just before the claim; if a
+ * collision still occurs the scan falls through to the next free pair instead
+ * of racing another shard on the same deterministic start.
+ */
+async function pickCollisionSafeExposureAppPort(): Promise<number> {
+  const range = RUNTIME_EXPOSURE_APP_PORT_MAX - RUNTIME_EXPOSURE_APP_PORT_MIN + 1;
+  const start = RUNTIME_EXPOSURE_APP_PORT_MIN + Math.floor(Math.random() * range);
+  for (let appPort = start; appPort <= RUNTIME_EXPOSURE_APP_PORT_MAX; appPort += 1) {
+    if (await isLoopbackPortFree(appPort) && await isLoopbackPortFree(deriveViteHmrPort(appPort))) {
+      return appPort;
+    }
+  }
+  for (let appPort = RUNTIME_EXPOSURE_APP_PORT_MIN; appPort < start; appPort += 1) {
+    if (await isLoopbackPortFree(appPort) && await isLoopbackPortFree(deriveViteHmrPort(appPort))) {
+      return appPort;
+    }
+  }
+  throw new Error("no free app/HMR port pair available in the dedicated runtime exposure range");
+}
+
 function installDeps(overrides: {
   broker: BrokerClient;
   probeHealth?: () => Promise<boolean>;
@@ -617,11 +642,12 @@ describe("loopback bind is forced on the guest, not merely requested (PAP-17256)
 
     // A guest with no bind flags at all: the argv rewrite cannot reach it, so
     // this is the residual case that must fail loudly rather than expose.
+    const port = await pickCollisionSafeExposureAppPort();
     await expect(startRuntimeServicesForWorkspaceControl(startInput({
       serviceName: "paperclip-dev",
       command: guestCommand("dev-runner-legacy.mjs"),
       expose: LEGACY_HTTP_EXPOSE,
-      port: { type: "auto", envKey: "PORT" },
+      port,
     }))).rejects.toThrow(/listener_ownership_mismatch.*(?:0\.0\.0\.0|::)/s);
 
     // Terminal recovery: the reservation is released and nothing was exposed.
@@ -633,11 +659,12 @@ describe("loopback bind is forced on the guest, not merely requested (PAP-17256)
     const { broker } = createBroker();
     installDeps({ broker });
 
+    const port = await pickCollisionSafeExposureAppPort();
     const error = await startRuntimeServicesForWorkspaceControl(startInput({
       serviceName: "paperclip-dev",
       command: guestCommand("dev-runner-legacy.mjs"),
       expose: LEGACY_HTTP_EXPOSE,
-      port: { type: "auto", envKey: "PORT" },
+      port,
     })).then(() => null, (err: unknown) => err as Error);
 
     expect(error).not.toBeNull();
@@ -732,11 +759,12 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
     const { broker, calls } = createBroker();
     installDeps({ broker });
 
+    const port = await pickCollisionSafeExposureAppPort();
     const error = await startRuntimeServicesForWorkspaceControl(startInput({
       serviceName: "paperclip-dev",
       command: `${guestCommand("dev-runner-wildcard-hmr.mjs")} --bind lan`,
       expose: LEGACY_HTTP_EXPOSE,
-      port: { type: "auto", envKey: "PORT" },
+      port,
     })).then(() => null, (err: unknown) => err as Error);
 
     expect(error).not.toBeNull();
