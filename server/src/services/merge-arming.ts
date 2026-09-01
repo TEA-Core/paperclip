@@ -894,6 +894,174 @@ export async function publishApprovalStatus(
   return { kind: "failed", message: "status:failed:internal: exhausted GitHub token candidates" };
 }
 
+export type DecisionHeadResolution =
+  | { kind: "resolved"; headSha: string; displayName: string }
+  | { kind: "unresolvable"; reason: string };
+
+/**
+ * ADR-091 D2a — decision-time head pin. Resolves the PR head the approving
+ * decision was rendered against, using the same candidate walk
+ * publishApprovalStatus uses (cached linked PRs first, then the zero-mention-row
+ * live re-resolve for closing transitions, SUP-13313 / SUP-13831).
+ * runApprovalMergeArming passes this head to publishApprovalStatus as
+ * expectedHeadSha so a head that moves between the decision and the delegated
+ * write refuses (skipped:head_moved, zero writes) instead of stamping a
+ * never-reviewed head. Any case that cannot positively resolve a single head is
+ * "unresolvable"; the caller must refuse with a named skipped reason, never
+ * fall back to the live head (ADR-091 D4: cannot verify -> refuse).
+ */
+export async function resolveApprovalDecisionHead(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  issueIdentifier: string,
+  closingTransition: boolean,
+): Promise<DecisionHeadResolution> {
+  const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId);
+
+  if (linkedPRs.length > 1) {
+    const prList = linkedPRs.map((pr) => pr.displayName).join(", ");
+    return {
+      kind: "unresolvable",
+      reason: `ambiguous: multiple linked PRs (${linkedPRs.length}): ${prList}`,
+    };
+  }
+
+  if (linkedPRs.length === 1) {
+    const pr = linkedPRs[0]!;
+    const head = await fetchHeadViaTokenCandidates(db, companyId, pr.owner, pr.repo, pr.number);
+    return head.ok
+      ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName }
+      : { kind: "unresolvable", reason: head.reason };
+  }
+
+  // Zero cached linked PRs: mirror publishApprovalStatus's live re-resolve so
+  // the decision-time head matches what the publish would have resolved.
+  const withState = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+  const pairs: Array<{ owner: string; repo: string }> = [];
+  const seenPairs = new Set<string>();
+  for (const row of withState) {
+    const key = `${row.owner.toLowerCase()}/${row.repo.toLowerCase()}`;
+    if (seenPairs.has(key)) continue;
+    seenPairs.add(key);
+    pairs.push({ owner: row.owner, repo: row.repo });
+  }
+
+  if (pairs.length === 0 && closingTransition) {
+    const [issueRow] = await db
+      .select({
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+        executionWorkspaceId: issues.executionWorkspaceId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const ctx = await resolveIssueRepoContext(db, {
+      companyId,
+      projectId: issueRow?.projectId ?? null,
+      projectWorkspaceId: issueRow?.projectWorkspaceId ?? null,
+      executionWorkspaceId: issueRow?.executionWorkspaceId ?? null,
+    });
+    const parsed = ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null;
+    if (parsed) pairs.push({ owner: parsed.owner, repo: parsed.repo });
+  }
+
+  const needle = issueIdentifier.toLowerCase();
+  const matched: Array<{ owner: string; repo: string; number: number; displayName: string }> = [];
+
+  for (const pair of pairs) {
+    const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pair.owner, pair.repo);
+    if (candidates.length === 0) {
+      const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pair.owner, pair.repo);
+      const reason = isGitHubTokenResolution(tokenResult)
+        ? `auth_required: no GitHub token resolvable for ${pair.owner}/${pair.repo}`
+        : `auth_required: ${tokenResult.reason}`;
+      return { kind: "unresolvable", reason };
+    }
+    for (const candidate of candidates) {
+      const listResult = await fetchOpenPullRequests(candidate.token, pair.owner, pair.repo);
+      if (!listResult.ok) {
+        const { status, message } = listResult;
+        if (status === 401 || status === 403) {
+          if (candidate !== candidates[candidates.length - 1]) continue;
+          return { kind: "unresolvable", reason: `pr_auth: HTTP ${status} ${message ?? ""}` };
+        }
+        if (status === 404) return { kind: "unresolvable", reason: "pr_not_found: HTTP 404" };
+        if (status === 429) return { kind: "unresolvable", reason: "pr_rate_limited: HTTP 429" };
+        if (status === 0) {
+          return { kind: "unresolvable", reason: `pr_network: ${message ?? "network_error"}` };
+        }
+        return { kind: "unresolvable", reason: `pr_error: HTTP ${status} ${message ?? ""}` };
+      }
+      for (const item of listResult.items) {
+        if (item.draft === true) continue;
+        const headRef = (item.headRef ?? "").toLowerCase();
+        const title = (item.title ?? "").toLowerCase();
+        const body = (item.body ?? "").toLowerCase();
+        if (!headRef.includes(needle) && !title.includes(needle) && !body.includes(needle)) continue;
+        matched.push({
+          owner: pair.owner,
+          repo: pair.repo,
+          number: item.number,
+          displayName: `${pair.owner}/${pair.repo}#${item.number}`,
+        });
+      }
+      break;
+    }
+  }
+
+  if (matched.length > 1) {
+    const prList = matched.map((pr) => pr.displayName).join(", ");
+    return {
+      kind: "unresolvable",
+      reason: `ambiguous: multiple live-resolved PRs (${matched.length}): ${prList}`,
+    };
+  }
+  if (matched.length === 1) {
+    const pr = matched[0]!;
+    const head = await fetchHeadViaTokenCandidates(db, companyId, pr.owner, pr.repo, pr.number);
+    return head.ok
+      ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName }
+      : { kind: "unresolvable", reason: head.reason };
+  }
+  return { kind: "unresolvable", reason: "no-pr: no open linked PR resolvable at decision time" };
+}
+
+async function fetchHeadViaTokenCandidates(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<{ ok: true; headSha: string } | { ok: false; reason: string }> {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
+  if (candidates.length === 0) {
+    const tokenResult = await resolveGitHubTokenForRepo(db, companyId, owner, repo);
+    const reason = isGitHubTokenResolution(tokenResult)
+      ? `auth_required: no GitHub token resolvable for ${owner}/${repo}`
+      : `auth_required: ${tokenResult.reason}`;
+    return { ok: false, reason };
+  }
+  for (const candidate of candidates) {
+    const headShaResult = await fetchPullRequestHeadSha(candidate.token, owner, repo, number);
+    if (headShaResult.ok) return { ok: true, headSha: headShaResult.headSha };
+    const { status, message } = headShaResult;
+    if (status === 401 || status === 403) {
+      if (candidate !== candidates[candidates.length - 1]) continue;
+      const scopeDetail =
+        candidates.length === 1
+          ? `(scope=${candidate.scope}, secretName=${candidate.secretName})`
+          : `(tried: ${candidates.map((c) => `${c.scope}/${c.secretName}`).join(", ")})`;
+      return { ok: false, reason: `pr_auth: HTTP ${status} ${message ?? ""} ${scopeDetail}` };
+    }
+    if (status === 404) return { ok: false, reason: "pr_not_found: HTTP 404" };
+    if (status === 429) return { ok: false, reason: "pr_rate_limited: HTTP 429" };
+    if (status === 0) return { ok: false, reason: `pr_network: ${message ?? "network_error"}` };
+    return { ok: false, reason: `pr_error: HTTP ${status} ${message ?? ""}` };
+  }
+  return { ok: false, reason: "internal: exhausted GitHub token candidates" };
+}
+
 export interface HeadShaSuccess extends GitHubFetchResult {
   ok: true;
   headSha: string;
