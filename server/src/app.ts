@@ -54,6 +54,7 @@ import { goalRoutes } from "./routes/goals.js";
 import { onboardingSeedRoutes } from "./routes/onboarding-seed.js";
 import { boardChatRoutes } from "./routes/board-chat.js";
 import { approvalRoutes } from "./routes/approvals.js";
+import { agentGitHubTokenRoutes } from "./routes/agent-github-tokens.js";
 import { secretRoutes } from "./routes/secrets.js";
 import { toolAccessRoutes } from "./routes/tool-access.js";
 import { smokeLabRoutes } from "./routes/smoke-lab.js";
@@ -527,6 +528,7 @@ export async function createApp(
   api.use(boardChatRoutes(db, { deploymentMode: opts.deploymentMode }));
   api.use(approvalRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(secretRoutes(db));
+  api.use(agentGitHubTokenRoutes(db));
   const trustedLocalStdioRuntimeHost =
     process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
     ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
