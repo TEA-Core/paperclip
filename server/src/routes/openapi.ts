@@ -898,6 +898,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/reject",
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
   "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
+  "POST /api/issues/{id}/merge-arming/republish",
   "GET /api/companies/{companyId}/tools/gallery",
   "POST /api/companies/{companyId}/tools/apps/connect",
   "POST /api/companies/{companyId}/tools/apps/{connectionId}/finish",
@@ -4950,6 +4951,28 @@ registry.registerPath({
   summary: "Force-release an issue (admin)",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/merge-arming/republish",
+  tags: ["issues"],
+  summary: "Re-run the first paperclip/approved publish for a skipped stamp",
+  description:
+    "Operator recovery for a card whose approval decision is recorded but whose paperclip/approved " +
+    "stamp never landed. Board-only (company owner/admin); agent callers are refused 403 before any " +
+    "GitHub read or write. Idempotent: a card whose stamp is already published returns 200 " +
+    "already_published without a second write. Every refusal (no approved decision, stage-integrity " +
+    "failure, head_unresolvable, head_moved, not_delivered) returns 409 carrying the verbatim outcome " +
+    "message and performs zero GitHub writes.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({
