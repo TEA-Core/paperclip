@@ -2622,7 +2622,7 @@ describeEmbeddedPostgres(
 
         expect(result.kind).toBe("skipped");
         expect(result.message).toBe(
-          "status:skipped:not_delivered: some-org/upstream-lib#7 head some-org/upstream-lib:some-org/release-branch is not this card's delivery branch SUP-14676-own-delivery-branch",
+          "status:skipped:not_delivered: some-org/upstream-lib#7 head repo some-org/upstream-lib is not this card's delivery repo TEA-Core/paperclip; a deliverable in some-org/upstream-lib must be filed under a project bound to that repo (ADR-091 D5)",
         );
         expect(mockGhFetch).not.toHaveBeenCalled();
       },

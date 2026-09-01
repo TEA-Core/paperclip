@@ -584,7 +584,14 @@ function deliveryIdentityUnresolvedOutcome(branch: string | null): ArmingOutcome
   };
 }
 
-/** True when the PR's head repo AND head ref are this card's delivery identity. */
+/**
+ * True when the PR's head repo AND head ref are this card's delivery identity.
+ * ADR-091 D5 (SUP-14733): the gate STAYS CLOSED ACROSS REPOS — a card's
+ * delivery repo is structurally its project's repo, and branch-only matching
+ * would re-open the laundering vector D1 exists to block. This boolean is
+ * load-bearing: SUP-14734 is a message-only change and the accept/refuse
+ * verdict must stay byte-identical before and after.
+ */
 function isDeliveredByCard(
   pr: { owner: string; repo: string; headRefName: string | null },
   deliveryRepo: { owner: string; repo: string },
@@ -595,16 +602,43 @@ function isDeliveredByCard(
   return pr.headRefName !== null && pr.headRefName.toLowerCase() === deliveryBranch.toLowerCase();
 }
 
+/**
+ * ADR-091 D5 (SUP-14733): the single source of truth for one rejected
+ * candidate's fragment in a `not_delivered` refusal. When the head REPO differs
+ * from the delivery repo it names the repo mismatch and the remedy (file the
+ * deliverable under a project bound to that repo) instead of the misleading
+ * "branch X is not branch X" that reads as a control-plane bug. When the repo
+ * matches and only the head ref differs it keeps today's branch language. Both
+ * publishApprovalStatus and resolveApprovalDecisionHead route through this so
+ * the decision-time and publish-time refusals stay identical — a second copy of
+ * this rule is how the D2a round-1 regression happened. The repo comparison is
+ * case-insensitive, mirroring isDeliveredByCard, so the message half and the
+ * verdict never disagree on which half mismatched.
+ */
+function notDeliveredReasonForPr(
+  pr: { displayName: string; owner: string; repo: string; headRefName: string | null },
+  deliveryRepo: { owner: string; repo: string },
+  deliveryBranch: string,
+): string {
+  const repoMatches =
+    pr.owner.toLowerCase() === deliveryRepo.owner.toLowerCase() &&
+    pr.repo.toLowerCase() === deliveryRepo.repo.toLowerCase();
+  if (!repoMatches) {
+    const headRepo = `${pr.owner}/${pr.repo}`;
+    const delivery = `${deliveryRepo.owner}/${deliveryRepo.repo}`;
+    return `${pr.displayName} head repo ${headRepo} is not this card's delivery repo ${delivery}; a deliverable in ${headRepo} must be filed under a project bound to that repo (ADR-091 D5)`;
+  }
+  return `${pr.displayName} head ${pr.owner}/${pr.repo}:${pr.headRefName ?? "(unreadable)"} is not this card's delivery branch ${deliveryBranch}`;
+}
+
 /** The named `not_delivered` refusal, listing every candidate that failed the gate. */
 function notDeliveredOutcome(
   rejected: Array<{ displayName: string; owner: string; repo: string; headRefName: string | null }>,
+  deliveryRepo: { owner: string; repo: string },
   deliveryBranch: string,
 ): ArmingOutcome {
   const failed = rejected
-    .map(
-      (pr) =>
-        `${pr.displayName} head ${pr.owner}/${pr.repo}:${pr.headRefName ?? "(unreadable)"} is not this card's delivery branch ${deliveryBranch}`,
-    )
+    .map((pr) => notDeliveredReasonForPr(pr, deliveryRepo, deliveryBranch))
     .join("; ");
   return { kind: "skipped", message: `status:skipped:not_delivered: ${failed}` };
 }
@@ -621,7 +655,7 @@ function notDeliveredOutcome(
 type DeliveryNarrow<T> =
   | { outcome: "narrowed"; delivered: T[]; deliveryBranch: string }
   | { outcome: "identity-unresolved"; branch: string | null }
-  | { outcome: "not-delivered"; rejected: T[]; deliveryBranch: string };
+  | { outcome: "not-delivered"; rejected: T[]; deliveryRepo: { owner: string; repo: string }; deliveryBranch: string };
 
 async function narrowToDelivered<
   T extends { owner: string; repo: string; headRefName: string | null; displayName: string },
@@ -630,7 +664,7 @@ async function narrowToDelivered<
   if (!branch || !repo) return { outcome: "identity-unresolved", branch };
   const delivered = candidates.filter((pr) => isDeliveredByCard(pr, repo, branch));
   if (delivered.length === 0) {
-    return { outcome: "not-delivered", rejected: candidates, deliveryBranch: branch };
+    return { outcome: "not-delivered", rejected: candidates, deliveryRepo: repo, deliveryBranch: branch };
   }
   return { outcome: "narrowed", delivered, deliveryBranch: branch };
 }
@@ -662,7 +696,7 @@ export async function publishApprovalStatus(
       return deliveryIdentityUnresolvedOutcome(narrowed.branch);
     }
     if (narrowed.outcome === "not-delivered") {
-      return notDeliveredOutcome(narrowed.rejected, narrowed.deliveryBranch);
+      return notDeliveredOutcome(narrowed.rejected, narrowed.deliveryRepo, narrowed.deliveryBranch);
     }
 
     authorizingPRs = narrowed.delivered;
@@ -802,7 +836,7 @@ export async function publishApprovalStatus(
         return deliveryIdentityUnresolvedOutcome(narrowed.branch);
       }
       if (narrowed.outcome === "not-delivered") {
-        return notDeliveredOutcome(narrowed.rejected, narrowed.deliveryBranch);
+        return notDeliveredOutcome(narrowed.rejected, narrowed.deliveryRepo, narrowed.deliveryBranch);
       }
       matched = narrowed.delivered;
     }
@@ -1018,6 +1052,7 @@ function unresolvableFromNarrowing(
           repo: string;
           headRefName: string | null;
         }>;
+        deliveryRepo: { owner: string; repo: string };
         deliveryBranch: string;
       },
 ): DecisionHeadResolution {
@@ -1031,10 +1066,7 @@ function unresolvableFromNarrowing(
     };
   }
   const failed = narrowed.rejected
-    .map(
-      (pr) =>
-        `${pr.displayName} head ${pr.owner}/${pr.repo}:${pr.headRefName ?? "(unreadable)"} is not this card's delivery branch ${narrowed.deliveryBranch}`,
-    )
+    .map((pr) => notDeliveredReasonForPr(pr, narrowed.deliveryRepo, narrowed.deliveryBranch))
     .join("; ");
   return { kind: "unresolvable", reason: `not_delivered: ${failed}` };
 }
