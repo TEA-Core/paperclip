@@ -687,6 +687,19 @@ describe.sequential("issue comment reopen routes", () => {
           }),
         }),
       );
+      // The done/cancelled reset prunes the retired-revision completedStageIds;
+      // that prune is audited exactly like the PATCH and auto-approve paths do
+      // (issue.execution_stage_ids_pruned).
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.execution_stage_ids_pruned",
+          details: expect.objectContaining({
+            issueId: "11111111-1111-4111-8111-111111111111",
+            droppedStageIds: ["00000000-0000-4000-8000-000000000001"],
+          }),
+        }),
+      );
 
       // AC4 follow-through: with executionState nulled, a re-delivery to
       // in_review arms the first live stage fresh — a participant is selected
@@ -734,6 +747,18 @@ describe.sequential("issue comment reopen routes", () => {
           }),
         }),
       );
+      // Same prune-audit parity as the done reopen: the retired completedStageIds
+      // are dropped and recorded via issue.execution_stage_ids_pruned.
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.execution_stage_ids_pruned",
+          details: expect.objectContaining({
+            issueId: "11111111-1111-4111-8111-111111111111",
+            droppedStageIds: ["00000000-0000-4000-8000-000000000001"],
+          }),
+        }),
+      );
     });
 
     it("reopens a blocked card via comment without writing executionState (transition returns an empty patch)", async () => {
@@ -757,6 +782,12 @@ describe.sequential("issue comment reopen routes", () => {
             status: "todo",
           }),
         }),
+      );
+      // Nothing is pruned for a blocked reopen (empty transition patch), so no
+      // execution_stage_ids_pruned audit row is written.
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.execution_stage_ids_pruned" }),
       );
     });
   });

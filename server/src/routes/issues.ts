@@ -13886,6 +13886,30 @@ export function issueRoutes(
       reopenFromStatus = reopened ? issue.status : null;
       currentIssue = reopenedIssue;
 
+      // Audit parity with the PATCH route and auto-approve path: the transition's
+      // done/cancelled reset prunes retired-revision stage ids out of the stale
+      // executionState; record that prune so the reopen is auditable (ADR-073 D4).
+      if (reopenTransition.droppedStageIds?.length) {
+        void logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "execution-stage-prune",
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+          action: "issue.execution_stage_ids_pruned",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            issueId: id,
+            droppedStageIds: reopenTransition.droppedStageIds,
+          },
+        }).catch((err) => {
+          logger.warn({ err, issueId: id }, "failed to write execution stage prune audit log");
+        });
+      }
+
       await logActivity(db, {
         companyId: currentIssue.companyId,
         actorType: actor.actorType,
