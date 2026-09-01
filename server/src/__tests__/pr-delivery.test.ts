@@ -316,4 +316,108 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     expect((await service.sweepMergeState()).checked).toBe(0);
     expect(resolve).toHaveBeenCalledTimes(5);
   });
+
+  it("recordAtOpen + recordCarrierFanOut never downgrade a merged row on re-delivery", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "merged",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+        mergedAt: "2026-08-31T17:26:58Z",
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+      })),
+    });
+    await service.recordAtOpen(input());
+    await service.refreshMergeState(input());
+
+    // Simulate a re-delivery: the live route re-records the open row on the
+    // source and the fan-out re-mirrors it onto the descendants.
+    await service.recordAtOpen(input());
+    await service.recordCarrierFanOut({
+      companyId,
+      sourceIssueId,
+      externalId: EXTERNAL_ID,
+      url: PR_URL,
+      title: `PR #${PR_NUMBER} ${REPOSITORY}`,
+      status: "ready_for_review",
+      reviewState: "none",
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY },
+    });
+
+    const rows = await readRows();
+    expect(rows).toHaveLength(5);
+    for (const row of rows) {
+      // A recorded merge must stay merged; the merge marker is not clobbered
+      // by the open-time reset (the false-`unknown` this card prevents).
+      expect(row.status).toBe("merged");
+      const metadata = row.metadata as Record<string, unknown>;
+      expect(metadata.mergedAt).toBe("2026-08-31T17:26:58Z");
+      expect(metadata.mergeCommitSha).toBe("3fc37fe91c6190ab695a651224ad057db0a38aba");
+    }
+  });
+
+  it("sweepMergeState continues past a row whose resolver throws", async () => {
+    let threwOnce = false;
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => {
+        if (!threwOnce) {
+          threwOnce = true;
+          throw new Error("transient GitHub API failure");
+        }
+        return {
+          state: "merged",
+          headRef: "carrier-branch",
+          headSha: "abc123",
+          mergedAt: "2026-08-31T17:26:58Z",
+          mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+        };
+      }),
+    });
+    await service.recordAtOpen(input());
+
+    const swept = await service.sweepMergeState();
+    // One row's resolution threw and was caught; the remaining four still
+    // flipped — the failure did not abort the sweep and strand later rows.
+    expect(swept.checked).toBe(5);
+    expect(swept.flipped).toBe(4);
+
+    const rows = await readRows();
+    expect(rows).toHaveLength(5);
+    expect(rows.filter((row) => row.status === "merged")).toHaveLength(4);
+    expect(rows.filter((row) => row.status === "ready_for_review")).toHaveLength(1);
+  });
+
+  it("carrier fan-out is scoped to the source issue's company", async () => {
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other Co",
+      issuePrefix: "OTH",
+      requireBoardApprovalForNewAgents: false,
+    });
+    // A descendant whose parent is the carrier source but that lives in a
+    // different company: it must NOT be part of the fan-out tree.
+    const outsiderId = randomUUID();
+    await db.insert(issues).values({
+      id: outsiderId,
+      companyId: otherCompanyId,
+      title: "Outsider child",
+      status: "done",
+      parentId: sourceIssueId,
+    });
+
+    const service = prDeliveryService(db);
+    const tree = await service.listCarrierIssueIds(companyId, sourceIssueId);
+    expect(tree).not.toContain(outsiderId);
+    expect(tree.sort()).toEqual([sourceIssueId, ...childIds].sort());
+
+    await service.recordAtOpen(input());
+    // Exactly the five in-company issues carry the row; the outsider got none.
+    const all = await db
+      .select()
+      .from(issueWorkProducts)
+      .where(eq(issueWorkProducts.externalId, EXTERNAL_ID));
+    expect(all).toHaveLength(5);
+    expect(all.every((row) => row.companyId === companyId)).toBe(true);
+  });
 });

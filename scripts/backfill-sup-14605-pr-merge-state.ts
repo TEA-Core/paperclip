@@ -37,12 +37,27 @@ function parseFlag(name: string, fallback: string | null = null): string | null 
 async function main() {
   const sourceIssueId = parseFlag("--source-issue", SUP_14605)!;
   const repository = parseFlag("--repository", "TEA-Core/Trading-Signal-Platform")!;
-  const prNumber = Number(parseFlag("--pr-number", "3417")!);
+  const prNumberRaw = parseFlag("--pr-number", "3417")!;
   const headRef = parseFlag("--head-ref", null);
   const baseRef = parseFlag("--base-ref", null);
   const headSha = parseFlag("--head-sha", null);
   const url = parseFlag("--url", PR_URL)!;
   const dryRun = process.argv.includes("--dry-run");
+
+  // Validate operator-supplied flags before touching the DB (SUP-14645): a bad
+  // --pr-number or --repository would otherwise silently write a malformed
+  // externalId / GitHub reference.
+  const prNumber = Number(prNumberRaw);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    console.error(`--pr-number must be a positive integer, got: ${prNumberRaw}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+$/.test(repository)) {
+    console.error(`--repository must be in owner/repo form, got: ${repository}`);
+    process.exitCode = 1;
+    return;
+  }
 
   const config = loadConfig();
   const dbUrl =

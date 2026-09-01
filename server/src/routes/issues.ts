@@ -9162,17 +9162,29 @@ export function issueRoutes(
     if (prDelivery) {
       // Carrier delivery: mirror the source row onto every descendant so each
       // issue owns its own `pull_request` work product (SUP-14645). A no-op when
-      // the source issue has no descendants.
-      await prDeliverySvc.recordCarrierFanOut({
-        companyId: issue.companyId,
-        sourceIssueId: issue.id,
-        externalId: prDelivery.externalId,
-        url: product.url,
-        title: product.title,
-        status: product.status,
-        reviewState: product.reviewState,
-        metadata: product.metadata,
-      });
+      // the source issue has no descendants. A fan-out failure must not reject
+      // the request after the source row is already written (partial state + a
+      // client 500); log it and keep the 201 — the source row is the
+      // load-bearing one, and the fan-out rows are repaired by the next
+      // delivery or the merge sweep.
+      try {
+        await prDeliverySvc.recordCarrierFanOut({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          externalId: prDelivery.externalId,
+          url: product.url,
+          title: product.title,
+          status: product.status,
+          reviewState: product.reviewState,
+          metadata: product.metadata,
+        });
+      } catch (error) {
+        console.warn(
+          `[pr-delivery] carrier fan-out failed for issue ${issue.id} (source row kept): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
     }
     await logActivity(db, {
       companyId: issue.companyId,

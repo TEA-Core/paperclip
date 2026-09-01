@@ -170,10 +170,10 @@ export function prDeliveryService(
               WITH RECURSIVE issue_tree(id) AS (
                 SELECT ${issues.id}
                 FROM ${issues}
-                WHERE ${issues.companyId} = ${companyId}
-                  AND ${issues.id} = ${sourceIssueId}
-                UNION ALL
-                SELECT child.id
+                 WHERE ${issues.companyId} = ${companyId}
+                   AND ${issues.id} = ${sourceIssueId}
+                 UNION
+                 SELECT child.id
                 FROM ${issues} child
                 JOIN issue_tree parent ON child.parent_id = parent.id
                 WHERE child.company_id = ${companyId}
@@ -218,15 +218,21 @@ export function prDeliveryService(
       for (const issueId of issueIds) {
         const existing = await findExistingRow(tx, issueId, externalId);
         if (existing) {
-          await tx
-            .update(issueWorkProducts)
-            .set({
-              status: "ready_for_review",
-              url: input.url,
-              metadata,
-              updatedAt: new Date(),
-            })
-            .where(eq(issueWorkProducts.id, existing.id));
+          // A re-delivery must not downgrade a recorded merge: resetting a
+          // merged row to ready_for_review would transiently flip the delivery
+          // predicate from merged_via_pr back to unknown (SUP-14645). Preserve
+          // merged rows; only refresh rows that are not yet merged.
+          if (existing.status !== "merged") {
+            await tx
+              .update(issueWorkProducts)
+              .set({
+                status: "ready_for_review",
+                url: input.url,
+                metadata,
+                updatedAt: new Date(),
+              })
+              .where(eq(issueWorkProducts.id, existing.id));
+          }
         } else {
           await tx.insert(issueWorkProducts).values({
             companyId: input.companyId,
@@ -312,15 +318,20 @@ export function prDeliveryService(
       for (const issueId of descendants) {
         const existing = await findExistingRow(tx, issueId, input.externalId);
         if (existing) {
-          await tx
-            .update(issueWorkProducts)
-            .set({
-              status: input.status,
-              url: input.url,
-              metadata,
-              updatedAt: new Date(),
-            })
-            .where(eq(issueWorkProducts.id, existing.id));
+          // Never downgrade a descendant's recorded merge on a re-fan (same
+          // rationale as recordAtOpen: a merged row must stay merged, not reset
+          // to the open-time status). Only refresh non-merged rows.
+          if (existing.status !== "merged") {
+            await tx
+              .update(issueWorkProducts)
+              .set({
+                status: input.status,
+                url: input.url,
+                metadata,
+                updatedAt: new Date(),
+              })
+              .where(eq(issueWorkProducts.id, existing.id));
+          }
         } else {
           await tx.insert(issueWorkProducts).values({
             companyId: input.companyId,
@@ -374,13 +385,32 @@ export function prDeliveryService(
           ne(issueWorkProducts.status, "merged"),
         ),
       )
+      // Resolve the longest-un-checked rows first (mergeStateCheckedAt lives in
+      // the metadata JSON; never-checked rows are NULL and sort first) so a
+      // fixed set of unresolvable rows cannot occupy the `limit` slot every
+      // tick and starve the rest of the fleet (SUP-14645).
+      .orderBy(sql`${issueWorkProducts.metadata} ->> 'mergeStateCheckedAt' ASC NULLS FIRST`)
       .limit(limit);
 
     let checked = 0;
     let flipped = 0;
     for (const row of rows) {
       const reference = referenceFromRow(row);
-      if (!reference) continue;
+      if (!reference) {
+        // Not a resolvable PR (no repository/prNumber metadata and no usable
+        // URL): stamp a check marker so it stops occupying a `limit` slot every
+        // tick and the rest of the fleet keeps making progress (SUP-14645).
+        await db
+          .update(issueWorkProducts)
+          .set({
+            metadata: {
+              ...((row.metadata as Record<string, unknown> | null) ?? {}),
+              mergeStateCheckedAt: new Date(now).toISOString(),
+            },
+          })
+          .where(eq(issueWorkProducts.id, row.id));
+        continue;
+      }
 
       const metadata = (row.metadata as Record<string, unknown> | null) ?? {};
       const lastCheckedAt =
@@ -390,24 +420,35 @@ export function prDeliveryService(
       }
 
       checked += 1;
-      const details = await resolvePullRequestDetails(row.companyId, reference);
-      const nextMetadata: Record<string, unknown> = {
-        ...metadata,
-        mergeStateCheckedAt: new Date(now).toISOString(),
-      };
-      if (details.state === "merged") {
-        if (details.mergedAt) nextMetadata.mergedAt = details.mergedAt;
-        if (details.mergeCommitSha) nextMetadata.mergeCommitSha = details.mergeCommitSha;
-        await db
-          .update(issueWorkProducts)
-          .set({ status: "merged", metadata: nextMetadata, updatedAt: new Date(now) })
-          .where(eq(issueWorkProducts.id, row.id));
-        flipped += 1;
-      } else {
-        await db
-          .update(issueWorkProducts)
-          .set({ metadata: nextMetadata })
-          .where(eq(issueWorkProducts.id, row.id));
+      try {
+        const details = await resolvePullRequestDetails(row.companyId, reference);
+        const nextMetadata: Record<string, unknown> = {
+          ...metadata,
+          mergeStateCheckedAt: new Date(now).toISOString(),
+        };
+        if (details.state === "merged") {
+          if (details.mergedAt) nextMetadata.mergedAt = details.mergedAt;
+          if (details.mergeCommitSha) nextMetadata.mergeCommitSha = details.mergeCommitSha;
+          await db
+            .update(issueWorkProducts)
+            .set({ status: "merged", metadata: nextMetadata, updatedAt: new Date(now) })
+            .where(eq(issueWorkProducts.id, row.id));
+          flipped += 1;
+        } else {
+          await db
+            .update(issueWorkProducts)
+            .set({ metadata: nextMetadata })
+            .where(eq(issueWorkProducts.id, row.id));
+        }
+      } catch (error) {
+        // One row failing to resolve must not abort the sweep: log it and keep
+        // processing the remaining rows this tick so later rows are not
+        // stranded until the next heartbeat (SUP-14645).
+        console.warn(
+          `[pr-delivery] sweep: failed to resolve PR for work product ${row.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       }
     }
 
