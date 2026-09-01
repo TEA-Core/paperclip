@@ -1,17 +1,20 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
   companies,
+  companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRelations,
   issues,
+  principalPermissionGrants,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -19,6 +22,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -51,8 +55,11 @@ describeEmbeddedPostgres("issue payload strictness", () => {
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -70,7 +77,7 @@ describeEmbeddedPostgres("issue payload strictness", () => {
         type: "board",
         userId: "board-user",
         companyIds: [companyId],
-        memberships: [{ companyId, membershipRole: "admin", status: "active" }],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
         isInstanceAdmin: false,
         source: "session",
       };
@@ -91,6 +98,23 @@ describeEmbeddedPostgres("issue payload strictness", () => {
       name: "Paperclip",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
+    });
+    // The fake board actor in createApp is only trusted for company-scoped
+    // writes; detail reads (GET /api/issues/:id) re-check membership against
+    // the DB, so the board user needs a real active membership row.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "board-user",
+      status: "active",
+      membershipRole: "owner",
+      updatedAt: new Date(),
+    });
+    await ensureHumanRoleDefaultGrants(db, {
+      companyId,
+      principalId: "board-user",
+      membershipRole: "owner",
+      grantedByUserId: null,
     });
     await db.insert(issues).values({
       id: blockerIssueId,
@@ -122,6 +146,22 @@ describeEmbeddedPostgres("issue payload strictness", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await blockerIdsFor(res.body.id)).toEqual([blockerIssueId]);
+  });
+
+  it("persists blockedByIssueIds when the issue is created born-blocked", async () => {
+    const { companyId, blockerIssueId } = await seedCompanyWithBlocker();
+
+    const res = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Born blocked", status: "blocked", blockedByIssueIds: [blockerIssueId] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.status).toBe("blocked");
+    expect(await blockerIdsFor(res.body.id)).toEqual([blockerIssueId]);
+
+    const readBack = await request(createApp(companyId)).get(`/api/issues/${res.body.id}`);
+    expect(readBack.status).toBe(200);
+    expect(readBack.body.blockedBy?.map((row: { id: string }) => row.id)).toEqual([blockerIssueId]);
   });
 
   it("rejects a misspelled blockedBy on create instead of dropping it", async () => {
@@ -175,5 +215,64 @@ describeEmbeddedPostgres("issue payload strictness", () => {
     expect(patched.body.details?.unknownBlockedByIssueIds).toEqual([missingId]);
     // The original edge survives a rejected update.
     expect(await blockerIdsFor(existing.body.id)).toEqual([blockerIssueId]);
+  });
+
+  it("rejects a born-blocked create with a nonexistent blocker and names the id", async () => {
+    const { companyId } = await seedCompanyWithBlocker();
+    const missingId = "00000000-0000-4000-8000-000000000000";
+
+    const res = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Born blocked, missing blocker", status: "blocked", blockedByIssueIds: [missingId] });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details?.unknownBlockedByIssueIds).toEqual([missingId]);
+    expect(await db.select().from(issues).where(eq(issues.title, "Born blocked, missing blocker"))).toHaveLength(0);
+  });
+
+  it("rejects a born-blocked create naming a blocker from another company", async () => {
+    const { companyId } = await seedCompanyWithBlocker();
+    const otherCompanyId = randomUUID();
+    const issuePrefix = `O${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const crossCompanyBlockerId = randomUUID();
+    await db.insert(issues).values({
+      id: crossCompanyBlockerId,
+      companyId: otherCompanyId,
+      title: "Foreign Blocker",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    // The blocker belongs to another company; naming it must 4xx, not create a
+    // cross-company edge or silently drop it.
+    const crossRes = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Cross company blocker", status: "blocked", blockedByIssueIds: [crossCompanyBlockerId] });
+
+    expect(crossRes.status).toBe(422);
+    expect(crossRes.body.details?.unknownBlockedByIssueIds).toEqual([crossCompanyBlockerId]);
+    expect(
+      await db.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.title, "Cross company blocker"))),
+    ).toHaveLength(0);
+  });
+
+  it("creates a born-blocked issue without a blocker array unchanged", async () => {
+    const { companyId } = await seedCompanyWithBlocker();
+
+    const res = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Blocked without blockers", status: "blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.status).toBe("blocked");
+    expect(await blockerIdsFor(res.body.id)).toEqual([]);
   });
 });

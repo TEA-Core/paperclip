@@ -22,6 +22,17 @@ export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION =
 export const WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_MESSAGE =
   `executionWorkspacePreference: "reuse_existing" requires executionWorkspaceId, and none was supplied or inherited. ${WORKSPACE_REUSE_REQUIRES_EXECUTION_WORKSPACE_REMEDIATION}`;
 
+export const WORKSPACE_PATH_HELD_CODE = "workspace_path_held_by_live_workspace";
+export const WORKSPACE_PATH_HELD_REMEDIATION =
+  "Archive the holding execution workspace (or release the source issue's binding to it) and retry the allocation.";
+
+export const WORKSPACE_CROSS_SOURCE_BINDING_CODE = "workspace_cross_source_binding";
+export const WORKSPACE_CROSS_SOURCE_BINDING_REMEDIATION =
+  "Bind only to a workspace sourced by the issue itself or a shared workspace; drop the binding to allocate a fresh workspace, or archive the sourced workspace first.";
+
+export const WORKSPACE_CROSS_SOURCE_BINDING_MESSAGE =
+  `An issue cannot be bound to an execution workspace sourced by a different issue. ${WORKSPACE_CROSS_SOURCE_BINDING_REMEDIATION}`;
+
 export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_CODE = "workspace_issue_override_disallowed";
 export const WORKSPACE_ISSUE_OVERRIDE_DISALLOWED_REMEDIATION =
   "Remove the issue's executionWorkspacePreference/executionWorkspaceId override, or set the project's executionWorkspacePolicy.allowIssueOverride to true.";
@@ -52,6 +63,9 @@ function parseExecutionWorkspaceStrategy(raw: unknown): ExecutionWorkspaceStrate
     type,
     ...(typeof parsed.baseRef === "string" ? { baseRef: parsed.baseRef } : {}),
     ...(typeof parsed.branchTemplate === "string" ? { branchTemplate: parsed.branchTemplate } : {}),
+    ...(typeof parsed.existingBranch === "string" && parsed.existingBranch.trim().length > 0
+      ? { existingBranch: parsed.existingBranch.trim() }
+      : {}),
     ...(typeof parsed.worktreeParentDir === "string" ? { worktreeParentDir: parsed.worktreeParentDir } : {}),
     ...(typeof parsed.provisionCommand === "string" ? { provisionCommand: parsed.provisionCommand } : {}),
     ...(typeof parsed.runtimeProvisionCommand === "string"
@@ -325,34 +339,65 @@ export function selectEnvironmentExecutionWorkspaceSettings(
 export type ExecutionWorkspaceEnvironmentSource =
   | "agent"
   | "instance"
-  | "default";
+  | "default"
+  | "managed";
 
 export type ExecutionWorkspaceEnvironmentResolution = {
   environmentId: string;
   source: ExecutionWorkspaceEnvironmentSource;
 };
 
+export class ManagedSandboxUnavailableError extends Error {
+  constructor() {
+    super(
+      "This instance runs agents only in its platform-managed sandbox environment " +
+        "(managed sandbox only), but no active managed sandbox environment exists — " +
+        "its provider plugin may be unavailable. Refusing to fall back to local execution.",
+    );
+    this.name = "ManagedSandboxUnavailableError";
+  }
+}
+
 export function resolveExecutionWorkspaceEnvironmentId(input: {
   agentDefaultEnvironmentId: string | null;
   instanceDefaultEnvironmentId: string | null;
   localDefaultEnvironmentId: string;
+  /**
+   * Managed-sandbox-only policy (`enableManagedSandboxOnly`): any selection
+   * that lands on the local environment is redirected to the managed
+   * sandbox environment instead, and with no managed environment available
+   * the resolution fails closed — never local. Non-local selections (ssh,
+   * user-created sandboxes) are untouched: the policy hides local, it does
+   * not forbid other environments.
+   */
+  managedSandboxOnly?: boolean;
+  managedSandboxEnvironmentId?: string | null;
 }): ExecutionWorkspaceEnvironmentResolution {
-  if (input.agentDefaultEnvironmentId) {
+  const resolved = ((): ExecutionWorkspaceEnvironmentResolution => {
+    if (input.agentDefaultEnvironmentId) {
+      return {
+        environmentId: input.agentDefaultEnvironmentId,
+        source: "agent",
+      };
+    }
+    if (input.instanceDefaultEnvironmentId) {
+      return {
+        environmentId: input.instanceDefaultEnvironmentId,
+        source: "instance",
+      };
+    }
     return {
-      environmentId: input.agentDefaultEnvironmentId,
-      source: "agent",
+      environmentId: input.localDefaultEnvironmentId,
+      source: "default",
     };
+  })();
+  if (input.managedSandboxOnly !== true || resolved.environmentId !== input.localDefaultEnvironmentId) {
+    return resolved;
   }
-  if (input.instanceDefaultEnvironmentId) {
-    return {
-      environmentId: input.instanceDefaultEnvironmentId,
-      source: "instance",
-    };
+  if (!input.managedSandboxEnvironmentId) {
+    throw new ManagedSandboxUnavailableError();
   }
-  return {
-    environmentId: input.localDefaultEnvironmentId,
-    source: "default",
-  };
+  return { environmentId: input.managedSandboxEnvironmentId, source: "managed" };
 }
 
 export function defaultIssueExecutionWorkspaceSettingsForProject(

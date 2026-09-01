@@ -72,6 +72,7 @@ const {
     reconcileStaleRecoveryActionWakes: vi.fn(async () => ({ reFired: 0, rerouted: 0, maxAttemptsReached: 0 })),
     reconcileUnfinalizableWorkspaceBarriers: vi.fn(async () => ({ reported: 0 })),
     ingestStaleInReviewChildIssues: vi.fn(async () => ({ archived: 0 })),
+    sweepPendingCleanupLeases: vi.fn(async () => ({ swept: 0, destroyed: 0, capped: 0 })),
     reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
     scanTerminableSilentActiveRuns: vi.fn(async () => ({
       scanned: 0,
@@ -125,6 +126,7 @@ const {
   };
   const feedbackServiceFactoryMock = vi.fn(() => feedbackExportServiceMock);
   const fakeServer = {
+    on: vi.fn().mockReturnThis(),
     once: vi.fn().mockReturnThis(),
     off: vi.fn().mockReturnThis(),
     listen: vi.fn((_port: number, _host: string, callback?: () => void) => {
@@ -215,20 +217,20 @@ vi.mock("detect-port", () => ({
   default: detectPortMock,
 }));
 
-vi.mock("@paperclipai/db", () => ({
-  createDb: createDbMock,
-  ensurePostgresDatabase: vi.fn(),
-  getPostgresDataDirectory: vi.fn(),
-  inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
-  applyPendingMigrations: vi.fn(),
-  reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
-  formatDatabaseBackupResult: vi.fn(() => "ok"),
-  runDatabaseBackup: vi.fn(),
-  authUsers: {},
-  companies: {},
-  companyMemberships: {},
-  instanceUserRoles: {},
-}));
+vi.mock("@paperclipai/db", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@paperclipai/db")>();
+  return {
+    ...actual,
+    createDb: createDbMock,
+    ensurePostgresDatabase: vi.fn(),
+    getPostgresDataDirectory: vi.fn(),
+    inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
+    applyPendingMigrations: vi.fn(),
+    reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
+    formatDatabaseBackupResult: vi.fn(() => "ok"),
+    runDatabaseBackup: vi.fn(),
+  };
+});
 
 vi.mock("../app.js", () => ({
   createApp: createAppMock,
@@ -276,6 +278,38 @@ vi.mock("../services/index.js", () => ({
   decisionRetentionService: vi.fn(() => ({
     autoArchive: vi.fn(async () => 0),
     deliverNotifications: vi.fn(async () => ({ notifiedAgents: 0, delivered: 0 })),
+  })),
+  createCarrierPromotionSweepService: vi.fn(() => ({
+    sweep: vi.fn(async () => ({
+      due: false,
+      candidates: 0,
+      promoted: 0,
+      alreadyReady: 0,
+      blocked: 0,
+      noTrigger: 0,
+      failed: 0,
+    })),
+  })),
+  createCarrierOrphanJanitorService: vi.fn(() => ({
+    sweep: vi.fn(async () => ({
+      due: false,
+      candidates: 0,
+      skippedNonTerminalTree: 0,
+      stranded: 0,
+      alreadyClosed: 0,
+      closed: 0,
+      failed: 0,
+    })),
+  })),
+  createCarrierStrandedSurfaceService: vi.fn(() => ({
+    sweep: vi.fn(async () => ({
+      due: false,
+      candidates: 0,
+      surfaced: 0,
+      alreadySurfaced: 0,
+      prNotOpen: 0,
+      failed: 0,
+    })),
   })),
   createDoneCloseLandingBackstopService: vi.fn(() => ({
     sweep: vi.fn(async () => ({ due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0 })),
@@ -327,6 +361,18 @@ vi.mock("../services/index.js", () => ({
       checked: 0,
       healthy: 0,
       needsAttention: 0,
+      failed: 0,
+    })),
+  })),
+}));
+
+vi.mock("../services/question-response-delivery.js", () => ({
+  questionResponseDeliveryService: vi.fn(() => ({
+    sweepPending: vi.fn(async () => ({
+      scanned: 0,
+      steered: 0,
+      coalesced: 0,
+      wakeFallback: 0,
       failed: 0,
     })),
   })),
@@ -565,7 +611,11 @@ describe("startServer feedback export wiring", () => {
     try {
       await startServer();
 
-      expect(heartbeatServiceFactoryMock).not.toHaveBeenCalled();
+      // The disabled path still creates one heartbeat runtime. This runtime owns
+      // the orphan-sandbox cleanup sweep, so a leaked provider sandbox is still
+      // reaped at startup and on the interval.
+      expect(heartbeatServiceFactoryMock).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.sweepPendingCleanupLeases).toHaveBeenCalled();
       expect(intervalCallback).not.toBeNull();
       intervalCallback?.();
       await Promise.resolve();
@@ -736,7 +786,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     );
   });
 
-  it("rewrites explicit-port auth public URLs when detect-port selects a new port", async () => {
+  it("preserves explicit-port external auth public URLs when detect-port selects a new port", async () => {
     loadConfigMock.mockReturnValueOnce(buildTestConfig({
       port: 3100,
       authBaseUrlMode: "explicit",
@@ -746,9 +796,12 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     const started = await startServer();
 
+    // The server listens internally on 3110, but an explicit *external* base URL must keep
+    // its advertised port. Rewriting it to the internal listen port produced an unreachable
+    // URL that leaked to spawned agents as a dead PAPERCLIP_API_URL. (BRO-1558)
     expect(started.listenPort).toBe(3110);
-    expect(started.apiUrl).toBe("http://my-host.ts.net:3110");
-    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://my-host.ts.net:3110");
+    expect(started.apiUrl).toBe("http://my-host.ts.net:3100");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://my-host.ts.net:3100");
   });
 
   it("keeps no-port auth public URLs stable when detect-port selects a new port", async () => {

@@ -114,6 +114,35 @@ Code state moves between runs through the local execution-workspace cwd alone �
 
 The invariant is enforced by the "no-remote-git contract" case in `packages/adapter-utils/src/ssh-fixture.test.ts`, which asserts a remote-only commit reaches the local worktree with no remote configured at any point.
 
+## Base repository drift
+
+The base repository — `<project workspace cwd>`, the clone that holds `.paperclip/worktrees` — is nobody's workspace. Worktrees are cut from `origin/<base ref>`, never from its HEAD, so its working tree is used by hygiene and by provisioning, and by nothing else.
+
+Agents nonetheless leave files in it. Its path is exported as both `PAPERCLIP_WORKSPACE_BASE_CWD` and `PAPERCLIP_WORKSPACE_REPO_ROOT`, so any main-branch errand has exactly one home. Those leftovers are harmless while they stay untracked and unique. One becomes a wedge the moment its path collides with the base ref — the same path landing upstream, a file where the base ref grew a directory, or a file written under a path the base ref holds as a file. `git merge --ff-only` refuses all three, and refuses identically on every later dispatch.
+
+Hygiene clears that case on its own. Before fast-forwarding, it moves the conflicting untracked paths into `<git dir>/paperclip-base-repo-quarantine/<timestamp>/` and records them on the `worktree_prepare` operation. Files are moved, never deleted, and nothing under `.paperclip` is ever eligible — the live agent worktrees are there.
+
+**The fast-forward is attempted once per dispatch, after the quarantine — never retried.** The conflicts are resolved before the merge runs rather than in response to it refusing, so there is nothing to retry. Anything the quarantine could not clear leaves that dispatch's fast-forward refused, and the next dispatch tries again from the beginning.
+
+One quarantine moves at most 200 paths. Every untracked path is inspected, so the cap never hides a conflict; it only bounds a single bulk move. A base repo with more than 200 conflicting paths does not fast-forward that dispatch, and the operation's `metadata.quarantinedUntrackedPaths` names what was moved. Reaching the cap at all means something is wrong with that checkout, and it needs an operator rather than another dispatch.
+
+What is left behind is recorded rather than acted on, on the same operation: `metadata.untrackedBaseRepoPathCount` is the total, and `metadata.untrackedBaseRepoPaths` is **a sample of the first 50 names, not the whole list**. Sort on the count — `jsonb_array_length` of the sample tops out at 50 and would rank the worst checkouts level with the merely untidy ones.
+
+```sql
+select cwd,
+       (metadata->>'untrackedBaseRepoPathCount')::int as untracked,
+       metadata->'untrackedBaseRepoPaths' as sample
+from workspace_operations
+where phase = 'worktree_prepare'
+  and metadata ? 'untrackedBaseRepoPathCount'
+  and started_at > now() - interval '1 day'
+order by untracked desc;
+```
+
+A checkout whose untracked listing is too large to read at all reports neither field: hygiene declines to move anything on a listing it cannot read in full, warns, and leaves the fast-forward to refuse on its own. Partial knowledge here is worse than none — it would move some files while leaving the blocking one in place.
+
+Anything that appears there is a file an agent wrote to a shared checkout. Deleting it is safe once you know which run produced it; leaving it is safe until its path ships upstream.
+
 ## Current implementation guarantees
 
 With the current implementation:

@@ -26,9 +26,11 @@ import {
   preflightLowTrustWorkspaceIsolation,
   prioritizeProjectWorkspaceCandidatesForRun,
   parseSessionCompactionPolicy,
+  projectExecutionWorkspaceForSessionCategory,
   provisionExecutionWorkspaceForFreshnessDecision,
   readRuntimeStateSessionParams,
   reconcileReusedExecutionWorkspaceProjectWorkspaceId,
+  resolveExecutionWorkspaceBranchOwnership,
   resolveExecutionWorkspaceConfigFreshness,
   readExecutionWorkspaceOccupancyDeferrals,
   resolveExecutionWorkspaceOccupancyDecision,
@@ -43,8 +45,6 @@ import {
   shouldDeferFollowupWakeForSameIssue,
   stripHostWorkspaceProvisionForLowTrustSandbox,
   stripWorkspaceRuntimeFromExecutionRunConfig,
-  shouldResetTaskSessionForModelChange,
-  stripConfiguredModelFromSessionParams,
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
@@ -1347,11 +1347,54 @@ describe("applyPersistedExecutionWorkspaceConfig", () => {
 });
 
 describe("mergeExecutionWorkspaceMetadataForPersistence", () => {
+  it("persists branch ownership independently of fresh worktree creation", () => {
+    const executionWorkspace = {
+      created: true,
+      branchCreatedByRuntime: false,
+    };
+
+    const metadata = mergeExecutionWorkspaceMetadataForPersistence({
+      existingMetadata: null,
+      source: "task_session",
+      createdByRuntime: resolveExecutionWorkspaceBranchOwnership(executionWorkspace),
+      strategyType: "git_worktree",
+      configSnapshot: null,
+      shouldReuseExisting: false,
+      baseRef: "origin/main",
+      baseRefSha: null,
+    });
+
+    expect(metadata.createdByRuntime).toBe(false);
+    expect(metadata.gitBranchOwnershipVersion).toBe(1);
+  });
+
+  it("does not downgrade recorded runtime ownership after worktree reuse", () => {
+    const executionWorkspace = {
+      created: false,
+      branchCreatedByRuntime: true,
+    };
+
+    const metadata = mergeExecutionWorkspaceMetadataForPersistence({
+      existingMetadata: { createdByRuntime: true },
+      source: "task_session",
+      createdByRuntime: resolveExecutionWorkspaceBranchOwnership(executionWorkspace),
+      strategyType: "git_worktree",
+      configSnapshot: null,
+      shouldReuseExisting: false,
+      baseRef: "origin/main",
+      baseRefSha: null,
+    });
+
+    expect(metadata.createdByRuntime).toBe(true);
+    expect(metadata.gitBranchOwnershipVersion).toBe(1);
+  });
+
   it("merges config snapshot for newly realized workspaces", () => {
     expect(mergeExecutionWorkspaceMetadataForPersistence({
       existingMetadata: null,
       source: "task_session",
       createdByRuntime: true,
+      strategyType: "project_primary",
       configSnapshot: {
         environmentId: "env-new",
         provisionCommand: "bash ./scripts/provision.sh",
@@ -1385,6 +1428,7 @@ describe("mergeExecutionWorkspaceMetadataForPersistence", () => {
       },
       source: "task_session",
       createdByRuntime: false,
+      strategyType: "project_primary",
       configSnapshot: {
         environmentId: "env-new",
         provisionCommand: "bash ./scripts/new-provision.sh",
@@ -1407,6 +1451,7 @@ describe("mergeExecutionWorkspaceMetadataForPersistence", () => {
       existingMetadata: null,
       source: "task_session",
       createdByRuntime: true,
+      strategyType: "project_primary",
       configSnapshot: null,
       shouldReuseExisting: false,
       baseRef: "origin/main",
@@ -1532,6 +1577,7 @@ describe("effective run execution workspace config freshness", () => {
       },
       source: "task_session",
       createdByRuntime: false,
+      strategyType: "project_primary",
       configSnapshot: {
         workspaceRuntime: {
           services: [{ name: "web", command: "pnpm dev -- --host 0.0.0.0", port: 3200 }],
@@ -1663,6 +1709,7 @@ describe("effective run execution workspace config freshness", () => {
       },
       source: "task_session",
       createdByRuntime: false,
+      strategyType: "project_primary",
       configSnapshot: {
         provisionCommand: "pnpm install --frozen-lockfile",
       },
@@ -1878,6 +1925,69 @@ describe("effective run execution workspace config freshness", () => {
     expect(reuseRequest.bindingUnrestorable).toBe(false);
     expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(true);
     expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+  });
+
+  it.each([
+    { name: "a different branch", branchName: "PAP-9001-derived-child-branch" },
+    { name: "no recorded branch", branchName: null },
+  ])(
+    "realizes the pinned existing branch instead of reusing an inherited workspace on $name",
+    async ({ branchName }) => {
+      const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+        issueExecutionWorkspaceId: "workspace-old",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: "active",
+        requestedExistingBranch: "PAP-14380-salvage-pap-9514",
+        existingExecutionWorkspaceBranchName: branchName,
+      });
+
+      expect(reuseRequest).toEqual({
+        requestedExecutionWorkspaceId: "workspace-old",
+        requestedShouldReuseExisting: false,
+        existingExecutionWorkspaceAvailable: false,
+        // Fork-only field: a pinned-branch mismatch is a deliberate re-realize,
+        // not an unrestorable binding.
+        bindingUnrestorable: false,
+      });
+
+      const metadata = buildWorkspaceConfigMetadata();
+      const decision = resolveExecutionWorkspaceConfigFreshness({
+        hasExistingWorkspace: false,
+        existingWorkspaceMetadata: null,
+        nextMetadata: metadata,
+      });
+      const realizeWorkspace = vi.fn(async () => ({ id: "pinned-branch-workspace", warnings: [] }));
+      const restoreExistingWorkspace = vi.fn(async () => ({ id: "workspace-old", warnings: [] }));
+
+      const result = await provisionExecutionWorkspaceForFreshnessDecision({
+        requestedShouldReuseExisting: reuseRequest.requestedShouldReuseExisting,
+        existingExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
+        issueRef: { id: "issue-1", identifier: "PAP-42" },
+        runId: "run-1",
+        workspaceConfigFreshness: decision,
+        restoreExistingWorkspace,
+        realizeWorkspace,
+      });
+
+      expect(result.executionWorkspace).toEqual({ id: "pinned-branch-workspace", warnings: [] });
+      expect(result.reusedExecutionWorkspace).toBeNull();
+      expect(restoreExistingWorkspace).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps reusing an inherited workspace whose branch matches the pinned existing branch", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      requestedExistingBranch: "PAP-14380-salvage-pap-9514",
+      existingExecutionWorkspaceBranchName: "PAP-14380-salvage-pap-9514",
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-old",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+      bindingUnrestorable: false,
+    });
   });
 
   it("fails loudly when explicit reuse restore returns no workspace", async () => {
@@ -2098,16 +2208,16 @@ describe("shouldResetTaskSessionForWake", () => {
     expect(shouldResetTaskSessionForWake({ wakeReason: "issue_assigned" })).toBe(true);
   });
 
-  it("resets session context on execution review wakes", () => {
-    expect(shouldResetTaskSessionForWake({ wakeReason: "execution_review_requested" })).toBe(true);
+  it("preserves session context on execution review handoff wakes", () => {
+    expect(shouldResetTaskSessionForWake({ wakeReason: "execution_review_requested" })).toBe(false);
   });
 
   it("resets session context on execution approval wakes", () => {
     expect(shouldResetTaskSessionForWake({ wakeReason: "execution_approval_requested" })).toBe(true);
   });
 
-  it("resets session context on execution changes-requested wakes", () => {
-    expect(shouldResetTaskSessionForWake({ wakeReason: "execution_changes_requested" })).toBe(true);
+  it("preserves session context on execution changes-requested handoff wakes", () => {
+    expect(shouldResetTaskSessionForWake({ wakeReason: "execution_changes_requested" })).toBe(false);
   });
 
   it("preserves session context on timer heartbeats", () => {
@@ -2227,64 +2337,6 @@ describe("shouldDeferFollowupWakeForSameIssue", () => {
   });
 });
 
-describe("shouldResetTaskSessionForModelChange", () => {
-  it("resets when configured model differs from persisted session model", () => {
-    expect(
-      shouldResetTaskSessionForModelChange({
-        configuredModel: "gpt-5.4-mini",
-        taskSessionParams: {
-          sessionId: "thread-1",
-          __paperclipConfiguredModel: "opencode/mimo-v2-pro-free",
-        },
-      }),
-    ).toBe(true);
-  });
-
-  it("does not reset when models match", () => {
-    expect(
-      shouldResetTaskSessionForModelChange({
-        configuredModel: "gpt-5.4-mini",
-        taskSessionParams: {
-          sessionId: "thread-1",
-          __paperclipConfiguredModel: "gpt-5.4-mini",
-        },
-      }),
-    ).toBe(false);
-  });
-
-  it("does not reset when persisted session model is missing", () => {
-    expect(
-      shouldResetTaskSessionForModelChange({
-        configuredModel: "gpt-5.4-mini",
-        taskSessionParams: {
-          sessionId: "thread-1",
-        },
-      }),
-    ).toBe(false);
-  });
-
-  it("does not reset when configured model is missing", () => {
-    expect(
-      shouldResetTaskSessionForModelChange({
-        configuredModel: null,
-        taskSessionParams: {
-          sessionId: "thread-1",
-          __paperclipConfiguredModel: "gpt-5.4-mini",
-        },
-      }),
-    ).toBe(false);
-  });
-
-  it("does not reset when task session params are missing", () => {
-    expect(
-      shouldResetTaskSessionForModelChange({
-        configuredModel: "gpt-5.4-mini",
-        taskSessionParams: null,
-      }),
-    ).toBe(false);
-  });
-});
-
 type SessionConfigMetadata = Awaited<ReturnType<typeof buildEffectiveRunSessionConfigMetadata>>;
 
 async function buildSessionConfigMetadata(
@@ -2305,7 +2357,6 @@ async function buildSessionConfigMetadata(
         maxConcurrentRuns: 1,
       },
     },
-    modelProfile: null,
     issueOverrides: null,
     workspaceConfig: {
       requestedMode: "agent_default",
@@ -2387,7 +2438,6 @@ describe("effective run session config freshness", () => {
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
       taskSessionParams: sessionParamsWithConfigMetadata(base),
       configMetadata: next,
     });
@@ -2399,20 +2449,119 @@ describe("effective run session config freshness", () => {
     expect(decision.reasons.join("\n")).toContain("adapter config");
   });
 
-  it("keeps model-only compatibility as an additional reset reason", async () => {
-    const base = await buildSessionConfigMetadata();
+  it("preserves the session on a pure model swap across profile flips (SUP-13734)", async () => {
+    const base = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: {
+        command: "codex",
+        model: "claude-opus-5",
+        reasoningEffort: "high",
+        env: {
+          OPENAI_API_KEY: "resolved-secret-value",
+          PLAIN_FLAG: "plain-value",
+        },
+      },
+    });
+    const next = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: {
+        command: "codex",
+        model: "claude-sonnet-5",
+        reasoningEffort: "low",
+        variant: "low",
+        env: {
+          OPENAI_API_KEY: "resolved-secret-value",
+          PLAIN_FLAG: "plain-value",
+        },
+      },
+    });
+
+    expect(next.fingerprint).toBe(base.fingerprint);
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
-      taskSessionParams: sessionParamsWithConfigMetadata(base, "opencode/mimo-v2-pro-free"),
-      configMetadata: base,
+      taskSessionParams: sessionParamsWithConfigMetadata(base, "claude-opus-5"),
+      configMetadata: next,
     });
 
-    expect(decision.reset).toBe(true);
-    expect(decision.reasons).toEqual([
-      'configured model changed from "opencode/mimo-v2-pro-free" to "gpt-5.4-mini"',
-    ]);
+    expect(decision.reset).toBe(false);
+    expect(decision.changedCategories).toEqual([]);
+    expect(decision.reasons).toEqual([]);
+  });
+
+  it("does not reset for issue comment timestamps but still resets for workspace settings", async () => {
+    const base = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "agent_default",
+        effectiveMode: "agent_default",
+        issueConfigRevisionAt: "2026-06-01T00:00:00.000Z",
+        issueSettings: null,
+      },
+    });
+    const commentOnly = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "agent_default",
+        effectiveMode: "agent_default",
+        issueConfigRevisionAt: "2026-06-01T00:05:00.000Z",
+        issueSettings: null,
+      },
+    });
+    const workspaceChanged = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "isolated_workspace",
+        effectiveMode: "isolated_workspace",
+        issueConfigRevisionAt: "2026-06-01T00:05:00.000Z",
+        issueSettings: { mode: "isolated_workspace" },
+      },
+    });
+
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: commentOnly,
+      }),
+    ).toMatchObject({
+      reset: false,
+      changedCategories: [],
+      reasons: [],
+    });
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: workspaceChanged,
+      }),
+    ).toMatchObject({
+      reset: true,
+      changedCategories: ["workspaceConfig"],
+    });
+  });
+
+  it("still rotates the session when a non-model adapter config key changes", async () => {
+    const base = await buildSessionConfigMetadata();
+    const next = await buildSessionConfigMetadata({
+      effectiveAdapterConfig: {
+        command: "codex",
+        model: "gpt-5.4-mini",
+        extraArgs: ["--strict"],
+        env: {
+          OPENAI_API_KEY: "resolved-secret-value",
+          PLAIN_FLAG: "plain-value",
+        },
+      },
+    });
+
+    const decision = resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      taskSessionParams: sessionParamsWithConfigMetadata(base),
+      configMetadata: next,
+    });
+
+    expect(decision).toMatchObject({
+      reset: true,
+      changedCategories: ["adapterConfig"],
+    });
   });
 
   it("freshens legacy task sessions that lack versioned config metadata", async () => {
@@ -2420,7 +2569,6 @@ describe("effective run session config freshness", () => {
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
       taskSessionParams: {
         sessionId: "thread-1",
         __paperclipConfiguredModel: "gpt-5.4-mini",
@@ -2439,7 +2587,6 @@ describe("effective run session config freshness", () => {
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
       taskSessionParams: persistedParams,
       configMetadata: metadata,
     });
@@ -2453,7 +2600,6 @@ describe("effective run session config freshness", () => {
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
       taskSessionParams: {
         sessionId: "thread-1",
         __paperclipConfiguredModel: "gpt-5.4-mini",
@@ -2467,24 +2613,13 @@ describe("effective run session config freshness", () => {
     expect(decision.reasons).toEqual([]);
   });
 
-  it("names safe categories for model profile, issue override, env, secret, and runtime skill drift", async () => {
+  it("names safe categories for issue override, env, secret, and runtime skill drift", async () => {
     const base = await buildSessionConfigMetadata();
     const cases: Array<{
       name: string;
       category: string;
       metadata: SessionConfigMetadata;
     }> = [
-      {
-        name: "model profile",
-        category: "modelProfile",
-        metadata: await buildSessionConfigMetadata({
-          modelProfile: {
-            requested: "cheap",
-            applied: true,
-            configSource: "agent_runtime",
-          },
-        }),
-      },
       {
         name: "issue overrides",
         category: "issueOverrides",
@@ -2546,7 +2681,6 @@ describe("effective run session config freshness", () => {
     for (const testCase of cases) {
       const decision = resolveTaskSessionConfigFreshness({
         hasTaskSession: true,
-        configuredModel: "gpt-5.4-mini",
         taskSessionParams: sessionParamsWithConfigMetadata(base),
         configMetadata: testCase.metadata,
       });
@@ -2584,7 +2718,6 @@ describe("effective run session config freshness", () => {
 
     const decision = resolveTaskSessionConfigFreshness({
       hasTaskSession: true,
-      configuredModel: "gpt-5.4-mini",
       taskSessionParams: sessionParamsWithConfigMetadata(base),
       configMetadata: next,
     });
@@ -2623,39 +2756,6 @@ describe("effective run session config freshness", () => {
     expect(canonical).not.toContain("plain-value");
     expect(canonical).not.toContain("enabled");
     expect(canonical).not.toContain("openai-api-key");
-  });
-});
-
-describe("stripConfiguredModelFromSessionParams", () => {
-  it("removes the internal model key from persisted session params", () => {
-    expect(
-      stripConfiguredModelFromSessionParams({
-        sessionId: "thread-1",
-        __paperclipConfiguredModel: "gpt-5.4-mini",
-      }),
-    ).toEqual({ sessionId: "thread-1" });
-  });
-
-  it("returns null when session params are missing", () => {
-    expect(stripConfiguredModelFromSessionParams(null)).toBeNull();
-    expect(stripConfiguredModelFromSessionParams(undefined)).toBeNull();
-  });
-
-  it("returns a copy without mutating the input", () => {
-    const input = { sessionId: "thread-1", __paperclipConfiguredModel: "gpt-5.4-mini" };
-    const result = stripConfiguredModelFromSessionParams(input);
-    expect(result).not.toBe(input);
-    expect(input.__paperclipConfiguredModel).toBe("gpt-5.4-mini");
-  });
-
-  it("returns an empty object when only the internal model key is present (caller must normalize)", () => {
-    const stripped = stripConfiguredModelFromSessionParams({
-      __paperclipConfiguredModel: "gpt-5.4-mini",
-    });
-    expect(stripped).toEqual({});
-    // Callers that forward params to adapters must normalize {} back to null so
-    // the pre-PR null contract is preserved (adapters distinguishing {} from null).
-    expect(normalizeSessionParams(stripped)).toBeNull();
   });
 });
 
@@ -3302,32 +3402,48 @@ describe("reconcileReusedExecutionWorkspaceProjectWorkspaceId", () => {
   });
 });
 
-describe("SUP-13585 session workspaceConfig category — resumability, not row churn", () => {
-  const baseInput = {
-    requestedMode: "isolated_workspace",
-    effectiveMode: "isolated_workspace",
-    issueContext: {
+describe("SUP-13585 / SUP-13733 session workspaceConfig category — resumability, not row churn", () => {
+  const baseExistingWorkspace = {
+    id: "ew-row-1",
+    mode: "isolated_workspace",
+    strategyType: "git_worktree",
+    projectWorkspaceId: "pw-1",
+    repoUrl: "https://github.com/TEA-Core/Trading-Signal-Platform",
+    baseRef: "origin/main",
+    branchName: "SUP-1-x",
+    config: { provisionCommand: "bash ./scripts/provision-worktree.sh" },
+    updatedAt: new Date("2026-08-20T10:00:00.000Z"),
+    lastUsedAt: new Date("2026-08-20T10:00:00.000Z"),
+  };
+
+  function baseIssueContext(overrides?: Record<string, unknown>) {
+    return {
       projectId: "project-1",
       projectWorkspaceId: "pw-1",
-      executionWorkspaceId: "ew-1",
-      executionWorkspacePreference: "isolated_workspace",
+      executionWorkspacePreference: "reuse_existing",
       executionWorkspaceSettings: { mode: "isolated_workspace" },
       // Deliberately present: a caller passing the whole issue row must not leak these
       // into the hash. Touching an issue is not a reason to drop its agent's session.
       updatedAt: new Date("2026-08-20T10:00:00.000Z"),
       status: "in_progress",
       title: "before",
-    },
+      ...overrides,
+    };
+  }
+
+  const baseInput = {
+    requestedMode: "isolated_workspace",
+    effectiveMode: "isolated_workspace",
+    issueContext: baseIssueContext(),
     projectContext: {
       id: "project-1",
-      executionWorkspacePolicy: { allowIsolated: true },
+      executionWorkspacePolicy: { allowIsolated: true, workspaceStrategy: { type: "git_worktree" } },
       updatedAt: new Date("2026-08-20T10:00:00.000Z"),
       env: { PROJECT_FLAG: "enabled" },
     },
-    projectPolicy: { allowIsolated: true },
+    projectPolicy: { allowIsolated: true, workspaceStrategy: { type: "git_worktree" } },
     issueSettings: { mode: "isolated_workspace" },
-    reusableExecutionWorkspaceConfig: null,
-    existingExecutionWorkspace: { id: "ew-1", branchName: "SUP-1-x", baseRef: "origin/main" },
+    existingExecutionWorkspace: projectExecutionWorkspaceForSessionCategory(baseExistingWorkspace as Parameters<typeof projectExecutionWorkspaceForSessionCategory>[0]),
   };
 
   const fingerprintOf = async (input: Parameters<typeof buildSessionWorkspaceConfigCategoryValue>[0]) => {
@@ -3343,8 +3459,6 @@ describe("SUP-13585 session workspaceConfig category — resumability, not row c
       ...baseInput,
       issueContext: {
         ...baseInput.issueContext,
-        // The agent writing its own issue while it works: status flip, retitle, new
-        // updatedAt. None of it changes whether the saved session is still usable.
         updatedAt: new Date("2026-08-20T11:30:00.000Z"),
         status: "in_review",
         title: "after",
@@ -3360,7 +3474,6 @@ describe("SUP-13585 session workspaceConfig category — resumability, not row c
 
   it.each([
     ["projectWorkspaceId", { projectWorkspaceId: "pw-2" }],
-    ["executionWorkspaceId", { executionWorkspaceId: "ew-2" }],
     ["executionWorkspacePreference", { executionWorkspacePreference: "shared_workspace" }],
     ["executionWorkspaceSettings", { executionWorkspaceSettings: { mode: "shared_workspace" } }],
     ["projectId", { projectId: "project-2" }],
@@ -3387,13 +3500,51 @@ describe("SUP-13585 session workspaceConfig category — resumability, not row c
   it.each([
     ["requested mode", { requestedMode: "shared_workspace" }],
     ["effective mode", { effectiveMode: "shared_workspace" }],
-    ["existing workspace branch", { existingExecutionWorkspace: { id: "ew-1", branchName: "other", baseRef: "origin/main" } }],
-    ["existing workspace base ref", { existingExecutionWorkspace: { id: "ew-1", branchName: "SUP-1-x", baseRef: "origin/other" } }],
-  ])("still rotates on a workspace identity change: %s", async (_label, patch) => {
+    ["workspace repo url", { existingExecutionWorkspace: { ...baseInput.existingExecutionWorkspace, repoUrl: "https://github.com/other/repo" } }],
+    ["workspace branch", { existingExecutionWorkspace: { ...baseInput.existingExecutionWorkspace, branchName: "other" } }],
+    ["workspace base ref", { existingExecutionWorkspace: { ...baseInput.existingExecutionWorkspace, baseRef: "origin/other" } }],
+  ])("still rotates on a genuine workspace config change: %s", async (_label, patch) => {
     const before = await fingerprintOf(baseInput);
     const after = await fingerprintOf({ ...baseInput, ...patch });
 
     expect(after).not.toBe(before);
+  });
+
+  it("does not rotate when the same workspace is re-read with updated row timestamps", async () => {
+    const before = await fingerprintOf(baseInput);
+    const reReadWorkspace = {
+      ...baseExistingWorkspace,
+      updatedAt: new Date("2026-08-20T11:30:00.000Z"),
+      lastUsedAt: new Date("2026-08-20T11:30:00.000Z"),
+    };
+    const after = await fingerprintOf({
+      ...baseInput,
+      existingExecutionWorkspace: projectExecutionWorkspaceForSessionCategory(reReadWorkspace as Parameters<typeof projectExecutionWorkspaceForSessionCategory>[0]),
+    });
+
+    expect(after).toBe(before);
+  });
+
+  it("does not rotate when the issue is re-attached to a different workspace row with the same config", async () => {
+    const before = await fingerprintOf(baseInput);
+    const reattachedWorkspace = {
+      ...baseExistingWorkspace,
+      id: "ew-row-2",
+      updatedAt: new Date("2026-08-20T11:30:00.000Z"),
+      lastUsedAt: new Date("2026-08-20T11:30:00.000Z"),
+    };
+    const after = await fingerprintOf({
+      ...baseInput,
+      issueContext: {
+        ...baseInput.issueContext,
+        // The issue's executionWorkspaceId changed (cc352dbd -> 7eddf776 in the live case),
+        // but that is attach-state noise, not a workspace-config change.
+        executionWorkspaceId: "ew-row-2",
+      },
+      existingExecutionWorkspace: projectExecutionWorkspaceForSessionCategory(reattachedWorkspace as Parameters<typeof projectExecutionWorkspaceForSessionCategory>[0]),
+    });
+
+    expect(after).toBe(before);
   });
 
   it("distinguishes an issueless run from an issue-bearing one", async () => {

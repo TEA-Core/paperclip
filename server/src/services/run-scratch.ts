@@ -1,3 +1,4 @@
+import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +16,17 @@ export interface HeartbeatRunScratchMetadata {
   createdAt: string;
 }
 
+/**
+ * A scratch directory found on disk, paired with the marker that identifies the
+ * run that owns it. The reaper works from these rather than from in-memory
+ * state, which is the entire point: the leak that motivated SUP-13949 outlived
+ * the server process that created it.
+ */
+export interface DiscoveredRunScratch {
+  dir: string;
+  metadata: HeartbeatRunScratchMetadata;
+}
+
 export interface HeartbeatRunScratch {
   dir: string;
   markerPath: string;
@@ -27,8 +39,38 @@ export interface HeartbeatRunScratchEnvResult {
 }
 
 export type HeartbeatRunScratchCleanupResult =
-  | { removed: true; dir: string }
-  | { removed: false; dir: string; reason: "missing" | "unmarked" | "owner_mismatch" | "process_group_alive" };
+  | { removed: true; dir: string; terminatedProcessGroup?: RunScratchTerminationOutcome }
+  | {
+    removed: false;
+    dir: string;
+    reason: "missing" | "unmarked" | "owner_mismatch" | "process_group_alive" | "process_group_survived";
+    terminatedProcessGroup?: RunScratchTerminationOutcome;
+  };
+
+/**
+ * SUP-13949: what happened when a terminal run's process group was still alive.
+ *
+ * `already_gone` and `terminated` are both success — the distinction only
+ * matters for telling "the run tidied up after itself" apart from "we had to".
+ * A rising `terminated` rate on runs that exited cleanly is the signal that an
+ * adapter is leaving background helpers behind.
+ */
+export type RunScratchTerminationOutcome =
+  | { terminated: true; reason: "already_gone"; escalatedToKill: false }
+  | { terminated: true; reason: "signalled"; escalatedToKill: boolean }
+  | { terminated: false; reason: "no_group" | "survived"; escalatedToKill: boolean };
+
+/** Time between the group SIGTERM and the SIGKILL escalation. */
+export const RUN_SCRATCH_TERMINATION_GRACE_MS = 5_000;
+
+/**
+ * A scratch directory is only reaped once its owning run has been terminal for
+ * this long. The window is not about the processes — it is about the *server*:
+ * a run row can be terminal for a beat before the heartbeat teardown that owns
+ * it reaches its own cleanup, and reaping underneath that teardown would delete
+ * a directory it is still writing an event about.
+ */
+export const RUN_SCRATCH_REAP_MIN_AGE_MS = 10 * 60 * 1000;
 
 const TEMP_ENV_KEYS = ["TMPDIR", "TEMP", "TMP"] as const;
 const ISSUE_SEGMENT_MAX_CHARS = 32;
@@ -124,10 +166,344 @@ export function buildHeartbeatRunScratchEnv(
   return { env, tempKeysApplied };
 }
 
+/**
+ * SUP-13949: terminate what a finished run left behind in its process group.
+ *
+ * Adapter children are spawned `detached`, so each run owns a process group.
+ * `runChildProcess` signals that group on timeout, but a run whose direct child
+ * simply *exits* — the normal and the crash path alike — leaves any background
+ * helper the child forked still running. Those reparent to pid 1 and, because
+ * nothing supervises them any more, never exit: the observed fleet state was
+ * 1,291 such processes across 12 run families, the oldest 42 hours old, holding
+ * 19 GB and pushing the container to 93% of its memory limit.
+ *
+ * They are not merely idle. 309 of them belonged to a run investigating Claude
+ * OAuth and were still able to write `/paperclip/.claude/.credentials.json` a
+ * day after that run ended, which made a credential failure look like
+ * deliberate interference. A long-lived orphan acts.
+ *
+ * Only ever called once the owning run is terminal, so there is no live work in
+ * the group to protect. SIGTERM first so a helper can flush, then SIGKILL after
+ * the grace — the escalation is the point, since the whole failure mode is
+ * processes that ignore being asked nicely.
+ *
+ * `kill` and `sleep` are injected so the escalation ladder is testable without
+ * spawning real processes; `isProcessGroupAlive` decides liveness, and the
+ * group is only ever signalled while it reports alive. That check also carries
+ * the pid-reuse guard: POSIX will not recycle a pgid while its group is
+ * non-empty, so a group that answers `kill(-pgid, 0)` is still the group we
+ * started.
+ */
+export async function terminateRunScratchProcessGroup(input: {
+  processGroupId: number | null | undefined;
+  isProcessGroupAlive: (processGroupId: number | null | undefined) => boolean;
+  kill?: (target: number, signal: NodeJS.Signals) => void;
+  sleep?: (ms: number) => Promise<void>;
+  graceMs?: number;
+}): Promise<RunScratchTerminationOutcome> {
+  const { processGroupId } = input;
+  if (
+    process.platform === "win32" ||
+    typeof processGroupId !== "number" ||
+    !Number.isInteger(processGroupId) ||
+    processGroupId <= 0
+  ) {
+    return { terminated: false, reason: "no_group", escalatedToKill: false };
+  }
+  if (!input.isProcessGroupAlive(processGroupId)) {
+    return { terminated: true, reason: "already_gone", escalatedToKill: false };
+  }
+
+  const kill = input.kill ?? ((target: number, signal: NodeJS.Signals) => process.kill(target, signal));
+  const sleep = input.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const graceMs = Math.max(0, input.graceMs ?? RUN_SCRATCH_TERMINATION_GRACE_MS);
+
+  try {
+    kill(-processGroupId, "SIGTERM");
+  } catch {
+    // ESRCH between the liveness check and the signal just means the group
+    // drained on its own, which is the outcome we wanted.
+    if (!input.isProcessGroupAlive(processGroupId)) {
+      return { terminated: true, reason: "already_gone", escalatedToKill: false };
+    }
+  }
+
+  await sleep(graceMs);
+  if (!input.isProcessGroupAlive(processGroupId)) {
+    return { terminated: true, reason: "signalled", escalatedToKill: false };
+  }
+
+  try {
+    kill(-processGroupId, "SIGKILL");
+  } catch {
+    // Same race, or the signal is genuinely undeliverable. The liveness check
+    // below is the arbiter either way.
+  }
+  if (input.isProcessGroupAlive(processGroupId)) {
+    // SIGKILL cannot be caught, so a group that survives it was never sent it —
+    // an unprivileged supervisor under the uid split, or a process wedged in
+    // uninterruptible sleep. Report it rather than deleting the directory out
+    // from under processes that are still using it.
+    return { terminated: false, reason: "survived", escalatedToKill: true };
+  }
+  return { terminated: true, reason: "signalled", escalatedToKill: true };
+}
+
+/**
+ * SUP-13966: the process group to persist for a freshly spawned run child.
+ *
+ * The adapter's spawn meta is the preferred source, but it omits the group
+ * whenever the spawner does not know it, and roughly 1 in 8 spawned runs
+ * reach the row that way. When it is omitted we fall back to asking the
+ * kernel for the child's group, and when it is present we still run the
+ * value through the same guard: a reported group can be the server's own.
+ *
+ * The guard is the load-bearing part of the fallback. A child spawned
+ * *without* `detached` — the ACP lane, which hands the agent child to an
+ * external runtime that does not start a new group — sits in the server's
+ * own process group. Persisting that pgid would hand the reaper the
+ * address of the server itself: `SIGKILL -pgid` on the server's group is a
+ * SIGKILL of the server. So a group that names the server's own group is
+ * never recorded, on any path, and a group we cannot read (the child is
+ * already gone, the kernel refuses) is recorded as `null`, never guessed.
+ *
+ * `getpgid` is injected so the guard is testable without real processes;
+ * `serverPid` exists for the same reason.
+ */
+export async function resolveRecordableRunProcessGroupId(input: {
+  pid: number;
+  reported?: number | null;
+  /**
+   * False when the pid belongs to another host (remote execution): a local
+   * `getpgid` on a foreign pid can only name an unrelated local process,
+   * which would be exactly the kind of cross-wire kill this card exists to
+   * prevent.
+   */
+  allowPidFallback?: boolean;
+  getpgid?: (pid: number) => number | null | Promise<number | null>;
+  serverPid?: number;
+}): Promise<number | null> {
+  if (process.platform === "win32") return null;
+  const getpgid = input.getpgid ?? defaultReadProcessGroupId;
+  const serverPid = input.serverPid ?? process.pid;
+
+  const readGroup = async (pid: number): Promise<number | null> => {
+    try {
+      const group = await getpgid(pid);
+      return typeof group === "number" && Number.isInteger(group) && group > 0 ? group : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // If the server's own group cannot be read, the guard cannot run, and a
+  // guard that cannot run must not record. Refusing is the safe direction.
+  const serverGroup = await readGroup(serverPid);
+  if (serverGroup === null) return null;
+
+  let candidate =
+    typeof input.reported === "number" && Number.isInteger(input.reported) && input.reported > 0
+      ? input.reported
+      : null;
+  if (candidate === null && input.allowPidFallback !== false) {
+    candidate = await readGroup(input.pid);
+  }
+  if (candidate === null) return null;
+  if (candidate === serverGroup) return null;
+  return candidate;
+}
+
+/**
+ * The default group reader: field 5 of `/proc/<pid>/stat` is the process
+ * group. There is no Node API for it, and shelling out to `ps` for every
+ * spawn would be a syscall we do not need when the kernel already publishes
+ * the answer.
+ */
+async function defaultReadProcessGroupId(pid: number): Promise<number | null> {
+  if (process.platform !== "linux") return null;
+  let stat: string;
+  try {
+    stat = await fs.readFile(path.join("/proc", String(pid), "stat"), "utf8");
+  } catch {
+    // The child exited between the spawn and this read; nothing to record.
+    return null;
+  }
+  // Field 2 is `comm`, in parentheses and free to contain spaces and
+  // parentheses, so split on the *last* closing one: field 3 (state) follows
+  // it, then ppid, then pgrp.
+  const close = stat.lastIndexOf(")");
+  if (close < 0) return null;
+  const pgrp = Number(stat.slice(close + 2).split(" ")[2]);
+  return Number.isInteger(pgrp) && pgrp > 0 ? pgrp : null;
+}
+
+/**
+ * SUP-13966: what happened when a run's scratch directory was reaped without
+ * a process group to signal, and the reaper matched live processes by cwd
+ * instead.
+ *
+ * `terminated` is true when every matched process was signalled out (or
+ * nothing matched at all); `survivors` lists the pids that survived even
+ * SIGKILL — the directory must stay in place for those, for the same reason
+ * the group terminator keeps it.
+ */
+export type RunScratchCwdTerminationOutcome =
+  | { terminated: true; matchedPids: number[]; escalatedToKill: boolean }
+  | { terminated: false; matchedPids: number[]; survivors: number[]; escalatedToKill: boolean };
+
+async function defaultListProcessIds(): Promise<number[]> {
+  if (process.platform !== "linux") return [];
+  let entries: string[];
+  try {
+    entries = await fs.readdir("/proc");
+  } catch {
+    return [];
+  }
+  return entries.filter((entry) => /^\d+$/.test(entry)).map((entry) => Number(entry));
+}
+
+const DELETED_LINK_SUFFIX = " (deleted)";
+
+async function defaultReadProcessCwd(pid: number): Promise<string | null> {
+  const linkPath = path.join("/proc", String(pid), "cwd");
+  try {
+    return await fs.realpath(linkPath);
+  } catch {
+    // The cwd's path can be gone even while the process lives (the directory
+    // was deleted out from under it). The raw link still names it, and the
+    // match below runs on that name. The kernel appends " (deleted)" to that
+    // name; leaving it on would break the match for exactly the processes
+    // this fallback exists to find.
+    try {
+      const link = await fs.readlink(linkPath);
+      return link.endsWith(DELETED_LINK_SUFFIX) ? link.slice(0, -DELETED_LINK_SUFFIX.length) : link;
+    } catch {
+      return null;
+    }
+  }
+}
+
+function defaultIsProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but is not this user's to signal. It is
+    // alive and it cannot be signalled — both facts point the same way.
+    return (error as NodeJS.ErrnoException | undefined)?.code === "EPERM";
+  }
+}
+
+/**
+ * SUP-13966: the no-pgid fallback for the backstop. Terminates the processes
+ * still sitting inside a run's scratch directory when the run row carries no
+ * process group.
+ *
+ * Two classes of run reach this: the ACP lane, which spawns the agent child
+ * into the server's own process group (so no run-owned group exists to
+ * signal, and recording the server's group is what the
+ * {@link resolveRecordableRunProcessGroupId} guard forbids), and remote
+ * runs, whose recorded pid belongs to another host. Both can still leave
+ * local descendants behind: anything the child forked that outlived it
+ * reparents to pid 1 and keeps its cwd parked in the scratch directory.
+ *
+ * The match is therefore the one ground truth that survives both a server
+ * crash and a uid split: `/proc/<pid>/cwd`. Only pids whose cwd resolves
+ * under the directory being reaped are signalled — never the server
+ * itself, never a group (a bare `kill(pid)` cannot reach a recycled pid's
+ * neighbours), and SIGTERM before SIGKILL, same escalation ladder as the
+ * group terminator.
+ *
+ * `listProcessIds`, `readProcessCwd`, `isProcessAlive`, `kill`, and `sleep`
+ * are injected so the whole ladder is testable without real processes.
+ */
+export async function terminateProcessesWithCwdUnderDir(input: {
+  dir: string;
+  listProcessIds?: () => number[] | Promise<number[]>;
+  readProcessCwd?: (pid: number) => string | null | Promise<string | null>;
+  isProcessAlive?: (pid: number) => boolean;
+  kill?: (target: number, signal: NodeJS.Signals) => void;
+  sleep?: (ms: number) => Promise<void>;
+  graceMs?: number;
+  serverPid?: number;
+}): Promise<RunScratchCwdTerminationOutcome> {
+  const dir = path.resolve(input.dir);
+  const serverPid = input.serverPid ?? process.pid;
+  const listPids = input.listProcessIds ?? defaultListProcessIds;
+  const resolveCwd = input.readProcessCwd ?? defaultReadProcessCwd;
+  const checkAlive = input.isProcessAlive ?? defaultIsProcessAlive;
+  const kill = input.kill ?? ((target: number, signal: NodeJS.Signals) => process.kill(target, signal));
+  const sleep = input.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const graceMs = Math.max(0, input.graceMs ?? RUN_SCRATCH_TERMINATION_GRACE_MS);
+
+  const pids = await listPids();
+  const matched: number[] = [];
+  for (const pid of pids) {
+    if (!Number.isInteger(pid) || pid <= 0 || pid === serverPid) continue;
+    const cwd = await resolveCwd(pid);
+    if (cwd === null) continue;
+    if (isPathInside(dir, cwd)) matched.push(pid);
+  }
+
+  if (matched.length === 0) {
+    return { terminated: true, matchedPids: [], escalatedToKill: false };
+  }
+
+  for (const pid of matched) {
+    try {
+      kill(pid, "SIGTERM");
+    } catch {
+      // ESRCH between the match and the signal just means the process
+      // exited on its own, which is the outcome we wanted.
+    }
+  }
+  await sleep(graceMs);
+  // The match input is stale by exactly the grace interval: a matched pid can
+  // exit during it and the kernel can hand that number to an unrelated
+  // process. SIGKILL is uncatchable, so re-confirm the cwd before escalating —
+  // liveness alone would let a recycled pid inherit the kill.
+  const survivorsInDir: number[] = [];
+  for (const pid of matched) {
+    if (!checkAlive(pid)) continue;
+    const cwd = await resolveCwd(pid);
+    if (cwd !== null && isPathInside(dir, cwd)) survivorsInDir.push(pid);
+  }
+  let survivors = survivorsInDir;
+  let escalatedToKill = false;
+  if (survivors.length > 0) {
+    escalatedToKill = true;
+    for (const pid of survivors) {
+      try {
+        kill(pid, "SIGKILL");
+      } catch {
+        // Same race, or the process is a different uid the server cannot
+        // signal; the liveness check below is the arbiter either way.
+      }
+    }
+    survivors = survivors.filter((pid) => checkAlive(pid));
+  }
+
+  if (survivors.length > 0) {
+    // A process that survives SIGKILL still holds the directory; removing
+    // it would strand them with a missing cwd instead of stopping them.
+    return { terminated: false, matchedPids: matched, survivors, escalatedToKill };
+  }
+  return { terminated: true, matchedPids: matched, escalatedToKill };
+}
+
 export async function cleanupHeartbeatRunScratch(input: {
   scratch: HeartbeatRunScratch;
   processGroupId?: number | null;
   isProcessGroupAlive?: (processGroupId: number | null | undefined) => boolean;
+  /**
+   * SUP-13949: how to handle a process group that is still alive at cleanup.
+   *
+   * Omitted, the pre-SUP-13949 behaviour applies and cleanup skips with
+   * `process_group_alive` — which is what leaked, because nothing ever retried.
+   * Supplied, the group is terminated first and the directory is then removed.
+   * Only pass this once the run is terminal.
+   */
+  terminateProcessGroup?: (processGroupId: number | null | undefined) => Promise<RunScratchTerminationOutcome>;
 }): Promise<HeartbeatRunScratchCleanupResult> {
   const tmpRoot = path.resolve(os.tmpdir());
   const dir = path.resolve(input.scratch.dir);
@@ -150,10 +526,177 @@ export async function cleanupHeartbeatRunScratch(input: {
   ) {
     return { removed: false, dir, reason: "owner_mismatch" };
   }
+  let terminatedProcessGroup: RunScratchTerminationOutcome | undefined;
   if (input.isProcessGroupAlive?.(input.processGroupId) === true) {
-    return { removed: false, dir, reason: "process_group_alive" };
+    if (!input.terminateProcessGroup) {
+      return { removed: false, dir, reason: "process_group_alive" };
+    }
+    terminatedProcessGroup = await input.terminateProcessGroup(input.processGroupId);
+    if (!terminatedProcessGroup.terminated) {
+      // Leave the directory in place: the survivors still hold it, and removing
+      // it would strand them with a missing cwd instead of stopping them.
+      return { removed: false, dir, reason: "process_group_survived", terminatedProcessGroup };
+    }
   }
 
   await fs.rm(dir, { recursive: true, force: true });
-  return { removed: true, dir };
+  return terminatedProcessGroup ? { removed: true, dir, terminatedProcessGroup } : { removed: true, dir };
+}
+
+/**
+ * SUP-13949: enumerate the run scratch directories present on this host.
+ *
+ * The in-memory handle a run holds is not enough to find its own leak. When the
+ * server restarts — or crashes — every `HeartbeatRunScratch` it was holding is
+ * gone while the directories and their process groups are not, and nothing ever
+ * looks at them again. That is how a leaked family reached 42 hours old. This
+ * reads the ground truth back off disk instead.
+ *
+ * Unmarked directories are skipped, not returned. `os.tmpdir()` is shared with
+ * everything else on the host, and a `paperclip-run-`-prefixed name alone is
+ * not proof of ownership — only the marker is.
+ */
+export async function discoverRunScratchDirs(input?: {
+  tmpRoot?: string;
+}): Promise<DiscoveredRunScratch[]> {
+  const tmpRoot = path.resolve(input?.tmpRoot ?? os.tmpdir());
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(tmpRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const found: DiscoveredRunScratch[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("paperclip-run-")) continue;
+    const dir = path.join(tmpRoot, entry.name);
+    const metadata = await readMarker(path.join(dir, HEARTBEAT_RUN_SCRATCH_MARKER));
+    if (!metadata) continue;
+    found.push({ dir, metadata });
+  }
+  return found;
+}
+
+export type RunScratchLiveness = "active" | "finished" | "unknown";
+
+export type RunScratchReapOutcome =
+  | {
+    dir: string;
+    runId: string;
+    reaped: true;
+    terminatedProcessGroup: RunScratchTerminationOutcome;
+    /**
+     * SUP-13966: present only when the run row carried no process group and
+     * the directory was reaped through the cwd-matched fallback instead.
+     */
+    terminatedCwdProcesses?: RunScratchCwdTerminationOutcome;
+  }
+  | {
+    dir: string;
+    runId: string;
+    reaped: false;
+    reason: "active" | "unknown" | "too_recent" | "process_group_survived" | "error";
+  };
+
+/**
+ * SUP-13949: the backstop. Terminates and removes scratch directories whose
+ * owning run is over, whatever happened to the server in between.
+ *
+ * Three refusals, and each one is load-bearing:
+ *
+ * - `active` — never touch a running run. Obvious, and the reason the liveness
+ *   lookup is a required input rather than a heuristic on directory age.
+ * - `unknown` — a run the caller cannot resolve is NOT treated as finished. A
+ *   transient database error must not turn this into a fleet-wide killer of
+ *   live runs; refusing to act is always the safe direction here, because the
+ *   next sweep will retry with a working lookup.
+ * - `too_recent` — a run row reaches a terminal status slightly before the
+ *   heartbeat teardown that owns it finishes writing its cleanup event. Waiting
+ *   out {@link RUN_SCRATCH_REAP_MIN_AGE_MS} keeps the sweep from racing the
+ *   owner for the same directory.
+ *
+ * Termination comes before removal, always. `fs.rm` on a directory whose
+ * processes are alive removes the path and leaves the processes — which is the
+ * failure this exists to end, not a partial version of the fix.
+ */
+export async function reapAbandonedRunScratchDirs(input: {
+  resolveLiveness: (metadata: HeartbeatRunScratchMetadata) => Promise<{
+    liveness: RunScratchLiveness;
+    processGroupId?: number | null;
+  }>;
+  terminateProcessGroup: (processGroupId: number | null | undefined) => Promise<RunScratchTerminationOutcome>;
+  /**
+   * SUP-13966: the no-pgid fallback. Runs whose row carries no process group
+   * (the ACP lane, whose agent child sits in the server's own group, and
+   * remote runs, whose pid belongs to another host) previously hit a silent
+   * refusal here: `terminateProcessGroup(null)` reports `no_group`, the
+   * directory was kept, and nothing ever retried. When this is supplied, a
+   * finished run without a group instead has its cwd-matched processes
+   * terminated and the directory removed. Omitting it keeps the historical
+   * refusal.
+   */
+  terminateCwdProcesses?: (dir: string) => Promise<RunScratchCwdTerminationOutcome>;
+  tmpRoot?: string;
+  now?: Date;
+  minAgeMs?: number;
+  onError?: (err: unknown, dir: string) => void;
+}): Promise<RunScratchReapOutcome[]> {
+  const nowMs = (input.now ?? new Date()).getTime();
+  const minAgeMs = Math.max(0, input.minAgeMs ?? RUN_SCRATCH_REAP_MIN_AGE_MS);
+  const discovered = await discoverRunScratchDirs({ tmpRoot: input.tmpRoot });
+  const outcomes: RunScratchReapOutcome[] = [];
+
+  for (const { dir, metadata } of discovered) {
+    const runId = metadata.runId;
+    try {
+      const createdMs = Date.parse(metadata.createdAt);
+      // An unparseable timestamp must not read as "infinitely old". Treat it as
+      // brand new so the directory is skipped rather than eagerly destroyed.
+      if (!Number.isFinite(createdMs) || nowMs - createdMs < minAgeMs) {
+        outcomes.push({ dir, runId, reaped: false, reason: "too_recent" });
+        continue;
+      }
+
+      const { liveness, processGroupId } = await input.resolveLiveness(metadata);
+      if (liveness !== "finished") {
+        outcomes.push({ dir, runId, reaped: false, reason: liveness === "active" ? "active" : "unknown" });
+        continue;
+      }
+
+      const terminatedProcessGroup = await input.terminateProcessGroup(processGroupId);
+      if (terminatedProcessGroup.terminated) {
+        await fs.rm(dir, { recursive: true, force: true });
+        outcomes.push({ dir, runId, reaped: true, terminatedProcessGroup });
+        continue;
+      }
+      if (terminatedProcessGroup.reason === "survived") {
+        // The group is still alive after SIGKILL; the survivors hold the
+        // directory, and removing it would strand them with a missing cwd.
+        outcomes.push({ dir, runId, reaped: false, reason: "process_group_survived" });
+        continue;
+      }
+      // `no_group`: the run row carried no process group, so there was
+      // nothing to signal. That no longer reads as "the group survived" —
+      // it reads as "we have no group address", which is the case the
+      // cwd-matched fallback exists for. With no fallback supplied the
+      // outcome is byte-for-byte the historical refusal.
+      if (!input.terminateCwdProcesses) {
+        outcomes.push({ dir, runId, reaped: false, reason: "process_group_survived" });
+        continue;
+      }
+      const terminatedCwdProcesses = await input.terminateCwdProcesses(dir);
+      if (!terminatedCwdProcesses.terminated) {
+        outcomes.push({ dir, runId, reaped: false, reason: "process_group_survived" });
+        continue;
+      }
+      await fs.rm(dir, { recursive: true, force: true });
+      outcomes.push({ dir, runId, reaped: true, terminatedProcessGroup, terminatedCwdProcesses });
+    } catch (err) {
+      input.onError?.(err, dir);
+      outcomes.push({ dir, runId, reaped: false, reason: "error" });
+    }
+  }
+
+  return outcomes;
 }

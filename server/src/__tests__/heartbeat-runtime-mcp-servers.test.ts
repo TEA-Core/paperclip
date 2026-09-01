@@ -6,6 +6,7 @@ import {
   activityLog,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   toolAccessAuditEvents,
   toolApplications,
@@ -42,6 +43,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     await db.delete(toolMcpGatewayTokens);
     await db.delete(activityLog);
     await db.delete(toolAccessAuditEvents);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(toolMcpGateways);
     await db.delete(toolConnectionInstalls);

@@ -15,6 +15,7 @@ import {
   documentRevisions,
   feedbackExports,
   feedbackVotes,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
   issueComments,
@@ -62,6 +63,7 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     await db.delete(documents);
     await db.delete(issueComments);
     await db.delete(costEvents);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(companySkills);
     await db.delete(issues);

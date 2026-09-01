@@ -51,6 +51,14 @@ if (process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE === undefined) {
   process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsDir, "master.key");
 }
 
+// The automatic Tailscale HTTPS default (PAP-17158) probes for a real host
+// broker socket, so leaving it enabled would make every test that starts a
+// service named `paperclip-dev` behave differently on a broker-capable host
+// than on CI. Tests that exercise the default opt in explicitly.
+if (!process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS) {
+  process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = "off";
+}
+
 if (!SupertestTest.prototype.__paperclipLoopbackPatched) {
   SupertestTest.prototype.serverAddress = function serverAddress(app, path) {
     const addr = app.address();

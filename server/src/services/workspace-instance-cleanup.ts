@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +16,50 @@ const POSTGRES_STOP_TIMEOUT_MS = 10_000;
 export const WORKTREE_INSTANCE_ROOT_METADATA_KEY = "worktreeInstanceRoot";
 
 export function deriveWorktreeInstanceId(workspacePath: string): string {
+  const resolvedWorkspacePath = path.resolve(workspacePath);
+  const normalized = path.basename(resolvedWorkspacePath)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  // Strip a trailing separator the 48-character truncation may have left, exactly
+  // as scripts/provision-worktree.sh does. That script is what names the instance
+  // directory on disk; an id spelled "…-<hash>" here and "…--<hash>" there names a
+  // directory that does not exist, so cleanup would decline to reclaim the instance
+  // it was asked to reclaim and the disk would keep it. The two derivations have to
+  // move together or not at all.
+  const prefix = (normalized || "worktree").slice(0, 48).replace(/-+$/, "");
+  const pathHash = createHash("sha256").update(resolvedWorkspacePath).digest("hex").slice(0, 12);
+  return `${prefix}-${pathHash}`;
+}
+
+/**
+ * The instance id a seeded worktree actually runs as, read from the pointer the
+ * guest process itself loads.
+ *
+ * Synchronous and null-on-anything-unexpected by design: callers use it to
+ * decide whether they can prove workspace identity at all, and an unsafe or
+ * unreadable pointer must fail closed rather than fall back to a guess.
+ */
+export function readWorktreeInstanceId(workspacePath: string): string | null {
+  const envPath = path.join(path.resolve(workspacePath), ".paperclip", ".env");
+  let contents: string;
+  try {
+    contents = readFileSync(envPath, "utf8");
+  } catch {
+    return null;
+  }
+  const instanceId = parseEnvContents(contents).PAPERCLIP_INSTANCE_ID?.trim();
+  if (!instanceId || !INSTANCE_ID_RE.test(instanceId)) return null;
+  return instanceId;
+}
+
+// Legacy pre-slice-trim spelling (pre-SUP-14150): the 48-character slice kept any
+// separator it left behind, so a boundary basename minted a doubled "-" before the
+// path hash. .env files of boundary worktrees provisioned before the shell fix
+// still carry that spelling; teardown accepts it as well.
+export function deriveLegacyWorktreeInstanceId(workspacePath: string): string {
   const resolvedWorkspacePath = path.resolve(workspacePath);
   const normalized = path.basename(resolvedWorkspacePath)
     .trim()
@@ -174,7 +219,7 @@ export async function readWorktreeInstancePointer(workspacePath: string): Promis
   }
 }
 
-function resolveConfiguredInstanceRoot(pointer: WorktreeInstancePointer, expectedInstanceId?: string):
+function resolveConfiguredInstanceRoot(pointer: WorktreeInstancePointer, expectedInstanceIds?: string[]):
   | { instanceRoot: string; instanceId: string }
   | { warning: string; instanceRoot: string | null; refusalReason: string | null } {
   const env = parseEnvContents(pointer.envContents);
@@ -200,10 +245,10 @@ function resolveConfiguredInstanceRoot(pointer: WorktreeInstancePointer, expecte
     };
   }
   const instanceRoot = path.resolve(expandedHome, "instances", instanceId);
-  if (expectedInstanceId && instanceId !== expectedInstanceId) {
+  if (expectedInstanceIds && !expectedInstanceIds.includes(instanceId)) {
     return {
       instanceRoot,
-      warning: `Refusing worktree instance cleanup from ${pointer.envPath}: PAPERCLIP_INSTANCE_ID "${instanceId}" does not match the expected workspace instance "${expectedInstanceId}".`,
+      warning: `Refusing worktree instance cleanup from ${pointer.envPath}: PAPERCLIP_INSTANCE_ID "${instanceId}" does not match the expected workspace instance ${expectedInstanceIds.map((id) => JSON.stringify(id)).join(" or ")}.`,
       refusalReason: "instance_id_mismatch",
     };
   }
@@ -251,7 +296,10 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
   worktreesDir?: string;
   dependencies?: WorktreeInstanceCleanupDependencies;
 }): Promise<WorktreeInstanceCleanupResult> {
-  const configured = resolveConfiguredInstanceRoot(input.pointer, input.expectedInstanceId);
+  const expectedInstanceIds = Array.from(
+    new Set([input.expectedInstanceId, deriveLegacyWorktreeInstanceId(input.workspacePath)]),
+  );
+  const configured = resolveConfiguredInstanceRoot(input.pointer, expectedInstanceIds);
   if ("warning" in configured && !configured.warning) return { status: "not_configured" };
 
   const managedInstancesDir = resolveManagedInstancesDir(input.worktreesDir);
@@ -289,9 +337,19 @@ export async function cleanupWorktreeInstanceArtifacts(input: {
     return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
   }
 
-  const expectedInstanceRoot = input.expectedInstanceRoot
-    ? path.resolve(input.expectedInstanceRoot)
-    : null;
+  // Upstream tightened the persisted instance root from an optional cross-check
+  // into a precondition: without it, ownership of the directory is not proven by
+  // anything the DB recorded, and cleanup must fail closed. Safe in this fork
+  // because provisioning backfills WORKTREE_INSTANCE_ROOT for every git_worktree
+  // workspace that lacks it (see execution-workspace-provisioning.ts), so a null
+  // here is exceptional rather than the norm, and it surfaces as an operator
+  // warning instead of a silent deletion.
+  const expectedInstanceRoot = input.expectedInstanceRoot ? path.resolve(input.expectedInstanceRoot) : null;
+  if (!expectedInstanceRoot) {
+    warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because execution workspace ${input.workspaceId} has no persisted instance root.`;
+    await recordRefusal({ refusalReason: "persisted_instance_root_missing" });
+    return { status: "refused", instanceRoot: configuredInstanceRoot, warning };
+  }
   if (expectedInstanceRoot && configuredInstanceRoot !== expectedInstanceRoot) {
     warning = `Refusing to remove instance directory "${configuredInstanceRoot}" because it does not match execution workspace ${input.workspaceId}'s persisted instance root "${expectedInstanceRoot}".`;
     await recordRefusal({

@@ -5,6 +5,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueThreadInteractions,
   issues,
@@ -33,6 +34,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
   afterEach(async () => {
     await db.delete(issueThreadInteractions);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);

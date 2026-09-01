@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, lt, ne, not, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -15,6 +15,7 @@ import {
   folders,
   goals,
   heartbeatRuns,
+  issueComments,
   issueInboxArchives,
   issues,
   pluginManagedResources,
@@ -50,6 +51,7 @@ import {
   extractRoutineVariableNames,
   interpolateRoutineTemplate,
   isValidRoutineDateString,
+  normalizeAgentUrlKey,
   pluginOperationIssueOriginKind,
   routineRevisionSnapshotSchema,
   stringifyRoutineVariableValue,
@@ -61,6 +63,7 @@ import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
+import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
@@ -74,7 +77,7 @@ import {
   type WorktreeRunExecutionActivationState,
 } from "./instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, logActivityInTransaction } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
@@ -82,6 +85,8 @@ const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
+const EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE = "execution_issue_status";
+const EXECUTION_ISSUE_TRANSIENT_FAILURE_STATUSES = ["blocked", "cancelled"] as const;
 const ACTIVITY_GATE_IGNORED_ACTIONS = [
   "issue.read_marked",
   "issue.read_unmarked",
@@ -98,6 +103,37 @@ const WEEKDAY_INDEX: Record<string, number> = {
   Fri: 5,
   Sat: 6,
 };
+
+type ExecutionIssueTransientFailureStatus = (typeof EXECUTION_ISSUE_TRANSIENT_FAILURE_STATUSES)[number];
+
+function executionIssueTransientFailureReason(status: ExecutionIssueTransientFailureStatus) {
+  return `Execution issue moved to ${status}`;
+}
+
+function executionIssueTransientFailureStatusFromPayload(payload: unknown): ExecutionIssueTransientFailureStatus | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const transientFailure = (payload as Record<string, unknown>).transientFailure;
+  if (!transientFailure || typeof transientFailure !== "object" || Array.isArray(transientFailure)) return null;
+  const record = transientFailure as Record<string, unknown>;
+  if (record.code !== EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE) return null;
+  return EXECUTION_ISSUE_TRANSIENT_FAILURE_STATUSES.find((status) => record.status === status) ?? null;
+}
+
+function executionIssueTransientFailureClearedAtFromPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const transientFailure = (payload as Record<string, unknown>).transientFailure;
+  if (!transientFailure || typeof transientFailure !== "object" || Array.isArray(transientFailure)) return null;
+  const clearedAt = (transientFailure as Record<string, unknown>).clearedAt;
+  return typeof clearedAt === "string" ? clearedAt : null;
+}
+
+function legacyExecutionIssueTransientFailureStatus(
+  failureReason: string | null,
+): ExecutionIssueTransientFailureStatus | null {
+  return EXECUTION_ISSUE_TRANSIENT_FAILURE_STATUSES.find(
+    (status) => failureReason === executionIssueTransientFailureReason(status),
+  ) ?? null;
+}
 
 async function resolveCompanyDefaultResponsibleUserId(db: Db, companyId: string) {
   const company = await db
@@ -644,6 +680,151 @@ function mapRoutineDescriptionDocument(row: {
   };
 }
 
+/**
+ * SUP-13699: a `routine_execution` issue is an idempotent periodic sweep — each
+ * run subsumes whatever the previous run would have done. When a run reaches
+ * terminal `done`, the still-open earlier runs of the same routine are work a
+ * later run already did, and leaving them open parks a growing population of
+ * permanently-blocked duplicates on the board. Retire them in place: cancel
+ * each one with a supersede note naming the superseding issue.
+ *
+ * Eligibility is strict: same company, `originKind: "routine_execution"`, same
+ * routine (`originId`), strictly earlier period (`createdAt`), still
+ * non-terminal. Terminal siblings (`done`/`cancelled`) and any non-routine
+ * issue are never touched; matching is never on title. The per-row CAS (only
+ * cancel while the sibling is still open) makes the sweep idempotent under
+ * re-runs and concurrent superseding runs: a sibling another writer already
+ * retired gets no second write and no second comment.
+ *
+ * Runs inside the caller's transaction so the retirements are atomic with the
+ * superseding issue's terminal write.
+ */
+export async function supersedeOpenRoutineExecutionSiblings(
+  executor: Db,
+  superseding: {
+    id: string;
+    companyId: string;
+    originKind: string | null;
+    originId: string | null;
+    identifier: string | null;
+    createdAt: Date | string;
+  },
+  actor: { agentId?: string | null; userId?: string | null } = {},
+): Promise<Array<{ issueId: string; identifier: string | null; previousStatus: string }>> {
+  if (superseding.originKind !== "routine_execution" || !superseding.originId) return [];
+  const supersedingCreatedAt = new Date(superseding.createdAt);
+  const siblings = await executor
+    .select()
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, superseding.companyId),
+        eq(issues.originKind, "routine_execution"),
+        eq(issues.originId, superseding.originId),
+        inArray(issues.status, OPEN_ISSUE_STATUSES),
+        isNull(issues.hiddenAt),
+        isNull(issues.harnessKind),
+        ne(issues.id, superseding.id),
+        lt(issues.createdAt, supersedingCreatedAt),
+      ),
+    )
+    .orderBy(asc(issues.createdAt));
+  if (siblings.length === 0) return [];
+
+  const superseded: Array<{ issueId: string; identifier: string | null; previousStatus: string }> = [];
+  const now = new Date();
+  for (const sibling of siblings) {
+    // Mirror the canonical terminal-transition side effects of a
+    // blocked/cancelled write (issues.ts `update`): status + cancelledAt,
+    // cleared execution/checkout locks, cleared monitor wake fields, and the
+    // blocked-transition markers.
+    const [retired] = await executor
+      .update(issues)
+      .set({
+        status: "cancelled",
+        cancelledAt: now,
+        updatedAt: now,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        checkoutRunId: null,
+        monitorNextCheckAt: null,
+        monitorWakeRequestedAt: null,
+        unblockDescriptor: null,
+        blockedTransitionAt: null,
+        blockedOwnerNotifiedAt: null,
+      })
+      .where(and(eq(issues.id, sibling.id), inArray(issues.status, OPEN_ISSUE_STATUSES)))
+      .returning();
+    if (!retired) continue;
+
+    await executor.insert(issueComments).values({
+      companyId: superseding.companyId,
+      issueId: retired.id,
+      authorAgentId: null,
+      authorUserId: null,
+      authorType: "system",
+      createdByRunId: null,
+      body:
+        `Superseded by ${superseding.identifier ?? "a later run of the same routine"}: ` +
+        "a later run of this routine reached done, so this earlier run is retired automatically. " +
+        "No action is required on this issue.",
+      presentation: null,
+      metadata: null,
+      sourceTrust: null,
+    });
+
+    // Keep the routine run ledger consistent the way `syncRunStatusForIssue`
+    // does for route-level blocked/cancelled transitions.
+    if (retired.originRunId) {
+      await executor
+        .update(routineRuns)
+        .set({
+          status: "failed",
+          failureReason: `Superseded by ${superseding.identifier ?? "a later run of the same routine"}`,
+          completedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(routineRuns.id, retired.originRunId),
+            notInArray(routineRuns.status, ["coalesced", "skipped", "completed", "failed"]),
+          ),
+        );
+    }
+
+    await issueThreadInteractionService(executor).expirePendingInteractionsForTerminalIssue(
+      { id: retired.id, companyId: retired.companyId, status: retired.status },
+      { agentId: actor.agentId ?? null, userId: actor.userId ?? null },
+    );
+
+    await logActivityInTransaction(executor, {
+      companyId: superseding.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.routine_execution_superseded",
+      entityType: "issue",
+      entityId: retired.id,
+      details: {
+        identifier: retired.identifier,
+        previousStatus: sibling.status,
+        supersededByIssueId: superseding.id,
+        supersededByIdentifier: superseding.identifier,
+        source: "issue.status_transition.routine_supersede",
+      },
+    });
+
+    superseded.push({
+      issueId: retired.id,
+      identifier: retired.identifier,
+      previousStatus: sibling.status,
+    });
+  }
+  return superseded;
+}
+
 export function routineService(
   db: Db,
   deps: {
@@ -666,6 +847,25 @@ export function routineService(
       .from(routines)
       .where(eq(routines.id, id))
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function getRoutineAgentSummary(
+    companyId: string,
+    agentId: string,
+  ): Promise<RoutineDetail["assignee"]> {
+    return db
+      .select({
+        id: agents.id,
+        name: agents.name,
+        role: agents.role,
+        title: agents.title,
+      })
+      .from(agents)
+      .where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)))
+      .then((rows) => {
+        const row = rows[0];
+        return row ? { ...row, urlKey: normalizeAgentUrlKey(row.name) ?? row.id } : null;
+      });
   }
 
   async function getManagedRoutineBinding(routine: typeof routines.$inferSelect) {
@@ -1363,10 +1563,40 @@ export function routineService(
     reason: string;
     nextRunAt?: Date | null;
     details?: Record<string, unknown> | null;
+    idempotencyKey?: string | null;
+    rejectIdempotencyReplay?: boolean;
   }) {
     const triggeredAt = new Date();
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      await tx.execute(
+        sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
+      );
+
+      if (input.idempotencyKey) {
+        const existing = await txDb
+          .select()
+          .from(routineRuns)
+          .where(
+            and(
+              eq(routineRuns.companyId, input.routine.companyId),
+              eq(routineRuns.routineId, input.routine.id),
+              eq(routineRuns.source, input.source),
+              eq(routineRuns.idempotencyKey, input.idempotencyKey),
+              eq(routineRuns.triggerId, input.trigger.id),
+            ),
+          )
+          .orderBy(desc(routineRuns.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) {
+          if (input.rejectIdempotencyReplay) {
+            throw conflict("Webhook replay detected");
+          }
+          return existing;
+        }
+      }
+
       const [createdRun] = await txDb
         .insert(routineRuns)
         .values({
@@ -1382,6 +1612,7 @@ export function routineService(
           routineRevisionId: input.routine.latestRevisionId,
           responsibleUserId: input.routine.responsibleUserId ?? null,
           triggerPayload: input.details ?? null,
+          idempotencyKey: input.idempotencyKey ?? null,
         })
         .returning();
       await updateRoutineTouchedState({
@@ -1640,6 +1871,7 @@ export function routineService(
     projectWorkspaceId?: string | null;
     assigneeAgentId?: string | null;
     idempotencyKey?: string | null;
+    rejectIdempotencyReplay?: boolean;
     executionWorkspaceId?: string | null;
     executionWorkspacePreference?: string | null;
     executionWorkspaceSettings?: Record<string, unknown> | null;
@@ -1727,7 +1959,12 @@ export function routineService(
           .orderBy(desc(routineRuns.createdAt))
           .limit(1)
           .then((rows) => rows[0] ?? null);
-        if (existing) return existing;
+        if (existing) {
+          if (input.rejectIdempotencyReplay) {
+            throw conflict("Webhook replay detected");
+          }
+          return existing;
+        }
       }
 
       const triggeredAt = new Date();
@@ -2003,7 +2240,7 @@ export function routineService(
           ? db.select().from(projects).where(eq(projects.id, row.projectId)).then((rows) => rows[0] ?? null)
           : null,
         row.assigneeAgentId
-          ? db.select().from(agents).where(eq(agents.id, row.assigneeAgentId)).then((rows) => rows[0] ?? null)
+          ? getRoutineAgentSummary(row.companyId, row.assigneeAgentId)
           : null,
         row.parentIssueId ? issueSvc.getById(row.parentIssueId) : null,
         getRoutineDescriptionDocument(row.id),
@@ -2818,6 +3055,7 @@ export function routineService(
       if (!routine) throw notFound("Routine not found");
       if (!trigger.enabled || routine.status !== "active") throw conflict("Routine trigger is not active");
 
+      let hmacReplayKey: string | null = null;
       if (trigger.signingMode === "none") {
         // No authentication — the publicId in the URL acts as a shared secret.
       } else if (trigger.signingMode === "github_hmac") {
@@ -2874,6 +3112,10 @@ export function routineService(
           normalizedSignature.length === expectedHmac.length &&
           crypto.timingSafeEqual(Buffer.from(normalizedSignature), Buffer.from(expectedHmac));
         if (!valid) throw unauthorized();
+        hmacReplayKey = `webhook-hmac:${crypto
+          .createHash("sha256")
+          .update(`${trigger.id}:${providedTimestamp}:${expectedHmac}`)
+          .digest("hex")}`;
       }
 
       const eligibility = await getAutomaticRoutineDispatchEligibility(routine);
@@ -2883,6 +3125,8 @@ export function routineService(
           trigger,
           source: "webhook",
           reason: "worktree_execution_cutoff",
+          idempotencyKey: hmacReplayKey ?? input.idempotencyKey,
+          rejectIdempotencyReplay: hmacReplayKey !== null,
         });
       }
 
@@ -2894,7 +3138,8 @@ export function routineService(
         variables: isPlainRecord(input.payload) && isPlainRecord(input.payload.variables)
           ? input.payload.variables
           : null,
-        idempotencyKey: input.idempotencyKey,
+        idempotencyKey: hmacReplayKey ?? input.idempotencyKey,
+        rejectIdempotencyReplay: hmacReplayKey !== null,
       });
     },
 
@@ -3103,17 +3348,73 @@ export function routineService(
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue || issue.originKind !== "routine_execution" || !issue.originRunId) return null;
+      const run = await db
+        .select({
+          id: routineRuns.id,
+          status: routineRuns.status,
+          failureReason: routineRuns.failureReason,
+          triggerPayload: routineRuns.triggerPayload,
+        })
+        .from(routineRuns)
+        .where(eq(routineRuns.id, issue.originRunId))
+        .then((rows) => rows[0] ?? null);
+      if (!run) return null;
       if (issue.status === "done") {
+        const transientFailureStatus = executionIssueTransientFailureStatusFromPayload(run.triggerPayload)
+          ?? legacyExecutionIssueTransientFailureStatus(run.failureReason);
+        const transientFailureClearedAt = executionIssueTransientFailureClearedAtFromPayload(run.triggerPayload);
         return finalizeRun(issue.originRunId, {
           status: "completed",
+          failureReason: null,
           completedAt: new Date(),
+          ...(transientFailureStatus
+            ? {
+              triggerPayload: {
+                ...(run.triggerPayload ?? {}),
+                transientFailure: {
+                  code: EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE,
+                  status: transientFailureStatus,
+                  reason: executionIssueTransientFailureReason(transientFailureStatus),
+                  clearedAt: transientFailureClearedAt ?? new Date().toISOString(),
+                },
+              },
+            }
+            : {}),
         });
       }
       if (issue.status === "blocked" || issue.status === "cancelled") {
+        const failureReason = executionIssueTransientFailureReason(issue.status);
         return finalizeRun(issue.originRunId, {
           status: "failed",
-          failureReason: `Execution issue moved to ${issue.status}`,
+          failureReason,
           completedAt: new Date(),
+          triggerPayload: {
+            ...(run.triggerPayload ?? {}),
+            transientFailure: {
+              code: EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE,
+              status: issue.status,
+              reason: failureReason,
+              recordedAt: new Date().toISOString(),
+            },
+          },
+        });
+      }
+      const transientFailureStatus = executionIssueTransientFailureStatusFromPayload(run.triggerPayload)
+        ?? legacyExecutionIssueTransientFailureStatus(run.failureReason);
+      if (run.status === "failed" && transientFailureStatus) {
+        return finalizeRun(issue.originRunId, {
+          status: "issue_created",
+          failureReason: null,
+          completedAt: null,
+          triggerPayload: {
+            ...(run.triggerPayload ?? {}),
+            transientFailure: {
+              code: EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE,
+              status: transientFailureStatus,
+              reason: executionIssueTransientFailureReason(transientFailureStatus),
+              clearedAt: new Date().toISOString(),
+            },
+          },
         });
       }
       return null;

@@ -14,22 +14,44 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
 const mockHeartbeatService = vi.hoisted(() => ({
   buildIssueGraphLivenessAutoRecoveryPreview: vi.fn(),
   reconcileIssueGraphLiveness: vi.fn(),
+  startTaskDrain: vi.fn(),
+  stopTaskDrain: vi.fn(),
+  getTaskDrainStatus: vi.fn(),
+  getTaskDrainGeneration: vi.fn(),
+  restoreTaskDrainIfCurrent: vi.fn(),
 }));
 const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
+  findManagedSandboxEnvironment: vi.fn(),
+  update: vi.fn(),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockPublishActivity = vi.hoisted(() => vi.fn());
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => mockInstanceSettingsService,
     logActivity: mockLogActivity,
+    publishActivity: mockPublishActivity,
   }));
   vi.doMock("../services/environments.js", () => ({
     environmentService: () => mockEnvironmentService,
   }));
 }
+
+// Identity object the mocked db.transaction hands to writers; tests assert
+// both the marker clear and the settings update receive THIS same tx.
+const TX_SENTINEL = { __tx: true };
+// Module-scoped (not rebuilt per createApp call) so a test can assert how
+// many times a request opened a transaction — the task-drain audit writes
+// for every company must share ONE transaction, not one each.
+const mockDb = {
+  // Runs the callback with a sentinel tx and propagates throws, so a
+  // failing write inside rejects the whole request exactly like a real
+  // transaction rollback.
+  transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(TX_SENTINEL)),
+};
 
 async function createApp(actor: any) {
   const [{ errorHandler }, { instanceSettingsRoutes }] = await Promise.all([
@@ -42,7 +64,7 @@ async function createApp(actor: any) {
     req.actor = actor;
     next();
   });
-  app.use("/api", instanceSettingsRoutes({} as any));
+  app.use("/api", instanceSettingsRoutes(mockDb as any));
   app.use(errorHandler);
   return app;
 }
@@ -65,8 +87,24 @@ describe("instance settings routes", () => {
     mockInstanceSettingsService.listCompanyIds.mockReset();
     mockHeartbeatService.buildIssueGraphLivenessAutoRecoveryPreview.mockReset();
     mockHeartbeatService.reconcileIssueGraphLiveness.mockReset();
+    mockHeartbeatService.startTaskDrain.mockReset();
+    mockHeartbeatService.stopTaskDrain.mockReset();
+    mockHeartbeatService.getTaskDrainStatus.mockReset();
+    mockHeartbeatService.getTaskDrainGeneration.mockReset();
+    mockHeartbeatService.restoreTaskDrainIfCurrent.mockReset();
     mockEnvironmentService.getById.mockReset();
+    mockEnvironmentService.findManagedSandboxEnvironment.mockReset();
+    mockEnvironmentService.findManagedSandboxEnvironment.mockResolvedValue(null);
+    mockEnvironmentService.update.mockReset();
+    mockPublishActivity.mockReset();
     mockLogActivity.mockReset();
+    // Mirrors the real logActivity: push a publication for the transaction
+    // to publish once it commits, so route-level tests can prove publish
+    // happens only after every company's write in the same request lands.
+    mockLogActivity.mockImplementation((_db: unknown, input: { companyId: string }, postCommitPublications?: unknown[]) => {
+      postCommitPublications?.push({ companyId: input.companyId, payload: input, pluginEvent: null });
+      return Promise.resolve({ id: `activity-${input.companyId}` });
+    });
     mockInstanceSettingsService.get.mockResolvedValue({
       id: "instance-settings-1",
       defaultEnvironmentId: null,
@@ -293,10 +331,79 @@ describe("instance settings routes", () => {
       .send({ defaultEnvironmentId: "11111111-1111-4111-8111-111111111111" });
 
     expect(patchRes.status).toBe(200);
-    expect(mockInstanceSettingsService.update).toHaveBeenCalledWith({
-      defaultEnvironmentId: "11111111-1111-4111-8111-111111111111",
-    });
+    expect(mockInstanceSettingsService.update).toHaveBeenCalledWith(
+      { defaultEnvironmentId: "11111111-1111-4111-8111-111111111111" },
+      { db: TX_SENTINEL },
+    );
     expect(mockLogActivity).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears the managed-default stamp marker on an explicit tenant default write", async () => {
+    // A tenant write of defaultEnvironmentId reclassifies the default as
+    // tenant-chosen: the reconciliation stamp marker on the managed
+    // sandbox row must not survive, or a later managed-sandbox-only
+    // mode-off pass would mistake the tenant's choice for a stamp.
+    mockEnvironmentService.findManagedSandboxEnvironment.mockResolvedValue({
+      id: "managed-env-1",
+      driver: "sandbox",
+      status: "active",
+      config: {},
+      envVars: {},
+      metadata: { managedByPaperclip: true, managedDefaultStamped: true },
+    });
+    const app = await createApp({
+      type: "board",
+      userId: "local-board",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+    });
+
+    const patchRes = await request(app)
+      .patch("/api/instance/settings")
+      .send({ defaultEnvironmentId: "11111111-1111-4111-8111-111111111111" });
+
+    expect(patchRes.status).toBe(200);
+    expect(mockEnvironmentService.update).toHaveBeenCalledWith(
+      "managed-env-1",
+      { metadata: { managedByPaperclip: true } },
+      { db: TX_SENTINEL },
+    );
+    // Both writes commit in ONE transaction — each receives the SAME tx —
+    // so no partial failure can desync the stamp marker from the default
+    // (neither a stale stamp on a tenant choice, nor a reconciliation
+    // default that lost its marker and can never revert).
+    expect(mockInstanceSettingsService.update).toHaveBeenCalledWith(
+      { defaultEnvironmentId: "11111111-1111-4111-8111-111111111111" },
+      { db: TX_SENTINEL },
+    );
+  });
+
+  it("aborts the whole request (no committed settings) when the stamp-marker clear fails inside the transaction", async () => {
+    // The marker clear and the settings write share a transaction, so a
+    // failure in either rolls the whole thing back — a real DB would
+    // discard both; here the settings write is never even reached.
+    mockEnvironmentService.findManagedSandboxEnvironment.mockResolvedValue({
+      id: "managed-env-1",
+      driver: "sandbox",
+      status: "active",
+      config: {},
+      envVars: {},
+      metadata: { managedByPaperclip: true, managedDefaultStamped: true },
+    });
+    mockEnvironmentService.update.mockRejectedValue(new Error("metadata write failed"));
+    const app = await createApp({
+      type: "board",
+      userId: "local-board",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+    });
+
+    const patchRes = await request(app)
+      .patch("/api/instance/settings")
+      .send({ defaultEnvironmentId: "11111111-1111-4111-8111-111111111111" });
+
+    expect(patchRes.status).toBeGreaterThanOrEqual(500);
+    expect(mockInstanceSettingsService.update).not.toHaveBeenCalled();
   });
 
   it("rejects unknown defaultEnvironmentId values with 422", async () => {
@@ -719,6 +826,457 @@ describe("instance settings routes", () => {
 
       expect(res.status).toBe(200);
       expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ executionMode: "kubernetes" });
+    });
+  });
+
+  describe("operator-hidden settings floor", () => {
+    const adminActor = {
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    };
+
+    afterEach(() => {
+      delete process.env.PAPERCLIP_HIDDEN_SETTINGS;
+    });
+
+    it("rejects a write that changes a hidden general field", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.general.censorUsernameInLogs";
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ censorUsernameInLogs: true });
+
+      expect(res.status).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "settings_operator_managed" });
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("allows a same-value echo of a hidden general field", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.general.censorUsernameInLogs";
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ censorUsernameInLogs: false, keyboardShortcuts: true });
+
+      expect(res.status).toBe(200);
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: true,
+      });
+    });
+
+    it("deep-compares hidden backupRetention echoes instead of rejecting them", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.general.backupRetention";
+      mockInstanceSettingsService.getGeneral.mockResolvedValue({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        backupRetention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+      });
+      const app = await createApp(adminActor);
+
+      const echo = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ backupRetention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      expect(echo.status).toBe(200);
+
+      const change = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ backupRetention: { dailyDays: 14, weeklyWeeks: 4, monthlyMonths: 1 } });
+      expect(change.status).toBe(403);
+      expect(change.body.details).toMatchObject({ code: "settings_operator_managed" });
+    });
+
+    it("rejects a write that changes a hidden experimental toggle", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.experimental.enableEnvironments";
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableEnvironments: true });
+
+      expect(res.status).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "settings_operator_managed" });
+      expect(mockInstanceSettingsService.updateExperimental).not.toHaveBeenCalled();
+    });
+
+    it("allows writes to non-hidden experimental toggles while others are hidden", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS =
+        "instance.experimental.enableEnvironments,instance.experimental.enableServerInfoDebugView";
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableIsolatedWorkspaces: true });
+
+      expect(res.status).toBe(200);
+      expect(mockInstanceSettingsService.updateExperimental).toHaveBeenCalledWith({
+        enableIsolatedWorkspaces: true,
+      });
+    });
+
+    it("floors every experimental toggle when the whole Experimental page is hidden", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.experimental";
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableIsolatedWorkspaces: true });
+
+      expect(res.status).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "settings_operator_managed" });
+      expect(mockInstanceSettingsService.updateExperimental).not.toHaveBeenCalled();
+    });
+
+    it("keeps every field writable when the env var is unset", async () => {
+      const app = await createApp(adminActor);
+
+      const general = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ censorUsernameInLogs: true });
+      expect(general.status).toBe(200);
+
+      const experimental = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableEnvironments: true });
+      expect(experimental.status).toBe(200);
+    });
+  });
+
+  describe("task drain", () => {
+    const adminActor = {
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    };
+    const nonAdminActor = {
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: ["company-1"],
+    };
+    const idleStatus = {
+      draining: false,
+      startedAt: null,
+      expiresAt: null,
+      activeRuns: 0,
+      pendingWakes: 0,
+      quiescent: true,
+    };
+
+    afterEach(() => {
+      // A drain the mock left active must not carry over into an unrelated
+      // test, so every test starts from the idle status again.
+      mockHeartbeatService.getTaskDrainStatus.mockReset();
+      mockHeartbeatService.startTaskDrain.mockReset();
+      mockHeartbeatService.stopTaskDrain.mockReset();
+      mockHeartbeatService.getTaskDrainGeneration.mockReset();
+      mockHeartbeatService.restoreTaskDrainIfCurrent.mockReset();
+    });
+
+    it("returns the idle status", async () => {
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
+      const app = await createApp(nonAdminActor);
+
+      const res = await request(app).get("/api/instance/task-drain");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(idleStatus);
+    });
+
+    it("starts a drain and writes an activity record for every company in one transaction", async () => {
+      const startedAt = "2026-08-29T00:00:00.000Z";
+      const expiresAt = "2026-08-29T06:00:00.000Z";
+      mockHeartbeatService.startTaskDrain.mockReturnValue({ startedAt, expiresAt });
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .post("/api/instance/task-drain")
+        .send({ ttlMs: 21_600_000 });
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.startTaskDrain).toHaveBeenCalledWith({ ttlMs: 21_600_000 });
+      expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+      expect(mockLogActivity).toHaveBeenCalledTimes(2);
+      for (const call of mockLogActivity.mock.calls) {
+        expect(call[0]).toBe(TX_SENTINEL);
+        expect(call[1]).toMatchObject({ action: "instance.task_drain.started" });
+      }
+      // Publish only runs after the shared transaction commits.
+      expect(mockPublishActivity).toHaveBeenCalledTimes(2);
+    });
+
+    it("starts an indefinite drain when the caller sends no ttlMs", async () => {
+      mockHeartbeatService.startTaskDrain.mockReturnValue({ startedAt: "2026-08-29T00:00:00.000Z", expiresAt: null });
+      const app = await createApp(adminActor);
+
+      const res = await request(app).post("/api/instance/task-drain").send({});
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.startTaskDrain).toHaveBeenCalledWith({ ttlMs: null });
+    });
+
+    it("ends the drain and writes an activity record for every company in one transaction", async () => {
+      mockHeartbeatService.stopTaskDrain.mockReturnValue({ wasActive: true });
+      const app = await createApp(adminActor);
+
+      const res = await request(app).delete("/api/instance/task-drain");
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.stopTaskDrain).toHaveBeenCalledWith();
+      expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+      expect(mockLogActivity).toHaveBeenCalledTimes(2);
+      for (const call of mockLogActivity.mock.calls) {
+        expect(call[0]).toBe(TX_SENTINEL);
+        expect(call[1]).toMatchObject({ action: "instance.task_drain.stopped" });
+      }
+      expect(mockPublishActivity).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not start a drain when the company list read fails", async () => {
+      mockInstanceSettingsService.listCompanyIds.mockRejectedValue(new Error("db unavailable"));
+      const app = await createApp(adminActor);
+
+      const res = await request(app).post("/api/instance/task-drain").send({});
+
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(mockHeartbeatService.startTaskDrain).not.toHaveBeenCalled();
+    });
+
+    it("commits no activity record for any company when one company's audit write fails", async () => {
+      // company-1 succeeds, company-2 fails. A real transaction rolls both
+      // back together; here we prove the route puts both writes in the
+      // SAME transaction (rather than firing one independent write per
+      // company) and never publishes a record for the company that did
+      // succeed before the shared transaction rejected.
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
+      mockHeartbeatService.startTaskDrain.mockReturnValue({
+        startedAt: "2026-08-29T00:00:00.000Z",
+        expiresAt: null,
+      });
+      mockLogActivity.mockImplementation((_db: unknown, input: { companyId: string }) => (
+        input.companyId === "company-2"
+          ? Promise.reject(new Error("activity insert failed"))
+          : Promise.resolve({ id: `activity-${input.companyId}` })
+      ));
+      const app = await createApp(adminActor);
+
+      const res = await request(app).post("/api/instance/task-drain").send({});
+
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+      for (const call of mockLogActivity.mock.calls) {
+        expect(call[0]).toBe(TX_SENTINEL);
+      }
+      expect(mockPublishActivity).not.toHaveBeenCalled();
+    });
+
+    it("reverts the drain when the activity log write fails", async () => {
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
+      mockHeartbeatService.startTaskDrain.mockReturnValue({
+        startedAt: "2026-08-29T00:00:00.000Z",
+        expiresAt: null,
+      });
+      mockHeartbeatService.getTaskDrainGeneration.mockReturnValue(3);
+      mockLogActivity.mockRejectedValue(new Error("activity insert failed"));
+      const app = await createApp(adminActor);
+
+      const res = await request(app).post("/api/instance/task-drain").send({});
+
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(mockHeartbeatService.startTaskDrain).toHaveBeenCalledTimes(1);
+      // The rollback restores through the generation-guarded primitive
+      // (not a direct start/stop call), so a concurrent mutation that
+      // superseded this one after the generation was stamped is never
+      // clobbered by this restore.
+      expect(mockHeartbeatService.restoreTaskDrainIfCurrent).toHaveBeenCalledWith(3, {
+        draining: false,
+        ttlMs: null,
+      });
+    });
+
+    it("restores the prior drain when a POST over an active drain fails to write its audit record", async () => {
+      const priorExpiresAt = new Date(Date.now() + 60_000);
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue({
+        draining: true,
+        startedAt: new Date(Date.now() - 60_000),
+        expiresAt: priorExpiresAt,
+        activeRuns: 0,
+        pendingWakes: 0,
+        quiescent: true,
+      });
+      mockHeartbeatService.startTaskDrain.mockReturnValue({
+        startedAt: "2026-08-29T00:00:00.000Z",
+        expiresAt: "2026-08-29T06:00:00.000Z",
+      });
+      mockHeartbeatService.getTaskDrainGeneration.mockReturnValue(9);
+      mockLogActivity.mockRejectedValue(new Error("activity insert failed"));
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .post("/api/instance/task-drain")
+        .send({ ttlMs: 21_600_000 });
+
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(mockHeartbeatService.stopTaskDrain).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.startTaskDrain).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.restoreTaskDrainIfCurrent).toHaveBeenCalledTimes(1);
+      const [generationArg, restoreArg] = mockHeartbeatService.restoreTaskDrainIfCurrent.mock.calls[0];
+      expect(generationArg).toBe(9);
+      expect(restoreArg.draining).toBe(true);
+      expect(restoreArg.ttlMs).toBeGreaterThan(0);
+      expect(restoreArg.ttlMs).toBeLessThanOrEqual(60_000);
+    });
+
+    it("still reports the started drain when publishing its committed audit record fails", async () => {
+      // The audit row already committed by the time publish runs, so a
+      // publish failure must not roll the in-memory drain back — that
+      // would desync it from the row a client can already read. It also
+      // must not turn the response into a false failure: the caller asked
+      // to start a drain, and the drain did start.
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
+      const drain = { startedAt: "2026-08-29T00:00:00.000Z", expiresAt: null };
+      mockHeartbeatService.startTaskDrain.mockReturnValue(drain);
+      mockHeartbeatService.getTaskDrainGeneration.mockReturnValue(5);
+      mockPublishActivity.mockImplementation(() => {
+        throw new Error("live event bus unavailable");
+      });
+      const app = await createApp(adminActor);
+
+      const res = await request(app).post("/api/instance/task-drain").send({});
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(drain);
+      expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+      expect(mockLogActivity).toHaveBeenCalledTimes(2);
+      expect(mockHeartbeatService.restoreTaskDrainIfCurrent).not.toHaveBeenCalled();
+    });
+
+    it("does not stop the drain when the company list read fails", async () => {
+      mockInstanceSettingsService.listCompanyIds.mockRejectedValue(new Error("db unavailable"));
+      const app = await createApp(adminActor);
+
+      const res = await request(app).delete("/api/instance/task-drain");
+
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(mockHeartbeatService.stopTaskDrain).not.toHaveBeenCalled();
+    });
+
+    it("restores an active drain when the activity log write fails", async () => {
+      const expiresAt = new Date(Date.now() + 60_000);
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue({
+        draining: true,
+        startedAt: new Date(),
+        expiresAt,
+        activeRuns: 0,
+        pendingWakes: 0,
+        quiescent: true,
+      });
+      mockHeartbeatService.stopTaskDrain.mockReturnValue({ wasActive: true });
+      mockHeartbeatService.getTaskDrainGeneration.mockReturnValue(11);
+      mockLogActivity.mockRejectedValue(new Error("activity insert failed"));
+      const app = await createApp(adminActor);
+
+      const res = await request(app).delete("/api/instance/task-drain");
+
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(mockHeartbeatService.stopTaskDrain).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.startTaskDrain).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.restoreTaskDrainIfCurrent).toHaveBeenCalledTimes(1);
+      const [generationArg, restoreArg] = mockHeartbeatService.restoreTaskDrainIfCurrent.mock.calls[0];
+      expect(generationArg).toBe(11);
+      expect(restoreArg.draining).toBe(true);
+      expect(restoreArg.ttlMs).toBeGreaterThan(0);
+      expect(restoreArg.ttlMs).toBeLessThanOrEqual(60_000);
+    });
+
+    it("still reports the stopped drain when publishing its committed audit record fails", async () => {
+      const expiresAt = new Date(Date.now() + 60_000);
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue({
+        draining: true,
+        startedAt: new Date(),
+        expiresAt,
+        activeRuns: 0,
+        pendingWakes: 0,
+        quiescent: true,
+      });
+      mockHeartbeatService.stopTaskDrain.mockReturnValue({ wasActive: true });
+      mockHeartbeatService.getTaskDrainGeneration.mockReturnValue(7);
+      mockPublishActivity.mockImplementation(() => {
+        throw new Error("live event bus unavailable");
+      });
+      const app = await createApp(adminActor);
+
+      const res = await request(app).delete("/api/instance/task-drain");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ wasActive: true });
+      expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+      expect(mockLogActivity).toHaveBeenCalledTimes(2);
+      expect(mockHeartbeatService.restoreTaskDrainIfCurrent).not.toHaveBeenCalled();
+    });
+
+    it("still publishes the second company's record when the first company's publish fails", async () => {
+      // Each committed audit record publishes independently, so one
+      // company's publish failure must not stop the rest from publishing.
+      const drain = { startedAt: "2026-08-29T00:00:00.000Z", expiresAt: null };
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
+      mockHeartbeatService.startTaskDrain.mockReturnValue(drain);
+      mockHeartbeatService.getTaskDrainGeneration.mockReturnValue(5);
+      mockPublishActivity.mockImplementation((publication: { companyId: string }) => {
+        if (publication.companyId === "company-1") throw new Error("live event bus unavailable");
+      });
+      const app = await createApp(adminActor);
+
+      const res = await request(app).post("/api/instance/task-drain").send({});
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(drain);
+      expect(mockPublishActivity).toHaveBeenCalledTimes(2);
+      expect(mockPublishActivity.mock.calls.map(([publication]: [{ companyId: string }]) => publication.companyId)).toEqual([
+        "company-1",
+        "company-2",
+      ]);
+    });
+
+    it("rejects a board actor without instance admin rights", async () => {
+      const app = await createApp(nonAdminActor);
+
+      const res = await request(app).post("/api/instance/task-drain").send({});
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.startTaskDrain).not.toHaveBeenCalled();
+    });
+
+    it("rejects a ttl above the maximum", async () => {
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .post("/api/instance/task-drain")
+        .send({ ttlMs: 24 * 60 * 60 * 1000 + 1 });
+
+      expect(res.status).toBe(400);
+      expect(mockHeartbeatService.startTaskDrain).not.toHaveBeenCalled();
+    });
+
+    it("rejects a zero or negative ttl", async () => {
+      const app = await createApp(adminActor);
+
+      const zeroRes = await request(app).post("/api/instance/task-drain").send({ ttlMs: 0 });
+      expect(zeroRes.status).toBe(400);
+
+      const negativeRes = await request(app).post("/api/instance/task-drain").send({ ttlMs: -1 });
+      expect(negativeRes.status).toBe(400);
+
+      expect(mockHeartbeatService.startTaskDrain).not.toHaveBeenCalled();
     });
   });
 });

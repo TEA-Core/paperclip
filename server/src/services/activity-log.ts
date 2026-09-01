@@ -103,6 +103,7 @@ function readNonEmptyString(value: unknown) {
  * looks like — and what would otherwise blow up the `activity_log.run_id` foreign key).
  */
 async function lookupActivityRun(db: Db, input: LogActivityInput) {
+
   const runId = readNonEmptyString(input.runId);
   if (!runId || !isUuidLike(runId)) return null;
   const row = await db

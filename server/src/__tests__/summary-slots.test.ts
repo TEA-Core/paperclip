@@ -9,6 +9,7 @@ import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   issues,
   projectWorkspaces,
@@ -50,6 +51,7 @@ describeEmbeddedPostgres("summary slot service", () => {
     await db.delete(documentRevisions);
     await db.delete(documents);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);

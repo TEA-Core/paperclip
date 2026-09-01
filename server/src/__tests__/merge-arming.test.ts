@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import {
   companies,
   createDb,
+  executionWorkspaces,
   externalObjectMentions,
   externalObjects,
   issues,
@@ -15,7 +16,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { armMergeOnApproval, publishApprovalStatus, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
+import { armMergeOnApproval, publishApprovalStatus, resolveLinkedPullRequests, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -118,10 +119,10 @@ function createPRExternalObject(
   }
   if ("headRefName" in overrides) {
     if (overrides.headRefName !== null) {
-      data.head = { ref: overrides.headRefName };
+      data.headRef = overrides.headRefName;
     }
   } else {
-    data.head = { ref: "some-branch-name" };
+    data.headRef = "some-branch-name";
   }
   if ("title" in overrides) {
     if (overrides.title !== null) {
@@ -1235,6 +1236,66 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       expect(body.description).toBe("SUP-12345 approved via Paperclip");
       expect(body.target_url).toBe("https://paperclip.example.com/issues/SUP-12345");
     });
+
+    it("reports the head SHA it stamped on armed (SUP-13714 persistence)", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/42" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345");
+      expect(result.kind).toBe("armed");
+      expect(result.headSha).toBe(HEAD_SHA);
+    });
+  });
+
+  describe("status:skipped:head_moved (TOCTOU pin)", () => {
+    it("refuses to write when expectedHeadSha does not match the live head", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/42" }),
+      );
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345", {
+        expectedHeadSha: "different0000000000000000000000000000000000000000",
+      });
+
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("status:skipped:head_moved");
+      expect(result.headSha).toBe(HEAD_SHA);
+
+      const posts = mockGhFetch.mock.calls.filter(
+        (call) => (call[1] as RequestInit | undefined)?.method === "POST",
+      );
+      expect(posts).toHaveLength(0);
+    });
+
+    it("writes when expectedHeadSha matches the live head", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42),
+      );
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({ head: { sha: HEAD_SHA }, html_url: "https://github.com/TEA-Core/paperclip/pull/42" }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-12345", {
+        expectedHeadSha: HEAD_SHA,
+      });
+      expect(result.kind).toBe("armed");
+      expect(result.headSha).toBe(HEAD_SHA);
+      expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe("status:skipped:no-pr", () => {
@@ -1497,6 +1558,59 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
         "status:failed:pr_auth: HTTP 401 Bad credentials (scope=company, secretName=GITHUB_TOKEN)",
       );
       expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("repo-context fallback when zero mention rows are cached (SUP-13831)", () => {
+    it("arms the merge by live-resolving the repo from the issue's project workspace when no PR was ever mentioned", async () => {
+      const [projectRow] = await db
+        .insert(projects)
+        .values({
+          id: randomUUID(),
+          companyId,
+          name: "TEA-Core/paperclip",
+          urlKey: "TEA-Core-paperclip",
+          status: "in_progress",
+        })
+        .returning();
+      await db.insert(projectWorkspaces).values({
+        id: randomUUID(),
+        companyId,
+        projectId: projectRow!.id,
+        name: "paperclip",
+        repoUrl: "https://github.com/TEA-Core/paperclip",
+        isPrimary: true,
+      });
+      await db.update(issues).set({ projectId: projectRow!.id }).where(eq(issues.id, issueId));
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse([
+            {
+              number: 3264,
+              draft: false,
+              head: { ref: "TST-12345-work" },
+              title: "deliver TST-12345",
+              body: null,
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          createMockResponse({
+            head: { sha: HEAD_SHA },
+            html_url: "https://github.com/TEA-Core/paperclip/pull/3264",
+          }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "TST-12345");
+      expect(result.kind).toBe("armed");
+      expect(result.message).toContain("live re-resolve");
+      expect(result.message).toContain("TEA-Core/paperclip#3264");
+      expect(mockGhFetch).toHaveBeenCalledTimes(3);
+      expect(mockGhFetch.mock.calls[0]![0]).toBe(
+        "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100",
+      );
     });
   });
 
@@ -2262,3 +2376,448 @@ describe("guard: shouldPublishApprovalStatus (SUP-12558)", () => {
     expect(shouldPublishApprovalStatus(undefined)).toBe(false);
   });
 });
+
+describeEmbeddedPostgres(
+  "publishApprovalStatus delivery-identity gate (ADR-091 D1, SUP-14676)",
+  () => {
+    let db: Db;
+    let companyId: string;
+    let issueId: string;
+    let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+    const HEAD_SHA = "abc123def456789012345678901234567890abcd";
+    const DELIVERY_BRANCH = "SUP-14676-own-delivery-branch";
+    const DELIVERY_REPO_URL = "https://github.com/TEA-Core/paperclip";
+
+    beforeAll(async () => {
+      tempDb = await startEmbeddedPostgresTestDatabase("paperclip-merge-arming-gate-");
+      db = createDb(tempDb.connectionString);
+    }, 20_000);
+
+    afterAll(async () => {
+      await tempDb?.cleanup();
+    });
+
+    beforeEach(async () => {
+      vi.resetAllMocks();
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
+
+      await db.delete(externalObjectMentions);
+      await db.delete(externalObjects);
+      await db.delete(issues);
+      await db.delete(executionWorkspaces);
+      await db.delete(projectWorkspaces);
+      await db.delete(projects);
+      await db.delete(companies);
+
+      const companyRows = await db
+        .insert(companies)
+        .values({ name: "Gate Company", issuePrefix: "SUP", mergeArmingEnabled: true })
+        .returning();
+      companyId = companyRows[0]!.id;
+
+      issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Gate Issue",
+        status: "in_progress",
+      });
+    });
+
+    afterEach(async () => {
+      await db.delete(externalObjectMentions);
+      await db.delete(externalObjects);
+      await db.delete(issues);
+      await db.delete(executionWorkspaces);
+      await db.delete(projectWorkspaces);
+      await db.delete(projects);
+      await db.delete(companies);
+    });
+
+    async function seedDeliveryIdentity(branch: string | null, repoUrl: string | null) {
+      const [projectRow] = await db
+        .insert(projects)
+        .values({
+          id: randomUUID(),
+          companyId,
+          name: "TEA-Core/paperclip",
+          urlKey: "tea-core-paperclip",
+          status: "in_progress",
+        })
+        .returning();
+      const [ewRow] = await db
+        .insert(executionWorkspaces)
+        .values({
+          id: randomUUID(),
+          companyId,
+          projectId: projectRow!.id,
+          mode: "isolated",
+          strategyType: "git_worktree",
+          name: "card-workspace",
+          status: "active",
+          branchName: branch,
+          repoUrl,
+        })
+        .returning();
+      await db
+        .update(issues)
+        .set({ projectId: projectRow!.id, executionWorkspaceId: ewRow!.id })
+        .where(eq(issues.id, issueId));
+    }
+
+    async function seedMention(owner: string, repo: string, number: number, headRefName: string | null) {
+      const obj = createPRExternalObject(companyId, owner, repo, number, { headRefName });
+      const [externalObj] = await db.insert(externalObjects).values(obj).returning();
+      await db.insert(externalObjectMentions).values({
+        companyId,
+        sourceIssueId: issueId,
+        sourceKind: "issue_comment",
+        objectId: externalObj!.id,
+        objectType: "pull_request",
+        providerKey: "github",
+      });
+    }
+
+    it(
+      "refuses to stamp a PR the card merely cited (same repo, different branch) — not_delivered, zero writes",
+      async () => {
+        await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+        // The card cited another card's PR: same repo, but the head ref is that card's branch.
+        await seedMention("TEA-Core", "paperclip", 42, "SUP-14671-other-card-branch");
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("skipped");
+        expect(result.message).toBe(
+          "status:skipped:not_delivered: TEA-Core/paperclip#42 head TEA-Core/paperclip:SUP-14671-other-card-branch is not this card's delivery branch SUP-14676-own-delivery-branch",
+        );
+        expect(result.headSha).toBeUndefined();
+        expect(mockGhFetch).not.toHaveBeenCalled();
+      },
+    );
+
+    it(
+      "publishes as today when the sole candidate matches the card's delivery repo AND branch",
+      async () => {
+        await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+        await seedMention("TEA-Core", "paperclip", 42, DELIVERY_BRANCH);
+
+        mockGhFetch
+          .mockResolvedValueOnce(
+            createMockResponse({
+              head: { sha: HEAD_SHA },
+              html_url: "https://github.com/TEA-Core/paperclip/pull/42",
+            }),
+          )
+          .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("armed");
+        expect(result.headSha).toBe(HEAD_SHA);
+        expect(mockGhFetch).toHaveBeenCalledTimes(2);
+        const statusCall = mockGhFetch.mock.calls[1]!;
+        expect(statusCall[0]).toBe(
+          `https://api.github.com/repos/TEA-Core/paperclip/statuses/${HEAD_SHA}`,
+        );
+        expect(statusCall[1]).toMatchObject({
+          method: "POST",
+          headers: { authorization: `Bearer ${GITHUB_TOKEN}` },
+        });
+        const body = JSON.parse(statusCall[1]!.body as string);
+        expect(body.state).toBe("success");
+        expect(body.context).toBe("paperclip/approved");
+      },
+    );
+
+    it(
+      "refuses a coordinating card that cited an external (different-repo) PR — not_delivered, zero writes (SUP-14671 shape)",
+      async () => {
+        await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+        // A coordinating card cited a PR in a dependency repo it did not deliver.
+        await seedMention("some-org", "upstream-lib", 7, "some-org/release-branch");
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("skipped");
+        expect(result.message).toBe(
+          "status:skipped:not_delivered: some-org/upstream-lib#7 head some-org/upstream-lib:some-org/release-branch is not this card's delivery branch SUP-14676-own-delivery-branch",
+        );
+        expect(mockGhFetch).not.toHaveBeenCalled();
+      },
+    );
+
+    it(
+      "fails closed when the card's delivery identity cannot be resolved (no branch recorded)",
+      async () => {
+        await seedDeliveryIdentity(null, DELIVERY_REPO_URL);
+        await seedMention("TEA-Core", "paperclip", 42, "whatever-branch");
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("skipped");
+        expect(result.message).toBe(
+          "status:skipped:delivery_identity_unresolved: no delivery branch recorded on this card's execution workspace; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+        );
+        expect(mockGhFetch).not.toHaveBeenCalled();
+      },
+    );
+
+    // The live-discovery path (SUP-13313/SUP-13831) is reached with ZERO cached
+    // mentions and authorizes by identifier SUBSTRING on head ref / title / body.
+    // It is a second stamp path and takes the same gate — a gate on only one of
+    // the two paths is not a gate.
+    it(
+      "refuses a zero-mention card whose live-discovered PR only CITES its identifier — not_delivered, zero status writes",
+      async () => {
+        await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+        // No cached mentions at all: a coordination card. The open PR in the
+        // project repo carries this card's identifier in its body only — it was
+        // delivered from another card's branch.
+        mockGhFetch.mockResolvedValueOnce(
+          createMockResponse([
+            {
+              number: 99,
+              draft: false,
+              head: { ref: "SUP-14671-other-card-branch" },
+              title: "coordination follow-up",
+              body: "Rolls up SUP-14676 and its siblings.",
+            },
+          ]),
+        );
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("skipped");
+        expect(result.message).toBe(
+          "status:skipped:not_delivered: TEA-Core/paperclip#99 head TEA-Core/paperclip:SUP-14671-other-card-branch is not this card's delivery branch SUP-14676-own-delivery-branch",
+        );
+        // Only the open-PR listing; no head-SHA read and no status POST.
+        expect(mockGhFetch).toHaveBeenCalledTimes(1);
+        expect(mockGhFetch.mock.calls[0]![0]).toBe(
+          "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100",
+        );
+      },
+    );
+
+    it(
+      "fails closed on the live path when no delivery branch is recorded — never falls back to identifier-substring authorization",
+      async () => {
+        await seedDeliveryIdentity(null, DELIVERY_REPO_URL);
+        mockGhFetch.mockResolvedValueOnce(
+          createMockResponse([
+            {
+              number: 99,
+              draft: false,
+              head: { ref: "SUP-14676-looks-like-ours" },
+              title: "SUP-14676 deliver",
+              body: null,
+            },
+          ]),
+        );
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("skipped");
+        expect(result.message).toBe(
+          "status:skipped:delivery_identity_unresolved: no delivery branch recorded on this card's execution workspace; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+        );
+        expect(mockGhFetch).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it(
+      "still publishes on the live path when the discovered PR head ref IS the card's delivery branch (SUP-13313 happy path preserved)",
+      async () => {
+        await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+        mockGhFetch
+          .mockResolvedValueOnce(
+            createMockResponse([
+              {
+                number: 99,
+                draft: false,
+                head: { ref: DELIVERY_BRANCH },
+                title: "deliver SUP-14676",
+                body: null,
+              },
+            ]),
+          )
+          .mockResolvedValueOnce(
+            createMockResponse({
+              head: { sha: HEAD_SHA },
+              html_url: "https://github.com/TEA-Core/paperclip/pull/99",
+            }),
+          )
+          .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("armed");
+        expect(result.message).toContain("live re-resolve");
+        expect(result.headSha).toBe(HEAD_SHA);
+        expect(mockGhFetch).toHaveBeenCalledTimes(3);
+        expect(mockGhFetch.mock.calls[2]![0]).toBe(
+          `https://api.github.com/repos/TEA-Core/paperclip/statuses/${HEAD_SHA}`,
+        );
+      },
+    );
+
+    // SUP-14715 D-A: the cached-mention D1 gate previously read nested head.ref
+    // / flat headRefName — neither of which the GitHub external-object provider
+    // writes. It now reads the canonical flat headRef key (with nested head.ref
+    // and flat headRefName tolerated for legacy cached rows). This is the
+    // cached-mention stamp path that had zero coverage under the real provider
+    // shape.
+    async function seedMentionWithData(
+      owner: string,
+      repo: string,
+      number: number,
+      data: Record<string, unknown>,
+    ) {
+      const [externalObj] = await db
+        .insert(externalObjects)
+        .values({
+          companyId,
+          providerKey: "github",
+          objectType: "pull_request",
+          externalId: `${owner}/${repo}#pull/${number}`,
+          data: { state: "open", draft: false, node_id: NODE_ID, ...data },
+        })
+        .returning();
+      await db.insert(externalObjectMentions).values({
+        companyId,
+        sourceIssueId: issueId,
+        sourceKind: "issue_comment",
+        objectId: externalObj!.id,
+        objectType: "pull_request",
+        providerKey: "github",
+      });
+    }
+
+    it("resolveLinkedPullRequests populates headRefName from a data.headRef-only row (the provider shape)", async () => {
+      await seedMentionWithData("TEA-Core", "paperclip", 42, { headRef: "SUP-14715-canonical" });
+
+      const prs = await resolveLinkedPullRequests(db, companyId, issueId);
+
+      expect(prs).toHaveLength(1);
+      expect(prs[0]!.headRefName).toBe("SUP-14715-canonical");
+    });
+
+    it("arms the cached-mention card whose delivery branch equals a headRef-only row's branch (canonical provider shape)", async () => {
+      await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+      await seedMentionWithData("TEA-Core", "paperclip", 42, { headRef: DELIVERY_BRANCH });
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({
+            head: { sha: HEAD_SHA },
+            html_url: "https://github.com/TEA-Core/paperclip/pull/42",
+          }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+        enforceDeliveryIdentity: true,
+      });
+
+      expect(result.kind).toBe("armed");
+      expect(result.headSha).toBe(HEAD_SHA);
+      expect(mockGhFetch).toHaveBeenCalledTimes(2);
+      expect(mockGhFetch.mock.calls[1]![0]).toBe(
+        `https://api.github.com/repos/TEA-Core/paperclip/statuses/${HEAD_SHA}`,
+      );
+    });
+
+    it("refuses not_delivered when the card's branch differs from a headRef-only row's branch (canonical provider shape)", async () => {
+      await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+      await seedMentionWithData("TEA-Core", "paperclip", 42, {
+        headRef: "SUP-14714-other-card-branch",
+      });
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+        enforceDeliveryIdentity: true,
+      });
+
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toBe(
+        "status:skipped:not_delivered: TEA-Core/paperclip#42 head TEA-Core/paperclip:SUP-14714-other-card-branch is not this card's delivery branch SUP-14676-own-delivery-branch",
+      );
+      expect(result.headSha).toBeUndefined();
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("still arms a legacy cached row that stores the head ref under nested head.ref", async () => {
+      await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+      await seedMentionWithData("TEA-Core", "paperclip", 42, { head: { ref: DELIVERY_BRANCH } });
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({
+            head: { sha: HEAD_SHA },
+            html_url: "https://github.com/TEA-Core/paperclip/pull/42",
+          }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+        enforceDeliveryIdentity: true,
+      });
+
+      expect(result.kind).toBe("armed");
+      expect(result.headSha).toBe(HEAD_SHA);
+    });
+
+    it("still arms a legacy cached row that stores the head ref under flat headRefName", async () => {
+      await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+      await seedMentionWithData("TEA-Core", "paperclip", 42, { headRefName: DELIVERY_BRANCH });
+
+      mockGhFetch
+        .mockResolvedValueOnce(
+          createMockResponse({
+            head: { sha: HEAD_SHA },
+            html_url: "https://github.com/TEA-Core/paperclip/pull/42",
+          }),
+        )
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+        enforceDeliveryIdentity: true,
+      });
+
+      expect(result.kind).toBe("armed");
+      expect(result.headSha).toBe(HEAD_SHA);
+    });
+
+    it("fails closed with the unchanged not_delivered message when the row has none of headRef / head.ref / headRefName", async () => {
+      await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+      await seedMentionWithData("TEA-Core", "paperclip", 42, {});
+
+      const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+        enforceDeliveryIdentity: true,
+      });
+
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toBe(
+        "status:skipped:not_delivered: TEA-Core/paperclip#42 head TEA-Core/paperclip:(unreadable) is not this card's delivery branch SUP-14676-own-delivery-branch",
+      );
+      expect(result.headSha).toBeUndefined();
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+  },
+);

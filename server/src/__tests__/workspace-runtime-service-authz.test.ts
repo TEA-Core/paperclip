@@ -6,6 +6,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   issues,
   projectWorkspaces,
@@ -44,6 +45,7 @@ describeEmbeddedPostgres("workspace runtime service authz helper", () => {
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -349,7 +351,11 @@ describeEmbeddedPostgres("workspace runtime service authz helper", () => {
     } as any, {
       companyId,
       executionWorkspaceId,
-    })).resolves.toBeUndefined();
+    })).resolves.toMatchObject({
+      actorType: "agent",
+      agentId: managerId,
+      issueId: null,
+    });
   });
 
   it("rejects unrelated same-company agents without matching workspace assignments", async () => {

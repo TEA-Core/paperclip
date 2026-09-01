@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { hasVerifiedWorktreeSeedManifest } from "./worktree-seed-manifest.js";
 
 function parseEnvFile(contents: string): Record<string, string> {
   const entries: Record<string, string> = {};
@@ -52,14 +53,30 @@ export function isLinkedGitWorktreeCheckout(rootDir: string): boolean {
   return readFileSync(gitMetadataPath, "utf8").trimStart().startsWith("gitdir:");
 }
 
+// SUP-14087: on a cross-uid worktree the canonical `.paperclip/` config/env/
+// seed markers belong to another uid and are 0o600. Provisioning writes a
+// uid-scoped state dir at `.paperclip/uid-<uid>/` instead; every consumer
+// resolves through this rule — use the scoped dir when it exists for the
+// running uid, else the canonical dir — so each uid reads only its own state.
+export function resolveWorktreeStateDir(rootDir: string, uid: number = process.getuid?.() ?? -1): string {
+  const scopedDir = path.resolve(rootDir, ".paperclip", `uid-${uid}`);
+  return existsSync(path.join(scopedDir, ".env")) ? scopedDir : path.resolve(rootDir, ".paperclip");
+}
+
 export function resolveWorktreeEnvFilePath(rootDir: string): string {
-  return path.resolve(rootDir, ".paperclip", ".env");
+  return path.join(resolveWorktreeStateDir(rootDir), ".env");
 }
 
 export function isWorktreeSeedPending(rootDir: string): boolean {
-  const markerDir = path.resolve(rootDir, ".paperclip");
-  return existsSync(path.resolve(markerDir, "seed-pending"))
-    && !existsSync(path.resolve(markerDir, "seed-complete"));
+  // SUP-14087 partitions the marker dir per uid; upstream's seed-manifest
+  // verification runs inside that partition rather than a fixed `.paperclip`.
+  const markerDir = resolveWorktreeStateDir(rootDir);
+  const manifestPath = path.join(markerDir, "seed-manifest.json");
+  if (existsSync(manifestPath)) {
+    return !hasVerifiedWorktreeSeedManifest(manifestPath);
+  }
+  return existsSync(path.join(markerDir, "seed-pending"))
+    && !existsSync(path.join(markerDir, "seed-complete"));
 }
 
 function expandHomePrefix(value: string): string {
@@ -81,7 +98,7 @@ function repairStaleMigratedWorktreeEnvEntries(
   entries: Record<string, string>,
   env: NodeJS.ProcessEnv,
 ): Record<string, string> {
-  const localConfigPath = path.resolve(rootDir, ".paperclip", "config.json");
+  const localConfigPath = path.join(resolveWorktreeStateDir(rootDir), "config.json");
   const configuredPath = entries.PAPERCLIP_CONFIG?.trim();
   if (!configuredPath) return entries;
 

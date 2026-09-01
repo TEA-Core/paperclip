@@ -109,10 +109,16 @@ export function buildExecutionPolicy(input: {
 
   if (stages.length === 0 && !monitor) return null;
 
-  return {
+  const policy: IssueExecutionPolicy = {
     mode,
     commentRequired: true,
     stages,
     ...(monitor ? { monitor } : {}),
   };
+  if (stages.length > 0) return policy;
+  // Omit an empty stages array from the write payload: the write boundary
+  // rejects an explicit `stages: []` (SUP-13634), and the PATCH schema applies
+  // `.default([])` when the field is absent.
+  const { stages: _omittedStages, ...rest } = policy;
+  return rest as IssueExecutionPolicy;
 }

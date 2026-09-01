@@ -316,6 +316,12 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
     { label: "board", issuePrefix: "BEH", nextStatus: "in_progress", comment: "Picked up: best-effort audit path exercised." },
   ])("keeps a $label status change committed when the audit insert fails", async ({ label, issuePrefix, nextStatus, comment }) => {
     const { companyId, agentId, issueId, identifier } = await seedIssue(issuePrefix);
+    // Transitions into in_progress require activeRun evidence: stamp a live
+    // execution run on the issue so the in_progress row carries it.
+    if (nextStatus === "in_progress") {
+      const executionRunId = await seedRun(companyId, agentId, issueId);
+      await db.update(issues).set({ executionRunId }).where(eq(issues.id, issueId));
+    }
     currentActor = label === "agent"
       ? agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId))
       : boardActor(companyId, unresolvableRunId());

@@ -8,6 +8,7 @@ paperclip_instance_id="${PAPERCLIP_INSTANCE_ID:-default}"
 paperclip_dir="$worktree_cwd/.paperclip"
 worktree_config_path="$paperclip_dir/config.json"
 worktree_env_path="$paperclip_dir/.env"
+seed_manifest_path="$paperclip_dir/seed-manifest.json"
 seed_pending_marker_path="$paperclip_dir/seed-pending"
 seed_complete_marker_path="$paperclip_dir/seed-complete"
 worktree_name="${PAPERCLIP_WORKSPACE_BRANCH:-$(basename "$worktree_cwd")}"
@@ -23,7 +24,7 @@ const normalized = path.basename(resolvedWorkspacePath)
   .replace(/[^a-z0-9_-]+/g, "-")
   .replace(/-+/g, "-")
   .replace(/^[-_]+|[-_]+$/g, "");
-const prefix = (normalized || "worktree").slice(0, 48);
+const prefix = (normalized || "worktree").slice(0, 48).replace(/-+$/, "");
 const pathHash = crypto.createHash("sha256").update(resolvedWorkspacePath).digest("hex").slice(0, 12);
 process.stdout.write(`${prefix}-${pathHash}`);
 EOF
@@ -39,12 +40,28 @@ if [[ ! -d "$worktree_cwd" ]]; then
   exit 1
 fi
 
-source_config_path="${PAPERCLIP_CONFIG:-}"
-if [[ -z "$source_config_path" && ( -e "$base_cwd/.paperclip/config.json" || -L "$base_cwd/.paperclip/config.json" ) ]]; then
-  source_config_path="$base_cwd/.paperclip/config.json"
+canonical_base_cwd="$(cd "$base_cwd" && pwd -P)"
+if [[ -L "$canonical_base_cwd/.paperclip" && ! -d "$canonical_base_cwd/.paperclip" ]]; then
+  # A broken link hides whatever it points at, so the config below would read as absent
+  # on a workspace that is malformed rather than plain. Refuse instead of falling back.
+  echo "Registered base project workspace .paperclip is a broken symlink: $canonical_base_cwd/.paperclip" >&2
+  exit 1
 fi
-if [[ -z "$source_config_path" ]]; then
-  source_config_path="$paperclip_home/instances/$paperclip_instance_id/config.json"
+source_config_path="$canonical_base_cwd/.paperclip/config.json"
+if [[ ! -e "$source_config_path" && ! -L "$source_config_path" ]]; then
+  # A base workspace that is a plain checkout carries no instance config of its own.
+  # Fall back to the control plane's own registered instance config, which is process
+  # state this workspace cannot rewrite.
+  source_config_path="${PAPERCLIP_CONFIG:-$paperclip_home/instances/$paperclip_instance_id/config.json}"
+fi
+if [[ ! -f "$source_config_path" || -L "$source_config_path" ]]; then
+  echo "Registered Paperclip seed source config is missing or is not a canonical file: $source_config_path" >&2
+  exit 1
+fi
+canonical_source_dir="$(cd "$(dirname "$source_config_path")" && pwd -P)"
+if [[ "$canonical_source_dir/config.json" != "$source_config_path" ]]; then
+  echo "Registered Paperclip seed source config uses a symlink alias: $source_config_path" >&2
+  exit 1
 fi
 source_env_path="$(dirname "$source_config_path")/.env"
 
@@ -66,6 +83,12 @@ base_cli_healthy() {
   (cd "$base_cwd" && node "$base_cli_runner_path" "$base_cli_entry_path" --help >/dev/null 2>&1)
 }
 
+# The owning uid of a path, or empty when it cannot be determined. GNU and BSD
+# stat disagree on the flag, and neither is guaranteed present.
+path_owner_uid() {
+  stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null || true
+}
+
 repair_base_workspace_install() {
   command -v pnpm >/dev/null 2>&1 || return 1
   [[ -f "$base_cwd/package.json" && -f "$base_cwd/pnpm-lock.yaml" ]] || return 1
@@ -74,6 +97,10 @@ repair_base_workspace_install() {
   # otherwise skip the dangling symlinks; --frozen-lockfile keeps the repair
   # from mutating the shared base workspace's lockfile.
   local repair_cmd=(pnpm install --prod=false --force --frozen-lockfile --config.confirmModulesPurge=false)
+  # pnpm 9.15.4 calls the deprecated url.parse() in toNerfDart on every
+  # install. Node 24 reports that call as DEP0169. Remove this flag when the
+  # pinned pnpm no longer calls url.parse() in that path.
+  local repair_node_options="${NODE_OPTIONS:-} --disable-warning=DEP0169"
   # Resolve the real git dir so locking also covers base workspaces that are
   # linked worktrees, where "$base_cwd/.git" is a file rather than a directory.
   local repair_lock_dir=""
@@ -96,11 +123,11 @@ repair_base_workspace_install() {
         echo "Base workspace CLI became healthy while waiting for the repair lock; skipping reinstall." >&2
         exit 0
       fi
-      env -u NODE_ENV CI=true "${repair_cmd[@]}" >&2 || exit 1
+      env -u NODE_ENV CI=true NODE_OPTIONS="$repair_node_options" "${repair_cmd[@]}" >&2 || exit 1
       base_cli_healthy
     )
   else
-    (cd "$base_cwd" && env -u NODE_ENV CI=true "${repair_cmd[@]}" >&2 && base_cli_healthy)
+    (cd "$base_cwd" && env -u NODE_ENV CI=true NODE_OPTIONS="$repair_node_options" "${repair_cmd[@]}" >&2 && base_cli_healthy)
   fi
 }
 
@@ -155,9 +182,12 @@ paperclipai_command_available() {
 }
 
 existing_worktree_config_is_usable() {
-  WORKTREE_CONFIG_PATH="$worktree_config_path" \
-  WORKTREE_ENV_PATH="$worktree_env_path" \
-  WORKTREE_INSTANCE_ID="$worktree_instance_id" \
+  local config_path="${1:-$worktree_config_path}"
+  local env_path="${2:-$worktree_env_path}"
+  local instance_id="${3:-$worktree_instance_id}"
+  WORKTREE_CONFIG_PATH="$config_path" \
+  WORKTREE_ENV_PATH="$env_path" \
+  WORKTREE_INSTANCE_ID="$instance_id" \
   node <<'EOF'
 const fs = require("node:fs");
 const os = require("node:os");
@@ -211,7 +241,13 @@ const expectedInstanceId = process.env.WORKTREE_INSTANCE_ID;
 if (!homeDir || !instanceId) {
   fail("existing worktree env is missing PAPERCLIP_HOME or PAPERCLIP_INSTANCE_ID");
 }
-if (instanceId !== expectedInstanceId) {
+// Compare the ids in one spelling. A stored id that differs only in how runs of
+// "-" collapse names the same instance directory — the shape written before the
+// prefix truncation was made canonical — and rejecting it condemns the worktree to
+// a destructive `worktree init --force` on every dispatch. Anything else still fails.
+const canonicalize = (value) =>
+  String(value ?? "").replace(/-+/g, "-").replace(/^[-_]+|[-_]+$/g, "");
+if (canonicalize(instanceId) !== canonicalize(expectedInstanceId)) {
   fail(`existing worktree env names legacy or mismatched instance ${instanceId}, expected ${expectedInstanceId}`);
 }
 if (!fs.existsSync(homeDir)) {
@@ -237,25 +273,93 @@ for (const rawValue of runtimePaths) {
 EOF
 }
 
-write_seed_pending_marker() {
-  SEED_PENDING_MARKER_PATH="$seed_pending_marker_path" \
-  SEED_COMPLETE_MARKER_PATH="$seed_complete_marker_path" \
+reconcile_worktree_deployment_mode() {
   SOURCE_CONFIG_PATH="$source_config_path" \
+  WORKTREE_CONFIG_PATH="$worktree_config_path" \
   node <<'EOF'
 const fs = require("node:fs");
 const path = require("node:path");
 
+const sourceConfigPath = path.resolve(process.env.SOURCE_CONFIG_PATH);
+const worktreeConfigPath = path.resolve(process.env.WORKTREE_CONFIG_PATH);
+const sourceConfig = JSON.parse(fs.readFileSync(sourceConfigPath, "utf8"));
+const worktreeConfig = JSON.parse(fs.readFileSync(worktreeConfigPath, "utf8"));
+const deploymentMode = sourceConfig?.server?.deploymentMode ?? "local_trusted";
+if (deploymentMode !== "local_trusted" && deploymentMode !== "authenticated") {
+  throw new Error(`Registered source has unsupported server.deploymentMode: ${deploymentMode}`);
+}
+const exposure = deploymentMode === "local_trusted"
+  ? "private"
+  : (sourceConfig?.server?.exposure ?? "private");
+const currentServer = worktreeConfig?.server && typeof worktreeConfig.server === "object"
+  ? worktreeConfig.server
+  : {};
+if (currentServer.deploymentMode === deploymentMode && currentServer.exposure === exposure) {
+  process.exit(0);
+}
+
+worktreeConfig.server = {
+  ...currentServer,
+  deploymentMode,
+  exposure,
+};
+if (worktreeConfig.$meta && typeof worktreeConfig.$meta === "object") {
+  worktreeConfig.$meta.updatedAt = new Date().toISOString();
+}
+
+const temporaryPath = `${worktreeConfigPath}.deployment-mode-${process.pid}`;
+try {
+  fs.writeFileSync(temporaryPath, `${JSON.stringify(worktreeConfig, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporaryPath, worktreeConfigPath);
+} finally {
+  fs.rmSync(temporaryPath, { force: true });
+}
+console.error(`Reconciled isolated Paperclip worktree deployment mode from ${sourceConfigPath}: ${deploymentMode}/${exposure}`);
+EOF
+}
+
+write_seed_pending_manifest() {
+  SEED_MANIFEST_PATH="$seed_manifest_path" \
+  SEED_PENDING_MARKER_PATH="$seed_pending_marker_path" \
+  SEED_COMPLETE_MARKER_PATH="$seed_complete_marker_path" \
+  SOURCE_CONFIG_PATH="$source_config_path" \
+  TARGET_INSTANCE_ID="$worktree_instance_id" \
+  node <<'EOF'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const manifestPath = process.env.SEED_MANIFEST_PATH;
 const pendingPath = process.env.SEED_PENDING_MARKER_PATH;
 const completePath = process.env.SEED_COMPLETE_MARKER_PATH;
+const sourceConfigPath = path.resolve(process.env.SOURCE_CONFIG_PATH);
+const sourceEnvPath = path.join(path.dirname(sourceConfigPath), ".env");
+let sourceInstanceId = path.basename(path.dirname(sourceConfigPath));
+if (fs.existsSync(sourceEnvPath)) {
+  const match = fs.readFileSync(sourceEnvPath, "utf8").match(/^\s*(?:export\s+)?PAPERCLIP_INSTANCE_ID\s*=\s*["']?([^\s"'#]+)["']?/m);
+  if (match?.[1]) sourceInstanceId = match[1];
+}
 fs.rmSync(completePath, { force: true });
+fs.rmSync(pendingPath, { force: true });
+const at = new Date().toISOString();
 fs.writeFileSync(
-  pendingPath,
+  manifestPath,
   `${JSON.stringify({
-    version: 1,
-    state: "pending",
-    sourceConfigPath: path.resolve(process.env.SOURCE_CONFIG_PATH),
+    version: 2,
+    source: {
+      instanceId: sourceInstanceId,
+      configPath: sourceConfigPath,
+    },
+    snapshotAt: null,
     seedMode: "minimal",
-    createdAt: new Date().toISOString(),
+    migrationRevision: null,
+    targetInstanceId: process.env.TARGET_INSTANCE_ID,
+    phase: "pending",
+    state: "pending",
+    attemptId: crypto.randomUUID(),
+    startedAt: null,
+    finishedAt: null,
+    diagnostics: [{ phase: "pending", status: "succeeded", at }],
   }, null, 2)}\n`,
   { mode: 0o600 },
 );
@@ -263,13 +367,18 @@ EOF
 }
 
 write_fallback_worktree_config() {
+  # The config dir and instance id are parameterized so a uid-scoped fallback
+  # (SUP-14087) can be written under .paperclip/uid-<uid>/ without touching the
+  # canonical .paperclip/config.json. Defaults preserve the canonical behavior.
+  local config_dir="${1:-$paperclip_dir}"
+  local instance_id="${2:-$worktree_instance_id}"
   WORKTREE_NAME="$worktree_name" \
   BASE_CWD="$base_cwd" \
   WORKTREE_CWD="$worktree_cwd" \
-  PAPERCLIP_DIR="$paperclip_dir" \
+  PAPERCLIP_DIR="$config_dir" \
   SOURCE_CONFIG_PATH="$source_config_path" \
   SOURCE_ENV_PATH="$source_env_path" \
-  WORKTREE_INSTANCE_ID="$worktree_instance_id" \
+  WORKTREE_INSTANCE_ID="$instance_id" \
   PAPERCLIP_WORKTREES_DIR="${PAPERCLIP_WORKTREES_DIR:-}" \
   node <<'EOF'
 const fs = require("node:fs");
@@ -521,7 +630,65 @@ main().catch((error) => {
 EOF
 }
 
-if [[ -e "$worktree_config_path" && -e "$worktree_env_path" ]] && existing_worktree_config_is_usable; then
+# SUP-14087: the top-level worktree config belongs to another uid. Regenerating
+# in place is not an option: `worktree init --force` unlinks the other uid's
+# config/env/seed marker/instance data and then re-copies git hooks it cannot
+# overwrite (EPERM on cross-uid-owned files), leaving both uids stranded.
+# Instead, write a uid-scoped config under .paperclip/uid-<uid>/ pointing at a
+# uid-scoped instance root in the shared worktree pool, so each uid keeps its
+# own config, env, seed marker, and instance data without ever touching the
+# other's files.
+provision_uid_scoped_worktree_config() {
+  local other_uid="$1"
+  local current_uid scoped_dir scoped_instance_id
+  current_uid="$(id -u)"
+  scoped_dir="$paperclip_dir/uid-${current_uid}"
+  scoped_instance_id="${worktree_instance_id}-uid-${current_uid}"
+
+  echo "provision-worktree: cross-uid worktree config: $worktree_config_path is owned by uid $other_uid but this provision runs as uid $current_uid. The config is not stale; it belongs to another uid. Provisioning a uid-scoped config at $scoped_dir instead of regenerating in place." >&2
+
+  if [[ -e "$scoped_dir/config.json" && -e "$scoped_dir/.env" ]]; then
+    if existing_worktree_config_is_usable "$scoped_dir/config.json" "$scoped_dir/.env" "$scoped_instance_id"; then
+      echo "Reusing existing uid-scoped isolated Paperclip worktree config at $scoped_dir/config.json" >&2
+      seed_pending_marker_path="$scoped_dir/seed-pending"
+      seed_complete_marker_path="$scoped_dir/seed-complete"
+      return 0
+    fi
+    echo "Existing uid-scoped Paperclip worktree config at $scoped_dir/config.json is stale for this host; regenerating." >&2
+  fi
+
+  if ! mkdir -p "$scoped_dir"; then
+    echo "provision-worktree: cross-uid worktree config at $worktree_config_path is owned by uid $other_uid and uid $current_uid cannot create $scoped_dir, so a uid-scoped config cannot be provisioned. This is not a stale config; provision as uid $other_uid instead, or make $paperclip_dir writable by uid $current_uid." >&2
+    return 1
+  fi
+
+  write_fallback_worktree_config "$scoped_dir" "$scoped_instance_id"
+
+  seed_pending_marker_path="$scoped_dir/seed-pending"
+  seed_complete_marker_path="$scoped_dir/seed-complete"
+}
+
+# SUP-14087: a config or env owned by another uid is NOT "stale for this host".
+# Stat ownership before anything else so the cross-uid case gets its own
+# diagnostic and its own repair (a uid-scoped config) instead of falling into
+# the regenerate path, which would clobber and then EPERM on the other uid's
+# files.
+worktree_config_other_uid=""
+current_provision_uid="$(id -u)"
+for worktree_state_path in "$worktree_config_path" "$worktree_env_path"; do
+  if [[ -e "$worktree_state_path" ]]; then
+    worktree_state_owner="$(path_owner_uid "$worktree_state_path")"
+    if [[ -n "$worktree_state_owner" && "$worktree_state_owner" != "$current_provision_uid" ]]; then
+      worktree_config_other_uid="$worktree_state_owner"
+      break
+    fi
+  fi
+done
+
+if [[ -n "$worktree_config_other_uid" ]]; then
+  provision_uid_scoped_worktree_config "$worktree_config_other_uid" || exit 1
+  created_worktree_config=1
+elif [[ -e "$worktree_config_path" && -e "$worktree_env_path" ]] && existing_worktree_config_is_usable; then
   echo "Reusing existing isolated Paperclip worktree config at $worktree_config_path" >&2
 else
   if [[ -e "$worktree_config_path" || -e "$worktree_env_path" ]]; then
@@ -551,8 +718,14 @@ else
   created_worktree_config=1
 fi
 
-if [[ "$created_worktree_config" -eq 1 && ! -e "$seed_pending_marker_path" && ! -e "$seed_complete_marker_path" ]]; then
-  write_seed_pending_marker
+# The target config can predate a deployment-mode change on the registered
+# source, and older/fallback CLI writers may default this field independently.
+# Reconcile it after either create or reuse so the final guest config always
+# carries the source's deployment/auth contract without replacing its database.
+reconcile_worktree_deployment_mode
+
+if [[ "$created_worktree_config" -eq 1 && ! -e "$seed_manifest_path" && ! -e "$seed_pending_marker_path" && ! -e "$seed_complete_marker_path" ]]; then
+  write_seed_pending_manifest
 fi
 
 list_base_node_modules_paths() {
@@ -635,6 +808,21 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
     needs_install=1
   fi
 
+  # SUP-14087: a shared worktree node_modules tree owned by another uid cannot be
+  # reinstalled here. pnpm's linkBins chmods every bin it relinks, so an install
+  # over the other uid's tree dies with EPERM mid-flight and leaves a
+  # partially rewritten tree. Refuse the install instead of corrupting the
+  # shared state; the tree stays as the owning uid last installed it. A symlink
+  # is safe to replace (the install would create a fresh tree), so only a real
+  # directory is gated.
+  if [[ "$needs_install" -eq 1 && -d "$worktree_cwd/node_modules" && ! -L "$worktree_cwd/node_modules" ]]; then
+    node_modules_owner_uid="$(path_owner_uid "$worktree_cwd/node_modules")"
+    if [[ -n "$node_modules_owner_uid" && "$node_modules_owner_uid" != "$current_provision_uid" ]]; then
+      echo "provision-worktree: cross-uid worktree node_modules: $worktree_cwd/node_modules is owned by uid $node_modules_owner_uid but this provision runs as uid $current_provision_uid. Skipping pnpm install to avoid EPERM on uid ${node_modules_owner_uid}-owned bins and a partially rewritten tree; the shared install is left as uid $node_modules_owner_uid last left it. Refresh dependencies for this branch by provisioning as uid $node_modules_owner_uid." >&2
+      needs_install=0
+    fi
+  fi
+
   if [[ "$needs_install" -eq 1 ]]; then
     backup_suffix=".paperclip-backup-${BASHPID:-$$}"
     moved_symlink_paths=()
@@ -685,7 +873,10 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
       local exit_code=0
       (
         cd "$worktree_cwd"
-        pnpm install --prod=false "$@"
+        # pnpm 9.15.4 calls the deprecated url.parse() in toNerfDart on every
+        # install. Node 24 reports that call as DEP0169. Remove this flag
+        # when the pinned pnpm no longer calls url.parse() in that path.
+        NODE_OPTIONS="${NODE_OPTIONS:-} --disable-warning=DEP0169" pnpm install --prod=false "$@"
       ) >"$stdout_path" 2>"$stderr_path" || exit_code=$?
 
       cat "$stdout_path"

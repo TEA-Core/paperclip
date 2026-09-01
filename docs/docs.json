@@ -84,6 +84,7 @@
               "deploy/tailscale-private-access",
               "deploy/docker",
               "deploy/deployment-modes",
+              "deploy/control-plane-rollout",
               "deploy/database",
               "deploy/secrets",
               "deploy/storage",

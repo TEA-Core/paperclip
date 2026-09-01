@@ -7,6 +7,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueRelations,
   issues,
@@ -194,6 +195,7 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
 
   afterEach(async () => {
     await db.delete(issueRelations);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);

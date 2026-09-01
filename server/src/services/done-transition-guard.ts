@@ -1,16 +1,25 @@
 import { execFile } from "node:child_process";
-import type { Db } from "@paperclipai/db";
 import { and, eq, inArray } from "drizzle-orm";
-import { executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
+import { agents, issues, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
   type GitHubTokenScope,
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
-import { resolveLinkedPullRequestsWithState, type LinkedPullRequest } from "./merge-arming.js";
+import {
+  fetchOpenPullRequests,
+  GITHUB_GRAPHQL_URL,
+  parseRepoUrl,
+  resolveIssueRepoContext,
+  resolveLinkedPullRequestsWithState,
+  type IssueRepoContext,
+  type LinkedPullRequest,
+} from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
+import { normalizeAgentUrlKey } from "@paperclipai/shared";
+import { parseIssueExecutionState } from "./issue-execution-policy.js";
 
 export class GitHubAuthError extends Error {
   readonly status: number;
@@ -33,6 +42,21 @@ const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "child-delivery-parent-close",
   "merged-elsewhere",
 ]);
+
+// SUP-14579 (ADR-072 close-ladder shape): the three stages a top-level
+// decomposed parent's review ladder must include before it may close. Each
+// requirement is a (stage type, agent urlKey) pair; agent identity is matched
+// by the participant agent's urlKey (see normalizeAgentUrlKey), not by a
+// literal name string.
+const ADR072_CLOSE_LADDER: {
+  stageType: string;
+  agentUrlKey: string;
+  label: string;
+}[] = [
+  { stageType: "review", agentUrlKey: "support-qae", label: "review:support-QAE" },
+  { stageType: "review", agentUrlKey: "coder-le", label: "review:coder-LE" },
+  { stageType: "approval", agentUrlKey: "exec-cto", label: "approval:exec-CTO" },
+];
 
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
@@ -63,101 +87,8 @@ export interface DoneTierDeclarationResult {
   skipReason: string | null;
 }
 
-function parseRepoUrl(repoUrl: string | null): { hostname: string; owner: string; repo: string } | null {
-  if (!repoUrl) return null;
-  let url: URL;
-  try {
-    url = new URL(repoUrl);
-  } catch {
-    return null;
-  }
-  if (url.protocol !== "https:") return null;
-  if (url.username || url.password) return null;
-  const parts = url.pathname.split("/").filter(Boolean);
-  if (parts.length < 2) return null;
-  const owner = parts[0]!;
-  const repo = parts[1]!.replace(/\.git$/i, "");
-  if (!owner || !repo) return null;
-  return { hostname: url.hostname, owner, repo };
-}
-
 function appendSkipReason(current: string | null, piece: string): string {
   return current ? `${current}; ${piece}` : piece;
-}
-
-async function resolveIssueRepoContext(
-  db: Db,
-  issue: {
-    companyId: string;
-    projectId: string | null;
-    projectWorkspaceId: string | null;
-    executionWorkspaceId: string | null;
-  },
-): Promise<{
-  branch: string | null;
-  defaultRef: string | null;
-  repoUrl: string | null;
-  providerType: string | null;
-  worktreePath: string | null;
-} | null> {
-  if (issue.executionWorkspaceId) {
-    const row = await db
-      .select()
-      .from(executionWorkspaces)
-      .where(eq(executionWorkspaces.id, issue.executionWorkspaceId))
-      .then((rows) => rows[0] ?? null);
-    if (row) {
-      return {
-        branch: row.branchName ?? null,
-        defaultRef: row.baseRef ?? null,
-        repoUrl: row.repoUrl ?? null,
-        providerType: row.providerType ?? null,
-        worktreePath: row.providerRef ?? row.cwd ?? null,
-      };
-    }
-  }
-
-  if (issue.projectWorkspaceId) {
-    const row = await db
-      .select()
-      .from(projectWorkspaces)
-      .where(eq(projectWorkspaces.id, issue.projectWorkspaceId))
-      .then((rows) => rows[0] ?? null);
-    if (row) {
-      return {
-        branch: null,
-        defaultRef: row.defaultRef ?? row.repoRef ?? null,
-        repoUrl: row.repoUrl ?? null,
-        providerType: null,
-        worktreePath: null,
-      };
-    }
-  }
-
-  if (issue.projectId) {
-    const primaryWorkspace = await db
-      .select()
-      .from(projectWorkspaces)
-      .where(
-        and(
-          eq(projectWorkspaces.projectId, issue.projectId),
-          eq(projectWorkspaces.companyId, issue.companyId),
-          eq(projectWorkspaces.isPrimary, true),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
-    if (primaryWorkspace) {
-      return {
-        branch: null,
-        defaultRef: primaryWorkspace.defaultRef ?? primaryWorkspace.repoRef ?? null,
-        repoUrl: primaryWorkspace.repoUrl ?? null,
-        providerType: null,
-        worktreePath: null,
-      };
-    }
-  }
-
-  return null;
 }
 
 async function githubCompareAheadBy(
@@ -169,7 +100,15 @@ async function githubCompareAheadBy(
   token: string,
 ): Promise<number | null> {
   const apiBase = gitHubApiBase(hostname);
-  const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(defaultRef)}...${encodeURIComponent(branch)}`;
+  // baseRef is a local git ref (e.g. "origin/main", "origin/fold/tea-patches-...").
+  // The GitHub compare API takes the bare remote branch name and 404s on the
+  // remote-tracking prefix (SUP-13691). Strip it for this call only — the local
+  // git attribution probes below keep the full ref, where it is correct.
+  const compareBase =
+    defaultRef.startsWith("origin/") && defaultRef.length > "origin/".length
+      ? defaultRef.slice("origin/".length)
+      : defaultRef;
+  const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(compareBase)}...${encodeURIComponent(branch)}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "user-agent": "paperclip-done-transition-guard",
@@ -192,6 +131,52 @@ async function githubCompareAheadBy(
   const ahead = (body as Record<string, unknown> | null)?.ahead_by;
   if (typeof ahead === "number") return ahead;
   return null;
+}
+
+/**
+ * Dedicated branch-existence probe for the compare API. The compare endpoint
+ * 404s when either the base or the head ref is unresolvable on the remote
+ * (SUP-13831), so a compare-404 is not positive evidence the head branch is
+ * absent. This ref probe distinguishes the two: a 200 here proves the branch
+ * exists and the compare 404 was about the base ref (or a transient API
+ * state). 401/403 is classified as auth_failed with the status; every other
+ * unmeasurable outcome (network failure, unexpected status) is "error" so
+ * callers fail open.
+ */
+type BranchProbeOutcome =
+  | { outcome: "present" }
+  | { outcome: "absent" }
+  | { outcome: "error" }
+  | { outcome: "auth_failed"; status: number };
+
+async function githubBranchExists(
+  hostname: string,
+  owner: string,
+  repo: string,
+  branch: string,
+  token: string,
+): Promise<BranchProbeOutcome> {
+  const apiBase = gitHubApiBase(hostname);
+  const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
+    repo,
+  )}/git/ref/heads/${encodeURIComponent(branch)}`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-done-transition-guard",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+  try {
+    const response = await ghFetch(url, { headers });
+    if (response.status === 401 || response.status === 403) {
+      return { outcome: "auth_failed", status: response.status };
+    }
+    if (response.status === 404) return { outcome: "absent" };
+    if (response.ok) return { outcome: "present" };
+    return { outcome: "error" };
+  } catch {
+    return { outcome: "error" };
+  }
 }
 
 function runGit(args: string[], cwd: string): Promise<string> {
@@ -226,6 +211,25 @@ async function countIssueAttributableCommits(
     const attributableCount = Number.parseInt(attributableRaw.trim(), 10);
     if (Number.isNaN(aheadCount) || Number.isNaN(attributableCount)) return null;
     return { aheadCount, attributableCount };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether the worktree at `worktreePath` carries uncommitted content
+ * (modified, staged, or untracked non-ignored files). This is the owed-diff
+ * discriminator for the foreign-branch block: a clean worktree with zero
+ * attributable commits and no merged PR owes no observable repo content — the
+ * no-repo-deliverable shape (design/spec cards whose acceptance is a recorded
+ * decision, SUP-13873). Returns null when the probe is unreachable (path
+ * missing, git failure) so callers fail open instead of blocking on an
+ * unmeasured signal.
+ */
+async function worktreeHasUncommittedContent(worktreePath: string): Promise<boolean | null> {
+  try {
+    const out = await runGit(["status", "--porcelain"], worktreePath);
+    return out.split(/\r?\n/).some((line) => line.trim().length > 0);
   } catch {
     return null;
   }
@@ -329,6 +333,54 @@ async function writeAuditLog(
   }
 }
 
+/**
+ * SUP-14429 (mechanism B): resolve the live GraphQL `reviewDecision` of an open
+ * linked PR. This is the only signal that an external reviewer is currently
+ * holding the PR open — an undismissed CHANGES_REQUESTED is a pre-existing,
+ * externally-visible refusal, not the card observing its own merge (the
+ * SUP-13207 deadlock the decision-carrying waiver exists for).
+ *
+ * Every unresolvable outcome — no token handled by the caller, non-2xx, GraphQL
+ * errors, a null pullRequest, malformed body, transport throw — returns null.
+ * Callers must treat null as "not refused" and fail open, matching the
+ * `stale_open_unverifiable` precedent: never fail closed on a GitHub outage.
+ */
+async function fetchPullRequestReviewDecision(
+  pr: LinkedPullRequest,
+  token: string,
+): Promise<string | null> {
+  const query =
+    "query prReviewDecision($owner: String!, $name: String!, $number: Int!) { " +
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewDecision } } }";
+  try {
+    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "paperclip-done-transition-guard",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query,
+        variables: { owner: pr.owner, name: pr.repo, number: pr.number },
+      }),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body) return null;
+    if (Array.isArray(body.errors) && body.errors.length > 0) return null;
+    const repository = (body.data as Record<string, unknown> | null | undefined)?.repository as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const pullRequest = repository?.pullRequest as Record<string, unknown> | null | undefined;
+    const reviewDecision = pullRequest?.reviewDecision;
+    return typeof reviewDecision === "string" ? reviewDecision : null;
+  } catch {
+    return null;
+  }
+}
+
 async function hydrateLinkedPrState(
   pr: LinkedPullRequest,
   token: string,
@@ -351,8 +403,12 @@ async function hydrateLinkedPrState(
     if (typeof state === "string") {
       // The live call just succeeded: the persisted refresh error code (if any)
       // no longer describes this object, and the PR state below is positively
-      // proven again.
-      return { ...pr, cachedState: state, lastErrorCode: null };
+      // proven again. For open PRs, resolve the review decision in the same
+      // hydration pass (SUP-14429) — a PR that is not open owes no decision
+      // probe, and any probe failure degrades to null (fail open).
+      const reviewDecision =
+        state === "open" ? await fetchPullRequestReviewDecision(pr, token) : null;
+      return { ...pr, cachedState: state, lastErrorCode: null, reviewDecision };
     }
     return pr;
   } catch {
@@ -460,11 +516,24 @@ export async function evaluateDoneTierDeclaration(
   }
 
   if (!runId) {
-    return fallback(
-      "No accompanying comment and no run id to look up same-run comment; transition allowed",
-      true,
-      "no_accompanying_comment_no_run_id",
-    );
+    // SUP-14368: no comment and no run id means there is no evidence to verify — a
+    // missing declaration, not a verified pass. The bare no-evidence allow rendered
+    // "cannot verify" as "transition allowed", the fail-open exec-CTO ruled against
+    // on SUP-13094. It is now treated on the same terms as any other missing
+    // declaration: a 422 done_transition_missing_tier_declaration whose remedy names
+    // the accepted forms (the declaration is always writable, so no close deadlocks).
+    return {
+      allowed: false,
+      reason:
+        "No accompanying comment and no run id to look up a same-run comment; no done-tier declaration found. " +
+        `Accepted forms: "Closed at Tier 2 (live): <probe evidence>"` +
+        ` or ` +
+        `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+        ` — per SUP-12693.`,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
   }
 
   let comments: IssueComment[];
@@ -545,6 +614,306 @@ export async function evaluateDoneTierDeclaration(
   };
 }
 
+/**
+ * SUP-13831: live discovery of open PRs when the issue has zero cached
+ * mention rows. Mention rows are only created when a comment posts a full PR
+ * URL; repos that name a PR without the URL (e.g. "PR #3264") leave the
+ * external-object table empty, so the cached resolver sees nothing even when
+ * an open PR blocks. Ask GitHub directly for open, non-draft PRs that carry
+ * the issue identifier in the head ref, title, or body — the same ownership
+ * rule the live re-resolve in merge-arming uses.
+ *
+ * Failures never throw: they surface as `error` so the caller can count them
+ * in skipReason, and the guard falls back to the cached-empty state plus the
+ * compare flow below.
+ */
+async function liveDiscoverOpenLinkedPullRequests(
+  db: Db,
+  issue: { companyId: string; identifier: string | null },
+  ctx: IssueRepoContext | null,
+): Promise<{ prs: LinkedPullRequest[]; error: string | null }> {
+  if (!issue.identifier || !ctx?.repoUrl) return { prs: [], error: null };
+  const parsed = parseRepoUrl(ctx.repoUrl);
+  if (!parsed) return { prs: [], error: null };
+
+  let token: string | null;
+  try {
+    const tokenResult = await resolveGitHubToken(db, issue.companyId);
+    token = tokenResult.token;
+  } catch {
+    // Token resolution failure is already counted by the main flow's own
+    // token_resolution_failed / token_missing fallback; do not double-report.
+    return { prs: [], error: null };
+  }
+  if (!token) return { prs: [], error: null };
+
+  const listResult = await fetchOpenPullRequests(
+    token,
+    parsed.owner,
+    parsed.repo,
+    parsed.hostname,
+  );
+  if (!listResult.ok) {
+    return {
+      prs: [],
+      error: listResult.status === 0 ? "network" : `HTTP${listResult.status}`,
+    };
+  }
+
+  const needle = issue.identifier.toLowerCase();
+  const seen = new Set<string>();
+  const prs: LinkedPullRequest[] = [];
+  for (const item of listResult.items) {
+    if (item.draft === true) continue;
+    const headRef = (item.headRef ?? "").toLowerCase();
+    const title = (item.title ?? "").toLowerCase();
+    const body = (item.body ?? "").toLowerCase();
+    if (!headRef.includes(needle) && !title.includes(needle) && !body.includes(needle)) {
+      continue;
+    }
+    const key = `${parsed.owner.toLowerCase()}/${parsed.repo.toLowerCase()}#${item.number}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    prs.push({
+      id: `live:${key}`,
+      owner: parsed.owner,
+      repo: parsed.repo,
+      number: item.number,
+      nodeId: null,
+      headRefName: item.headRef,
+      title: item.title,
+      displayName: `${parsed.owner}/${parsed.repo}#${item.number}`,
+      cachedState: "open",
+      lastErrorCode: null,
+      reviewDecision: null,
+    });
+  }
+  return { prs, error: null };
+}
+
+/**
+ * SUP-14446 mechanism C: a close to `done` must account for the issue's own
+ * review ladder. An issue carrying a populated `executionPolicy.stages` can
+ * otherwise reach `done` with zero stage decisions recorded (SUP-8098: parked
+ * pending on stage 1; SUP-13253: `executionState` never initialised). A
+ * null/absent or unparseable `executionState` is the empty case — zero
+ * completed/skipped stages — exactly the shape these issues landed with.
+ *
+ * `decisionCarried` covers the in-flight final-stage approval: both call sites
+ * only invoke the guard with `decisionCarried=true` when this very transition
+ * records the last stage's `approved` decision, whose write (the one this
+ * guard precedes) appends the stage to `completedStageIds`. Until that write
+ * lands, the state's `currentStageId` would read as unsatisfied and deadlock
+ * the approval circuit — so a policy stage currently pending is treated as
+ * satisfied in that case only.
+ *
+ * Returns null when the issue carries no ladder (out of scope for this
+ * mechanism; the pre-existing null-policy path is unchanged).
+ */
+function evaluateReviewLadderSatisfaction(
+  executionPolicy: unknown,
+  executionState: unknown,
+  decisionCarried: boolean,
+): {
+  satisfied: boolean;
+  totalStages: number;
+  firstUnsatisfiedIndex: number;
+  firstUnsatisfiedStage: { id: string; type: string } | null;
+  unsatisfiedStageIds: string[];
+  completedStageIds: string[];
+  skippedStageIds: string[];
+} | null {
+  const rawStages =
+    executionPolicy != null && typeof executionPolicy === "object"
+      ? (executionPolicy as { stages?: unknown }).stages
+      : undefined;
+  if (!Array.isArray(rawStages)) return null;
+  const stages = rawStages
+    .filter(
+      (stage): stage is { id: string; type?: string } =>
+        stage != null &&
+        typeof stage === "object" &&
+        typeof (stage as { id?: unknown }).id === "string",
+    )
+    .map((stage) => ({
+      id: stage.id,
+      type: typeof stage.type === "string" ? stage.type : "unknown",
+    }));
+  if (stages.length === 0) return null;
+
+  const state = parseIssueExecutionState(executionState);
+  const completed = new Set<string>(state?.completedStageIds ?? []);
+  const skipped = new Set<string>(state?.skippedStageIds ?? []);
+
+  if (decisionCarried && state !== null && state.status === "pending" && state.currentStageId !== null) {
+    if (stages.some((stage) => stage.id === state.currentStageId)) {
+      completed.add(state.currentStageId);
+    }
+  }
+
+  const unsatisfied = stages
+    .map((stage, index) => ({ stage, index }))
+    .filter(({ stage }) => !completed.has(stage.id) && !skipped.has(stage.id));
+
+  const first = unsatisfied[0];
+  return {
+    satisfied: unsatisfied.length === 0,
+    totalStages: stages.length,
+    firstUnsatisfiedIndex: first ? first.index : -1,
+    firstUnsatisfiedStage: first ? { id: first.stage.id, type: first.stage.type } : null,
+    unsatisfiedStageIds: unsatisfied.map(({ stage }) => stage.id),
+    completedStageIds: [...completed],
+    skippedStageIds: [...skipped],
+  };
+}
+
+/**
+ * SUP-14561 (mechanism A): count this issue's child issues that each ran a
+ * review ladder — the child carries a non-null execution policy and its
+ * execution state has a non-empty completedStageIds or skippedStageIds.
+ *
+ * A ladder-less parent (executionPolicy null, or `stages: []` — either way
+ * `evaluateReviewLadderSatisfaction` reports no ladder) sitting over two or
+ * more such children is a decomposed body of reviewed engineering work: the
+ * work was gated at the children, so closing the parent with `done` would
+ * ship it through no review, no Definition-of-Done gate, and no approval
+ * (SUP-14306 / SUP-14309 / SUP-14023 / SUP-13777). One-off ops/reflection
+ * cards whose children carry no policy of their own count 0 and stay legal.
+ *
+ * This is a local indexed read (issues_company_parent_idx). Like mechanism C
+ * it runs before any GitHub path, and it fails closed on a throw: the
+ * transition write targets the same store, so a Postgres error must not be
+ * waved through.
+ */
+async function countLadderedChildren(
+  db: Db,
+  companyId: string,
+  parentId: string,
+): Promise<{ count: number; identifiers: string[] }> {
+  const rows = await db
+    .select({
+      identifier: issues.identifier,
+      executionPolicy: issues.executionPolicy,
+      executionState: issues.executionState,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), eq(issues.parentId, parentId)));
+  let count = 0;
+  const identifiers: string[] = [];
+  for (const row of rows) {
+    if (row.executionPolicy == null) continue;
+    const state = parseIssueExecutionState(row.executionState);
+    const completed = state?.completedStageIds?.length ?? 0;
+    const skipped = state?.skippedStageIds?.length ?? 0;
+    if (completed > 0 || skipped > 0) {
+      count += 1;
+      identifiers.push(row.identifier ?? "<unnamed>");
+    }
+  }
+  return { count, identifiers };
+}
+
+/**
+ * SUP-14579 (mechanism D / ADR-072 close-ladder shape): given a parent's
+ * execution policy, report which of the three ADR-072 close-ladder stages
+ * (review:support-QAE, review:coder-LE, approval:exec-CTO) are absent.
+ *
+  * A stage satisfies a requirement when its `type` matches the required stage
+  * type AND at least one of its agent participants resolves to the required
+  * agent urlKey. Stages carry participant agent ids, not names, so the agent
+  * names are resolved in a single indexed read over the union of all
+  * participant agent ids, then compared via `normalizeAgentUrlKey`. That read
+  * is scoped to the issue's company so an agent from another company can never
+  * be counted as satisfying a close-ladder stage.
+  *
+  * Returns the labels of the missing requirements; an empty array means the
+  * ladder carries the full close-ladder shape. A missing/stages-less policy
+  * reports every requirement as missing.
+  */
+async function findMissingAdr072CloseLadderStages(
+  db: Db,
+  companyId: string,
+  executionPolicy: unknown,
+): Promise<string[]> {
+  const rawStages =
+    executionPolicy != null && typeof executionPolicy === "object"
+      ? (executionPolicy as { stages?: unknown }).stages
+      : undefined;
+  if (!Array.isArray(rawStages)) {
+    return ADR072_CLOSE_LADDER.map((requirement) => requirement.label);
+  }
+
+  const stages = rawStages
+    .filter(
+      (stage): stage is { type?: unknown; participants?: unknown } =>
+        stage != null && typeof stage === "object",
+    )
+    .map((stage) => ({
+      type: typeof stage.type === "string" ? stage.type : null,
+      participants: Array.isArray(stage.participants) ? stage.participants : [],
+    }));
+
+  const agentIds = new Set<string>();
+  for (const stage of stages) {
+    for (const participant of stage.participants) {
+      if (
+        participant != null &&
+        typeof participant === "object" &&
+        (participant as { type?: unknown }).type === "agent" &&
+        typeof (participant as { agentId?: unknown }).agentId === "string"
+      ) {
+        agentIds.add((participant as { agentId: string }).agentId);
+      }
+    }
+  }
+
+  const agentIdToUrlKey = new Map<string, string | null>();
+  if (agentIds.size > 0) {
+    const agentRows = await db
+      .select({ id: agents.id, name: agents.name })
+      .from(agents)
+      .where(and(inArray(agents.id, [...agentIds]), eq(agents.companyId, companyId)));
+    for (const row of agentRows) {
+      agentIdToUrlKey.set(row.id, normalizeAgentUrlKey(row.name));
+    }
+  }
+
+  const missing: string[] = [];
+  for (const requirement of ADR072_CLOSE_LADDER) {
+    const satisfied = stages.some(
+      (stage) =>
+        stage.type === requirement.stageType &&
+        stage.participants.some((participant) => {
+          if (
+            participant == null ||
+            typeof participant !== "object" ||
+            (participant as { type?: unknown }).type !== "agent" ||
+            typeof (participant as { agentId?: unknown }).agentId !== "string"
+          ) {
+            return false;
+          }
+          return (
+            agentIdToUrlKey.get((participant as { agentId: string }).agentId) ===
+            requirement.agentUrlKey
+          );
+        }),
+    );
+    if (!satisfied) missing.push(requirement.label);
+  }
+  return missing;
+}
+
+/**
+ * Gate an issue's transition to `done`. Runs the pre-network fail-closed gates
+ * first — a sanctioned no-deliverable-head `override` (which lands the close
+ * with an audit row), mechanism C (an unrun review ladder, SUP-14446),
+ * mechanism A (a ladder-less decomposed parent over 2+ laddered children,
+ * SUP-14561), and mechanism D (a shape-incomplete ADR-072 close ladder,
+ * SUP-14579) — then verifies the PR/GitHub delivery and tier declaration and
+ * applies the open-PR block. `decisionCarried` applies the ADR-074 D6
+ * carve-out for decision-carrying board closes. Every refusal, override, and
+ * skip records an audit row.
+ */
 export async function evaluateDoneTransitionGuard(
   db: Db,
   issue: {
@@ -554,6 +923,9 @@ export async function evaluateDoneTransitionGuard(
     projectId: string | null;
     projectWorkspaceId: string | null;
     executionWorkspaceId: string | null;
+    parentId?: string | null;
+    executionPolicy?: unknown;
+    executionState?: unknown;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
@@ -570,15 +942,228 @@ export async function evaluateDoneTransitionGuard(
     skipReason: skipReason && prSkipReason ? `${skipReason}; ${prSkipReason}` : (skipReason ?? prSkipReason),
   });
 
+  const reviewLadder = evaluateReviewLadderSatisfaction(
+    issue.executionPolicy,
+    issue.executionState,
+    decisionCarried,
+  );
+
+  // SUP-14561 (mechanism A): a ladder-less parent is only suspect when its
+  // children demonstrably ran ladders. Query the decomposition only in that
+  // case; a parent that carries its own ladder is governed by mechanism C.
+  const mechanismA =
+    reviewLadder === null
+      ? await countLadderedChildren(db, issue.companyId, issue.id)
+      : null;
+
+  // SUP-14579 (mechanism D / ADR-072 close-ladder shape): a decomposed parent
+  // whose review ladder is satisfied but shape-incomplete (missing one of the
+  // three close-ladder stages) must not close ungated. The shape check applies at
+  // every tree depth — a nested parent closing a decomposed body of work is the
+  // same defect a top-level one is, so the original `parentId === null` depth
+  // gate was removed (SUP-14640). Any parent sitting over two or more laddered
+  // children is subject to it; the agent-resolution read happens here so the
+  // override path below can record its own audit action. Computed eagerly — it
+  // is a local indexed read and only runs in the pre-network zone.
+  let ladderShape: {
+    ladderedChildCount: number;
+    ladderedChildIdentifiers: string[];
+    missingStageLabels: string[];
+  } | null = null;
+  if (reviewLadder !== null && reviewLadder.satisfied) {
+    const laddered = await countLadderedChildren(db, issue.companyId, issue.id);
+    if (laddered.count >= 2) {
+      const missingStageLabels = await findMissingAdr072CloseLadderStages(
+        db,
+        issue.companyId,
+        issue.executionPolicy,
+      );
+      if (missingStageLabels.length > 0) {
+        ladderShape = {
+          ladderedChildCount: laddered.count,
+          ladderedChildIdentifiers: laddered.identifiers,
+          missingStageLabels,
+        };
+      }
+    }
+  }
+
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
     void writeAuditLog(db, issue, "issue.done_transition_override", {
       disposition: override.disposition,
       overrideReason: override.reason ?? null,
       source: "done_transition_guard",
     });
+    if (reviewLadder !== null && !reviewLadder.satisfied) {
+      void writeAuditLog(db, issue, "issue.done_transition_ladder_override", {
+        disposition: override.disposition,
+        overrideReason: override.reason ?? null,
+        reason: `review_ladder_unsatisfied:${reviewLadder.firstUnsatisfiedStage?.id ?? "unknown"}`,
+        unsatisfiedStageIds: reviewLadder.unsatisfiedStageIds,
+        completedStageIds: reviewLadder.completedStageIds,
+        skippedStageIds: reviewLadder.skippedStageIds,
+        source: "done_transition_guard",
+      });
+      return {
+        allowed: true,
+        reason:
+          `Override accepted: ${override.disposition} ` +
+          `(review ladder bypassed — unsatisfied stages: ${reviewLadder.unsatisfiedStageIds.join(", ")})`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    if (mechanismA !== null && mechanismA.count >= 2) {
+      void writeAuditLog(db, issue, "issue.done_transition_null_policy_override", {
+        disposition: override.disposition,
+        overrideReason: override.reason ?? null,
+        ladderedChildCount: mechanismA.count,
+        ladderedChildIdentifiers: mechanismA.identifiers,
+        source: "done_transition_guard",
+      });
+      return {
+        allowed: true,
+        reason:
+          `Override accepted: ${override.disposition} ` +
+          `(ungated decomposed-parent close bypassed — ${mechanismA.count} laddered children: ` +
+          `${mechanismA.identifiers.join(", ")})`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    if (ladderShape !== null) {
+      void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_override", {
+        disposition: override.disposition,
+        overrideReason: override.reason ?? null,
+        missingStageLabels: ladderShape.missingStageLabels,
+        ladderedChildCount: ladderShape.ladderedChildCount,
+        ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
+        source: "done_transition_guard",
+      });
+      return {
+        allowed: true,
+        reason:
+          `Override accepted: ${override.disposition} ` +
+          `(ADR-072 close-ladder shape bypassed — missing stages: ` +
+          `${ladderShape.missingStageLabels.join(", ")})`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
     return {
       allowed: true,
       reason: `Override accepted: ${override.disposition}`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // SUP-14446 mechanism C: fail closed on an unrun review ladder. This runs
+  // before any GitHub/network path so an unsatisfied ladder can never be
+  // waved through by a credential-less or network-fail-open configuration.
+  if (reviewLadder !== null && !reviewLadder.satisfied) {
+    const first = reviewLadder.firstUnsatisfiedStage;
+    void writeAuditLog(db, issue, "issue.done_transition_ladder_refused", {
+      reason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
+      skipReason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
+      stageIndex: reviewLadder.firstUnsatisfiedIndex,
+      stageType: first?.type ?? null,
+      unsatisfiedStageIds: reviewLadder.unsatisfiedStageIds,
+      completedStageIds: reviewLadder.completedStageIds,
+      skippedStageIds: reviewLadder.skippedStageIds,
+      decisionCarried,
+    });
+    return {
+      allowed: false,
+      reason:
+        `Review ladder unsatisfied: stage ${reviewLadder.firstUnsatisfiedIndex + 1} of ` +
+        `${reviewLadder.totalStages} (${first?.type ?? "unknown"}, ${first?.id ?? "unknown"}) has no recorded decision — ` +
+        "its id is in neither completedStageIds nor skippedStageIds. " +
+        "Complete or skip the stage before marking done, or set doneTransitionOverride to a " +
+        `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // SUP-14561 (mechanism A): refuse a ladder-less parent over a decomposed
+  // body of work. No execution policy (or an empty one) was attached to this
+  // issue, yet two or more children each ran a review ladder — the work was
+  // gated at the children and the parent would close ungated. Fail closed
+  // here, in the same pre-network zone as mechanism C.
+  if (mechanismA !== null && mechanismA.count >= 2) {
+    void writeAuditLog(db, issue, "issue.done_transition_null_policy_refused", {
+      reason: "ungated_decomposed_parent",
+      ladderedChildCount: mechanismA.count,
+      ladderedChildIdentifiers: mechanismA.identifiers,
+      source: "done_transition_guard",
+    });
+    return {
+      allowed: false,
+      reason:
+        `Mechanism A (ungated decomposed parent) refused: this issue carries no review ladder, ` +
+        `but ${mechanismA.count} child issues each ran one (${mechanismA.identifiers.join(", ")}). ` +
+        "The decomposed work was gated at the children; closing the parent ungated would ship it " +
+        "with no verification gate and no approval. Attach an execution policy with a review ladder " +
+        "to this issue, or set doneTransitionOverride to a sanctioned no-deliverable-head disposition " +
+        `(${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // SUP-14579 (mechanism D / ADR-072 close-ladder shape): fail closed when a
+  // decomposed parent's review ladder is satisfied but shape-incomplete, at any
+  // tree depth (the `parentId === null` depth gate was removed in SUP-14640).
+  // Runs in the same pre-network zone as mechanisms A and C.
+  if (ladderShape !== null) {
+    void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_refused", {
+      reason: "adr072_close_ladder_shape_incomplete",
+      missingStageLabels: ladderShape.missingStageLabels,
+      ladderedChildCount: ladderShape.ladderedChildCount,
+      ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
+      source: "done_transition_guard",
+    });
+    return {
+      allowed: false,
+      reason:
+        `Mechanism D (ADR-072 close-ladder shape) refused: this issue is a ` +
+        `decomposed parent over ${ladderShape.ladderedChildCount} laddered children ` +
+        `(${ladderShape.ladderedChildIdentifiers.join(", ")}), but its review ladder is missing ` +
+        `the ADR-072 close-ladder stage(s): ${ladderShape.missingStageLabels.join(", ")}. ` +
+        "Add the missing review/approval stages to this issue's execution policy, or set " +
+        `doneTransitionOverride to a sanctioned no-deliverable-head disposition ` +
+        `(${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
       aheadBy: null,
       branch: null,
       defaultRef: null,
@@ -595,7 +1180,36 @@ export async function evaluateDoneTransitionGuard(
   // Treating an unhydrated row as open would block `done` on any issue that merely
   // links a PR (including already-merged or unrelated ones) in exactly the
   // credential-less configuration this guard is built for. Fail open on unknown.
+  let prSkipReason: string | null = null;
+  let cachedCtx: IssueRepoContext | null | undefined;
+  const getCtx = async (): Promise<IssueRepoContext | null> => {
+    if (cachedCtx === undefined) {
+      cachedCtx = await resolveIssueRepoContext(db, issue);
+    }
+    return cachedCtx;
+  };
+
   let resolvedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+
+  // SUP-13831: zero cached mention rows is a false negative when the PR was
+  // never posted with its full URL. Live-discover open PRs carrying the issue
+  // identifier; failures are counted in skipReason and the compare flow below
+  // still applies.
+  if (resolvedPrs.length === 0) {
+    let live: { prs: LinkedPullRequest[]; error: string | null } = { prs: [], error: null };
+    try {
+      const liveCtx = await getCtx();
+      live = await liveDiscoverOpenLinkedPullRequests(db, issue, liveCtx);
+    } catch {
+      live = { prs: [], error: "ctx" };
+    }
+    if (live.prs.length > 0) {
+      resolvedPrs = live.prs;
+      prSkipReason = appendSkipReason(prSkipReason, `live_linked_pr_discovered:${live.prs.length}`);
+    } else if (live.error !== null) {
+      prSkipReason = appendSkipReason(prSkipReason, `live_pr_discovery_failed:${live.error}`);
+    }
+  }
 
   // Best-effort synchronous hydration: attempt to fetch current state from GitHub for
   // any unhydrated (cachedState === null) rows and any cached-"open" rows. A cached
@@ -604,7 +1218,6 @@ export async function evaluateDoneTransitionGuard(
   // stale state. A thrown/failed hydration must NOT throw — degrade to the cached
   // state. We only hydrate if a company token is available; if token resolution
   // itself fails, we keep the cached states as-is.
-  let prSkipReason: string | null = null;
   try {
     const tokenResult = await resolveGitHubToken(db, issue.companyId);
     if (tokenResult.token !== null) {
@@ -649,6 +1262,42 @@ export async function evaluateDoneTransitionGuard(
   if (openPrs.length > 0) {
     const prNames = openPrs.map((p) => p.displayName).join(", ");
     if (decisionCarried) {
+      // SUP-14429 (mechanism B): narrow the D6 waiver to what it actually covers.
+      // An open linked PR held by an undismissed external CHANGES_REQUESTED review
+      // is a pre-existing, externally-visible refusal — it is NOT the card
+      // observing its own merge (the SUP-13207 deadlock the waiver below exists
+      // for). Waiving it would close the card done over a PR that can never merge
+      // and arm a merge against a head that will not land, leaving the PR open
+      // forever with no trace on the issue. Only a live GraphQL reviewDecision of
+      // exactly CHANGES_REQUESTED refuses; every other outcome (APPROVED,
+      // REVIEW_REQUIRED, null — including "could not be resolved") keeps the
+      // waiver, per the fail-open-on-unknown contract (SUP-14429 AC4).
+      const refused = openPrs.filter((p) => p.reviewDecision === "CHANGES_REQUESTED");
+      if (refused.length > 0) {
+        const refusalToken = `open_linked_prs_changes_requested:${refused.length}`;
+        const refusedNames = refused.map((p) => p.displayName).join(", ");
+        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          reason: refusalToken,
+          skipReason: refusalToken,
+          prs: refusedNames,
+        });
+        return {
+          allowed: false,
+          reason:
+            `Issue has ${refused.length} open linked PR${refused.length === 1 ? "" : "s"} ` +
+            `held unmergeable by an undismissed external CHANGES_REQUESTED review (${refusedNames}). ` +
+            "Dismiss or resolve the external review and re-approve, or set doneTransitionOverride to a " +
+            `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}). ` +
+            "The decision-carrying carve-out does not waive a PR an external reviewer is refusing.",
+          aheadBy: null,
+          branch: null,
+          defaultRef: null,
+          owner: null,
+          repo: null,
+          skipped: false,
+          skipReason: refusalToken,
+        };
+      }
       // A review approval is exactly what arms the merge (armMergeOnApproval):
       // blocking the approval on the open PR it approves deadlocks the
       // approval circuit (SUP-13207, board direction B). Plain (non-decision)
@@ -695,7 +1344,7 @@ export async function evaluateDoneTransitionGuard(
     };
   }
 
-  const ctx = await resolveIssueRepoContext(db, issue);
+  const ctx = await getCtx();
   if (!ctx || !ctx.repoUrl || !ctx.defaultRef) {
     return fallback("No resolvable execution workspace or repo context; transition allowed");
   }
@@ -761,6 +1410,67 @@ export async function evaluateDoneTransitionGuard(
       // commits ahead of a stale local base with none attributable — must fail
       // open, because that state is a property of the checkout mechanism, not of
       // the issue's work (SUP-13205).
+      //
+      // A compare 404 is ambiguous (SUP-13831): it fires when the BASE ref is
+      // unresolvable on the remote just as it does when the head branch is
+      // absent. Probe the head ref directly before classifying the 404.
+      const probe = await githubBranchExists(
+        parsed.hostname,
+        parsed.owner,
+        parsed.repo,
+        branch,
+        token,
+      );
+      if (probe.outcome === "auth_failed") {
+        return fallback(
+          `GitHub ref probe rejected the credential (HTTP ${probe.status}); transition allowed`,
+          true,
+          `auth_failed:branch_probe:${probe.status}`,
+        );
+      }
+      if (probe.outcome === "error") {
+        return fallback(
+          `Branch ${branch} ref probe could not be measured; transition allowed`,
+          true,
+          `branch_probe_failed:${branch}`,
+        );
+      }
+      if (probe.outcome === "present") {
+        // The head ref exists on the remote: the compare 404 was about the base
+        // ref (unresolvable/stale on the remote) or a transient API state, not
+        // the deliverable branch. Never report this as branch-absent.
+        if (decisionCarried) {
+          void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+            reason: `compare_404_base_ref_unresolvable_decision_carried:${branch}`,
+            skipReason: prSkipReason,
+            branch,
+            defaultRef: ctx.defaultRef,
+            owner: parsed.owner,
+            repo: parsed.repo,
+          });
+          return {
+            allowed: true,
+            reason:
+              `Decision-carrying transition allowed: compare 404 for branch ${branch} but the branch exists on the remote ` +
+              `(the base ref ${ctx.defaultRef} could not be resolved on the remote). ` +
+              "The approval arms the merge rather than closing the issue — the branch lands with delivery.",
+            aheadBy: null,
+            branch,
+            defaultRef: ctx.defaultRef,
+            owner: parsed.owner,
+            repo: parsed.repo,
+            skipped: false,
+            skipReason: prSkipReason,
+          };
+        }
+        return fallback(
+          `Branch ${branch} exists on the remote; the compare 404 indicates the base ref ${ctx.defaultRef} could not be resolved on the remote. Transition allowed`,
+          true,
+          `compare_404_base_ref_unresolvable:${branch}`,
+        );
+      }
+      // probe.outcome === "absent": the dedicated ref probe confirms the branch
+      // is genuinely absent from the remote. Existing attribution logic below.
       const attribution = ctx.worktreePath
         ? await countIssueAttributableCommits(ctx.worktreePath, ctx.defaultRef, issue.identifier)
         : null;
@@ -794,6 +1504,40 @@ export async function evaluateDoneTransitionGuard(
             true,
             `branch_absent_landed_via_merged_pr:${issue.identifier}:${mergedPrCount}`,
           );
+        }
+        if (decisionCarried) {
+          // Defense-in-depth (SUP-13691): a 404 here means the branch was not
+          // pushed (or the base ref did not resolve on the remote). The review
+          // approval that arms the merge must not be blocked by the unpushed
+          // branch it is approving (SUP-13207/13290 precedent); a plain close
+          // still lands the deliverable first.
+          void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+            reason: `branch_absent_decision_carried:${branch}`,
+            skipReason: `branch_absent_decision_carried:${branch}`,
+            branch,
+            defaultRef: ctx.defaultRef,
+            owner: parsed.owner,
+            repo: parsed.repo,
+            aheadCount: attribution.aheadCount,
+            attributableCommitCount: attribution.attributableCount,
+            mergedPrCount,
+          });
+          return {
+            allowed: true,
+            reason:
+              `Decision-carrying transition exempted from the branch-absent-on-remote block: ` +
+              `Branch ${branch} is absent from the remote while the execution workspace carries ` +
+              `${attribution.attributableCount} commit${attribution.attributableCount === 1 ? "" : "s"} attributable to ` +
+              `${issue.identifier} and no merged PR references it. ` +
+              "The approval arms the merge rather than closing the issue — the branch lands with delivery.",
+            aheadBy: null,
+            branch,
+            defaultRef: ctx.defaultRef,
+            owner: parsed.owner,
+            repo: parsed.repo,
+            skipped: false,
+            skipReason: prSkipReason,
+          };
         }
         void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
           reason: "branch_absent_on_remote",
@@ -957,6 +1701,46 @@ export async function evaluateDoneTransitionGuard(
       );
     }
 
+    // SUP-13873: with attribution and merged-PR probes both measured at zero,
+    // the branch still owes no observable repo content only when the issue's
+    // worktree itself is clean. A design/spec card whose acceptance is a
+    // recorded decision (a done-tier disposition, SUP-12693) leaves no
+    // attributable commit, no merged PR, and no uncommitted work — that is the
+    // sanctioned no-repo-deliverable close. A dirty worktree means content
+    // exists that was never delivered: keep the block and name the owed step.
+    const uncommitted = ctx.worktreePath
+      ? await worktreeHasUncommittedContent(ctx.worktreePath)
+      : null;
+    if (uncommitted === null) {
+      return fallback(
+        `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch) ` +
+          `and the worktree status probe could not be measured; transition allowed`,
+        true,
+        appendSkipReason(foreignToken, "foreign_workspace_branch_status_probe_failed"),
+      );
+    }
+    if (!uncommitted) {
+      return {
+        allowed: true,
+        reason:
+          `Branch ${branch} does not reference ${identifier} (foreign/workspace-shared branch); ` +
+          `no commit on it is attributable to ${identifier}, no merged PR references ${identifier}, ` +
+          "and the issue's worktree is clean — no repo deliverable is owed. " +
+          "This is the sanctioned no-repo-deliverable close; the done-tier disposition " +
+          "records the outcome.",
+        aheadBy,
+        branch,
+        defaultRef: ctx.defaultRef,
+        owner: parsed.owner,
+        repo: parsed.repo,
+        skipped: false,
+        skipReason: appendSkipReason(
+          foreignToken,
+          `no_repo_deliverable_clean_worktree:${identifier}`,
+        ),
+      };
+    }
+
     void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
       reason: "foreign_workspace_branch",
       skipReason: foreignToken,
@@ -967,14 +1751,17 @@ export async function evaluateDoneTransitionGuard(
       aheadBy,
       attributableCommitCount: attribution.attributableCount,
       mergedPrCount,
+      worktreeDirty: true,
     });
     return {
       allowed: false,
       reason:
         `Branch ${branch} is ahead of ${ctx.defaultRef} by ${aheadBy} commits and does not reference ` +
         `${identifier} (foreign/workspace-shared branch); no commit on it is attributable to ` +
-        `${identifier} and no merged PR references ${identifier}. ` +
-        "Deliver this issue's work via its own branch and deliver.sh before marking the issue done.",
+        `${identifier} and no merged PR references ${identifier}, but the issue's worktree holds ` +
+        "uncommitted work that was never delivered. Deliver that work via its own branch and " +
+        "deliver.sh (or record the disposition, e.g. as a design/spec card whose acceptance is a " +
+        "done-tier decision) before marking the issue done.",
       aheadBy,
       branch,
       defaultRef: ctx.defaultRef,

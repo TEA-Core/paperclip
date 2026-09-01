@@ -19,6 +19,15 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    # No `init: true` here on purpose. The image makes tini PID 1 itself
+    # (Dockerfile ENTRYPOINT), which covers every launch path -- compose, plain
+    # `docker run`, the quadlet units and the ECS task definition -- instead of
+    # one lever per orchestrator. Setting it here too would nest docker-init
+    # around tini and make tini warn that it is not PID 1 on every boot.
+    # pids_limit is the backstop: if something ever does leak processes again,
+    # this container hits its own ceiling and dies visibly rather than starving
+    # the whole host of pids.
+    pids_limit: 2048
     ports:
       - "3100:3100"
     environment:
@@ -29,6 +38,15 @@ services:
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private"
       PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://localhost:3100}"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      # Credentials for the bundled CodeRabbit CLI, seeded into
+      # /paperclip/.coderabbit by the entrypoint so agents can run
+      # `coderabbit review --agent` headless. Optional: unset simply leaves the
+      # CLI installed and signed out. See .env.example for how to produce it.
+      CODERABBIT_AUTH_JSON_B64: "${CODERABBIT_AUTH_JSON_B64:-}"
+      # The API-key fallback, for organizations that issue keys instead. Only
+      # consulted when no credential exists yet; unlike the line above it costs
+      # a call to CodeRabbit at boot, so prefer the pre-authenticated JSON.
+      CODERABBIT_API_KEY: "${CODERABBIT_API_KEY:-}"
     volumes:
       - paperclip-data:/paperclip
     depends_on:

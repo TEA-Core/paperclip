@@ -252,7 +252,11 @@ describeEmbeddedPostgres("reuse_existing execution workspace binding", () => {
     expect(issue.executionWorkspacePreference).toBeNull();
   });
 
-  it("still inherits a workspace whose owning issue is live", async () => {
+  it("declines to inherit a live-sourced workspace so the new issue never binds cross-source", async () => {
+    // SUP-14139: binding the new issue to a row sourced by another issue would
+    // run its execution inside that issue's worktree — the shape that wedged
+    // SUP-13445/SUP-14124. A live source is no longer inherited; the issue is
+    // created unbound and gets its own workspace on its next run.
     const companyId = await seedCompany();
     const { projectId, projectWorkspaceId, executionWorkspaceId } = await seedProjectWorkspace(companyId);
     const sourceIssueId = randomUUID();
@@ -282,8 +286,8 @@ describeEmbeddedPostgres("reuse_existing execution workspace binding", () => {
       executionWorkspacePreference: "reuse_existing",
     });
 
-    expect(issue.executionWorkspaceId).toBe(executionWorkspaceId);
-    expect(issue.executionWorkspacePreference).toBe("reuse_existing");
+    expect(issue.executionWorkspaceId).toBeNull();
+    expect(issue.executionWorkspacePreference).toBeNull();
   });
 
   it("rejects an update that would leave reuse_existing without a workspace id", async () => {

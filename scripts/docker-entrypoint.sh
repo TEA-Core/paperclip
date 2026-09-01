@@ -125,9 +125,129 @@ if [ -d "$MCP_PREFIX/lib/node_modules/@paperclipai/mcp-server" ]; then
     ' -- "$MCP_PREFIX" "$NPM_GLOBAL"
 fi
 
+# Seed CodeRabbit CLI credentials so `coderabbit review --agent` runs headless.
+#
+# The CLI reads ONLY $HOME/.coderabbit/auth.json. It does NOT read
+# CODERABBIT_API_KEY at review time -- verified against the shipped binary:
+# with the variable exported and no auth.json, `coderabbit auth status` still
+# reports "signed out". Unauthenticated, `coderabbit review` does not review;
+# it falls through to an interactive browser OAuth flow and, with no browser
+# reachable, exits 1 in ~5s with {"status":"environment_unsupported"}. That is
+# a clean failure rather than a hang, but it is still every agent review
+# failing, so seeding here is what makes the CLI usable at all.
+#
+# Both the server (uid 1000) and agent runtimes (PAPERCLIP_AGENT_UID, uid 1001)
+# have HOME=/paperclip and therefore share this one directory, so it takes the
+# fork's shared-group treatment (setgid `agents`, group-writable) rather than
+# the CLI's own 0700/0600 default -- which uid 1001 could not read. The CLI
+# also writes machine-id, logs, and per-review state in here, so group WRITE is
+# required, not just group read.
+#
+# Credentials are portable: an auth.json captured on one machine authenticates
+# unchanged on another (no machine-id binding), and OAuth tokens carry
+# "expiresAt":"never", so there is no refresh treadmill to keep alive.
+coderabbit_home="${home_dir}/.coderabbit"
+if [ -n "${CODERABBIT_AUTH_JSON_B64:-}" ] || [ -n "${CODERABBIT_API_KEY:-}" ]; then
+    install -d -m 2770 -o node "$coderabbit_home" 2>/dev/null || mkdir -p "$coderabbit_home"
+    if getent group agents >/dev/null 2>&1; then
+        chgrp agents "$coderabbit_home" 2>/dev/null || true
+        chmod 2770 "$coderabbit_home" 2>/dev/null || true
+    fi
+fi
+
+# Preferred path: a known-good auth.json handed over base64-encoded. This is
+# offline -- no call to CodeRabbit at boot -- so a CodeRabbit outage can never
+# hold up a container start. Decoded to a temp file and validated before it
+# replaces a working credential, so a malformed variable degrades to a warning
+# instead of destroying the auth that was already on the volume.
+if [ -n "${CODERABBIT_AUTH_JSON_B64:-}" ]; then
+    cr_tmp="${coderabbit_home}/.auth.json.tmp"
+    # The token must be a non-empty STRING, not merely present: `has()` is true
+    # for {"accessToken":null} and {"accessToken":""} alike, either of which
+    # would replace a working credential with one the CLI cannot use -- and,
+    # because the file then exists, also suppress the API-key fallback below.
+    if printf '%s' "$CODERABBIT_AUTH_JSON_B64" | base64 -d > "$cr_tmp" 2>/dev/null \
+        && jq -e '(.accessToken | type == "string") and (.accessToken | length > 0)' "$cr_tmp" >/dev/null 2>&1; then
+        mv "$cr_tmp" "${coderabbit_home}/auth.json"
+        chown node "${coderabbit_home}/auth.json" 2>/dev/null || true
+        getent group agents >/dev/null 2>&1 && chgrp agents "${coderabbit_home}/auth.json" 2>/dev/null || true
+        chmod 0660 "${coderabbit_home}/auth.json" 2>/dev/null || true
+        echo "docker-entrypoint.sh: seeded CodeRabbit CLI credentials from CODERABBIT_AUTH_JSON_B64"
+    else
+        rm -f "$cr_tmp"
+        echo "docker-entrypoint.sh: warning: CODERABBIT_AUTH_JSON_B64 is not valid base64-encoded CodeRabbit auth JSON; leaving existing CodeRabbit credentials untouched. every \`coderabbit review\` will exit 1 with \"environment_unsupported\" until this is fixed." >&2
+    fi
+# Fallback: exchange an API key for stored credentials. This one DOES call
+# CodeRabbit (the key is validated server-side), so it is skipped whenever a
+# credential already exists and is non-fatal when it fails -- a degraded CLI is
+# survivable, a container that will not boot is not.
+elif [ -n "${CODERABBIT_API_KEY:-}" ] && [ ! -f "${coderabbit_home}/auth.json" ]; then
+    if gosu node env HOME="$home_dir" coderabbit auth login --api-key "$CODERABBIT_API_KEY" >/dev/null 2>&1; then
+        getent group agents >/dev/null 2>&1 && chgrp agents "${coderabbit_home}/auth.json" 2>/dev/null || true
+        chmod 0660 "${coderabbit_home}/auth.json" 2>/dev/null || true
+        echo "docker-entrypoint.sh: authenticated CodeRabbit CLI from CODERABBIT_API_KEY"
+    else
+        echo "docker-entrypoint.sh: warning: CodeRabbit API key login failed (invalid/expired key, or CodeRabbit unreachable). every \`coderabbit review\` will exit 1 with \"environment_unsupported\" until this is fixed." >&2
+    fi
+fi
+
 umask 002
 
-# Give the server CAP_KILL when the agent-uid split is armed.
+# Normalise mixed-ownership worktrees once the uid split is armed.
+#
+# Before the split, the whole fleet wrote as uid 1000 and every worktree was
+# uniformly 1000-owned. Agent runs under the split write as uid 1001 in the
+# same shared `agents` group, so a worktree that has seen an agent run holds a
+# mix of 1000- and 1001-owned files. The next provision (server, uid 1000)
+# then chmods those 1001-owned node_modules/.bin links and EPERMs — chmod(2)
+# keys off ownership or CAP_FOWNER, and group write is irrelevant to it
+# (SUP-13977). chown is the one-time repair for trees that already carry the
+# mix; the CAP_FOWNER grant below covers files agents write between boots, so
+# a tree that becomes mixed again never needs this pass.
+#
+# ONE-TIME, marker-gated. A recursive chown over the whole worktrees subtree
+# costs real minutes against ~969 trees, so it runs only until it has fully
+# succeeded once. The marker lives in $home_dir — the same persistent volume
+# that holds the worktrees — so it survives restarts, and it is NOT written
+# when any worktree failed, so a partial pass retries at the next boot. The
+# stale-marker hole (a volume restored to a mixed snapshot) is covered by the
+# CAP_FOWNER grant: the grant is the ongoing mechanism, this pass only drains
+# the pre-existing backlog.
+#
+# Scoped to the worktrees subtree ONLY — never the home root or the workspaces
+# bind at large. Chowning a read-only bind (vaults, skills-lib) or the root
+# shared toolchain is exactly the outage class this fork walked into on
+# 2026-08-15 (deploy never reached /api/health, rolled back at gate 2), so the
+# glob deliberately matches only `instances/<id>/projects/*/*/paperclip/
+# .paperclip/worktrees/*`.
+#
+# `chown` does not touch mode bits, so setgid directories (which the split
+# relies on to keep new files group-agents) survive unchanged.
+normalise_marker="${home_dir}/.paperclip-worktree-normalise.done"
+if [ -n "${PAPERCLIP_AGENT_UID:-}" ] && [ ! -f "$normalise_marker" ]; then
+    worktrees_root="${home_dir}/instances/${PAPERCLIP_INSTANCE_ID:-default}/projects"
+    agents_gid="$(getent group agents | cut -d: -f3 2>/dev/null || true)"
+    agents_gid="${agents_gid:-1002}"
+    wt_fail=0
+    for wt in "$worktrees_root"/*/*/paperclip/.paperclip/worktrees/*; do
+        [ -d "$wt" ] || continue
+        if ! chown -R "${PUID}:${agents_gid}" "$wt" 2>/dev/null; then
+            echo "docker-entrypoint.sh: warning: could not normalise ownership of $wt to ${PUID}:${agents_gid}" >&2
+            wt_fail=$((wt_fail + 1))
+        fi
+    done
+    if [ "$wt_fail" -eq 0 ]; then
+        if touch "$normalise_marker" 2>/dev/null; then
+            echo "docker-entrypoint.sh: normalised mixed-ownership worktrees to ${PUID}:${agents_gid}"
+        else
+            echo "docker-entrypoint.sh: warning: worktrees normalised but could not write $normalise_marker; the pass will run again next boot" >&2
+        fi
+    else
+        echo "docker-entrypoint.sh: warning: $wt_fail mixed-ownership worktree(s) could not be normalised; retrying next boot. Provisioning them may still EPERM on chmod." >&2
+    fi
+fi
+
+# Give the server CAP_KILL and CAP_FOWNER when the agent-uid split is armed.
 #
 # With PAPERCLIP_AGENT_UID set, agent runtimes are spawned as a DIFFERENT uid
 # through the setuid shim (/usr/local/sbin/paperclip-spawn-agent). The server
@@ -148,26 +268,46 @@ umask 002
 # set; CAP_KILL is kernel-enforced with no argument parsing to get wrong and
 # needs zero changes to the kill path.
 #
-# Raised as an AMBIENT capability so it survives the setuid drop to node and is
-# held by the server process itself. The privilege does NOT flow back down to
-# agents: the kernel clears the ambient set on execve of a setuid binary, so
-# every runtime spawned through the shim lands at uid 1001 with CapPrm/CapEff/
-# CapAmb all zero (verified in-container). The asymmetry is the point — the
-# server can signal agents, agents cannot signal anything.
+# CAP_FOWNER is the same one-directional shape for the FILESYSTEM boundary's
+# other half. Both uids share group `agents`, so both can read and write each
+# other's worktree files, but chmod(2) keys off ownership — group write is
+# irrelevant to it — so pnpm's linkBin EPERMs on any node_modules/.bin link
+# the other uid owns and headless install aborts (SUP-13977).
 #
-# cap_kill is already in the container's bounding set (CapBnd 00000000a80425fb
-# under stock Docker), so no compose `cap_add` is required. Accepted cost: the
-# server can now signal any process in the container, pid 1 included.
+# THE GRANT IS DELIBERATELY ONE-DIRECTIONAL. Do NOT widen it to "so either uid
+# can chmod a file owned by the other": that dissolves the uid split in both
+# directions. The failing chmod is performed by pnpm inside provisioning at the
+# SERVER uid (1000) on files owned by 1001. So uid 1000 (server/provisioner)
+# gains CAP_FOWNER, and uid 1001 (agent) gains nothing and must remain unable
+# to chmod server-owned files. That preserves the M1 property the uid split
+# exists to buy: an agent cannot read /proc/<server-pid>/environ or the
+# root-owned secrets master key, and the capability never crosses the setuid
+# boundary (below).
+#
+# Both are raised as AMBIENT capabilities so they survive the setuid drop to
+# node and are held by the server process itself. The privilege does NOT flow
+# back down to agents: the kernel clears the ambient set on execve of a setuid
+# binary, so every runtime spawned through the shim lands at uid 1001 with
+# CapPrm/CapEff/CapAmb all zero (verified in-container). The asymmetry is the
+# point — the server can signal agents and chmod agent-owned files; agents can
+# do neither.
+#
+# cap_kill and cap_fowner are both already in the container's bounding set
+# (CapBnd 00000000a80425fb under stock Docker — bit 3 is fowner, bit 5 is
+# kill), so no compose `cap_add` is required. Accepted cost: the server can
+# now signal any process in the container, pid 1 included, and chmod any file
+# in the container regardless of owner.
 #
 # `sh -c 'exec "$@"' --` re-execs the original argv with no shell left in the
 # middle, so the server keeps the same process shape it has under gosu and tini
 # still reaps it directly.
 #
 # PROBE THE GRANT, NOT THE BINARY. `command -v capsh` proves only that the file
-# exists. The grant additionally needs cap_kill in the container's BOUNDING set,
-# which is a property of the runtime and not of the image: under
-# `cap_drop: [KILL]`, a restricted Kubernetes PodSecurity profile, or any
-# runtime that trims the default set, `--inh=cap_kill` fails with
+# exists. The grant additionally needs both capabilities in the container's
+# BOUNDING set, which is a property of the runtime and not of the image: under
+# `cap_drop: [KILL]` (or `[FOWNER]`), a restricted Kubernetes PodSecurity
+# profile, or any runtime that trims the default set, `--inh=cap_kill,cap_fowner`
+# fails with
 #
 #   Unable to set inheritable capabilities: Operation not permitted
 #
@@ -180,17 +320,17 @@ umask 002
 # So: run the exact same option vector in a subshell first and only exec it if
 # it succeeded. One extra fork at boot converts an outage into a documented
 # degrade back to the gosu path — the server then behaves exactly as it did
-# before CAP_KILL existed, which is survivable, unlike not starting.
+# before CAP_KILL/CAP_FOWNER existed, which is survivable, unlike not starting.
 #
 # A missing capsh takes the same branch (127 from the shell), so one probe
 # covers both causes and the captured stderr names which one it was.
 if [ -n "${PAPERCLIP_AGENT_UID:-}" ]; then
-    if cap_probe_err="$(capsh --keep=1 --user=node --inh=cap_kill --addamb=cap_kill \
+    if cap_probe_err="$(capsh --keep=1 --user=node --inh=cap_kill,cap_fowner --addamb=cap_kill,cap_fowner \
         --shell=/bin/sh -- -c 'exit 0' 2>&1)"; then
-        exec capsh --keep=1 --user=node --inh=cap_kill --addamb=cap_kill \
+        exec capsh --keep=1 --user=node --inh=cap_kill,cap_fowner --addamb=cap_kill,cap_fowner \
             --shell=/bin/sh -- -c 'exec "$@"' -- "$@"
     fi
-    echo "docker-entrypoint.sh: warning: PAPERCLIP_AGENT_UID is set but CAP_KILL could not be granted (${cap_probe_err:-capsh unavailable}). Starting without it: the server cannot signal agent processes, so run timeouts will fail with EPERM and leave runtimes orphaned. Restore the KILL capability to fix this." >&2
+    echo "docker-entrypoint.sh: warning: PAPERCLIP_AGENT_UID is set but CAP_KILL/CAP_FOWNER could not be granted (${cap_probe_err:-capsh unavailable}). Starting without them: the server cannot signal agent processes, so run timeouts will fail with EPERM and leave runtimes orphaned, and cannot chmod agent-owned files in mixed-ownership worktrees, so pnpm linkBin will EPERM during provision. Restore the KILL and FOWNER capabilities to fix this." >&2
 fi
 
 exec gosu node "$@"
