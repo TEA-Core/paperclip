@@ -1520,16 +1520,18 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
     // SUP-14644 (ruling SUP-14643): the delivery verdict is derived from
     // recorded work-product state only. A recorded merged marker
-    // (status "merged" + a non-empty metadata.mergedAt) is the sole path to
-    // merged_via_pr. Any pull_request product without the full merged marker
-    // counts as an unmerged record. No live GitHub resolution and no ancestry
-    // inference feed the verdict; absent a PR record the state fails safe to
-    // unknown downstream.
+    // (status "merged" + a non-blank string metadata.mergedAt) is the sole
+    // path to merged_via_pr. Any pull_request product without the full merged
+    // marker counts as an unmerged record. No live GitHub resolution and no
+    // ancestry inference feed the verdict; absent a PR record the state fails
+    // safe to unknown downstream.
     const deliveryPullRequestProducts = await listDeliveryPullRequestProducts(workspace);
+    // readNullableString returns null for non-strings and for blank/
+    // whitespace-only strings, so only a genuine non-blank string mergedAt
+    // satisfies the marker (a `false`/`0`/object or "   " must not).
     const hasMergedMarker = (product: (typeof deliveryPullRequestProducts)[number]): boolean =>
       product.status === "merged"
-      && product.metadata?.mergedAt != null
-      && product.metadata?.mergedAt !== "";
+      && readNullableString(product.metadata?.mergedAt) !== null;
     const hasMergedPullRequestProduct = deliveryPullRequestProducts.some((product) => hasMergedMarker(product));
     const hasUnmergedPullRequestProduct = deliveryPullRequestProducts.some((product) => !hasMergedMarker(product));
     const aheadOfBase = typeof git?.aheadCount === "number" && git.aheadCount > 0;

@@ -494,7 +494,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(archived?.cleanupEligibleAt).toBeInstanceOf(Date);
   }, 20_000);
 
-  async function seedAncestryTerminalWorkspace(overrides: { updatedAt?: Date; mergedPr?: boolean } = {}) {
+  async function seedAncestryTerminalWorkspace(overrides: {
+    updatedAt?: Date;
+    mergedPr?: boolean;
+    prMergedAt?: string;
+  } = {}) {
     // Build a worktree whose HEAD equals the base ref (zero commits ahead).
     // With no recorded PR the delivery verdict is unknown — ancestry is no
     // longer a verdict input (SUP-14644). Pass mergedPr to attach a recorded
@@ -565,6 +569,18 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         metadata: { mergedAt: "2026-01-01T00:00:00Z" },
       });
     }
+    if (overrides.prMergedAt !== undefined) {
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId: sourceIssueId,
+        type: "pull_request",
+        provider: "github",
+        title: "Merged PR with recorded mergedAt",
+        url: "https://github.com/paperclipai/paperclip/pull/10627",
+        status: "merged",
+        metadata: { mergedAt: overrides.prMergedAt },
+      });
+    }
     return { companyId, projectId, executionWorkspaceId, sourceIssueId, worktreePath };
   }
 
@@ -586,6 +602,22 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
     expect(workspace?.status).toBe("active");
   }, 20_000);
+
+  it.each([
+    ["   ", "unknown"],
+    ["2026-01-01T00:00:00Z", "merged_via_pr"],
+  ] as const)(
+    "resolves a zero-commit workspace whose PR mergedAt=%s as %s",
+    async (mergedAt, expected) => {
+      // A PR record only reaches merged_via_pr with a genuine non-blank string
+      // mergedAt. On a zero-commit branch (not ahead of base) a whitespace-only
+      // mergedAt fails safe to unknown; a real timestamp yields merged_via_pr.
+      const seeded = await seedAncestryTerminalWorkspace({ prMergedAt: mergedAt });
+      const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+      expect(readiness?.deliveryState).toBe(expected);
+    },
+    20_000,
+  );
 
   it("fails closed before archive when git status inspection is unavailable", async () => {
     const seeded = await seedAncestryTerminalWorkspace();
