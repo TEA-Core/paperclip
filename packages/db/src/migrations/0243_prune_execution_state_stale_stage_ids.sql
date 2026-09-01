@@ -12,7 +12,13 @@ WITH src AS (
   SELECT
     i.id                                                AS issue_id,
     i.execution_state                                   AS st,
-    COALESCE(i.execution_policy -> 'stages', '[]'::jsonb) AS stages
+    -- jsonb_array_elements raises on a non-array, which would abort the whole
+    -- migration. COALESCE only guards a missing key (SQL NULL); JSON null, an
+    -- object or a scalar all survive it, so gate on jsonb_typeof instead.
+    CASE WHEN jsonb_typeof(i.execution_policy -> 'stages') = 'array'
+         THEN i.execution_policy -> 'stages'
+         ELSE '[]'::jsonb
+    END AS stages
   FROM issues i
   WHERE i.execution_state IS NOT NULL
 ),
@@ -24,7 +30,12 @@ pruned AS (
     s.st -> 'skippedStageIds'   AS raw_skipped,
     (
       SELECT COALESCE(jsonb_agg(e.value ORDER BY e.ord), '[]'::jsonb)
-      FROM jsonb_array_elements(COALESCE(s.st -> 'completedStageIds', '[]'::jsonb)) WITH ORDINALITY AS e(value, ord)
+      FROM jsonb_array_elements(
+        CASE WHEN jsonb_typeof(s.st -> 'completedStageIds') = 'array'
+             THEN s.st -> 'completedStageIds'
+             ELSE '[]'::jsonb
+        END
+      ) WITH ORDINALITY AS e(value, ord)
       WHERE (e.value #>> '{}') IN (
         SELECT p.pid ->> 'id'
         FROM jsonb_array_elements(s.stages) AS p(pid)
@@ -33,7 +44,12 @@ pruned AS (
     ) AS kept_completed,
     (
       SELECT COALESCE(jsonb_agg(e.value ORDER BY e.ord), '[]'::jsonb)
-      FROM jsonb_array_elements(COALESCE(s.st -> 'skippedStageIds', '[]'::jsonb)) WITH ORDINALITY AS e(value, ord)
+      FROM jsonb_array_elements(
+        CASE WHEN jsonb_typeof(s.st -> 'skippedStageIds') = 'array'
+             THEN s.st -> 'skippedStageIds'
+             ELSE '[]'::jsonb
+        END
+      ) WITH ORDINALITY AS e(value, ord)
       WHERE (e.value #>> '{}') IN (
         SELECT p.pid ->> 'id'
         FROM jsonb_array_elements(s.stages) AS p(pid)
