@@ -73,50 +73,54 @@ async function main() {
     || `postgres://paperclip:paperclip@127.0.0.1:${config.embeddedPostgresPort}/paperclip`;
   const db = createDb(dbUrl);
 
-  const [sourceIssue] = await db
-    .select({ companyId: issues.companyId, title: issues.title })
-    .from(issues)
-    .where(eq(issues.id, sourceIssueId));
-  if (!sourceIssue) {
-    console.error(`Source issue not found: ${sourceIssueId}`);
-    process.exitCode = 1;
-    return;
-  }
-  const companyId = sourceIssue.companyId;
-  const service = prDeliveryService(db);
+  try {
+    const [sourceIssue] = await db
+      .select({ companyId: issues.companyId, title: issues.title })
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    if (!sourceIssue) {
+      console.error(`Source issue not found: ${sourceIssueId}`);
+      process.exitCode = 1;
+      return;
+    }
+    const companyId = sourceIssue.companyId;
+    const service = prDeliveryService(db);
 
-  const tree = await service.listCarrierIssueIds(companyId, sourceIssueId);
-  console.log(`Carrier ${repository}#${prNumber}`);
-  console.log(`Company: ${companyId}`);
-  console.log(`Carrier tree (${tree.length} issues): ${tree.join(", ")}`);
+    const tree = await service.listCarrierIssueIds(companyId, sourceIssueId);
+    console.log(`Carrier ${repository}#${prNumber}`);
+    console.log(`Company: ${companyId}`);
+    console.log(`Carrier tree (${tree.length} issues): ${tree.join(", ")}`);
 
-  if (dryRun) {
-    console.log("Dry run: no writes performed.");
-    return;
-  }
+    if (dryRun) {
+      console.log("Dry run: no writes performed.");
+      return;
+    }
 
-  const input = { companyId, sourceIssueId, repository, prNumber, headRef, baseRef, headSha, url };
-  const recorded = await service.recordAtOpen(input);
-  console.log(`Recorded ready_for_review rows on ${recorded.writtenIssueIds.length} issues.`);
+    const input = { companyId, sourceIssueId, repository, prNumber, headRef, baseRef, headSha, url };
+    const recorded = await service.recordAtOpen(input);
+    console.log(`Recorded ready_for_review rows on ${recorded.writtenIssueIds.length} issues.`);
 
-  const refreshed = await service.refreshMergeState(input);
-  console.log(
-    `Merge state: ${refreshed.merged ? "merged" : "NOT merged"} ` +
-    `(mergedAt=${refreshed.mergedAt ?? "n/a"}, mergeCommitSha=${refreshed.mergeCommitSha ?? "n/a"})`,
-  );
-  for (const row of refreshed.rows) {
-    console.log(`  ${row.issueId}: found=${row.found} status=${row.status ?? "n/a"}`);
-  }
-
-  if (!refreshed.merged) {
-    console.error(
-      `PR did not resolve as merged. ${recorded.writtenIssueIds.length} ready_for_review rows are recorded; ` +
-        "no merge stamp was applied. Re-run once GitHub reports the PR merged.",
+    const refreshed = await service.refreshMergeState(input);
+    console.log(
+      `Merge state: ${refreshed.merged ? "merged" : "NOT merged"} ` +
+      `(mergedAt=${refreshed.mergedAt ?? "n/a"}, mergeCommitSha=${refreshed.mergeCommitSha ?? "n/a"})`,
     );
-    process.exitCode = 1;
-    return;
+    for (const row of refreshed.rows) {
+      console.log(`  ${row.issueId}: found=${row.found} status=${row.status ?? "n/a"}`);
+    }
+
+    if (!refreshed.merged) {
+      console.error(
+        `PR did not resolve as merged. ${recorded.writtenIssueIds.length} ready_for_review rows are recorded; ` +
+          "no merge stamp was applied. Re-run once GitHub reports the PR merged.",
+      );
+      process.exitCode = 1;
+      return;
+    }
+    console.log("Backfill complete.");
+  } finally {
+    await db.$client.end();
   }
-  console.log("Backfill complete.");
 }
 
 void main().catch((error) => {

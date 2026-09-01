@@ -520,14 +520,19 @@ function prDeliverySignature(input: {
   if (input.type !== "pull_request") return null;
   const metadata = input.metadata ?? {};
   let repository =
-    typeof metadata.repository === "string" && metadata.repository ? metadata.repository : null;
+    typeof metadata.repository === "string" &&
+    /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(metadata.repository)
+      ? metadata.repository
+      : null;
   let prNumber =
-    typeof metadata.prNumber === "number" && Number.isInteger(metadata.prNumber)
+    typeof metadata.prNumber === "number" &&
+    Number.isInteger(metadata.prNumber) &&
+    metadata.prNumber > 0
       ? metadata.prNumber
       : null;
   if ((!repository || !prNumber) && typeof input.url === "string") {
     const match = input.url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
-    if (match) {
+    if (match && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(match[1]) && Number(match[2]) > 0) {
       repository ??= match[1];
       prNumber ??= Number(match[2]);
     }
