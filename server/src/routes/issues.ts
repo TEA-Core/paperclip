@@ -3103,6 +3103,17 @@ export function issueRoutes(
         { authorType: "system" },
       );
 
+      // SUP-14722 (ADR-091 D-D): a refusal must suppress the merge action, not just
+      // the status write. A non-`armed` statusOutcome — head_unresolvable, or any
+      // publishApprovalStatus skip (head_moved / not_delivered / no-pr / ambiguous) —
+      // means the approval never certified a head, yet armMergeOnApproval re-resolves
+      // linked PRs live and would arm auto-merge on whatever head is current. Refuse
+      // here (mirrors SUP-14678 D3's early-return refusal) so the two refusal paths
+      // in this hook read identically. Placed AFTER the Guard A / D-B anchor writes
+      // and the [Merge-arming] comment so the anchor persistence SUP-14717 (D-B) adds
+      // on non-`armed` outcomes still runs on the refusal path.
+      if (statusOutcome.kind !== "armed") return;
+
       const company = await db
         .select({ mergeArmingEnabled: companies.mergeArmingEnabled })
         .from(companies)
