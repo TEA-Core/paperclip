@@ -40,8 +40,15 @@ import {
 //   - Guard A (SUP-13714): the live head is only re-published when the PR's
 //     diff-vs-base is unchanged in substance from the head that was approved
 //     (exec-CTO ruling). The approval transition persists the certified head
-//     SHA in executionState.approvalStatus.publishedHeadSha. When the live
-//     head differs, the PR's base commit is resolved and the three-dot compare
+//     SHA: publishedHeadSha when the stamp was written, and — since SUP-14715
+//     D-B — approvedHeadSha on a skipped/failed first publish, so a skipped
+//     first publish leaves a real anchor this service can recover instead of a
+//     permanent guard-a:no-approved-head dead-end. The anchor head is read from
+//     publishedHeadSha, falling back to approvedHeadSha; when it came from
+//     approvedHeadSha the delegated publish below enforces the ADR-091 D1
+//     delivery-identity gate (a first publish), a re-publish does not. When the
+//     live head differs, the PR's base commit is resolved and the three-dot
+//     compare
 //     (merge-base-resolved) is fetched at each head; the per-file blob SHAs of
 //     the two diffs-vs-base are compared. This is what makes update-branch and
 //     rebase inert (the head tree gains the base's new files, but the PR's own
@@ -154,26 +161,59 @@ interface GitHubReadOutcome {
 }
 
 interface ApprovedHeadRecord {
-  publishedHeadSha: string;
+  /** The anchor head the card's approval certified (publishedHeadSha, or the D-B approvedHeadSha fallback). */
+  anchorHeadSha: string;
   publishedAt?: string;
+  /**
+   * SUP-14715 D-B: true when the anchor head came from
+   * approvalStatus.approvedHeadSha — a head the approval certified but whose
+   * paperclip/approved status was never written (a skipped/failed FIRST
+   * publish). The delegated publish below is then a first publish and must
+   * enforce the ADR-091 D1 delivery-identity gate, because that gate never
+   * successfully ran for this head. False when the anchor is publishedHeadSha
+   * (a re-publish that certifies by content identity and leaves the gate
+   * unset, exactly as before).
+   */
+  firstPublish: boolean;
 }
 
 /**
- * The approved head persisted by the approval transition
- * (executionState.approvalStatus.publishedHeadSha), or null when the card was
- * approved before SUP-13714 shipped or the record was never written. A null
- * here is Guard A's approved-head-unrecoverable case: the reconciler refuses
- * to re-publish, because it cannot prove the live head was ever reviewed.
+ * The approved head the card's approval certified, or null when the card was
+ * approved before SUP-13714 shipped / the SUP-14715 D-B anchor, or the record
+ * was never written. A null here is Guard A's approved-head-unrecoverable case:
+ * the reconciler refuses to re-publish, because it cannot prove the live head
+ * was ever reviewed.
+ *
+ * Two anchors are distinguished (SUP-14715 D-B): publishedHeadSha (the status
+ * was actually written here — a re-publish, firstPublish: false) and, when that
+ * is absent, approvedHeadSha (certified at approval time but never published —
+ * a first publish, firstPublish: true). Guard A's content-identity compare is
+ * identical in both cases; only the delegated publish's delivery-identity gate
+ * differs.
  */
 function readApprovedHead(state: Record<string, unknown> | null | undefined): ApprovedHeadRecord | null {
   const approvalStatus = state?.approvalStatus as Record<string, unknown> | null | undefined;
   if (!approvalStatus || typeof approvalStatus !== "object") return null;
+
   const publishedHeadSha = approvalStatus.publishedHeadSha;
-  if (typeof publishedHeadSha !== "string" || publishedHeadSha.length === 0) return null;
-  return {
-    publishedHeadSha,
-    publishedAt: typeof approvalStatus.publishedAt === "string" ? approvalStatus.publishedAt : undefined,
-  };
+  if (typeof publishedHeadSha === "string" && publishedHeadSha.length > 0) {
+    return {
+      anchorHeadSha: publishedHeadSha,
+      publishedAt: typeof approvalStatus.publishedAt === "string" ? approvalStatus.publishedAt : undefined,
+      firstPublish: false,
+    };
+  }
+
+  const approvedHeadSha = approvalStatus.approvedHeadSha;
+  if (typeof approvedHeadSha === "string" && approvedHeadSha.length > 0) {
+    return {
+      anchorHeadSha: approvedHeadSha,
+      publishedAt: typeof approvalStatus.approvedAt === "string" ? approvalStatus.approvedAt : undefined,
+      firstPublish: true,
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -747,8 +787,9 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   // Guard A — content-identity anti-laundering check (SUP-13714). The
   // paperclip/approved status is an authorization: it may only certify content
   // that was actually reviewed. The approval transition persisted the exact
-  // head it certified (executionState.approvalStatus.publishedHeadSha). When
-  // the live head differs, re-publish only if the PR's diff-vs-base is
+  // head it certified — publishedHeadSha when the stamp was written, or the
+  // SUP-14715 D-B approvedHeadSha fallback on a skipped/failed first publish.
+  // When the live head differs, re-publish only if the PR's diff-vs-base is
   // unchanged in substance from the approved head (exec-CTO ruling): resolve
   // the PR's base commit, fetch the three-dot compare (merge-base-resolved) at
   // each head, and compare the per-file blob SHAs. This makes update-branch and
@@ -757,7 +798,14 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   // added/removed file. Any case we cannot positively verify is a refusal with
   // a recorded reason — never a re-publish.
   const approvedHead = readApprovedHead(row.executionState);
-  let approvedHeadSha: string | null = approvedHead ? approvedHead.publishedHeadSha : null;
+  let approvedHeadSha: string | null = approvedHead ? approvedHead.anchorHeadSha : null;
+  // SUP-14715 D-B: the anchor came from approvalStatus.approvedHeadSha (a
+  // certified but never-published FIRST publish) when approvedHead.firstPublish —
+  // the ADR-091 D1 delivery-identity gate never ran for that head, so the
+  // delegated publish below enforces it. A re-publish (anchor from
+  // publishedHeadSha) and a SUP-14602 pending-candidate recovery
+  // (approvedHead === null) both certify by content identity without the gate.
+  const enforceDeliveryIdentity = approvedHead ? approvedHead.firstPublish : false;
   if (approvedHeadSha === null) {
     // SUP-14602: no published head, but the approval-time certification may
     // have survived the skipped:ambiguous transition as pending candidates.
@@ -859,9 +907,21 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     }
   }
 
-  const outcome = await publishApprovalStatus(db, row.companyId, row.id, row.identifier ?? "", {
+  const publishOptions: { expectedHeadSha: string; enforceDeliveryIdentity?: boolean } = {
     expectedHeadSha: headSha,
-  });
+  };
+  // SUP-14715 D-B: when the anchor came from approvedHeadSha, the ADR-091 D1
+  // delivery-identity gate never successfully ran for this head — the arming
+  // attempt that certified it skipped/failed before the stamp was written. So
+  // this delegated write is a FIRST publish and enforces the delivery-identity
+  // gate, taking the same integrity gate as any other first publish. A
+  // re-publish (anchor from publishedHeadSha) and a SUP-14602 pending-candidate
+  // recovery (approvedHead === null) certify by content identity and leave the
+  // gate unset.
+  if (enforceDeliveryIdentity) {
+    publishOptions.enforceDeliveryIdentity = true;
+  }
+  const outcome = await publishApprovalStatus(db, row.companyId, row.id, row.identifier ?? "", publishOptions);
   if (outcome.kind === "armed") {
     if (approvedHead === null) {
       // SUP-14602: the recovery path certified this head through the same
