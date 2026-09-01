@@ -12,6 +12,23 @@ export const GITHUB_APP_PRIVATE_KEY_SECRET_NAME = "GITHUB_APP_PRIVATE_KEY";
 
 export const GITHUB_APP_ID = "4595159";
 
+/**
+ * The identity of a GitHub App for installation-token minting: its numeric App id (used as
+ * the JWT `iss`) and the secret-store name holding its private key. `resolveAppInstallationToken`
+ * accepts one so a company can mint tokens for more than one installed App; the token cache is
+ * keyed by this identity so one App's token is never served to a caller asking for another.
+ */
+export interface GitHubAppDescriptor {
+  appId: string;
+  privateKeySecretName: string;
+}
+
+/** Default App identity: app 4595159, private key under GITHUB_APP_PRIVATE_KEY. */
+export const DEFAULT_GITHUB_APP: GitHubAppDescriptor = {
+  appId: GITHUB_APP_ID,
+  privateKeySecretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+};
+
 export type GitHubTokenScope = "app_installation" | "project_env" | "company";
 
 export interface GitHubTokenResolution {
@@ -46,9 +63,9 @@ const GH_API_BASE = "https://api.github.com";
 
 const GH_FETCH_TIMEOUT_MS = 15_000;
 
-function generateAppJWT(privateKey: string): string {
+function generateAppJWT(privateKey: string, appId: string): string {
   const now = Math.floor(Date.now() / 1000);
-  const payload = { iat: now - 10, exp: now + 60, iss: GITHUB_APP_ID };
+  const payload = { iat: now - 10, exp: now + 60, iss: appId };
   const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
   const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const data = `${header}.${body}`;
@@ -108,8 +125,9 @@ export async function resolveAppInstallationToken(
   owner?: string,
   repo?: string,
   accessContext?: Record<string, unknown>,
+  app: GitHubAppDescriptor = DEFAULT_GITHUB_APP,
 ): Promise<GitHubTokenResolution | null> {
-  const cacheKey = `${companyId}:${owner ?? ""}:${repo ?? ""}`;
+  const cacheKey = `${companyId}:${app.appId}:${owner ?? ""}:${repo ?? ""}`;
   const now = Date.now();
 
   const cached = appTokenCache.get(cacheKey);
@@ -117,12 +135,12 @@ export async function resolveAppInstallationToken(
     return {
       token: cached.token,
       scope: "app_installation",
-      secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+      secretName: app.privateKeySecretName,
       installationId: cached.installationId,
     };
   }
 
-  const secret = await secrets.getByName(companyId, GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+  const secret = await secrets.getByName(companyId, app.privateKeySecretName);
   if (!secret) return null;
 
   let privateKey: string;
@@ -135,7 +153,7 @@ export async function resolveAppInstallationToken(
     );
   } catch {
     logger.warn(
-      { companyId, secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME },
+      { companyId, secretName: app.privateKeySecretName },
       "Failed to resolve GitHub App private key secret; falling back to PAT",
     );
     return null;
@@ -143,7 +161,7 @@ export async function resolveAppInstallationToken(
 
   if (!privateKey || !privateKey.trim()) {
     logger.warn(
-      { companyId, secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME },
+      { companyId, secretName: app.privateKeySecretName },
       "GitHub App private key secret is empty; falling back to PAT",
     );
     return null;
@@ -151,10 +169,10 @@ export async function resolveAppInstallationToken(
 
   let jwt: string;
   try {
-    jwt = generateAppJWT(privateKey);
+    jwt = generateAppJWT(privateKey, app.appId);
   } catch {
     logger.warn(
-      { companyId, secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME },
+      { companyId, secretName: app.privateKeySecretName },
       "Failed to generate GitHub App JWT (malformed PEM); falling back to PAT",
     );
     return null;
@@ -188,7 +206,7 @@ export async function resolveAppInstallationToken(
     logger.warn(
       {
         companyId,
-        secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+        secretName: app.privateKeySecretName,
         error: err instanceof Error ? err.message : "unknown",
       },
       "GitHub App installation resolution failed; falling back to PAT",
@@ -207,7 +225,7 @@ export async function resolveAppInstallationToken(
     logger.warn(
       {
         companyId,
-        secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+        secretName: app.privateKeySecretName,
         error: err instanceof Error ? err.message : "unknown",
       },
       "GitHub App installation token minting failed; falling back to PAT",
@@ -217,7 +235,7 @@ export async function resolveAppInstallationToken(
 
   if (!tokenResponse.token) {
     logger.warn(
-      { companyId, secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME },
+      { companyId, secretName: app.privateKeySecretName },
       "GitHub App returned empty token; falling back to PAT",
     );
     return null;
@@ -233,7 +251,7 @@ export async function resolveAppInstallationToken(
   return {
     token: tokenResponse.token,
     scope: "app_installation",
-    secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+    secretName: app.privateKeySecretName,
     installationId,
   };
 }
