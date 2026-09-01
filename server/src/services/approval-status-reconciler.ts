@@ -2,10 +2,9 @@ import type { Db } from "@paperclipai/db";
 import {
   externalObjectMentions,
   externalObjects,
-  issueExecutionDecisions,
   issues,
 } from "@paperclipai/db";
-import { and, eq, ne, sql } from "drizzle-orm";
+import { and, ne, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import {
   resolveGitHubTokenCandidatesForRepo,
@@ -18,6 +17,7 @@ import {
   resolveLinkedPullRequestsWithState,
   type LinkedPullRequest,
 } from "./merge-arming.js";
+import { evaluateStageIntegrity } from "./stage-integrity.js";
 
 // SUP-13535. The paperclip/approved commit status is written exactly once, on
 // the PR head that existed when the card was approved. When that head later
@@ -398,122 +398,11 @@ async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateR
     .limit(limit);
 }
 
-/**
- * ADR-073 stage-integrity audit of the recorded approval. Returns a skip
- * verdict when the "approved" record is not backed by a real, non-self
- * decision: an auto-skipped review stage writes no decision row and lands in
- * skippedStageIds, so it must never be treated as an approval.
- */
-async function evaluateStageIntegrity(db: Db, row: CandidateRow): Promise<{ reason: string; detail: string } | null> {
-  const state: Record<string, unknown> = row.executionState ?? {};
-  const policy: Record<string, unknown> = row.executionPolicy ?? {};
-
-  const skippedStageIds = Array.isArray(state.skippedStageIds)
-    ? (state.skippedStageIds as unknown[]).filter((s): s is string => typeof s === "string")
-    : [];
-  if (skippedStageIds.length > 0) {
-    return {
-      reason: "guard-b:skipped-stage",
-      detail: `skipped stages present: ${skippedStageIds.join(", ")}`,
-    };
-  }
-
-  const policyStageIds = new Set(
-    (Array.isArray(policy.stages)
-      ? (policy.stages as Array<Record<string, unknown> | null | undefined>)
-      : []
-    )
-      .map((stage) => (stage && typeof stage.id === "string" ? stage.id : null))
-      .filter((id): id is string => id !== null),
-  );
-
-  const completedStageIds = Array.isArray(state.completedStageIds)
-    ? (state.completedStageIds as unknown[]).filter((s): s is string => typeof s === "string")
-    : [];
-  if (completedStageIds.length === 0) {
-    return {
-      reason: "guard-b:no-completed-stage",
-      detail: "no completed stages recorded in executionState",
-    };
-  }
-  for (const stageId of completedStageIds) {
-    if (!policyStageIds.has(stageId)) {
-      return {
-        reason: "guard-b:stage-not-in-policy",
-        detail: `completed stage ${stageId} is not in executionPolicy.stages`,
-      };
-    }
-  }
-
-  const decisions = await db
-    .select({
-      stageId: issueExecutionDecisions.stageId,
-      actorAgentId: issueExecutionDecisions.actorAgentId,
-      actorUserId: issueExecutionDecisions.actorUserId,
-      createdAt: issueExecutionDecisions.createdAt,
-    })
-    .from(issueExecutionDecisions)
-    .where(eq(issueExecutionDecisions.issueId, row.id));
-
-  const latestByStage = new Map<string, { actorAgentId: string | null; actorUserId: string | null; createdAt: Date }>();
-  for (const decision of decisions) {
-    const existing = latestByStage.get(decision.stageId);
-    if (!existing || decision.createdAt.getTime() >= existing.createdAt.getTime()) {
-      latestByStage.set(decision.stageId, {
-        actorAgentId: decision.actorAgentId,
-        actorUserId: decision.actorUserId,
-        createdAt: decision.createdAt,
-      });
-    }
-  }
-  for (const stageId of completedStageIds) {
-    if (!latestByStage.has(stageId)) {
-      return {
-        reason: "guard-b:stage-without-decision",
-        detail: `completed stage ${stageId} has no issue_execution_decisions row`,
-      };
-    }
-  }
-
-  const forbiddenAgents = new Set<string>();
-  const forbiddenUsers = new Set<string>();
-  if (row.createdByAgentId) forbiddenAgents.add(row.createdByAgentId);
-  if (row.createdByUserId) forbiddenUsers.add(row.createdByUserId);
-  if (typeof policy.returnAssigneeAgentId === "string" && policy.returnAssigneeAgentId) {
-    forbiddenAgents.add(policy.returnAssigneeAgentId);
-  }
-  const returnAssignee = state.returnAssignee as
-    | { type?: unknown; agentId?: unknown; userId?: unknown }
-    | null
-    | undefined;
-  if (returnAssignee && typeof returnAssignee === "object") {
-    if (returnAssignee.type === "agent" && typeof returnAssignee.agentId === "string") {
-      forbiddenAgents.add(returnAssignee.agentId);
-    }
-    if (returnAssignee.type === "user" && typeof returnAssignee.userId === "string") {
-      forbiddenUsers.add(returnAssignee.userId);
-    }
-  }
-
-  for (const stageId of completedStageIds) {
-    const latest = latestByStage.get(stageId)!;
-    if ((latest.actorAgentId && forbiddenAgents.has(latest.actorAgentId)) ||
-        (latest.actorUserId && forbiddenUsers.has(latest.actorUserId))) {
-      return {
-        reason: "guard-b:decision-by-author-or-return-assignee",
-        detail: `stage ${stageId} decided by the card's author or returnAssignee`,
-      };
-    }
-  }
-
-  return null;
-}
-
 async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateResult> {
   const label = row.identifier ?? row.id;
 
   const integrity = await evaluateStageIntegrity(db, row);
-  if (integrity) {
+  if (!integrity.ok) {
     return { kind: "skipped", reason: integrity.reason, detail: `guard-b ${integrity.detail}` };
   }
 

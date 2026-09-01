@@ -153,6 +153,7 @@ import {
   type ArmingOutcome,
   type MergeArmingDecision,
 } from "../services/merge-arming.js";
+import { evaluateStageIntegrity } from "../services/stage-integrity.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
@@ -2981,6 +2982,42 @@ export function issueRoutes(
     if (!shouldPublishApprovalStatus(decision)) return;
     const issueIdentifier = `SUP-${issue.issueNumber}`;
     try {
+      // ADR-091 D3: enforce the reconciler's ADR-073 stage-integrity predicate
+      // on the FIRST publish too — one predicate, two call sites (ADR-085). A
+      // card is only stamped when its recorded approval ladder is a real,
+      // non-self, non-auto-skipped one. An unverifiable integrity record
+      // (missing decision rows / unreadable execution state) refuses the first
+      // stamp (ADR-091 D4); a refusal maps to a skipped [Merge-arming] comment
+      // so the outcome stays diagnosable in-thread.
+      const [integrityRow] = await db
+        .select({
+          id: issueRows.id,
+          createdByAgentId: issueRows.createdByAgentId,
+          createdByUserId: issueRows.createdByUserId,
+          executionState: issueRows.executionState,
+          executionPolicy: issueRows.executionPolicy,
+        })
+        .from(issueRows)
+        .where(eq(issueRows.id, issue.id));
+      if (!integrityRow) {
+        await svc.addComment(
+          issue.id,
+          "[Merge-arming] status:skipped:guard-b:unverifiable: issue row unreadable; refusing to publish the first stamp",
+          {},
+          { authorType: "system" },
+        );
+        return;
+      }
+      const integrity = await evaluateStageIntegrity(db, integrityRow);
+      if (!integrity.ok) {
+        await svc.addComment(
+          issue.id,
+          `[Merge-arming] status:skipped:${integrity.reason}: ${integrity.detail}`,
+          {},
+          { authorType: "system" },
+        );
+        return;
+      }
       // ADR-091 D2a: pin the FIRST publish to the head the approving decision
       // was rendered against. Resolve it up front, then hand it to
       // publishApprovalStatus as expectedHeadSha so a head that moves between
