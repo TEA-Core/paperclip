@@ -13845,7 +13845,39 @@ export function issueRoutes(
             actor,
           })
         : null;
-      const reopenedIssue = await svc.update(id, { status: "todo" });
+      // The implicit comment-reopen historically wrote `status: "todo"` with a bare
+      // `svc.update`, bypassing `applyIssueExecutionPolicyTransition` (SUP-14756).
+      // That left a reopened `done`/`cancelled` card carrying its pre-reopen
+      // `executionState` (e.g. `status: "completed"`); because the done/cancelled
+      // -> non-terminal reset is keyed on the pre-reopen status, no later PATCH could
+      // ever clear it. Route the status write through the same transition the PATCH
+      // route uses so the reset lands in this single write.
+      const reopenPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+      const reopenTransition = applyIssueExecutionPolicyTransition({
+        issue,
+        policy: reopenPolicy,
+        previousPolicy: reopenPolicy,
+        requestedStatus: "todo",
+        requestedAssigneePatch: {},
+        actor: {
+          agentId: actor.agentId ?? null,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        commentBody: req.body.body,
+      });
+      if (reopenTransition.decision) {
+        // A reopen moves the card back to `todo`; the transition should never mint
+        // a stage decision here. Fail loud rather than silently drop it.
+        throw new Error("Comment-reopen unexpectedly produced an execution stage decision");
+      }
+      const reopenedExecutionState =
+        reopenTransition.patch.executionState !== undefined
+          ? reopenTransition.patch.executionState
+          : issue.executionState;
+      const reopenedIssue = await svc.update(id, {
+        status: "todo",
+        ...reopenTransition.patch,
+      });
       if (!reopenedIssue) {
         res.status(404).json({ error: "Issue not found" });
         return;
@@ -13866,6 +13898,7 @@ export function issueRoutes(
         entityId: currentIssue.id,
         details: {
           status: "todo",
+          executionState: reopenedExecutionState,
           ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
           ...(scheduledRetrySupersededByComment
             ? {

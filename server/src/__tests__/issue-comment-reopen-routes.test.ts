@@ -612,6 +612,155 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  describe("SUP-14756: comment-reopen routes the status write through the execution-policy transition", () => {
+    // The exact recorded SUP-14590 shape: a `done`/`cancelled` card that still
+    // carries a `completed` executionState plus an executionPolicy whose live
+    // stage differs from the retired revision the state points at. Before the
+    // fix, the comment-reopen wrote only `status: "todo"` and left the state
+    // `completed`, so no later PATCH could fire the done->non-terminal reset.
+    // A `blocked` card instead carries no executionState (a card parked mid-
+    // dependency has no active stage).
+    function sup14590Issue(status: "done" | "cancelled" | "blocked") {
+      return {
+        ...makeIssue(status),
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            {
+              id: "33333333-4444-4555-8666-777777777777",
+              type: "review",
+              participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+              approvalsNeeded: 1,
+            },
+          ],
+        },
+        executionState:
+          status === "blocked"
+            ? null
+            : {
+                status: "completed",
+                currentStageId: null,
+                currentStageIndex: null,
+                currentStageType: null,
+                currentParticipant: null,
+                returnAssignee: null,
+                completedStageIds: ["00000000-0000-4000-8000-000000000001"],
+                skippedStageIds: [],
+                lastDecisionId: null,
+                lastDecisionOutcome: null,
+              },
+      };
+    }
+
+    async function reopenViaComment(issue: Record<string, unknown>) {
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch));
+      return request(await installActor(createApp()))
+        .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+        .send({ body: "please continue" });
+    }
+
+    it("reopens a done card via comment and nulls the completed executionState in the same write", async () => {
+      const issue = sup14590Issue("done");
+      const res = await reopenViaComment(issue);
+
+      expect(res.status).toBe(201);
+      // One write carries both the status reset and the executionState reset.
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "11111111-1111-4111-8111-111111111111",
+        expect.objectContaining({ status: "todo", executionState: null }),
+      );
+      // The activity row now records the executionState change — the missing
+      // key was the only tell that the transition had been skipped.
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.updated",
+          details: expect.objectContaining({
+            status: "todo",
+            reopened: true,
+            reopenedFrom: "done",
+            executionState: null,
+          }),
+        }),
+      );
+
+      // AC4 follow-through: with executionState nulled, a re-delivery to
+      // in_review arms the first live stage fresh — a participant is selected
+      // and the retired-revision completedStageIds do not carry over.
+      const { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } =
+        await import("../services/issue-execution-policy.js");
+      const policy = normalizeIssueExecutionPolicy(issue.executionPolicy);
+      const redelivery = applyIssueExecutionPolicyTransition({
+        issue: { ...issue, status: "todo", executionState: null },
+        policy,
+        previousPolicy: policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: null, userId: "local-board" },
+        commentBody: null,
+      });
+      const armed = redelivery.patch.executionState as {
+        status: string;
+        currentStageId: string | null;
+        currentParticipant: unknown;
+        completedStageIds: string[] | null;
+      };
+      expect(armed.status).toBe("pending");
+      expect(armed.currentStageId).toBe("33333333-4444-4555-8666-777777777777");
+      expect(armed.currentParticipant).not.toBeNull();
+      expect(armed.completedStageIds ?? []).not.toContain("00000000-0000-4000-8000-000000000001");
+    });
+
+    it("reopens a cancelled card via comment identically (nulls the completed executionState)", async () => {
+      const issue = sup14590Issue("cancelled");
+      const res = await reopenViaComment(issue);
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "11111111-1111-4111-8111-111111111111",
+        expect.objectContaining({ status: "todo", executionState: null }),
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          details: expect.objectContaining({
+            reopened: true,
+            reopenedFrom: "cancelled",
+            executionState: null,
+          }),
+        }),
+      );
+    });
+
+    it("reopens a blocked card via comment without writing executionState (transition returns an empty patch)", async () => {
+      const issue = sup14590Issue("blocked");
+      const res = await reopenViaComment(issue);
+
+      expect(res.status).toBe(201);
+      // No executionState is written for a non-terminal (blocked) reopen: the
+      // transition returns an empty patch and the write is status-only.
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "11111111-1111-4111-8111-111111111111",
+        { status: "todo" },
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          details: expect.objectContaining({
+            reopened: true,
+            reopenedFrom: "blocked",
+            status: "todo",
+          }),
+        }),
+      );
+    });
+  });
+
   it("allows default-open non-assignee POST comments on closed issues without reopening", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.addComment.mockResolvedValue({
