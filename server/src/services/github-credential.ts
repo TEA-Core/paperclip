@@ -36,6 +36,8 @@ export interface GitHubTokenResolution {
   scope: GitHubTokenScope;
   secretName: string;
   installationId?: string;
+  /** Epoch millis when the minted installation token expires (present for app_installation scope). */
+  expiresAt?: number;
 }
 
 export interface GitHubTokenResolutionFailure {
@@ -73,7 +75,12 @@ function generateAppJWT(privateKey: string, appId: string): string {
   return `${data}.${sig}`;
 }
 
-async function ghAppFetch(path: string, jwt: string, method = "GET"): Promise<any> {
+async function ghAppFetch(
+  path: string,
+  jwt: string,
+  method = "GET",
+  body?: Record<string, unknown>,
+): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(
     () => controller.abort(new Error(`GitHub App API timeout after ${GH_FETCH_TIMEOUT_MS}ms: ${path}`)),
@@ -89,6 +96,7 @@ async function ghAppFetch(path: string, jwt: string, method = "GET"): Promise<an
         "X-GitHub-Api-Version": "2022-11-28",
         ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
       },
+      ...(method === "POST" && body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
     const text = await res.text();
     if (!res.ok) {
@@ -109,7 +117,7 @@ function isExpired(cached: CachedAppToken, now: number): boolean {
  * `secretService(db)` so a credential provider (e.g. the git remote auth provider) can pass
  * its own secret deps without pulling the whole secret service along.
  */
-interface AppInstallationTokenSecrets {
+export interface AppInstallationTokenSecrets {
   getByName: (companyId: string, name: string) => Promise<{ id: string } | null | undefined>;
   resolveSecretValue: (
     companyId: string,
@@ -126,6 +134,7 @@ export async function resolveAppInstallationToken(
   repo?: string,
   accessContext?: Record<string, unknown>,
   app: GitHubAppDescriptor = DEFAULT_GITHUB_APP,
+  permissions?: Record<string, unknown>,
 ): Promise<GitHubTokenResolution | null> {
   const cacheKey = `${companyId}:${app.appId}:${owner ?? ""}:${repo ?? ""}`;
   const now = Date.now();
@@ -137,6 +146,7 @@ export async function resolveAppInstallationToken(
       scope: "app_installation",
       secretName: app.privateKeySecretName,
       installationId: cached.installationId,
+      expiresAt: cached.expiresAt,
     };
   }
 
@@ -220,6 +230,7 @@ export async function resolveAppInstallationToken(
       `/app/installations/${installationId}/access_tokens`,
       jwt,
       "POST",
+      permissions ? { permissions } : undefined,
     );
   } catch (err) {
     logger.warn(
@@ -242,10 +253,11 @@ export async function resolveAppInstallationToken(
   }
 
   const expiresAt = new Date(tokenResponse.expires_at).getTime();
+  const safeExpiresAt = isNaN(expiresAt) ? Date.now() + 60 * 60 * 1000 : expiresAt;
   appTokenCache.set(cacheKey, {
     token: tokenResponse.token,
     installationId,
-    expiresAt: isNaN(expiresAt) ? Date.now() + 60 * 60 * 1000 : expiresAt,
+    expiresAt: safeExpiresAt,
   });
 
   return {
@@ -253,6 +265,7 @@ export async function resolveAppInstallationToken(
     scope: "app_installation",
     secretName: app.privateKeySecretName,
     installationId,
+    expiresAt: safeExpiresAt,
   };
 }
 
