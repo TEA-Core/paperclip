@@ -194,50 +194,65 @@ export async function ensureSharedGroupOwnership(
     try {
       verifiedPath = await fs.realpath(`/proc/self/fd/${handle.fd}`);
     } catch {
-      // /proc/self/fd is Linux-specific. On other platforms we cannot verify
-      // post-open; rely on O_NOFOLLOW for leaf-symlink protection and skip
-      // containment/denied checks (they are moot without a verified path).
+      // /proc/self/fd is Linux-specific. On other platforms (or a container
+      // without /proc) we cannot verify the post-open target. Containment can
+      // then not be proven, so it is enforced below (fail-closed). The
+      // denied-directory guard still has a meaningful lexical floor and runs
+      // against the lexical path; O_NOFOLLOW already proved the leaf is not a
+      // symlink.
       verifiedPath = null;
     }
 
-    if (verifiedPath !== null) {
+    // Containment is fail-closed: when a containment root was requested but
+    // the opened handle cannot be verified, we cannot prove the target is
+    // inside it, so refuse rather than mutate. The self-repair caller always
+    // passes containmentRoot; a non-Linux host is not where it runs.
+    if (containmentRoot != null && verifiedPath === null) {
+      warn(
+        `Paperclip: refusing shared-group ownership on ${dirPath} — the opened handle could not ` +
+          `be verified (no /proc/self/fd) and a containment root was required. No mutation performed.`,
+      );
+      return;
+    }
+
+    if (verifiedPath !== null && containmentRoot != null) {
       // Containment check: when a containment root is specified, the verified
       // path must be the root itself or within it. This catches ancestor
       // symlinks that O_NOFOLLOW does not prevent.
-      if (containmentRoot != null) {
-        const resolvedRoot = await fs.realpath(containmentRoot);
-        if (
-          verifiedPath !== resolvedRoot &&
-          !verifiedPath.startsWith(resolvedRoot + path.sep)
-        ) {
-          warn(
-            `Paperclip: refusing shared-group ownership on ${dirPath} — the resolved target ` +
-              `${verifiedPath} is outside the containment root ${resolvedRoot}. ` +
-              `This may indicate a concurrent symlink swap (TOCTOU). No mutation performed.`,
-          );
-          return;
-        }
-      }
-
-      // Denied-dir check on the VERIFIED (real) path, not the lexical path.
-      // A lexical path inside the worktree could resolve (via symlink) to a
-      // server-owned directory; the old code compared only the lexical path.
+      const resolvedRoot = await fs.realpath(containmentRoot);
       if (
-        isDeniedServerOwnedDirOrAncestor(verifiedPath, [
-          resolveMasterKeyDir,
-          resolvePostgresDataDir,
-          resolveDatabaseBackupDir,
-        ])
+        verifiedPath !== resolvedRoot &&
+        !verifiedPath.startsWith(resolvedRoot + path.sep)
       ) {
         warn(
-          `Paperclip: refusing shared-group ownership on ${dirPath} — it resolves to ${verifiedPath}, ` +
-            `which is a server-owned directory (secrets master-key, embedded-Postgres data, or ` +
-            `database backup) or an ancestor/descendant of one. ` +
-            `Under M1 (agent uid 1001, server uid 1000) these directories must remain owned by ` +
-            `the server group, not "${groupName}".`,
+          `Paperclip: refusing shared-group ownership on ${dirPath} — the resolved target ` +
+            `${verifiedPath} is outside the containment root ${resolvedRoot}. ` +
+            `This may indicate a concurrent symlink swap (TOCTOU). No mutation performed.`,
         );
         return;
       }
+    }
+
+    // Denied-dir check prefers the VERIFIED (real) path; a lexical path inside
+    // the worktree could resolve (via symlink) to a server-owned directory.
+    // When the handle cannot be verified, fall back to the lexical path
+    // instead of skipping the guard entirely.
+    const deniedCheckPath = verifiedPath ?? dirPath;
+    if (
+      isDeniedServerOwnedDirOrAncestor(deniedCheckPath, [
+        resolveMasterKeyDir,
+        resolvePostgresDataDir,
+        resolveDatabaseBackupDir,
+      ])
+    ) {
+      warn(
+        `Paperclip: refusing shared-group ownership on ${dirPath} — it resolves to ${deniedCheckPath}, ` +
+          `which is a server-owned directory (secrets master-key, embedded-Postgres data, or ` +
+          `database backup) or an ancestor/descendant of one. ` +
+          `Under M1 (agent uid 1001, server uid 1000) these directories must remain owned by ` +
+          `the server group, not "${groupName}".`,
+      );
+      return;
     }
 
     const gid = await resolveGid(groupName);
@@ -260,7 +275,11 @@ export async function ensureSharedGroupOwnership(
     const stat = await handle.stat();
     await handle.chown(stat.uid, gid);
     const currentMode = stat.mode & 0o7777;
-    await handle.chmod(currentMode | 0o2070);
+    // Directories need setgid + group rwx for group inheritance and traversal.
+    // Regular files need only group rw: adding setgid + group execute to a
+    // file produces a setgid executable built from content an agent can write.
+    const groupBits = stat.isDirectory() ? 0o2070 : 0o0060;
+    await handle.chmod(currentMode | groupBits);
   } catch (err) {
     if (!chgrpFailedWarned) {
       chgrpFailedWarned = true;

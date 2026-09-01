@@ -112,6 +112,26 @@ describe("shared-group-ownership", () => {
       expect(chmodMode & 0o0070).toBe(0o0070);
     });
 
+    it("adds only group rw (no setgid, no group exec) to a regular file", async () => {
+      const { ensureSharedGroupOwnership } = await loadFreshModule();
+      const file = path.join(os.tmpdir(), "paperclip-shared-group-test-file");
+      const handle = setupOpenSuccess(file, {
+        stat: vi.fn().mockResolvedValue({ uid: 1000, mode: 0o644, isDirectory: () => false }),
+      });
+
+      await ensureSharedGroupOwnership(file, {
+        resolveGid: async () => REAL_GID,
+        resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
+      });
+
+      expect(handle.chmod).toHaveBeenCalledTimes(1);
+      const mode = handle.chmod.mock.calls[0]?.[0] as number;
+      // Group rw applied; no setgid and no group execute on a regular file.
+      expect(mode & 0o0060).toBe(0o0060);
+      expect(mode & 0o2000).toBe(0);
+      expect(mode & 0o0010).toBe(0);
+    });
+
     it("chgrps to the resolved group when the group exists", async () => {
       const { ensureSharedGroupOwnership } = await loadFreshModule();
       const dir = path.join(os.tmpdir(), "paperclip-shared-group-test-chgrp");
@@ -427,7 +447,9 @@ describe("shared-group-ownership", () => {
       const worktrees = path.join(repoRoot, ".paperclip", "worktrees");
 
       const handles: MockHandle[] = [];
-      mockOpen.mockImplementation(async () => {
+      const openedPaths: string[] = [];
+      mockOpen.mockImplementation(async (p: string) => {
+        openedPaths.push(p);
         const h = createMockHandle({
           stat: vi.fn().mockResolvedValue({ uid: 1000, mode: 0o2700, isDirectory: () => true }),
         });
@@ -435,7 +457,10 @@ describe("shared-group-ownership", () => {
         return h;
       });
       mockRealpath.mockImplementation(async (p: string) => {
-        if (p.startsWith("/proc/self/fd/")) return p.replace("/proc/self/fd/100", "");
+        // Every handle shares fd 100; the module opens a directory and then
+        // immediately resolves /proc/self/fd/<fd>, so the most-recently-opened
+        // path is the directory currently being verified.
+        if (p.startsWith("/proc/self/fd/")) return openedPaths[openedPaths.length - 1] ?? p;
         return p;
       });
 
@@ -596,12 +621,19 @@ describe("shared-group-ownership regression (real fs)", () => {
     // The lexical path is inside the worktree, but resolves outside
     const lexicalPath = path.join(linkedDir, "target.txt");
 
+    const warnSpy = vi.fn();
     await ensureSharedGroupOwnership(lexicalPath, {
       resolveGid: async () => REAL_GID,
       resolveMasterKeyDir: () => path.join(tmpRoot, "nonexistent-secrets"),
       containmentRoot: worktree,
-      warn: () => {},
+      warn: warnSpy,
     });
+
+    // Assert the containment guard itself fired (not just that chown would
+    // fail on a non-root runner), so this test fails if the check regresses.
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("outside the containment root"),
+    );
 
     // The external target must be UNCHANGED
     const afterStat = await realFs.stat(externalTarget);

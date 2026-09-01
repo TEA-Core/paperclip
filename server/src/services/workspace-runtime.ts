@@ -38,6 +38,11 @@ import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
+import {
+  ensureSharedGroupOwnership,
+  ensureSharedGroupTraversalPath,
+  type EnsureSharedGroupOwnershipOptions,
+} from "./shared-group-ownership.js";
 import { hasVerifiedWorktreeSeedManifest, isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
 import {
   buildManagedWorkspaceGuestEnv,
@@ -3798,8 +3803,15 @@ export async function assertWorktreeWritableByProcessUser(
     // before anyone is told to touch the host.
     await ensureSharedGroupOwnership(worktreePath, { ...sharedGroupRepairOptions, containmentRoot: worktreePath });
     const resolvedWorktreePath = await fs.realpath(worktreePath);
-    for (const fullPath of unwritable) {
-      if (fullPath === worktreePath) continue;
+    // Bounded repair: this per-path shared-group repair targets a small number
+    // of files that escaped the root's setgid inheritance. A tree-wide
+    // permission problem (more unwritable paths than MAX_FAILURES) is not what
+    // it can fix — that is resolved by the `chgrp -R` remediation in the
+    // failure message below. Capping the loop keeps a large repo from turning
+    // one provisioning step into hundreds of thousands of serial
+    // open/realpath/chown/chmod syscalls.
+    const trackedUnwritable = unwritable.filter((p) => p !== worktreePath).slice(0, MAX_FAILURES);
+    for (const fullPath of trackedUnwritable) {
       // SUP-14642 (security, redo 2) + SUP-14687: the caller-side realpath
       // pre-check is a cheap early filter; the authoritative containment
       // verification happens inside ensureSharedGroupOwnership via the
@@ -3849,12 +3861,6 @@ export async function assertWorktreeWritableByProcessUser(
     );
   }
 }
-
-import {
-  ensureSharedGroupOwnership,
-  ensureSharedGroupTraversalPath,
-  type EnsureSharedGroupOwnershipOptions,
-} from "./shared-group-ownership.js";
 
 /**
  * SUP-13090: pnpm refuses a frozen install when the committed lockfile disagrees

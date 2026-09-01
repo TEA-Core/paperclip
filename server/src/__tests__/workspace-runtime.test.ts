@@ -709,7 +709,7 @@ describe("assertWorktreeWritableByProcessUser", () => {
     try {
       await expect(
         assertWorktreeWritableByProcessUser(worktreePath, {
-          resolveGid: async () => process.getgid(),
+          resolveGid: async () => (typeof process.getgid === "function" ? process.getgid() : null),
         }),
       ).resolves.toBeUndefined();
     } finally {
@@ -736,7 +736,7 @@ describe("assertWorktreeWritableByProcessUser", () => {
     try {
       await expect(
         assertWorktreeWritableByProcessUser(worktreePath, {
-          resolveGid: async () => process.getgid(),
+          resolveGid: async () => (typeof process.getgid === "function" ? process.getgid() : null),
         }),
       ).resolves.toBeUndefined();
     } finally {
@@ -760,7 +760,7 @@ describe("assertWorktreeWritableByProcessUser", () => {
     const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
     try {
       await assertWorktreeWritableByProcessUser(worktreePath, {
-        resolveGid: async () => process.getgid(),
+        resolveGid: async () => (typeof process.getgid === "function" ? process.getgid() : null),
       });
       // Assert before the spy is restored — mockRestore() clears mock.calls.
       const call = warnSpy.mock.calls.find(
@@ -814,7 +814,7 @@ describe("assertWorktreeWritableByProcessUser", () => {
       // by the repair, so it survives the re-probe and the validator throws.
       await expect(
         assertWorktreeWritableByProcessUser(worktreePath, {
-          resolveGid: async () => process.getgid(),
+          resolveGid: async () => (typeof process.getgid === "function" ? process.getgid() : null),
         }),
       ).rejects.toThrow(/not writable/);
     } finally {
@@ -875,7 +875,7 @@ describe("assertWorktreeWritableByProcessUser", () => {
       // the repair, so it survives the re-probe and the validator throws.
       await expect(
         assertWorktreeWritableByProcessUser(worktreePath, {
-          resolveGid: async () => process.getgid(),
+          resolveGid: async () => (typeof process.getgid === "function" ? process.getgid() : null),
         }),
       ).rejects.toThrow(/not writable/);
     } finally {
