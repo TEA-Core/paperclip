@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { issueExecutionDecisions } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 
 /**
  * ADR-091 D3: the ADR-073 stage-integrity record — a card whose approval
@@ -12,6 +12,15 @@ import { eq } from "drizzle-orm";
  */
 export interface StageIntegrityRecord {
   id: string;
+  /**
+   * The owning company. `issue_execution_decisions.issueId` already references
+   * the globally unique `issues.id`, so scoping the decision read by company is
+   * redundant today — it is required anyway because this predicate authorizes
+   * the `paperclip/approved` stamp, and every read behind an authorization
+   * decision carries its company boundary explicitly (repo company-scoping
+   * guideline). It also matches the `(company_id, issue_id)` index.
+   */
+  companyId: string;
   createdByAgentId: string | null;
   createdByUserId: string | null;
   executionState: Record<string, unknown> | null;
@@ -94,7 +103,12 @@ export async function evaluateStageIntegrity(
       createdAt: issueExecutionDecisions.createdAt,
     })
     .from(issueExecutionDecisions)
-    .where(eq(issueExecutionDecisions.issueId, row.id));
+    .where(
+      and(
+        eq(issueExecutionDecisions.issueId, row.id),
+        eq(issueExecutionDecisions.companyId, row.companyId),
+      ),
+    );
 
   const latestByStage = new Map<string, { actorAgentId: string | null; actorUserId: string | null; createdAt: Date }>();
   for (const decision of decisions) {

@@ -2992,13 +2992,14 @@ export function issueRoutes(
       const [integrityRow] = await db
         .select({
           id: issueRows.id,
+          companyId: issueRows.companyId,
           createdByAgentId: issueRows.createdByAgentId,
           createdByUserId: issueRows.createdByUserId,
           executionState: issueRows.executionState,
           executionPolicy: issueRows.executionPolicy,
         })
         .from(issueRows)
-        .where(eq(issueRows.id, issue.id));
+        .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId)));
       if (!integrityRow) {
         await svc.addComment(
           issue.id,

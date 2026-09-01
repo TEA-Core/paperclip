@@ -131,10 +131,16 @@ describeEmbeddedPostgres("stage-integrity (ADR-073 shared predicate)", () => {
 
   function record(
     issueId: string,
-    overrides: Partial<Pick<StageIntegrityRecord, "createdByAgentId" | "createdByUserId" | "executionState" | "executionPolicy">> = {},
+    overrides: Partial<
+      Pick<
+        StageIntegrityRecord,
+        "companyId" | "createdByAgentId" | "createdByUserId" | "executionState" | "executionPolicy"
+      >
+    > = {},
   ): StageIntegrityRecord {
     return {
       id: issueId,
+      companyId,
       createdByAgentId: null,
       createdByUserId: null,
       executionState: cleanState(),
@@ -164,6 +170,30 @@ describeEmbeddedPostgres("stage-integrity (ADR-073 shared predicate)", () => {
     const result = await evaluateStageIntegrity(db, record(issueId));
 
     expect(isOk(result)).toBe(true);
+  });
+
+  it("does not count a decision row from outside the record's company", async () => {
+    const issueId = await insertIssue();
+    await insertDecision(issueId, { actorUserId: USER_REVIEWER });
+
+    // Same issue row, evaluated under a different company boundary. The
+    // decision read is company-scoped, so the row is invisible and the
+    // completed stage refuses for want of a decision (fail closed, ADR-091 D4).
+    const otherCompany = await db
+      .insert(companies)
+      .values({ name: "Other Company", issuePrefix: "OTH" })
+      .returning();
+
+    const result = await evaluateStageIntegrity(
+      db,
+      record(issueId, { companyId: otherCompany[0]!.id }),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "guard-b:stage-without-decision",
+      detail: `completed stage ${APPROVAL_STAGE_ID} has no issue_execution_decisions row`,
+    });
   });
 
   it("refuses a card reaching approval with an auto-skipped stage", async () => {
