@@ -3796,20 +3796,16 @@ export async function assertWorktreeWritableByProcessUser(
     // shared-group repair the provisioning path already runs at four other
     // sites in this module is the right one, so attempt it here and re-probe
     // before anyone is told to touch the host.
-    await ensureSharedGroupOwnership(worktreePath, sharedGroupRepairOptions);
+    await ensureSharedGroupOwnership(worktreePath, { ...sharedGroupRepairOptions, containmentRoot: worktreePath });
     const resolvedWorktreePath = await fs.realpath(worktreePath);
     for (const fullPath of unwritable) {
       if (fullPath === worktreePath) continue;
-      // SUP-14642 (security, redo 2): containment is a property of the WHOLE
-      // resolved path, not just the leaf. fs.lstat skips following only the
-      // final component, so a tracked file whose PARENT directory is a symlink
-      // still resolves through it to an external target as a regular file and
-      // isSymbolicLink() is false; ensureSharedGroupOwnership stats/chowns/
-      // chmods symlink-following while its denied-dir guard compares only the
-      // lexical path, so the external target would be chgrp'd to the shared
-      // group + group rwx. Require the realpath of the candidate to stay inside
-      // the realpath of the worktree; otherwise skip. The path still surfaces
-      // in the failure list below.
+      // SUP-14642 (security, redo 2) + SUP-14687: the caller-side realpath
+      // pre-check is a cheap early filter; the authoritative containment
+      // verification happens inside ensureSharedGroupOwnership via the
+      // handle's /proc/self/fd resolution (containmentRoot param). A
+      // concurrent symlink swap between this check and the mutation is
+      // closed by the module's resolve-then-mutate-by-handle design.
       let resolvedFullPath: string;
       try {
         resolvedFullPath = await fs.realpath(fullPath);
@@ -3824,7 +3820,7 @@ export async function assertWorktreeWritableByProcessUser(
       ) {
         continue;
       }
-      await ensureSharedGroupOwnership(fullPath, sharedGroupRepairOptions);
+      await ensureSharedGroupOwnership(fullPath, { ...sharedGroupRepairOptions, containmentRoot: worktreePath });
     }
     const surviving = await probeUnwritablePaths();
     if (surviving.length === 0) {

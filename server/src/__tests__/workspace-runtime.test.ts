@@ -914,6 +914,42 @@ describe("assertWorktreeWritableByProcessUser", () => {
     expect(message.indexOf("chgrp")).toBeLessThan(message.indexOf("chown"));
   });
 
+  // SUP-14687: an unopenable tracked file (chmod 0o000) cannot be repaired via
+  // handle-based mutation. The repair attempts fs.open, receives EACCES, warns,
+  // and returns without any path-based fallback. The file still surfaces in the
+  // surviving-unwritable list, and its mode is unchanged (no path-based mutation).
+  it("surfaces an unopenable (EACCES) tracked file in the surviving-unwritable list without path-based fallback", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "SUP-14687-eacces-surviving";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
+
+    const lockedFile = path.join(worktreePath, "locked-000.txt");
+    await fs.writeFile(lockedFile, "locked\n", "utf8");
+    await execFileAsync("git", ["add", "locked-000.txt"], { cwd: worktreePath });
+    await execFileAsync("git", ["commit", "-m", "add locked file"], { cwd: worktreePath });
+
+    await fs.chmod(lockedFile, 0o000);
+
+    try {
+      let message = "";
+      try {
+        await assertWorktreeWritableByProcessUser(worktreePath, noOpSharedGroupRepair);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+
+      expect(message).toMatch(/not writable/);
+      expect(message).toContain("locked-000.txt");
+      // The file's mode is unchanged: no path-based fallback mutated it.
+      const afterStat = await fs.stat(lockedFile);
+      expect(afterStat.mode & 0o7777).toBe(0o000);
+    } finally {
+      await fs.chmod(lockedFile, 0o644);
+    }
+  });
+
   it("throws when the path is not a valid git repository", async () => {
     const nonRepoPath = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-non-repo-"));
 
