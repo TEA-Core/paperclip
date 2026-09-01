@@ -437,13 +437,15 @@ export const resolveIssueRecoveryActionSchema = z.object({
   }
 
   if (value.outcome === "false_positive" || value.outcome === "cancelled") {
-    if (
-      value.sourceIssueStatus !== "done" &&
-      value.sourceIssueStatus !== "in_review"
-    ) {
+    // A false-positive/cancelled verdict is a statement that the alert was never valid, not that
+    // the work closed. `sourceIssueStatus` is applied verbatim as the card's new status, so
+    // `todo` leaves a live card exactly where it is. The only status that must stay off-limits is
+    // `blocked`: a bogus alert must never be the thing that force-blocks a card. Board-only
+    // enforcement for these outcomes lives in the route (`assertBoard`), not in this schema.
+    if (value.sourceIssueStatus === "blocked") {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "This recovery outcome requires sourceIssueStatus to be done or in_review",
+        message: "This recovery outcome requires sourceIssueStatus to be todo, done, or in_review",
         path: ["sourceIssueStatus"],
       });
     }
