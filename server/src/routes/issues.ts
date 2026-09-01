@@ -148,7 +148,9 @@ import {
 import {
   armMergeOnApproval,
   publishApprovalStatus,
+  resolveApprovalDecisionHead,
   shouldPublishApprovalStatus,
+  type ArmingOutcome,
   type MergeArmingDecision,
 } from "../services/merge-arming.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
@@ -2979,19 +2981,50 @@ export function issueRoutes(
     if (!shouldPublishApprovalStatus(decision)) return;
     const issueIdentifier = `SUP-${issue.issueNumber}`;
     try {
-      // SUP-13831: the zero-mention-row live-discovery in publishApprovalStatus
-      // is a delivery probe. It must only run when the transition CLOSes the
-      // issue (effectiveStatus === "done"), not when a stage approval redirects
-      // the requested `done` to a later stage (effectiveStatus === "in_review").
-      const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier, {
+      // ADR-091 D2a: pin the FIRST publish to the head the approving decision
+      // was rendered against. Resolve it up front, then hand it to
+      // publishApprovalStatus as expectedHeadSha so a head that moves between
+      // the decision and the delegated write refuses (skipped:head_moved, zero
+      // writes) instead of stamping whatever live head is there. An
+      // unresolvable decision-time head is a refusal with a named skipped
+      // reason (ADR-091 D4: cannot verify -> refuse), never a fallback to the
+      // live head.
+      const decisionHead = await resolveApprovalDecisionHead(
+        db,
+        issue.companyId,
+        issue.id,
+        issueIdentifier,
         closingTransition,
+      );
+      let statusOutcome: ArmingOutcome;
+      if (decisionHead.kind === "resolved") {
+        // SUP-13831: the zero-mention-row live-discovery in publishApprovalStatus
+        // is a delivery probe. It must only run when the transition CLOSes the
+        // issue (effectiveStatus === "done"), not when a stage approval redirects
+        // the requested `done` to a later stage (effectiveStatus === "in_review").
         // ADR-091 D1 (SUP-14676): the first-publish path is where a card that
         // merely CITES a PR could otherwise stamp it. Enforce the delivery
         // identity gate here. (The approval-status reconciler's Guard A
         // re-publish omits this on purpose — it certifies the head by content
         // identity instead of delivery identity.)
-        enforceDeliveryIdentity: true,
-      });
+        statusOutcome = await publishApprovalStatus(
+          db,
+          issue.companyId,
+          issue.id,
+          issueIdentifier,
+          {
+            closingTransition,
+            expectedHeadSha: decisionHead.headSha,
+            enforceDeliveryIdentity: true,
+          },
+        );
+      } else {
+        statusOutcome = {
+          kind: "skipped",
+          message: `status:skipped:head_unresolvable: ${decisionHead.reason}; refusing to stamp an unverifiable head`,
+          headSha: null,
+        };
+      }
 
       // SUP-13714 Guard A persistence: record which head this approval
       // certified so the reconciler can verify content identity before
