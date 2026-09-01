@@ -8755,6 +8755,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
       }
 
+      // Durable suppressor (SUP-14699): when the board has ruled this alarm
+      // structurally invalid for the current assignee, it is recorded as a
+      // resolved `false_positive` of this kind. The mint path above reads only
+      // the currently-open action, so without this check the next tick re-mints
+      // the alarm ~12s after the board resolved it — a ratified ruling surviving
+      // exactly one sweep interval. Keying on `false_positive` (not any
+      // resolution) preserves the sweep's real purpose: `restored` means the
+      // condition cleared and must keep re-detecting; only a ruling-invalid
+      // alarm goes quiet. Reading the persisted row — not the in-memory sight
+      // counter — means the ruling survives a control-plane restart. A change of
+      // assignee re-arms, because a different agent is a different claim.
+      const ruledInvalid = await recoveryActionsSvc.getLatestResolvedForIssue(
+        candidate.companyId,
+        candidate.id,
+        UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND,
+      );
+      if (
+        ruledInvalid?.outcome === "false_positive" &&
+        (ruledInvalid.evidence?.assigneeAgentId as string | null | undefined) === candidate.assigneeAgentId
+      ) {
+        continue;
+      }
+
       const escalatedAction = await recoveryActionsSvc.upsertSourceScoped({
         companyId: candidate.companyId,
         sourceIssueId: candidate.id,
