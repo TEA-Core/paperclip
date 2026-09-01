@@ -238,13 +238,6 @@ describe("issue validators", () => {
       outcome: "restored",
       sourceIssueStatus: "todo",
     });
-
-    expect(
-      resolveIssueRecoveryActionSchema.safeParse({
-        outcome: "false_positive",
-        sourceIssueStatus: "todo",
-      }).success,
-    ).toBe(false);
   });
 
   it("allows cancelled recovery resolutions to atomically restore the source issue status", () => {
@@ -270,6 +263,64 @@ describe("issue validators", () => {
         outcome: "cancelled",
       }).success,
     ).toBe(false);
+  });
+
+  it("allows false-positive and cancelled resolutions to leave a live source issue at todo", () => {
+    // A bogus-alert verdict is a statement about the alert, not the work, so it must not
+    // force-close a card that is legitimately live. `todo` leaves the card where it is.
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "false_positive",
+        sourceIssueStatus: "todo",
+      }),
+    ).toMatchObject({
+      outcome: "false_positive",
+      sourceIssueStatus: "todo",
+    });
+
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "cancelled",
+        sourceIssueStatus: "todo",
+      }),
+    ).toMatchObject({
+      outcome: "cancelled",
+      sourceIssueStatus: "todo",
+    });
+
+    // A bogus-alert verdict must still be unable to force-block a card.
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "false_positive",
+        sourceIssueStatus: "blocked",
+      }).success,
+    ).toBe(false);
+
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "cancelled",
+        sourceIssueStatus: "blocked",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps the blocked recovery outcome restricted to a blocked source status", () => {
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "blocked",
+        sourceIssueStatus: "todo",
+      }).success,
+    ).toBe(false);
+
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "blocked",
+        sourceIssueStatus: "blocked",
+      }),
+    ).toMatchObject({
+      outcome: "blocked",
+      sourceIssueStatus: "blocked",
+    });
   });
 
   it("rejects recovery outcomes that are not supported by the source-scoped resolution endpoint", () => {
