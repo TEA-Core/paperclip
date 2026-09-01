@@ -90,6 +90,7 @@ function zeroSummary(): ApprovalStatusReconcilerTickSummary {
     failed: 0,
     failedDetails: [],
     capped: 0,
+    nextScanKey: null,
     voidWarnings: 0,
     voidWarningDetails: [],
   };
@@ -937,14 +938,19 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
-    it("skips cards whose only mention is a closed PR", async () => {
+    it("does not select cards whose only mention is a closed PR (dead cards stay out of the scan)", async () => {
       const issueId = await insertIssue();
       await insertDecision(issueId);
       await insertMention(issueId, { state: "closed" });
 
       const summary = await runApprovalStatusReconcilerTick(db);
 
-      expect(summary.skipped["no-open-pr"]).toBe(1);
+      // SUP-14736: the linked-PR EXISTS now requires a live open/unhydrated
+      // PR, so an all-closed card is excluded before it ever reaches the
+      // per-candidate resolver — it no longer consumes the window.
+      expect(summary.scanned).toBe(0);
+      expect(summary.republished).toBe(0);
+      expect(Object.keys(summary.skipped)).toEqual([]);
       expect(postStatusCalls()).toHaveLength(0);
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
@@ -969,6 +975,83 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(mockGhFetch.mock.calls.map((call) => String(call[0]))).not.toContain(
         "https://api.github.com/repos/TEA-Core/paperclip/pulls/44",
       );
+    });
+
+    describe("candidate scan traversal (SUP-14736)", () => {
+      function installClosedPrRoutes(numbers: number[]) {
+        installRoutes(
+          numbers.map((n) => ({
+            url: `https://api.github.com/repos/TEA-Core/paperclip/pulls/${n}`,
+            body: { ...OPEN_PR_BODY, state: "closed", merged: false },
+          })),
+        );
+      }
+
+      async function seedOpenCandidates(identifiers: string[]) {
+        for (const identifier of identifiers) {
+          const issueId = await insertIssue({ identifier });
+          await insertDecision(issueId);
+          await insertMention(issueId, { number: Number(identifier.split("-")[1]) });
+        }
+      }
+
+      it("walks the candidate set across consecutive ticks instead of re-reading the head", async () => {
+        await seedOpenCandidates(["SUP-42", "SUP-43", "SUP-44", "SUP-45", "SUP-46"]);
+        installClosedPrRoutes([42, 43, 44, 45, 46]);
+
+        const tick1 = await runApprovalStatusReconcilerTick(db, { maxCandidates: 2 });
+        expect(tick1.scanned).toBe(2);
+        expect(tick1.capped).toBe(1);
+        expect(tick1.nextScanKey).toBe("SUP-43");
+
+        const tick2 = await runApprovalStatusReconcilerTick(db, {
+          maxCandidates: 2,
+          resumeAfter: tick1.nextScanKey,
+        });
+        expect(tick2.scanned).toBe(2);
+        expect(tick2.capped).toBe(1);
+        expect(tick2.nextScanKey).toBe("SUP-45");
+
+        const tick3 = await runApprovalStatusReconcilerTick(db, {
+          maxCandidates: 2,
+          resumeAfter: tick2.nextScanKey,
+        });
+        expect(tick3.scanned).toBe(1);
+        expect(tick3.capped).toBe(0);
+        expect(tick3.nextScanKey).toBeNull();
+
+        // Every candidate was reached, and no candidate was scanned twice.
+        const scannedTotal = tick1.scanned + tick2.scanned + tick3.scanned;
+        expect(scannedTotal).toBe(5);
+        // Consecutive ticks advanced the window — the second tick's candidate
+        // set differs from the first (no re-reading of the dead head).
+        expect(tick2.skippedDetails).not.toEqual(tick1.skippedDetails);
+      });
+
+      it("wraps to the start of the set once the cursor reaches the end", async () => {
+        await seedOpenCandidates(["SUP-42", "SUP-43", "SUP-44"]);
+        installClosedPrRoutes([42, 43, 44]);
+
+        const tick1 = await runApprovalStatusReconcilerTick(db, { maxCandidates: 2 });
+        expect(tick1.scanned).toBe(2);
+        expect(tick1.nextScanKey).toBe("SUP-43");
+
+        const tick2 = await runApprovalStatusReconcilerTick(db, {
+          maxCandidates: 2,
+          resumeAfter: tick1.nextScanKey,
+        });
+        expect(tick2.scanned).toBe(1);
+        expect(tick2.capped).toBe(0);
+        expect(tick2.nextScanKey).toBeNull();
+
+        // With the cursor reset to null the scan starts back at the head.
+        const tick3 = await runApprovalStatusReconcilerTick(db, {
+          maxCandidates: 2,
+          resumeAfter: tick2.nextScanKey,
+        });
+        expect(tick3.scanned).toBe(2);
+        expect(tick3.nextScanKey).toBe("SUP-43");
+      });
     });
 
     describe("pending candidate recovery (SUP-14602)", () => {
@@ -1319,6 +1402,39 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
 
         await vi.advanceTimersByTimeAsync(1_000);
         expect(runTick).toHaveBeenCalledTimes(2);
+
+        stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("threads the keyset cursor into the next tick (SUP-14736)", async () => {
+      vi.useFakeTimers();
+      try {
+        const summaries = [
+          { ...zeroSummary(), nextScanKey: "SUP-43" },
+          { ...zeroSummary(), nextScanKey: "SUP-44" },
+          zeroSummary(),
+        ];
+        const runTick = vi.fn().mockImplementation(async () => summaries.shift()!);
+        const stop = startApprovalStatusReconciler(db, {
+          intervalMs: 60_000,
+          initialDelayMs: 1_000,
+          runTick,
+        });
+
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(runTick).toHaveBeenCalledTimes(1);
+        expect(runTick.mock.calls[0]![0]).toMatchObject({ resumeAfter: null });
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(runTick).toHaveBeenCalledTimes(2);
+        expect(runTick.mock.calls[1]![0]).toMatchObject({ resumeAfter: "SUP-43" });
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(runTick).toHaveBeenCalledTimes(3);
+        expect(runTick.mock.calls[2]![0]).toMatchObject({ resumeAfter: "SUP-44" });
 
         stop();
       } finally {

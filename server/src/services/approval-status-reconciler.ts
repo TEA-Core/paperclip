@@ -105,6 +105,13 @@ const USER_AGENT = "paperclip-approval-status-reconciler";
 export interface ApprovalStatusReconcilerTickOptions {
   /** Upper bound on candidates handled in one tick. Excess is reported as `capped`. */
   maxCandidates?: number;
+  /**
+   * SUP-14736. Resume the scan after this candidate identifier (keyset
+   * cursor), so consecutive ticks advance past the window instead of
+   * re-scanning the same lexicographic head forever. Omit / null to start
+   * from the beginning of the candidate set.
+   */
+  resumeAfter?: string | null;
 }
 
 export interface ApprovalStatusReconcilerTickSummary {
@@ -122,6 +129,12 @@ export interface ApprovalStatusReconcilerTickSummary {
   failedDetails: string[];
   /** Candidates dropped by the per-tick cap. */
   capped: number;
+  /**
+   * SUP-14736. The candidate identifier to pass back as `resumeAfter` on the
+   * next tick so the scan advances. Null when this tick reached the end of
+   * the candidate set — the next tick wraps around to the beginning.
+   */
+  nextScanKey: string | null;
   /**
    * SUP-14049: voids observed this tick whose PR warning was ensured
    * (posted now, or already present from an earlier tick).
@@ -525,10 +538,32 @@ async function postApprovalVoidWarning(
 
 /**
  * Cards whose recorded approval decision is still `approved`, that are not
- * cancelled, and that carry at least one linked GitHub PR. The trigger is the
- * control-plane record alone — nothing is inferred from commits or GitHub.
+ * cancelled, and that carry a linked GitHub PR the reconciler can still act
+ * on. The trigger is the control-plane record alone — nothing is inferred from
+ * commits or GitHub.
+ *
+ * SUP-14736: two fixes to `findApprovalCandidates`, which had been permanently
+ * wedged on the lexicographic first N candidates:
+ *
+ *   - The linked-PR EXISTS now requires at least one linked, non-draft PR whose
+ *     cached state is `open` or still unhydrated (null). Cards whose linked PRs
+ *     are all closed/merged were selected on every tick only to be disposed of
+ *     as `no-open-pr` after a pointless GitHub fan-out; nothing about a closed
+ *     PR ever changes, so they never left the set and consumed the whole window.
+ *     This mirrors the in-memory `resolveLinkedPullRequestsWithState` filter
+ *     (draft PRs are dropped there too) so the SQL set and the in-memory set
+ *     agree on which cards can act.
+ *   - A keyset cursor (`afterIdentifier`) pages the scan forward. `issues.identifier`
+ *     is globally unique, so `identifier > afterIdentifier ORDER BY identifier`
+ *     advances a bounded window across ticks instead of re-reading the same dead
+ *     head. When a tick reaches the end of the set the caller passes null to wrap
+ *     around, giving a round-robin over the live candidate set.
  */
-async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateRow[]> {
+async function findApprovalCandidates(
+  db: Db,
+  limit: number,
+  afterIdentifier: string | null = null,
+): Promise<CandidateRow[]> {
   return db
     .select({
       id: issues.id,
@@ -553,7 +588,11 @@ async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateR
             and ${externalObjectMentions.sourceIssueId} = ${issues.id}
             and ${externalObjectMentions.objectType} = 'pull_request'
             and ${externalObjects.providerKey} = 'github'
+            and (${externalObjects.data} ->> 'state' = 'open'
+              or ${externalObjects.data} ->> 'state' is null)
+            and ${externalObjects.data} ->> 'draft' is distinct from 'true'
         ))`,
+        afterIdentifier != null ? sql`${issues.identifier} > ${afterIdentifier}` : undefined,
       ),
     )
     .orderBy(issues.identifier)
@@ -902,9 +941,18 @@ export async function runApprovalStatusReconcilerTick(
   options: ApprovalStatusReconcilerTickOptions = {},
 ): Promise<ApprovalStatusReconcilerTickSummary> {
   const maxCandidates = options.maxCandidates ?? DEFAULT_MAX_CANDIDATES;
-  const rows = await findApprovalCandidates(db, maxCandidates + 1);
+  const resumeAfter = options.resumeAfter ?? null;
+  const rows = await findApprovalCandidates(db, maxCandidates + 1, resumeAfter);
   const capped = Math.max(0, rows.length - maxCandidates);
   const batch = capped > 0 ? rows.slice(0, maxCandidates) : rows;
+
+  // SUP-14736: advance the keyset cursor past the candidates this tick
+  // consumed so the next tick resumes after them instead of re-reading the
+  // same lexicographic head. When this tick reached the end of the set
+  // (rows.length <= maxCandidates) the cursor wraps to null; the scheduler
+  // feeds the returned value back via `resumeAfter`.
+  const nextScanKey =
+    capped > 0 && batch.length > 0 ? (batch[batch.length - 1]?.identifier ?? null) : null;
 
   const summary: ApprovalStatusReconcilerTickSummary = {
     scanned: 0,
@@ -914,6 +962,7 @@ export async function runApprovalStatusReconcilerTick(
     failed: 0,
     failedDetails: [],
     capped,
+    nextScanKey,
     voidWarnings: 0,
     voidWarningDetails: [],
   };
@@ -995,7 +1044,13 @@ export function startApprovalStatusReconciler(
   schedule: ApprovalStatusReconcilerSchedule,
 ): () => void {
   const runTick = schedule.runTick ?? ((tickOptions) => runApprovalStatusReconcilerTick(db, tickOptions));
-  const tickOptions: ApprovalStatusReconcilerTickOptions = { maxCandidates: schedule.maxCandidates };
+  const baseOptions: ApprovalStatusReconcilerTickOptions = { maxCandidates: schedule.maxCandidates };
+  // SUP-14736: in-process keyset cursor. The candidate scan walks the set in
+  // identifier order; when a tick consumes a full window the summary's
+  // `nextScanKey` tells the next tick where to resume, so the set is traversed
+  // round-robin instead of re-reading the same lexicographic head every
+  // interval. When a tick reaches the end of the set the cursor wraps to null.
+  let cursor: string | null = null;
   let inFlight = false;
   let stopped = false;
 
@@ -1006,7 +1061,10 @@ export function startApprovalStatusReconciler(
       return;
     }
     inFlight = true;
-    void Promise.resolve(runTick(tickOptions))
+    void Promise.resolve(runTick({ ...baseOptions, resumeAfter: cursor }))
+      .then((summary) => {
+        cursor = summary && typeof summary.nextScanKey === "string" ? summary.nextScanKey : null;
+      })
       .catch((err) => {
         logger.warn({ err }, "approval status reconciler tick threw");
       })
