@@ -304,6 +304,49 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
+  it("lets a cancelled/false-positive verdict record a cancelled source status as an honest no-op", () => {
+    // A source issue that is already `cancelled` is terminal. `cancelled` must be a legal
+    // `sourceIssueStatus` for these outcomes so the board can dispose of a stuck recovery action
+    // without flipping the card to a false `done` (abandoned work marked complete) or resurrecting
+    // it into `in_review`. Applied verbatim, `cancelled -> cancelled` is a no-op, so the status
+    // stays truthful. (SUP-13874 / SUP-14035)
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "cancelled",
+        sourceIssueStatus: "cancelled",
+      }),
+    ).toMatchObject({
+      outcome: "cancelled",
+      sourceIssueStatus: "cancelled",
+    });
+
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "false_positive",
+        sourceIssueStatus: "cancelled",
+      }),
+    ).toMatchObject({
+      outcome: "false_positive",
+      sourceIssueStatus: "cancelled",
+    });
+
+    // Restoring hands the card back to a live state, so it must never cancel it.
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "restored",
+        sourceIssueStatus: "cancelled",
+      }).success,
+    ).toBe(false);
+
+    // A blocked verdict only ever moves the card to blocked.
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "blocked",
+        sourceIssueStatus: "cancelled",
+      }).success,
+    ).toBe(false);
+  });
+
   it("keeps the blocked recovery outcome restricted to a blocked source status", () => {
     expect(
       resolveIssueRecoveryActionSchema.safeParse({
