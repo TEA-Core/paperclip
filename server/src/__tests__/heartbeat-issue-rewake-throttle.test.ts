@@ -433,4 +433,125 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     expect(wake).toBeNull();
     expect((await latestWakeRequest(agentId))?.reason).toBe("issue_rewake_throttled");
   });
+
+  describe("deferred-wake promotion damp (SUP-14737)", () => {
+    async function seedDeferredWake(input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      requestedByActorType: "user" | "agent" | "system";
+    }) {
+      const wakeId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        source: "automation",
+        reason: "issue_execution_promoted",
+        payload: { issueId: input.issueId },
+        status: "deferred_issue_execution",
+        requestedByActorType: input.requestedByActorType,
+        requestedByActorId: input.requestedByActorType === "agent" ? input.agentId : "board-user",
+        requestedAt: new Date(),
+      });
+      return wakeId;
+    }
+
+    async function fetchWakeRow(wakeId: string) {
+      const [wake] = await db
+        .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeId));
+      return wake ?? null;
+    }
+
+    async function runsForWakeup(companyId: string, wakeId: string) {
+      return db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.wakeupRequestId, wakeId)));
+    }
+
+    it("damps a no-progress self-loop promotion: the deferred wake is skipped, no run re-armed", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+      // Two consecutive terminal runs that produced no issue-state change.
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+      const endingRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 0 });
+
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        requestedByActorType: "agent",
+      });
+
+      const [endingRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, endingRunId));
+      await heartbeat.releaseIssueExecutionAndPromote(endingRun);
+
+      const wake = await fetchWakeRow(wakeId);
+      expect(wake?.status).toBe("skipped");
+      expect(wake?.reason).toBe("issue_deferred_promotion_dampened");
+      expect(await runsForWakeup(companyId, wakeId)).toEqual([]);
+    });
+
+    it("drains a deferred wake sitting on a blocked card that is not board input", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+
+      const endingRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 0 });
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        requestedByActorType: "agent",
+      });
+
+      const [endingRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, endingRunId));
+      await heartbeat.releaseIssueExecutionAndPromote(endingRun);
+
+      const wake = await fetchWakeRow(wakeId);
+      expect(wake?.status).toBe("skipped");
+      expect(wake?.reason).toBe("issue_deferred_promotion_drained_blocked");
+      expect(await runsForWakeup(companyId, wakeId)).toEqual([]);
+    });
+
+    it("lets a promotion through when genuine new user input arrived after the last run", async () => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+      const endingRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 5 });
+
+      // A board comment after the newest run finished is new input: it breaks the
+      // no-progress streak and the deferred self-promotion must proceed.
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "user",
+        actorId: "board-user",
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: issueId,
+        createdAt: new Date(),
+      });
+
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        requestedByActorType: "agent",
+      });
+
+      const [endingRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, endingRunId));
+      await heartbeat.releaseIssueExecutionAndPromote(endingRun);
+
+      const wake = await fetchWakeRow(wakeId);
+      // Reason is the promotion marker; the status may have advanced to "claimed"
+      // by the time we read it because the heartbeat worker claims a freshly
+      // promoted queued wake immediately.
+      expect(wake?.reason).toBe("issue_execution_promoted");
+      expect(["queued", "claimed", "processing"]).toContain(wake?.status);
+      const promoted = await runsForWakeup(companyId, wakeId);
+      expect(promoted).toHaveLength(1);
+    });
+  });
 });
