@@ -3,9 +3,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import {
   companies,
   createDb,
+  executionWorkspaces,
   externalObjectMentions,
   externalObjects,
   issues,
+  projects,
   type Db,
 } from "@paperclipai/db";
 import {
@@ -125,6 +127,8 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(companies);
 
     const companyRows = await db
@@ -138,31 +142,68 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(companies);
   });
 
-  async function insertIssue(overrides: { identifier?: string } = {}) {
+  async function insertIssue(overrides: { identifier?: string; deliveryIdentity?: boolean } = {}) {
     const issueId = randomUUID();
+    let projectId: string | null = null;
+    let executionWorkspaceId: string | null = null;
+    // Default: the card delivered on its own execution-workspace branch — the D1
+    // delivery identity both the resolver and publishApprovalStatus narrow by.
+    // Pass { deliveryIdentity: false } to exercise the fail-closed
+    // delivery_identity_unresolved path.
+    if (overrides.deliveryIdentity !== false) {
+      const [projectRow] = await db
+        .insert(projects)
+        .values({
+          id: randomUUID(),
+          companyId,
+          name: `${OWNER}/${REPO}`,
+          status: "in_progress",
+        })
+        .returning();
+      projectId = projectRow!.id;
+      const [ewRow] = await db
+        .insert(executionWorkspaces)
+        .values({
+          id: randomUUID(),
+          companyId,
+          projectId,
+          mode: "isolated",
+          strategyType: "git_worktree",
+          name: "card-workspace",
+          status: "active",
+          branchName: "SUP-42-branch",
+          repoUrl: `https://github.com/${OWNER}/${REPO}`,
+        })
+        .returning();
+      executionWorkspaceId = ewRow!.id;
+    }
     await db.insert(issues).values({
       id: issueId,
       companyId,
       title: "Test Issue",
       status: "in_review",
       identifier: overrides.identifier ?? "SUP-42",
+      projectId,
+      executionWorkspaceId,
     });
     return issueId;
   }
 
   async function insertMention(
     issueId: string,
-    overrides: { state?: string | null; draft?: boolean; number?: number } = {},
+    overrides: { state?: string | null; draft?: boolean; number?: number; headRefName?: string } = {},
   ) {
     const number = overrides.number ?? 42;
     const data: Record<string, unknown> = {
       state: overrides.state ?? "open",
       draft: overrides.draft ?? false,
       node_id: "PR_node_id_12345",
-      head: { ref: "SUP-42-branch" },
+      head: { ref: overrides.headRefName ?? "SUP-42-branch" },
       title: `Fix thing (SUP-${number})`,
     };
     const [externalObj] = await db
@@ -230,10 +271,32 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
-    it("refuses when multiple linked PRs are ambiguous", async () => {
+    // ADR-091 D1 (SUP-14676 round-1): the resolver must apply the delivery-identity
+    // narrowing BEFORE the length arithmetic, exactly as publishApprovalStatus does.
+    // A card that delivered PR #42 and merely CITED a second PR (#43) must pin the
+    // delivered one — the round-1 regression refused its own first publish here.
+    it("pins the delivered PR when the card delivered one PR and merely cited another", async () => {
       const issueId = await insertIssue();
-      await insertMention(issueId);
-      await insertMention(issueId, { number: 43 });
+      // #42 is on the card's own delivery branch (delivered); #43 is on another
+      // card's branch (merely cited / linked).
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      await insertMention(issueId, { number: 43, headRefName: "SUP-43-other-card-branch" });
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("refuses as ambiguous only when two linked PRs are BOTH delivered on the card's branch", async () => {
+      const issueId = await insertIssue();
+      // Both PRs sit on the card's delivery branch -> genuinely ambiguous.
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      await insertMention(issueId, { number: 43, headRefName: "SUP-42-branch" });
       installRoutes([]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -242,6 +305,35 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       if (result.kind === "unresolvable") {
         expect(result.reason).toMatch(/^ambiguous:/);
         expect(result.reason).toContain("2");
+      }
+    });
+
+    it("refuses with not_delivered when the only linked PR is not this card's delivery branch", async () => {
+      const issueId = await insertIssue();
+      // The card cited another card's PR (same repo, other branch) and delivered nothing.
+      await insertMention(issueId, { number: 42, headRefName: "SUP-43-other-card-branch" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^not_delivered:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("refuses with delivery_identity_unresolved when the card's delivery identity cannot be resolved", async () => {
+      // No execution workspace -> no delivery branch; fail closed (ADR-091 D4).
+      const issueId = await insertIssue({ deliveryIdentity: false });
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^delivery_identity_unresolved:/);
       }
     });
   });
@@ -296,9 +388,12 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(decisionHead.headSha).toBe(APPROVED_HEAD);
 
       // 2. A push lands: the live head is now LIVE_HEAD by the time we publish.
+      // The first publish runs with enforceDeliveryIdentity: true, exactly as
+      // runApprovalMergeArming does — the same gate the resolver just applied.
       installRoutes([{ url: PR_URL, body: prHeadBody(LIVE_HEAD) }]);
       const outcome = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
         closingTransition: true,
+        enforceDeliveryIdentity: true,
         expectedHeadSha: decisionHead.headSha,
       });
 

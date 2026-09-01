@@ -565,6 +565,32 @@ function notDeliveredOutcome(
   return { kind: "skipped", message: `status:skipped:not_delivered: ${failed}` };
 }
 
+/**
+ * ADR-091 D1 shared delivery-identity narrowing. Resolves this card's delivery
+ * identity and keeps only the PRs it actually delivered, BEFORE any length
+ * arithmetic. publishApprovalStatus and resolveApprovalDecisionHead both route
+ * through this so the head a decision pins is always the head the publish will
+ * stamp — a second copy of this rule is how the D2a round-1 regression happened.
+ * The generic result lets each caller map a refusal to its own outcome type
+ * (ArmingOutcome vs DecisionHeadResolution) without duplicating the rule.
+ */
+type DeliveryNarrow<T> =
+  | { outcome: "narrowed"; delivered: T[]; deliveryBranch: string }
+  | { outcome: "identity-unresolved"; branch: string | null }
+  | { outcome: "not-delivered"; rejected: T[]; deliveryBranch: string };
+
+async function narrowToDelivered<
+  T extends { owner: string; repo: string; headRefName: string | null; displayName: string },
+>(db: Db, companyId: string, issueId: string, candidates: T[]): Promise<DeliveryNarrow<T>> {
+  const { branch, repo } = await resolveDeliveryIdentity(db, companyId, issueId);
+  if (!branch || !repo) return { outcome: "identity-unresolved", branch };
+  const delivered = candidates.filter((pr) => isDeliveredByCard(pr, repo, branch));
+  if (delivered.length === 0) {
+    return { outcome: "not-delivered", rejected: candidates, deliveryBranch: branch };
+  }
+  return { outcome: "narrowed", delivered, deliveryBranch: branch };
+}
+
 export async function publishApprovalStatus(
   db: Db,
   companyId: string,
@@ -585,24 +611,17 @@ export async function publishApprovalStatus(
   // leaves enforceDeliveryIdentity unset.
   let authorizingPRs = linkedPRs;
   if (options?.enforceDeliveryIdentity && linkedPRs.length > 0) {
-    const { branch: deliveryBranch, repo: deliveryRepo } = await resolveDeliveryIdentity(
-      db,
-      companyId,
-      issueId,
-    );
-
+    const narrowed = await narrowToDelivered(db, companyId, issueId, linkedPRs);
     // ADR-091 D4: fail closed when the card's delivery identity cannot be
     // positively resolved — refuse to stamp on an unverified branch.
-    if (!deliveryBranch || !deliveryRepo) {
-      return deliveryIdentityUnresolvedOutcome(deliveryBranch);
+    if (narrowed.outcome === "identity-unresolved") {
+      return deliveryIdentityUnresolvedOutcome(narrowed.branch);
+    }
+    if (narrowed.outcome === "not-delivered") {
+      return notDeliveredOutcome(narrowed.rejected, narrowed.deliveryBranch);
     }
 
-    const delivered = linkedPRs.filter((pr) => isDeliveredByCard(pr, deliveryRepo, deliveryBranch));
-    if (delivered.length === 0) {
-      return notDeliveredOutcome(linkedPRs, deliveryBranch);
-    }
-
-    authorizingPRs = delivered;
+    authorizingPRs = narrowed.delivered;
   }
 
   if (linkedPRs.length === 0) {
@@ -732,21 +751,16 @@ export async function publishApprovalStatus(
     // names it — the exact failure D1 exists to kill. A card that delivered its own
     // PR has head ref === its delivery branch, so the SUP-13313 happy path stands.
     if (options?.enforceDeliveryIdentity && matched.length > 0) {
-      const { branch: deliveryBranch, repo: deliveryRepo } = await resolveDeliveryIdentity(
-        db,
-        companyId,
-        issueId,
-      );
+      const narrowed = await narrowToDelivered(db, companyId, issueId, matched);
       // ADR-091 D4: no branch (or no repo) recorded → refuse, never fall back to
       // identifier-substring authorization.
-      if (!deliveryBranch || !deliveryRepo) {
-        return deliveryIdentityUnresolvedOutcome(deliveryBranch);
+      if (narrowed.outcome === "identity-unresolved") {
+        return deliveryIdentityUnresolvedOutcome(narrowed.branch);
       }
-      const delivered = matched.filter((pr) => isDeliveredByCard(pr, deliveryRepo, deliveryBranch));
-      if (delivered.length === 0) {
-        return notDeliveredOutcome(matched, deliveryBranch);
+      if (narrowed.outcome === "not-delivered") {
+        return notDeliveredOutcome(narrowed.rejected, narrowed.deliveryBranch);
       }
-      matched = delivered;
+      matched = narrowed.delivered;
     }
 
     if (matched.length > 1) {
@@ -899,6 +913,44 @@ export type DecisionHeadResolution =
   | { kind: "unresolvable"; reason: string };
 
 /**
+ * ADR-091 D2a — map a shared-narrowing refusal to the resolver's unresolvable
+ * form. Carries the SAME named reasons the publisher surfaces (not_delivered /
+ * delivery_identity_unresolved) so the decision-time refusal is consistent with
+ * what publishApprovalStatus would have done.
+ */
+function unresolvableFromNarrowing(
+  narrowed:
+    | { outcome: "identity-unresolved"; branch: string | null }
+    | {
+        outcome: "not-delivered";
+        rejected: Array<{
+          displayName: string;
+          owner: string;
+          repo: string;
+          headRefName: string | null;
+        }>;
+        deliveryBranch: string;
+      },
+): DecisionHeadResolution {
+  if (narrowed.outcome === "identity-unresolved") {
+    const missing = !narrowed.branch
+      ? "no delivery branch recorded on this card's execution workspace"
+      : "no delivery repo resolvable for this card's execution workspace";
+    return {
+      kind: "unresolvable",
+      reason: `delivery_identity_unresolved: ${missing}; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)`,
+    };
+  }
+  const failed = narrowed.rejected
+    .map(
+      (pr) =>
+        `${pr.displayName} head ${pr.owner}/${pr.repo}:${pr.headRefName ?? "(unreadable)"} is not this card's delivery branch ${narrowed.deliveryBranch}`,
+    )
+    .join("; ");
+  return { kind: "unresolvable", reason: `not_delivered: ${failed}` };
+}
+
+/**
  * ADR-091 D2a — decision-time head pin. Resolves the PR head the approving
  * decision was rendered against, using the same candidate walk
  * publishApprovalStatus uses (cached linked PRs first, then the zero-mention-row
@@ -919,16 +971,29 @@ export async function resolveApprovalDecisionHead(
 ): Promise<DecisionHeadResolution> {
   const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId);
 
-  if (linkedPRs.length > 1) {
-    const prList = linkedPRs.map((pr) => pr.displayName).join(", ");
+  // ADR-091 D1 (SUP-14676): this resolver pins the FIRST publish, and that path
+  // always runs publishApprovalStatus with enforceDeliveryIdentity: true — so it
+  // must apply the SAME delivery-identity narrowing, BEFORE the length
+  // arithmetic, or it would pin a head the publish never stamps. A card that
+  // delivered one PR and merely cited a second must pin the DELIVERED one; an
+  // unresolvable delivery identity fails closed (D4), never an unnarrowed set.
+  let authorizingPRs = linkedPRs;
+  if (linkedPRs.length > 0) {
+    const narrowed = await narrowToDelivered(db, companyId, issueId, linkedPRs);
+    if (narrowed.outcome !== "narrowed") return unresolvableFromNarrowing(narrowed);
+    authorizingPRs = narrowed.delivered;
+  }
+
+  if (authorizingPRs.length > 1) {
+    const prList = authorizingPRs.map((pr) => pr.displayName).join(", ");
     return {
       kind: "unresolvable",
-      reason: `ambiguous: multiple linked PRs (${linkedPRs.length}): ${prList}`,
+      reason: `ambiguous: multiple linked PRs (${authorizingPRs.length}): ${prList}`,
     };
   }
 
-  if (linkedPRs.length === 1) {
-    const pr = linkedPRs[0]!;
+  if (authorizingPRs.length === 1) {
+    const pr = authorizingPRs[0]!;
     const head = await fetchHeadViaTokenCandidates(db, companyId, pr.owner, pr.repo, pr.number);
     return head.ok
       ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName }
@@ -955,7 +1020,7 @@ export async function resolveApprovalDecisionHead(
         executionWorkspaceId: issues.executionWorkspaceId,
       })
       .from(issues)
-      .where(eq(issues.id, issueId));
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
     const ctx = await resolveIssueRepoContext(db, {
       companyId,
       projectId: issueRow?.projectId ?? null,
@@ -967,7 +1032,13 @@ export async function resolveApprovalDecisionHead(
   }
 
   const needle = issueIdentifier.toLowerCase();
-  const matched: Array<{ owner: string; repo: string; number: number; displayName: string }> = [];
+  const matched: Array<{
+    owner: string;
+    repo: string;
+    number: number;
+    displayName: string;
+    headRefName: string | null;
+  }> = [];
 
   for (const pair of pairs) {
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pair.owner, pair.repo);
@@ -1004,21 +1075,33 @@ export async function resolveApprovalDecisionHead(
           repo: pair.repo,
           number: item.number,
           displayName: `${pair.owner}/${pair.repo}#${item.number}`,
+          headRefName: item.headRef ?? null,
         });
       }
       break;
     }
   }
 
-  if (matched.length > 1) {
-    const prList = matched.map((pr) => pr.displayName).join(", ");
+  // ADR-091 D1 (SUP-14676): the live-discovery candidates above are matched by
+  // identifier substring — pure citation. They take the SAME delivery-identity
+  // gate as the cached path (and as publishApprovalStatus) BEFORE the length
+  // arithmetic, so the pinned head is always the head the publish will stamp.
+  let authorizingMatched = matched;
+  if (matched.length > 0) {
+    const narrowed = await narrowToDelivered(db, companyId, issueId, matched);
+    if (narrowed.outcome !== "narrowed") return unresolvableFromNarrowing(narrowed);
+    authorizingMatched = narrowed.delivered;
+  }
+
+  if (authorizingMatched.length > 1) {
+    const prList = authorizingMatched.map((pr) => pr.displayName).join(", ");
     return {
       kind: "unresolvable",
-      reason: `ambiguous: multiple live-resolved PRs (${matched.length}): ${prList}`,
+      reason: `ambiguous: multiple live-resolved PRs (${authorizingMatched.length}): ${prList}`,
     };
   }
-  if (matched.length === 1) {
-    const pr = matched[0]!;
+  if (authorizingMatched.length === 1) {
+    const pr = authorizingMatched[0]!;
     const head = await fetchHeadViaTokenCandidates(db, companyId, pr.owner, pr.repo, pr.number);
     return head.ok
       ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName }
