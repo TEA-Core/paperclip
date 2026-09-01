@@ -23,10 +23,14 @@ operator. A green "buildability" run is a build check, not a deploy.
 - **Trigger:** after a PR that touches server code merges onto the fold branch
   (`fold/**`), an operator decides when to roll the merged code out. There is no
   schedule, no webhook, and no bot that does this.
-- **Owner of every manual step:** the **human board operator** — the user who
-  holds the AWS account/credentials for the `paperclip-server` ECS service (the
-  responsible user on the open redeploy card, SUP-14694). No agent workspace has
-  AWS credentials, so no agent can perform the rollout without them being wired.
+- **Owner of the rollout action (Steps 4–5):** the **human board operator** —
+  the user who holds the AWS account/credentials for the `paperclip-server` ECS
+  service (the responsible user on the open redeploy card, SUP-14694). No agent
+  workspace has AWS credentials, so no agent can perform the rollout without
+  them being wired.
+- **Owner of the liveness verification (Step 7):** the **closing agent** of the
+  card whose consumption point is the plane — this is part of the card's own
+  `done` = Live evidence, not part of the operator's rollout.
 
 ## Fold-merge → running-container sequence
 
@@ -47,10 +51,14 @@ Steps 4 and 5 are the entire manual surface. The commands (from
 export AWS_REGION=us-east-1
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
-# Step 4 — build and push the ECR image at the target commit (e.g. d1eecef04)
-git checkout d1eecef04
-docker build --target production \
-  --build-arg PAPERCLIP_BUILD_COMMIT=d1eecef04ba22b11f3a466c9080fbbb81c1cc953 \
+# Set the APPROVED target commit the rollout is pinned to. Use the full SHA of
+# the approved merge; never copy a filing-time example SHA.
+export TARGET_COMMIT="approved-full-commit-sha"
+
+# Step 4 — build and push the ECR image at $TARGET_COMMIT
+git checkout "$TARGET_COMMIT"
+docker build --platform linux/amd64 --target production \
+  --build-arg PAPERCLIP_BUILD_COMMIT="$TARGET_COMMIT" \
   -t paperclip-server .
 docker tag paperclip-server:latest \
   $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest
@@ -68,10 +76,11 @@ aws ecs update-service \
 ```
 
 The image is built from the `production` stage (never the `cloud` stage for the
-self-hosted plane). `PAPERCLIP_BUILD_COMMIT` bakes the commit SHA into the
-image so `/api/health` can report it; if the operator uses the plain commands
-above the image derives the version from `git describe` and the commit must be
-passed explicitly.
+self-hosted plane), and `--platform linux/amd64` matches Fargate's default
+X86_64 runtime. `PAPERCLIP_BUILD_COMMIT` bakes the commit SHA into the image so
+`/api/health` can report it. `TARGET_COMMIT` is deliberately not prefilled with
+an example SHA: the operator must set it to the specific approved merge the
+rollout is pinned to, or the resulting image would silently serve an old commit.
 
 ## Liveness check a closing agent must run
 
@@ -89,8 +98,14 @@ Pass criteria:
 
 - `.status` is `ok`.
 - `.commit` is the merge commit (or an ancestor-of-the-merge that contains it)
-  that the card's code merged as. Compare against the fold tip:
-  `gh api repos/tea-core/paperclip/compare/<served-commit>...fold/tea-patches-v2026.722.0 --jq '.ahead_by'` → `0` means the plane serves the fold tip.
+  that the card's code merged as. Treat the target merge as the base and the
+  served commit as the head — accept `identical` or `ahead` (behind_by `0`),
+  which means the served plane contains the target merge:
+  `gh api repos/tea-core/paperclip/compare/<target-merge-sha>...<served-commit> --jq '.status, .behind_by'`.
+  When the requirement is specifically "the plane serves the fold tip", require
+  exact SHA equality: `.commit` must equal the fold tip SHA
+  (`git rev-parse origin/fold/tea-patches-v2026.722.0`). The served-commit-then-
+  fold-tip comparison is the wrong direction for that check and is not used here.
 - For byte-level proof, diff the deployed tree against the commit (see SUP-14694
   for the blob-identity method).
 
