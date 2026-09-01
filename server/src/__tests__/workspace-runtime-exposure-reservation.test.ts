@@ -18,18 +18,24 @@
  *
  * The broker is a fake, so no Tailscale Serve state is ever read or mutated.
  * Allocation is driven by an injected `isPortAvailable` that models a synthetic
- * host, and the only ports it will ever return are the `425xx`/`525xx` pairs
- * named below — deliberately far from a canary lane on `42000`/`42001`, which
- * this suite must not disturb. Guests do bind those two pairs on loopback, so
+ * host, and the only ports it will ever return are the pair lane picked below —
+ * deliberately kept a margin away from the canary lane on `42000`/`42001`,
+ * which this suite must not disturb. Guests do bind that lane on loopback, so
  * the readiness and exposure lifecycle is exercised for real; they are reaped in
  * `afterEach`. `PAPERCLIP_HOME` is redirected to a temp dir so the local-service
  * registry never touches the real instance on this host.
  */
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  RUNTIME_EXPOSURE_APP_PORT_MAX,
+  RUNTIME_EXPOSURE_APP_PORT_MIN,
+  RUNTIME_EXPOSURE_HMR_PORT_OFFSET,
+} from "@paperclipai/shared";
 import {
   activityLog,
   companies,
@@ -54,12 +60,76 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
+/**
+ * The pair lane is chosen per process instead of being a fixed constant.
+ *
+ * A fixed lane (`42501`/`42502`) was the flake: the merge queue runs several
+ * `merge_group` builds concurrently on one runner host, so two shards that each
+ * ran this file both bound `42502`, and the second guest died with `EADDRINUSE`.
+ * The runtime's post-mortem then found no host listener (the other shard's guest
+ * had already exited), so it could not quarantine the pair and the start failed
+ * terminally. A randomised lane — the same hardening the PAP-17256 loopback-bind
+ * tests use — makes concurrent processes pick disjoint lanes with overwhelming
+ * probability. `isPortAvailable` is still synthetic (only this lane is usable),
+ * so the allocator's decisions and every assertion below are unchanged.
+ */
+
+/**
+ * Probe whether `port` currently has no loopback listener, mirroring the
+ * allocator's own availability check so the chosen lane is verifiably claimable
+ * by the real guest that binds it.
+ */
+async function isLoopbackPortFree(port: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const probe = net.createServer();
+    probe.unref();
+    probe.once("error", () => resolve(false));
+    probe.listen(port, "127.0.0.1", () => {
+      probe.close(() => resolve(true));
+    });
+  });
+}
+
+/**
+ * The lane base the allocator may hand out: the leased pair at `appBase` and the
+ * relocation pair at `appBase + 1`, each with its Vite HMR companion. Both app
+ * ports and both HMR ports must be free on the real host right now, so a guest
+ * bind cannot collide with an unrelated loopback socket. The scan keeps one
+ * hundred ports clear of the `42000`/`42001` canary lane and stays inside the
+ * dedicated range for the `+1` relocation pair.
+ */
+const PAIR_LANE_MIN = RUNTIME_EXPOSURE_APP_PORT_MIN + 100;
+const PAIR_LANE_MAX = RUNTIME_EXPOSURE_APP_PORT_MAX - 1;
+
+async function isPairLaneFree(appBase: number): Promise<boolean> {
+  return (
+    (await isLoopbackPortFree(appBase))
+    && (await isLoopbackPortFree(appBase + 1))
+    && (await isLoopbackPortFree(appBase + RUNTIME_EXPOSURE_HMR_PORT_OFFSET))
+    && (await isLoopbackPortFree(appBase + 1 + RUNTIME_EXPOSURE_HMR_PORT_OFFSET))
+  );
+}
+
+async function pickCollisionSafePairLane(): Promise<number> {
+  const span = PAIR_LANE_MAX - PAIR_LANE_MIN + 1;
+  const start = PAIR_LANE_MIN + Math.floor(Math.random() * span);
+  for (let appBase = start; appBase <= PAIR_LANE_MAX; appBase += 1) {
+    if (await isPairLaneFree(appBase)) return appBase;
+  }
+  for (let appBase = PAIR_LANE_MIN; appBase < start; appBase += 1) {
+    if (await isPairLaneFree(appBase)) return appBase;
+  }
+  throw new Error("no free pair lane in the dedicated runtime exposure range");
+}
+
+const PAIR_LANE = await pickCollisionSafePairLane();
+
 /** The pair lane B holds under an open lease. */
-const LEASED_APP_PORT = 42_501;
-const LEASED_HMR_PORT = 52_501;
+const LEASED_APP_PORT = PAIR_LANE;
+const LEASED_HMR_PORT = PAIR_LANE + RUNTIME_EXPOSURE_HMR_PORT_OFFSET;
 /** The next pair a correct allocator must relocate to. */
-const NEXT_APP_PORT = 42_502;
-const NEXT_HMR_PORT = 52_502;
+const NEXT_APP_PORT = PAIR_LANE + 1;
+const NEXT_HMR_PORT = PAIR_LANE + 1 + RUNTIME_EXPOSURE_HMR_PORT_OFFSET;
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 
