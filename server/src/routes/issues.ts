@@ -153,6 +153,7 @@ import {
   type ArmingOutcome,
   type MergeArmingDecision,
 } from "../services/merge-arming.js";
+import { evaluateStageIntegrity, type CandidateRow } from "../services/approval-status-reconciler.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
@@ -7291,6 +7292,211 @@ export function issueRoutes(
       details: { name: removed.name, color: removed.color },
     });
     res.json(removed);
+  });
+
+  // SUP-14748: operator-invocable first-publish re-arm for a skipped
+  // paperclip/approved stamp. The first publish can skip for reasons only a human
+  // understands (a hand-merged PR, a closed PR, a coordinating card that merely
+  // cited a PR, a head that moved between approval and publish). This is the only
+  // sanctioned recovery: it re-runs publishApprovalStatus verbatim — pinned to the
+  // decision-time head, delivery-identity enforced — instead of a human
+  // hand-writing the status, which would manufacture a fake approval. Board-only;
+  // an agent caller is refused before any GitHub read or write.
+  router.post("/issues/:id/merge-arming/republish", async (req, res) => {
+    // Gate 1: board-only. Agent actors are refused here (403) before any GitHub
+    // read or write — the very agents whose card may have skipped must not be able
+    // to re-stamp it themselves.
+    assertBoard(req);
+
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+
+    // Gate 2: company owner/admin. Re-stamping is a judgment call, not a
+    // mechanical one. local_implicit (trusted local dev) is exempt, matching the
+    // other board-gated routes.
+    if (req.actor.source !== "local_implicit") {
+      const userId = req.actor.userId?.trim();
+      const membership = userId
+        ? await db
+            .select({ membershipRole: companyMemberships.membershipRole })
+            .from(companyMemberships)
+            .where(and(
+              eq(companyMemberships.companyId, issue.companyId),
+              eq(companyMemberships.principalType, "user"),
+              eq(companyMemberships.principalId, userId),
+              eq(companyMemberships.status, "active"),
+            ))
+            .then((rows) => rows[0] ?? null)
+        : null;
+      const role = membership?.membershipRole;
+      if (!role || (role !== "owner" && role !== "admin")) {
+        throw forbidden("Company owner or admin required to republish a skipped approval stamp");
+      }
+    }
+
+    const state: Record<string, unknown> = issue.executionState ?? {};
+    const approvalStatus = state.approvalStatus as Record<string, unknown> | undefined;
+
+    // Idempotent no-op FIRST: the stamp is already published for this card, so it
+    // is already green. Say so and stop — no guards, no GitHub I/O, never a second
+    // write. "already_published" is the definitive first check on this recovery
+    // surface: a card that is already stamped is not a recovery case.
+    const priorHeadSha =
+      approvalStatus && typeof approvalStatus.publishedHeadSha === "string"
+        ? approvalStatus.publishedHeadSha
+        : null;
+    if (priorHeadSha) {
+      res.status(200).json({
+        outcome: "already_published",
+        headSha: priorHeadSha,
+        message: `paperclip/approved is already published on ${priorHeadSha.slice(0, 7)}; nothing to re-arm.`,
+      });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+
+    // Guard A: the card must record a real "approved" decision. A card whose
+    // review stage auto-skipped (no decision row) or was never approved has
+    // nothing to stamp — this would manufacture a fake approval, not recover one.
+    // Mirrors the reconciler's candidate trigger (lastDecisionOutcome).
+    if (state.lastDecisionOutcome !== "approved") {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: "no_approved_decision",
+        message: "This card has no recorded 'approved' decision; there is nothing to re-stamp.",
+      });
+      return;
+    }
+
+    // Guard B: ADR-073 stage-integrity, reused verbatim from the reconciler
+    // (exported specifically so this route does not reimplement it).
+    const candidate: CandidateRow = {
+      id: issue.id,
+      companyId: issue.companyId,
+      identifier: issue.identifier,
+      createdByAgentId: issue.createdByAgentId,
+      createdByUserId: issue.createdByUserId,
+      executionState: state,
+      executionPolicy: issue.executionPolicy,
+    };
+    const integrity = await evaluateStageIntegrity(db, candidate);
+    if (integrity) {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: integrity.reason,
+        message: integrity.detail,
+      });
+      return;
+    }
+
+    // The publish pins the decision head by matching the card identifier against
+    // the linked PR's head ref / title / body, so a card with no identifier cannot
+    // be pinned. Fail closed.
+    const identifier = issue.identifier;
+    if (!identifier) {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: "head_unresolvable",
+        message:
+          "status:skipped:head_unresolvable: this card has no identifier to pin the approval decision head against",
+      });
+      return;
+    }
+
+    // Resolve the decision-time head the way the decision-time arming did, so the
+    // publish is pinned to exactly the head the reviewer approved.
+    const decisionHead = await resolveApprovalDecisionHead(
+      db,
+      issue.companyId,
+      issue.id,
+      identifier,
+      true,
+    );
+    if (decisionHead.kind !== "resolved") {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: "head_unresolvable",
+        message: `status:skipped:head_unresolvable: ${decisionHead.reason}; refusing to stamp an unverifiable head`,
+      });
+      return;
+    }
+
+    // Re-run the first publish, pinned to the resolved head, delivery-identity
+    // enforced (a cited-but-not-delivered PR is refused, never stamped).
+    const publishOutcome = await publishApprovalStatus(
+      db,
+      issue.companyId,
+      issue.id,
+      identifier,
+      {
+        closingTransition: true,
+        expectedHeadSha: decisionHead.headSha,
+        enforceDeliveryIdentity: true,
+      },
+    );
+
+    if (publishOutcome.kind !== "armed" || typeof publishOutcome.headSha !== "string") {
+      logger.info(
+        {
+          issueId: issue.id,
+          companyId: issue.companyId,
+          outcome: publishOutcome.kind,
+          message: publishOutcome.message,
+        },
+        "merge-arming republish refused",
+      );
+      res.status(409).json({
+        outcome: publishOutcome.kind,
+        message: publishOutcome.message,
+        headSha: publishOutcome.headSha ?? null,
+      });
+      return;
+    }
+
+    // Persist the certified head so the reconciler (Guard A) and the enforcer can
+    // verify it — mirrors runApprovalMergeArming exactly (executionState.approvalStatus).
+    await db
+      .update(issueRows)
+      .set({
+        executionState: {
+          ...state,
+          approvalStatus: {
+            ...(approvalStatus ?? {}),
+            publishedHeadSha: publishOutcome.headSha,
+            publishedAt: new Date().toISOString(),
+          },
+        },
+      })
+      .where(eq(issueRows.id, issue.id));
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: "issue.merge_arming_republish",
+      entityType: "issue",
+      entityId: issue.id,
+      agentId: null,
+      runId: null,
+      details: {
+        outcome: publishOutcome.kind,
+        headSha: publishOutcome.headSha,
+        message: publishOutcome.message,
+      },
+    });
+
+    logger.info(
+      { issueId: issue.id, companyId: issue.companyId, headSha: publishOutcome.headSha },
+      "merge-arming republish: paperclip/approved re-published",
+    );
+
+    res.status(200).json({
+      outcome: "armed",
+      headSha: publishOutcome.headSha,
+      message: publishOutcome.message,
+    });
   });
 
   router.get("/issues/:id/heartbeat-context", async (req, res) => {

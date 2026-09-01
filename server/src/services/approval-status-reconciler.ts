@@ -138,7 +138,7 @@ export interface ApprovalStatusReconcilerTickSummary {
   voidWarningDetails: string[];
 }
 
-interface CandidateRow {
+export interface CandidateRow {
   id: string;
   companyId: string;
   identifier: string | null;
@@ -606,7 +606,10 @@ async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateR
  * decision: an auto-skipped review stage writes no decision row and lands in
  * skippedStageIds, so it must never be treated as an approval.
  */
-async function evaluateStageIntegrity(db: Db, row: CandidateRow): Promise<{ reason: string; detail: string } | null> {
+export async function evaluateStageIntegrity(
+  db: Db,
+  row: CandidateRow,
+): Promise<{ reason: string; detail: string } | null> {
   const state: Record<string, unknown> = row.executionState ?? {};
   const policy: Record<string, unknown> = row.executionPolicy ?? {};
 

@@ -62,7 +62,33 @@ The non-pusher approval is real; it is recorded one layer up from GitHub.
   contains slashes — `gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-<N>-<sha>`.
   The queue-ref regex is `^gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$`; the
   single-component agent-tools pattern would never resolve a fold queue entry
-  and would deadlock the fold merge queue.
+   and would deadlock the fold merge queue.
+
+### First-publish recovery surface (SUP-14748)
+
+The first `publishApprovalStatus` call can skip for reasons only a human
+understands — a PR that was hand-merged or closed, a coordinating card that
+merely cited a PR rather than delivering it, a head that moved between the
+approval decision and the publish. The stamp cannot be manufactured by hand:
+the enforcer rejects it, and a locally-written `paperclip/approved` would be a
+contract violation (fake approval). The only sanctioned recovery is the
+**operator-invocable re-arm** route:
+
+- `POST /api/issues/:issueId/merge-arming/republish` — board owner/admin only.
+  An agent caller is refused (403) before any GitHub read or write. It is the
+  single surface a human may use to re-stamp; hand-writing the status on the PR
+  head is still forbidden.
+- It re-runs `publishApprovalStatus` **verbatim** — pinned to the decision-time
+  head and with delivery identity enforced — rather than re-deriving anything.
+  It is idempotent: if `executionState.approvalStatus.publishedHeadSha` is
+  already set it returns `200 already_published` with no GitHub I/O; otherwise
+  it resolves the decision head, re-publishes to the pinned head, and persists
+  the certified head back to `executionState.approvalStatus` (so the reconciler
+  and enforcer can verify it).
+- It fails closed: `409` with a verbatim refusal when the card has no recorded
+  `approved` decision, when ADR-073 stage-integrity (Guard B) does not hold,
+  when the decision head cannot be positively resolved, or when the head moved
+  between resolve and publish. Nothing is stamped in the failure case.
 
 ### Waiving a cardless PR
 
