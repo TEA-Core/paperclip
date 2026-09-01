@@ -76,7 +76,13 @@ try {
   // Containment is checked on the object we are holding, not on a name that can
   // be re-pointed. /proc/self/fd/<fd> names the inode this fd actually refers to.
   const verified = await fs.realpath(`/proc/self/fd/${handle.fd}`);
-  if (containmentRoot && !isWithin(verified, containmentRoot)) return; // skip + warn
+  if (containmentRoot && !isWithin(verified, containmentRoot)) {
+    warn(
+      `Paperclip: refusing shared-group ownership on ${dirPath} — it resolves to ${verified}, ` +
+        `outside the containment root ${containmentRoot}.`,
+    );
+    return;
+  }
   if (
     isDeniedServerOwnedDirOrAncestor(verified, [
       resolveMasterKeyDir,
@@ -84,7 +90,12 @@ try {
       resolveDatabaseBackupDir,
     ])
   ) {
-    return; // skip + warn
+    warn(
+      `Paperclip: refusing shared-group ownership on ${dirPath} — it resolves to ${verified}, ` +
+        `a server-owned directory (secrets master-key, embedded-Postgres data, or database backup), ` +
+        `an ancestor of one, or a descendant of one.`,
+    );
+    return;
   }
   const st = await handle.stat();
   await handle.chown(st.uid, gid);            // fchown — no path resolution
@@ -92,9 +103,33 @@ try {
 } catch (err) {
   warn(...); // §4: skip the repair. No path-based fallback on any error.
 } finally {
-  await handle?.close();
+  // close() can reject (EIO, EBADF). Swallowing it is deliberate: an await that
+  // throws from `finally` REPLACES the primary error — the escape-relevant one —
+  // with a cleanup failure, and there is nothing left to repair by then either way.
+  await handle?.close().catch(() => {});
 }
 ```
+
+Every skip is a **warned** skip, not a bare `return`. The two branches above and §4's `catch`
+are the three exits, and each emits exactly one `warn`. This is load-bearing, not cosmetic:
+`shared-group-ownership.test.ts` asserts `warnSpy` was called exactly once with
+`expect.stringContaining("refusing shared-group ownership")` at **seven** sites — `:169`, `:189`,
+`:208`, `:253`, `:273`, `:292`, `:398`. A silent skip turns a live escape attempt into an
+invisible no-op and fails all seven. Keep that substring in the denied-dir message; the
+containment refusal is a new case and needs its own test.
+
+The `finally` swallow is likewise not style. Probed on this platform:
+
+```text
+bare  await handle.close()   -> CLEANUP: EIO on close      <- primary error LOST
+await handle.close().catch() -> PRIMARY: escape detected   <- primary error survives
+FileHandle.close() thenable/catchable: true true
+```
+
+An awaited rejection in `finally` replaces the in-flight exception. With a bare
+`await handle?.close()`, an `EIO`/`EBADF` on close would overwrite exactly the error §4 exists
+to surface, and would escape the `catch` above it — throwing out of a function all twelve call
+sites treat as best-effort.
 
 `isDeniedServerOwnedDirOrAncestor` and the three resolver locals are the existing symbols in
 `server/src/services/shared-group-ownership.ts` — the guard at `:30-39` and the `resolveMasterKeyDir` /
