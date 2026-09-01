@@ -12,7 +12,7 @@ import {
   issueRelations,
   issues,
 } from "@paperclipai/db";
-import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../services/issue-dependency-wakeups.js";
+import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.js";
 import {
   createMergedOperatorMergeCardPullRequestResolver,
   createMergedOperatorMergeCardSweepService,
@@ -220,10 +220,13 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
     expect(enqueueWakeup).toHaveBeenCalledWith(agentId, expect.objectContaining({
       reason: "issue_blockers_resolved",
-      idempotencyKey: buildIssueBlockersResolvedWakeIdempotencyKey({
-        dependentIssueId: fixture.dependentId,
-        resolvedBlockerIssueId: fixture.cardId,
-      }),
+      // Upstream re-keyed this wake as level-triggered
+      // `issue_blockers_resolved:state:<dependent>:<cycle>:<digest>`
+      // (`buildIssueBlockersResolvedWakeStateKey`). The dependent id is the
+      // stable part; the digest depends on the full blocker set.
+      idempotencyKey: expect.stringContaining(
+        `issue_blockers_resolved:state:${fixture.dependentId}:`,
+      ),
       requestedByActorType: "system",
       requestedByActorId: MERGED_OPERATOR_MERGE_CARDS_ACTOR_ID,
       contextSnapshot: expect.objectContaining({
@@ -599,9 +602,15 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
       agentId,
       source: "automation",
       status: "completed",
-      idempotencyKey: buildIssueBlockersResolvedWakeIdempotencyKey({
+      // Must be the exact key the sweep computes, not a matcher: this row is the
+      // pre-existing wake whose presence the sweep is supposed to detect.
+      // Upstream re-keyed the wake as level-triggered, so the legacy
+      // resolved-blocker-edge key no longer collides and the sweep would wake
+      // again.
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
         dependentIssueId: fixture.dependentId,
-        resolvedBlockerIssueId: fixture.cardId,
+        blockerIssueIds: [fixture.cardId],
+        blockedTransitionAt: null,
       }),
     });
 

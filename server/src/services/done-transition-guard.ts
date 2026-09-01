@@ -956,19 +956,21 @@ export async function evaluateDoneTransitionGuard(
       ? await countLadderedChildren(db, issue.companyId, issue.id)
       : null;
 
-  // SUP-14579 (mechanism D / ADR-072 close-ladder shape): a top-level decomposed
-  // parent whose review ladder is satisfied but shape-incomplete (missing one of
-  // the three close-ladder stages) must not close ungated. Only a parent with no
-  // parent of its own sitting over two or more laddered children is subject to
-  // the shape check; the agent-resolution read happens here so the override path
-  // below can record its own audit action. Computed eagerly — it is a local
-  // indexed read and only runs in the pre-network zone.
+  // SUP-14579 (mechanism D / ADR-072 close-ladder shape): a decomposed parent
+  // whose review ladder is satisfied but shape-incomplete (missing one of the
+  // three close-ladder stages) must not close ungated. The shape check applies at
+  // every tree depth — a nested parent closing a decomposed body of work is the
+  // same defect a top-level one is, so the original `parentId === null` depth
+  // gate was removed (SUP-14640). Any parent sitting over two or more laddered
+  // children is subject to it; the agent-resolution read happens here so the
+  // override path below can record its own audit action. Computed eagerly — it
+  // is a local indexed read and only runs in the pre-network zone.
   let ladderShape: {
     ladderedChildCount: number;
     ladderedChildIdentifiers: string[];
     missingStageLabels: string[];
   } | null = null;
-  if (reviewLadder !== null && reviewLadder.satisfied && issue.parentId === null) {
+  if (reviewLadder !== null && reviewLadder.satisfied) {
     const laddered = await countLadderedChildren(db, issue.companyId, issue.id);
     if (laddered.count >= 2) {
       const missingStageLabels = await findMissingAdr072CloseLadderStages(
@@ -1141,8 +1143,9 @@ export async function evaluateDoneTransitionGuard(
   }
 
   // SUP-14579 (mechanism D / ADR-072 close-ladder shape): fail closed when a
-  // top-level decomposed parent's review ladder is satisfied but shape-
-  // incomplete. Runs in the same pre-network zone as mechanisms A and C.
+  // decomposed parent's review ladder is satisfied but shape-incomplete, at any
+  // tree depth (the `parentId === null` depth gate was removed in SUP-14640).
+  // Runs in the same pre-network zone as mechanisms A and C.
   if (ladderShape !== null) {
     void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_refused", {
       reason: "adr072_close_ladder_shape_incomplete",
@@ -1154,7 +1157,7 @@ export async function evaluateDoneTransitionGuard(
     return {
       allowed: false,
       reason:
-        `Mechanism D (ADR-072 close-ladder shape) refused: this issue is a top-level ` +
+        `Mechanism D (ADR-072 close-ladder shape) refused: this issue is a ` +
         `decomposed parent over ${ladderShape.ladderedChildCount} laddered children ` +
         `(${ladderShape.ladderedChildIdentifiers.join(", ")}), but its review ladder is missing ` +
         `the ADR-072 close-ladder stage(s): ${ladderShape.missingStageLabels.join(", ")}. ` +

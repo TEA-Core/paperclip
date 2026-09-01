@@ -7,6 +7,7 @@ const mockLoggerWarn = vi.hoisted(() => vi.fn());
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
+  getByIdForUpdate: vi.fn(),
   getByIdentifier: vi.fn(async () => null),
   getComment: vi.fn(),
   getCommentCursor: vi.fn(),
@@ -120,7 +121,14 @@ function createStubDb() {
     then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
       Promise.resolve(stubRows).then(onFulfilled, onRejected),
   };
-  return { select: () => query };
+  // A `done`/`cancelled` transition is review-policy sensitive, so the route now
+  // commits it inside a transaction (the locked-policy re-read has to be atomic
+  // with the update). Nothing in that path touches the tx beyond handing it to
+  // the mocked services, so running the callback against this same stub is
+  // enough to exercise the real code path.
+  const stub: any = { select: () => query };
+  stub.transaction = async (fn: (tx: unknown) => unknown) => fn(stub);
+  return stub;
 }
 
 async function createApp() {
@@ -210,6 +218,11 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
     });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    // The locked re-read inside the transaction sees the same row as the
+    // unlocked read, so per-test `getById` overrides flow through unchanged.
+    mockIssueService.getByIdForUpdate.mockImplementation(
+      async (issueId: string) => mockIssueService.getById(issueId),
+    );
   });
 
   it("emits the signal exactly once when a PATCH commits blocked with an empty blocker set", async () => {

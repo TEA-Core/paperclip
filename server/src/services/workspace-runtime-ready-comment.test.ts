@@ -27,6 +27,7 @@ function workspace(
     worktreePath: "/repo/.paperclip/worktrees/PAP-16051",
     warnings: [],
     created: true,
+    branchCreatedByRuntime: true,
     ...overrides,
   };
 }
@@ -60,6 +61,7 @@ function runtimeService(
     stoppedAt: null,
     stopPolicy: null,
     healthStatus: "healthy",
+    exposure: null,
     reused: false,
     ...overrides,
   };
@@ -193,11 +195,6 @@ describe("workspace-ready comment builders", () => {
       "- Service: web: http://localhost:3100 (reused)",
     ].join("\n"));
   });
-  // A workspace warning is unbounded provider text. When one exceeded the
-  // metadata row cap the whole comment failed zod validation with
-  // {"code":"too_big","maximum":2000,"path":["sections",1,"rows",0,"text"]},
-  // so the workspace-ready signal never landed on the issue - on every run of
-  // an affected agent.
   it("clamps an over-long warning so the metadata still validates", () => {
     const longWarning = `head ${"w".repeat(5_000)} tail`;
     const input = {
@@ -220,4 +217,5 @@ describe("workspace-ready comment builders", () => {
     // The markdown body has no cap, so nothing is lost.
     expect(buildWorkspaceReadyComment(input)).toContain(longWarning);
   });
+
 });

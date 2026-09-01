@@ -1049,6 +1049,9 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         if (!returnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
         }
+        if (!returnAssignee) {
+          throw unprocessable("This execution stage has no return assignee");
+        }
         const decision = {
           stageId: activeStage.id,
           stageType: activeStage.type,

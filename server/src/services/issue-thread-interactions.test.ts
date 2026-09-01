@@ -12,15 +12,22 @@ vi.mock("./issues.js", () => ({
 type SelectRow = Record<string, unknown>;
 
 function createSelectChain(rows: SelectRow[]) {
+  // `.for("update")` is part of the chain: the service takes a row lock on the
+  // issue before it decides whether the interaction may be created. Omitting it
+  // makes the chain throw instead of resolving.
+  const terminal = {
+    then(callback: (rows: SelectRow[]) => unknown) {
+      return Promise.resolve(callback(rows));
+    },
+    for() {
+      return terminal;
+    },
+  };
   return {
     from() {
       return {
         where() {
-          return {
-            then(callback: (rows: SelectRow[]) => unknown) {
-              return Promise.resolve(callback(rows));
-            },
-          };
+          return terminal;
         },
       };
     },
@@ -35,6 +42,7 @@ function createFakeDb(args: {
   const issueTouches: Array<Record<string, unknown>> = [];
   const interactionUpdates: Array<Record<string, unknown>> = [];
   const toolActionRequestUpdates: Array<Record<string, unknown>> = [];
+  const inserts: Array<{ table: string; values: Record<string, unknown> }> = [];
   let selectCallCount = 0;
 
   const db: any = {
@@ -66,7 +74,11 @@ function createFakeDb(args: {
         };
       },
     })),
-    insert: vi.fn(),
+    insert: vi.fn((table: unknown) => ({
+      values: async (values: Record<string, unknown>) => {
+        inserts.push({ table: getTableName(table as never), values });
+      },
+    })),
     transaction: async (callback: (tx: typeof db) => Promise<void>) => callback(db),
   };
 
@@ -76,6 +88,7 @@ function createFakeDb(args: {
     issueTouches,
     interactionUpdates,
     toolActionRequestUpdates,
+    inserts,
   };
 }
 
@@ -86,14 +99,15 @@ describe("issueThreadInteractionService", () => {
   });
 
   it.each([
-    ["ask_user_questions", undefined, {}, "board_or_agents", "board_or_agents"],
-    ["suggest_tasks", undefined, {}, "board_only", "board_only"],
-    ["request_confirmation", "board_or_agents", {}, "board_or_agents", "board_or_agents"],
-    ["request_checkbox_confirmation", undefined, { request_checkbox_confirmation: { defaultPolicy: "board_or_agents" } }, "board_or_agents", "board_or_agents"],
-    ["request_item_verdicts", "board_or_agents", { request_item_verdicts: { cap: "board_only" } }, "board_or_agents", "board_only"],
+    ["ask_user_questions", undefined, {}, "anyone", "anyone", "inherited", "requested"],
+    ["suggest_tasks", undefined, {}, "anyone", "anyone", "inherited", "requested"],
+    ["request_confirmation", "board_or_agents", {}, "anyone", "anyone", "explicit", "requested"],
+    ["request_confirmation", "board_only", {}, "human_only", "human_only", "explicit", "requested"],
+    ["request_checkbox_confirmation", undefined, { request_checkbox_confirmation: { defaultPolicy: "not_creator" } }, "not_creator", "not_creator", "inherited", "requested"],
+    ["request_item_verdicts", "anyone", { request_item_verdicts: { cap: "not_creator" } }, "anyone", "not_creator", "explicit", "company_cap"],
   ] as const)(
     "resolves %s requested/default/cap policy snapshots",
-    async (kind, requested, governance, expectedRequested, expectedEffective) => {
+    async (kind, requested, governance, expectedRequested, expectedEffective, expectedProvenance, expectedSource) => {
       const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
       expect(resolveInteractionPolicy({
         kind,
@@ -103,11 +117,13 @@ describe("issueThreadInteractionService", () => {
       })).toEqual({
         requestedResolverPolicy: expectedRequested,
         effectiveResolverPolicy: expectedEffective,
+        resolverPolicyProvenance: expectedProvenance,
+        effectiveResolverPolicySource: expectedSource,
       });
     },
   );
 
-  it("always clamps tool-action confirmations to board-only", async () => {
+  it("always clamps tool-action confirmations to human-only", async () => {
     const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
     expect(resolveInteractionPolicy({
       kind: "request_confirmation",
@@ -115,8 +131,10 @@ describe("issueThreadInteractionService", () => {
       governance: { request_confirmation: { defaultPolicy: "board_or_agents", cap: "board_or_agents" } },
       hasToolAction: true,
     })).toEqual({
-      requestedResolverPolicy: "board_or_agents",
-      effectiveResolverPolicy: "board_only",
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "governed_action",
     });
   });
 
@@ -130,8 +148,10 @@ describe("issueThreadInteractionService", () => {
       kind: "suggest_tasks",
       status: "pending",
       continuationPolicy: "wake_assignee",
-      requestedResolverPolicy: "board_only",
-      effectiveResolverPolicy: "board_only",
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone",
+      resolverPolicyProvenance: "inherited",
+      effectiveResolverPolicySource: "requested",
       idempotencyKey: "run-1:suggest",
       sourceCommentId: null,
       sourceRunId: "22222222-2222-4222-8222-222222222222",
@@ -255,6 +275,16 @@ describe("issueThreadInteractionService", () => {
     });
     expect(state.interactionUpdates).toHaveLength(1);
     expect(state.issueTouches).toHaveLength(1);
+    expect(state.inserts).toEqual([
+      expect.objectContaining({
+        table: "issue_question_response_deliveries",
+        values: expect.objectContaining({
+          interactionId: "interaction-2",
+          correlationId: "question-response:interaction-2",
+          payloadSha256: expect.any(String),
+        }),
+      }),
+    ]);
   });
 
   it("withdraws a pending interaction with attribution and rejects repeats", async () => {
@@ -363,5 +393,91 @@ describe("issueThreadInteractionService", () => {
     expect(expired[0]?.result).toMatchObject({ version: 1, outcome: "issue_closed" });
     expect(state.toolActionRequestUpdates).toHaveLength(1);
     expect(state.toolActionRequestUpdates[0]).toMatchObject({ status: "expired", resolvedByUserId: "local-board" });
+  });
+
+  it("create blocks the issue when kind is request_board_approval", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+    const interactionRow = {
+      id: "interaction-3",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "request_board_approval",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: "Approve hosting spend",
+      summary: null,
+      createdByAgentId: "agent-1",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        prompt: "Approve hosting spend",
+        target: null,
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+
+    const issueStatusUpdates: Array<Record<string, unknown>> = [];
+    const issueTouches: Array<Record<string, unknown>> = [];
+
+    const db: any = {
+      select: vi.fn(() => createSelectChain([interactionRow])),
+      insert: vi.fn(() => ({
+        values() {
+          return {
+            returning: async () => [interactionRow],
+          };
+        },
+      })) as any,
+      update: vi.fn(() => ({
+        set(values: Record<string, unknown>) {
+          return {
+            where() {
+              if ("status" in values) {
+                issueStatusUpdates.push(values);
+                return Promise.resolve(undefined);
+              }
+              if ("updatedAt" in values) {
+                issueTouches.push(values);
+                return Promise.resolve(undefined);
+              }
+              throw new Error(`Unexpected update target`);
+            },
+          };
+        },
+      })),
+      transaction: async (callback: (tx: typeof db) => Promise<void>) => callback(db),
+    };
+
+    const svc = issueThreadInteractionService(db as never);
+
+    const result = await svc.create({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+    }, {
+      kind: "request_board_approval",
+      continuationPolicy: "wake_assignee",
+      title: "Approve hosting spend",
+      payload: {
+        version: 1,
+        prompt: "Approve hosting spend",
+        target: null,
+      },
+    } as any, {
+      agentId: "agent-1",
+    });
+
+    expect(result.kind).toBe("request_board_approval");
+    expect(issueStatusUpdates).toHaveLength(1);
+    expect(issueStatusUpdates[0]).toEqual({ status: "blocked" });
+    expect(issueTouches).toHaveLength(1);
   });
 });

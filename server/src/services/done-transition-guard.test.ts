@@ -642,11 +642,49 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
-    it("exempts a non-top-level issue (has a parent) from the shape check (AC4a)", async () => {
+    it("refuses done for a nested (non-top-level) decomposed parent over 2+ laddered children (SUP-14640)", async () => {
+      // The shape check no longer stops at the tree root: a parent that has its
+      // own parent (parentId !== null) yet closes 2+ laddered children over an
+      // incomplete close ladder is refused exactly as a top-level one is. Under
+      // the pre-SUP-14640 `parentId === null` depth gate this card was exempt,
+      // so this test fails against current main.
       setupDbMock({ issues: twoLadderedChildren, agents });
       const result = await evaluateDoneTransitionGuard(
         mockDb,
         { ...issue, parentId: "99999999-9999-4999-8999-999999999999", executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("Mechanism D");
+      expect(result.reason).toContain("ADR-072 close-ladder shape");
+      expect(result.reason).toContain("review:coder-LE");
+      expect(result.reason).toContain("approval:exec-CTO");
+      expect(result.reason).not.toContain("review:support-QAE");
+      // Fail closed before any external probe: no GitHub call, no PR resolution.
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            reason: "adr072_close_ladder_shape_incomplete",
+            missingStageLabels: ["review:coder-LE", "approval:exec-CTO"],
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-9001", "SUP-9002"],
+          }),
+        }),
+      );
+    });
+
+    it("allows done when a nested decomposed parent carries the full 3-stage close ladder (SUP-14640)", async () => {
+      // Removing the depth gate must not over-refuse: a nested parent whose
+      // ladder carries the full ADR-072 close-ladder shape still closes.
+      setupDbMock({ issues: twoLadderedChildren, agents });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: "99999999-9999-4999-8999-999999999999", executionPolicy: fullLadder, executionState: satisfiedState([stage1, stage2, stage3]) },
         null,
       );
       expect(result.allowed).toBe(true);
