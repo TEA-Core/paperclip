@@ -797,7 +797,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
               draft: false,
               merged: false,
               merged_at: null,
-              head: { ref: `${identifier}-hotfix` },
+              head: { ref: branchName },
               title: `${identifier}: the duplicate PR`,
               body: null,
             },
@@ -842,7 +842,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       { owner: "TEA-Core", repo: "paperclip", number: 43, headShaAtApproval: headSha43 },
     ]);
     expect(typeof approvalStatus?.skipReason).toBe("string");
-    expect(approvalStatus.skipReason).toMatch(/^status:skipped:ambiguous/);
+    expect(approvalStatus.skipReason).toMatch(/^status:skipped:head_unresolvable:.*ambiguous/);
     expect(typeof approvalStatus?.certifiedAt).toBe("string");
     // publishedHeadSha must still mean "published" — nothing was published.
     expect(approvalStatus?.publishedHeadSha).toBeUndefined();

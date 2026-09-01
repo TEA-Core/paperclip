@@ -59,6 +59,12 @@ export interface ArmingOutcome {
   skipCandidates?: ApprovalCandidateAnchor[];
 }
 
+/**
+ * SUP-14602: a certification anchor for one candidate PR of an ambiguous
+ * approval. The approval-status reconciler uses it to re-run Guard A against a
+ * head it knows was certified at approval time, rather than re-resolving the
+ * ambiguous candidate set live.
+ */
 export interface ApprovalCandidateAnchor {
   owner: string;
   repo: string;
@@ -980,7 +986,20 @@ export async function publishApprovalStatus(
 
 export type DecisionHeadResolution =
   | { kind: "resolved"; headSha: string; displayName: string }
-  | { kind: "unresolvable"; reason: string };
+  | {
+      kind: "unresolvable";
+      reason: string;
+      /**
+       * SUP-14602: present only for the AMBIGUOUS unresolvable outcomes. When the
+       * decision cannot resolve a single head because several candidate PRs are
+       * all still open, the resolver certifies each candidate head at approval
+       * time so the caller can persist them (executionState.approvalStatus
+       * .pendingCandidates) and the approval-status reconciler can re-run Guard A
+       * against a certified head once the ambiguity resolves. Absent for every
+       * other unresolvable reason (no-pr / not-delivered / delivery_identity).
+       */
+      pendingCandidates?: ApprovalCandidateAnchor[];
+    };
 
 /**
  * ADR-091 D2a — map a shared-narrowing refusal to the resolver's unresolvable
@@ -1056,9 +1075,15 @@ export async function resolveApprovalDecisionHead(
 
   if (authorizingPRs.length > 1) {
     const prList = authorizingPRs.map((pr) => pr.displayName).join(", ");
+    // SUP-14602: ambiguity is unresolvable at decision time, but the certification
+    // the producer had in hand must not be discarded. Certify every AUTHORIZING
+    // candidate head now so the caller persists pendingCandidates and the
+    // reconciler can recover once the duplicate PR closes.
+    const pendingCandidates = await certifyCandidateHeads(db, companyId, authorizingPRs);
     return {
       kind: "unresolvable",
       reason: `ambiguous: multiple linked PRs (${authorizingPRs.length}): ${prList}`,
+      pendingCandidates,
     };
   }
 
@@ -1165,9 +1190,14 @@ export async function resolveApprovalDecisionHead(
 
   if (authorizingMatched.length > 1) {
     const prList = authorizingMatched.map((pr) => pr.displayName).join(", ");
+    // SUP-14602: same as the cached branch above — certify every surviving
+    // candidate head at approval time so the skipped:ambiguous decision does not
+    // discard the certification (see DecisionHeadResolution.pendingCandidates).
+    const pendingCandidates = await certifyCandidateHeads(db, companyId, authorizingMatched);
     return {
       kind: "unresolvable",
       reason: `ambiguous: multiple live-resolved PRs (${authorizingMatched.length}): ${prList}`,
+      pendingCandidates,
     };
   }
   if (authorizingMatched.length === 1) {
@@ -1178,6 +1208,31 @@ export async function resolveApprovalDecisionHead(
       : { kind: "unresolvable", reason: head.reason };
   }
   return { kind: "unresolvable", reason: "no-pr: no open linked PR resolvable at decision time" };
+}
+
+/**
+ * SUP-14602: certifies each candidate's head at approval time so a
+ * skipped:ambiguous decision can be persisted as pendingCandidates and later
+ * recovered by the approval-status reconciler. A candidate whose head cannot be
+ * read is anchored to null (the reconciler fails closed on it —
+ * guard-a:no-approved-head) rather than dropping the whole certification.
+ */
+async function certifyCandidateHeads(
+  db: Db,
+  companyId: string,
+  candidates: Array<{ owner: string; repo: string; number: number }>,
+): Promise<ApprovalCandidateAnchor[]> {
+  const anchors: ApprovalCandidateAnchor[] = [];
+  for (const pr of candidates) {
+    const head = await fetchHeadViaTokenCandidates(db, companyId, pr.owner, pr.repo, pr.number);
+    anchors.push({
+      owner: pr.owner,
+      repo: pr.repo,
+      number: pr.number,
+      headShaAtApproval: head.ok ? head.headSha : null,
+    });
+  }
+  return anchors;
 }
 
 async function fetchHeadViaTokenCandidates(
