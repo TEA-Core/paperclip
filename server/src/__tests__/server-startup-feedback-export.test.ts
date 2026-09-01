@@ -309,6 +309,17 @@ vi.mock("../services/index.js", () => ({
       failed: 0,
     })),
   })),
+  createToastReadabilitySweepService: vi.fn(() => ({
+    disabled: true,
+    sweep: vi.fn(async () => ({
+      due: false,
+      tablesScanned: 0,
+      columnsProbed: 0,
+      unreadableRows: [],
+      failedTables: [],
+      sweepError: null,
+    })),
+  })),
   createDoneCloseLandingBackstopService: vi.fn(() => ({
     sweep: vi.fn(async () => ({ due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0 })),
   })),
