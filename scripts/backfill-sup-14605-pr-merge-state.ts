@@ -109,7 +109,10 @@ async function main() {
   }
 
   if (!refreshed.merged) {
-    console.error("PR did not resolve as merged; rows were left untouched. Nothing stamped.");
+    console.error(
+      `PR did not resolve as merged. ${recorded.writtenIssueIds.length} ready_for_review rows are recorded; ` +
+        "no merge stamp was applied. Re-run once GitHub reports the PR merged.",
+    );
     process.exitCode = 1;
     return;
   }

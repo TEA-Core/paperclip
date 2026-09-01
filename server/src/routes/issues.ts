@@ -533,12 +533,7 @@ function prDeliverySignature(input: {
     }
   }
   if (!repository || !prNumber) return null;
-  const existing = typeof input.externalId === "string" ? input.externalId : null;
-  const externalId =
-    existing && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/.test(existing)
-      ? existing
-      : `${repository}#${prNumber}`;
-  return { repository, prNumber, externalId };
+  return { repository, prNumber, externalId: `${repository}#${prNumber}` };
 }
 
 const attachmentArtifactMetadataInputSchema = z.object({
@@ -9179,10 +9174,9 @@ export function issueRoutes(
           metadata: product.metadata,
         });
       } catch (error) {
-        console.warn(
-          `[pr-delivery] carrier fan-out failed for issue ${issue.id} (source row kept): ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+        logger.warn(
+          { err: error, issueId: issue.id, companyId: issue.companyId, workProductId: product.id },
+          "PR delivery carrier fan-out failed after work product creation",
         );
       }
     }
