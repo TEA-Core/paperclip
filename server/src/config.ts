@@ -73,8 +73,13 @@ export interface Config {
   opencodeJanitorIntervalMinutes: number;
   opencodeJanitorRetentionDays: number;
   opencodeJanitorVacuum: boolean;
+  opencodeLogRotationEnabled: boolean;
+  opencodeLogMaxSizeBytes: number;
+  opencodeLogRetainedArchives: number;
+  opencodeLogRetainedTailBytes: number;
   approvalStatusReconcilerEnabled: boolean;
   approvalStatusReconcilerIntervalMinutes: number;
+  workspaceReaperCooldownDays: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -298,6 +303,38 @@ export function loadConfig(): Config {
   // Opt-in, unlike the rest of the sweep: VACUUM holds an exclusive lock for the
   // length of a full-file rewrite, and getting that wrong starves the fleet.
   const opencodeJanitorVacuum = process.env.PAPERCLIP_OPENCODE_JANITOR_VACUUM === "true";
+  // SUP-13970. opencode's own log is a single unrotated file; on the paperclip
+  // host it reached 1 GB on the same volume that holds worktrees. The periodic
+  // rotation caps it: when the live log exceeds max size, its most recent tail
+  // bytes are archived and the file is truncated in place. On by default: the
+  // no-op cost where opencode is not used is one stat per scheduler tick, and
+  // the archive footprint is bounded by retainedArchives x retainedTailBytes.
+  const opencodeLogRotationEnabled =
+    process.env.PAPERCLIP_OPENCODE_LOG_ROTATION_ENABLED !== undefined
+      ? process.env.PAPERCLIP_OPENCODE_LOG_ROTATION_ENABLED === "true"
+      : true;
+  // Zero is meaningful for all three of these (rotate on every tick, keep no
+  // archive, keep no tail), so the usual `Number(env) || default` idiom cannot
+  // be used: it would silently rewrite an explicit 0 into the default. Read the
+  // override only when the variable is present and parses to a finite number.
+  const opencodeLogNumber = (name: string, fallback: number): number => {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === "") return fallback;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : fallback;
+  };
+  const opencodeLogMaxSizeBytes = opencodeLogNumber(
+    "PAPERCLIP_OPENCODE_LOG_MAX_SIZE_BYTES",
+    512 * 1024 * 1024,
+  );
+  const opencodeLogRetainedArchives = opencodeLogNumber(
+    "PAPERCLIP_OPENCODE_LOG_RETAINED_ARCHIVES",
+    5,
+  );
+  const opencodeLogRetainedTailBytes = opencodeLogNumber(
+    "PAPERCLIP_OPENCODE_LOG_RETAINED_TAIL_BYTES",
+    32 * 1024 * 1024,
+  );
   // SUP-13535. The paperclip/approved commit status is written once, on the
   // head that existed at approval time. When that head later moves (conflict
   // resolution, update-branch) the status is stranded and the merge queue
@@ -313,6 +350,21 @@ export function loadConfig(): Config {
     1,
     Number(process.env.PAPERCLIP_APPROVAL_STATUS_RECONCILER_INTERVAL_MINUTES) || 5,
   );
+  // The terminal-workspace reaper waits this many days after an issue tree
+  // becomes terminal before it archives the workspace. A person can reopen the
+  // work inside this window. A value of 0 disables the cooldown and restores
+  // immediate reaping. A negative or non-numeric value falls back to the
+  // default. The day granularity and the default of 7 obey the
+  // PAPERCLIP_DB_BACKUP_RETENTION_DAYS precedent above.
+  const workspaceReaperCooldownDaysEnv =
+    process.env.PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS?.trim();
+  const workspaceReaperCooldownDaysRaw = Number(workspaceReaperCooldownDaysEnv);
+  const workspaceReaperCooldownDays =
+    workspaceReaperCooldownDaysEnv
+      && Number.isFinite(workspaceReaperCooldownDaysRaw)
+      && workspaceReaperCooldownDaysRaw >= 0
+      ? workspaceReaperCooldownDaysRaw
+      : 7;
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -355,12 +407,17 @@ export function loadConfig(): Config {
     opencodeJanitorIntervalMinutes,
     opencodeJanitorRetentionDays,
     opencodeJanitorVacuum,
+    opencodeLogRotationEnabled,
+    opencodeLogMaxSizeBytes,
+    opencodeLogRetainedArchives,
+    opencodeLogRetainedTailBytes,
     approvalStatusReconcilerEnabled,
     approvalStatusReconcilerIntervalMinutes,
     databaseBackupEnabled,
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    workspaceReaperCooldownDays,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

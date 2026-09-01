@@ -19,6 +19,7 @@ import {
   documentAnnotationThreads,
   documents,
   documentRevisions,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
   issues,
@@ -104,6 +105,7 @@ describeEmbeddedPostgres("cases routes", () => {
     await db.delete(assets);
     await db.delete(labels);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(projects);
     await db.delete(agents);

@@ -32,7 +32,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
 
       - name: Refresh pnpm lockfile
@@ -139,4 +139,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr merge --auto --squash --delete-branch "${{ steps.upsert-pr.outputs.pr_url }}"
+          # No --delete-branch: rejected when the target branch has a merge queue
+          # enabled ("Cannot use -d or --delete-branch when merge queue enabled").
+          # No --squash/--merge: on merge-queue branches the queue owns the merge
+          # method (the fold queue is SQUASH), so a per-PR method is not passed.
+          gh pr merge --auto "${{ steps.upsert-pr.outputs.pr_url }}"

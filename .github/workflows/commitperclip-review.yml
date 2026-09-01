@@ -16,9 +16,11 @@ concurrency:
 
 permissions:
   pull-requests: write
-  security-events: write
   checks: write
   contents: read
+# `security-events: write` is gone with the draft-advisory gate it existed for.
+# The diff-based replacement runs in pr.yml's policy job and reports through
+# annotations and a job-summary table, so nothing here needs advisory scope.
 
 jobs:
   review:
@@ -39,7 +41,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Generate commitperclip token
         id: token
@@ -71,16 +73,6 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
-
-      - name: Run security gates
-        run: node .github/scripts/check-pr-security.mjs
-        continue-on-error: true
-        timeout-minutes: 3
-        env:
-          GH_TOKEN: ${{ steps.token.outputs.value }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
 
       - name: Fail if quality gates failed
         if: >-

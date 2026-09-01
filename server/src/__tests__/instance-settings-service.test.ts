@@ -10,6 +10,8 @@ describe("instance settings service", () => {
   it("ignores retired experimental flags without resetting current settings", () => {
     expect(normalizeExperimentalSettings({
       enableEnvironments: true,
+      enableNativeRunner: false,
+      enableManagedSandboxOnly: false,
       enableIsolatedWorkspaces: true,
       enableIssuePlanDecompositions: true,
       enableExperimentalFileViewer: true,
@@ -25,11 +27,13 @@ describe("instance settings service", () => {
       enableNewestFirstIssueThread: true,
     })).toEqual({
       enableEnvironments: true,
+      enableNativeRunner: false,
+      enableManagedSandboxOnly: false,
       enableIsolatedWorkspaces: true,
       enableStreamlinedLeftNavigation: true,
       enableApps: false,
       enableConferenceRoomChat: false,
-      enableTaskChatRedesign: false,
+      enableClassicTaskInterface: false,
       enableExternalObjects: false,
       enableSmokeLab: false,
       enablePipelines: false,
@@ -50,6 +54,7 @@ describe("instance settings service", () => {
       enableWorkspaceBranchReconcileForward: true,
       enableWorkspaceDirtyQuarantineRepair: false,
       enableOwnerInstanceAdmin: false,
+      enableSandboxDuplexBridge: false,
       enableWorktreeRunExecution: false,
       worktreeRunExecutionActivatedAt: null,
       worktreeRunExecutionActivationInstanceId: null,
@@ -70,6 +75,20 @@ describe("instance settings service", () => {
     expect(
       normalizeExperimentalSettings({ enableStreamlinedLeftNavigation: true }).enableConferenceRoomChat,
     ).toBe(false);
+  });
+
+  it("defaults enableClassicTaskInterface to false for empty and legacy stored settings", () => {
+    expect(normalizeExperimentalSettings(undefined).enableClassicTaskInterface).toBe(false);
+    expect(normalizeExperimentalSettings({}).enableClassicTaskInterface).toBe(false);
+    // The retired enableTaskChatRedesign key must not bleed into the new flag:
+    // an install that had the chat redesign ON opted into chat-style, which is
+    // now the default — not into the classic view.
+    expect(
+      normalizeExperimentalSettings({ enableTaskChatRedesign: true }).enableClassicTaskInterface,
+    ).toBe(false);
+    expect(
+      normalizeExperimentalSettings({ enableClassicTaskInterface: true }).enableClassicTaskInterface,
+    ).toBe(true);
   });
 
   it("defaults enableSimplifiedEnglishInteractions to false for empty and legacy stored settings", () => {

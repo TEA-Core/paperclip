@@ -197,7 +197,7 @@ export function AppsConnect() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: selectedCompany?.name ?? "Company", href: "/dashboard" },
+      { label: selectedCompany?.name ?? "Organization", href: "/dashboard" },
       { label: "Apps", href: "/apps" },
       { label: "Connect an app" },
     ]);
@@ -443,7 +443,59 @@ export function AppsConnect() {
   });
 
   if (!selectedCompanyId) {
-    return <div className="p-6 text-sm text-muted-foreground">Select a company to connect apps.</div>;
+    return <div className="p-6 text-sm text-muted-foreground">Select an organization to connect apps.</div>;
+  }
+
+  if (directOAuthEntry && step === "key") {
+    return (
+      <OAuthConnectStateScreen
+        entry={directOAuthEntry}
+        phase={oauthPhase}
+        error={oauthError}
+        onRetry={async () => {
+          setOAuthError(null);
+          setOAuthPhase("starting");
+          const connectionId = connectResult?.connectionId ?? existingOAuthConnection?.id;
+          if (connectionId) {
+            startOAuth(connectionId);
+            return;
+          }
+
+          // The create request may have reached the server even when its
+          // response did not reach the browser. Re-read both resources before
+          // creating again so Retry resumes that durable draft instead of
+          // duplicating it.
+          directOAuthRetryingRef.current = true;
+          try {
+            const [applicationsResult, connectionsResult] = await Promise.all([
+              applicationsQuery.refetch(),
+              connectionsQuery.refetch(),
+            ]);
+            if (applicationsResult.isError || connectionsResult.isError) {
+              setOAuthPhase("error");
+              setOAuthError("Paperclip couldn’t check for an existing connection. Try again.");
+              return;
+            }
+            const refreshedConnection = reusableOAuthConnection(
+              directOAuthSource,
+              applicationsResult.data?.applications ?? [],
+              connectionsResult.data?.connections ?? [],
+              createNewConnection
+                ? { applicationId: prefill.applicationId, draftOnly: true }
+                : {},
+            );
+            if (refreshedConnection) {
+              startOAuth(refreshedConnection.id);
+            } else {
+              connectMutation.mutate(directOAuthEntry);
+            }
+          } finally {
+            directOAuthRetryingRef.current = false;
+          }
+        }}
+        onCancel={() => navigate("/apps/browse")}
+      />
+    );
   }
 
   if (directOAuthEntry && step === "key") {

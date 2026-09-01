@@ -7,6 +7,7 @@ import {
   approvals,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issues,
@@ -162,6 +163,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     await db.delete(toolConnections);
     await db.delete(toolApplications);
     await db.delete(toolPolicies);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);

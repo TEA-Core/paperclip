@@ -10,6 +10,7 @@ import {
   companyMemberships,
   createDb,
   documents,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueAttachments,
   issueComments,
@@ -121,6 +122,7 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
     await db.delete(activityLog);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);

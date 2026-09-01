@@ -19,6 +19,7 @@ import {
   createDb,
   environmentLeases,
   environments,
+  heartbeatRunEvents,
   heartbeatRuns,
 } from "@paperclipai/db";
 import type { Environment } from "@paperclipai/shared";
@@ -69,6 +70,7 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
       await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
     await db.delete(environmentLeases);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(environments);

@@ -11,6 +11,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issueComments,
@@ -21,6 +22,8 @@ import {
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -52,12 +55,19 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
 
   afterEach(async () => {
     enqueueWakeup.mockClear();
+    // SUP-14359: a successful non-self commented PATCH dispatches an
+    // issue_commented wake fire-and-forget (routes/issues.ts); the in-flight
+    // wake can still be inserting heartbeat_runs / agent_wakeup_requests rows
+    // while this cleanup deletes. Drain it (module-level, shared across
+    // heartbeatService instances) before the deletes.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
     await db.delete(issueComments);
     await db.delete(issueRecoveryActions);
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueInboxArchives);
@@ -294,7 +304,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
 
     const res = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, stageRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done", comment: "Stage signoff." });
+      .send({ status: "done", comment: `Stage signoff.\n\n${DONE_TIER_DECLARATION}` });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({ id: issueId, status: "done" });
@@ -344,7 +354,10 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       .patch(`/api/issues/${issueId}`)
       .send({ status: "done", comment: DONE_TIER_DECLARATION });
     expect(peerVerdict.status, JSON.stringify(peerVerdict.body)).toBe(403);
-    expect(peerVerdict.body.error).toBe("Issue is outside this actor's authorization boundary");
+    // SUP-14304: the boundary refusal now answers with the shared issue-write
+    // denial copy — still a 403 authorization denial (never the 409 run lock),
+    // and details.code names the wall that fired.
+    expect(peerVerdict.body.details.code).toBe("issue_write_no_grant");
 
     // The policy itself still admits a writer other than the review requester;
     // under the fork that writer is an authenticated operator, not a peer agent.
@@ -385,23 +398,6 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     expect(userVerdict.body).toMatchObject({ id: issueId, status: "cancelled" });
   });
 
-  it("allows an agent writer to relax reviewPolicy in the verdict patch", async () => {
-    const seeded = await seedCompany("RLP");
-    const issueId = await seedReview({
-      companyId: seeded.companyId,
-      assigneeAgentId: seeded.assigneeAgentId,
-      identifier: "RLP-1",
-      reviewPolicy: "human_only",
-    });
-    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
-
-    const verdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
-      .patch(`/api/issues/${issueId}`)
-      .send({ status: "done", reviewPolicy: "anyone", comment: DONE_TIER_DECLARATION });
-
-    expect(verdict.status, JSON.stringify(verdict.body)).toBe(200);
-    expect(verdict.body).toMatchObject({ id: issueId, status: "done", reviewPolicy: "anyone" });
-  });
 
   it("enforces not_creator when accepting or rejecting pending review interactions", async () => {
     const seeded = await seedCompany("INT");
@@ -563,4 +559,101 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     ]);
     expect(results.map((result) => result.status).sort()).toEqual([200, 409]);
   });
+  it("does not let an agent bypass human_only by relaxing reviewPolicy in the verdict patch", async () => {
+    const seeded = await seedCompany("RLP");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "RLP-1",
+      reviewPolicy: "human_only",
+    });
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+
+    const verdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", reviewPolicy: "anyone" });
+
+    expect(verdict.status).toBe(403);
+    expect(verdict.body).toMatchObject({
+      details: {
+        code: "review_policy_denied",
+        policy: "human_only",
+        allowedActor: "authenticated_user_with_issue_write_access",
+        remediation: "Have an authenticated user with issue write access submit the verdict.",
+      },
+    });
+    const [persisted] = await db.select({
+      status: issues.status,
+      reviewPolicy: issues.reviewPolicy,
+    }).from(issues).where(eq(issues.id, issueId));
+    expect(persisted).toEqual({ status: "in_review", reviewPolicy: "human_only" });
+  });
+
+  it("does not let the review requester bypass not_creator by relaxing reviewPolicy in the verdict patch", async () => {
+    const seeded = await seedCompany("RNC");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "RNC-1",
+      reviewPolicy: "not_creator",
+    });
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "agent",
+      actorId: seeded.assigneeAgentId,
+      agentId: seeded.assigneeAgentId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { status: "in_review", _previous: { status: "in_progress" } },
+    });
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+
+    const verdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", reviewPolicy: "anyone" });
+
+    expect(verdict.status).toBe(403);
+    expect(verdict.body).toMatchObject({
+      details: {
+        code: "review_policy_denied",
+        policy: "not_creator",
+        allowedActor: "writer_other_than_review_requester",
+        remediation: "Have another writer with issue write access submit the verdict.",
+      },
+    });
+    const [persisted] = await db.select({
+      status: issues.status,
+      reviewPolicy: issues.reviewPolicy,
+    }).from(issues).where(eq(issues.id, issueId));
+    expect(persisted).toEqual({ status: "in_review", reviewPolicy: "not_creator" });
+  });
+
+  it("does not let an excluded actor relax an existing review policy in a separate patch", async () => {
+    const seeded = await seedCompany("RSP");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "RSP-1",
+      reviewPolicy: "human_only",
+    });
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+
+    const relaxation = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ reviewPolicy: "anyone" });
+
+    expect(relaxation.status).toBe(403);
+    expect(relaxation.body).toMatchObject({
+      details: {
+        code: "review_policy_denied",
+        policy: "human_only",
+      },
+    });
+    const [persisted] = await db.select({ reviewPolicy: issues.reviewPolicy })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(persisted).toEqual({ reviewPolicy: "human_only" });
+  });
+
 });

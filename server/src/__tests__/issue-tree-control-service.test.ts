@@ -6,6 +6,7 @@ import {
   agentWakeupRequests,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueTreeHoldMembers,
@@ -42,6 +43,7 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
     await db.delete(issueTreeHolds);
     await db.delete(issueComments);
     await db.delete(issues);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);

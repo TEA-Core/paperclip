@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import type { Db } from "@paperclipai/db";
+import { and, eq, inArray } from "drizzle-orm";
+import { agents, issues, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -8,6 +9,7 @@ import {
 import { logActivity } from "./activity-log.js";
 import {
   fetchOpenPullRequests,
+  GITHUB_GRAPHQL_URL,
   parseRepoUrl,
   resolveIssueRepoContext,
   resolveLinkedPullRequestsWithState,
@@ -16,6 +18,8 @@ import {
 } from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
+import { normalizeAgentUrlKey } from "@paperclipai/shared";
+import { parseIssueExecutionState } from "./issue-execution-policy.js";
 
 export class GitHubAuthError extends Error {
   readonly status: number;
@@ -38,6 +42,21 @@ const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "child-delivery-parent-close",
   "merged-elsewhere",
 ]);
+
+// SUP-14579 (ADR-072 close-ladder shape): the three stages a top-level
+// decomposed parent's review ladder must include before it may close. Each
+// requirement is a (stage type, agent urlKey) pair; agent identity is matched
+// by the participant agent's urlKey (see normalizeAgentUrlKey), not by a
+// literal name string.
+const ADR072_CLOSE_LADDER: {
+  stageType: string;
+  agentUrlKey: string;
+  label: string;
+}[] = [
+  { stageType: "review", agentUrlKey: "support-qae", label: "review:support-QAE" },
+  { stageType: "review", agentUrlKey: "coder-le", label: "review:coder-LE" },
+  { stageType: "approval", agentUrlKey: "exec-cto", label: "approval:exec-CTO" },
+];
 
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
@@ -314,6 +333,54 @@ async function writeAuditLog(
   }
 }
 
+/**
+ * SUP-14429 (mechanism B): resolve the live GraphQL `reviewDecision` of an open
+ * linked PR. This is the only signal that an external reviewer is currently
+ * holding the PR open — an undismissed CHANGES_REQUESTED is a pre-existing,
+ * externally-visible refusal, not the card observing its own merge (the
+ * SUP-13207 deadlock the decision-carrying waiver exists for).
+ *
+ * Every unresolvable outcome — no token handled by the caller, non-2xx, GraphQL
+ * errors, a null pullRequest, malformed body, transport throw — returns null.
+ * Callers must treat null as "not refused" and fail open, matching the
+ * `stale_open_unverifiable` precedent: never fail closed on a GitHub outage.
+ */
+async function fetchPullRequestReviewDecision(
+  pr: LinkedPullRequest,
+  token: string,
+): Promise<string | null> {
+  const query =
+    "query prReviewDecision($owner: String!, $name: String!, $number: Int!) { " +
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewDecision } } }";
+  try {
+    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "paperclip-done-transition-guard",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query,
+        variables: { owner: pr.owner, name: pr.repo, number: pr.number },
+      }),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body) return null;
+    if (Array.isArray(body.errors) && body.errors.length > 0) return null;
+    const repository = (body.data as Record<string, unknown> | null | undefined)?.repository as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const pullRequest = repository?.pullRequest as Record<string, unknown> | null | undefined;
+    const reviewDecision = pullRequest?.reviewDecision;
+    return typeof reviewDecision === "string" ? reviewDecision : null;
+  } catch {
+    return null;
+  }
+}
+
 async function hydrateLinkedPrState(
   pr: LinkedPullRequest,
   token: string,
@@ -336,8 +403,12 @@ async function hydrateLinkedPrState(
     if (typeof state === "string") {
       // The live call just succeeded: the persisted refresh error code (if any)
       // no longer describes this object, and the PR state below is positively
-      // proven again.
-      return { ...pr, cachedState: state, lastErrorCode: null };
+      // proven again. For open PRs, resolve the review decision in the same
+      // hydration pass (SUP-14429) — a PR that is not open owes no decision
+      // probe, and any probe failure degrades to null (fail open).
+      const reviewDecision =
+        state === "open" ? await fetchPullRequestReviewDecision(pr, token) : null;
+      return { ...pr, cachedState: state, lastErrorCode: null, reviewDecision };
     }
     return pr;
   } catch {
@@ -445,11 +516,24 @@ export async function evaluateDoneTierDeclaration(
   }
 
   if (!runId) {
-    return fallback(
-      "No accompanying comment and no run id to look up same-run comment; transition allowed",
-      true,
-      "no_accompanying_comment_no_run_id",
-    );
+    // SUP-14368: no comment and no run id means there is no evidence to verify — a
+    // missing declaration, not a verified pass. The bare no-evidence allow rendered
+    // "cannot verify" as "transition allowed", the fail-open exec-CTO ruled against
+    // on SUP-13094. It is now treated on the same terms as any other missing
+    // declaration: a 422 done_transition_missing_tier_declaration whose remedy names
+    // the accepted forms (the declaration is always writable, so no close deadlocks).
+    return {
+      allowed: false,
+      reason:
+        "No accompanying comment and no run id to look up a same-run comment; no done-tier declaration found. " +
+        `Accepted forms: "Closed at Tier 2 (live): <probe evidence>"` +
+        ` or ` +
+        `"Closed at Tier 1 (landed, not liveness-probed): <reason>. Liveness unverified."` +
+        ` — per SUP-12693.`,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
   }
 
   let comments: IssueComment[];
@@ -601,11 +685,235 @@ async function liveDiscoverOpenLinkedPullRequests(
       displayName: `${parsed.owner}/${parsed.repo}#${item.number}`,
       cachedState: "open",
       lastErrorCode: null,
+      reviewDecision: null,
     });
   }
   return { prs, error: null };
 }
 
+/**
+ * SUP-14446 mechanism C: a close to `done` must account for the issue's own
+ * review ladder. An issue carrying a populated `executionPolicy.stages` can
+ * otherwise reach `done` with zero stage decisions recorded (SUP-8098: parked
+ * pending on stage 1; SUP-13253: `executionState` never initialised). A
+ * null/absent or unparseable `executionState` is the empty case — zero
+ * completed/skipped stages — exactly the shape these issues landed with.
+ *
+ * `decisionCarried` covers the in-flight final-stage approval: both call sites
+ * only invoke the guard with `decisionCarried=true` when this very transition
+ * records the last stage's `approved` decision, whose write (the one this
+ * guard precedes) appends the stage to `completedStageIds`. Until that write
+ * lands, the state's `currentStageId` would read as unsatisfied and deadlock
+ * the approval circuit — so a policy stage currently pending is treated as
+ * satisfied in that case only.
+ *
+ * Returns null when the issue carries no ladder (out of scope for this
+ * mechanism; the pre-existing null-policy path is unchanged).
+ */
+function evaluateReviewLadderSatisfaction(
+  executionPolicy: unknown,
+  executionState: unknown,
+  decisionCarried: boolean,
+): {
+  satisfied: boolean;
+  totalStages: number;
+  firstUnsatisfiedIndex: number;
+  firstUnsatisfiedStage: { id: string; type: string } | null;
+  unsatisfiedStageIds: string[];
+  completedStageIds: string[];
+  skippedStageIds: string[];
+} | null {
+  const rawStages =
+    executionPolicy != null && typeof executionPolicy === "object"
+      ? (executionPolicy as { stages?: unknown }).stages
+      : undefined;
+  if (!Array.isArray(rawStages)) return null;
+  const stages = rawStages
+    .filter(
+      (stage): stage is { id: string; type?: string } =>
+        stage != null &&
+        typeof stage === "object" &&
+        typeof (stage as { id?: unknown }).id === "string",
+    )
+    .map((stage) => ({
+      id: stage.id,
+      type: typeof stage.type === "string" ? stage.type : "unknown",
+    }));
+  if (stages.length === 0) return null;
+
+  const state = parseIssueExecutionState(executionState);
+  const completed = new Set<string>(state?.completedStageIds ?? []);
+  const skipped = new Set<string>(state?.skippedStageIds ?? []);
+
+  if (decisionCarried && state !== null && state.status === "pending" && state.currentStageId !== null) {
+    if (stages.some((stage) => stage.id === state.currentStageId)) {
+      completed.add(state.currentStageId);
+    }
+  }
+
+  const unsatisfied = stages
+    .map((stage, index) => ({ stage, index }))
+    .filter(({ stage }) => !completed.has(stage.id) && !skipped.has(stage.id));
+
+  const first = unsatisfied[0];
+  return {
+    satisfied: unsatisfied.length === 0,
+    totalStages: stages.length,
+    firstUnsatisfiedIndex: first ? first.index : -1,
+    firstUnsatisfiedStage: first ? { id: first.stage.id, type: first.stage.type } : null,
+    unsatisfiedStageIds: unsatisfied.map(({ stage }) => stage.id),
+    completedStageIds: [...completed],
+    skippedStageIds: [...skipped],
+  };
+}
+
+/**
+ * SUP-14561 (mechanism A): count this issue's child issues that each ran a
+ * review ladder — the child carries a non-null execution policy and its
+ * execution state has a non-empty completedStageIds or skippedStageIds.
+ *
+ * A ladder-less parent (executionPolicy null, or `stages: []` — either way
+ * `evaluateReviewLadderSatisfaction` reports no ladder) sitting over two or
+ * more such children is a decomposed body of reviewed engineering work: the
+ * work was gated at the children, so closing the parent with `done` would
+ * ship it through no review, no Definition-of-Done gate, and no approval
+ * (SUP-14306 / SUP-14309 / SUP-14023 / SUP-13777). One-off ops/reflection
+ * cards whose children carry no policy of their own count 0 and stay legal.
+ *
+ * This is a local indexed read (issues_company_parent_idx). Like mechanism C
+ * it runs before any GitHub path, and it fails closed on a throw: the
+ * transition write targets the same store, so a Postgres error must not be
+ * waved through.
+ */
+async function countLadderedChildren(
+  db: Db,
+  companyId: string,
+  parentId: string,
+): Promise<{ count: number; identifiers: string[] }> {
+  const rows = await db
+    .select({
+      identifier: issues.identifier,
+      executionPolicy: issues.executionPolicy,
+      executionState: issues.executionState,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), eq(issues.parentId, parentId)));
+  let count = 0;
+  const identifiers: string[] = [];
+  for (const row of rows) {
+    if (row.executionPolicy == null) continue;
+    const state = parseIssueExecutionState(row.executionState);
+    const completed = state?.completedStageIds?.length ?? 0;
+    const skipped = state?.skippedStageIds?.length ?? 0;
+    if (completed > 0 || skipped > 0) {
+      count += 1;
+      identifiers.push(row.identifier ?? "<unnamed>");
+    }
+  }
+  return { count, identifiers };
+}
+
+/**
+ * SUP-14579 (mechanism D / ADR-072 close-ladder shape): given a parent's
+ * execution policy, report which of the three ADR-072 close-ladder stages
+ * (review:support-QAE, review:coder-LE, approval:exec-CTO) are absent.
+ *
+  * A stage satisfies a requirement when its `type` matches the required stage
+  * type AND at least one of its agent participants resolves to the required
+  * agent urlKey. Stages carry participant agent ids, not names, so the agent
+  * names are resolved in a single indexed read over the union of all
+  * participant agent ids, then compared via `normalizeAgentUrlKey`. That read
+  * is scoped to the issue's company so an agent from another company can never
+  * be counted as satisfying a close-ladder stage.
+  *
+  * Returns the labels of the missing requirements; an empty array means the
+  * ladder carries the full close-ladder shape. A missing/stages-less policy
+  * reports every requirement as missing.
+  */
+async function findMissingAdr072CloseLadderStages(
+  db: Db,
+  companyId: string,
+  executionPolicy: unknown,
+): Promise<string[]> {
+  const rawStages =
+    executionPolicy != null && typeof executionPolicy === "object"
+      ? (executionPolicy as { stages?: unknown }).stages
+      : undefined;
+  if (!Array.isArray(rawStages)) {
+    return ADR072_CLOSE_LADDER.map((requirement) => requirement.label);
+  }
+
+  const stages = rawStages
+    .filter(
+      (stage): stage is { type?: unknown; participants?: unknown } =>
+        stage != null && typeof stage === "object",
+    )
+    .map((stage) => ({
+      type: typeof stage.type === "string" ? stage.type : null,
+      participants: Array.isArray(stage.participants) ? stage.participants : [],
+    }));
+
+  const agentIds = new Set<string>();
+  for (const stage of stages) {
+    for (const participant of stage.participants) {
+      if (
+        participant != null &&
+        typeof participant === "object" &&
+        (participant as { type?: unknown }).type === "agent" &&
+        typeof (participant as { agentId?: unknown }).agentId === "string"
+      ) {
+        agentIds.add((participant as { agentId: string }).agentId);
+      }
+    }
+  }
+
+  const agentIdToUrlKey = new Map<string, string | null>();
+  if (agentIds.size > 0) {
+    const agentRows = await db
+      .select({ id: agents.id, name: agents.name })
+      .from(agents)
+      .where(and(inArray(agents.id, [...agentIds]), eq(agents.companyId, companyId)));
+    for (const row of agentRows) {
+      agentIdToUrlKey.set(row.id, normalizeAgentUrlKey(row.name));
+    }
+  }
+
+  const missing: string[] = [];
+  for (const requirement of ADR072_CLOSE_LADDER) {
+    const satisfied = stages.some(
+      (stage) =>
+        stage.type === requirement.stageType &&
+        stage.participants.some((participant) => {
+          if (
+            participant == null ||
+            typeof participant !== "object" ||
+            (participant as { type?: unknown }).type !== "agent" ||
+            typeof (participant as { agentId?: unknown }).agentId !== "string"
+          ) {
+            return false;
+          }
+          return (
+            agentIdToUrlKey.get((participant as { agentId: string }).agentId) ===
+            requirement.agentUrlKey
+          );
+        }),
+    );
+    if (!satisfied) missing.push(requirement.label);
+  }
+  return missing;
+}
+
+/**
+ * Gate an issue's transition to `done`. Runs the pre-network fail-closed gates
+ * first — a sanctioned no-deliverable-head `override` (which lands the close
+ * with an audit row), mechanism C (an unrun review ladder, SUP-14446),
+ * mechanism A (a ladder-less decomposed parent over 2+ laddered children,
+ * SUP-14561), and mechanism D (a shape-incomplete ADR-072 close ladder,
+ * SUP-14579) — then verifies the PR/GitHub delivery and tier declaration and
+ * applies the open-PR block. `decisionCarried` applies the ADR-074 D6
+ * carve-out for decision-carrying board closes. Every refusal, override, and
+ * skip records an audit row.
+ */
 export async function evaluateDoneTransitionGuard(
   db: Db,
   issue: {
@@ -615,6 +923,9 @@ export async function evaluateDoneTransitionGuard(
     projectId: string | null;
     projectWorkspaceId: string | null;
     executionWorkspaceId: string | null;
+    parentId?: string | null;
+    executionPolicy?: unknown;
+    executionState?: unknown;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
@@ -631,15 +942,228 @@ export async function evaluateDoneTransitionGuard(
     skipReason: skipReason && prSkipReason ? `${skipReason}; ${prSkipReason}` : (skipReason ?? prSkipReason),
   });
 
+  const reviewLadder = evaluateReviewLadderSatisfaction(
+    issue.executionPolicy,
+    issue.executionState,
+    decisionCarried,
+  );
+
+  // SUP-14561 (mechanism A): a ladder-less parent is only suspect when its
+  // children demonstrably ran ladders. Query the decomposition only in that
+  // case; a parent that carries its own ladder is governed by mechanism C.
+  const mechanismA =
+    reviewLadder === null
+      ? await countLadderedChildren(db, issue.companyId, issue.id)
+      : null;
+
+  // SUP-14579 (mechanism D / ADR-072 close-ladder shape): a decomposed parent
+  // whose review ladder is satisfied but shape-incomplete (missing one of the
+  // three close-ladder stages) must not close ungated. The shape check applies at
+  // every tree depth — a nested parent closing a decomposed body of work is the
+  // same defect a top-level one is, so the original `parentId === null` depth
+  // gate was removed (SUP-14640). Any parent sitting over two or more laddered
+  // children is subject to it; the agent-resolution read happens here so the
+  // override path below can record its own audit action. Computed eagerly — it
+  // is a local indexed read and only runs in the pre-network zone.
+  let ladderShape: {
+    ladderedChildCount: number;
+    ladderedChildIdentifiers: string[];
+    missingStageLabels: string[];
+  } | null = null;
+  if (reviewLadder !== null && reviewLadder.satisfied) {
+    const laddered = await countLadderedChildren(db, issue.companyId, issue.id);
+    if (laddered.count >= 2) {
+      const missingStageLabels = await findMissingAdr072CloseLadderStages(
+        db,
+        issue.companyId,
+        issue.executionPolicy,
+      );
+      if (missingStageLabels.length > 0) {
+        ladderShape = {
+          ladderedChildCount: laddered.count,
+          ladderedChildIdentifiers: laddered.identifiers,
+          missingStageLabels,
+        };
+      }
+    }
+  }
+
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
     void writeAuditLog(db, issue, "issue.done_transition_override", {
       disposition: override.disposition,
       overrideReason: override.reason ?? null,
       source: "done_transition_guard",
     });
+    if (reviewLadder !== null && !reviewLadder.satisfied) {
+      void writeAuditLog(db, issue, "issue.done_transition_ladder_override", {
+        disposition: override.disposition,
+        overrideReason: override.reason ?? null,
+        reason: `review_ladder_unsatisfied:${reviewLadder.firstUnsatisfiedStage?.id ?? "unknown"}`,
+        unsatisfiedStageIds: reviewLadder.unsatisfiedStageIds,
+        completedStageIds: reviewLadder.completedStageIds,
+        skippedStageIds: reviewLadder.skippedStageIds,
+        source: "done_transition_guard",
+      });
+      return {
+        allowed: true,
+        reason:
+          `Override accepted: ${override.disposition} ` +
+          `(review ladder bypassed — unsatisfied stages: ${reviewLadder.unsatisfiedStageIds.join(", ")})`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    if (mechanismA !== null && mechanismA.count >= 2) {
+      void writeAuditLog(db, issue, "issue.done_transition_null_policy_override", {
+        disposition: override.disposition,
+        overrideReason: override.reason ?? null,
+        ladderedChildCount: mechanismA.count,
+        ladderedChildIdentifiers: mechanismA.identifiers,
+        source: "done_transition_guard",
+      });
+      return {
+        allowed: true,
+        reason:
+          `Override accepted: ${override.disposition} ` +
+          `(ungated decomposed-parent close bypassed — ${mechanismA.count} laddered children: ` +
+          `${mechanismA.identifiers.join(", ")})`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
+    if (ladderShape !== null) {
+      void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_override", {
+        disposition: override.disposition,
+        overrideReason: override.reason ?? null,
+        missingStageLabels: ladderShape.missingStageLabels,
+        ladderedChildCount: ladderShape.ladderedChildCount,
+        ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
+        source: "done_transition_guard",
+      });
+      return {
+        allowed: true,
+        reason:
+          `Override accepted: ${override.disposition} ` +
+          `(ADR-072 close-ladder shape bypassed — missing stages: ` +
+          `${ladderShape.missingStageLabels.join(", ")})`,
+        aheadBy: null,
+        branch: null,
+        defaultRef: null,
+        owner: null,
+        repo: null,
+        skipped: false,
+        skipReason: null,
+      };
+    }
     return {
       allowed: true,
       reason: `Override accepted: ${override.disposition}`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // SUP-14446 mechanism C: fail closed on an unrun review ladder. This runs
+  // before any GitHub/network path so an unsatisfied ladder can never be
+  // waved through by a credential-less or network-fail-open configuration.
+  if (reviewLadder !== null && !reviewLadder.satisfied) {
+    const first = reviewLadder.firstUnsatisfiedStage;
+    void writeAuditLog(db, issue, "issue.done_transition_ladder_refused", {
+      reason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
+      skipReason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
+      stageIndex: reviewLadder.firstUnsatisfiedIndex,
+      stageType: first?.type ?? null,
+      unsatisfiedStageIds: reviewLadder.unsatisfiedStageIds,
+      completedStageIds: reviewLadder.completedStageIds,
+      skippedStageIds: reviewLadder.skippedStageIds,
+      decisionCarried,
+    });
+    return {
+      allowed: false,
+      reason:
+        `Review ladder unsatisfied: stage ${reviewLadder.firstUnsatisfiedIndex + 1} of ` +
+        `${reviewLadder.totalStages} (${first?.type ?? "unknown"}, ${first?.id ?? "unknown"}) has no recorded decision — ` +
+        "its id is in neither completedStageIds nor skippedStageIds. " +
+        "Complete or skip the stage before marking done, or set doneTransitionOverride to a " +
+        `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // SUP-14561 (mechanism A): refuse a ladder-less parent over a decomposed
+  // body of work. No execution policy (or an empty one) was attached to this
+  // issue, yet two or more children each ran a review ladder — the work was
+  // gated at the children and the parent would close ungated. Fail closed
+  // here, in the same pre-network zone as mechanism C.
+  if (mechanismA !== null && mechanismA.count >= 2) {
+    void writeAuditLog(db, issue, "issue.done_transition_null_policy_refused", {
+      reason: "ungated_decomposed_parent",
+      ladderedChildCount: mechanismA.count,
+      ladderedChildIdentifiers: mechanismA.identifiers,
+      source: "done_transition_guard",
+    });
+    return {
+      allowed: false,
+      reason:
+        `Mechanism A (ungated decomposed parent) refused: this issue carries no review ladder, ` +
+        `but ${mechanismA.count} child issues each ran one (${mechanismA.identifiers.join(", ")}). ` +
+        "The decomposed work was gated at the children; closing the parent ungated would ship it " +
+        "with no verification gate and no approval. Attach an execution policy with a review ladder " +
+        "to this issue, or set doneTransitionOverride to a sanctioned no-deliverable-head disposition " +
+        `(${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // SUP-14579 (mechanism D / ADR-072 close-ladder shape): fail closed when a
+  // decomposed parent's review ladder is satisfied but shape-incomplete, at any
+  // tree depth (the `parentId === null` depth gate was removed in SUP-14640).
+  // Runs in the same pre-network zone as mechanisms A and C.
+  if (ladderShape !== null) {
+    void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_refused", {
+      reason: "adr072_close_ladder_shape_incomplete",
+      missingStageLabels: ladderShape.missingStageLabels,
+      ladderedChildCount: ladderShape.ladderedChildCount,
+      ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
+      source: "done_transition_guard",
+    });
+    return {
+      allowed: false,
+      reason:
+        `Mechanism D (ADR-072 close-ladder shape) refused: this issue is a ` +
+        `decomposed parent over ${ladderShape.ladderedChildCount} laddered children ` +
+        `(${ladderShape.ladderedChildIdentifiers.join(", ")}), but its review ladder is missing ` +
+        `the ADR-072 close-ladder stage(s): ${ladderShape.missingStageLabels.join(", ")}. ` +
+        "Add the missing review/approval stages to this issue's execution policy, or set " +
+        `doneTransitionOverride to a sanctioned no-deliverable-head disposition ` +
+        `(${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
       aheadBy: null,
       branch: null,
       defaultRef: null,
@@ -738,6 +1262,42 @@ export async function evaluateDoneTransitionGuard(
   if (openPrs.length > 0) {
     const prNames = openPrs.map((p) => p.displayName).join(", ");
     if (decisionCarried) {
+      // SUP-14429 (mechanism B): narrow the D6 waiver to what it actually covers.
+      // An open linked PR held by an undismissed external CHANGES_REQUESTED review
+      // is a pre-existing, externally-visible refusal — it is NOT the card
+      // observing its own merge (the SUP-13207 deadlock the waiver below exists
+      // for). Waiving it would close the card done over a PR that can never merge
+      // and arm a merge against a head that will not land, leaving the PR open
+      // forever with no trace on the issue. Only a live GraphQL reviewDecision of
+      // exactly CHANGES_REQUESTED refuses; every other outcome (APPROVED,
+      // REVIEW_REQUIRED, null — including "could not be resolved") keeps the
+      // waiver, per the fail-open-on-unknown contract (SUP-14429 AC4).
+      const refused = openPrs.filter((p) => p.reviewDecision === "CHANGES_REQUESTED");
+      if (refused.length > 0) {
+        const refusalToken = `open_linked_prs_changes_requested:${refused.length}`;
+        const refusedNames = refused.map((p) => p.displayName).join(", ");
+        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+          reason: refusalToken,
+          skipReason: refusalToken,
+          prs: refusedNames,
+        });
+        return {
+          allowed: false,
+          reason:
+            `Issue has ${refused.length} open linked PR${refused.length === 1 ? "" : "s"} ` +
+            `held unmergeable by an undismissed external CHANGES_REQUESTED review (${refusedNames}). ` +
+            "Dismiss or resolve the external review and re-approve, or set doneTransitionOverride to a " +
+            `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}). ` +
+            "The decision-carrying carve-out does not waive a PR an external reviewer is refusing.",
+          aheadBy: null,
+          branch: null,
+          defaultRef: null,
+          owner: null,
+          repo: null,
+          skipped: false,
+          skipReason: refusalToken,
+        };
+      }
       // A review approval is exactly what arms the merge (armMergeOnApproval):
       // blocking the approval on the open PR it approves deadlocks the
       // approval circuit (SUP-13207, board direction B). Plain (non-decision)

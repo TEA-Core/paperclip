@@ -33,8 +33,8 @@ variables:
       - explicit
   - name: excludeAgentIds
     label: Agent ids to exclude (comma-separated)
-    type: string
-    defaultValue: null
+    type: text
+    defaultValue: ""
     required: false
     options: []
 triggers:

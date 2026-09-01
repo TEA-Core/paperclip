@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -11,6 +11,7 @@ import {
   nodeVersionMeetsClaudeAcpMinimum,
   prepareClaudeLocalManagedHome,
   resolveClaudeAcpBillingIdentity,
+  resolveClaudeConfigNormalizerEntry,
   resolveClaudeExecutionEngine,
   resolveClaudeExecutionEngineForRun,
   testClaudeAcpEnvironment,
@@ -88,18 +89,13 @@ afterEach(async () => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  // The remote-sandbox tests in this file stage a process-session bridge whose
-  // detached event writer can still be flushing a trailing file into
-  // `.../process-sessions/<id>/events` after the run's own best-effort session-dir
-  // removal (which production catch-wraps) has returned. Under CI load that write
-  // lands between this recursive delete's directory snapshot and its `rmdir` and
-  // surfaces as `ENOTEMPTY`, failing a test that already passed. `maxRetries`/
-  // `retryDelay` ride out that window, matching the cleanup in
-  // `packages/adapter-utils/src/acpx-engine/execute.test.ts`.
+  // The sandbox process-session bridge writes event files asynchronously; on slow
+  // CI shards a final write can race the recursive rm (ENOTEMPTY on the events
+  // dir), so let fs.rm retry until the writer has quiesced.
   await Promise.all(
     tempRoots
       .splice(0)
-      .map((root) => fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })),
+      .map((root) => fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })),
   );
 });
 
@@ -195,6 +191,23 @@ async function makeTempRoot(prefix: string) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   tempRoots.push(root);
   return root;
+}
+
+/** Seed a valid OAuth credentials file into the server's shared Claude home. */
+async function seedValidOauthCredentials(serverHome: string): Promise<void> {
+  const configDir = path.join(serverHome, ".claude");
+  await fs.mkdir(configDir, { recursive: true });
+  const now = Date.now();
+  const inMs = 48 * 60 * 60 * 1000;
+  const credentials = {
+    claudeAiOauth: {
+      accessToken: "test-access-token",
+      refreshToken: "test-refresh-token",
+      expiresAt: now + inMs,
+      refreshTokenExpiresAt: now + inMs,
+    },
+  };
+  await fs.writeFile(path.join(configDir, ".credentials.json"), JSON.stringify(credentials), "utf8");
 }
 
 async function createRuntimeSkill(root: string) {
@@ -308,9 +321,9 @@ describe("claude_local ACP lane", () => {
   });
 
   it("checks the Node version required by the Claude ACP runtime", () => {
-    setNodeVersion("v22.11.0");
+    setNodeVersion("v24.10.0");
     expect(nodeVersionMeetsClaudeAcpMinimum()).toBe(false);
-    setNodeVersion("v22.12.0");
+    setNodeVersion("v24.11.0");
     expect(nodeVersionMeetsClaudeAcpMinimum()).toBe(true);
   });
 
@@ -319,7 +332,7 @@ describe("claude_local ACP lane", () => {
     const commandPath = path.join(root, "bin", "claude-agent-acp");
     await fs.mkdir(path.dirname(commandPath), { recursive: true });
     await fs.writeFile(commandPath, "#!/usr/bin/env sh\n", "utf8");
-    setNodeVersion("v22.12.0");
+    setNodeVersion("v24.11.0");
 
     expect(resolveClaudeExecutionEngine({})).toEqual({ engine: "acp", explicit: false });
     await expect(
@@ -335,7 +348,7 @@ describe("claude_local ACP lane", () => {
       }),
     ).resolves.toEqual({ engine: "cli", explicit: true });
 
-    setNodeVersion("v22.11.0");
+    setNodeVersion("v24.10.0");
     await expect(
       resolveClaudeExecutionEngineForRun({
         config: { agentCommand: commandPath },
@@ -390,7 +403,7 @@ describe("claude_local ACP lane", () => {
   });
 
   it("uses ACP for bridged sandbox auto runs when the ACP command is configured as a shell command", async () => {
-    setNodeVersion("v22.12.0");
+    setNodeVersion("v24.11.0");
     await expect(
       resolveClaudeExecutionEngineForRun({
         config: { agentCommand: "claude-agent-acp" },
@@ -416,7 +429,7 @@ describe("claude_local ACP lane", () => {
   });
 
   it("falls back to the CLI lane for one-shot sandbox auto runs", async () => {
-    setNodeVersion("v22.12.0");
+    setNodeVersion("v24.11.0");
     await expect(
       resolveClaudeExecutionEngineForRun({
         config: {},
@@ -435,7 +448,7 @@ describe("claude_local ACP lane", () => {
   });
 
   it("falls back to the CLI lane for non-sandbox remote auto runs", async () => {
-    setNodeVersion("v22.12.0");
+    setNodeVersion("v24.11.0");
     await expect(
       resolveClaudeExecutionEngineForRun({
         config: {},
@@ -467,8 +480,13 @@ describe("claude_local ACP lane", () => {
     const commandPath = path.join(root, "bin", "claude-agent-acp");
     await fs.mkdir(path.dirname(commandPath), { recursive: true });
     await fs.writeFile(commandPath, "#!/usr/bin/env sh\n", "utf8");
-    setNodeVersion("v22.12.0");
+    setNodeVersion("v24.11.0");
 
+    // The ACP lane now verifies auth: without a credential the lane runs a real
+    // host login probe, so its status depends on the host login state. Give the
+    // config a Bedrock credential to make the auth path deterministic. Bedrock
+    // gates off the host login probe, so the result reflects only the ACP
+    // prerequisites, and a valid credential lets the lane report a pass.
     const result = await testClaudeAcpEnvironment({
       adapterType: "claude_local",
       companyId: "company-1",
@@ -476,6 +494,7 @@ describe("claude_local ACP lane", () => {
         engine: "acp",
         cwd: root,
         agentCommand: commandPath,
+        env: { CLAUDE_CODE_USE_BEDROCK: "1" },
       },
     });
 
@@ -489,6 +508,12 @@ describe("claude_local ACP lane", () => {
     expect(result.checks).toContainEqual(
       expect.objectContaining({
         code: "claude_acp_command_resolvable",
+        level: "info",
+      }),
+    );
+    expect(result.checks).toContainEqual(
+      expect.objectContaining({
+        code: "claude_acp_bedrock_auth",
         level: "info",
       }),
     );
@@ -508,6 +533,7 @@ describe("claude_local ACP lane", () => {
     process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
     process.env.PAPERCLIP_INSTANCE_ID = "test";
     process.env.HOME = path.join(root, "server-home");
+    await seedValidOauthCredentials(path.join(root, "server-home"));
     const runtimes: FakeRuntime[] = [];
     const meta: AdapterInvocationMeta[] = [];
     const execute = createClaudeAcpExecutor({
@@ -672,6 +698,166 @@ describe("claude_local ACP lane", () => {
     expect(Object.keys(meta[0]?.env ?? {}).filter((key) => key.startsWith("XDG_"))).toEqual([]);
   });
 
+
+  it("test_claude_acp_seam_registers_workspace_sync_back", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-syncback-");
+    const localCwd = path.join(root, "worktree");
+    const remoteCwd = path.join(root, "remote-workspace");
+    const sharedClaudeConfig = path.join(root, "shared-claude-config");
+    await fs.mkdir(localCwd, { recursive: true });
+    await fs.mkdir(remoteCwd, { recursive: true });
+    await fs.mkdir(sharedClaudeConfig, { recursive: true });
+    await fs.writeFile(path.join(localCwd, "hello.txt"), "hi", "utf8");
+    await fs.writeFile(
+      path.join(sharedClaudeConfig, "settings.json"),
+      JSON.stringify({ permissions: { defaultMode: "acceptEdits" } }),
+      "utf8",
+    );
+    await fs.writeFile(path.join(sharedClaudeConfig, "CLAUDE.md"), "# shared guidance\n", "utf8");
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.CLAUDE_CONFIG_DIR = sharedClaudeConfig;
+
+    // The runtime writes a NEW file into the in-sandbox workspace during the turn.
+    // The seam must register a workspace sync-back teardown, so the file lands in
+    // the host worktree after the run.
+    const runtime = new FakeRuntime({});
+    const startTurn = runtime.startTurn.bind(runtime);
+    runtime.startTurn = (input) => {
+      const turn = startTurn(input);
+      const remoteWorkspaceCwd = input.handle.cwd ?? remoteCwd;
+      return {
+        ...turn,
+        result: (async () => {
+          await fs.writeFile(path.join(remoteWorkspaceCwd, "from-sandbox.txt"), "synced", "utf8");
+          return await turn.result;
+        })(),
+      };
+    };
+
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => {
+        Object.assign(runtime.options, options);
+        return runtime as never;
+      },
+    });
+
+    const result = await execute(
+      buildContext(localCwd, {
+        config: {
+          engine: "acp",
+          cwd: localCwd,
+          agentCommand: "node ./fake-acp.js",
+          stateDir: path.join(root, "state"),
+          promptTemplate: "Do the assigned work.",
+        },
+        context: {
+          issueId: "issue-1",
+          paperclipWorkspace: { cwd: localCwd, source: "project_workspace", workspaceId: "workspace-1" },
+        },
+        executionTarget: {
+          kind: "remote",
+          transport: "sandbox",
+          providerKey: "fake-plugin",
+          remoteCwd,
+          runner: createLocalSandboxRunner(),
+        } as never,
+        authToken: "real-run-jwt",
+      }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    // The teardown fired `restoreWorkspace`, so the sandbox-authored file is now
+    // in the host worktree.
+    await expect(fs.readFile(path.join(localCwd, "from-sandbox.txt"), "utf8")).resolves.toBe("synced");
+  });
+
+  it("test_claude_acp_teardown_restore_failure_sanitizes_the_run_log", async () => {
+    // Security regression for a workspace-restore write failure: the run log
+    // is readable by any same-company actor, so the teardown must never write
+    // the caught error's own message there — that message can carry the host
+    // workspace path. Force a real EACCES by making the workspace read-only,
+    // and name it with a sentinel marker so any leak is easy to spot.
+    const root = await makeTempRoot("paperclip-claude-acp-restore-failure-");
+    const localCwd = path.join(root, "SENTINEL-HOST-PATH-marker", "worktree");
+    const remoteCwd = path.join(root, "remote-workspace");
+    await fs.mkdir(localCwd, { recursive: true });
+    await fs.mkdir(remoteCwd, { recursive: true });
+    await fs.writeFile(path.join(localCwd, "hello.txt"), "hi", "utf8");
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+
+    // The runtime writes a new file into the in-sandbox workspace during the
+    // turn, so the teardown's restore has something to copy back — and a new
+    // file is exactly what a read-only workspace directory rejects. The
+    // workspace turns read-only only after the turn's own writes (settings
+    // seeded at startup, the sandbox-authored file) — the teardown restore
+    // that runs after the turn is the write this test forces to fail.
+    const runtime = new FakeRuntime({});
+    const startTurn = runtime.startTurn.bind(runtime);
+    runtime.startTurn = (input) => {
+      const turn = startTurn(input);
+      const remoteWorkspaceCwd = input.handle.cwd ?? remoteCwd;
+      return {
+        ...turn,
+        result: (async () => {
+          await fs.writeFile(path.join(remoteWorkspaceCwd, "from-sandbox.txt"), "synced", "utf8");
+          await fs.chmod(localCwd, 0o500);
+          return await turn.result;
+        })(),
+      };
+    };
+
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => {
+        Object.assign(runtime.options, options);
+        return runtime as never;
+      },
+    });
+
+    const loggedLines: string[] = [];
+    try {
+      const result = await execute(
+        buildContext(localCwd, {
+          config: {
+            engine: "acp",
+            cwd: localCwd,
+            agentCommand: "node ./fake-acp.js",
+            stateDir: path.join(root, "state"),
+            promptTemplate: "Do the assigned work.",
+          },
+          context: {
+            issueId: "issue-1",
+            paperclipWorkspace: { cwd: localCwd, source: "project_workspace", workspaceId: "workspace-1" },
+          },
+          executionTarget: {
+            kind: "remote",
+            transport: "sandbox",
+            providerKey: "fake-plugin",
+            remoteCwd,
+            runner: createLocalSandboxRunner(),
+          } as never,
+          authToken: "real-run-jwt",
+          onLog: async (_stream, chunk) => {
+            loggedLines.push(chunk);
+          },
+        }),
+      );
+
+      // Fail-open: the restore miss never changes the run's exit code or
+      // status, and it surfaces as one allowlisted code — never the raw error.
+      expect(result.exitCode).toBe(0);
+      expect(result.resultJson?.workspaceRestoreFailure).toBe("restore_permission_denied");
+      const allLogs = loggedLines.join("");
+      expect(allLogs).not.toContain("SENTINEL-HOST-PATH-marker");
+      expect(allLogs).not.toContain(localCwd);
+      expect(allLogs).not.toContain("EACCES");
+      expect(allLogs).toContain("permission denied");
+    } finally {
+      await fs.chmod(localCwd, 0o700).catch(() => undefined);
+    }
+  });
+
   it("seeds the agent-side Claude config home on the local lane and repoints CLAUDE_CONFIG_DIR onto it", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-local-home-");
     const localCwd = path.join(root, "worktree");
@@ -680,7 +866,16 @@ describe("claude_local ACP lane", () => {
     const serverHome = path.join(root, "server-home");
     const sharedClaudeConfig = path.join(serverHome, ".claude");
     await fs.mkdir(sharedClaudeConfig, { recursive: true });
-    const credentialsBody = JSON.stringify({ fake: "credential-artifact" });
+    // A real OAuth credentials body so the pre-turn credential-health probe
+    // (SUP-13716) sees a valid claudeAiOauth section and does not trip.
+    const credentialsBody = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "fake-access-token",
+        refreshToken: "fake-refresh-token",
+        expiresAt: Date.now() + 48 * 60 * 60 * 1000,
+        refreshTokenExpiresAt: Date.now() + 48 * 60 * 60 * 1000,
+      },
+    });
     const claudeJsonBody = JSON.stringify({ fake: "state-artifact" });
     await fs.writeFile(path.join(sharedClaudeConfig, ".credentials.json"), credentialsBody, "utf8");
     await fs.writeFile(path.join(sharedClaudeConfig, ".claude.json"), claudeJsonBody, "utf8");
@@ -836,6 +1031,20 @@ describe("claude_local ACP lane", () => {
     // The server's shared home: where the server uid keeps its credentials.
     const serverHome = path.join(root, "server-home");
     await fs.mkdir(path.join(serverHome, ".claude"), { recursive: true });
+    // The SUP-13716 credential probe runs after the seed: without a live OAuth
+    // credential in the shared home it reports "missing" and refuses the run.
+    await fs.writeFile(
+      path.join(serverHome, ".claude", ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "test-access-token",
+          refreshToken: "test-refresh-token",
+          expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+          refreshTokenExpiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
+        },
+      }),
+      "utf8",
+    );
 
     const previousHome = process.env.HOME;
     const previousPaperclipHome = process.env.PAPERCLIP_HOME;
@@ -900,6 +1109,270 @@ describe("claude_local ACP lane", () => {
       else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
       if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
       else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+    }
+  });
+
+  it("armed lane: the seed leaves SDK subdirs to the agent uid and the teardown execs the normalizer through the shim", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-local-armed-");
+    const serverHome = path.join(root, "server-home");
+    await fs.mkdir(path.join(serverHome, ".claude"), { recursive: true });
+    // The SUP-13716 credential probe runs after the seed: without a live OAuth
+    // credential in the shared home it reports "missing" and refuses the run.
+    await fs.writeFile(
+      path.join(serverHome, ".claude", ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "test-access-token",
+          refreshToken: "test-refresh-token",
+          expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+          refreshTokenExpiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
+        },
+      }),
+      "utf8",
+    );
+
+    // Fake setuid shim: records its argv and the env it saw, then exits 0.
+    const shimPath = path.join(root, "fake-spawn-shim");
+    const argvLog = path.join(root, "shim-argv.log");
+    const masterKey = "master-key-never-leave-the-server";
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        "{",
+        'printf "argc=%s\\n" "$#"',
+        'for a in "$@"; do printf "arg=%s\\n" "$a"; done',
+        'printf "master_key=%s\\n" "${PAPERCLIP_SECRETS_MASTER_KEY-}"',
+        'printf "paperclip_home=%s\\n" "${PAPERCLIP_HOME-}"',
+        `} > "${argvLog}"`,
+        "exit 0",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    const previousAgentUid = process.env.PAPERCLIP_AGENT_UID;
+    const previousShim = process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+    const previousMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    try {
+      process.env.HOME = serverHome;
+      process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+      process.env.PAPERCLIP_INSTANCE_ID = "test";
+      process.env.PAPERCLIP_AGENT_UID = "1001";
+      process.env.PAPERCLIP_AGENT_SPAWN_SHIM = shimPath;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY = masterKey;
+      delete process.env.CLAUDE_CONFIG_DIR;
+
+      const logs: string[] = [];
+      const runEnv: Record<string, string> = {};
+      const result = await prepareClaudeLocalManagedHome({
+        acpxAgent: "claude",
+        companyId: "company-1",
+        agentId: "agent-1",
+        runId: "run-1",
+        config: { acpAgentUidSplit: true },
+        env: runEnv,
+        onLog: async (_stream, message) => {
+          logs.push(message);
+        },
+      });
+      const agentSideHome = path.join(
+        root,
+        "paperclip-home",
+        "instances",
+        "test",
+        "companies",
+        "company-1",
+        "agents",
+        "agent-1",
+        "claude-config",
+      );
+      expect(runEnv.CLAUDE_CONFIG_DIR).toBe(agentSideHome);
+      // Armed: the seed must NOT pre-create the SDK subdirs — the agent uid
+      // creates and owns them.
+      for (const subdir of ["projects", "session-env", "sessions", "shell-snapshots", "statsig"]) {
+        await expect(fs.access(path.join(agentSideHome, subdir))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      }
+      expect((await fs.stat(agentSideHome)).mode & 0o7777).toBe(0o2770);
+
+      // Simulate the agent-uid CLI creating SDK state dirs mid-run...
+      const sessionsDir = path.join(agentSideHome, "sessions");
+      const projectDir = path.join(agentSideHome, "projects", "worktree-cwd");
+      await fs.mkdir(sessionsDir, { recursive: true });
+      await fs.mkdir(projectDir, { recursive: true });
+      await fs.chmod(sessionsDir, 0o700);
+      await fs.chmod(projectDir, 0o2700);
+
+      // ...and the dual-pass teardown: the in-process pass re-normalizes what
+      // the server uid owns; the shim pass execs the standalone normalizer.
+      await result?.teardown?.();
+      expect((await fs.stat(sessionsDir)).mode & 0o7777).toBe(0o2770);
+      expect((await fs.stat(projectDir)).mode & 0o7777).toBe(0o2770);
+      const argvLogContent = await fs.readFile(argvLog, "utf8");
+      const argv = argvLogContent.split("\n");
+      expect(argv).toContain(`arg=${process.execPath}`);
+      expect(argv).toContain(`arg=${agentSideHome}`);
+      // The entry must EXIST, not merely be spelled plausibly. The previous
+      // assertion here only checked that some argv entry ended in
+      // `claude-config-normalize.js`, so it stayed green while the shipped
+      // spawn pointed at a file that is not in the running tree: this package
+      // is consumed from `src/`, where the sibling is `.ts`. Every armed run
+      // exited 1 with MODULE_NOT_FOUND, and because the pass is best-effort the
+      // only trace was a log line.
+      const scriptArg = argv
+        .filter((line) => line.startsWith("arg="))
+        .map((line) => line.slice("arg=".length))
+        .find((value) => /claude-config-normalize\.(js|ts)$/.test(value));
+      expect(scriptArg).toBeDefined();
+      await expect(fs.access(scriptArg as string)).resolves.toBeUndefined();
+      // Whatever node flags the resolver decides the entry needs must actually
+      // reach the shim, ahead of the script. (Under vitest there are none —
+      // vitest resolves TypeScript through vite rather than a node loader — so
+      // this asserts consistency, and the forwarding itself is covered below.)
+      const entry = await resolveClaudeConfigNormalizerEntry();
+      for (const nodeArg of entry?.nodeArgs ?? []) expect(argv).toContain(`arg=${nodeArg}`);
+      // The scrubbed child env never carried the master key; the host plumbing
+      // keys (needed for the path-shape check) did.
+      expect(argvLogContent).not.toContain(masterKey);
+      expect(argv).toContain("master_key=");
+      expect(argv).toContain(`paperclip_home=${path.join(root, "paperclip-home")}`);
+      // Exit 0: no fault was logged.
+      expect(logs.some((line) => line.includes("exited with code"))).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+      if (previousAgentUid === undefined) delete process.env.PAPERCLIP_AGENT_UID;
+      else process.env.PAPERCLIP_AGENT_UID = previousAgentUid;
+      if (previousShim === undefined) delete process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+      else process.env.PAPERCLIP_AGENT_SPAWN_SHIM = previousShim;
+      if (previousMasterKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      else process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousMasterKey;
+    }
+  });
+
+  it("forwards the parent's loader flags to a TypeScript normalizer entry, and only those", async () => {
+    // This package's `exports` are TypeScript sources, so a server that imports
+    // it from `src/` runs under `node --import <loader>` and the sibling entry
+    // is `.ts`. Bare node cannot run that entry: type stripping erases
+    // annotations but does not rewrite the entry's own `./claude-config.js`
+    // specifier. The loader flag therefore has to ride along to the child.
+    const previous = process.execArgv;
+    try {
+      process.execArgv = [
+        "--import",
+        "./server/node_modules/tsx/dist/loader.mjs",
+        "--inspect=9229",
+        "--experimental-loader=ts-node/esm",
+      ];
+      const entry = await resolveClaudeConfigNormalizerEntry();
+      expect(entry).not.toBeNull();
+      if (entry?.script.endsWith(".ts")) {
+        expect(entry.nodeArgs).toEqual([
+          "--import",
+          path.resolve(process.cwd(), "./server/node_modules/tsx/dist/loader.mjs"),
+          "--experimental-loader=ts-node/esm",
+        ]);
+        // --inspect must NOT be forwarded: the child would fight the parent for
+        // the debugger port.
+        expect(entry.nodeArgs.join(" ")).not.toContain("--inspect");
+      } else {
+        // Built layout: the compiled sibling runs under bare node.
+        expect(entry?.nodeArgs).toEqual([]);
+      }
+    } finally {
+      process.execArgv = previous;
+    }
+  });
+
+  it("armed lane: a non-zero normalizer shim exit is logged, not thrown", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-local-armed-fail-");
+    const serverHome = path.join(root, "server-home");
+    await fs.mkdir(path.join(serverHome, ".claude"), { recursive: true });
+    // The SUP-13716 credential probe runs after the seed: without a live OAuth
+    // credential in the shared home it reports "missing" and refuses the run.
+    await fs.writeFile(
+      path.join(serverHome, ".claude", ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "test-access-token",
+          refreshToken: "test-refresh-token",
+          expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+          refreshTokenExpiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
+        },
+      }),
+      "utf8",
+    );
+
+    const shimPath = path.join(root, "fake-spawn-shim");
+    await fs.writeFile(
+      shimPath,
+      ["#!/bin/sh", 'echo "normalizer: simulated failure" >&2', "exit 3"].join("\n") + "\n",
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    const previousAgentUid = process.env.PAPERCLIP_AGENT_UID;
+    const previousShim = process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+    try {
+      process.env.HOME = serverHome;
+      process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+      process.env.PAPERCLIP_INSTANCE_ID = "test";
+      process.env.PAPERCLIP_AGENT_UID = "1001";
+      process.env.PAPERCLIP_AGENT_SPAWN_SHIM = shimPath;
+      delete process.env.CLAUDE_CONFIG_DIR;
+
+      const logs: string[] = [];
+      const result = await prepareClaudeLocalManagedHome({
+        acpxAgent: "claude",
+        companyId: "company-1",
+        agentId: "agent-1",
+        runId: "run-1",
+        config: { acpAgentUidSplit: true },
+        env: {},
+        onLog: async (_stream, message) => {
+          logs.push(message);
+        },
+      });
+
+      // The re-normalize must never fail the run.
+      await expect(result?.teardown?.()).resolves.toBeUndefined();
+      expect(
+        logs.some(
+          (line) =>
+            line.includes("agent-uid Claude config normalizer") &&
+            line.includes("exited with code 3") &&
+            line.includes("normalizer: simulated failure"),
+        ),
+      ).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+      if (previousAgentUid === undefined) delete process.env.PAPERCLIP_AGENT_UID;
+      else process.env.PAPERCLIP_AGENT_UID = previousAgentUid;
+      if (previousShim === undefined) delete process.env.PAPERCLIP_AGENT_SPAWN_SHIM;
+      else process.env.PAPERCLIP_AGENT_SPAWN_SHIM = previousShim;
     }
   });
 
@@ -1082,7 +1555,7 @@ describe("claude_local ACP lane", () => {
   });
 
   it("falls back to the CLI lane for a runner-less sandbox even when the ACP command is set", async () => {
-    setNodeVersion("v22.13.0");
+    setNodeVersion("v24.11.0");
     await expect(
       resolveClaudeExecutionEngineForRun({
         config: { agentCommand: "claude-agent-acp" },
@@ -1107,6 +1580,7 @@ describe("claude_local ACP lane", () => {
     process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
     process.env.PAPERCLIP_INSTANCE_ID = "test";
     process.env.HOME = path.join(root, "server-home");
+    await seedValidOauthCredentials(path.join(root, "server-home"));
     const runtimes: FakeRuntime[] = [];
     const execute = createClaudeAcpExecutor({
       createRuntime: (options: FakeRuntimeOptions) => {
@@ -1187,6 +1661,7 @@ describe("claude_local ACP lane", () => {
     process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
     process.env.PAPERCLIP_INSTANCE_ID = "test";
     process.env.HOME = path.join(root, "server-home");
+    await seedValidOauthCredentials(path.join(root, "server-home"));
     const runtimes: FakeRuntime[] = [];
     const execute = createClaudeAcpExecutor({
       createRuntime: (options: FakeRuntimeOptions) => {
@@ -1257,5 +1732,147 @@ describe("resolveClaudeAcpBillingIdentity", () => {
         executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/work" },
       } as never).billingType,
     ).toBe("subscription");
+  });
+});
+
+describe("prepareClaudeLocalManagedHome", () => {
+  async function setupTestHome() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-local-managed-home-"));
+    tempRoots.push(root);
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    delete process.env.CLAUDE_CONFIG_DIR;
+    return root;
+  }
+
+  function createOnLog() {
+    return vi.fn(async (_stream: "stdout" | "stderr", _chunk: string) => {});
+  }
+
+  it("throws an auth-like error when OAuth credentials are missing in the agent-side home", async () => {
+    const root = await setupTestHome();
+    await fs.mkdir(path.join(root, ".claude"), { recursive: true });
+
+    const env: NodeJS.ProcessEnv = {};
+    const onLog = createOnLog();
+    await expect(
+      prepareClaudeLocalManagedHome({
+        env,
+        companyId: "company-1",
+        agentId: "agent-1",
+        config: {},
+        onLog,
+      } as never),
+    ).rejects.toThrow(/Re-login is required/);
+
+    expect(env.CLAUDE_CONFIG_DIR).toBeTruthy();
+    expect(onLog.mock.calls).toEqual(
+      expect.arrayContaining([
+        [
+          "stderr",
+          expect.stringMatching(/claude-credential-health: missing:/),
+        ],
+      ]),
+    );
+  });
+
+  it("skips the OAuth probe when a CLAUDE_CODE_OAUTH_TOKEN is configured", async () => {
+    // A configured subscription token authenticates Claude without any stored
+    // credentials file, so an empty shared home must not trip the probe.
+    const root = await setupTestHome();
+    await fs.mkdir(path.join(root, ".claude"), { recursive: true });
+
+    const env: NodeJS.ProcessEnv = { CLAUDE_CODE_OAUTH_TOKEN: "claude-subscription-token" };
+    const onLog = createOnLog();
+    await prepareClaudeLocalManagedHome({
+      env,
+      companyId: "company-1",
+      agentId: "agent-1",
+      config: {},
+      onLog,
+    } as never);
+
+    expect(env.CLAUDE_CONFIG_DIR).toBeTruthy();
+    expect(onLog.mock.calls).not.toEqual(
+      expect.arrayContaining([
+        [
+          "stderr",
+          expect.stringMatching(/claude-credential-health:/),
+        ],
+      ]),
+    );
+  });
+
+  it("skips the OAuth probe when an API key is configured", async () => {
+    const root = await setupTestHome();
+    await fs.mkdir(path.join(root, ".claude"), { recursive: true });
+
+    const env: NodeJS.ProcessEnv = { ANTHROPIC_API_KEY: "sk-ant-test" };
+    const onLog = createOnLog();
+    await prepareClaudeLocalManagedHome({
+      env,
+      companyId: "company-1",
+      agentId: "agent-1",
+      config: {},
+      onLog,
+    } as never);
+
+    expect(env.CLAUDE_CONFIG_DIR).toBeTruthy();
+    expect(onLog.mock.calls).toEqual(
+      expect.arrayContaining([
+        [
+          "stdout",
+          expect.stringMatching(/Local ACP run will use the agent-side Claude config home/),
+        ],
+      ]),
+    );
+    expect(onLog.mock.calls).not.toEqual(
+      expect.arrayContaining([
+        [
+          "stderr",
+          expect.stringMatching(/claude-credential-health:/),
+        ],
+      ]),
+    );
+  });
+
+  it("succeeds when valid OAuth credentials are present in the shared home", async () => {
+    const root = await setupTestHome();
+    const nowSec = Math.floor(Date.now() / 1000);
+    const sharedHome = path.join(root, ".claude");
+    await fs.mkdir(sharedHome, { recursive: true });
+    await fs.writeFile(
+      path.join(sharedHome, ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "opaque-access-token",
+          refreshToken: "opaque-refresh-token",
+          expiresAt: nowSec + 8 * 60 * 60,
+          refreshTokenExpiresAt: nowSec + 30 * 24 * 60 * 60,
+        },
+      }),
+      "utf8",
+    );
+
+    const env: NodeJS.ProcessEnv = {};
+    const onLog = createOnLog();
+    await prepareClaudeLocalManagedHome({
+      env,
+      companyId: "company-1",
+      agentId: "agent-1",
+      config: {},
+      onLog,
+    } as never);
+
+    expect(env.CLAUDE_CONFIG_DIR).toBeTruthy();
+    expect(onLog.mock.calls).toEqual(
+      expect.arrayContaining([
+        [
+          "stdout",
+          expect.stringMatching(/Local ACP run will use the agent-side Claude config home/),
+        ],
+      ]),
+    );
   });
 });

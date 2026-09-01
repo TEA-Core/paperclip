@@ -59,6 +59,7 @@ import {
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
 } from "./workspace-runtime.js";
+import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
 import {
   workspaceOperationService,
   type WorkspaceOperationRecorder,
@@ -135,7 +136,7 @@ export interface ExecutionWorkspaceProvisioningInput {
   executionProjectId: string | null;
   resolvedInstanceSettings: ExecutionWorkspaceProvisioningResolvedInstanceSettings;
   mergedConfig: Record<string, unknown>;
-  executionPolicy: { executionMode: string };
+  executionPolicy: { executionMode: string | undefined; managedSandboxOnly?: boolean };
   context: Record<string, unknown>;
   previousSessionParams: Record<string, unknown> | null;
   resolveWorkspace: (
@@ -559,6 +560,17 @@ export async function provisionIssueExecutionWorkspace(
         companyId: agent.companyId,
       },
       heartbeatRunId: run.id,
+      // Carry the persisted branch-ownership record into realization. Without
+      // it every existing workspace realizes as operator-owned: the
+      // restore-missing path then fails closed on a branch the runtime itself
+      // created, and the unstarted-worktree refresh is skipped.
+      recordedBranchOwnership:
+        existingExecutionWorkspace?.status !== "archived" && existingExecutionWorkspace?.branchName
+          ? {
+              branchName: existingExecutionWorkspace.branchName,
+              createdByRuntime: isRuntimeOwnedGitBranch(existingExecutionWorkspace.metadata),
+            }
+          : null,
       existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
       enableWorkspaceBranchReconcileForward:
         input.resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
@@ -579,6 +591,7 @@ export async function provisionIssueExecutionWorkspace(
       : null,
     source: executionWorkspace.source,
     createdByRuntime: executionWorkspace.created,
+    strategyType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "project_primary",
     configSnapshot: input.configSnapshot,
     shouldReuseExisting: resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace,
     shouldRefreshConfigSnapshot: resolvedWorkspaceReusePolicy.shouldRefreshWorkspaceConfigSnapshot,

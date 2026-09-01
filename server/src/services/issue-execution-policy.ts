@@ -122,6 +122,7 @@ function blankExecutionState(): IssueExecutionState {
     currentStageType: null,
     currentParticipant: null,
     returnAssignee: null,
+    deliveryAuthor: null,
     reviewRequest: null,
     completedStageIds: [],
     lastDecisionId: null,
@@ -325,11 +326,8 @@ function nextAssigneeIds(input: {
 export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | null): IssueExecutionPolicy | null {
   if (!policy) return null;
   if (!policy.monitor) return policy;
-  return {
-    mode: policy.mode,
-    commentRequired: policy.commentRequired,
-    stages: policy.stages,
-  };
+  const { monitor: _monitor, ...rest } = policy;
+  return rest;
 }
 
 export function setIssueExecutionPolicyMonitorScheduledBy(
@@ -442,7 +440,9 @@ export function normalizeIssueExecutionPolicy(
  * removable with a two-character value or a bare null. Three destructive
  * shapes are rejected at the write boundary:
  *
- * - an explicitly empty `stages` array (`executionPolicy.stages: []`);
+ * - an explicitly empty `stages` array (`executionPolicy.stages: []`), unless
+ *   the stored policy is *already* stage-less, in which case the array removes
+ *   nothing (SUP-13925);
  * - an explicit `executionPolicy: null` on an issue whose stored policy is
  *   non-null;
  * - any other body over an issue that currently has stages, where the body
@@ -453,6 +453,18 @@ export function normalizeIssueExecutionPolicy(
  * monitor-only policy (or a policy with authorization/review-preset content
  * but no stages) can still be cleared or replaced with a body that is not
  * null-as-is and that omits the `stages` field.
+ *
+ * SUP-13925: the empty-`stages` rejection is scoped to writes that actually
+ * remove something. A monitor-only watcher's stored policy is
+ * `{mode, stages: [], monitor}` by design, and the natural re-arm idiom is to
+ * read that policy, edit `monitor.nextCheckAt`, and write the whole object
+ * back. That round-trip carries an explicit `stages: []` and used to 422, which
+ * left the only working re-arm path a partial `{monitor: {...}}` body that
+ * relies on merge semantics. Permitting the round-trip grants no new
+ * capability: over an already stage-less policy the identical stored result is
+ * reachable today by omitting the `stages` key entirely, so the rejection was
+ * blocking an idiom rather than defending the ladder. Over a policy that *has*
+ * stages the rejection is unchanged — that is the case ADR-029/ADR-072 guard.
  */
 export function assertPatchableExecutionPolicyWrite(input: {
   raw: unknown;
@@ -463,7 +475,12 @@ export function assertPatchableExecutionPolicyWrite(input: {
 }): void {
   const { raw, currentPolicy, stagesExplicitlyEmpty } = input;
 
-  if (stagesExplicitlyEmpty) {
+  // SUP-13925: only reject when there is a close ladder to strip. `stages: []`
+  // over a stored policy that is already stage-less is a faithful round-trip,
+  // not a removal. `currentPolicy === null` still rejects: there is no stored
+  // shape being round-tripped, so an explicit empty array there is the
+  // ladder-free policy the guard was written to keep off the board.
+  if (stagesExplicitlyEmpty && (currentPolicy === null || currentPolicy.stages.length > 0)) {
     throw unprocessable("executionPolicy.stages must not be empty");
   }
 
@@ -635,6 +652,7 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     currentStageType: null,
     currentParticipant: null,
     returnAssignee: previous?.returnAssignee ?? null,
+    deliveryAuthor: previous?.deliveryAuthor ?? null,
     reviewRequest: null,
     completedStageIds,
     skippedStageIds: mergeSkippedStageIds(previous),
@@ -658,6 +676,7 @@ function buildStateWithCompletedStages(input: {
     currentStageType: input.previous?.currentStageType ?? null,
     currentParticipant: input.previous?.currentParticipant ?? null,
     returnAssignee: input.previous?.returnAssignee ?? input.returnAssignee,
+    deliveryAuthor: input.previous?.deliveryAuthor ?? null,
     reviewRequest: input.previous?.reviewRequest ?? null,
     completedStageIds: input.completedStageIds,
     skippedStageIds: mergeSkippedStageIds(input.previous, input.skippedStageIds),
@@ -680,6 +699,7 @@ function buildSkippedStageCompletedState(input: {
     currentStageType: null,
     currentParticipant: null,
     returnAssignee: input.previous?.returnAssignee ?? input.returnAssignee,
+    deliveryAuthor: input.previous?.deliveryAuthor ?? null,
     reviewRequest: null,
     completedStageIds: input.completedStageIds,
     skippedStageIds: mergeSkippedStageIds(input.previous, input.skippedStageIds),
@@ -697,6 +717,7 @@ function buildPendingState(input: {
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   changesRequestedCount?: number;
+  deliveryAuthor?: IssueExecutionStagePrincipal | null;
 }): IssueExecutionState {
   return {
     status: PENDING_STATUS,
@@ -705,6 +726,7 @@ function buildPendingState(input: {
     currentStageType: input.stage.type,
     currentParticipant: input.participant,
     returnAssignee: input.returnAssignee,
+    deliveryAuthor: input.deliveryAuthor ?? input.previous?.deliveryAuthor ?? null,
     reviewRequest: input.reviewRequest ?? null,
     completedStageIds: input.previous?.completedStageIds ?? [],
     skippedStageIds: mergeSkippedStageIds(input.previous),
@@ -742,6 +764,7 @@ function buildPendingStagePatch(input: {
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   changesRequestedCount?: number;
+  deliveryAuthor?: IssueExecutionStagePrincipal | null;
 }) {
   input.patch.status = "in_review";
   Object.assign(input.patch, patchForPrincipal(input.participant));
@@ -753,6 +776,7 @@ function buildPendingStagePatch(input: {
     returnAssignee: input.returnAssignee,
     reviewRequest: input.reviewRequest,
     changesRequestedCount: input.changesRequestedCount,
+    deliveryAuthor: input.deliveryAuthor,
   });
 }
 
@@ -1019,6 +1043,9 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         if (!returnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
         }
+        if (!returnAssignee) {
+          throw unprocessable("This execution stage has no return assignee");
+        }
         const decision = {
           stageId: activeStage.id,
           stageType: activeStage.type,
@@ -1204,6 +1231,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     );
   }
 
+  // The assignee of record at delivery is the delivery author. Capturing it
+  // here (before the patch reassigns the issue to the review participant)
+  // keeps the diff author distinguishable on the recorded shape; the
+  // exclusion above already keeps the author from being selected as the
+  // participant of their own stage.
   buildPendingStagePatch({
     patch,
     previous:
@@ -1220,6 +1252,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     participant,
     returnAssignee,
     reviewRequest: input.reviewRequest ?? null,
+    deliveryAuthor: currentAssignee,
   });
   return {
     patch,

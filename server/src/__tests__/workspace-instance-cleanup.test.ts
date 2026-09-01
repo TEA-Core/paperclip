@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupWorktreeInstanceArtifacts,
+  deriveLegacyWorktreeInstanceId,
   deriveWorktreeInstanceId,
   readManagedWorktreeInstanceOwnership,
   readWorktreeInstancePointer,
@@ -28,6 +29,12 @@ async function writeWorkspaceEnv(workspacePath: string, homeDir: string, instanc
     `PAPERCLIP_HOME=${JSON.stringify(homeDir)}\nPAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}\n`,
     "utf8",
   );
+}
+
+// A basename whose normalized 48th character (0-based 47) is a hyphen: the slice
+// boundary case where the legacy spelling re-introduces a doubled "-".
+async function makeBoundaryWorkspacePath(root: string): Promise<string> {
+  return fs.mkdtemp(path.join(root, `${"s".repeat(47)}-`));
 }
 
 function createRecorderDouble() {
@@ -90,6 +97,124 @@ describe("worktree instance cleanup", () => {
     expect(deriveWorktreeInstanceId(plusPath)).toMatch(/^feature-cleanup-[a-f0-9]{12}$/);
     expect(deriveWorktreeInstanceId(dashPath)).toMatch(/^feature-cleanup-[a-f0-9]{12}$/);
   });
+
+  it("spells the legacy id with the doubled separator only at a hyphen slice boundary", () => {
+    const parent = path.join(os.tmpdir(), "paperclip-instance-id-boundary");
+    const hyphenBoundaryPath = path.join(parent, `${"a".repeat(47)}-tail`);
+    const underscoreBoundaryPath = path.join(parent, `${"a".repeat(47)}_tail`);
+    const plainPath = path.join(parent, "feature-cleanup");
+
+    const hyphenStable = deriveWorktreeInstanceId(hyphenBoundaryPath);
+    expect(hyphenStable).toMatch(new RegExp(`^${"a".repeat(47)}-[a-f0-9]{12}$`));
+    expect(deriveLegacyWorktreeInstanceId(hyphenBoundaryPath)).toBe(`${"a".repeat(47)}--${hyphenStable.slice(-12)}`);
+    expect(deriveLegacyWorktreeInstanceId(hyphenBoundaryPath)).not.toBe(hyphenStable);
+
+    // The shell fix strips only a trailing hyphen after the slice, so an
+    // underscore boundary is spelled identically in both formulas.
+    expect(deriveLegacyWorktreeInstanceId(underscoreBoundaryPath)).toBe(
+      deriveWorktreeInstanceId(underscoreBoundaryPath),
+    );
+    expect(deriveLegacyWorktreeInstanceId(plainPath)).toBe(deriveWorktreeInstanceId(plainPath));
+  });
+
+  it("spells the exact SUP-14139 boundary basename with a doubled hyphen in the legacy formula", () => {
+    const sup14139Path = path.join(
+      os.tmpdir(),
+      "paperclip-sup-14139-boundary",
+      "SUP-14139-execution-workspace-allocation-has-no-path-exclusivity-two-active-rows-over-one-worktree-and-an-issue-bound-to",
+    );
+    const stable = deriveWorktreeInstanceId(sup14139Path);
+    expect(stable).toMatch(/^sup-14139-execution-workspace-allocation-has-no-[a-f0-9]{12}$/);
+    expect(stable).not.toContain("--");
+    expect(deriveLegacyWorktreeInstanceId(sup14139Path)).toBe(
+      `sup-14139-execution-workspace-allocation-has-no--${stable.slice(-12)}`,
+    );
+  });
+
+  it("removes a boundary worktree instance persisted with the slice-stable instance id", async () => {
+    const root = await makeTempRoot("paperclip-cleanup-boundary-");
+    const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
+    const workspacePath = await makeBoundaryWorkspacePath(root);
+    const instanceId = deriveWorktreeInstanceId(workspacePath);
+    const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+    await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
+    await fs.writeFile(path.join(instanceRoot, "marker"), "remove me", "utf8");
+    await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
+
+    const pointer = await readWorktreeInstancePointer(workspacePath);
+    const result = await cleanupWorktreeInstanceArtifacts({
+      pointer: pointer!,
+      workspaceId: "workspace-1",
+      workspacePath,
+      expectedInstanceId: instanceId,
+      expectedInstanceRoot: instanceRoot,
+      worktreesDir,
+    });
+
+    expect(result).toMatchObject({ status: "removed", instanceRoot });
+    await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("removes a boundary worktree instance persisted with the legacy instance id without migrating the pointer", async () => {
+    const root = await makeTempRoot("paperclip-cleanup-boundary-");
+    const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
+    const workspacePath = await makeBoundaryWorkspacePath(root);
+    const instanceId = deriveLegacyWorktreeInstanceId(workspacePath);
+    const stableInstanceId = deriveWorktreeInstanceId(workspacePath);
+    expect(instanceId).not.toBe(stableInstanceId);
+    expect(instanceId).toContain("--");
+    const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+    await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
+    await fs.writeFile(path.join(instanceRoot, "marker"), "remove me", "utf8");
+    await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
+
+    const pointer = await readWorktreeInstancePointer(workspacePath);
+    const result = await cleanupWorktreeInstanceArtifacts({
+      pointer: pointer!,
+      workspaceId: "workspace-1",
+      workspacePath,
+      expectedInstanceId: stableInstanceId,
+      expectedInstanceRoot: instanceRoot,
+      worktreesDir,
+    });
+
+    expect(result).toMatchObject({ status: "removed", instanceRoot });
+    await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(path.join(workspacePath, ".paperclip", ".env"), "utf8")).toContain(
+      `PAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}`,
+    );
+  });
+
+  it("still refuses a boundary worktree instance persisted with a foreign instance id", async () => {
+    const root = await makeTempRoot("paperclip-cleanup-boundary-");
+    const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
+    const workspacePath = await makeBoundaryWorkspacePath(root);
+    const instanceId = deriveWorktreeInstanceId(workspacePath);
+    const foreignRoot = path.join(worktreesDir, "instances", "foreign-boundary-instance");
+    await fs.mkdir(foreignRoot, { recursive: true });
+    await fs.writeFile(path.join(foreignRoot, "marker"), "keep me", "utf8");
+    await writeWorkspaceEnv(workspacePath, worktreesDir, "foreign-boundary-instance");
+    const stopEmbeddedPostgres = vi.fn(async () => false);
+    const removeInstanceRoot = vi.fn(async () => {});
+
+    const pointer = await readWorktreeInstancePointer(workspacePath);
+    const result = await cleanupWorktreeInstanceArtifacts({
+      pointer: pointer!,
+      workspaceId: "workspace-1",
+      workspacePath,
+      expectedInstanceId: instanceId,
+      expectedInstanceRoot: null,
+      worktreesDir,
+      dependencies: { stopEmbeddedPostgres, removeInstanceRoot },
+    });
+
+    expect(result).toMatchObject({ status: "refused", instanceRoot: foreignRoot });
+    expect((result as { warning: string }).warning).toContain("expected workspace instance");
+    expect(stopEmbeddedPostgres).not.toHaveBeenCalled();
+    expect(removeInstanceRoot).not.toHaveBeenCalled();
+    expect(await fs.readFile(path.join(foreignRoot, "marker"), "utf8")).toBe("keep me");
+  });
+
   it("removes an instance directory inside the managed worktree instances root", async () => {
     const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
     const workspacePath = await makeTempRoot("paperclip-cleanup-workspace-");
@@ -114,7 +239,7 @@ describe("worktree instance cleanup", () => {
     await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("falls back to deterministic instance ownership when persisted root metadata is absent", async () => {
+  it("preserves a collision-resistant active instance when persisted ownership is absent", async () => {
     const worktreesDir = await makeTempRoot("paperclip-managed-worktrees-");
     const workspacePath = await makeTempRoot("paperclip-cleanup-workspace-");
     const instanceId = deriveWorktreeInstanceId(workspacePath);
@@ -133,8 +258,9 @@ describe("worktree instance cleanup", () => {
       worktreesDir,
     });
 
-    expect(result).toMatchObject({ status: "removed", instanceRoot });
-    await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(result).toMatchObject({ status: "refused", instanceRoot });
+    expect((result as { warning: string }).warning).toContain("no persisted instance root");
+    await expect(fs.readFile(path.join(instanceRoot, "marker"), "utf8")).resolves.toBe("remove me");
   });
 
   it("refuses and logs an instance pointer outside the managed worktree root", async () => {
@@ -353,4 +479,53 @@ describe("worktree instance cleanup", () => {
       wait: async () => {},
     })).resolves.toBe(false);
   });
+  // Upstream test removed here: the "deterministic ownership fallback" this
+  // asserted is inherited upstream code (de08d947e), and upstream has since
+  // replaced it with a fail-closed refusal (#11651) -- covered by "refuses ...
+  // no persisted instance root" above. Deleting an instance directory the
+  // workspace row cannot prove it owns is not a fallback worth keeping.
+
+});
+
+describe("deriveWorktreeInstanceId agrees with the script that names the directory", () => {
+  // SUP-14156 made `scripts/provision-worktree.sh` strip a trailing separator the
+  // 48-character truncation leaves behind. That script is what creates the
+  // instance directory. This function did not move with it, so it derived an id
+  // spelled "--" for exactly those names — an id naming a directory that does not
+  const canonicalizeLikeTheScript = (value: string) =>
+    value.trim().toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^[-_]+|[-_]+$/g, "") || "worktree";
+
+  // 48 characters of this slug end exactly on a "-", which is the precondition.
+  // Taken from the branch that wedged in production.
+  const truncatesOnADash =
+    "/paperclip/worktrees/SUP-14139-execution-workspace-allocation-has-no-path-exclusivity";
+
+
+  it("never emits a doubled separator", () => {
+    expect(deriveWorktreeInstanceId(truncatesOnADash)).not.toContain("--");
+  });
+
+  it("round-trips through the script's canonical form unchanged", () => {
+    for (const candidate of [
+      truncatesOnADash,
+      "/paperclip/worktrees/short-branch",
+      "/paperclip/worktrees/UPPER_Case.Branch@v2",
+      "/paperclip/worktrees/---leading-and-trailing---",
+    ]) {
+      const derived = deriveWorktreeInstanceId(candidate);
+      expect(canonicalizeLikeTheScript(derived), candidate).toBe(derived);
+    }
+  });
+
+  it("still distinguishes two worktrees whose names truncate identically", () => {
+    // The hash is over the absolute path, so stripping the separator must not
+    // make two different workspaces share one instance directory.
+    const a = deriveWorktreeInstanceId(`${truncatesOnADash}-two-active-rows`);
+    const b = deriveWorktreeInstanceId(`${truncatesOnADash}-and-an-issue-bound`);
+    expect(a).not.toBe(b);
+  });
+
 });

@@ -2,9 +2,11 @@ import express from "express";
 import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
+import { evaluateIssueContinuationPath } from "../routes/issues.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  getByIdForUpdate: vi.fn(),
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
@@ -13,6 +15,7 @@ const mockIssueService = vi.hoisted(() => ({
   findMentionedAgents: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  getRelationSummaries: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -148,7 +151,7 @@ vi.mock("../services/routines.js", () => ({
 
 vi.mock("../services/index.js", () => ({
   companyService: () => ({
-    getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
+    getById: vi.fn(async () => ({ id: "company-1" })),
   }),
   accessService: () => mockAccessService,
   agentService: () => mockAgentService,
@@ -289,6 +292,7 @@ describe.sequential("issue comment reopen routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockReset();
+    mockIssueService.getByIdForUpdate.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
     mockIssueService.update.mockReset();
     mockIssueService.addComment.mockReset();
@@ -340,6 +344,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectJoined }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDb.transaction.mockImplementation(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx));
+    mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
     mockHeartbeatService.wakeup.mockResolvedValue(undefined);
     mockHeartbeatService.reportRunActivity.mockResolvedValue(undefined);
     mockHeartbeatService.getRun.mockResolvedValue(null);
@@ -1054,6 +1059,88 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  it("skips the assignee wakeup when the issue is concurrently cancelled while the comment is being written", async () => {
+    const app = await installActor(createApp());
+    // First call is the route's pre-insert fetch; second is the wake-decision
+    // re-fetch. A stale wake decision would use the first (open, assigned)
+    // snapshot instead of the second (cancelled) one.
+    mockIssueService.getById
+      .mockResolvedValueOnce(makeIssue("in_progress"))
+      .mockResolvedValueOnce(makeIssue("cancelled"));
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-race-cancel",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "Still working on this?",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Still working on this?" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalled();
+    // Give any (incorrect) fire-and-forget wakeup a moment to fire before asserting its absence.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("wakes the freshly reassigned agent, not the pre-insert snapshot's assignee, when the issue is concurrently reassigned", async () => {
+    const app = await installActor(createApp());
+    const reassignedAgentId = "44444444-4444-4444-8444-444444444444";
+    mockIssueService.getById
+      .mockResolvedValueOnce(makeIssue("in_progress"))
+      .mockResolvedValueOnce({ ...makeIssue("in_progress"), assigneeAgentId: reassignedAgentId });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-race-reassign",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "Status update",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Status update" });
+
+    expect(res.status).toBe(201);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      reassignedAgentId,
+      expect.objectContaining({ reason: "issue_commented" }),
+    ));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.anything(),
+    );
+  });
+
+  it("keeps the comment write successful and falls back to the in-hand snapshot when the wake re-fetch fails", async () => {
+    const app = await installActor(createApp());
+    // The comment is already committed before the wake-decision re-fetch runs.
+    // If that best-effort re-fetch throws, the route must still return 201 for
+    // the persisted comment (a 5xx would invite a retry that duplicates it) and
+    // fall back to the in-hand snapshot so a legitimate wake isn't dropped.
+    mockIssueService.getById
+      .mockResolvedValueOnce(makeIssue("in_progress"))
+      .mockRejectedValueOnce(new Error("transient read failure"));
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-refetch-fail",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "Still here?",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Still here?" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalled();
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_commented" }),
+    ));
+  });
+
   it("passes validated comment presentation fields to trusted board comment writes", async () => {
     const app = await installActor(createApp());
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
@@ -1265,6 +1352,62 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     ));
+  });
+
+  it("does not implicitly reopen a blocked issue via PATCH when the same request wires blockers", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: "11111111-1111-4111-8111-111111111111",
+      blockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("blocked"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({
+        blockedByIssueIds: ["33333333-3333-4333-8333-333333333333"],
+        comment: "wired the dependency this issue is waiting on",
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    const patch = mockIssueService.update.mock.calls[0][1] as Record<string, unknown>;
+    expect(patch.status).toBeUndefined();
+    expect(patch.blockedByIssueIds).toEqual(["33333333-3333-4333-8333-333333333333"]);
+  });
+
+  it("still implicitly reopens a blocked issue via PATCH when the same request clears blockers", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: "11111111-1111-4111-8111-111111111111",
+      blockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("blocked"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ blockedByIssueIds: [], comment: "nothing left to wait on, please continue" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    const patch = mockIssueService.update.mock.calls[0][1] as Record<string, unknown>;
+    expect(patch.status).toBe("todo");
   });
 
   it("does not implicitly reopen closed issues via POST comments when no agent is assigned", async () => {
@@ -2377,7 +2520,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-1",
@@ -2462,7 +2605,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "kind: review\ndecision: approved\nsummary: ship it";
+    const reviewBody = "kind: review\ndecision: approved\nsummary: ship it\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-2",
@@ -2549,7 +2692,7 @@ describe.sequential("issue comment reopen routes", () => {
       },
       parentId: null,
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-3",
@@ -2636,7 +2779,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: APPROVED";
+    const reviewBody = "## Review: APPROVED\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-5",
@@ -3052,11 +3195,11 @@ describe.sequential("issue comment reopen routes", () => {
   });
 
   describe.each([
-    { name: "uppercase approval", body: "## Review: APPROVED" },
-    { name: "trailing punctuation", body: "## Review: APPROVED!" },
-    { name: "ticketed approval", body: "## Review: PAP-580 - APPROVED" },
-    { name: "lowercase approval", body: "## Review: LGTM, approved" },
-    { name: "approval with body context", body: "## Review: APPROVED\n\nReady to ship." },
+    { name: "uppercase approval", body: "## Review: APPROVED\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface." },
+    { name: "trailing punctuation", body: "## Review: APPROVED!\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface." },
+    { name: "ticketed approval", body: "## Review: PAP-580 - APPROVED\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface." },
+    { name: "lowercase approval", body: "## Review: LGTM, approved\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface." },
+    { name: "approval with body context", body: "## Review: APPROVED\n\nReady to ship.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface." },
   ])("auto-approves positive approval phrasings ($name)", ({ body }) => {
     it("triggers the auto-approval transition", async () => {
       const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
@@ -3168,7 +3311,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-atomic",
@@ -3238,7 +3381,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-missing",
@@ -3415,13 +3558,528 @@ describe.sequential("issue comment reopen routes", () => {
         payload: expect.objectContaining({
           issueId: "11111111-1111-4111-8111-111111111111",
           executionStage: expect.objectContaining({
-            wakeRole: "executor",
-            stageType: "review",
-            lastDecisionOutcome: "changes_requested",
-            allowedActions: ["address_changes", "resubmit"],
-          }),
+             wakeRole: "executor",
+             stageType: "review",
+             lastDecisionOutcome: "changes_requested",
+             allowedActions: ["address_changes", "resubmit"],
+           }),
+         }),
+       }),
+     ));
+  });
+
+  describe("in_progress continuation-path evidence guard (SUP-14030, ghost-pass-reporting §2a)", () => {
+    const issueId = "11111111-1111-4111-8111-111111111111";
+    const assigneeId = "22222222-2222-4222-8222-222222222222";
+
+    function mockRunningReceipt(issue: ReturnType<typeof makeIssue>) {
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+    }
+
+    it("rejects a board PATCH todo -> in_progress without a live continuation path", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      // The 422 payload is diagnosable without reading the source: it names the
+      // §2a disjuncts checked, which are absent, and the settle-window state.
+      expect(res.body.details).toEqual(
+        expect.objectContaining({
+          issueId,
+          currentStatus: "todo",
+          executionRunId: null,
+          monitorNextCheckAt: null,
+          lastActivityAt: null,
+          settleWindowMs: 300000,
+          settledWithinWindow: false,
+          checkedDisjuncts: [
+            "activeRun",
+            "monitorNextCheckAtInFuture",
+            "watchdog",
+            "scheduledRetry",
+            "activeRecoveryAction",
+            "successfulRunHandoffLive",
+          ],
+          absentDisjuncts: [
+            "activeRun",
+            "monitorNextCheckAtInFuture",
+            "watchdog",
+            "scheduledRetry",
+            "activeRecoveryAction",
+            "successfulRunHandoffLive",
+          ],
+          disjuncts: {
+            activeRun: false,
+            monitorNextCheckAtInFuture: false,
+            watchdog: false,
+            scheduledRetry: false,
+            activeRecoveryAction: false,
+            successfulRunHandoffLive: false,
+          },
         }),
-      }),
-    ));
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a resume PATCH with explicit in_progress when no run is active", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", resume: true, comment: "start it now" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows a board PATCH todo -> in_progress when the stamped execution run is running", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-live" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-live", status: "running" });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("allows a board PATCH todo -> in_progress when the stamped execution run is queued", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-queued" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-queued", status: "queued" });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("rejects when the stamped execution run is terminal and no assignee run is active", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-dead" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-dead", status: "completed" });
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows when the assignee's live run targets this issue via contextSnapshot", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+        id: "run-live",
+        status: "running",
+        agentId: assigneeId,
+        contextSnapshot: { issueId },
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("rejects when the assignee's live run targets a different issue", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+        id: "run-live",
+        status: "running",
+        agentId: assigneeId,
+        contextSnapshot: { issueId: "99999999-9999-4999-8999-999999999999" },
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows the assignee agent whose own run holds the issue lock", async () => {
+      const issue = { ...makeIssue("todo"), executionRunId: "run-1" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockHeartbeatService.getRun.mockResolvedValue({ id: "run-1", status: "running" });
+
+      const res = await request(await installActor(createApp(), agentActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("allows a board PATCH todo -> in_progress when a future monitorNextCheckAt is armed (no run)", async () => {
+      const issue = {
+        ...makeIssue("todo"),
+        monitorNextCheckAt: new Date(Date.now() + 60_000),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("rejects when monitorNextCheckAt is in the past and no run is active", async () => {
+      const issue = {
+        ...makeIssue("todo"),
+        monitorNextCheckAt: new Date(Date.now() - 60_000),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(res.body.details.absentDisjuncts).toContain("monitorNextCheckAtInFuture");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows a board PATCH that arms a monitor and claims in_progress in the same body", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "in_progress",
+          executionPolicy: {
+            monitor: { nextCheckAt: new Date(Date.now() + 60_000).toISOString() },
+          },
+        });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("does not reject an issue stamped moments ago (5-minute settle window)", async () => {
+      const issue = {
+        ...makeIssue("todo"),
+        updatedAt: new Date(Date.now() - 60_000),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("rejects when lastActivityAt is older than the settle window and no disjunct holds", async () => {
+      const issue = {
+        ...makeIssue("todo"),
+        updatedAt: new Date(Date.now() - 10 * 60_000),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(res.body.details.settledWithinWindow).toBe(false);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows when a scheduled retry is live", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+        runId: "run-scheduled",
+        scheduledAt: new Date(Date.now() + 120_000),
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("allows when an active recovery action is live", async () => {
+      const issue = makeIssue("todo");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: "recovery-1",
+        state: "active",
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("does not guard a no-op in_progress -> in_progress PATCH without run evidence", async () => {
+      const issue = makeIssue("in_progress");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+      );
+    });
+
+    it("still allows a stage changes_requested bounce to in_progress without run evidence", async () => {
+      const policy = await normalizePolicy({
+        stages: [
+          {
+            id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            type: "review",
+            participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+          },
+        ],
+      })!;
+      const issue = {
+        ...makeIssue("in_review"),
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: policy.stages[0].id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+          returnAssignee: { type: "agent", agentId: assigneeId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockRunningReceipt(issue);
+
+      const res = await request(
+        await installActor(createApp(), {
+          type: "agent",
+          agentId: "33333333-3333-4333-8333-333333333333",
+          companyId: "company-1",
+          runId: "run-2",
+        }),
+      )
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", comment: "Needs another pass" });
+
+      expect(res.status).toBe(200);
+      const updateArgs = mockIssueService.update.mock.calls[0];
+      expect(updateArgs?.[0]).toBe(issueId);
+      expect(updateArgs?.[1]).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: assigneeId,
+      });
+    });
+  });
+
+  describe("evaluateIssueContinuationPath (ghost-pass-reporting §2a predicate, SUP-14030)", () => {
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    const emptyEvidence = {
+      activeRun: false,
+      monitorNextCheckAt: null,
+      watchdog: null,
+      scheduledRetry: null,
+      activeRecoveryAction: null,
+      successfulRunHandoff: null,
+      lastActivityAt: null,
+    };
+
+    it("rejects when no disjunct holds and lastActivityAt is absent", () => {
+      const result = evaluateIssueContinuationPath(emptyEvidence, { now });
+      expect(result.ok).toBe(false);
+      expect(result.disjuncts).toEqual({
+        activeRun: false,
+        monitorNextCheckAtInFuture: false,
+        watchdog: false,
+        scheduledRetry: false,
+        activeRecoveryAction: false,
+        successfulRunHandoffLive: false,
+      });
+      expect(result.settledWithinWindow).toBe(false);
+      expect(result.lastActivityAt).toBeNull();
+    });
+
+    it("accepts on the activeRun disjunct alone", () => {
+      const result = evaluateIssueContinuationPath(
+        { ...emptyEvidence, activeRun: true },
+        { now },
+      );
+      expect(result.ok).toBe(true);
+      expect(result.disjuncts.activeRun).toBe(true);
+    });
+
+    it("accepts on a future monitorNextCheckAt (Date or ISO string)", () => {
+      for (const monitorNextCheckAt of [
+        new Date("2026-08-25T12:01:00.000Z"),
+        "2026-08-25T12:01:00.000Z",
+      ]) {
+        const result = evaluateIssueContinuationPath(
+          { ...emptyEvidence, monitorNextCheckAt },
+          { now },
+        );
+        expect(result.ok).toBe(true);
+        expect(result.disjuncts.monitorNextCheckAtInFuture).toBe(true);
+      }
+    });
+
+    it("rejects a monitorNextCheckAt at or before now", () => {
+      for (const monitorNextCheckAt of [
+        new Date("2026-08-25T11:59:59.999Z"),
+        "2026-08-25T12:00:00.000Z",
+      ]) {
+        const result = evaluateIssueContinuationPath(
+          { ...emptyEvidence, monitorNextCheckAt },
+          { now },
+        );
+        expect(result.ok).toBe(false);
+        expect(result.disjuncts.monitorNextCheckAtInFuture).toBe(false);
+      }
+    });
+
+    it("accepts on a live watchdog, scheduled retry, or recovery action", () => {
+      const result = evaluateIssueContinuationPath(
+        { ...emptyEvidence, watchdog: { id: "wd-1" } },
+        { now },
+      );
+      expect(result.ok).toBe(true);
+      expect(result.disjuncts.watchdog).toBe(true);
+
+      const retry = evaluateIssueContinuationPath(
+        { ...emptyEvidence, scheduledRetry: { runId: "run-sched" } },
+        { now },
+      );
+      expect(retry.ok).toBe(true);
+      expect(retry.disjuncts.scheduledRetry).toBe(true);
+
+      const recovery = evaluateIssueContinuationPath(
+        { ...emptyEvidence, activeRecoveryAction: { id: "rec-1" } },
+        { now },
+      );
+      expect(recovery.ok).toBe(true);
+      expect(recovery.disjuncts.activeRecoveryAction).toBe(true);
+    });
+
+    it("accepts a successfulRunHandoff only when hasLiveContinuation is true", () => {
+      const live = evaluateIssueContinuationPath(
+        { ...emptyEvidence, successfulRunHandoff: { hasLiveContinuation: true } },
+        { now },
+      );
+      expect(live.ok).toBe(true);
+      expect(live.disjuncts.successfulRunHandoffLive).toBe(true);
+
+      const stale = evaluateIssueContinuationPath(
+        { ...emptyEvidence, successfulRunHandoff: { hasLiveContinuation: false } },
+        { now },
+      );
+      expect(stale.ok).toBe(false);
+      expect(stale.disjuncts.successfulRunHandoffLive).toBe(false);
+    });
+
+    it("applies the 5-minute settle window against lastActivityAt", () => {
+      // 4m59s ago -> inside the window, accepted even with no disjuncts.
+      const fresh = evaluateIssueContinuationPath(
+        { ...emptyEvidence, lastActivityAt: new Date("2026-08-25T11:55:01.000Z") },
+        { now },
+      );
+      expect(fresh.ok).toBe(true);
+      expect(fresh.settledWithinWindow).toBe(true);
+
+      // Exactly 5 minutes ago -> outside the window (strict <).
+      const boundary = evaluateIssueContinuationPath(
+        { ...emptyEvidence, lastActivityAt: new Date("2026-08-25T11:55:00.000Z") },
+        { now },
+      );
+      expect(boundary.ok).toBe(false);
+      expect(boundary.settledWithinWindow).toBe(false);
+
+      // ISO strings and unparseable values are handled.
+      const freshString = evaluateIssueContinuationPath(
+        { ...emptyEvidence, lastActivityAt: "2026-08-25T11:59:00.000Z" },
+        { now },
+      );
+      expect(freshString.ok).toBe(true);
+
+      const garbage = evaluateIssueContinuationPath(
+        { ...emptyEvidence, lastActivityAt: "not-a-date" },
+        { now },
+      );
+      expect(garbage.ok).toBe(false);
+      expect(garbage.lastActivityAt).toBeNull();
+    });
   });
 });

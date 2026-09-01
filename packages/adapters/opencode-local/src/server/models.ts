@@ -10,6 +10,15 @@ import { isValidOpenCodeModelId } from "../index.js";
 
 const MODELS_CACHE_TTL_MS = 60_000;
 const MODELS_DISCOVERY_TIMEOUT_MS = 20_000;
+// `opencode models` is a lightweight metadata call, but on a shared ollama
+// daemon it can queue behind an in-flight `opencode run` generation on the
+// same host and either time out or fail with an opaque error. Retry a few
+// times with backoff before surfacing a hard failure (SAG-6326/SAG-6336).
+const MODELS_DISCOVERY_RETRY_DELAYS_MS = [2_000, 4_000];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function resolveOpenCodeCommand(input: unknown): string {
   const envOverride =
@@ -132,28 +141,38 @@ export async function discoverOpenCodeModels(input: {
   // Prevent OpenCode from writing an opencode.json into the working directory.
   const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...env, ...(resolvedHome ? { HOME: resolvedHome } : {}), OPENCODE_DISABLE_PROJECT_CONFIG: "true" }));
 
-  const result = await runChildProcess(
-    `opencode-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    command,
-    ["models"],
-    {
-      cwd,
-      env: runtimeEnv,
-      timeoutSec: MODELS_DISCOVERY_TIMEOUT_MS / 1000,
-      graceSec: 3,
-      onLog: async () => {},
-    },
-  );
+  const maxAttempts = MODELS_DISCOVERY_RETRY_DELAYS_MS.length + 1;
+  let lastError: Error | undefined;
 
-  if (result.timedOut) {
-    throw new Error(`\`opencode models\` timed out after ${MODELS_DISCOVERY_TIMEOUT_MS / 1000}s.`);
-  }
-  if ((result.exitCode ?? 1) !== 0) {
-    const detail = firstNonEmptyLine(result.stderr) || firstNonEmptyLine(result.stdout);
-    throw new Error(detail ? `\`opencode models\` failed: ${detail}` : "`opencode models` failed.");
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = await runChildProcess(
+      `opencode-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      command,
+      ["models"],
+      {
+        cwd,
+        env: runtimeEnv,
+        timeoutSec: MODELS_DISCOVERY_TIMEOUT_MS / 1000,
+        graceSec: 3,
+        onLog: async () => {},
+      },
+    );
+
+    if (result.timedOut) {
+      lastError = new Error(`\`opencode models\` timed out after ${MODELS_DISCOVERY_TIMEOUT_MS / 1000}s.`);
+    } else if ((result.exitCode ?? 1) !== 0) {
+      const detail = firstNonEmptyLine(result.stderr) || firstNonEmptyLine(result.stdout);
+      lastError = new Error(detail ? `\`opencode models\` failed: ${detail}` : "`opencode models` failed.");
+    } else {
+      return sortModels(parseOpenCodeModelsOutput(result.stdout));
+    }
+
+    const delayMs = MODELS_DISCOVERY_RETRY_DELAYS_MS[attempt - 1];
+    if (delayMs === undefined) break;
+    await sleep(delayMs);
   }
 
-  return sortModels(parseOpenCodeModelsOutput(result.stdout));
+  throw lastError ?? new Error("`opencode models` failed.");
 }
 
 export async function discoverOpenCodeModelsCached(input: {
@@ -199,19 +218,34 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
     return [{ id: model, label: model }];
   }
 
-  // __PC_OC_MODELVAL_FAILOPEN_PATCHED__ (sectoid TEA fork; reconciled onto 722)
-  let models = await discoverOpenCodeModelsCached({
-    command: input.command,
-    cwd: input.cwd,
-    env: input.env,
-  });
+  let models: AdapterModel[];
+  try {
+    models = await discoverOpenCodeModelsCached({
+      command: input.command,
+      cwd: input.cwd,
+      env: input.env,
+    });
+  } catch (err) {
+    // The availability probe is a best-effort pre-flight guard, not a gate. If
+    // `opencode models` itself cannot run — a transient CLI error, a timeout, a
+    // provider hiccup — do NOT abort the run. The real invocation is
+    // authoritative, so a probe that can't execute must never be fatal.
+    // (Previously this threw and crashed runs mid-flight, discarding the agent's
+    // completed work and its terminal disposition, which then reopened the issue.)
+    console.warn(
+      `[opencode-local] Model availability probe could not run for "${model}" (${
+        err instanceof Error ? err.message : String(err)
+      }); proceeding with the configured model.`,
+    );
+    return [{ id: model, label: model }];
+  }
 
   // Transient-blip resilience: `opencode models` can exit 0 yet omit a
   // registry/auth-backed provider (observed: zai-coding-plan) on a models.dev /
   // OAuth enumeration blip, while statically-configured providers
   // (cloudflare-ai-gateway, ollama) always appear. When the configured model is
-  // missing, re-run discovery UNCACHED (bypassing the ${MODELS_CACHE_TTL_MS}ms
-  // result cache) a bounded number of times before treating it as truly absent.
+  // missing, re-run discovery UNCACHED (bypassing the result cache) a bounded
+  // number of times before treating it as truly absent.
   if (models.length > 0 && !models.some((entry) => entry.id === model)) {
     const retriesRaw = Number.parseInt(
       process.env.PAPERCLIP_OPENCODE_MODEL_VALIDATION_RETRIES ?? "2",
@@ -239,21 +273,19 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
   }
 
   if (models.length === 0) {
-    throw new Error("OpenCode returned no models. Run `opencode models` and verify provider auth.");
+    // The probe ran but returned nothing (e.g. a transient provider-auth blip).
+    // Same reasoning as above: warn, don't block the run.
+    console.warn(
+      `[opencode-local] \`opencode models\` returned no models; proceeding with the configured model "${model}".`,
+    );
+    return [{ id: model, label: model }];
   }
 
   if (!models.some((entry) => entry.id === model)) {
     const sample = models.slice(0, 12).map((entry) => entry.id).join(", ");
-    const tail = models.length > 12 ? ", ..." : "";
-    if (isTruthyEnvFlag(process.env.PAPERCLIP_OPENCODE_STRICT_MODEL_VALIDATION)) {
-      throw new Error(
-        `Configured OpenCode model is unavailable: ${model}. Available models: ${sample}${tail}`,
-      );
-    }
-    console.warn(
-      `[paperclip-opencode] Configured model ${model} not present in \`opencode models\` output after re-discovery; proceeding anyway. Model discovery is unreliable for registry/auth-backed providers (e.g. zai-coding-plan); opencode validates the model at invocation. Available sample: ${sample}${tail}. Set PAPERCLIP_OPENCODE_STRICT_MODEL_VALIDATION=1 to restore the hard-fail.`,
+    throw new Error(
+      `Configured OpenCode model is unavailable: ${model}. Available models: ${sample}${models.length > 12 ? ", ..." : ""}`,
     );
-    return [{ id: model, label: model }];
   }
 
   return models;

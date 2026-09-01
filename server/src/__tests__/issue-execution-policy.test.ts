@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -208,6 +208,63 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
     ).toThrowError("executionPolicy.stages must not be empty");
   });
 
+  // SUP-13925: a monitor-only watcher's stored policy is `{mode, stages: [],
+  // monitor}` by design. The re-arm idiom reads that policy, edits
+  // `monitor.nextCheckAt`, and writes the whole object back — which carries an
+  // explicit `stages: []` and used to 422, leaving a partial `{monitor}` body
+  // as the only working path.
+  function monitorOnlyPolicy() {
+    return normalizeIssueExecutionPolicy({ stages: [], monitor })!;
+  }
+
+  it("allows an explicit empty stages array over an already stage-less stored policy", () => {
+    expect(monitorOnlyPolicy().stages).toEqual([]);
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { mode: "normal", commentRequired: true, stages: [], monitor },
+        currentPolicy: monitorOnlyPolicy(),
+        stagesExplicitlyEmpty: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it("allows the monitor re-arm round-trip that regressed (whole-object write with a new nextCheckAt)", () => {
+    const stored = monitorOnlyPolicy();
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: {
+          ...stored,
+          monitor: { ...stored.monitor, nextCheckAt: "2026-08-26T08:00:00.000Z", maxAttempts: 100 },
+        },
+        currentPolicy: stored,
+        stagesExplicitlyEmpty: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it("grants no capability the partial-body path did not already have", () => {
+    // The permissive branch is safe precisely because omitting `stages`
+    // entirely reaches the identical stored result today. If that ever stops
+    // being true, this test fails and the relaxation must be re-argued.
+    const stored = monitorOnlyPolicy();
+    const whole = { mode: "normal" as const, commentRequired: true, stages: [], monitor };
+    expect(normalizeIssueExecutionPolicy(whole)).toEqual(
+      normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, monitor }),
+    );
+    expect(normalizeIssueExecutionPolicy(whole)!.stages).toEqual(stored.stages);
+  });
+
+  it("still rejects an explicit empty stages array over a policy that HAS stages", () => {
+    // The ADR-029/ADR-072 case. Unchanged by SUP-13925.
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { mode: "normal", commentRequired: true, stages: [], monitor },
+        currentPolicy: reviewOnlyPolicy(),
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy.stages must not be empty");
+  });
+
   it("rejects an explicit null over a non-null stored policy", () => {
     expect(() =>
       assertWrite({ raw: null, currentPolicy: twoStagePolicy() }),
@@ -321,6 +378,41 @@ describe("parseIssueExecutionState", () => {
       lastDecisionOutcome: null,
     });
     expect(state!.skippedStageIds).toEqual([]);
+  });
+
+  it("round-trips deliveryAuthor", () => {
+    // The delivery author is only useful if it survives the read back. zod
+    // strips unknown keys, so a state written with deliveryAuthor but parsed
+    // by a schema that does not declare it would lose the one field that
+    // tells a hand-PATCH delivery apart from a self-review (SUP-13899).
+    const state = parseIssueExecutionState({
+      status: "pending",
+      currentStageId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    expect(state!.deliveryAuthor).toEqual({ type: "agent", agentId: coderAgentId });
+  });
+
+  it("defaults deliveryAuthor to null for a state written before the field existed", () => {
+    const state = parseIssueExecutionState({
+      status: "pending",
+      currentStageId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    expect(state!.deliveryAuthor).toBeNull();
   });
 });
 
@@ -2374,6 +2466,119 @@ describe("issue execution policy transitions", () => {
         }),
       ).toThrow("Monitor bounds are already exhausted");
     });
+
+    describe("stripMonitorFromExecutionPolicy (SUP-14374)", () => {
+      const fullPolicy = () =>
+        normalizeIssueExecutionPolicy({
+          stages: [],
+          monitor: {
+            nextCheckAt: "2026-04-11T12:30:00.000Z",
+            scheduledBy: "assignee",
+          },
+          returnAssigneeAgentId: ctoAgentId,
+          reviewPreset: {
+            id: "low_trust_review",
+            version: 1,
+            rawOutputDisposition: "quarantine",
+          },
+          authorizationPolicy: {
+            trustBoundary: {
+              mode: "low_trust_review",
+              allowedAgentIds: [qaAgentId],
+            },
+          },
+          maxReviewRounds: 3,
+        })!;
+
+      it("removes only the monitor key, preserving every other policy field", () => {
+        const policy = fullPolicy();
+        const stripped = stripMonitorFromExecutionPolicy(policy)!;
+        expect(stripped.monitor).toBeUndefined();
+        expect(stripped.returnAssigneeAgentId).toBe(ctoAgentId);
+        expect(stripped.reviewPreset).toEqual({
+          id: "low_trust_review",
+          version: 1,
+          rawOutputDisposition: "quarantine",
+        });
+        expect(stripped.authorizationPolicy).toEqual({
+          trustBoundary: {
+            mode: "low_trust_review",
+            allowedAgentIds: [qaAgentId],
+          },
+        });
+        expect(stripped.maxReviewRounds).toBe(3);
+        expect(stripped.mode).toBe("normal");
+        expect(stripped.commentRequired).toBe(true);
+        expect(stripped.stages).toEqual([]);
+      });
+
+      it("passes null through as null and returns policies without a monitor unchanged", () => {
+        expect(stripMonitorFromExecutionPolicy(null)).toBeNull();
+        const noMonitor = normalizeIssueExecutionPolicy({
+          stages: [],
+          returnAssigneeAgentId: ctoAgentId,
+        })!;
+        expect(stripMonitorFromExecutionPolicy(noMonitor)).toBe(noMonitor);
+      });
+    });
+
+    it("monitor fire preserves executionPolicy fields (buildIssueMonitorTriggeredPatch, SUP-14374)", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+        },
+        returnAssigneeAgentId: ctoAgentId,
+        reviewPreset: {
+          id: "low_trust_review",
+          version: 1,
+          rawOutputDisposition: "quarantine",
+        },
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: "low_trust_review",
+            allowedAgentIds: [qaAgentId],
+          },
+        },
+        maxReviewRounds: 2,
+      })!;
+
+      const patch = buildIssueMonitorTriggeredPatch({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+          monitorAttemptCount: 0,
+          monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        policy,
+        triggeredAt: new Date("2026-04-11T12:35:00.000Z"),
+      });
+
+      expect(patch.monitorLastTriggeredAt).toEqual(new Date("2026-04-11T12:35:00.000Z"));
+      expect(patch.monitorAttemptCount).toBe(1);
+      const firedPolicy = patch.executionPolicy as Record<string, unknown>;
+      expect(firedPolicy.monitor).toBeUndefined();
+      expect(firedPolicy.returnAssigneeAgentId).toBe(ctoAgentId);
+      expect(firedPolicy.reviewPreset).toEqual({
+        id: "low_trust_review",
+        version: 1,
+        rawOutputDisposition: "quarantine",
+      });
+      expect(firedPolicy.authorizationPolicy).toEqual({
+        trustBoundary: {
+          mode: "low_trust_review",
+          allowedAgentIds: [qaAgentId],
+        },
+      });
+      expect(firedPolicy.maxReviewRounds).toBe(2);
+    });
   });
 
   describe("returnAssigneeAgentId routing", () => {
@@ -3011,6 +3216,249 @@ describe("review round circuit breaker", () => {
       status: "pending",
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
+    });
+  });
+});
+
+describe("delivery author record (SUP-13899)", () => {
+  it("records the delivering author distinctly from the review participant on a hand-PATCH delivery", () => {
+    const policy = reviewOnlyPolicy();
+    // External-lane shape: the delivery author (coder) is still the issue
+    // assignee when the hand PATCH moves the issue to in_review; no explicit
+    // assignee write accompanies it.
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: null,
+    });
+
+    // The recorded shape a gate reads back: the issue assignee is the review
+    // participant, but the delivery author is recorded separately, so
+    // participant == assignee no longer reads as a self-approved stage.
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("still fails loud when the only review participant is the delivering author", () => {
+    const selfGatedPolicy = makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
+    ]);
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: selfGatedPolicy,
+          executionState: null,
+        },
+        policy: selfGatedPolicy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: null,
+      }),
+    ).toThrow(/No eligible review participant/);
+  });
+
+  it("carries deliveryAuthor forward through the review decision into the completed state", () => {
+    const policy = twoStagePolicy();
+    const reviewStageId = policy.stages[0].id;
+
+    const delivered = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: null,
+    });
+
+    const reviewed = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: delivered.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "QA signoff complete",
+    });
+    expect(reviewed.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageType: "approval",
+      completedStageIds: [reviewStageId],
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+
+    const completed = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: ctoUserId,
+        executionPolicy: policy,
+        executionState: reviewed.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { userId: ctoUserId },
+      commentBody: "Ship it",
+    });
+
+    expect(completed.patch.executionState).toMatchObject({
+      status: "completed",
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("updates deliveryAuthor on re-delivery after changes_requested", () => {
+    const policy = reviewOnlyPolicy();
+    const reviewStageId = policy.stages[0].id;
+
+    const bounced = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          deliveryAuthor: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Round one feedback",
+    });
+    expect(bounced.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+
+    const reDelivered = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: bounced.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: null,
+    });
+    expect(reDelivered.patch.executionState).toMatchObject({
+      status: "pending",
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("records the assignee of record at re-delivery when the issue was handed off mid-bounce", () => {
+    const policy = reviewOnlyPolicy();
+    const reviewStageId = policy.stages[0].id;
+
+    const bounced = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          deliveryAuthor: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Round one feedback",
+    });
+
+    // A plain handoff (no stage transition) leaves the recorded state — and
+    // its delivery author — untouched.
+    const handoff = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: bounced.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: { assigneeAgentId: ctoAgentId },
+      actor: { userId: boardUserId },
+      commentBody: null,
+    });
+    expect(handoff.patch.executionState).toBeUndefined();
+
+    const reDelivered = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: ctoAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: bounced.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: ctoAgentId },
+      commentBody: null,
+    });
+    // The handoff agent is now the delivery author while the return assignee
+    // still points at the original author — the two are recorded distinctly.
+    expect(reDelivered.patch.executionState).toMatchObject({
+      status: "pending",
+      deliveryAuthor: { type: "agent", agentId: ctoAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
     });
   });
 });

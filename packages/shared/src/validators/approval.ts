@@ -9,9 +9,9 @@ import { multilineTextSchema } from "./text.js";
  */
 export const createApprovalObjectSchema = z.object({
   type: z.enum(APPROVAL_TYPES),
-  requestedByAgentId: z.string().uuid().optional().nullable(),
+  requestedByAgentId: z.string().guid().optional().nullable(),
   payload: z.record(z.string(), z.unknown()),
-  issueIds: z.array(z.string().uuid()).optional(),
+  issueIds: z.array(z.string().guid()).optional(),
 });
 
 /** Issue-gating approval types must be created with at least one linked issue. */

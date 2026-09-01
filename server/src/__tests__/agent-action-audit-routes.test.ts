@@ -10,6 +10,7 @@ import {
   companyMemberships,
   createDb,
   documents,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueDocuments,
@@ -53,6 +54,7 @@ describePostgres("agent action audit routes", () => {
     await db.delete(issueComments);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);

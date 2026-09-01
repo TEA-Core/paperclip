@@ -1,6 +1,13 @@
-name: Fold deploy gate
+name: Fold buildability gate
 
 # TEA-Core fork only.
+#
+# NOTICE (SUP-14706): this workflow does NOT deploy. It does not build an
+# image for the plane, does not publish one, and does not roll the running
+# container. A green run here only proves the merged branch is buildable.
+# It was renamed from "Fold deploy gate" because that name read like a deploy.
+# The real fold-merge-to-running-container path is operator-pressed; see
+# docs/deploy/control-plane-rollout.md for the runbook and liveness check.
 #
 # `pr.yml` gates pull requests. This gates the *merged* state of the deployed
 # line, which is a different failure mode and the one that actually bit us:
@@ -30,7 +37,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: fold-deploy-gate-${{ github.ref }}
+  group: fold-buildability-gate-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

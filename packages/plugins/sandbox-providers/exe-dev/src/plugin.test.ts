@@ -168,6 +168,7 @@ describe("exe.dev sandbox provider plugin", () => {
 
   describe("sshPrivateKey validation", () => {
     const VALID_OPENSSH = [
+      // paperclip:allow-security secret-literal: throwaway key pair generated for this fixture, never used anywhere
       "-----BEGIN OPENSSH PRIVATE KEY-----",
       "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt",
       "ZWQyNTUxOQAAACBPzMxQp4Y6XCfDV2t6oWmqHkKx0K7C7w7q9F6gQ3jPbgAAAJjJ8jjE",
@@ -177,6 +178,7 @@ describe("exe.dev sandbox provider plugin", () => {
       "-----END OPENSSH PRIVATE KEY-----",
     ].join("\n");
     const VALID_RSA_PEM = [
+      // paperclip:allow-security secret-literal: throwaway key pair generated for this fixture, never used anywhere
       "-----BEGIN RSA PRIVATE KEY-----",
       "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu",
       "KUpRKfFLfRYC9AIKjbJTWit+CqvjWYzvQwECAwEAAQJAIJLixBy2qpFoS4DSmoEm",
@@ -244,6 +246,7 @@ describe("exe.dev sandbox provider plugin", () => {
 
     it("rejects a body with non-base64 characters", () => {
       const garbled = [
+        // paperclip:allow-security secret-literal: throwaway key pair generated for this fixture, never used anywhere
         "-----BEGIN OPENSSH PRIVATE KEY-----",
         "this is not base64!!",
         "-----END OPENSSH PRIVATE KEY-----",
@@ -253,6 +256,7 @@ describe("exe.dev sandbox provider plugin", () => {
 
     it("rejects a header/footer label mismatch", () => {
       const mismatched = [
+        // paperclip:allow-security secret-literal: throwaway key pair generated for this fixture, never used anywhere
         "-----BEGIN OPENSSH PRIVATE KEY-----",
         "Zm9vYmFy",
         "-----END RSA PRIVATE KEY-----",
@@ -372,7 +376,9 @@ describe("exe.dev sandbox provider plugin", () => {
 
     const body = String(fetchMock.mock.calls[0]?.[1]?.body ?? "");
     expect(body).toContain("--setup-script=");
-    expect(body).toContain("nodesource.com/setup_20.x");
+    expect(body).toContain("process.versions.node");
+    expect(body).toContain("v[0]>24||(v[0]===24&&v[1]>=11)");
+    expect(body).toContain("nodesource.com/setup_24.x");
     expect(body).toContain("sudo apt-get install -y nodejs");
   });
 
@@ -425,7 +431,7 @@ describe("exe.dev sandbox provider plugin", () => {
     await acquirePromise?.catch((error: Error) => {
       // Operator did not supply a setupScript, so the visible default install
       // is not a secret and stays in the error for debuggability.
-      expect(error.message).toContain("nodesource.com/setup_20.x");
+      expect(error.message).toContain("nodesource.com/setup_24.x");
       expect(error.message).not.toContain("[REDACTED]");
     });
   });

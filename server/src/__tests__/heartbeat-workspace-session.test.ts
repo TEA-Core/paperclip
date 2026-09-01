@@ -30,6 +30,7 @@ import {
   provisionExecutionWorkspaceForFreshnessDecision,
   readRuntimeStateSessionParams,
   reconcileReusedExecutionWorkspaceProjectWorkspaceId,
+  resolveExecutionWorkspaceBranchOwnership,
   resolveExecutionWorkspaceConfigFreshness,
   readExecutionWorkspaceOccupancyDeferrals,
   resolveExecutionWorkspaceOccupancyDecision,
@@ -1346,11 +1347,54 @@ describe("applyPersistedExecutionWorkspaceConfig", () => {
 });
 
 describe("mergeExecutionWorkspaceMetadataForPersistence", () => {
+  it("persists branch ownership independently of fresh worktree creation", () => {
+    const executionWorkspace = {
+      created: true,
+      branchCreatedByRuntime: false,
+    };
+
+    const metadata = mergeExecutionWorkspaceMetadataForPersistence({
+      existingMetadata: null,
+      source: "task_session",
+      createdByRuntime: resolveExecutionWorkspaceBranchOwnership(executionWorkspace),
+      strategyType: "git_worktree",
+      configSnapshot: null,
+      shouldReuseExisting: false,
+      baseRef: "origin/main",
+      baseRefSha: null,
+    });
+
+    expect(metadata.createdByRuntime).toBe(false);
+    expect(metadata.gitBranchOwnershipVersion).toBe(1);
+  });
+
+  it("does not downgrade recorded runtime ownership after worktree reuse", () => {
+    const executionWorkspace = {
+      created: false,
+      branchCreatedByRuntime: true,
+    };
+
+    const metadata = mergeExecutionWorkspaceMetadataForPersistence({
+      existingMetadata: { createdByRuntime: true },
+      source: "task_session",
+      createdByRuntime: resolveExecutionWorkspaceBranchOwnership(executionWorkspace),
+      strategyType: "git_worktree",
+      configSnapshot: null,
+      shouldReuseExisting: false,
+      baseRef: "origin/main",
+      baseRefSha: null,
+    });
+
+    expect(metadata.createdByRuntime).toBe(true);
+    expect(metadata.gitBranchOwnershipVersion).toBe(1);
+  });
+
   it("merges config snapshot for newly realized workspaces", () => {
     expect(mergeExecutionWorkspaceMetadataForPersistence({
       existingMetadata: null,
       source: "task_session",
       createdByRuntime: true,
+      strategyType: "project_primary",
       configSnapshot: {
         environmentId: "env-new",
         provisionCommand: "bash ./scripts/provision.sh",
@@ -1384,6 +1428,7 @@ describe("mergeExecutionWorkspaceMetadataForPersistence", () => {
       },
       source: "task_session",
       createdByRuntime: false,
+      strategyType: "project_primary",
       configSnapshot: {
         environmentId: "env-new",
         provisionCommand: "bash ./scripts/new-provision.sh",
@@ -1406,6 +1451,7 @@ describe("mergeExecutionWorkspaceMetadataForPersistence", () => {
       existingMetadata: null,
       source: "task_session",
       createdByRuntime: true,
+      strategyType: "project_primary",
       configSnapshot: null,
       shouldReuseExisting: false,
       baseRef: "origin/main",
@@ -1531,6 +1577,7 @@ describe("effective run execution workspace config freshness", () => {
       },
       source: "task_session",
       createdByRuntime: false,
+      strategyType: "project_primary",
       configSnapshot: {
         workspaceRuntime: {
           services: [{ name: "web", command: "pnpm dev -- --host 0.0.0.0", port: 3200 }],
@@ -1662,6 +1709,7 @@ describe("effective run execution workspace config freshness", () => {
       },
       source: "task_session",
       createdByRuntime: false,
+      strategyType: "project_primary",
       configSnapshot: {
         provisionCommand: "pnpm install --frozen-lockfile",
       },
@@ -1877,6 +1925,69 @@ describe("effective run execution workspace config freshness", () => {
     expect(reuseRequest.bindingUnrestorable).toBe(false);
     expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(true);
     expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+  });
+
+  it.each([
+    { name: "a different branch", branchName: "PAP-9001-derived-child-branch" },
+    { name: "no recorded branch", branchName: null },
+  ])(
+    "realizes the pinned existing branch instead of reusing an inherited workspace on $name",
+    async ({ branchName }) => {
+      const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+        issueExecutionWorkspaceId: "workspace-old",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: "active",
+        requestedExistingBranch: "PAP-14380-salvage-pap-9514",
+        existingExecutionWorkspaceBranchName: branchName,
+      });
+
+      expect(reuseRequest).toEqual({
+        requestedExecutionWorkspaceId: "workspace-old",
+        requestedShouldReuseExisting: false,
+        existingExecutionWorkspaceAvailable: false,
+        // Fork-only field: a pinned-branch mismatch is a deliberate re-realize,
+        // not an unrestorable binding.
+        bindingUnrestorable: false,
+      });
+
+      const metadata = buildWorkspaceConfigMetadata();
+      const decision = resolveExecutionWorkspaceConfigFreshness({
+        hasExistingWorkspace: false,
+        existingWorkspaceMetadata: null,
+        nextMetadata: metadata,
+      });
+      const realizeWorkspace = vi.fn(async () => ({ id: "pinned-branch-workspace", warnings: [] }));
+      const restoreExistingWorkspace = vi.fn(async () => ({ id: "workspace-old", warnings: [] }));
+
+      const result = await provisionExecutionWorkspaceForFreshnessDecision({
+        requestedShouldReuseExisting: reuseRequest.requestedShouldReuseExisting,
+        existingExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
+        issueRef: { id: "issue-1", identifier: "PAP-42" },
+        runId: "run-1",
+        workspaceConfigFreshness: decision,
+        restoreExistingWorkspace,
+        realizeWorkspace,
+      });
+
+      expect(result.executionWorkspace).toEqual({ id: "pinned-branch-workspace", warnings: [] });
+      expect(result.reusedExecutionWorkspace).toBeNull();
+      expect(restoreExistingWorkspace).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps reusing an inherited workspace whose branch matches the pinned existing branch", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      requestedExistingBranch: "PAP-14380-salvage-pap-9514",
+      existingExecutionWorkspaceBranchName: "PAP-14380-salvage-pap-9514",
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-old",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+      bindingUnrestorable: false,
+    });
   });
 
   it("fails loudly when explicit reuse restore returns no workspace", async () => {
@@ -2097,16 +2208,16 @@ describe("shouldResetTaskSessionForWake", () => {
     expect(shouldResetTaskSessionForWake({ wakeReason: "issue_assigned" })).toBe(true);
   });
 
-  it("resets session context on execution review wakes", () => {
-    expect(shouldResetTaskSessionForWake({ wakeReason: "execution_review_requested" })).toBe(true);
+  it("preserves session context on execution review handoff wakes", () => {
+    expect(shouldResetTaskSessionForWake({ wakeReason: "execution_review_requested" })).toBe(false);
   });
 
   it("resets session context on execution approval wakes", () => {
     expect(shouldResetTaskSessionForWake({ wakeReason: "execution_approval_requested" })).toBe(true);
   });
 
-  it("resets session context on execution changes-requested wakes", () => {
-    expect(shouldResetTaskSessionForWake({ wakeReason: "execution_changes_requested" })).toBe(true);
+  it("preserves session context on execution changes-requested handoff wakes", () => {
+    expect(shouldResetTaskSessionForWake({ wakeReason: "execution_changes_requested" })).toBe(false);
   });
 
   it("preserves session context on timer heartbeats", () => {
@@ -2374,6 +2485,57 @@ describe("effective run session config freshness", () => {
     expect(decision.reset).toBe(false);
     expect(decision.changedCategories).toEqual([]);
     expect(decision.reasons).toEqual([]);
+  });
+
+  it("does not reset for issue comment timestamps but still resets for workspace settings", async () => {
+    const base = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "agent_default",
+        effectiveMode: "agent_default",
+        issueConfigRevisionAt: "2026-06-01T00:00:00.000Z",
+        issueSettings: null,
+      },
+    });
+    const commentOnly = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "agent_default",
+        effectiveMode: "agent_default",
+        issueConfigRevisionAt: "2026-06-01T00:05:00.000Z",
+        issueSettings: null,
+      },
+    });
+    const workspaceChanged = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "isolated_workspace",
+        effectiveMode: "isolated_workspace",
+        issueConfigRevisionAt: "2026-06-01T00:05:00.000Z",
+        issueSettings: { mode: "isolated_workspace" },
+      },
+    });
+
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: commentOnly,
+      }),
+    ).toMatchObject({
+      reset: false,
+      changedCategories: [],
+      reasons: [],
+    });
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: workspaceChanged,
+      }),
+    ).toMatchObject({
+      reset: true,
+      changedCategories: ["workspaceConfig"],
+    });
   });
 
   it("still rotates the session when a non-model adapter config key changes", async () => {

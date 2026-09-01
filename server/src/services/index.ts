@@ -23,6 +23,7 @@ export {
 export { agentInstructionsService, syncInstructionsBundleConfigFromFilePath } from "./agent-instructions.js";
 export { assetService } from "./assets.js";
 export { documentService, extractLegacyPlanBody } from "./documents.js";
+export { artifactReviewDocumentService } from "./artifact-review-documents.js";
 export { statusCardService } from "./status-cards.js";
 export { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 export { documentAnnotationService } from "./document-annotations.js";
@@ -76,6 +77,30 @@ export { attentionService } from "./attention.js";
 export { captureDecisionSnapshot, decisionTrainingService } from "./decision-training.js";
 export { decisionService } from "./decisions.js";
 export { decisionRetentionService } from "./decision-retention.js";
+export {
+  createCarrierPromotionSweepService,
+  type CarrierPromotionSweepOptions,
+  type CarrierPromotionSweepResult,
+} from "./carrier-promotion-sweep.js";
+export {
+  CARRIER_ORPHAN_JANITOR_ACTOR_ID,
+  CARRIER_ORPHAN_JANITOR_CLOSED_ACTION,
+  closeGitHubPullRequest,
+  createCarrierOrphanJanitorService,
+  deleteGitHubBranch,
+  fetchGitHubPullRequestState,
+  type CarrierOrphanJanitorOptions,
+  type CarrierOrphanJanitorSweepResult,
+} from "./carrier-orphan-janitor.js";
+export {
+  CARRIER_STRANDED_SURFACE_ACTOR_ID,
+  CARRIER_STRANDED_SURFACE_ACTION,
+  buildStrandedCardDescription,
+  buildStrandedCardTitle,
+  createCarrierStrandedSurfaceService,
+  type CarrierStrandedSurfaceOptions,
+  type CarrierStrandedSurfaceSweepResult,
+} from "./carrier-stranded-surface.js";
 export {
   createDoneCloseLandingBackstopService,
   type DoneCloseLandingBackstopOptions,
@@ -164,7 +189,23 @@ export {
 } from "./environment-custom-image-terminal-sessions.js";
 export { executionWorkspaceService } from "./execution-workspaces.js";
 export { workspaceOperationService } from "./workspace-operations.js";
+export {
+  workspaceRuntimeLeaseService,
+  buildWorkspaceRuntimeLeaseOwnerKey,
+  LEASED_WORKSPACE_RUNTIME_ACTIONS,
+  WORKSPACE_RUNTIME_ELIGIBLE_ISSUE_STATUSES,
+  WORKSPACE_RUNTIME_LEASE_TTL_MS,
+  type WorkspaceRuntimeLeaseClaim,
+  type WorkspaceRuntimeLeaseOwner,
+  type WorkspaceRuntimeLeaseService,
+} from "./workspace-runtime-leases.js";
 export { workspaceFileResourceService } from "./workspace-file-resources.js";
+export {
+  createWorkspaceGitOperationScheduler,
+  getWorkspaceGitOperationSchedulerSnapshot,
+  workspaceGitOperationScheduler,
+  type WorkspaceGitSchedulerSnapshot,
+} from "./workspace-git-operation-scheduler.js";
 export { workProductService } from "./work-products.js";
 export {
   logActivity,

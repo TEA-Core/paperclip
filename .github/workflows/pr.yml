@@ -147,6 +147,32 @@ jobs:
       - name: Reject git push in adapter/runtime code
         run: node ./scripts/check-no-git-push.mjs
 
+      - name: PR security gate
+        # Replaces upstream's `.github/scripts/check-pr-security.mjs`, deleted in
+        # paperclipai/paperclip#11828. That gate filed a GitHub draft security
+        # advisory per PR and posted a deliberately non-blocking `neutral` check
+        # run, so its findings went to a queue nobody read: 1,566 bot-authored
+        # drafts against ~99 human-reported ones.
+        #
+        # The sink is what changed. This runs in the `policy` job, which every
+        # required check transitively needs, so a blocking finding fails
+        # `verify` and the merge queue ejects the entry. Non-blocking findings
+        # become inline annotations on the PR diff plus a job-summary table.
+        #
+        # Deliberately NOT gated on `github.event_name == 'pull_request'` like
+        # the lockfile guards above. Those bind on facts a queue entry cannot
+        # change; this one binds on the diff content, which is exactly what the
+        # queue re-tests against the real post-merge state. BASE_SHA/HEAD_SHA
+        # resolve both payload shapes at the job level, and the checkout above
+        # uses fetch-depth: 0, so the merge base is present in either event.
+        run: node ./scripts/check-pr-security.mjs
+
+      - name: Test PR security gate
+        run: node --test ./scripts/check-pr-security.test.mjs
+
+      - name: Test PR security gate wiring
+        run: node --test ./scripts/__tests__/pr-security-gate.test.mjs
+
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 
@@ -183,6 +209,9 @@ jobs:
       - name: Test agent spawn shim invariants
         run: node --test ./scripts/__tests__/agent-spawn-shim.test.mjs
 
+      - name: Test worktree uid partition probe wiring
+        run: node --test ./scripts/__tests__/worktree-uid-partition.test.mjs
+
       - name: Test /app runtime tree ownership invariants
         run: node --test ./scripts/__tests__/dockerfile-app-root-owned.test.mjs
 
@@ -200,6 +229,15 @@ jobs:
 
       - name: Test CI lockfile drift handling
         run: node --test ./scripts/__tests__/ci-lockfile-drift.test.mjs
+
+      - name: Test provisioner instance id canonical form
+        run: node --test ./scripts/__tests__/provision-worktree-instance-id.test.mjs
+
+      - name: Test worktree provisioning fallback ladder
+        run: node --test ./scripts/__tests__/provision-worktree-self-heal.test.mjs
+
+      - name: Test provisioner instance id reuse
+        run: node --test ./scripts/__tests__/provision-worktree-instance-id-reuse.test.mjs
 
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
@@ -377,10 +415,13 @@ jobs:
           fi
 
   verify:
-    # Preserve the legacy required-check name while the underlying work runs in parallel.
+    # Preserve the legacy required-check name while the underlying work runs in
+    # parallel. `if: always()` makes this aggregation job run even when a lane
+    # fails, so the assertions below are what turn a red lane into a red
+    # `verify` (the ruleset's required context) instead of letting it merge.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, general_tests, build]
+    needs: [typecheck_release_registry, general_tests, build, verify_serialized_server, canary_dry_run]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -390,10 +431,14 @@ jobs:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
+          CANARY_DRY_RUN_RESULT: ${{ needs.canary_dry_run.result }}
         run: |
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
+          test "$VERIFY_SERIALIZED_SERVER_RESULT" = "success"
+          test "$CANARY_DRY_RUN_RESULT" = "success"
 
   build:
     name: Build
@@ -491,6 +536,64 @@ jobs:
 
       - name: Run serialized server test shard
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
+
+  worktree_uid_partition:
+    # Two-real-uid regression probe for the uid-scoped worktree state partition
+    # (SUP-14127, SUP-14126 ruling item 4). This is the merge precondition for
+    # the uid-scoped worktree-state cluster: on any PR touching the resolution
+    # / state code it runs the worktree state-dir resolution under two distinct
+    # real uids (1000 + 1001 via setpriv) and asserts the 0o600 partition holds
+    # in BOTH uid directions (real EACCES, own scoped-dir resolution, no
+    # mutation of the other uid's files). The probe is RED against the current
+    # canonical-only fold head and GREEN once the uid-scoped resolution lands —
+    # that red-then-green is the regression gate. It deliberately does not join
+    # the `verify` aggregate so non-cluster PRs are unaffected; the gate binds
+    # on the cluster PRs that touch these paths.
+    name: Worktree UID partition probe
+    needs: [policy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # The path gate diffs BASE_SHA...HEAD_SHA, so the base commit must
+          # actually exist in the checkout like it does for the policy job.
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Restore regenerated PR lockfile (when policy regenerated one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
+        uses: actions/download-artifact@v8
+        with:
+          name: pr-lockfile
+          path: .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run two-real-uid worktree state partition probe
+        run: |
+          changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+          if ! printf '%s\n' "$changed" | grep -qE 'dev-runner-worktree\.ts|worktree-config\.ts|provision-worktree\.sh'; then
+            echo "No uid-scoped worktree-state files changed on this PR — probe not applicable."
+            exit 0
+          fi
+          bash ./scripts/probe-worktree-uid-partition.sh
 
   canary_dry_run:
     name: Canary Dry Run

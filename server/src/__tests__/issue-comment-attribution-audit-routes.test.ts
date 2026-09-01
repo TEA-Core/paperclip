@@ -10,6 +10,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
@@ -65,6 +66,7 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(issueComments);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(companyMemberships);

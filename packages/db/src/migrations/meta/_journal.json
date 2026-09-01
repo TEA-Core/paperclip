@@ -1527,6 +1527,167 @@
       "when": 1785930077830,
       "tag": "0219_secrets_directory_observations",
       "breakpoints": true
+    },
+    {
+      "idx": 218,
+      "version": "7",
+      "when": 1787780637406,
+      "tag": "0220_billing_event_agent_delete_set_null",
+      "breakpoints": true
+    },
+    {
+      "idx": 219,
+      "version": "7",
+      "when": 1787780638406,
+      "tag": "0221_heartbeat_ctx_paperclip_issue_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 220,
+      "version": "7",
+      "when": 1787953983365,
+      "tag": "0222_agent_delete_fk_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 221,
+      "version": "7",
+      "when": 1788040950632,
+      "tag": "0223_agent_delete_fk_policies_validate",
+      "breakpoints": true
+    },
+    {
+      "idx": 222,
+      "version": "7",
+      "when": 1788040951632,
+      "tag": "0224_onboarding_first_task_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 223,
+      "version": "7",
+      "when": 1788040952632,
+      "tag": "0225_complete_mystique",
+      "breakpoints": true
+    },
+    {
+      "idx": 224,
+      "version": "7",
+      "when": 1788040953632,
+      "tag": "0226_lively_lord_tyger",
+      "breakpoints": true
+    },
+    {
+      "idx": 225,
+      "version": "7",
+      "when": 1788040954632,
+      "tag": "0227_flat_daimon_hellstrom",
+      "breakpoints": true
+    },
+    {
+      "idx": 226,
+      "version": "7",
+      "when": 1788040955632,
+      "tag": "0228_company_onboarding_seeds",
+      "breakpoints": true
+    },
+    {
+      "idx": 227,
+      "version": "7",
+      "when": 1788040956632,
+      "tag": "0229_yielding_starbolt",
+      "breakpoints": true
+    },
+    {
+      "idx": 228,
+      "version": "7",
+      "when": 1788040957632,
+      "tag": "0230_mushy_jack_murdock",
+      "breakpoints": true
+    },
+    {
+      "idx": 229,
+      "version": "7",
+      "when": 1788040958632,
+      "tag": "0231_runtime_service_exposure",
+      "breakpoints": true
+    },
+    {
+      "idx": 230,
+      "version": "7",
+      "when": 1788040959632,
+      "tag": "0232_execution_workspace_runtime_leases",
+      "breakpoints": true
+    },
+    {
+      "idx": 231,
+      "version": "7",
+      "when": 1788040960632,
+      "tag": "0233_swift_justin_hammer",
+      "breakpoints": true
+    },
+    {
+      "idx": 232,
+      "version": "7",
+      "when": 1788040961632,
+      "tag": "0234_orphan_cleanup_env_reference_survives_delete",
+      "breakpoints": true
+    },
+    {
+      "idx": 233,
+      "version": "7",
+      "when": 1788040962632,
+      "tag": "0235_robust_zaladane",
+      "breakpoints": true
+    },
+    {
+      "idx": 234,
+      "version": "7",
+      "when": 1788040963632,
+      "tag": "0236_unified_adapter_auth_sessions",
+      "breakpoints": true
+    },
+    {
+      "idx": 235,
+      "version": "7",
+      "when": 1788040964632,
+      "tag": "0237_drop_claude_setup_token_sessions",
+      "breakpoints": true
+    },
+    {
+      "idx": 236,
+      "version": "7",
+      "when": 1788040965632,
+      "tag": "0238_tan_colossus",
+      "breakpoints": true
+    },
+    {
+      "idx": 237,
+      "version": "7",
+      "when": 1788040966632,
+      "tag": "0239_modern_pandemic",
+      "breakpoints": true
+    },
+    {
+      "idx": 238,
+      "version": "7",
+      "when": 1788040967632,
+      "tag": "0240_nasty_grim_reaper",
+      "breakpoints": true
+    },
+    {
+      "idx": 239,
+      "version": "7",
+      "when": 1788040968632,
+      "tag": "0241_drop_company_brand_color_and_attachment_max_bytes",
+      "breakpoints": true
+    },
+    {
+      "idx": 240,
+      "version": "7",
+      "when": 1788040969632,
+      "tag": "0242_better_auth_account_issuer",
+      "breakpoints": true
     }
   ]
 }

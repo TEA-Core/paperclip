@@ -11,6 +11,7 @@ import {
   createDb,
   documentRevisions,
   documents,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
   issueComments,
@@ -90,6 +91,7 @@ describeEmbeddedPostgres("status card routes", () => {
     await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(instanceSettings);
     await db.delete(agents);

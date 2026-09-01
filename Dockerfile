@@ -1,14 +1,16 @@
 # syntax=docker/dockerfile:1.20
-FROM node:22-trixie-slim AS base
+FROM node:24-trixie-slim AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 \
-  # libcap2-bin provides capsh, which the entrypoint uses to hand the server an
-  # ambient CAP_KILL when the agent-uid split is armed — without it the server
-  # cannot signal the agent uid and every run timeout dies with EPERM. It is
-  # currently pulled in transitively by the base image; name it explicitly so a
-  # base bump cannot silently remove it.
+  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 tini \
+  # libcap2-bin provides capsh, which the entrypoint uses to hand the server
+  # ambient CAP_KILL and CAP_FOWNER when the agent-uid split is armed — without
+  # CAP_KILL the server cannot signal the agent uid (every run timeout dies
+  # with EPERM); without CAP_FOWNER it cannot chmod agent-owned files in mixed
+  # worktrees and pnpm linkBin aborts provisioning (SUP-13977). It is currently
+  # pulled in transitively by the base image; name it explicitly so a base bump
+  # cannot silently remove it.
   && apt-get install -y --no-install-recommends libcap2-bin \
   # Agents run as an unprivileged user with no sudo, so anything they need at
   # runtime has to be baked in here — they cannot apt-get install it themselves.
@@ -48,7 +50,9 @@ COPY packages/adapter-utils/package.json packages/adapter-utils/
 COPY packages/google-sheets-mcp-server/package.json packages/google-sheets-mcp-server/
 COPY packages/kv-demo-mcp-server/package.json packages/kv-demo-mcp-server/
 COPY packages/mcp-server/package.json packages/mcp-server/
+COPY packages/paperclip-runner/package.json packages/paperclip-runner/
 COPY packages/skills-catalog/package.json packages/skills-catalog/
+COPY packages/tailscale-https-broker/package.json packages/tailscale-https-broker/
 COPY packages/teams-catalog/package.json packages/teams-catalog/
 COPY packages/adapters/claude-local/package.json packages/adapters/claude-local/
 COPY packages/adapters/codex-local/package.json packages/adapters/codex-local/
@@ -56,6 +60,7 @@ COPY packages/adapters/cursor-cloud/package.json packages/adapters/cursor-cloud/
 COPY packages/adapters/cursor-local/package.json packages/adapters/cursor-local/
 COPY packages/adapters/gemini-local/package.json packages/adapters/gemini-local/
 COPY packages/adapters/grok-local/package.json packages/adapters/grok-local/
+COPY packages/adapters/kimi-local/package.json packages/adapters/kimi-local/
 COPY packages/adapters/hermes/package.json packages/adapters/hermes/
 COPY packages/adapters/hermes-gateway/package.json packages/adapters/hermes-gateway/
 COPY packages/adapters/openclaw-gateway/package.json packages/adapters/openclaw-gateway/
@@ -73,10 +78,22 @@ RUN pnpm install --frozen-lockfile
 
 FROM base AS build
 WORKDIR /app
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends cargo rustc \
+  && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app /app
 COPY . .
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
+# The server build runs scripts/write-build-stamp.mjs, which stamps the built
+# commit into dist/build-info.json. The build context has no .git, so the
+# script reads PAPERCLIP_BUILD_COMMIT instead. Docker exposes an ARG to the
+# next RUN as an environment variable, so declare it here — in the build
+# stage — before the server build. The production stage below declares the
+# same ARG again for the runtime fallback; an ARG goes out of scope at the
+# end of its stage. Empty for local `docker build`, which then writes no stamp.
+ARG PAPERCLIP_BUILD_COMMIT=""
+ENV NODE_OPTIONS=--max-old-space-size=4096
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 # Bundled plugins declare their entrypoints as build outputs under a gitignored dist/.
@@ -161,6 +178,7 @@ RUN node -e '\
   proc.stdin.write("\n"); \
   proc.stdin.end(); \
 '
+RUN rm -rf packages/paperclip-runner/runner/target
 
 FROM base AS production
 ARG USER_UID=1000
@@ -184,7 +202,7 @@ WORKDIR /app
 # never hit the layer cache and rebuilds on every build. The two `--from=build`
 # copies this fork used to open with now sit after the entrypoint, below.
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
-  && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest supabase@latest \
+  && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest supabase@latest @moonshot-ai/kimi-code@latest \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
   # Chromium shared libraries. Playwright downloads its browsers into
@@ -222,6 +240,30 @@ RUN mkdir -p /opt/blacksmith/bin \
   # self-update rewrites the target in place, so the link keeps resolving.
   && ln -sf /opt/blacksmith/bin/blacksmith /usr/local/bin/blacksmith \
   && /opt/blacksmith/bin/blacksmith --version
+
+# CodeRabbit CLI — `coderabbit review --agent` emits NDJSON findings a QA agent
+# can consume. NOT an npm package: `@coderabbitai/cli` does not exist on the
+# registry (404), so the only supported install is the vendor script, which
+# fetches a ~100MB self-contained binary for the build platform. The script
+# resolves linux x64 and arm64 from `uname -m`, so this layer stays correct for
+# the tagged multi-arch build.
+#
+# Same node-owned-prefix reasoning as blacksmith above: `coderabbit update`
+# self-updates the binary in place, and the default install dir (~/.local/bin)
+# is under /paperclip — a VOLUME, so a build-time write there is masked at
+# runtime. CODERABBIT_INSTALL_DIR moves it to a real image path.
+#
+# CI=1 suppresses the installer's interactive post-install login prompt, and
+# putting the target on PATH for the duration keeps the installer from
+# appending a PATH line to root's shell profile (it never reads it here, and
+# the symlinks below are what actually make the CLI reachable).
+RUN mkdir -p /opt/coderabbit/bin \
+  && CI=1 CODERABBIT_INSTALL_DIR=/opt/coderabbit/bin PATH="/opt/coderabbit/bin:${PATH}" \
+    sh -c "$(curl -fsSL https://cli.coderabbit.ai/install.sh)" \
+  && chown -R node:node /opt/coderabbit \
+  && ln -sf /opt/coderabbit/bin/coderabbit /usr/local/bin/coderabbit \
+  && ln -sf /opt/coderabbit/bin/coderabbit /usr/local/bin/cr \
+  && /opt/coderabbit/bin/coderabbit --version
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
@@ -275,23 +317,32 @@ RUN groupadd -g ${AGENTS_GID} agents \
        echo "SKIP paperclip-spawn-agent exec probes: BUILDPLATFORM=${BUILDPLATFORM} != TARGETPLATFORM=${TARGETPLATFORM} (setuid bit is not honoured under binfmt emulation)"; \
      fi \
   # capsh is the other half of the uid split: the entrypoint uses it to hand the
-  # server an ambient CAP_KILL, without which the server can create agent
-  # processes but never signal them. It arrives with libcap2-bin. Prove it is
-  # present AND functional in the built image, so a base-image bump that drops
-  # the package fails the build instead of silently degrading every deployment
-  # to a server that cannot enforce a run timeout.
+  # server ambient CAP_KILL and CAP_FOWNER, without which the server can create
+  # agent processes but never signal them, and cannot chmod agent-owned files in
+  # mixed-ownership worktrees (pnpm linkBin EPERMs, SUP-13977). It arrives with
+  # libcap2-bin. Prove it is present AND functional in the built image, so a
+  # base-image bump that drops the package fails the build instead of silently
+  # degrading every deployment to a server that cannot enforce a run timeout or
+  # re-provision a tree an agent has written to.
   #
-  # The grant itself also needs cap_kill in the BOUNDING set, which belongs to
-  # the builder rather than the image — a builder that trims capabilities would
-  # fail this probe for a reason the image cannot fix. So assert the full grant
-  # only when the builder actually has cap_kill, and otherwise assert presence
-  # alone and say so out loud: a probe that quietly downgrades reads as a pass.
+  # The grant itself also needs both capabilities in the BOUNDING set, which
+  # belongs to the builder rather than the image — a builder that trims
+  # capabilities would fail this probe for a reason the image cannot fix. So
+  # assert the full grant only when the builder actually has both, and
+  # otherwise assert presence alone and say so out loud: a probe that quietly
+  # downgrades reads as a pass.
+  #
+  # The probe asserts the resulting capability MASK (cap_fowner+cap_kill =
+  # bits 3+5 = 0x28) and the dropped uid, not the exit status alone — the capsh
+  # grant fails soft and a successful-looking arm can leave the bit absent.
   && command -v capsh >/dev/null \
-  && if capsh --print | sed -n 's/^Bounding set =//p' | grep -q '\bcap_kill\b'; then \
-       [ "$(capsh --keep=1 --user=node --inh=cap_kill --addamb=cap_kill \
-              --shell=/bin/sh -- -c 'id -u')" = "$(id -u node)" ]; \
+  && if capsh --print | sed -n 's/^Bounding set =//p' | grep -q '\bcap_kill\b' \
+     && capsh --print | sed -n 's/^Bounding set =//p' | grep -q '\bcap_fowner\b'; then \
+       [ "$(capsh --keep=1 --user=node --inh=cap_kill,cap_fowner --addamb=cap_kill,cap_fowner \
+              --shell=/bin/sh -- -c 'echo "$(id -u) $(sed -n "s/^CapAmb:[[:space:]]*//p" /proc/self/status)"')" \
+         = "$(id -u node) 0000000000000028" ]; \
      else \
-       echo "SKIP capsh grant probe: cap_kill is not in the builder's bounding set (capsh presence is still asserted)"; \
+       echo "SKIP capsh grant probe: cap_kill/cap_fowner not both in the builder's bounding set (capsh presence is still asserted)"; \
      fi
 
 COPY --from=build /app /app
@@ -332,7 +383,14 @@ ENV NODE_ENV=production \
 
 EXPOSE 3100
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+# tini, not node, is PID 1. The entrypoint ends in `exec`, so without an init
+# node inherits PID 1 and never wait()s the orphans the kernel re-parents onto
+# it -- agent runs spawn git/claude/esbuild/sh descendants that outlive their
+# leader, so they pile up as permanent zombies (~79/h measured) until the
+# cgroup pid limit is exhausted and *every* fork() in the container fails.
+# tini reaps adopted orphans and forwards signals, so the exec chain below and
+# graceful shutdown are unchanged. Mirrors docker/agent-runtime/Dockerfile.base.
+ENTRYPOINT ["/usr/bin/tini", "--", "docker-entrypoint.sh"]
 CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
 
 # Cloud image variant (build with `--target cloud`): the production image
@@ -367,5 +425,66 @@ RUN set -eu; \
     test -f "$dir/dist/manifest.js" || { echo "ERROR: $dir is missing dist/manifest.js after build" >&2; exit 1; }; \
   done
 
+# The hosted image variant ships selected optional peer packages
+# pre-installed. A managed tenant then needs no separate install step.
+# The self-hosted image stays on the opt-in contract: it never runs this
+# stage, so a package like `@sentry/node` stays a true optional peer
+# dependency. A self-hosted operator installs it by hand (see
+# doc/observability.md).
+#
+# CLOUD_BUNDLED_SERVER_DEPS names the optional peer packages to install.
+# The value is a space-separated list, the same shape as
+# CLOUD_BUNDLED_PLUGINS above. The stage reads each package's version
+# from the `peerDependencies` block of `server/package.json` at build
+# time, so the version has one committed home.
+#
+# The stage fails the build in three cases:
+# - the argument is empty
+# - server/package.json declares no version for a named package
+# - the named package is not an optional peer
+#
+# This check keeps the argument limited to packages the server already
+# treats as optional.
+#
+# The install happens in its own isolated directory, not inside
+# `server`'s own workspace install. The self-hosted target above never
+# gains these packages this way. The directory sits under `/app`, not
+# `server/`, and `--ignore-workspace` below excludes it from the pnpm
+# workspace. From that directory, pnpm still finds the `packageManager`
+# pin in the repo's own `package.json` by walking up — the same pnpm
+# version the rest of the build uses.
+#
+# The install writes no lock file (`--no-lockfile`, the same flag the
+# `cloud-plugins` stage above uses). Two builds of the same commit can
+# therefore install different transitive versions of a named package.
+# Three facts make this an accepted trade-off:
+# - the `cloud-plugins` stage above already has the same property, with
+#   the same flag
+# - the direct version of each named package comes from one exact,
+#   single-sourced place: the `peerDependencies` block of
+#   `server/package.json`
+# - an automated check asserts the installed direct version after every
+#   build, so a transitive drift that breaks the package still fails the
+#   build
+FROM build AS cloud-server-deps
+WORKDIR /app/.cloud-server-deps
+ARG CLOUD_BUNDLED_SERVER_DEPS="@sentry/node"
+RUN set -eu; \
+  test -n "$CLOUD_BUNDLED_SERVER_DEPS" || { echo "ERROR: CLOUD_BUNDLED_SERVER_DEPS is empty; name at least one optional peer package to install" >&2; exit 1; }; \
+  echo '{"name":"paperclip-cloud-server-deps","private":true}' > package.json; \
+  specifiers=""; \
+  for name in $CLOUD_BUNDLED_SERVER_DEPS; do \
+    version="$(node -e "const pkg=require('/app/server/package.json'); const name=process.argv[1]; const version=(pkg.peerDependencies||{})[name]; if(!version){console.error('ERROR: server/package.json declares no peerDependencies version for '+JSON.stringify(name));process.exit(1);} const meta=(pkg.peerDependenciesMeta||{})[name]; if(!meta||meta.optional!==true){console.error('ERROR: '+JSON.stringify(name)+' is not declared as an optional peer dependency in server/package.json; CLOUD_BUNDLED_SERVER_DEPS may name only optional peer packages');process.exit(1);} process.stdout.write(version);" "$name")"; \
+    test -n "$version" || { echo "ERROR: could not resolve a version for '$name'" >&2; exit 1; }; \
+    specifiers="$specifiers ${name}@${version}"; \
+  done; \
+  test -n "$specifiers" || { echo "ERROR: CLOUD_BUNDLED_SERVER_DEPS names no package" >&2; exit 1; }; \
+  pnpm add --ignore-workspace --no-lockfile $specifiers
+
 FROM production AS cloud
 COPY --chown=node:node --from=cloud-plugins /app/packages/plugins/sandbox-providers /app/packages/plugins/sandbox-providers
+# Land the isolated install inside the server's own `node_modules`, the
+# directory Node's module resolution walks up to from `/app/server` for
+# both a CommonJS `require.resolve` and an ECMAScript `import` — an entry
+# on `NODE_PATH` would satisfy only the first and silently fail the second.
+COPY --chown=node:node --from=cloud-server-deps /app/.cloud-server-deps/node_modules /app/server/node_modules
