@@ -6,6 +6,8 @@ import {
   type GitHubPullRequestReference,
   type PullRequestMergeDetailsResolver,
 } from "./github-pull-request-merge.js";
+import { logActivity, logActivityInTransaction } from "./activity-log.js";
+import type { LogActivityInput } from "./activity-log.js";
 
 /**
  * Produce-side of the delivery-path PR work product (SUP-14645).
@@ -145,6 +147,35 @@ function openMetadata(input: PrDeliveryInput): Record<string, unknown> {
 const PR_MERGE_SWEEP_COOLDOWN_MS = 5 * 60 * 1000;
 const PR_MERGE_SWEEP_DEFAULT_LIMIT = 100;
 
+/**
+ * Build the audit entry for a pr-delivery mutation of a `pull_request` work
+ * product. These writes are system-driven (the scheduled merge sweep, the
+ * carrier fan-out mirror, and the one-shot backfill — none run under a request
+ * actor), so they are logged under a stable `pr-delivery` system actor. The
+ * entry names the affected issue (entity + issueId) so the activity feed
+ * attributes the mutation to the right thread (AGENTS.md: write activity-log
+ * entries for mutations).
+ */
+function prDeliveryActivity(
+  companyId: string,
+  issueId: string,
+  action: string,
+  details: Record<string, unknown>,
+): LogActivityInput {
+  return {
+    companyId,
+    actorType: "system",
+    actorId: "pr-delivery",
+    agentId: null,
+    runId: null,
+    action,
+    entityType: "issue",
+    entityId: issueId,
+    issueId,
+    details,
+  };
+}
+
 export function prDeliveryService(
   db: Db,
   opts: { resolvePullRequestDetails?: PullRequestMergeDetailsResolver } = {},
@@ -232,22 +263,47 @@ export function prDeliveryService(
                 updatedAt: new Date(),
               })
               .where(eq(issueWorkProducts.id, existing.id));
+            await logActivityInTransaction(
+              tx as unknown as Db,
+              prDeliveryActivity(input.companyId, issueId, "issue.work_product_updated", {
+                workProductId: existing.id,
+                type: "pull_request",
+                provider: "github",
+                externalId,
+                prNumber: input.prNumber,
+                status: "ready_for_review",
+              }),
+            );
           }
         } else {
-          await tx.insert(issueWorkProducts).values({
-            companyId: input.companyId,
-            issueId,
-            type: "pull_request",
-            provider: "github",
-            externalId,
-            title: `PR #${input.prNumber} ${input.repository}`,
-            url: input.url,
-            status: "ready_for_review",
-            reviewState: "none",
-            isPrimary: true,
-            healthStatus: "unknown",
-            metadata,
-          });
+          const [inserted] = await tx
+            .insert(issueWorkProducts)
+            .values({
+              companyId: input.companyId,
+              issueId,
+              type: "pull_request",
+              provider: "github",
+              externalId,
+              title: `PR #${input.prNumber} ${input.repository}`,
+              url: input.url,
+              status: "ready_for_review",
+              reviewState: "none",
+              isPrimary: true,
+              healthStatus: "unknown",
+              metadata,
+            })
+            .returning({ id: issueWorkProducts.id });
+          await logActivityInTransaction(
+            tx as unknown as Db,
+            prDeliveryActivity(input.companyId, issueId, "issue.work_product_created", {
+              workProductId: inserted.id,
+              type: "pull_request",
+              provider: "github",
+              externalId,
+              prNumber: input.prNumber,
+              status: "ready_for_review",
+            }),
+          );
         }
         writtenIssueIds.push(issueId);
       }
@@ -284,6 +340,19 @@ export function prDeliveryService(
             .update(issueWorkProducts)
             .set({ status: "merged", metadata: nextMetadata, updatedAt: new Date() })
             .where(eq(issueWorkProducts.id, existing.id));
+          await logActivityInTransaction(
+            tx as unknown as Db,
+            prDeliveryActivity(input.companyId, issueId, "issue.work_product_updated", {
+              workProductId: existing.id,
+              type: "pull_request",
+              provider: "github",
+              externalId,
+              prNumber: input.prNumber,
+              status: "merged",
+              mergedAt,
+              mergeCommitSha,
+            }),
+          );
         }
         rows.push({
           issueId,
@@ -331,22 +400,47 @@ export function prDeliveryService(
                 updatedAt: new Date(),
               })
               .where(eq(issueWorkProducts.id, existing.id));
+            await logActivityInTransaction(
+              tx as unknown as Db,
+              prDeliveryActivity(input.companyId, issueId, "issue.work_product_updated", {
+                workProductId: existing.id,
+                type: "pull_request",
+                provider: "github",
+                externalId: input.externalId,
+                status: input.status,
+                carrierFanOut: true,
+              }),
+            );
           }
         } else {
-          await tx.insert(issueWorkProducts).values({
-            companyId: input.companyId,
-            issueId,
-            type: "pull_request",
-            provider: "github",
-            externalId: input.externalId,
-            title,
-            url: input.url,
-            status: input.status,
-            reviewState: input.reviewState,
-            isPrimary: false,
-            healthStatus: "unknown",
-            metadata,
-          });
+          const [inserted] = await tx
+            .insert(issueWorkProducts)
+            .values({
+              companyId: input.companyId,
+              issueId,
+              type: "pull_request",
+              provider: "github",
+              externalId: input.externalId,
+              title,
+              url: input.url,
+              status: input.status,
+              reviewState: input.reviewState,
+              isPrimary: false,
+              healthStatus: "unknown",
+              metadata,
+            })
+            .returning({ id: issueWorkProducts.id });
+          await logActivityInTransaction(
+            tx as unknown as Db,
+            prDeliveryActivity(input.companyId, issueId, "issue.work_product_created", {
+              workProductId: inserted.id,
+              type: "pull_request",
+              provider: "github",
+              externalId: input.externalId,
+              status: input.status,
+              carrierFanOut: true,
+            }),
+          );
         }
         writtenIssueIds.push(issueId);
       }
@@ -374,6 +468,7 @@ export function prDeliveryService(
       .select({
         id: issueWorkProducts.id,
         companyId: issueWorkProducts.companyId,
+        issueId: issueWorkProducts.issueId,
         url: issueWorkProducts.url,
         metadata: issueWorkProducts.metadata,
       })
@@ -434,6 +529,18 @@ export function prDeliveryService(
             .set({ status: "merged", metadata: nextMetadata, updatedAt: new Date(now) })
             .where(eq(issueWorkProducts.id, row.id));
           flipped += 1;
+          await logActivity(
+            db,
+            prDeliveryActivity(row.companyId, row.issueId, "issue.work_product_updated", {
+              workProductId: row.id,
+              type: "pull_request",
+              provider: "github",
+              externalId: `${reference.owner}/${reference.repo}#${reference.number}`,
+              status: "merged",
+              mergedAt: details.mergedAt ?? null,
+              mergeCommitSha: details.mergeCommitSha ?? null,
+            }),
+          );
         } else {
           await db
             .update(issueWorkProducts)
@@ -449,6 +556,24 @@ export function prDeliveryService(
             error instanceof Error ? error.message : String(error)
           }`,
         );
+        // Stamp the cooldown marker even on failure, so a persistently-failing
+        // row cools down instead of being re-selected every tick under
+        // `NULLS FIRST` and starving the rest of the fleet (SUP-14645).
+        // Best-effort: a marker failure must not abort the sweep either.
+        try {
+          await db
+            .update(issueWorkProducts)
+            .set({
+              metadata: { ...metadata, mergeStateCheckedAt: new Date(now).toISOString() },
+            })
+            .where(eq(issueWorkProducts.id, row.id));
+        } catch (stampError) {
+          console.warn(
+            `[pr-delivery] sweep: failed to stamp cooldown marker for work product ${row.id}: ${
+              stampError instanceof Error ? stampError.message : String(stampError)
+            }`,
+          );
+        }
       }
     }
 

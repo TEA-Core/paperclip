@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
+  activityLog,
   companies,
   createDb,
   issueWorkProducts,
@@ -67,6 +68,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
 
   afterEach(async () => {
     await db.delete(issueWorkProducts);
+    await db.delete(activityLog);
   });
 
   afterAll(async () => {
@@ -96,6 +98,10 @@ describeEmbeddedPostgres("prDeliveryService", () => {
           eq(issueWorkProducts.type, "pull_request"),
         ),
       );
+  }
+
+  async function readActivity() {
+    return db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
   }
 
   it("fans a ready_for_review row out to every issue in the carrier tree at PR-open", async () => {
@@ -385,6 +391,11 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     expect(rows).toHaveLength(5);
     expect(rows.filter((row) => row.status === "merged")).toHaveLength(4);
     expect(rows.filter((row) => row.status === "ready_for_review")).toHaveLength(1);
+    // pr-delivery-sweep-catch-no-cooldown-stamp: the row whose resolver threw
+    // must still carry the cooldown marker, so it cools down instead of being
+    // re-selected every tick under NULLS FIRST.
+    const failedRow = rows.find((row) => row.status === "ready_for_review")!;
+    expect((failedRow.metadata as Record<string, unknown>).mergeStateCheckedAt).toBeTruthy();
   });
 
   it("carrier fan-out is scoped to the source issue's company", async () => {
@@ -419,5 +430,116 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       .where(eq(issueWorkProducts.externalId, EXTERNAL_ID));
     expect(all).toHaveLength(5);
     expect(all.every((row) => row.companyId === companyId)).toBe(true);
+  });
+
+  it("logs a created activity entry on every carrier issue at PR-open", async () => {
+    const service = prDeliveryService(db);
+    await service.recordAtOpen(input());
+
+    const activity = await readActivity();
+    expect(activity).toHaveLength(5);
+    for (const entry of activity) {
+      expect(entry.action).toBe("issue.work_product_created");
+      expect(entry.entityType).toBe("issue");
+      expect(entry.actorType).toBe("system");
+      const details = entry.details as Record<string, unknown>;
+      expect(details.type).toBe("pull_request");
+      expect(details.externalId).toBe(EXTERNAL_ID);
+      expect(details.status).toBe("ready_for_review");
+      expect(details.workProductId).toBeTruthy();
+    }
+    expect(activity.map((entry) => entry.entityId).sort()).toEqual([sourceIssueId, ...childIds].sort());
+  });
+
+  it("logs a created activity entry on every descendant for the carrier fan-out", async () => {
+    const service = prDeliveryService(db);
+    await service.recordCarrierFanOut({
+      companyId,
+      sourceIssueId,
+      externalId: EXTERNAL_ID,
+      url: PR_URL,
+      title: `PR #${PR_NUMBER} ${REPOSITORY}`,
+      status: "ready_for_review",
+      reviewState: "none",
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY },
+    });
+
+    const activity = await readActivity();
+    expect(activity).toHaveLength(4);
+    for (const entry of activity) {
+      expect(entry.action).toBe("issue.work_product_created");
+      expect(entry.entityId).not.toBe(sourceIssueId);
+      const details = entry.details as Record<string, unknown>;
+      expect(details.externalId).toBe(EXTERNAL_ID);
+      expect(details.carrierFanOut).toBe(true);
+    }
+    expect(activity.map((entry) => entry.entityId).sort()).toEqual(childIds.sort());
+  });
+
+  it("logs an updated activity entry when refresh flips every row to merged", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "merged",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+        mergedAt: "2026-08-31T17:26:58Z",
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+      })),
+    });
+    await service.recordAtOpen(input());
+    await db.delete(activityLog);
+    await service.refreshMergeState(input());
+
+    const activity = await readActivity();
+    expect(activity).toHaveLength(5);
+    for (const entry of activity) {
+      expect(entry.action).toBe("issue.work_product_updated");
+      const details = entry.details as Record<string, unknown>;
+      expect(details.status).toBe("merged");
+      expect(details.mergedAt).toBe("2026-08-31T17:26:58Z");
+      expect(details.mergeCommitSha).toBe("3fc37fe91c6190ab695a651224ad057db0a38aba");
+    }
+  });
+
+  it("logs no activity when a refresh resolves the PR as open (no row mutation)", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "open",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+      })),
+    });
+    await service.recordAtOpen(input());
+    await db.delete(activityLog);
+    await service.refreshMergeState(input());
+
+    expect(await readActivity()).toHaveLength(0);
+  });
+
+  it("logs an updated activity entry when the sweep flips a row to merged", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "merged",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+        mergedAt: "2026-08-31T17:26:58Z",
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+      })),
+    });
+    await service.recordAtOpen(input());
+    await db.delete(activityLog);
+    const swept = await service.sweepMergeState();
+
+    expect(swept.flipped).toBe(5);
+    const activity = await readActivity();
+    expect(activity).toHaveLength(5);
+    for (const entry of activity) {
+      expect(entry.action).toBe("issue.work_product_updated");
+      expect(entry.actorType).toBe("system");
+      const details = entry.details as Record<string, unknown>;
+      expect(details.externalId).toBe(EXTERNAL_ID);
+      expect(details.status).toBe("merged");
+      expect(details.mergedAt).toBe("2026-08-31T17:26:58Z");
+    }
   });
 });

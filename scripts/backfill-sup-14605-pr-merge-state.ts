@@ -31,7 +31,14 @@ function parseFlag(name: string, fallback: string | null = null): string | null 
   const index = process.argv.indexOf(name);
   if (index < 0) return fallback;
   const value = process.argv[index + 1];
-  return value && !value.startsWith("--") ? value : fallback;
+  // A flag that is present but has no value (or is immediately followed by
+  // another flag) is an operator typo: failing loudly beats silently falling
+  // back to the hardcoded default and backfilling the wrong issue/PR
+  // (SUP-14645, backfill-parseflag-silent-fallback).
+  if (!value || value.startsWith("--")) {
+    throw new Error(`Flag ${name} must be followed by a value`);
+  }
+  return value;
 }
 
 async function main() {
