@@ -482,6 +482,19 @@ export interface PublishApprovalStatusOptions {
    * already-closed cards (the approval-status reconciler).
    */
   closingTransition?: boolean;
+  /**
+   * ADR-091 D1 (SUP-14676): enforce the delivery-identity gate at the
+   * authorization site. When true, the authorizing candidate set is narrowed to
+   * PRs this card actually delivered — the PR's head repo is the card's project
+   * repo AND the PR's head ref equals the card's own execution-workspace
+   * delivery branch — before the length arithmetic. A card that merely CITES a
+   * PR (a bare PR URL in the title/description/comment/document creates the
+   * mention row) it did not deliver is refused, not stamped. Unresolvable
+   * delivery identity fails closed (ADR-091 D4). Callers that already certify
+   * the head by another mechanism — the approval-status reconciler's Guard A
+   * re-publish — leave this unset so their delegated write is unchanged.
+   */
+  enforceDeliveryIdentity?: boolean;
 }
 
 export async function publishApprovalStatus(
@@ -492,6 +505,71 @@ export async function publishApprovalStatus(
   options?: PublishApprovalStatusOptions,
 ): Promise<ArmingOutcome> {
   const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId);
+
+  // ADR-091 D1 (SUP-14676): delivery-identity gate. A mention row is created by
+  // prose — a bare PR URL in the card's title/description/comment/document — so
+  // selecting candidates by sourceIssueId alone lets any card that merely CITES
+  // a PR stamp it. Narrow the authorizing candidate set to PRs this card actually
+  // delivered (the head repo is the card's project repo AND the head ref equals
+  // the card's own execution-workspace delivery branch), dropping non-delivered
+  // candidates BEFORE the length arithmetic. Opt-in: the approval-status
+  // reconciler's Guard A re-publish certifies the head by content identity and
+  // leaves enforceDeliveryIdentity unset.
+  let authorizingPRs = linkedPRs;
+  if (options?.enforceDeliveryIdentity && linkedPRs.length > 0) {
+    const [issueRow] = await db
+      .select({
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+        executionWorkspaceId: issues.executionWorkspaceId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const ctx = await resolveIssueRepoContext(db, {
+      companyId,
+      projectId: issueRow?.projectId ?? null,
+      projectWorkspaceId: issueRow?.projectWorkspaceId ?? null,
+      executionWorkspaceId: issueRow?.executionWorkspaceId ?? null,
+    });
+    const deliveryBranch = ctx?.branch ?? null;
+    const deliveryRepo = ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null;
+
+    // ADR-091 D4: fail closed when the card's delivery identity cannot be
+    // positively resolved — refuse to stamp on an unverified branch.
+    if (!deliveryBranch || !deliveryRepo) {
+      const missing = !deliveryBranch
+        ? "no delivery branch recorded on this card's execution workspace"
+        : "no delivery repo resolvable for this card's execution workspace";
+      return {
+        kind: "skipped",
+        message: `status:skipped:delivery_identity_unresolved: ${missing}; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)`,
+      };
+    }
+
+    const delivered = linkedPRs.filter((pr) => {
+      if (pr.owner.toLowerCase() !== deliveryRepo.owner.toLowerCase()) return false;
+      if (pr.repo.toLowerCase() !== deliveryRepo.repo.toLowerCase()) return false;
+      return (
+        pr.headRefName !== null &&
+        pr.headRefName.toLowerCase() === deliveryBranch.toLowerCase()
+      );
+    });
+
+    if (delivered.length === 0) {
+      const failed = linkedPRs
+        .map(
+          (pr) =>
+            `${pr.displayName} head ${pr.owner}/${pr.repo}:${pr.headRefName ?? "(unreadable)"} is not this card's delivery branch ${deliveryBranch}`,
+        )
+        .join("; ");
+      return {
+        kind: "skipped",
+        message: `status:skipped:not_delivered: ${failed}`,
+      };
+    }
+
+    authorizingPRs = delivered;
+  }
 
   if (linkedPRs.length === 0) {
     // SUP-13313: an empty cached open-PR set means "the PR I know about is
@@ -673,15 +751,15 @@ export async function publishApprovalStatus(
     };
   }
 
-  if (linkedPRs.length > 1) {
-    const prList = linkedPRs.map((pr) => pr.displayName).join(", ");
+  if (authorizingPRs.length > 1) {
+    const prList = authorizingPRs.map((pr) => pr.displayName).join(", ");
     return {
       kind: "skipped",
-      message: `status:skipped:ambiguous: Multiple linked PRs (${linkedPRs.length}): ${prList}`,
+      message: `status:skipped:ambiguous: Multiple linked PRs (${authorizingPRs.length}): ${prList}`,
     };
   }
 
-  const pr = linkedPRs[0]!;
+  const pr = authorizingPRs[0]!;
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
   if (candidates.length === 0) {
     const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);

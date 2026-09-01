@@ -2985,6 +2985,12 @@ export function issueRoutes(
       // the requested `done` to a later stage (effectiveStatus === "in_review").
       const statusOutcome = await publishApprovalStatus(db, issue.companyId, issue.id, issueIdentifier, {
         closingTransition,
+        // ADR-091 D1 (SUP-14676): the first-publish path is where a card that
+        // merely CITES a PR could otherwise stamp it. Enforce the delivery
+        // identity gate here. (The approval-status reconciler's Guard A
+        // re-publish omits this on purpose — it certifies the head by content
+        // identity instead of delivery identity.)
+        enforceDeliveryIdentity: true,
       });
 
       // SUP-13714 Guard A persistence: record which head this approval

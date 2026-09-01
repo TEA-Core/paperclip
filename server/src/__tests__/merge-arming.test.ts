@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import {
   companies,
   createDb,
+  executionWorkspaces,
   externalObjectMentions,
   externalObjects,
   issues,
@@ -2375,3 +2376,201 @@ describe("guard: shouldPublishApprovalStatus (SUP-12558)", () => {
     expect(shouldPublishApprovalStatus(undefined)).toBe(false);
   });
 });
+
+describeEmbeddedPostgres(
+  "publishApprovalStatus delivery-identity gate (ADR-091 D1, SUP-14676)",
+  () => {
+    let db: Db;
+    let companyId: string;
+    let issueId: string;
+    let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+    const HEAD_SHA = "abc123def456789012345678901234567890abcd";
+    const DELIVERY_BRANCH = "SUP-14676-own-delivery-branch";
+    const DELIVERY_REPO_URL = "https://github.com/TEA-Core/paperclip";
+
+    beforeAll(async () => {
+      tempDb = await startEmbeddedPostgresTestDatabase("paperclip-merge-arming-gate-");
+      db = createDb(tempDb.connectionString);
+    }, 20_000);
+
+    afterAll(async () => {
+      await tempDb?.cleanup();
+    });
+
+    beforeEach(async () => {
+      vi.resetAllMocks();
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
+
+      await db.delete(externalObjectMentions);
+      await db.delete(externalObjects);
+      await db.delete(issues);
+      await db.delete(executionWorkspaces);
+      await db.delete(projectWorkspaces);
+      await db.delete(projects);
+      await db.delete(companies);
+
+      const companyRows = await db
+        .insert(companies)
+        .values({ name: "Gate Company", issuePrefix: "SUP", mergeArmingEnabled: true })
+        .returning();
+      companyId = companyRows[0]!.id;
+
+      issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Gate Issue",
+        status: "in_progress",
+      });
+    });
+
+    afterEach(async () => {
+      await db.delete(externalObjectMentions);
+      await db.delete(externalObjects);
+      await db.delete(issues);
+      await db.delete(executionWorkspaces);
+      await db.delete(projectWorkspaces);
+      await db.delete(projects);
+      await db.delete(companies);
+    });
+
+    async function seedDeliveryIdentity(branch: string | null, repoUrl: string | null) {
+      const [projectRow] = await db
+        .insert(projects)
+        .values({
+          id: randomUUID(),
+          companyId,
+          name: "TEA-Core/paperclip",
+          urlKey: "tea-core-paperclip",
+          status: "in_progress",
+        })
+        .returning();
+      const [ewRow] = await db
+        .insert(executionWorkspaces)
+        .values({
+          id: randomUUID(),
+          companyId,
+          projectId: projectRow!.id,
+          mode: "isolated",
+          strategyType: "git_worktree",
+          name: "card-workspace",
+          status: "active",
+          branchName: branch,
+          repoUrl,
+        })
+        .returning();
+      await db
+        .update(issues)
+        .set({ projectId: projectRow!.id, executionWorkspaceId: ewRow!.id })
+        .where(eq(issues.id, issueId));
+    }
+
+    async function seedMention(owner: string, repo: string, number: number, headRefName: string | null) {
+      const obj = createPRExternalObject(companyId, owner, repo, number, { headRefName });
+      const [externalObj] = await db.insert(externalObjects).values(obj).returning();
+      await db.insert(externalObjectMentions).values({
+        companyId,
+        sourceIssueId: issueId,
+        sourceKind: "issue_comment",
+        objectId: externalObj!.id,
+        objectType: "pull_request",
+        providerKey: "github",
+      });
+    }
+
+    it(
+      "refuses to stamp a PR the card merely cited (same repo, different branch) — not_delivered, zero writes",
+      async () => {
+        await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+        // The card cited another card's PR: same repo, but the head ref is that card's branch.
+        await seedMention("TEA-Core", "paperclip", 42, "SUP-14671-other-card-branch");
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("skipped");
+        expect(result.message).toBe(
+          "status:skipped:not_delivered: TEA-Core/paperclip#42 head TEA-Core/paperclip:SUP-14671-other-card-branch is not this card's delivery branch SUP-14676-own-delivery-branch",
+        );
+        expect(result.headSha).toBeUndefined();
+        expect(mockGhFetch).not.toHaveBeenCalled();
+      },
+    );
+
+    it(
+      "publishes as today when the sole candidate matches the card's delivery repo AND branch",
+      async () => {
+        await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+        await seedMention("TEA-Core", "paperclip", 42, DELIVERY_BRANCH);
+
+        mockGhFetch
+          .mockResolvedValueOnce(
+            createMockResponse({
+              head: { sha: HEAD_SHA },
+              html_url: "https://github.com/TEA-Core/paperclip/pull/42",
+            }),
+          )
+          .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("armed");
+        expect(result.headSha).toBe(HEAD_SHA);
+        expect(mockGhFetch).toHaveBeenCalledTimes(2);
+        const statusCall = mockGhFetch.mock.calls[1]!;
+        expect(statusCall[0]).toBe(
+          `https://api.github.com/repos/TEA-Core/paperclip/statuses/${HEAD_SHA}`,
+        );
+        expect(statusCall[1]).toMatchObject({
+          method: "POST",
+          headers: { authorization: `Bearer ${GITHUB_TOKEN}` },
+        });
+        const body = JSON.parse(statusCall[1]!.body as string);
+        expect(body.state).toBe("success");
+        expect(body.context).toBe("paperclip/approved");
+      },
+    );
+
+    it(
+      "refuses a coordinating card that cited an external (different-repo) PR — not_delivered, zero writes (SUP-14671 shape)",
+      async () => {
+        await seedDeliveryIdentity(DELIVERY_BRANCH, DELIVERY_REPO_URL);
+        // A coordinating card cited a PR in a dependency repo it did not deliver.
+        await seedMention("some-org", "upstream-lib", 7, "some-org/release-branch");
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("skipped");
+        expect(result.message).toBe(
+          "status:skipped:not_delivered: some-org/upstream-lib#7 head some-org/upstream-lib:some-org/release-branch is not this card's delivery branch SUP-14676-own-delivery-branch",
+        );
+        expect(mockGhFetch).not.toHaveBeenCalled();
+      },
+    );
+
+    it(
+      "fails closed when the card's delivery identity cannot be resolved (no branch recorded)",
+      async () => {
+        await seedDeliveryIdentity(null, DELIVERY_REPO_URL);
+        await seedMention("TEA-Core", "paperclip", 42, "whatever-branch");
+
+        const result = await publishApprovalStatus(db, companyId, issueId, "SUP-14676", {
+          enforceDeliveryIdentity: true,
+        });
+
+        expect(result.kind).toBe("skipped");
+        expect(result.message).toBe(
+          "status:skipped:delivery_identity_unresolved: no delivery branch recorded on this card's execution workspace; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+        );
+        expect(mockGhFetch).not.toHaveBeenCalled();
+      },
+    );
+  },
+);
