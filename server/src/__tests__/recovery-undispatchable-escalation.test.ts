@@ -398,4 +398,147 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
     expect(row.status).toBe("escalated");
     expect(row.outcome).toBe("exhausted");
   });
+
+  async function resolveBoardRuling(actionId: string, outcome: "false_positive" | "restored") {
+    // Simulates the board resolution this card consumes: a resolved row of the
+    // action whose outcome records the ruling. The mint-time evidence
+    // (assigneeAgentId) is deliberately preserved — a board resolution does not
+    // rewrite it. This is the row the producer card makes reachable via
+    // `resolveIssueRecoveryActionSchema` (outcome false_positive on a todo
+    // source); exercising it here through the row keeps this card independent
+    // of that validator relaxation.
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        status: "resolved",
+        outcome,
+        resolutionNote: outcome === "false_positive"
+          ? "Ruled structurally invalid: pull-only assignee has no wake path by design."
+          : "Condition cleared; re-detection stays armed.",
+        resolvedAt: new Date(),
+      })
+      .where(eq(issueRecoveryActions.id, actionId));
+  }
+
+  it("does not re-mint after a board false_positive ruling with an unchanged assignee, across two consecutive sweeps", async () => {
+    const companyId = await seedCompany();
+    const pullOnlyAgentId = await seedAgent(companyId, "process");
+    const issueId = await seedCard(companyId, pullOnlyAgentId);
+
+    const { action } = await openEscalation(companyId, pullOnlyAgentId, issueId);
+    await resolveBoardRuling(action.id, "false_positive");
+
+    // A fresh service instance: first sweep is first-sight, second is the
+    // confirmed cycle that the pre-fix code re-minted. Both must stay quiet.
+    const sweep = makeSweep();
+    const next = await sweep.reconcileUndispatchableAssignedIssues();
+    expect(next.escalated).toBe(0);
+    const again = await sweep.reconcileUndispatchableAssignedIssues();
+    expect(again.escalated).toBe(0);
+    expect(again.reported).toBe(1);
+
+    const rows = await recoveryActionRows(issueId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(action.id);
+    expect(rows[0].status).toBe("resolved");
+    expect(rows[0].outcome).toBe("false_positive");
+  });
+
+  it("the false_positive ruling survives a simulated control-plane restart", async () => {
+    const companyId = await seedCompany();
+    const pullOnlyAgentId = await seedAgent(companyId, "process");
+    const issueId = await seedCard(companyId, pullOnlyAgentId);
+
+    const { action } = await openEscalation(companyId, pullOnlyAgentId, issueId);
+    await resolveBoardRuling(action.id, "false_positive");
+
+    // Restart = fresh instance with an empty in-memory sight counter. The
+    // suppression must come from the persisted row, not that counter.
+    const restarted = makeSweep();
+    await restarted.reconcileUndispatchableAssignedIssues();
+    const second = await restarted.reconcileUndispatchableAssignedIssues();
+    expect(second.escalated).toBe(0);
+
+    const rows = await recoveryActionRows(issueId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("resolved");
+    expect(rows[0].outcome).toBe("false_positive");
+  });
+
+  it("re-arms and re-mints when the card is re-assigned to a different pull-only agent", async () => {
+    const companyId = await seedCompany();
+    const pullOnlyAgentAId = await seedAgent(companyId, "process");
+    const pullOnlyAgentBId = await seedAgent(companyId, "process");
+    const issueId = await seedCard(companyId, pullOnlyAgentAId);
+
+    const { action } = await openEscalation(companyId, pullOnlyAgentAId, issueId);
+    await resolveBoardRuling(action.id, "false_positive");
+
+    // A different agent is a different claim: the ruling no longer applies.
+    await db.update(issues).set({ assigneeAgentId: pullOnlyAgentBId }).where(eq(issues.id, issueId));
+
+    const restarted = makeSweep();
+    const first = await restarted.reconcileUndispatchableAssignedIssues();
+    expect(first.escalated).toBe(0);
+    const second = await restarted.reconcileUndispatchableAssignedIssues();
+    expect(second.escalated).toBe(1);
+
+    const rows = await recoveryActionRows(issueId);
+    expect(rows).toHaveLength(2);
+    const active = rows.find((r) => r.status === "active");
+    expect(active?.kind).toBe("undispatchable_assignee");
+    expect(active?.previousOwnerAgentId).toBe(pullOnlyAgentBId);
+    expect(active?.evidence).toMatchObject({ assigneeAgentId: pullOnlyAgentBId });
+  });
+
+  it("a prior restored resolution does not suppress: the cleared condition keeps re-detecting", async () => {
+    const companyId = await seedCompany();
+    const pullOnlyAgentId = await seedAgent(companyId, "process");
+    const issueId = await seedCard(companyId, pullOnlyAgentId);
+
+    const { action } = await openEscalation(companyId, pullOnlyAgentId, issueId);
+    await resolveBoardRuling(action.id, "restored");
+
+    // `restored` means the condition cleared — detection stays armed, so a new
+    // confirmed cycle mints a fresh (distinct) action instead of staying quiet.
+    const sweep = makeSweep();
+    const first = await sweep.reconcileUndispatchableAssignedIssues();
+    expect(first.escalated).toBe(0);
+    const second = await sweep.reconcileUndispatchableAssignedIssues();
+    expect(second.escalated).toBe(1);
+
+    const active = (await recoveryActionRows(issueId)).find((r) => r.status === "active");
+    expect(active).toBeTruthy();
+    expect(active?.id).not.toBe(action.id);
+  });
+
+  it("the report-only detection row still emits under suppression (not a blind spot)", async () => {
+    const companyId = await seedCompany();
+    const pullOnlyAgentId = await seedAgent(companyId, "process");
+    const issueId = await seedCard(companyId, pullOnlyAgentId);
+
+    const { action } = await openEscalation(companyId, pullOnlyAgentId, issueId);
+    await resolveBoardRuling(action.id, "false_positive");
+
+    // Wipe the durable detection record so a suppressed sweep must still emit a
+    // fresh one: the report path runs even though the mint path is suppressed.
+    await db.delete(activityLog).where(eq(activityLog.entityId, issueId));
+
+    const next = await makeSweep().reconcileUndispatchableAssignedIssues();
+    expect(next.reported).toBe(1);
+    expect(next.issueIds).toEqual([issueId]);
+    expect(next.escalated).toBe(0);
+
+    const detections = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.undispatchable_assignee_detected"),
+        ),
+      );
+    expect(detections).toHaveLength(1);
+    expect(detections[0].details).toMatchObject({ assigneeAgentId: pullOnlyAgentId });
+  });
 });
