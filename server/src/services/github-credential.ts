@@ -227,13 +227,21 @@ export async function resolveAppInstallationToken(
     return null;
   }
 
+  // Narrow the minted installation token to the repo the caller was authorized
+  // for. Without `repositories` in the mint body GitHub issues an
+  // installation-wide token, so the credential would out-reach the repo the
+  // request-layer check already granted (owner/repo).
+  const mintBody: Record<string, unknown> = {};
+  if (permissions) mintBody.permissions = permissions;
+  if (owner && repo) mintBody.repositories = [repo];
+
   let tokenResponse: { token: string; expires_at: string };
   try {
     tokenResponse = await ghAppFetch(
       `/app/installations/${installationId}/access_tokens`,
       jwt,
       "POST",
-      permissions ? { permissions } : undefined,
+      Object.keys(mintBody).length > 0 ? mintBody : undefined,
     );
   } catch (err) {
     logger.warn(

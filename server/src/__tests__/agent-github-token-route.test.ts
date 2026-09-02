@@ -350,7 +350,74 @@ describe("resolveAppInstallationToken — permissions, expiry, cache (route cont
         { contents: "read", pull_requests: "write" },
       );
       expect(isGitHubTokenResolution(result)).toBe(true);
-      expect(mintBody).toBe(JSON.stringify({ permissions: { contents: "read", pull_requests: "write" } }));
+      expect(mintBody).toBe(
+        JSON.stringify({
+          permissions: { contents: "read", pull_requests: "write" },
+          repositories: [repo],
+        }),
+      );
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("narrows the minted token to the requested repo by sending repositories in the mint POST body", async () => {
+    const expiresAt = "2026-08-17T13:00:00.000Z";
+    let mintBody: unknown;
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn((input: string | URL, init?: RequestInit) => {
+      const target = typeof input === "string" ? input : input.toString();
+      if (target.includes(`/repos/${owner}/${repo}/installation`)) {
+        return Promise.resolve(new Response(JSON.stringify({ id: Number(FIXTURE_INSTALLATION_ID) }), { status: 200 }));
+      }
+      if (target.includes("/access_tokens")) {
+        mintBody = init?.body;
+        return Promise.resolve(
+          new Response(JSON.stringify({ token: FIXTURE_TOKEN, expires_at: expiresAt }), { status: 200 }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }) as any;
+
+    try {
+      // No permissions requested — the body is ONLY the narrowing. This is the
+      // bug this test pins: the mint must carry the repo so the credential cannot
+      // reach any other repo in the installation, even though the request layer
+      // already authorized exactly this one.
+      const result = await resolveAppInstallationToken(company, fakeSecrets, owner, repo, undefined, DEFAULT_GITHUB_APP);
+      expect(isGitHubTokenResolution(result)).toBe(true);
+      expect(mintBody).toBe(JSON.stringify({ repositories: [repo] }));
+      expect(JSON.stringify(mintBody)).not.toContain("permissions");
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("does not narrow a mint with no repo context (company-wide scope stays broad)", async () => {
+    let mintBody: unknown;
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn((input: string | URL, init?: RequestInit) => {
+      const target = typeof input === "string" ? input : input.toString();
+      // /access_tokens is a substring of the install-mint URL, so it must be
+      // checked before the /app/installations list match.
+      if (target.includes("/access_tokens")) {
+        mintBody = init?.body;
+        return Promise.resolve(
+          new Response(JSON.stringify({ token: FIXTURE_TOKEN, expires_at: "2026-08-17T13:00:00.000Z" }), { status: 200 }),
+        );
+      }
+      if (target.includes("/app/installations")) {
+        return Promise.resolve(new Response(JSON.stringify([{ id: Number(FIXTURE_INSTALLATION_ID) }]), { status: 200 }));
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }) as any;
+
+    try {
+      const result = await resolveAppInstallationToken(company, fakeSecrets, undefined, undefined, undefined, DEFAULT_GITHUB_APP);
+      expect(isGitHubTokenResolution(result)).toBe(true);
+      // No owner/repo → no narrowing: the body is omitted entirely (undefined),
+      // so the company-wide diagnostics probe still sees the whole installation.
+      expect(mintBody).toBeUndefined();
     } finally {
       global.fetch = originalFetch;
     }
