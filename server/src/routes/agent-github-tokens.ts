@@ -18,7 +18,7 @@ import {
 const agentInstallationTokenBodySchema = z.object({
   owner: z.string().min(1),
   repo: z.string().min(1),
-  permissions: z.record(z.string(), z.unknown()).optional(),
+  permissions: z.record(z.string(), z.enum(["read", "write", "admin", "none"])).optional(),
 });
 
 type InstallationTokenBody = z.infer<typeof agentInstallationTokenBodySchema>;

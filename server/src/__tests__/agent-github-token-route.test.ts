@@ -144,6 +144,22 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
     expect(res.status).toBe(400);
   });
 
+  it("rejects an invalid permissions value with 400 instead of surfacing a 502 mint_failed", async () => {
+    const { deps, resolveToken } = fakeDeps({ tokenResult: null });
+    const app = createApp(agentActor(), deps);
+    const res = await request(app)
+      .post("/api/agents/me/github/installation-tokens")
+      .send({ owner: "owner", repo: "repo", permissions: { contents: "bogus" } });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Validation error");
+    expect(Array.isArray(res.body.details)).toBe(true);
+    const issue = (res.body.details as Array<{ code?: string; path?: Array<string | number> }>).find(
+      (entry) => entry.path?.includes("contents"),
+    );
+    expect(issue?.code).toBe("invalid_value");
+    expect(resolveToken).not.toHaveBeenCalled();
+  });
+
   it("returns the minted token, expiry, and installation id on the happy path", async () => {
     const { deps, resolveToken } = fakeDeps();
     const app = createApp(agentActor(), deps);
