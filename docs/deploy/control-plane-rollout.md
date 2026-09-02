@@ -1,91 +1,197 @@
 ---
 title: Control-Plane Rollout Runbook
-summary: The fold-merge-to-running-container sequence for the live control plane, and the liveness check a closing agent must run
+summary: How merged fold code becomes the running control plane on the wonton host, which lanes roll it, and the liveness check a closing agent must run
 ---
 
 # Control-Plane Rollout Runbook
 
 How merged server code becomes the running control plane at
-`https://paperclip.dvit.io`, who presses each button, and how a closing agent
-proves the code is actually serving.
+`https://paperclip.dvit.io`, which lane rolls it, and how a closing agent proves
+the code is actually serving.
 
-**The one-sentence answer to "what rolls the container?":**
-**Nothing automated. The container is operator-pressed.** `docker.yml` builds and
-publishes a `ghcr.io/tea-core/paperclip:sha-<short>` image on every fold push,
-but no workflow pushes to ECR and no workflow calls `aws ecs update-service`.
-The live plane is an AWS ECS/Fargate service (`paperclip-server`, cluster
-`paperclip`) whose image comes from ECR (`<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/paperclip-server:latest`),
-and the ECR push plus the service update are manual, performed by a human
-operator. A green "buildability" run is a build check, not a deploy.
+**The one-sentence answer to "what rolls the container?":** a cron-driven
+rollout driver on the host, in a daily unattended window. The live plane is a
+**Docker Compose stack on the intranet host `wonton`** — not a cloud service —
+and the swap is performed by `deploy-image.sh`, which quiesces dispatch, drains
+in-flight agent runs, swaps the container behind gates, and rolls back on
+failure.
 
-## Trigger condition and owner
+> **This deployment does not use AWS.** There is no ECR repository, no ECS
+> service, no Fargate task, and no workflow that calls `aws ecs update-service`.
+> [`docs/deploy/aws-ecs.md`](aws-ecs.md) is *product* documentation for users
+> deploying their own Paperclip to AWS; it does not describe this fork's plane.
+> An earlier revision of this runbook told operators to `docker push` to ECR and
+> roll an ECS service `paperclip-server` in cluster `paperclip`. Those commands
+> address infrastructure that does not exist here, and cards that cited them
+> (SUP-14774) could never be executed. Do not reintroduce them.
 
-- **Trigger:** after a PR that touches server code merges onto the fold branch
-  (`fold/**`), an operator decides when to roll the merged code out. There is no
-  schedule, no webhook, and no bot that does this.
-- **Owner of the rollout action (Steps 4–5):** the **human board operator** —
-  the user who holds the AWS account/credentials for the `paperclip-server` ECS
-  service (the responsible user on the open redeploy card, SUP-14694). No agent
-  workspace has AWS credentials, so no agent can perform the rollout without
-  them being wired.
-- **Owner of the liveness verification (Step 7):** the **closing agent** of the
-  card whose consumption point is the plane — this is part of the card's own
-  `done` = Live evidence, not part of the operator's rollout.
+## Where the plane actually runs
+
+| | |
+|---|---|
+| Host | `wonton` — `10.10.10.3`, `paperclip.internal` (since 2026-08-21) |
+| Runtime | Docker Compose: `paperclip-server-1`, `paperclip-db-1` (`postgres:17-alpine`) |
+| Host port | `3101` |
+| Public URL | `https://paperclip.dvit.io` (edge proxy in front of the same container) |
+| Intranet URL | `http://10.10.10.3:3101` |
+| Deployed line | `fold/tea-patches-v2026.722.0` |
+| Image source | `ghcr.io/tea-core/paperclip@<digest>`, published by `docker.yml` on every fold push |
+
+The operational runbook, the compose files and the rollout scripts live in
+`~/stack-admin/paperclip-docker/` **on wonton**. That is a separate repository
+from this one — it is not checked in here, and nothing in this repo deploys
+anything.
 
 ## Fold-merge → running-container sequence
 
 | # | Step | Automated? | Owner |
 |---|------|-----------|-------|
-| 1 | PR merges onto `fold/**` (GitHub) | **Automated** (GitHub merge) | — |
-| 2 | `Fold buildability gate` runs on the merged branch (`install --frozen-lockfile`, typecheck, server build, `docker build`). This is a build check only. | **Automated** (`.github/workflows/fold-deploy-gate.yml`) | — |
-| 3 | `docker.yml` `build-and-push` / `build-and-push-cloud` trigger on the fold push and publish `ghcr.io/tea-core/paperclip:sha-<short>` (and `sha-<short>-cloud`). This produces an image artifact; **it is not deployed anywhere**. | **Automated** (`.github/workflows/docker.yml`) | — |
-| 4 | Build the ECR image at the target commit and push `paperclip-server:latest` to ECR. | **Manual** — see the commands below | Human board operator |
-| 5 | Roll the ECS service: `aws ecs update-service --cluster paperclip --service paperclip-server --force-new-deployment`. | **Manual** (initiated by operator) | Human board operator |
-| 6 | ECS rolling update: new task starts, passes the `/api/health` container health check, old task drains. | **Automated** (ECS orchestrator, but only because step 5 was pressed) | — |
-| 7 | Liveness verification: `GET /api/health` returns the target commit. | **Manual** — performed by whoever closes the consuming card | Closing agent |
+| 1 | PR merges onto `fold/**` through the merge queue | **Automated** (GitHub) | — |
+| 2 | `Fold buildability gate` runs on the merged branch (`install --frozen-lockfile`, typecheck, server build, `docker build`). Build check only. | **Automated** (`.github/workflows/fold-deploy-gate.yml`) | — |
+| 3 | `docker.yml` publishes `ghcr.io/tea-core/paperclip:sha-<short>` (and `sha-<short>-cloud`). This is the artifact the rollout consumes. | **Automated** (`.github/workflows/docker.yml`) | — |
+| 4 | `auto-rollout.sh` decides whether the fold tip is eligible, pulls the image by digest and retags it `tea-core/paperclip:fold-<short>`. | **Automated** (daily cron on wonton) | — |
+| 5 | `deploy-image.sh <tag>` runs the gated swap (below). | **Automated** (invoked by step 4) | — |
+| 6 | Liveness verification: `GET /api/health` reports the target commit. | **Manual** — performed by whoever closes the consuming card | Closing agent |
 
-Steps 4 and 5 are the entire manual surface. The commands (from
-[`docs/deploy/aws-ecs.md`](aws-ecs.md)):
+Steps 4–5 are **not** a manual operator surface in the normal case. See the
+lanes below for the cases where a human is required.
 
-```bash
-export AWS_REGION=us-east-1
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+## The three rollout lanes
 
-# Set the APPROVED target commit the rollout is pinned to. Use the full SHA of
-# the approved merge; never copy a filing-time example SHA.
-export TARGET_COMMIT="approved-full-commit-sha"
+### 1. Daily window (the normal path)
 
-# Step 4 — build and push the ECR image at $TARGET_COMMIT
-git checkout "$TARGET_COMMIT"
-docker build --platform linux/amd64 --target production \
-  --build-arg PAPERCLIP_BUILD_COMMIT="$TARGET_COMMIT" \
-  -t paperclip-server .
-docker tag paperclip-server:latest \
-  $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest
-aws ecr get-login-password --region $AWS_REGION \
-  | docker login --username AWS --password-stdin \
-    $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-docker push \
-  $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paperclip-server:latest
+A cron entry on wonton runs the driver once a day, unattended:
 
-# Step 5 — roll the service
-aws ecs update-service \
-  --cluster paperclip \
-  --service paperclip-server \
-  --force-new-deployment
+```
+47 11 * * * auto-rollout.sh --execute --detach --retry-window 7200
 ```
 
-The image is built from the `production` stage (never the `cloud` stage for the
-self-hosted plane), and `--platform linux/amd64` matches Fargate's default
-X86_64 runtime. `PAPERCLIP_BUILD_COMMIT` bakes the commit SHA into the image so
-`/api/health` can report it. `TARGET_COMMIT` is deliberately not prefilled with
-an example SHA: the operator must set it to the specific approved merge the
-rollout is pinned to, or the resulting image would silently serve an old commit.
+`auto-rollout.sh` never deploys blindly. Before it calls `deploy-image.sh` it
+requires all of the following, and emits a single `decision:` line recording the
+outcome (`deploy`, `hold`, or `blocked`):
+
+- the target commit is the tip of the deployed fold branch;
+- `fold-deploy-gate` **and** `docker` are both green on that exact SHA;
+- ghcr has a manifest for the `sha-<short>` tag, and the image config's
+  `org.opencontainers.image.revision` label equals that commit — a tag whose
+  label names a different commit is `blocked`, not deployed;
+- the image carries **no new migrations** (see below).
+
+Batching is deliberate. Every rollout costs a drain, and the fold branch has
+taken merges as often as one per ~80 minutes; a per-merge rollout would leave
+dispatch quiesced for most of the day. The cost is per-*deploy*, not per-merge.
+
+For the same reason, do not replace this with a pull-and-restart watcher
+(watchtower or equivalent): no quiesce, no drain, no lineage preflight and no
+gates is exactly the 2026-07-31 failure that destroyed 17 in-flight agent runs.
+
+**Diagnose a stalled rollout from the absence of the `decision:` line**, never
+from the gate `success` lines above it. A driver that dies before deciding
+prints a plausible-looking partial log. Alerts go to ntfy topic
+`paperclip-rollout`.
+
+### 2. Urgent lane (agent-initiated, approval-gated)
+
+An agent that needs a fix rolled sooner than the daily window does **not** need
+host access. It files a board approval:
+
+```
+paperclipCreateApproval
+  type:    "request_board_approval"
+  payload: { kind:  "urgent_rollout",
+             title: "...",
+             body:  "<why this cannot wait>",
+             tip:   "<optional 40-char SHA; omit for the branch tip>" }
+```
+
+A watcher on wonton polls every 5 minutes and fires once the approval reaches
+`approved`. The signal is the board's existing decision path, so the request is
+attributable to the requesting agent and the decision is recorded in the product
+rather than in a log on the host.
+
+What this grants is narrow: **it changes the timing of a deploy that was already
+going to happen.** Every `auto-rollout.sh` gate above still applies, the drain is
+not skippable from this lane, and no drain knob is exposed. A 4-hour cooldown
+bounds how often the fleet can pay a drain.
+
+### 3. Human operator (migration-carrying images only)
+
+`auto-rollout.sh` **refuses** to ship an image that carries new migrations, and
+this is the one case that genuinely requires a human. The compose file sets
+`PAPERCLIP_MIGRATION_AUTO_APPLY=true`, so such an image mutates the schema on
+startup, while `deploy-image.sh`'s rollback re-tags the *image* — it cannot
+revert the schema. An automatic rollback would therefore land the OLD image on
+the NEW schema, and whether that is tolerable is per-migration and unverified.
+
+The operator action is an **SSH-to-wonton deploy**, not a cloud API call:
+
+```bash
+ssh wonton
+cd ~/stack-admin/paperclip-docker
+
+# 1. confirm what the driver would do, changing nothing
+./scripts/auto-rollout.sh --plan
+
+# 2. resolve and pull the approved image, then run the gated swap
+./scripts/deploy-image.sh tea-core/paperclip:fold-<short>
+```
+
+Do **not** hand-run `docker tag` + `docker compose up -d`. A bare restart
+SIGKILLs every in-flight `opencode run`, and runs last 20–90 minutes.
+
+Two further traps on this path, both load-bearing:
+
+- **Build from the right tree.** The deployed line is the
+  `fold/tea-patches-v2026.722.0` worktree on wonton. A different local checkout
+  named `paperclip` can sit ~100 migrations behind while still producing a
+  container that serves `/api/health` 200, renders the UI, and logs no startup
+  error — with every heartbeat dying on a missing column. Prefer the CI-published
+  ghcr image: a local `docker build` produces no `org.opencontainers.image.*`
+  labels, which blinds both the preflight and the rollout driver's revision check.
+- **Always pass the compose file set.** An explicit `-f` disables compose's
+  automatic loading of `docker-compose.override.yml`, silently dropping
+  `PAPERCLIP_ALLOWED_HOSTNAMES` (the server then 403s every request whose Host it
+  does not know, including `paperclip.internal`) and the db memory limits.
+  `deploy-image.sh` already handles this; ad-hoc commands do not.
+
+## What `deploy-image.sh` actually does
+
+The script exists because container replacement destroys in-flight agent work. A
+few seconds of HTTP 503 is not the cost worth avoiding — the runs are.
+
+1. **Lineage gate** — `preflight-image.sh --image <tag>` compares the image's
+   migration history against what the live DB has applied; refuses on mismatch.
+2. **Rollback anchor** — tags the currently-running image `rollback-<id>` before
+   touching anything.
+3. **Quiesce** — `POST /api/instance/dispatch-quiesce`, which gates new dispatch
+   and **cancels nothing**. The response carries the in-flight run count.
+   *Never* quiesce by pausing agents: `POST /agents/:id/pause` calls
+   `cancelActiveForAgent`, which cancels every queued/running run — on
+   2026-08-01 that killed 14 live runs and the drain then reported
+   "drained after 0s".
+4. **Drain** — polls `GET /api/instance/dispatch-quiesce` until `inFlightRuns`
+   reaches 0, deadline-bounded (`--drain-deadline`, default 5400s). On timeout it
+   **aborts rather than killing runs**; `--skip-drain` is the explicit opt-in to
+   losing them. If the count becomes unreadable mid-drain it aborts too.
+5. **Swap** — retags the live tag and recreates the containers, in place.
+   Never blue/green: run liveness is keyed on `process_pid` with no instance
+   identity, so a second container's reaper would classify the first's live runs
+   as orphans.
+6. **Verify** — health 200, then the *heartbeat* path: `errorMissingColumn` and
+   `heartbeat execution setup failed` must both be 0, measured against a baseline
+   sampled **before** the quiesce. Any gate failing triggers an automatic
+   rollback to the anchor.
+7. **Resume** — via an EXIT trap, so dispatch returns even if the script dies
+   mid-flight. A quiesce that could not be released is retained in
+   `~/.paperclip/deploy-state/quiesced-by-deploy.txt` and blocks the next deploy
+   until cleared; recover with `./scripts/deploy-image.sh --resume-only`.
+
+Zero *work* loss, at the cost of a ~20s API gap during the swap.
 
 ## Liveness check a closing agent must run
 
 `done` = Live. A server-side card is only live when the **running** plane serves
-the merged commit — CI green and "deploy gate" green do not prove that.
+the merged commit — CI green and a green buildability gate do not prove that.
 
 Probe the deployed plane, not the repo:
 
@@ -97,45 +203,43 @@ curl -sf https://paperclip.dvit.io/api/health
 Pass criteria:
 
 - `.status` is `ok`.
-- `.commit` is the merge commit (or an ancestor-of-the-merge that contains it)
-  that the card's code merged as. Treat the target merge as the base and the
-  served commit as the head — accept `identical` or `ahead` (behind_by `0`),
-  which means the served plane contains the target merge:
-  `gh api repos/tea-core/paperclip/compare/<target-merge-sha>...<served-commit> --jq '.status, .behind_by'`.
+- `.commit` is the merge commit (or a descendant containing it) that the card's
+  code merged as. Treat the target merge as the base and the served commit as the
+  head — accept `identical` or `ahead` (behind_by `0`), which means the served
+  plane contains the target merge:
+  `gh api repos/TEA-Core/paperclip/compare/<target-merge-sha>...<served-commit> --jq '.status, .behind_by'`.
   When the requirement is specifically "the plane serves the fold tip", require
-  exact SHA equality: `.commit` must equal the fold tip SHA
-  (`git rev-parse origin/fold/tea-patches-v2026.722.0`). The served-commit-then-
-  fold-tip comparison is the wrong direction for that check and is not used here.
-- For byte-level proof, diff the deployed tree against the commit (see SUP-14694
-  for the blob-identity method).
+  exact SHA equality: `.commit` must equal
+  `git rev-parse origin/fold/tea-patches-v2026.722.0`.
 
 **The "Fold buildability gate" workflow conclusion is NOT a liveness check.** It
-only proves the merged branch *can* be built (`install`/typecheck/server-build/
-`docker build`). It does not build an image for the plane, publish to ECR, or
-roll the ECS service — a green run while the plane is stale is the exact
-"green when skipped" failure mode `done-definition.md` forbids. Never quote a
-workflow conclusion as evidence that code is serving.
+only proves the merged branch *can* be built. It does not publish the image the
+plane consumes and it does not roll the container — a green run while the plane
+is stale is the exact "green when skipped" failure mode the company's
+done-definition doctrine forbids. Never quote a workflow conclusion as evidence
+that code is serving.
 
-## Outstanding rollout debt at filing time (2026-09-01T08:15Z)
+## Measuring rollout debt
 
-As of filing, the live plane served `922b9dc7f` (PR #426, merged
-2026-08-31T14:34:07Z) while the fold branch was 5 commits ahead. These merges
-are merged-but-not-serving and constitute the rollout debt:
+Rollout debt is the set of merges that are on the fold branch but not in the
+served image. Compute it rather than reading a stale table:
 
-| merge | at | card |
-|---|---|---|
-| `ee75f2b57` (#432) | 2026-08-31T20:12:06Z | SUP-14640 |
-| `e368a9e9c` (#435) | 2026-09-01T02:01:17Z | SUP-14644 |
-| `eff52af40` (#437) | 2026-09-01T03:16:48Z | ADR-091 D1 |
-| `171333836` (#440) | 2026-09-01T07:01:04Z | SUP-14685 |
-| `d1eecef04` (#433) | 2026-09-01T07:58:29Z | SUP-14642 |
+```bash
+SERVED=$(curl -sf https://paperclip.dvit.io/api/health | jq -r .commit)
+git fetch origin fold/tea-patches-v2026.722.0
+git log --oneline "$SERVED..origin/fold/tea-patches-v2026.722.0"
+```
 
-The redeploy itself is **SUP-14694** (currently blocked on SUP-14645) — do not
-race it. The backfill work that consumes a fresh plane is SUP-14693.
+An empty list means the plane is current. A non-empty list is normal *within* a
+daily window; it is a fault only if it spans more than one window, which points
+at a `blocked`/`hold` decision (or a driver that never reached its `decision:`
+line) rather than at the merges themselves.
 
 ## Related
 
-- [`docs/deploy/aws-ecs.md`](aws-ecs.md) — full ECS setup, `docker/ecs-task-definition.json` template, and the deployment/rollback commands.
 - `.github/workflows/fold-deploy-gate.yml` — the buildability gate (renamed from "Fold deploy gate" by SUP-14706 so a green run cannot be read as a deploy).
-- `.github/workflows/docker.yml` — image build + publish to ghcr.io (artifact production, not deployment).
-- `docs/deploy/dev-plane-restart-hygiene.md` — restart hygiene for dev/shared planes (dispatch quiesce before a swap).
+- `.github/workflows/docker.yml` — image build + publish to ghcr.io; this is the artifact the rollout consumes.
+- [`docs/deploy/dev-plane-restart-hygiene.md`](dev-plane-restart-hygiene.md) — restart hygiene for dev/shared planes (dispatch quiesce before a swap).
+- [`docs/deploy/docker.md`](docker.md) — the Docker Compose deployment this plane is an instance of.
+- [`docs/deploy/aws-ecs.md`](aws-ecs.md) — **product documentation** for users deploying Paperclip to AWS. Not this deployment. Nothing in this runbook depends on it.
+- `~/stack-admin/paperclip-docker/README.md` **on wonton** — the operational runbook for this host: image build, merge-queue gates, deploy, and recovery.
