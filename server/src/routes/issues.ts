@@ -511,7 +511,7 @@ function requiresPaperclipAttachmentMetadata(input: {
  * null for non-PR work products or PRs with no resolvable GitHub reference, in
  * which case the work product is recorded with no carrier fan-out.
  */
-function prDeliverySignature(input: {
+export function prDeliverySignature(input: {
   type?: unknown;
   externalId?: string | null;
   url?: string | null;
@@ -519,26 +519,29 @@ function prDeliverySignature(input: {
 }): { repository: string; prNumber: number; externalId: string } | null {
   if (input.type !== "pull_request") return null;
   const metadata = input.metadata ?? {};
-  let repository =
+  const metaRepo =
     typeof metadata.repository === "string" &&
     /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(metadata.repository)
       ? metadata.repository
       : null;
-  let prNumber =
+  const metaPr =
     typeof metadata.prNumber === "number" &&
     Number.isInteger(metadata.prNumber) &&
     metadata.prNumber > 0
       ? metadata.prNumber
       : null;
-  if ((!repository || !prNumber) && typeof input.url === "string") {
+  if (metaRepo && metaPr) {
+    return { repository: metaRepo, prNumber: metaPr, externalId: `${metaRepo}#${metaPr}` };
+  }
+  if (typeof input.url === "string") {
     const match = input.url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
     if (match && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(match[1]) && Number(match[2]) > 0) {
-      repository ??= match[1];
-      prNumber ??= Number(match[2]);
+      const repo = match[1];
+      const prNum = Number(match[2]);
+      return { repository: repo, prNumber: prNum, externalId: `${repo}#${prNum}` };
     }
   }
-  if (!repository || !prNumber) return null;
-  return { repository, prNumber, externalId: `${repository}#${prNumber}` };
+  return null;
 }
 
 const attachmentArtifactMetadataInputSchema = z.object({

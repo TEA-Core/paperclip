@@ -13,6 +13,69 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { prDeliveryService } from "../services/pr-delivery.js";
+import { prDeliverySignature } from "../routes/issues.js";
+
+describe("prDeliverySignature (unit)", () => {
+  it("returns null for non-pull_request types", () => {
+    expect(prDeliverySignature({ type: "artifact", url: "https://github.com/o/r/pull/1", metadata: {} })).toBeNull();
+  });
+
+  it("resolves both from metadata when they form a complete valid pair", () => {
+    const result = prDeliverySignature({
+      type: "pull_request",
+      url: "https://github.com/other/repo/pull/999",
+      metadata: { repository: "TEA-Core/paperclip", prNumber: 438 },
+    });
+    expect(result).toEqual({ repository: "TEA-Core/paperclip", prNumber: 438, externalId: "TEA-Core/paperclip#438" });
+  });
+
+  it("resolves both from URL when metadata is a mixed source (repository valid, prNumber absent)", () => {
+    const result = prDeliverySignature({
+      type: "pull_request",
+      url: "https://github.com/TEA-Core/Trading-Signal-Platform/pull/3417",
+      metadata: { repository: "TEA-Core/paperclip" },
+    });
+    expect(result).toEqual({ repository: "TEA-Core/Trading-Signal-Platform", prNumber: 3417, externalId: "TEA-Core/Trading-Signal-Platform#3417" });
+  });
+
+  it("resolves both from URL when metadata is a mixed source (prNumber valid, repository absent)", () => {
+    const result = prDeliverySignature({
+      type: "pull_request",
+      url: "https://github.com/TEA-Core/Trading-Signal-Platform/pull/3417",
+      metadata: { prNumber: 999 },
+    });
+    expect(result).toEqual({ repository: "TEA-Core/Trading-Signal-Platform", prNumber: 3417, externalId: "TEA-Core/Trading-Signal-Platform#3417" });
+  });
+
+  it("resolves both from URL when metadata has no valid fields", () => {
+    const result = prDeliverySignature({
+      type: "pull_request",
+      url: "https://github.com/TEA-Core/paperclip/pull/438",
+      metadata: { foo: "bar" },
+    });
+    expect(result).toEqual({ repository: "TEA-Core/paperclip", prNumber: 438, externalId: "TEA-Core/paperclip#438" });
+  });
+
+  it("returns null when neither metadata nor URL yields a complete pair", () => {
+    expect(
+      prDeliverySignature({
+        type: "pull_request",
+        url: "https://example.com/not-a-github-url",
+        metadata: { repository: "only/repo" },
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null when metadata pair is incomplete and URL is null", () => {
+    expect(
+      prDeliverySignature({
+        type: "pull_request",
+        url: null,
+        metadata: { repository: "TEA-Core/paperclip" },
+      }),
+    ).toBeNull();
+  });
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
