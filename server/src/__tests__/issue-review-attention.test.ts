@@ -239,6 +239,45 @@ describeEmbeddedPostgres("issue review attention", () => {
     ]));
   });
 
+  it("classifies an escalated human hold as stalled without loosening healthy reviews", async () => {
+    const { companyId, agentId } = await seed();
+    // Escalated hold: the card is parked on a human (assigneeUserId set, agent
+    // assignee cleared) and that same human is the pending
+    // executionState.currentParticipant, with the agent preserved as the return
+    // assignee. Both user-shaped review paths resolve to the hold user, so none
+    // of them is a maintained action path -> the hold is `stalled` (SUP-14806).
+    const holdUserId = "esc-hold-user";
+    const escalatedHoldIssueId = await insertReview({
+      companyId,
+      agentId,
+      identifier: "RVA-ESC-1",
+      assigneeUserId: holdUserId,
+      executionState: {
+        status: "pending",
+        currentParticipant: { type: "user", userId: holdUserId },
+        returnAssignee: { type: "agent", agentId },
+      },
+    });
+    // Regression: a live agent participant is a maintained path -> stays covered.
+    const agentParticipantIssueId = await insertReview({
+      companyId,
+      agentId,
+      identifier: "RVA-ESC-2",
+      executionState: { status: "pending", currentParticipant: { type: "agent", agentId } },
+    });
+
+    const rows = await svc.list(companyId, { status: "in_review" });
+    const byId = new Map(rows.map((row) => [row.id, row.reviewAttention]));
+    expect(byId.get(escalatedHoldIssueId)).toMatchObject({
+      state: "stalled",
+      paths: [],
+    });
+    expect(byId.get(agentParticipantIssueId)).toMatchObject({
+      state: "covered",
+      paths: [expect.objectContaining({ kind: "execution_participant" })],
+    });
+  });
+
   it("does not let a transiently skipped recovery consume its fingerprint", async () => {
     const { companyId, agentId } = await seed();
     const idempotencyKey = `issue_review_path_lost:${randomUUID()}:fingerprint`;
