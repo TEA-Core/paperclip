@@ -792,7 +792,8 @@ function extractHeadEvidence(event: Record<string, unknown>): HeadEvidence | nul
 type TimelineHeadEvents =
   | { kind: "ok"; headAtApproval: string | null; sawCommittedHeadEvent: boolean }
   | { kind: "truncated"; headAtApproval: string | null; sawCommittedHeadEvent: boolean }
-  | { kind: "failed"; detail: string };
+  | { kind: "failed"; detail: string }
+  | { kind: "unparseable"; detail: string };
 
 /**
  * Fetch the PR timeline and recover the verified head-at-approval: the newest
@@ -837,9 +838,13 @@ async function readPrTimelineHeadEvents(
       const info = extractHeadEvidence(event);
       if (info === null) continue;
       if (info.kind === "unparseable") {
+        // A structurally malformed head-mutating event is DETERMINISTIC, not a
+        // transient read failure. Report it as its own outcome so the caller can
+        // apply a different caching policy than the HTTP/network `failed` case
+        // (backfill-unparseable-event-misclassified-transient).
         return {
-          kind: "failed",
-          detail: "timeline-read-failed: unparseable head-mutating event; refusing to anchor",
+          kind: "unparseable",
+          detail: "unparseable head-mutating event; refusing to anchor",
         };
       }
       if (info.kind === "committed") {
@@ -1018,6 +1023,26 @@ async function backfillPreDBApprovalAnchor(
     return {
       kind: "skipped",
       reason: "backfill:timeline-read-failed",
+      detail: `backfill: ${timeline.detail}`,
+    };
+  }
+  if (timeline.kind === "unparseable") {
+    // A structurally malformed but stable event (e.g. a head_ref_force_pushed
+    // with a null commit_id) is a DETERMINISTIC refusal: the same bytes are read
+    // on every tick, so persist a named refusal keyed on (live head, approval
+    // time) and skip the timeline re-read while neither changes. This is the
+    // mirror image of the transient `failed` branch above, which stays
+    // non-cached so a recoverable card retries instead of stranding on one
+    // blip (backfill-unparseable-event-misclassified-transient).
+    await persistBackfillRefusal(db, row, {
+      reason: "backfill:unparseable-force-push",
+      observedHeadSha: currentHeadSha,
+      approvedAtMs: approvalTimeMs,
+      observedAt: new Date().toISOString(),
+    });
+    return {
+      kind: "skipped",
+      reason: "backfill:unparseable-force-push",
       detail: `backfill: ${timeline.detail}`,
     };
   }

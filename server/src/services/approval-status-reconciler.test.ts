@@ -131,6 +131,16 @@ const TIMELINE_REAPPROVAL_BODY = [
   { event: "head_ref_force_pushed", commit_id: APPROVED_HEAD, created_at: "2026-08-19T09:00:00Z" },
   { event: "head_ref_force_pushed", commit_id: NEW_HEAD, created_at: "2026-08-21T00:00:00Z" },
 ];
+// A head_ref_force_pushed event whose commit_id is null: structurally malformed
+// but STABLE — the same bytes are read on every tick. Unlike a transient HTTP /
+// network failure (which must be retried next tick), this is a DETERMINISTIC
+// refusal that must be cached as a named refusal, and it must not be reported as
+// a transient timeline-read-failed (backfill-unparseable-event-misclassified-
+// transient).
+const TIMELINE_UNPARSEABLE_FORCE_PUSH_BODY = [
+  { event: "labeled", created_at: "2026-08-19T09:00:00Z" },
+  { event: "head_ref_force_pushed", commit_id: null, created_at: "2026-08-19T10:00:00Z" },
+];
 
 function zeroSummary(): ApprovalStatusReconcilerTickSummary {
   return {
@@ -1796,6 +1806,57 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const summary2 = await runApprovalStatusReconcilerTick(db);
       expect(summary2.skipped["backfill:timeline-read-failed"]).toBe(1);
       expect(timelineCalls()).toBeGreaterThan(readsAfterFirst);
+    });
+
+    it("persists a stable refusal for a deterministic unparseable force-push event, so the next tick does not re-read the timeline (SUP-14747 D-E, backfill-unparseable-event-misclassified-transient)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        // A structurally malformed but stable event: a head_ref_force_pushed with
+        // a null commit_id. Unlike the transient 500 above, the same bytes are
+        // read on every tick, so this is a DETERMINISTIC refusal that must be
+        // cached — and it must NOT be reported as a transient
+        // timeline-read-failed.
+        { url: TIMELINE_URL, body: TIMELINE_UNPARSEABLE_FORCE_PUSH_BODY },
+      ]);
+
+      const timelineCalls = () =>
+        mockGhFetch.mock.calls.filter((call) => String(call[0]) === TIMELINE_URL).length;
+
+      const summary1 = await runApprovalStatusReconcilerTick(db);
+      // The unparseable event is its own deterministic refusal, not the transient
+      // read-failed bucket.
+      expect(summary1.skipped["backfill:unparseable-force-push"]).toBe(1);
+      expect(summary1.skipped["backfill:timeline-read-failed"]).toBeUndefined();
+      expect(summary1.backfilled).toBe(0);
+      const readsAfterFirst = timelineCalls();
+      expect(readsAfterFirst).toBeGreaterThan(0);
+
+      // Zero writes: no anchor is persisted, and the deterministic refusal is.
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      const refusal = approvalStatus.backfillRefusal as Record<string, unknown>;
+      expect(refusal).toMatchObject({
+        reason: "backfill:unparseable-force-push",
+        observedHeadSha: NEW_HEAD,
+        approvedAtMs: new Date(APPROVED_AT).getTime(),
+      });
+
+      // Second tick, same live head + approval time: the persisted refusal
+      // short-circuits the timeline re-read. No additional timeline HTTP calls.
+      const summary2 = await runApprovalStatusReconcilerTick(db);
+      expect(summary2.skipped["backfill:unparseable-force-push"]).toBe(1);
+      expect(timelineCalls()).toBe(readsAfterFirst);
     });
 
     it("re-evaluates a cached backfill refusal when the card is re-approved at a later time with the live head unchanged (SUP-14747 D-E, backfill-refusal-not-keyed-on-approval-time)", async () => {
