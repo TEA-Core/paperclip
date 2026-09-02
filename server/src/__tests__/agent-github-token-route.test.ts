@@ -160,6 +160,23 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
     expect(resolveToken).not.toHaveBeenCalled();
   });
 
+  it("rejects an unknown permission key with a typed 400 that names the key, without minting", async () => {
+    const { deps, resolveToken } = fakeDeps({ tokenResult: null });
+    const app = createApp(agentActor(), deps);
+    const res = await request(app)
+      .post("/api/agents/me/github/installation-tokens")
+      .send({ owner: "owner", repo: "repo", permissions: { contnets: "read" } });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Unrecognized field(s): permissions.contnets");
+    expect(Array.isArray(res.body.details)).toBe(true);
+    const issue = (res.body.details as Array<{ code?: string; keys?: unknown[]; path?: Array<string | number> }>).find(
+      (entry) => entry.code === "unrecognized_keys",
+    );
+    expect(issue?.path?.includes("permissions")).toBe(true);
+    expect(issue?.keys).toContain("contnets");
+    expect(resolveToken).not.toHaveBeenCalled();
+  });
+
   it("returns the minted token, expiry, and installation id on the happy path", async () => {
     const { deps, resolveToken } = fakeDeps();
     const app = createApp(agentActor(), deps);
