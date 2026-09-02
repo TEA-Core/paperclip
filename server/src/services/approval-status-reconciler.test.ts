@@ -94,11 +94,26 @@ const TIMELINE_SAME_HEAD_BODY = [
   { event: "labeled", created_at: "2026-08-19T09:30:00Z" },
   { event: "head_ref_force_pushed", commit_id: NEW_HEAD, created_at: "2026-08-19T10:00:00Z" },
 ];
-// Last head-mutating event at/before the approval is APPROVED_HEAD, which
-// differs from the live head (NEW_HEAD): the head moved after approval.
+// Last verified (server-timed) head at/before the approval is APPROVED_HEAD,
+// which differs from the live head (NEW_HEAD): the head moved after approval.
+// Uses a force-push so the "moved" path is exercised from a server timestamp.
 const TIMELINE_MOVED_HEAD_BODY = [
-  { event: "committed", sha: APPROVED_HEAD, committer: { date: "2026-08-19T09:00:00Z" }, author: { date: "2026-08-19T09:00:00Z" } },
+  { event: "head_ref_force_pushed", commit_id: APPROVED_HEAD, created_at: "2026-08-19T09:00:00Z" },
   { event: "labeled", created_at: "2026-08-19T09:30:00Z" },
+];
+// Only committed (client-timed) head events, no force-push: the head-at-approval
+// cannot be verified to a server timestamp, so the backfill must refuse.
+const TIMELINE_COMMITTED_ONLY_BODY = [
+  { event: "committed", sha: NEW_HEAD, committer: { date: "2026-08-19T09:00:00Z" }, author: { date: "2026-08-19T09:00:00Z" } },
+  { event: "labeled", created_at: "2026-08-19T09:30:00Z" },
+];
+// A committed event whose client-set committer.date sits before the approval,
+// followed by a force-push of the SAME sha whose server created_at sits AFTER
+// the approval. The client date must not place the head at/before the approval;
+// the only server-timed push is post-approval, so no verified head exists.
+const TIMELINE_POST_APPROVAL_PUSH_BODY = [
+  { event: "committed", sha: NEW_HEAD, committer: { date: "2026-08-19T09:00:00Z" }, author: { date: "2026-08-19T09:00:00Z" } },
+  { event: "head_ref_force_pushed", commit_id: NEW_HEAD, created_at: "2026-08-20T01:00:00Z" },
 ];
 // No head-mutating event at/before the approval — the head is unverifiable.
 const TIMELINE_NO_HEAD_EVENT_BODY = [
@@ -1627,6 +1642,105 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(summary.skipped["backfill:no-head-mutating-event"]).toBe(1);
       expect(summary.backfilled).toBe(0);
       expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("refuses the backfill when the head is provable only through committed (client-timed) events, writing no anchor (SUP-14747 D-E, backfill-committed-event-timing)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["backfill:head-unverifiable"]).toBe(1);
+      expect(summary.backfilled).toBe(0);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      expect(approvalStatus.publishedHeadSha).toBeNull();
+    });
+
+    it("does not anchor a head whose force-push landed after the approval even when a committed event's client date is earlier (SUP-14747 D-E, backfill-committed-event-timing)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_POST_APPROVAL_PUSH_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      // The committed event's committer.date sits before the approval, but the
+      // only server-timed push is after it: the head-at-approval cannot be
+      // verified to a server timestamp, so nothing is anchored and nothing is
+      // stamped.
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["backfill:head-unverifiable"]).toBe(1);
+      expect(summary.backfilled).toBe(0);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      expect(approvalStatus.publishedHeadSha).toBeNull();
+    });
+
+    it("skips the timeline re-read on a stable refusal while the live head is unchanged (SUP-14747 D-E, backfill-repeat-fanout)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+      ]);
+
+      const timelineCalls = () =>
+        mockGhFetch.mock.calls.filter((call) => String(call[0]) === TIMELINE_URL).length;
+
+      const summary1 = await runApprovalStatusReconcilerTick(db);
+      expect(summary1.skipped["backfill:head-unverifiable"]).toBe(1);
+      const readsAfterFirst = timelineCalls();
+      expect(readsAfterFirst).toBeGreaterThan(0);
+
+      // Second tick, same live head: the persisted refusal short-circuits the
+      // timeline re-read and re-reports the same refusal.
+      const summary2 = await runApprovalStatusReconcilerTick(db);
+      expect(summary2.skipped["backfill:head-unverifiable"]).toBe(1);
+      expect(timelineCalls()).toBe(readsAfterFirst);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      const refusal = approvalStatus.backfillRefusal as Record<string, unknown>;
+      expect(refusal).toMatchObject({ reason: "backfill:head-unverifiable", observedHeadSha: NEW_HEAD });
     });
 
     it("recovers a stranded card's anchor but refuses to stamp it when the card is not the PR's delivering card (delivery-identity gate) (SUP-14747 D-E)", async () => {

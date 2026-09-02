@@ -753,53 +753,57 @@ export async function evaluateStageIntegrity(
 // head-mutating event at/before the approval) is a recorded refusal, zero writes.
 // ---------------------------------------------------------------------------
 
-type HeadEvent =
-  | { kind: "head"; sha: string; timeMs: number }
+type HeadEvidence =
+  | { kind: "force_pushed"; sha: string; timeMs: number }
+  | { kind: "committed"; sha: string }
   | { kind: "unparseable" };
 
 /**
- * Extract the head-mutating event's sha + timestamp, or flag it as unparseable
- * (a head-mutating event whose sha/time cannot be placed is a fail-closed
- * refusal, never something to silently skip). Non head-mutating events return
- * null. `committed` carries the sha on `.sha` and the time on the committer
- * (falling back to author) date; `head_ref_force_pushed` carries it on
- * `.commit_id` / `.created_at`.
+ * Extract a head-mutating event's evidence. `head_ref_force_pushed` events carry
+ * a server-recorded `created_at` (the moment the push reached GitHub) and are the
+ * only events trusted to place the head "at or before the approval time".
+ * `committed` events carry only client-set `committer.date` / `author.date` and
+ * NO server `created_at` — the API returns none for them, and GitHub orders the
+ * timeline by commit timestamp, not push time — so they are recorded but never
+ * trusted to place the head: a head provable only through committed events is
+ * refused as unverifiable (the backfill-committed-event-timing review finding). A
+ * head-mutating event that cannot be placed (a force-push missing its
+ * `created_at`/`commit_id`, a commit missing its sha) is `unparseable` — a
+ * fail-closed refusal, never a silent skip. Non head-mutating events return null.
  */
-function extractHeadEvent(event: Record<string, unknown>): HeadEvent | null {
+function extractHeadEvidence(event: Record<string, unknown>): HeadEvidence | null {
   const kind = typeof event.event === "string" ? event.event : null;
-  if (kind === "committed") {
-    const sha = typeof event.sha === "string" && event.sha.length > 0 ? event.sha : null;
-    const committer = event.committer as Record<string, unknown> | undefined;
-    const author = event.author as Record<string, unknown> | undefined;
-    const dateStr =
-      (typeof committer?.date === "string" ? committer.date : null) ??
-      (typeof author?.date === "string" ? author.date : null);
-    const timeMs = dateStr ? Date.parse(dateStr) : NaN;
-    return sha && !Number.isNaN(timeMs) ? { kind: "head", sha, timeMs } : { kind: "unparseable" };
-  }
   if (kind === "head_ref_force_pushed") {
     const sha =
       typeof event.commit_id === "string" && event.commit_id.length > 0 ? event.commit_id : null;
     const createdStr = typeof event.created_at === "string" ? event.created_at : null;
     const timeMs = createdStr ? Date.parse(createdStr) : NaN;
-    return sha && !Number.isNaN(timeMs) ? { kind: "head", sha, timeMs } : { kind: "unparseable" };
+    return sha && !Number.isNaN(timeMs) ? { kind: "force_pushed", sha, timeMs } : { kind: "unparseable" };
+  }
+  if (kind === "committed") {
+    const sha = typeof event.sha === "string" && event.sha.length > 0 ? event.sha : null;
+    // No server timestamp: the sha is recorded, but the event cannot place the
+    // head at a trustworthy time.
+    return sha ? { kind: "committed", sha } : { kind: "unparseable" };
   }
   return null;
 }
 
 type TimelineHeadEvents =
-  | { kind: "ok"; shas: string[] }
-  | { kind: "truncated"; shas: string[] }
+  | { kind: "ok"; headAtApproval: string | null; sawCommittedHeadEvent: boolean }
+  | { kind: "truncated"; headAtApproval: string | null; sawCommittedHeadEvent: boolean }
   | { kind: "failed"; detail: string };
 
 /**
- * Fetch the PR timeline and return the SHAs of head-mutating events at or
- * before `cutoffMs`, in chronological order. The timeline is read oldest-first,
- * so the loop stops as soon as it reaches an event past the approval time — at
- * that point every at/before-approval head mutation is already captured. A
- * bounded fan-out that exhausts its pages without reaching the end of the
- * timeline (or passing the approval time) is reported `truncated` so the caller
- * refuses rather than anchoring a head it cannot prove.
+ * Fetch the PR timeline and recover the verified head-at-approval: the newest
+ * `head_ref_force_pushed` event whose server-recorded `created_at` is at or
+ * before `cutoffMs` (in chronological order — the PR timeline's own order). The
+ * loop reads oldest-first and stops as soon as it reaches a force-push past the
+ * approval time, so every at/before-approval push is already captured. `committed`
+ * events are recorded (`sawCommittedHeadEvent`) but never trusted to place the
+ * head. A bounded fan-out that exhausts its pages without reaching the end of the
+ * timeline (or passing the approval time via a force-push) is reported
+ * `truncated` so the caller refuses rather than anchoring a head it cannot prove.
  */
 async function readPrTimelineHeadEvents(
   db: Db,
@@ -809,7 +813,8 @@ async function readPrTimelineHeadEvents(
   number: number,
   cutoffMs: number,
 ): Promise<TimelineHeadEvents> {
-  const shas: string[] = [];
+  let headAtApproval: string | null = null;
+  let sawCommittedHeadEvent = false;
   let complete = false;
 
   outer: for (let page = 1; page <= MAX_BACKFILL_TIMELINE_PAGES; page++) {
@@ -829,7 +834,7 @@ async function readPrTimelineHeadEvents(
     }
     for (const event of items) {
       if (!event || typeof event !== "object") continue;
-      const info = extractHeadEvent(event);
+      const info = extractHeadEvidence(event);
       if (info === null) continue;
       if (info.kind === "unparseable") {
         return {
@@ -837,8 +842,13 @@ async function readPrTimelineHeadEvents(
           detail: "timeline-read-failed: unparseable head-mutating event; refusing to anchor",
         };
       }
+      if (info.kind === "committed") {
+        sawCommittedHeadEvent = true;
+        continue;
+      }
+      // force_pushed — the only events with a trustworthy server timestamp.
       if (info.timeMs <= cutoffMs) {
-        shas.push(info.sha);
+        headAtApproval = info.sha;
       } else {
         complete = true;
         break outer;
@@ -850,7 +860,9 @@ async function readPrTimelineHeadEvents(
     }
   }
 
-  return complete ? { kind: "ok", shas } : { kind: "truncated", shas };
+  return complete
+    ? { kind: "ok", headAtApproval, sawCommittedHeadEvent }
+    : { kind: "truncated", headAtApproval, sawCommittedHeadEvent };
 }
 
 type BackfillOutcome =
@@ -858,15 +870,67 @@ type BackfillOutcome =
   | { kind: "skipped"; reason: string; detail: string };
 
 /**
+ * A stable backfill refusal persisted on the card's executionState.approvalStatus
+ * so the next reconciler tick can re-report it without re-reading the PR
+ * timeline while the live head is unchanged (the backfill-repeat-fanout review
+ * finding). `observedHeadSha` is the live head the refusal was derived against.
+ */
+type BackfillRefusal = {
+  reason: string;
+  observedHeadSha: string;
+  observedAt: string;
+};
+
+function readBackfillRefusal(row: CandidateRow): BackfillRefusal | null {
+  const approvalStatus =
+    (row.executionState?.approvalStatus as Record<string, unknown> | null | undefined) ?? null;
+  if (!approvalStatus || typeof approvalStatus !== "object") return null;
+  const raw = approvalStatus.backfillRefusal;
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (
+    typeof obj.reason !== "string" ||
+    typeof obj.observedHeadSha !== "string" ||
+    obj.observedHeadSha.length === 0
+  ) {
+    return null;
+  }
+  return {
+    reason: obj.reason,
+    observedHeadSha: obj.observedHeadSha,
+    observedAt: typeof obj.observedAt === "string" ? obj.observedAt : "",
+  };
+}
+
+async function persistBackfillRefusal(
+  db: Db,
+  row: CandidateRow,
+  refusal: BackfillRefusal,
+): Promise<void> {
+  const currentState = row.executionState ?? {};
+  const existing = (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
+  const nextExecutionState: Record<string, unknown> = {
+    ...currentState,
+    approvalStatus: { ...existing, backfillRefusal: refusal },
+  };
+  await db
+    .update(issues)
+    .set({ executionState: nextExecutionState })
+    .where(eq(issues.id, row.id));
+  row.executionState = nextExecutionState;
+}
+
+/**
  * SUP-14747: recover the D-B approval anchor for a stranded pre-D-B first
  * publish. Reads the card's approval time (latest approved decision), derives
- * the head-at-approval-time from the PR timeline, and — only when that head
- * still equals the live head — writes approvalStatus.approvedHeadSha +
- * approvedAt so the unmodified first-publish path certifies it. Refuses (with
- * a recorded reason, zero writes) whenever the head moved after approval or the
- * timeline cannot be positively read. On success it also re-sets row.executionState
- * so the post-success publishedHeadSha stamp below persists the recovered anchor
- * alongside the stamp it writes.
+ * the verified head-at-approval-time from the PR timeline (the newest force-push
+ * whose server-recorded `created_at` is at/before the approval), and — only when
+ * that head still equals the live head — writes approvalStatus.approvedHeadSha +
+ * approvedAt so the unmodified first-publish path certifies it. A head provable
+ * only through committed (client-timed) events, or any head we cannot verify to a
+ * server timestamp, is refused with a recorded reason and zero writes. A stable
+ * refusal is persisted on the card so the next tick skips the timeline re-read
+ * while the live head is unchanged (backfill-repeat-fanout).
  */
 async function backfillPreDBApprovalAnchor(
   db: Db,
@@ -896,6 +960,20 @@ async function backfillPreDBApprovalAnchor(
   }
   const approvalTimeMs = decision.createdAt.getTime();
 
+  // Finding 3 (backfill-repeat-fanout): a stable refusal is a deterministic
+  // function of (timeline, live head, approval time). While the live head is the
+  // same one the last refusal was derived against, re-report it and skip the
+  // timeline re-read. A new live head clears the marker (observedHeadSha
+  // mismatch) and forces a fresh read.
+  const cached = readBackfillRefusal(row);
+  if (cached && cached.observedHeadSha === currentHeadSha) {
+    return {
+      kind: "skipped",
+      reason: cached.reason,
+      detail: `backfill: stable refusal ${cached.reason} (observed head ${cached.observedHeadSha.slice(0, 7)} unchanged since ${cached.observedAt || "an earlier tick"}); skipping the timeline re-read for ${target.displayName}`,
+    };
+  }
+
   const timeline = await readPrTimelineHeadEvents(
     db,
     row.companyId,
@@ -905,41 +983,65 @@ async function backfillPreDBApprovalAnchor(
     approvalTimeMs,
   );
   if (timeline.kind === "failed") {
+    await persistBackfillRefusal(db, row, {
+      reason: "backfill:timeline-read-failed",
+      observedHeadSha: currentHeadSha,
+      observedAt: new Date().toISOString(),
+    });
     return { kind: "skipped", reason: "backfill:timeline-read-failed", detail: `backfill: ${timeline.detail}` };
   }
   if (timeline.kind === "truncated") {
+    await persistBackfillRefusal(db, row, {
+      reason: "backfill:timeline-truncated",
+      observedHeadSha: currentHeadSha,
+      observedAt: new Date().toISOString(),
+    });
     return {
       kind: "skipped",
       reason: "backfill:timeline-truncated",
       detail: `backfill: PR timeline for ${target.displayName} is incomplete and cannot be positively read up to the approval time; refusing to anchor an unverifiable head`,
     };
   }
-  if (timeline.shas.length === 0) {
-    return {
-      kind: "skipped",
-      reason: "backfill:no-head-mutating-event",
-      detail: `backfill: no committed / head_ref_force_pushed event at or before the approval time for ${target.displayName}; refusing to anchor an unverifiable head`,
-    };
-  }
-  const headAtApprovalTime = timeline.shas[timeline.shas.length - 1]!;
 
-  if (headAtApprovalTime !== currentHeadSha) {
+  if (timeline.headAtApproval === null) {
+    const reason = timeline.sawCommittedHeadEvent
+      ? "backfill:head-unverifiable"
+      : "backfill:no-head-mutating-event";
+    const detail = timeline.sawCommittedHeadEvent
+      ? `backfill: ${target.displayName} shows only committed (client-timed) head events at or before the approval ${decision.createdAt.toISOString()} and no force-pushed (server-timed) head; the head-at-approval cannot be verified to a server timestamp; refusing to anchor an unverifiable head`
+      : `backfill: no committed / head_ref_force_pushed event at or before the approval time for ${target.displayName}; refusing to anchor an unverifiable head`;
+    await persistBackfillRefusal(db, row, {
+      reason,
+      observedHeadSha: currentHeadSha,
+      observedAt: new Date().toISOString(),
+    });
+    return { kind: "skipped", reason, detail };
+  }
+
+  if (timeline.headAtApproval !== currentHeadSha) {
+    await persistBackfillRefusal(db, row, {
+      reason: "backfill:head-moved-since-approval",
+      observedHeadSha: currentHeadSha,
+      observedAt: new Date().toISOString(),
+    });
     return {
       kind: "skipped",
       reason: "backfill:head-moved-since-approval",
-      detail: `backfill: head at approval time ${headAtApprovalTime.slice(0, 7)} differs from the live head ${currentHeadSha.slice(0, 7)}; the reviewed code is no longer the head; refusing and leaving the card for re-review`,
+      detail: `backfill: verified head at approval time ${timeline.headAtApproval.slice(0, 7)} differs from the live head ${currentHeadSha.slice(0, 7)}; the reviewed code is no longer the head; refusing and leaving the card for re-review`,
     };
   }
 
   const existingApprovalStatus =
     ((row.executionState?.approvalStatus as Record<string, unknown> | null | undefined) ?? {});
+  const nextApprovalStatus: Record<string, unknown> = {
+    ...existingApprovalStatus,
+    approvedHeadSha: timeline.headAtApproval,
+    approvedAt: decision.createdAt.toISOString(),
+  };
+  delete nextApprovalStatus.backfillRefusal;
   const nextExecutionState: Record<string, unknown> = {
     ...(row.executionState ?? {}),
-    approvalStatus: {
-      ...existingApprovalStatus,
-      approvedHeadSha: headAtApprovalTime,
-      approvedAt: decision.createdAt.toISOString(),
-    },
+    approvalStatus: nextApprovalStatus,
   };
   await db
     .update(issues)
@@ -949,8 +1051,8 @@ async function backfillPreDBApprovalAnchor(
 
   return {
     kind: "backfilled",
-    anchorHeadSha: headAtApprovalTime,
-    detail: `backfill: anchored ${headAtApprovalTime.slice(0, 7)} from the ${target.displayName} timeline (approved ${decision.createdAt.toISOString()})`,
+    anchorHeadSha: timeline.headAtApproval,
+    detail: `backfill: anchored ${timeline.headAtApproval.slice(0, 7)} from the ${target.displayName} timeline (approved ${decision.createdAt.toISOString()})`,
   };
 }
 
