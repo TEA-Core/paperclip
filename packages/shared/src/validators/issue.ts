@@ -512,8 +512,13 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(schema: z.ZodObje
  * that set dependencies at create time produced a tree that looked fired and had zero dependency
  * edges. Strictness turns every such payload into a 400 that names the offending key.
  *
- * `.strict()` propagates through `.partial()`, `.omit()` and `.extend()`, so the update, input and
- * child schemas derived from this one inherit it.
+ * `.strict()` propagates through `.partial()`, `.omit()` and `.extend()`, so the input and
+ * child schemas derived from this one inherit it. The update schema is one exception to the
+ * inheritance: `objectWithoutDefaults` rebuilds the shape with a bare `z.object()` and drops the
+ * base strictness, so `updateIssueObjectSchema` re-asserts `.strict()` by hand. The end result is
+ * that create and update agree on unknown-key handling — both reject an unrecognized key with a
+ * 400 that names it — so neither path can silently discard a supplied field such as a misspelled
+ * parent reference (`parentIssueId` for `parentId`).
  */
 const createIssueBaseSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
