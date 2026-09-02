@@ -629,10 +629,19 @@ function isDeliveredByCardIdentifierPrefix(
 }
 
 /** ADR-091 D4: the fail-closed refusal when delivery identity is unresolvable. */
-function deliveryIdentityUnresolvedOutcome(branch: string | null): ArmingOutcome {
-  const missing = !branch
-    ? "no delivery branch recorded on this card's execution workspace"
-    : "no delivery repo resolvable for this card's execution workspace";
+function deliveryIdentityUnresolvedOutcome(
+  branch: string | null,
+  missingIdentifier?: boolean,
+): ArmingOutcome {
+  // SUP-14783: a shared-workspace card DOES have a branch recorded - it just
+  // belongs to another issue - so reporting "no delivery branch recorded" here
+  // would name the wrong missing thing and send an operator to the workspace
+  // instead of the card.
+  const missing = missingIdentifier
+    ? "this card's execution-workspace branch belongs to another issue and the card has no readable identifier to authorize against"
+    : !branch
+      ? "no delivery branch recorded on this card's execution workspace"
+      : "no delivery repo resolvable for this card's execution workspace";
   return {
     kind: "skipped",
     message: `status:skipped:delivery_identity_unresolved: ${missing}; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)`,
@@ -718,7 +727,7 @@ function notDeliveredOutcome(
  */
 type DeliveryNarrow<T> =
   | { outcome: "narrowed"; delivered: T[]; deliveryBranch: string }
-  | { outcome: "identity-unresolved"; branch: string | null }
+  | { outcome: "identity-unresolved"; branch: string | null; missingIdentifier?: boolean }
   | {
       outcome: "not-delivered";
       rejected: T[];
@@ -741,7 +750,9 @@ async function narrowToDelivered<
   // no identifier is readable — never silently fall back to a check that cannot
   // pass.
   const usePrefixPredicate = !branchIsOwn && Boolean(identifier);
-  if (!branchIsOwn && !identifier) return { outcome: "identity-unresolved", branch: null };
+  if (!branchIsOwn && !identifier) {
+    return { outcome: "identity-unresolved", branch, missingIdentifier: true };
+  }
   const delivered = usePrefixPredicate
     ? candidates.filter((pr) => isDeliveredByCardIdentifierPrefix(pr, repo, identifier as string))
     : candidates.filter((pr) => isDeliveredByCard(pr, repo, branch));
@@ -781,7 +792,7 @@ export async function publishApprovalStatus(
     // ADR-091 D4: fail closed when the card's delivery identity cannot be
     // positively resolved — refuse to stamp on an unverified branch.
     if (narrowed.outcome === "identity-unresolved") {
-      return deliveryIdentityUnresolvedOutcome(narrowed.branch);
+      return deliveryIdentityUnresolvedOutcome(narrowed.branch, narrowed.missingIdentifier);
     }
     if (narrowed.outcome === "not-delivered") {
       return notDeliveredOutcome(
@@ -926,7 +937,7 @@ export async function publishApprovalStatus(
       // ADR-091 D4: no branch (or no repo) recorded → refuse, never fall back to
       // identifier-substring authorization.
       if (narrowed.outcome === "identity-unresolved") {
-        return deliveryIdentityUnresolvedOutcome(narrowed.branch);
+        return deliveryIdentityUnresolvedOutcome(narrowed.branch, narrowed.missingIdentifier);
       }
       if (narrowed.outcome === "not-delivered") {
         return notDeliveredOutcome(
@@ -1141,7 +1152,7 @@ export type DecisionHeadResolution =
  */
 function unresolvableFromNarrowing(
   narrowed:
-    | { outcome: "identity-unresolved"; branch: string | null }
+    | { outcome: "identity-unresolved"; branch: string | null; missingIdentifier?: boolean }
     | {
         outcome: "not-delivered";
         rejected: Array<{
@@ -1156,9 +1167,11 @@ function unresolvableFromNarrowing(
       },
 ): DecisionHeadResolution {
   if (narrowed.outcome === "identity-unresolved") {
-    const missing = !narrowed.branch
-      ? "no delivery branch recorded on this card's execution workspace"
-      : "no delivery repo resolvable for this card's execution workspace";
+    const missing = narrowed.missingIdentifier
+      ? "this card's execution-workspace branch belongs to another issue and the card has no readable identifier to authorize against"
+      : !narrowed.branch
+        ? "no delivery branch recorded on this card's execution workspace"
+        : "no delivery repo resolvable for this card's execution workspace";
     return {
       kind: "unresolvable",
       reason: `delivery_identity_unresolved: ${missing}; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)`,

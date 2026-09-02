@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   companies,
   createDb,
@@ -621,6 +622,33 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(result.kind).toBe("unresolvable");
       if (result.kind === "unresolvable") {
         expect(result.reason).toMatch(/^not_delivered:/);
+      }
+    });
+
+    // CodeRabbit on PR #473: the fail-closed branch previously reported "no
+    // delivery branch recorded", which is false for a shared-workspace card -
+    // a branch IS recorded, it just belongs to another issue. The refusal must
+    // name the identifier as the missing thing, or it sends an operator to
+    // inspect the workspace instead of the card.
+    it("names the MISSING IDENTIFIER, not a missing branch, when a shared card has no identifier", async () => {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
+      const issueId = await insertIssue({
+        identifier: "SUP-42",
+        sharedWorkspaceOwnerIssueId: ownerIssueId,
+        branchName: PARENT_BRANCH,
+      });
+      // Strip the identifier so ownership is disproven AND no prefix exists.
+      await db.update(issues).set({ identifier: null }).where(eq(issues.id, issueId));
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-adr-074-alarm-pin-tamper" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^delivery_identity_unresolved:/);
+        expect(result.reason).toContain("no readable identifier to authorize against");
+        expect(result.reason).not.toContain("no delivery branch recorded");
       }
     });
 
