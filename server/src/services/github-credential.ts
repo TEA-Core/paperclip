@@ -88,13 +88,12 @@ export function resolveBrokerGitHubApp(
 ): GitHubAppDescriptor {
   const trimmed = name?.trim();
   if (!trimmed) return GITHUB_APP_REGISTRY.default;
-  const descriptor = GITHUB_APP_REGISTRY[trimmed as GitHubAppDescriptorName];
-  if (!descriptor) {
+  if (!Object.hasOwn(GITHUB_APP_REGISTRY, trimmed)) {
     throw new GitHubAppConfigurationError(
       `Unknown GitHub App descriptor "${trimmed}"; valid names: ${Object.keys(GITHUB_APP_REGISTRY).join(", ")}`,
     );
   }
-  return descriptor;
+  return GITHUB_APP_REGISTRY[trimmed as GitHubAppDescriptorName];
 }
 
 export type GitHubTokenScope = "app_installation" | "project_env" | "company";

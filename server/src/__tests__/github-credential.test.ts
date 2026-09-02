@@ -898,6 +898,19 @@ describe("resolveBrokerGitHubApp — configurable broker App descriptor", () => 
     // Names are matched case-sensitively, so "Default" is unknown.
     expect(() => resolveBrokerGitHubApp("Default")).toThrow(GitHubAppConfigurationError);
   });
+
+  it("rejects Object.prototype names instead of returning an inherited truthy property", () => {
+    // Indexing a plain-object registry by a user-supplied name would otherwise return
+    // Object.prototype members (toString, constructor, __proto__, ...) as a truthy
+    // non-descriptor, silently yielding undefined appId/privateKeySecretName. Each such
+    // name must fail fast with the same named error as any other unknown name.
+    for (const name of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
+      expect(() => resolveBrokerGitHubApp(name)).toThrow(GitHubAppConfigurationError);
+      expect(() => resolveBrokerGitHubApp(name)).toThrow(
+        /Unknown GitHub App descriptor ".*"; valid names: default, fleet/,
+      );
+    }
+  });
 });
 
 describe("resolveGitHubTokenForRepo", () => {
