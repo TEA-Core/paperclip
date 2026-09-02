@@ -6,6 +6,7 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
+import { COMPANY_IMPORT_ROUTE_PATH } from "../routes/company-import-paths.js";
 import { buildOpenApiSpec, openApiRoutes } from "../routes/openapi.js";
 import {
   GITHUB_INSTALLATION_PERMISSION_LEVELS,
@@ -508,12 +509,16 @@ const ISSUE_INSTANCE_ADMIN_ROUTES = [
   "POST /api/adapters/{type}/reload",
 ];
 
-// 8 additional board-only routes the regression guard surfaced while writing the
-// 54 above: same defect (assertBoard handler, published agent-callable), all in
-// companies.ts. Closed alongside the ticket's routes so the guard stays green.
+// 10 additional board-only routes the regression guard + reviewer live-probe
+// surfaced while writing the 54 above: same defect (assertBoard handler,
+// published agent-callable), all in companies.ts. The two bare-constant import
+// routes were only catchable once the scanner resolved unquoted path constants.
+// Closed alongside the ticket's routes so the guard stays green.
 const DISCOVERED_BOARD_ROUTES = [
   "GET /api/companies/{companyId}/feedback-traces",
+  "POST /api/companies/import",
   "POST /api/companies/import/preview",
+  "POST /api/companies/import/transfers",
   "POST /api/companies/{companyId}/archive",
   "DELETE /api/companies/{companyId}",
   "PUT /api/companies/import/transfers/{transferId}/parts/{partIndex}",
@@ -529,6 +534,16 @@ const INSTANCE_ADMIN_ROUTES = ISSUE_INSTANCE_ADMIN_ROUTES;
 // next, for multi-line registrations).
 const ROUTE_BOUNDARY = /^\s{0,2}router\.(get|post|put|patch|delete|all)\(/;
 const FIRST_QUOTED_TOKEN = /(["'`])(.+?)\1/;
+// A `router.<method>(IDENT, …)` registration whose path is an unquoted constant.
+// The quoted-token scan cannot see these, so they must be resolved explicitly or
+// surfaced — never silently skipped (AC #2/#3: "fail loudly, never silently skip").
+const BARE_PATH_ARG = /router\.(get|post|put|patch|delete|all)\(\s*([A-Za-z_$][A-Za-z0-9_$]*)/;
+// Known unquoted path constants. Values come from the shared/route modules so the
+// map can never drift from what the handler actually mounts.
+const BARE_PATH_CONSTANTS: Record<string, string> = {
+  COMPANY_IMPORT_ROUTE_PATH: COMPANY_IMPORT_ROUTE_PATH,
+  COMPANY_IMPORT_TRANSFERS_ROUTE_PATH: COMPANY_IMPORT_TRANSFERS_ROUTE_PATH,
+};
 
 // Strip `if (req.actor.type !== "agent") { ... }` blocks: an assertBoard inside
 // such a guard only applies to board actors (agents are allowed through), so it
@@ -549,6 +564,13 @@ function leadingSpaces(line: string): number {
 // path literal may sit on the registration line itself or on one of the next
 // two lines (multi-line registrations such as `router.post(\n "…", …)`).
 function resolveAuthRoute(file: string, prefix: string, candidateLines: string[]): string | null {
+  // Unquoted path constant (`router.post(COMPANY_IMPORT_ROUTE_PATH, …)`): the
+  // quoted-token scan misses these, so resolve against the known map first.
+  const bare = candidateLines[0]?.match(BARE_PATH_ARG);
+  if (bare && bare[2] in BARE_PATH_CONSTANTS) {
+    const raw = BARE_PATH_CONSTANTS[bare[2]];
+    return `${bare[1].toUpperCase()} ${normalizeExpressPath(resolveMountedPath(file, prefix, raw))}`;
+  }
   for (const line of candidateLines) {
     if (!line) continue;
     const m = line.match(FIRST_QUOTED_TOKEN);
@@ -566,8 +588,9 @@ function resolveAuthRoute(file: string, prefix: string, candidateLines: string[]
 // Walk every route file and map each registration to the source text of its
 // handler. Each block is bounded by the handler's closing `);`/`});`, so helper
 // functions defined between routes do not bleed into a route's block.
-function buildAuthRouteBlocks(): Map<string, AuthBlock> {
+function buildAuthRouteBlocks(): { byRoute: Map<string, AuthBlock>; unresolvedBareConstants: string[] } {
   const byRoute = new Map<string, AuthBlock>();
+  const unresolvedBareConstants: string[] = [];
   const files = fs.readdirSync(ROUTES_DIR).filter((entry) => entry.endsWith(".ts"));
 
   for (const file of files) {
@@ -588,6 +611,7 @@ function buildAuthRouteBlocks(): Map<string, AuthBlock> {
         if (leadingSpaces(lines[endIdx]) <= routeIndent && /\)\;|}\);/.test(trimmed)) break;
         endIdx += 1;
       }
+      const bare = lines[startIdx].match(BARE_PATH_ARG);
       const route = resolveAuthRoute(file, prefix, [
         lines[startIdx],
         lines[startIdx + 1],
@@ -596,11 +620,18 @@ function buildAuthRouteBlocks(): Map<string, AuthBlock> {
       const text = lines.slice(startIdx, endIdx).join("\n");
       if (route && !byRoute.has(route)) {
         byRoute.set(route, { file, text });
+      } else if (bare && !(bare[2] in BARE_PATH_CONSTANTS)) {
+        // A registration whose path is an unquoted constant we do not know. Skip
+        // it silently and the guard cannot see a board-only handler behind it, so
+        // surface it instead.
+        unresolvedBareConstants.push(
+          `${file} (line ${startIdx + 1}): router.${bare[1]}(${bare[2]}, …) — path constant not in BARE_PATH_CONSTANTS`,
+        );
       }
     });
   }
 
-  return byRoute;
+  return { byRoute, unresolvedBareConstants };
 }
 
 // Derive the expected auth level from a route handler's base assertion.
@@ -619,7 +650,7 @@ function deriveAuthLevel(block: AuthBlock | undefined): "instance_admin" | "boar
   return null;
 }
 
-const authRouteBlocks = buildAuthRouteBlocks();
+const { byRoute: authRouteBlocks, unresolvedBareConstants } = buildAuthRouteBlocks();
 
 describe("openapi auth parity (SUP-14798)", () => {
   const spec = buildOpenApiSpec();
@@ -648,7 +679,17 @@ describe("openapi auth parity (SUP-14798)", () => {
   it("reproduces the issue's 54 board + 7 instance-admin closure counts", () => {
     expect(ISSUE_BOARD_ROUTES).toHaveLength(54);
     expect(ISSUE_INSTANCE_ADMIN_ROUTES).toHaveLength(7);
-    expect(DISCOVERED_BOARD_ROUTES).toHaveLength(8);
+    expect(DISCOVERED_BOARD_ROUTES).toHaveLength(10);
+  });
+
+  it("resolves every bare-constant route registration (no silent skips)", () => {
+    // A `router.<method>(SOME_CONST, …)` registration whose constant is not in
+    // BARE_PATH_CONSTANTS would otherwise slip past the auth-parity guard — exactly
+    // how SUP-14798's 61-route blind spot accumulated. Fail loudly, naming it.
+    expect(
+      unresolvedBareConstants,
+      `unresolvable bare-constant route registrations:\n${unresolvedBareConstants.join("\n")}`,
+    ).toEqual([]);
   });
 
   it("publishes the correct actor for every board route and omits AgentBearerAuth", () => {

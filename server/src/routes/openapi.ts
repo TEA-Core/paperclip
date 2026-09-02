@@ -1028,11 +1028,15 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "PUT /api/tool-connections/{connectionId}/installs",
   "GET /api/tool-gateway/audit",
   "GET /api/tool-gateway/runtime-slots",
-  // SUP-14798: 8 additional board-only routes (handler calls assertBoard) discovered
+  // SUP-14798: 10 additional board-only routes (handler calls assertBoard) discovered
   // by the openapi-auth-parity regression test during SUP-14798; same defect class as
-  // the 54 above, all in companies.ts, previously published as agent-callable.
+  // the 54 above, all in companies.ts, previously published as agent-callable. The two
+  // bare-constant import routes (COMPANY_IMPORT_ROUTE_PATH / COMPANY_IMPORT_TRANSFERS_
+  // ROUTE_PATH) were the last blind spot — the scanner skipped unquoted path constants.
   "GET /api/companies/{companyId}/feedback-traces",
+  "POST /api/companies/import",
   "POST /api/companies/import/preview",
+  "POST /api/companies/import/transfers",
   "POST /api/companies/{companyId}/archive",
   "DELETE /api/companies/{companyId}",
   "PUT /api/companies/import/transfers/{transferId}/parts/{partIndex}",
