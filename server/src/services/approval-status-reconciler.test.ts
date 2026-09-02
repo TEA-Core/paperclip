@@ -83,6 +83,29 @@ const OPEN_PR_BODY = {
   base: { ref: "main", sha: BASE_SHA },
 };
 
+// SUP-14747 D-E backfill fixtures. The card's approval decision is seeded at
+// APPROVED_AT (2026-08-20T00:00:00Z); all head-mutating events below sit before
+// it, so "last head-mutating event at/before the approval" is the one listed.
+const TIMELINE_URL = `https://api.github.com/repos/TEA-Core/paperclip/issues/42/timeline?per_page=100&page=1`;
+// Last head-mutating event at/before the approval is NEW_HEAD — equals the live
+// head, so the backfill invariant holds and the anchor is recovered.
+const TIMELINE_SAME_HEAD_BODY = [
+  { event: "committed", sha: NEW_HEAD, committer: { date: "2026-08-19T09:00:00Z" }, author: { date: "2026-08-19T09:00:00Z" } },
+  { event: "labeled", created_at: "2026-08-19T09:30:00Z" },
+  { event: "head_ref_force_pushed", commit_id: NEW_HEAD, created_at: "2026-08-19T10:00:00Z" },
+];
+// Last head-mutating event at/before the approval is APPROVED_HEAD, which
+// differs from the live head (NEW_HEAD): the head moved after approval.
+const TIMELINE_MOVED_HEAD_BODY = [
+  { event: "committed", sha: APPROVED_HEAD, committer: { date: "2026-08-19T09:00:00Z" }, author: { date: "2026-08-19T09:00:00Z" } },
+  { event: "labeled", created_at: "2026-08-19T09:30:00Z" },
+];
+// No head-mutating event at/before the approval — the head is unverifiable.
+const TIMELINE_NO_HEAD_EVENT_BODY = [
+  { event: "labeled", created_at: "2026-08-19T09:00:00Z" },
+  { event: "review_dismissed", created_at: "2026-08-19T09:30:00Z" },
+];
+
 function zeroSummary(): ApprovalStatusReconcilerTickSummary {
   return {
     scanned: 0,
@@ -94,6 +117,8 @@ function zeroSummary(): ApprovalStatusReconcilerTickSummary {
     capped: 0,
     voidWarnings: 0,
     voidWarningDetails: [],
+    backfilled: 0,
+    backfilledDetails: [],
   };
 }
 
@@ -674,7 +699,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
-    it("refuses to re-publish for a head that was never reviewed when the approved head is unrecoverable (guard A)", async () => {
+    it("refuses to re-publish when the approved head is unrecoverable and the PR timeline cannot be read (backfill fail-closed)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({ approvalStatus: null }),
       });
@@ -684,12 +709,15 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        // No timeline route: the SUP-14747 backfill cannot positively read the
+        // head at approval time, so it must refuse rather than infer an anchor.
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
 
       expect(summary.republished).toBe(0);
-      expect(summary.skipped["guard-a:no-approved-head"]).toBe(1);
+      expect(summary.skipped["backfill:timeline-read-failed"]).toBe(1);
+      expect(summary.backfilled).toBe(0);
       expect(postStatusCalls()).toHaveLength(0);
       // No publishedHeadSha means nothing is voided — no PR warning either.
       expect(postCommentCalls()).toHaveLength(0);
@@ -1513,7 +1541,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
-    it("refuses guard-a:no-approved-head when neither publishedHeadSha nor approvedHeadSha is recorded", async () => {
+    it("recovers a stranded pre-D-B first publish from the PR timeline and publishes it when the head is unchanged since approval (SUP-14747 D-E)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
           approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
@@ -1521,16 +1549,83 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       });
       await insertDecision(issueId);
       await insertMention(issueId);
+      // The card's delivery identity matches the linked PR, so the first
+      // publish's ADR-091 D1 delivery-identity gate passes.
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
 
       installRoutes([
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_SAME_HEAD_BODY },
+        { url: POST_STATUS_URL, body: { id: 12348 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(summary.backfilled).toBe(1);
+      expect(Object.keys(summary.skipped)).toEqual([]);
+      expect(postStatusCalls()).toHaveLength(1);
+      expect(postStatusBodies()[0]).toMatchObject({ state: "success", context: PAPERCLIP_APPROVED });
+
+      // The recovered D-B anchor and the published stamp both persist.
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBe(NEW_HEAD);
+      expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
+    });
+
+    it("refuses the backfill when the head moved after approval and leaves the card stranded, writing no anchor (SUP-14747 D-E)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_MOVED_HEAD_BODY },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
 
       expect(summary.republished).toBe(0);
-      expect(summary.skipped["guard-a:no-approved-head"]).toBe(1);
+      expect(summary.skipped["backfill:head-moved-since-approval"]).toBe(1);
+      expect(summary.backfilled).toBe(0);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      expect(approvalStatus.publishedHeadSha).toBeNull();
+    });
+
+    it("refuses the backfill when there is no head-mutating event at or before the approval, writing no anchor (SUP-14747 D-E)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["backfill:no-head-mutating-event"]).toBe(1);
+      expect(summary.backfilled).toBe(0);
       expect(postStatusCalls()).toHaveLength(0);
     });
 
