@@ -3017,11 +3017,75 @@ export function issueRoutes(
     decision,
     closingTransition,
   }: {
-    issue: { id: string; companyId: string; issueNumber: number | null; identifier: string | null; executionState: unknown };
+    issue: {
+      id: string;
+      companyId: string;
+      issueNumber: number | null;
+      identifier: string | null;
+      executionState: unknown;
+      executionPolicy: Record<string, unknown> | null;
+      createdByAgentId: string | null;
+      createdByUserId: string | null;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+    };
     decision: MergeArmingDecision | null | undefined;
     closingTransition: boolean;
   }): Promise<void> => {
     if (!shouldPublishApprovalStatus(decision)) return;
+    // ADR-092 D4: enforce stage-integrity at decision time. Both call sites
+    // invoke this hook after the transaction commits, so the decision row and
+    // completedStageIds are already durable — the predicate is evaluable here.
+    // D5: a finding refuses to stamp, never refuses to close.
+    // adr-092-d4-enforcement-fails-open (SUP-14792 round-2): fail CLOSED on
+    // error. An evaluateStageIntegrity throw (we could not positively verify the
+    // decision) or a finding whose [Merge-arming] refusal comment throws must
+    // refuse to stamp/arm, not fall through — a guard that reports integrity it
+    // is not enforcing is the exact defect ADR-092 eliminates. `return` skips
+    // only stamp/arm (the hook runs post-commit), so the status transition is
+    // untouched (ADR-073 D3 "never refuse to close" holds).
+    const candidate: CandidateRow = {
+      id: issue.id,
+      companyId: issue.companyId,
+      identifier: issue.identifier,
+      createdByAgentId: issue.createdByAgentId,
+      createdByUserId: issue.createdByUserId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+      executionState: (issue.executionState ?? {}) as Record<string, unknown>,
+      executionPolicy: issue.executionPolicy,
+    };
+    try {
+      const integrity = await evaluateStageIntegrity(db, candidate);
+      if (integrity) {
+        const msg = `status:skipped:stage_integrity:${integrity.reason}: ${integrity.detail}`;
+        try {
+          await svc.addComment(
+            issue.id,
+            `[Merge-arming] ${msg}`,
+            {},
+            { authorType: "system" },
+          );
+        } catch (commentErr) {
+          // Fail closed: even if the refusal comment cannot be written, the
+          // finding was positively identified, so we still must not stamp/arm.
+          logger.warn(
+            { err: commentErr, issueId: issue.id },
+            "stage-integrity refusal comment write failed; still refusing to stamp/arm",
+          );
+        }
+        return;
+      }
+    } catch (err) {
+      // Fail closed: an evaluateStageIntegrity throw means we could not
+      // positively verify the decision — that is a refusal, not a pass-through
+      // to stamp/arm.
+      logger.warn(
+        { err, issueId: issue.id },
+        "stage-integrity check at decision time threw; refusing to stamp/arm (fail-closed)",
+      );
+      return;
+    }
     // SUP-14602: the live-discovery / decision-head needle must be the issue's
     // REAL identifier (company issuePrefix + number), not a hardcoded "SUP-".
     // Both resolveApprovalDecisionHead and publishApprovalStatus search open PRs
@@ -7413,7 +7477,7 @@ export function issueRoutes(
       return;
     }
 
-    // Guard B: ADR-073 stage-integrity, reused verbatim from the reconciler
+    // Guard B: ADR-073/092 stage-integrity, reused verbatim from the reconciler
     // (exported specifically so this route does not reimplement it).
     const candidate: CandidateRow = {
       id: issue.id,
@@ -7421,6 +7485,8 @@ export function issueRoutes(
       identifier: issue.identifier,
       createdByAgentId: issue.createdByAgentId,
       createdByUserId: issue.createdByUserId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
       executionState: state,
       executionPolicy: issue.executionPolicy,
     };

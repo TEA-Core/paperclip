@@ -228,6 +228,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       executionPolicy?: Record<string, unknown>;
       createdByAgentId?: string | null;
       createdByUserId?: string | null;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
     } = {},
   ) {
     const issueId = randomUUID();
@@ -241,6 +243,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       executionState: overrides.executionState ?? approvedState(),
       createdByAgentId: overrides.createdByAgentId ?? null,
       createdByUserId: overrides.createdByUserId ?? null,
+      assigneeAgentId: overrides.assigneeAgentId ?? null,
+      assigneeUserId: overrides.assigneeUserId ?? null,
     });
     return issueId;
   }
@@ -890,15 +894,15 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
-    it("skips when the approval was made by the card's own author (guard B)", async () => {
-      await insertAgent(AGENT_AUTHOR, "Author");
-      const issueId = await insertIssue({ createdByAgentId: AGENT_AUTHOR });
+    it("skips when the approval was made by the card's assignee (guard B, ADR-092 D3 fallback)", async () => {
+      await insertAgent(AGENT_AUTHOR, "Assignee");
+      const issueId = await insertIssue({ createdByAgentId: AGENT_AUTHOR, assigneeAgentId: AGENT_AUTHOR });
       await insertDecision(issueId, { actorAgentId: AGENT_AUTHOR });
       await insertMention(issueId);
 
       const summary = await runApprovalStatusReconcilerTick(db);
 
-      expect(summary.skipped["guard-b:decision-by-author-or-return-assignee"]).toBe(1);
+      expect(summary.skipped["guard-b:decision-by-return-assignee"]).toBe(1);
       expect(postStatusCalls()).toHaveLength(0);
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
@@ -913,7 +917,111 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
 
       const summary = await runApprovalStatusReconcilerTick(db);
 
-      expect(summary.skipped["guard-b:decision-by-author-or-return-assignee"]).toBe(1);
+      expect(summary.skipped["guard-b:decision-by-return-assignee"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("refuses when the assignee decided its own stage with no declared or stored return assignee (ADR-092 D3 fallback)", async () => {
+      const stage2Id = "00000000-0000-0000-0000-0000000000b1";
+      const stage3Id = "00000000-0000-0000-0000-0000000000b2";
+      await insertAgent(AGENT_AUTHOR, "Assignee");
+      await insertAgent(AGENT_REVIEWER, "Reviewer");
+      const issueId = await insertIssue({
+        assigneeAgentId: AGENT_AUTHOR,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            { id: REVIEW_STAGE_ID, type: "review", approvalsNeeded: 1 },
+            { id: APPROVAL_STAGE_ID, type: "approval", approvalsNeeded: 1 },
+          ],
+        },
+        executionState: approvedState({
+          completedStageIds: [REVIEW_STAGE_ID, APPROVAL_STAGE_ID],
+          returnAssignee: null,
+        }),
+      });
+      await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorAgentId: AGENT_AUTHOR, actorUserId: null });
+      await insertDecision(issueId, { stageId: APPROVAL_STAGE_ID, actorAgentId: AGENT_REVIEWER, actorUserId: null });
+      await insertMention(issueId);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["guard-b:decision-by-return-assignee"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("passes when creator=assignee, declared return assignee is a third agent, none decided by return assignee (ADR-092 D7 legal shape)", async () => {
+      const stage2Id = "00000000-0000-0000-0000-0000000000c1";
+      const stage3Id = "00000000-0000-0000-0000-0000000000c2";
+      await insertAgent(AGENT_AUTHOR, "FilerAndAssignee");
+      await insertAgent(AGENT_REVIEWER, "Reviewer");
+      await insertAgent(AGENT_LEAD, "ReturnAssignee");
+      const issueId = await insertIssue({
+        createdByAgentId: AGENT_AUTHOR,
+        assigneeAgentId: AGENT_AUTHOR,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            { id: REVIEW_STAGE_ID, type: "review", approvalsNeeded: 1 },
+            { id: APPROVAL_STAGE_ID, type: "approval", approvalsNeeded: 1 },
+          ],
+          returnAssigneeAgentId: AGENT_LEAD,
+        },
+        executionState: approvedState({
+          completedStageIds: [REVIEW_STAGE_ID, APPROVAL_STAGE_ID],
+          returnAssignee: { type: "agent", agentId: AGENT_LEAD, userId: null },
+        }),
+      });
+      await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorAgentId: AGENT_REVIEWER, actorUserId: null });
+      await insertDecision(issueId, { stageId: APPROVAL_STAGE_ID, actorAgentId: AGENT_AUTHOR, actorUserId: null });
+      await insertMention(issueId);
+
+      installRoutes([{ url: PR_URL, body: OPEN_PR_BODY }]);
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { statuses: [] } },
+        { url: POST_STATUS_URL, body: {} },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["guard-b:decision-by-return-assignee"]).toBeUndefined();
+      expect(summary.republished).toBe(1);
+    });
+
+    it("refuses when the return assignee decided a completed stage (ADR-092 D7 illegal twin)", async () => {
+      const stage2Id = "00000000-0000-0000-0000-0000000000d1";
+      await insertAgent(AGENT_AUTHOR, "FilerAndAssignee");
+      await insertAgent(AGENT_REVIEWER, "Reviewer");
+      await insertAgent(AGENT_LEAD, "ReturnAssignee");
+      const issueId = await insertIssue({
+        createdByAgentId: AGENT_AUTHOR,
+        assigneeAgentId: AGENT_AUTHOR,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            { id: REVIEW_STAGE_ID, type: "review", approvalsNeeded: 1 },
+            { id: APPROVAL_STAGE_ID, type: "approval", approvalsNeeded: 1 },
+          ],
+          returnAssigneeAgentId: AGENT_LEAD,
+        },
+        executionState: approvedState({
+          completedStageIds: [REVIEW_STAGE_ID, APPROVAL_STAGE_ID],
+          returnAssignee: { type: "agent", agentId: AGENT_LEAD, userId: null },
+        }),
+      });
+      await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorAgentId: AGENT_LEAD, actorUserId: null });
+      await insertDecision(issueId, { stageId: APPROVAL_STAGE_ID, actorAgentId: AGENT_REVIEWER, actorUserId: null });
+      await insertMention(issueId);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["guard-b:decision-by-return-assignee"]).toBe(1);
       expect(postStatusCalls()).toHaveLength(0);
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
@@ -1427,9 +1535,10 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     });
 
     it("still fires the stage-integrity (self-approval) refusal on a first-publish-anchored card", async () => {
-      await insertAgent(AGENT_AUTHOR, "Author");
+      await insertAgent(AGENT_AUTHOR, "Assignee");
       const issueId = await insertIssue({
         createdByAgentId: AGENT_AUTHOR,
+        assigneeAgentId: AGENT_AUTHOR,
         executionState: approvedState({
           approvalStatus: { approvedHeadSha: NEW_HEAD, approvedAt: APPROVED_AT },
         }),
@@ -1439,7 +1548,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
 
       const summary = await runApprovalStatusReconcilerTick(db);
 
-      expect(summary.skipped["guard-b:decision-by-author-or-return-assignee"]).toBe(1);
+      expect(summary.skipped["guard-b:decision-by-return-assignee"]).toBe(1);
       expect(postStatusCalls()).toHaveLength(0);
       // Guard B refuses before any GitHub read.
       expect(mockGhFetch).not.toHaveBeenCalled();

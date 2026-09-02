@@ -144,6 +144,8 @@ export interface CandidateRow {
   identifier: string | null;
   createdByAgentId: string | null;
   createdByUserId: string | null;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
   executionState: Record<string, unknown> | null;
   executionPolicy: Record<string, unknown> | null;
 }
@@ -576,6 +578,8 @@ async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateR
       identifier: issues.identifier,
       createdByAgentId: issues.createdByAgentId,
       createdByUserId: issues.createdByUserId,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
       executionState: issues.executionState,
       executionPolicy: issues.executionPolicy,
     })
@@ -601,10 +605,12 @@ async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateR
 }
 
 /**
- * ADR-073 stage-integrity audit of the recorded approval. Returns a skip
- * verdict when the "approved" record is not backed by a real, non-self
+ * ADR-073 / ADR-092 stage-integrity audit of the recorded approval. Returns a
+ * skip verdict when the "approved" record is not backed by a real, non-self
  * decision: an auto-skipped review stage writes no decision row and lands in
- * skippedStageIds, so it must never be treated as an approval.
+ * skippedStageIds, so it must never be treated as an approval. The gated
+ * principal is the resolved return assignee (ADR-092 D3):
+ * policy.returnAssigneeAgentId ?? state.returnAssignee ?? assigneeAgentId.
  */
 export async function evaluateStageIntegrity(
   db: Db,
@@ -682,21 +688,23 @@ export async function evaluateStageIntegrity(
 
   const forbiddenAgents = new Set<string>();
   const forbiddenUsers = new Set<string>();
-  if (row.createdByAgentId) forbiddenAgents.add(row.createdByAgentId);
-  if (row.createdByUserId) forbiddenUsers.add(row.createdByUserId);
   if (typeof policy.returnAssigneeAgentId === "string" && policy.returnAssigneeAgentId) {
     forbiddenAgents.add(policy.returnAssigneeAgentId);
-  }
-  const returnAssignee = state.returnAssignee as
-    | { type?: unknown; agentId?: unknown; userId?: unknown }
-    | null
-    | undefined;
-  if (returnAssignee && typeof returnAssignee === "object") {
-    if (returnAssignee.type === "agent" && typeof returnAssignee.agentId === "string") {
-      forbiddenAgents.add(returnAssignee.agentId);
+  } else {
+    const returnAssignee = state.returnAssignee as
+      | { type?: unknown; agentId?: unknown; userId?: unknown }
+      | null
+      | undefined;
+    if (returnAssignee && typeof returnAssignee === "object") {
+      if (returnAssignee.type === "agent" && typeof returnAssignee.agentId === "string") {
+        forbiddenAgents.add(returnAssignee.agentId);
+      } else if (returnAssignee.type === "user" && typeof returnAssignee.userId === "string") {
+        forbiddenUsers.add(returnAssignee.userId);
+      }
     }
-    if (returnAssignee.type === "user" && typeof returnAssignee.userId === "string") {
-      forbiddenUsers.add(returnAssignee.userId);
+    if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
+      if (row.assigneeAgentId) forbiddenAgents.add(row.assigneeAgentId);
+      if (row.assigneeUserId) forbiddenUsers.add(row.assigneeUserId);
     }
   }
 
@@ -705,8 +713,8 @@ export async function evaluateStageIntegrity(
     if ((latest.actorAgentId && forbiddenAgents.has(latest.actorAgentId)) ||
         (latest.actorUserId && forbiddenUsers.has(latest.actorUserId))) {
       return {
-        reason: "guard-b:decision-by-author-or-return-assignee",
-        detail: `stage ${stageId} decided by the card's author or returnAssignee`,
+        reason: "guard-b:decision-by-return-assignee",
+        detail: `stage ${stageId} decided by the resolved return assignee`,
       };
     }
   }
