@@ -7,6 +7,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  applyPaperclipGitHubCredentialHelperEnv,
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
   buildPersistentSkillSnapshot,
@@ -2697,6 +2698,74 @@ describe("applyPaperclipWorkspaceEnv", () => {
     );
 
     expect(env).toEqual({});
+  });
+});
+
+describe("applyPaperclipGitHubCredentialHelperEnv", () => {
+  it("clears the ambient credential helper, installs URL-scoped helpers, and sets GIT_TERMINAL_PROMPT=0", () => {
+    const env = applyPaperclipGitHubCredentialHelperEnv(
+      {},
+      "/opt/repo/scripts/paperclip-github-credential-helper.sh",
+    );
+
+    expect(env).toEqual({
+      GIT_CONFIG_COUNT: "3",
+      GIT_CONFIG_KEY_0: "credential.helper",
+      GIT_CONFIG_VALUE_0: "",
+      GIT_CONFIG_KEY_1: "credential.https://github.com.helper",
+      GIT_CONFIG_VALUE_1: "/opt/repo/scripts/paperclip-github-credential-helper.sh",
+      GIT_CONFIG_KEY_2: "credential.https://www.github.com.helper",
+      GIT_CONFIG_VALUE_2: "/opt/repo/scripts/paperclip-github-credential-helper.sh",
+      GIT_TERMINAL_PROMPT: "0",
+    });
+  });
+
+  it("merges with a pre-existing GIT_CONFIG_COUNT instead of clobbering it", () => {
+    const env = applyPaperclipGitHubCredentialHelperEnv(
+      {
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "core.hooksPath",
+        GIT_CONFIG_VALUE_0: "/opt/hooks",
+        GIT_CONFIG_KEY_1: "user.name",
+        GIT_CONFIG_VALUE_1: "paperclip",
+      },
+      "/opt/repo/scripts/paperclip-github-credential-helper.sh",
+    );
+
+    // Pre-existing keys are preserved...
+    expect(env.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("/opt/hooks");
+    expect(env.GIT_CONFIG_KEY_1).toBe("user.name");
+    expect(env.GIT_CONFIG_VALUE_1).toBe("paperclip");
+    // ...and our entries are appended at the next indices.
+    expect(env.GIT_CONFIG_COUNT).toBe("5");
+    expect(env.GIT_CONFIG_KEY_2).toBe("credential.helper");
+    expect(env.GIT_CONFIG_VALUE_2).toBe("");
+    expect(env.GIT_CONFIG_KEY_3).toBe("credential.https://github.com.helper");
+    expect(env.GIT_CONFIG_VALUE_3).toBe("/opt/repo/scripts/paperclip-github-credential-helper.sh");
+    expect(env.GIT_CONFIG_KEY_4).toBe("credential.https://www.github.com.helper");
+    expect(env.GIT_CONFIG_VALUE_4).toBe("/opt/repo/scripts/paperclip-github-credential-helper.sh");
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+  });
+
+  it("is a no-op when the helper path is empty or whitespace", () => {
+    expect(applyPaperclipGitHubCredentialHelperEnv({ FOO: "bar" }, "")).toEqual({
+      FOO: "bar",
+    });
+    expect(applyPaperclipGitHubCredentialHelperEnv({ FOO: "bar" }, "   ")).toEqual({
+      FOO: "bar",
+    });
+  });
+
+  it("starts from a clean 3-entry config when GIT_CONFIG_COUNT is malformed", () => {
+    const env = applyPaperclipGitHubCredentialHelperEnv(
+      { GIT_CONFIG_COUNT: "not-a-number" },
+      "/opt/repo/scripts/paperclip-github-credential-helper.sh",
+    );
+    expect(env.GIT_CONFIG_COUNT).toBe("3");
+    expect(env.GIT_CONFIG_KEY_0).toBe("credential.helper");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("");
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
   });
 });
 

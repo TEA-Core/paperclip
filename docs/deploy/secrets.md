@@ -93,9 +93,20 @@ Security properties:
 - Tokens are minted on demand and cached server-side; no token is written to
   disk, logs, or the environment.
 
-This requires a fleet GitHub App to be configured on the server (with the
-target org/repos granted to it). Until that exists, the scripts are inert and
-git/gh behave as they did before.
+This requires a fleet GitHub App to be configured on the server (with the target
+org/repos granted to it). The wiring activates whenever the helper script is present
+in a repo workspace. Until the App is configured for a company:
+
+- The credential helper is a clean no-op for `get` (it emits no credential when the
+  broker reports `code=app_not_configured`), so git operations against github.com
+  fail fast and legibly under `GIT_TERMINAL_PROMPT=0` — no hang, no interactive prompt.
+- Ambient github.com credential helpers are cleared for that run (required so the App
+  token wins once configured — a generic ambient helper shadows URL-scoped helpers);
+  non-github.com hosts and non-repo workspaces are untouched.
+- The `gh` wrapper reports a legible "App not configured" error instead of exec'ing
+  `gh` without a token.
+
+Once the App is configured, the same wiring mints installation tokens automatically.
 
 ## User-Specific Secrets
 

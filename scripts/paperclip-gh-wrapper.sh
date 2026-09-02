@@ -18,6 +18,8 @@
 #   - Runs the real `gh` with GH_TOKEN set for that single invocation only. The
 #     token is never written to disk, never logged, and is not left in a
 #     persistent environment variable.
+#   - If the broker reports code=app_not_configured (fleet App not yet configured),
+#     the wrapper fails legibly instead of exec'ing gh without a token.
 #
 set -u
 
@@ -97,7 +99,8 @@ fi
 API_BASE="${PAPERCLIP_API_URL%/}"
 ENDPOINT="$API_BASE/api/agents/me/github/installation-tokens"
 
-CURL_ERR="$(mktemp 2>/dev/null || echo "/tmp/.gh-wrapper-curl.err.$$")"
+CURL_ERR="$(mktemp 2>/dev/null)"
+[ -n "$CURL_ERR" ] || fail "mktemp is unavailable; cannot safely capture broker/curl errors (refusing to fall back to a predictable /tmp path)."
 trap 'rm -f "$CURL_ERR" 2>/dev/null' EXIT
 RESPONSE="$(curl -sS -m 30 -X POST "$ENDPOINT" \
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
@@ -111,12 +114,21 @@ fi
 
 TOKEN=""
 ERR_MSG=""
+ERR_CODE=""
 if command -v jq >/dev/null 2>&1; then
   TOKEN="$(printf '%s' "$RESPONSE" | jq -r '.token // empty' 2>/dev/null || true)"
-  ERR_MSG="$(printf '%s' "$RESPONSE" | jq -r '.error // .message // .code // empty' 2>/dev/null || true)"
+  ERR_MSG="$(printf '%s' "$RESPONSE" | jq -r '.error // .message // empty' 2>/dev/null || true)"
+  ERR_CODE="$(printf '%s' "$RESPONSE" | jq -r '.code // empty' 2>/dev/null || true)"
 else
   TOKEN="$(printf '%s' "$RESPONSE" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
   ERR_MSG="$(printf '%s' "$RESPONSE" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  ERR_CODE="$(printf '%s' "$RESPONSE" | sed -n 's/.*"code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+fi
+
+# The fleet App has no installation key for this company yet (transition state): a `gh`
+# call can't be authenticated, so fail legibly rather than exec gh with no token.
+if [ -z "$TOKEN" ] && [ "$ERR_CODE" = "app_not_configured" ]; then
+  fail "could not authenticate: the fleet GitHub App is not configured for this company (broker code=app_not_configured). Configure the App, then retry; or set a one-shot GH_TOKEN for this invocation."
 fi
 [ -n "$TOKEN" ] || fail "GitHub token mint failed${ERR_MSG:+: $ERR_MSG} (owner/repo: $OWNER_REPO)."
 

@@ -20,6 +20,11 @@
 #     persists the token to a credential cache.
 #   - Minting happens per `get`, so a long-running session that performs a git
 #     op late in its life still gets a fresh, un-expired token.
+#   - Only https://github.com is answered (host + protocol dual-gate); any other
+#     host/protocol is rejected so a mis-scoped config can't redirect the helper.
+#   - If the broker reports code=app_not_configured (fleet App not yet configured),
+#     `get` is a clean no-op: no credential on stdout, so git fails fast instead of
+#     hanging on a prompt (GIT_TERMINAL_PROMPT=0 is set by the wiring).
 #
 # Required in the environment of the invoking git process:
 #   PAPERCLIP_API_URL   base URL of the Paperclip API
@@ -55,13 +60,17 @@ command -v curl >/dev/null 2>&1 || fail "curl is required but was not found."
 [ -n "${PAPERCLIP_API_URL:-}" ] || fail "PAPERCLIP_API_URL is not set; cannot reach the Paperclip broker to mint a GitHub token."
 [ -n "${PAPERCLIP_API_KEY:-}" ] || fail "PAPERCLIP_API_KEY is not set; this git process is not running inside a Paperclip agent run."
 
-# Only answer for github.com hosts; re-validate so a mis-scoped config can't
-# redirect the helper at an arbitrary host.
+# Only answer for https://github.com; re-validate both host and protocol so a
+# mis-scoped config or an insteadOf-rewritten remote can't redirect the helper at an
+# arbitrary host or scheme (mirrors the protocol=https + host dual-gate in
+# server/src/services/git-credentials.ts).
 HOST="$(printf '%s\n' "$REQUEST" | sed -n 's/^host=//p' | head -n1)"
+PROTOCOL="$(printf '%s\n' "$REQUEST" | sed -n 's/^protocol=//p' | head -n1)"
 case "$HOST" in
   github.com|www.github.com) ;;
   *) fail "credential helper is configured for github.com only (requested host: '${HOST:-<unknown>}')." ;;
 esac
+[ "$PROTOCOL" = "https" ] || fail "credential helper answers only over https (requested protocol: '${PROTOCOL:-<unknown>}'.)"
 
 # Parse a git remote URL (https/ssh) into lowercase `owner/repo`, or empty.
 parse_owner_repo() {
@@ -120,7 +129,8 @@ BODY="$(printf '{"owner":"%s","repo":"%s","permissions":{"contents":"%s"}}' "$OW
 API_BASE="${PAPERCLIP_API_URL%/}"
 ENDPOINT="$API_BASE/api/agents/me/github/installation-tokens"
 
-CURL_ERR="$(mktemp 2>/dev/null || echo "/tmp/.gh-helper-curl.err.$$")"
+CURL_ERR="$(mktemp 2>/dev/null)"
+[ -n "$CURL_ERR" ] || fail "mktemp is unavailable; cannot safely capture broker/curl errors (refusing to fall back to a predictable /tmp path)."
 trap 'rm -f "$CURL_ERR" 2>/dev/null' EXIT
 RESPONSE="$(curl -sS -m 30 -X POST "$ENDPOINT" \
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
@@ -134,12 +144,25 @@ fi
 
 TOKEN=""
 ERR_MSG=""
+ERR_CODE=""
 if command -v jq >/dev/null 2>&1; then
   TOKEN="$(printf '%s' "$RESPONSE" | jq -r '.token // empty' 2>/dev/null || true)"
-  ERR_MSG="$(printf '%s' "$RESPONSE" | jq -r '.error // .message // .code // empty' 2>/dev/null || true)"
+  ERR_MSG="$(printf '%s' "$RESPONSE" | jq -r '.error // .message // empty' 2>/dev/null || true)"
+  ERR_CODE="$(printf '%s' "$RESPONSE" | jq -r '.code // empty' 2>/dev/null || true)"
 else
   TOKEN="$(printf '%s' "$RESPONSE" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
   ERR_MSG="$(printf '%s' "$RESPONSE" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  ERR_CODE="$(printf '%s' "$RESPONSE" | sed -n 's/.*"code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+fi
+
+# "App not configured" is a transition state, not a fault: the fleet GitHub App simply
+# has no installation key for this company yet. Emit no credential on stdout (a clean
+# no-op, so git falls through to any other credential source and fails fast under
+# GIT_TERMINAL_PROMPT=0 instead of hanging or prompting) and note it on stderr. Every
+# other failure hard-fails below with a legible message.
+if [ -z "$TOKEN" ] && [ "$ERR_CODE" = "app_not_configured" ]; then
+  printf 'paperclip-github-credential-helper: no github.com credentials: the fleet GitHub App is not configured for this company (broker code=app_not_configured).\n' >&2
+  exit 0
 fi
 
 [ -n "$TOKEN" ] || fail "GitHub token mint failed${ERR_MSG:+: $ERR_MSG} (owner/repo: $OWNER_REPO)."

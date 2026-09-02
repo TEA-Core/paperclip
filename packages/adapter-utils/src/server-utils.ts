@@ -2276,10 +2276,14 @@ export function buildPaperclipEnv(agent: { id: string; companyId: string }): Rec
  *   - `credential.https://github.com.helper` (and `www.github.com`) point at the
  *     helper script.
  *
- * This does not mint anything itself; the helper reads the run's
- * PAPERCLIP_API_URL/PAPERCLIP_API_KEY at git-invoke time. It merges with any
- * pre-existing GIT_CONFIG_COUNT so injected config is not clobbered.
- */
+  * This does not mint anything itself; the helper reads the run's
+  * PAPERCLIP_API_URL/PAPERCLIP_API_KEY at git-invoke time. It merges with any
+  * pre-existing GIT_CONFIG_COUNT so injected config is not clobbered.
+  *
+  * It also sets `GIT_TERMINAL_PROMPT=0` so that if the helper cannot mint a
+  * token (e.g. the fleet GitHub App is not yet configured and the helper is a
+  * clean no-op), git fails fast instead of hanging on an interactive prompt.
+  */
 export function applyPaperclipGitHubCredentialHelperEnv(
   env: Record<string, string>,
   helperPath: string,
@@ -2302,6 +2306,9 @@ export function applyPaperclipGitHubCredentialHelperEnv(
   index += 1;
 
   env.GIT_CONFIG_COUNT = String(index);
+  // Fail fast (no interactive prompt) when the helper yields no credential, e.g.
+  // when the fleet GitHub App is not yet configured. Mirrors buildGitAuthInvocation.
+  env.GIT_TERMINAL_PROMPT = "0";
   return env;
 }
 
