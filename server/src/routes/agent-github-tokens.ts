@@ -8,10 +8,12 @@ import { assertCompanyAccess } from "./authz.js";
 import { HttpError, forbidden, notFound } from "../errors.js";
 import { logActivity, secretService } from "../services/index.js";
 import {
-  DEFAULT_GITHUB_APP,
+  BROKER_GITHUB_APP_ENV,
   normalizeRepoUrl,
   resolveAppInstallationToken,
+  resolveBrokerGitHubApp,
   type AppInstallationTokenSecrets,
+  type GitHubAppDescriptor,
   type GitHubTokenResolution,
 } from "../services/github-credential.js";
 
@@ -110,13 +112,20 @@ type InstallationTokenBody = z.infer<typeof agentInstallationTokenRequestSchema>
 
 type AgentGitHubTokenRoutesDeps = {
   secrets?: AppInstallationTokenSecrets;
+  /**
+   * Registry name of the App to mint with (see GITHUB_APP_REGISTRY). Overrides the
+   * PAPERCLIP_GITHUB_BROKER_APP env var. A name not in the registry is rejected at route
+   * construction with a GitHubAppConfigurationError, so a mismatched App/secret pair cannot
+   * reach the mint.
+   */
+  appName?: string;
   resolveToken?: (
     companyId: string,
     secrets: AppInstallationTokenSecrets,
     owner?: string,
     repo?: string,
     accessContext?: Record<string, unknown>,
-    app?: typeof DEFAULT_GITHUB_APP,
+    app?: GitHubAppDescriptor,
     permissions?: Record<string, unknown>,
   ) => Promise<GitHubTokenResolution | null>;
   log?: typeof logActivity;
@@ -129,12 +138,21 @@ type AgentGitHubTokenRoutesDeps = {
  * already reach through a company project workspace. The route is agent-only,
  * verifies company + repo access, and mints a fresh App installation token (or
  * returns a cached one) via the shared `resolveAppInstallationToken` service.
+ *
+ * The App minted with is selected at construction from the PAPERCLIP_GITHUB_BROKER_APP env
+ * var (default "default" = App 4595159 / GITHUB_APP_PRIVATE_KEY). Naming the "fleet" App mints
+ * under 4809618 / GITHUB_APP_PRIVATE_KEY_FLEET without a code edit; an unknown name is rejected
+ * at load rather than surfacing as an opaque 401 on the first mint.
  */
 export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps = {}) {
   const router = Router();
   const secrets = deps.secrets ?? secretService(db);
   const resolveToken = deps.resolveToken ?? resolveAppInstallationToken;
   const log = deps.log ?? logActivity;
+  // Resolve the broker's App once, at construction, from the configured name (deps.appName
+  // overrides the PAPERCLIP_GITHUB_BROKER_APP env var). An unknown name throws here, breaking
+  // startup with a named error rather than 401-ing on the first mint.
+  const app = resolveBrokerGitHubApp(deps.appName ?? process.env[BROKER_GITHUB_APP_ENV]);
 
   // The repo must map to a project workspace of a project the calling agent is
   // actually assigned to (issues assigned to it in this company), not just any
@@ -188,8 +206,6 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
       const { owner, repo, permissions } = req.body as InstallationTokenBody;
       await assertRepoReachable(companyId, req.actor.agentId, owner, repo);
 
-      const app = DEFAULT_GITHUB_APP;
-
       // Distinguish "App not configured" (404) from "configured but mint failed" (502).
       const secret = await secrets.getByName(companyId, app.privateKeySecretName);
       if (!secret) {
@@ -228,6 +244,7 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
         token: result.token,
         expiresAt: result.expiresAt,
         installationId: result.installationId,
+        appId: app.appId,
       });
     },
   );

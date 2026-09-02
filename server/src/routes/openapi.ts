@@ -1956,6 +1956,7 @@ registry.registerPath({
             token: z.string(),
             expiresAt: z.number().int().optional(),
             installationId: z.string().optional(),
+            appId: z.string(),
           }),
         },
       },

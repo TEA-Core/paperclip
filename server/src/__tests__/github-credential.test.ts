@@ -7,10 +7,15 @@ import {
   resolveGitHubTokenForRepo,
   resolveGitHubTokenCandidatesForRepo,
   resolveAppInstallationToken,
+  resolveBrokerGitHubApp,
   isGitHubTokenResolution,
   appTokenCache,
   GITHUB_APP_ID,
   GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+  FLEET_GITHUB_APP_ID,
+  FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+  GITHUB_APP_REGISTRY,
+  GitHubAppConfigurationError,
   DEFAULT_GITHUB_APP,
 } from "../services/github-credential.js";
 import { GITHUB_PROBE_URL_BY_SCOPE } from "../routes/diagnostics.js";
@@ -843,6 +848,67 @@ describe("resolveAppInstallationToken — App identity selection", () => {
       }
     } finally {
       global.fetch = originalFetch;
+    }
+  });
+});
+
+describe("resolveBrokerGitHubApp — configurable broker App descriptor", () => {
+  it("selects the default App when no name is given (absent, empty, or whitespace)", () => {
+    expect(resolveBrokerGitHubApp()).toBe(DEFAULT_GITHUB_APP);
+    expect(resolveBrokerGitHubApp("")).toBe(DEFAULT_GITHUB_APP);
+    expect(resolveBrokerGitHubApp("   ")).toBe(DEFAULT_GITHUB_APP);
+    expect(DEFAULT_GITHUB_APP).toEqual({
+      appId: GITHUB_APP_ID,
+      privateKeySecretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+    });
+  });
+
+  it("selects the fleet App as a coherent pair — its id is always bound to its own secret", () => {
+    const fleet = resolveBrokerGitHubApp("fleet");
+    expect(fleet).toEqual({
+      appId: FLEET_GITHUB_APP_ID,
+      privateKeySecretName: FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+    });
+    // The 401 from the issue is a fleet id signed with the default App's key; the fleet
+    // descriptor must never pair 4809618 with the default secret.
+    expect(fleet.privateKeySecretName).not.toBe(GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+  });
+
+  it("makes a mismatched appId/secret pairing impossible to express from any registry name", () => {
+    // Every registry entry keeps an App's id bound to that App's own key; no entry pairs
+    // 4595159 with the fleet key nor 4809618 with the default key.
+    for (const descriptor of Object.values(GITHUB_APP_REGISTRY)) {
+      if (descriptor.appId === FLEET_GITHUB_APP_ID) {
+        expect(descriptor.privateKeySecretName).toBe(FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+        expect(descriptor.privateKeySecretName).not.toBe(GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+      }
+      if (descriptor.appId === GITHUB_APP_ID) {
+        expect(descriptor.privateKeySecretName).toBe(GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+        expect(descriptor.privateKeySecretName).not.toBe(FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+      }
+    }
+  });
+
+  it("throws a named error for an unknown App name instead of silently falling back to the default", () => {
+    expect(() => resolveBrokerGitHubApp("bogus")).toThrow(GitHubAppConfigurationError);
+    expect(() => resolveBrokerGitHubApp("bogus")).toThrow(
+      /Unknown GitHub App descriptor "bogus"; valid names: default, fleet/,
+    );
+    // A typo'd name must not resolve to the default App (which would mint under the wrong issuer).
+    // Names are matched case-sensitively, so "Default" is unknown.
+    expect(() => resolveBrokerGitHubApp("Default")).toThrow(GitHubAppConfigurationError);
+  });
+
+  it("rejects Object.prototype names instead of returning an inherited truthy property", () => {
+    // Indexing a plain-object registry by a user-supplied name would otherwise return
+    // Object.prototype members (toString, constructor, __proto__, ...) as a truthy
+    // non-descriptor, silently yielding undefined appId/privateKeySecretName. Each such
+    // name must fail fast with the same named error as any other unknown name.
+    for (const name of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
+      expect(() => resolveBrokerGitHubApp(name)).toThrow(GitHubAppConfigurationError);
+      expect(() => resolveBrokerGitHubApp(name)).toThrow(
+        /Unknown GitHub App descriptor ".*"; valid names: default, fleet/,
+      );
     }
   });
 });

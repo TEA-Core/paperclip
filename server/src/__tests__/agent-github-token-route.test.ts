@@ -7,7 +7,12 @@ import { agentGitHubTokenRoutes } from "../routes/agent-github-tokens.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import {
   DEFAULT_GITHUB_APP,
+  FLEET_GITHUB_APP,
+  FLEET_GITHUB_APP_ID,
+  FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+  GITHUB_APP_ID,
   GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+  GitHubAppConfigurationError,
   appTokenCache,
   isGitHubTokenResolution,
   resolveAppInstallationToken,
@@ -83,13 +88,23 @@ function agentActor(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function fakeDeps(opts: { secret?: { id: string } | null; tokenResult?: GitHubTokenResolution | null } = {}) {
+function fakeDeps(
+  opts: {
+    secret?: { id: string } | null;
+    fleetSecret?: { id: string } | null;
+    tokenResult?: GitHubTokenResolution | null;
+  } = {},
+) {
   const secrets: AppInstallationTokenSecrets = {
-    getByName: vi.fn(async (_companyId, name) =>
-      name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME
-        ? (opts.secret !== undefined ? opts.secret : { id: "app-key-1" })
-        : null,
-    ),
+    getByName: vi.fn(async (_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return opts.secret !== undefined ? opts.secret : { id: "app-key-1" };
+      }
+      if (name === FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return opts.fleetSecret !== undefined ? opts.fleetSecret : { id: "fleet-key-1" };
+      }
+      return null;
+    }),
     resolveSecretValue: vi.fn(async () => FIXTURE_PRIVATE_KEY),
   };
   const resolveToken = vi.fn(async () =>
@@ -253,6 +268,7 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
       token: FIXTURE_TOKEN,
       expiresAt: 1_900_000_000_000,
       installationId: FIXTURE_INSTALLATION_ID,
+      appId: GITHUB_APP_ID,
     });
     expect(resolveToken).toHaveBeenCalledWith(
       "company-1",
@@ -300,6 +316,81 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
     expect(details.token).toBe("<redacted>");
     expect(JSON.stringify(audit)).not.toContain(FIXTURE_TOKEN);
     expect(JSON.stringify(audit)).not.toContain(FIXTURE_PRIVATE_KEY);
+  });
+});
+
+describe("broker App selection (configurable descriptor)", () => {
+  beforeEach(() => {
+    appTokenCache.clear();
+    delete process.env.PAPERCLIP_GITHUB_BROKER_APP;
+  });
+
+  afterEach(() => {
+    delete process.env.PAPERCLIP_GITHUB_BROKER_APP;
+  });
+
+  it("mints from the fleet App and reports its appId when the broker selects fleet", async () => {
+    const { deps, resolveToken, secrets } = fakeDeps();
+    const app = createApp(agentActor(), { ...deps, appName: "fleet" });
+    const res = await request(app).post("/api/agents/me/github/installation-tokens").send({ owner: "owner", repo: "repo" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.appId).toBe(FLEET_GITHUB_APP_ID);
+    // The mint was keyed to the fleet App's own secret, not the default App's.
+    expect(secrets.getByName).toHaveBeenCalledWith("company-1", FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+    expect(resolveToken).toHaveBeenCalledWith(
+      "company-1",
+      expect.anything(),
+      "owner",
+      "repo",
+      undefined,
+      FLEET_GITHUB_APP,
+      undefined,
+    );
+  });
+
+  it("reports the default App's appId when no App is selected", async () => {
+    const { deps } = fakeDeps();
+    const app = createApp(agentActor(), deps);
+    const res = await request(app).post("/api/agents/me/github/installation-tokens").send({ owner: "owner", repo: "repo" });
+    expect(res.status).toBe(200);
+    expect(res.body.appId).toBe(DEFAULT_GITHUB_APP.appId);
+  });
+
+  it("selects the fleet App from the PAPERCLIP_GITHUB_BROKER_APP env var", async () => {
+    process.env.PAPERCLIP_GITHUB_BROKER_APP = "fleet";
+    const { deps, resolveToken } = fakeDeps();
+    const app = createApp(agentActor(), deps);
+    const res = await request(app).post("/api/agents/me/github/installation-tokens").send({ owner: "owner", repo: "repo" });
+    expect(res.status).toBe(200);
+    expect(res.body.appId).toBe(FLEET_GITHUB_APP_ID);
+    expect(resolveToken).toHaveBeenCalledWith(
+      "company-1",
+      expect.anything(),
+      "owner",
+      "repo",
+      undefined,
+      FLEET_GITHUB_APP,
+      undefined,
+    );
+  });
+
+  it("returns 404 app_not_configured when the selected fleet App's key is not stored, without minting", async () => {
+    const { deps, resolveToken } = fakeDeps({ fleetSecret: null });
+    const app = createApp(agentActor(), { ...deps, appName: "fleet" });
+    const res = await request(app).post("/api/agents/me/github/installation-tokens").send({ owner: "owner", repo: "repo" });
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe("app_not_configured");
+    expect(resolveToken).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unknown App name at route construction with a named error, before any mint", async () => {
+    const { deps, resolveToken } = fakeDeps();
+    expect(() => agentGitHubTokenRoutes(fakeDb(), { ...deps, appName: "bogus" })).toThrow(GitHubAppConfigurationError);
+    expect(() => agentGitHubTokenRoutes(fakeDb(), { ...deps, appName: "bogus" })).toThrow(
+      /Unknown GitHub App descriptor "bogus"/,
+    );
+    expect(resolveToken).not.toHaveBeenCalled();
   });
 });
 

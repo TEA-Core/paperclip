@@ -29,6 +29,73 @@ export const DEFAULT_GITHUB_APP: GitHubAppDescriptor = {
   privateKeySecretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
 };
 
+/**
+ * The fleet App identity: app 4809618, private key under GITHUB_APP_PRIVATE_KEY_FLEET. It is
+ * deliberately a separate, least-privilege identity from the CI App (4595159 / GITHUB_APP_PRIVATE_KEY)
+ * so agent runs do not share the identity GitHub Actions uses to open PRs.
+ */
+export const FLEET_GITHUB_APP_ID = "4809618";
+export const FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME = "GITHUB_APP_PRIVATE_KEY_FLEET";
+export const FLEET_GITHUB_APP: GitHubAppDescriptor = {
+  appId: FLEET_GITHUB_APP_ID,
+  privateKeySecretName: FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+};
+
+/**
+ * The registry of Apps the installation-token broker may select. Each entry is a single,
+ * pre-paired descriptor — `appId` and `privateKeySecretName` are authored together and selected
+ * together by name, so one App's id can never be paired with another App's key (the 401 that
+ * results from such a mix is impossible to express through this registry rather than merely
+ * discouraged). Selection is by NAME; there is no surface that assembles a descriptor from an
+ * independent appId and an independent secret name.
+ */
+export const GITHUB_APP_REGISTRY = {
+  default: DEFAULT_GITHUB_APP,
+  fleet: FLEET_GITHUB_APP,
+} as const;
+
+/** The name of a broker-selectable App, as stored in GITHUB_APP_REGISTRY. */
+export type GitHubAppDescriptorName = keyof typeof GITHUB_APP_REGISTRY;
+
+/** Env var naming which GITHUB_APP_REGISTRY entry the broker mints with (default "default"). */
+export const BROKER_GITHUB_APP_ENV = "PAPERCLIP_GITHUB_BROKER_APP";
+
+/**
+ * Thrown at load when the broker is configured to select an App descriptor that is not in the
+ * registry. Fail-fast is intentional: a silently-wrong App would mint a JWT under the wrong
+ * issuer and surface as an opaque 401 at request time, so a bad name must break startup, not
+ * the first mint.
+ */
+export class GitHubAppConfigurationError extends Error {
+  readonly code = "github_app_misconfigured" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "GitHubAppConfigurationError";
+  }
+}
+
+/**
+ * Resolve the installation-token broker's App descriptor from a registry name.
+ *
+ * An empty/absent name selects the default App so every existing caller keeps working untouched.
+ * A known name returns its pre-paired descriptor; an unknown name throws
+ * {@link GitHubAppConfigurationError} with the offending name and the valid set, rather than
+ * falling back to the default App (a silent fallback would mint under the wrong issuer).
+ */
+export function resolveBrokerGitHubApp(
+  name?: string,
+): GitHubAppDescriptor {
+  const trimmed = name?.trim();
+  if (!trimmed) return GITHUB_APP_REGISTRY.default;
+  if (!Object.hasOwn(GITHUB_APP_REGISTRY, trimmed)) {
+    throw new GitHubAppConfigurationError(
+      `Unknown GitHub App descriptor "${trimmed}"; valid names: ${Object.keys(GITHUB_APP_REGISTRY).join(", ")}`,
+    );
+  }
+  return GITHUB_APP_REGISTRY[trimmed as GitHubAppDescriptorName];
+}
+
 export type GitHubTokenScope = "app_installation" | "project_env" | "company";
 
 export interface GitHubTokenResolution {
