@@ -8743,6 +8743,11 @@ describeEmbeddedPostgres("workspace sibling-branch safe restore (SUP-14781)", ()
     actualBranch: string;
     sourceIdentifier?: string;
     claimant?: "idle" | "active" | "none";
+    extraClaimants?: Array<{
+      kind: "idle" | "active";
+      lastUsedOffsetMs: number;
+      identifier?: string;
+    }>;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -8896,6 +8901,73 @@ describeEmbeddedPostgres("workspace sibling-branch safe restore (SUP-14781)", ()
       };
     }
 
+    const extraClaimants: Array<{
+      issueId: string;
+      workspaceId: string;
+      runId: string | null;
+      identifier: string;
+    }> = [];
+    for (const extra of input.extraClaimants ?? []) {
+      const extraIssueId = randomUUID();
+      const extraWorkspaceId = randomUUID();
+      const extraRunId = extra.kind === "active" ? randomUUID() : null;
+      const extraIdentifier = extra.identifier ?? "PAP-9991";
+      await db.insert(issues).values({
+        id: extraIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Extra branch claimant",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        identifier: extraIdentifier,
+      });
+      if (extraRunId) {
+        await db.insert(heartbeatRuns).values({
+          id: extraRunId,
+          companyId,
+          agentId,
+          invocationSource: "manual",
+          status: "running",
+          startedAt: now,
+          updatedAt: now,
+        });
+      }
+      await db.insert(executionWorkspaces).values({
+        id: extraWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId: extraIssueId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: input.actualBranch,
+        status: "active",
+        cwd: path.join(input.repoRoot, ".paperclip", "claimants", extraWorkspaceId),
+        providerRef: path.join(input.repoRoot, ".paperclip", "claimants", extraWorkspaceId),
+        baseRef: "HEAD",
+        branchName: input.actualBranch,
+        providerType: "git_worktree",
+        lastUsedAt: new Date(now.getTime() + extra.lastUsedOffsetMs),
+        updatedAt: new Date(now.getTime() + extra.lastUsedOffsetMs),
+      });
+      await db
+        .update(issues)
+        .set({
+          executionWorkspaceId: extraWorkspaceId,
+          executionRunId: extraRunId,
+          updatedAt: now,
+        })
+        .where(eq(issues.id, extraIssueId));
+      extraClaimants.push({
+        issueId: extraIssueId,
+        workspaceId: extraWorkspaceId,
+        runId: extraRunId,
+        identifier: extraIdentifier,
+      });
+    }
+
     return {
       companyId,
       agentId,
@@ -8905,6 +8977,7 @@ describeEmbeddedPostgres("workspace sibling-branch safe restore (SUP-14781)", ()
       sourceWorkspaceId,
       runId,
       claimant,
+      extraClaimants,
       sourceIdentifier: input.sourceIdentifier ?? "PAP-9901",
     };
   }
@@ -9009,6 +9082,53 @@ describeEmbeddedPostgres("workspace sibling-branch safe restore (SUP-14781)", ()
       },
     });
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  it("still fails closed when a stale claimant sorts ahead of a live claimant on the sibling branch", async () => {
+    const expectedBranch = "PAP-9903-recorded";
+    const actualBranch = "PAP-9903-live";
+    const { repoRoot, worktreePath } = await createCleanDivergedRepo({ expectedBranch, actualBranch });
+    const ids = await seedSiblingRestoreRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-9903",
+      claimant: "none",
+      extraClaimants: [
+        // Stale claimant: lastUsedAt +2000ms, so under `lastUsedAt desc` it sorts AHEAD of the
+        // live claimant (+1000ms). Its dispatch already finished, so it has no active run.
+        // First-match-only contention would return this row and mask the live one (fail-open).
+        { kind: "idle", lastUsedOffsetMs: 2_000, identifier: "PAP-9991" },
+        { kind: "active", lastUsedOffsetMs: 1_000, identifier: "PAP-9992" },
+      ],
+    });
+
+    const liveClaimant = ids.extraClaimants[1]!;
+    const staleClaimant = ids.extraClaimants[0]!;
+
+    await expect(dispatchSiblingRestore({ repoRoot, worktreePath, expectedBranch, ids })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          contention: expect.objectContaining({
+            claimedByWorkspaceId: liveClaimant.workspaceId,
+            claimedByIssueIdentifier: liveClaimant.identifier,
+            activeRun: expect.objectContaining({ status: "running" }),
+          }),
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            succeeded: false,
+            reason: expect.stringContaining("with active run"),
+          }),
+        }),
+      },
+    });
+    // The worktree must remain parked on the live sibling branch — the stale row that sorts
+    // first must not let the recorded branch yank it out from under the live run.
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+    expect(staleClaimant.workspaceId).not.toBe(liveClaimant.workspaceId);
   }, 20_000);
 });
 

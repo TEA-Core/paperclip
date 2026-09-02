@@ -2251,6 +2251,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         .orderBy(desc(executionWorkspaces.lastUsedAt), desc(executionWorkspaces.updatedAt))
         .limit(20);
 
+      let firstMatch: ExecutionWorkspaceGitWorktreeContention = null;
+      let liveMatch: ExecutionWorkspaceGitWorktreeContention = null;
       for (const candidate of candidates) {
         const candidatePath = readNullableString(candidate.providerRef) ?? readNullableString(candidate.cwd);
         const matchesPath = candidatePath ? path.resolve(candidatePath) === resolvedWorktreePath : false;
@@ -2313,16 +2315,24 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           ?? linkedIssueRows[0]
           ?? null;
 
-        return {
+        const record: NonNullable<ExecutionWorkspaceGitWorktreeContention> = {
           claimedByWorkspaceId: candidate.id,
           claimedByIssueId: claimedIssue?.id ?? candidate.sourceIssueId ?? null,
           claimedByIssueIdentifier:
             claimedIssue?.identifier ?? candidate.sourceIssueIdentifier ?? null,
           activeRun,
         };
+        if (firstMatch === null) firstMatch = record;
+        // SUP-14781: candidates are ordered lastUsedAt desc, so a stale row (its dispatch
+        // already finished, activeRun null) can sort ahead of a genuinely live one. Returning
+        // the first match alone answered "is the *first* claimant live", letting the clean
+        // safe-restore predicates fail open under a live competing run. Prefer the first live
+        // claimant when any exists so callers see real contention; otherwise keep the first
+        // match so an idle claim still surfaces (the dirty-quarantine path stays fail-closed).
+        if (record.activeRun && liveMatch === null) liveMatch = record;
       }
 
-      return null;
+      return liveMatch ?? firstMatch;
     },
 
     /**

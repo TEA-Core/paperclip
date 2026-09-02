@@ -1727,6 +1727,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   // dead-blocks every later dispatch on this shared worktree. Keep the full
   // contention record in `evidence` for audit/reporting; the repair predicates
   // below consult liveContention only.
+  // findGitWorktreeContention scans the whole candidate set and returns a live
+  // claimant when any exists (a stale row can otherwise sort ahead of a live one),
+  // so `activeRun` here is authoritative: null means no claimant is actually live.
   const liveContention = contention?.activeRun ? contention : null;
   const basePlainLanguageReason = explainGitWorktreeBranchIncoherence({
     expectedBranchName: input.expectedBranchName,
