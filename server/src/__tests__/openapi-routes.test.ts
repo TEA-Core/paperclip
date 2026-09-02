@@ -7,6 +7,10 @@ import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
 import { buildOpenApiSpec, openApiRoutes } from "../routes/openapi.js";
+import {
+  GITHUB_INSTALLATION_PERMISSION_LEVELS,
+  GITHUB_INSTALLATION_PERMISSION_NAMES,
+} from "../routes/agent-github-tokens.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROUTES_DIR = path.resolve(__dirname, "../routes");
@@ -283,6 +287,35 @@ describe("openapi routes", () => {
       missingInSpec: [],
       extraInSpec: [],
     });
+  });
+
+  it("documents the installation-token permissions body schema with parity to the runtime", () => {
+    const { spec } = loadSpecRoutes();
+    const body = spec.paths["/api/agents/me/github/installation-tokens"].post.requestBody.content[
+      "application/json"
+    ].schema;
+
+    expect(body.properties.owner).toEqual({ type: "string", minLength: 1 });
+    expect(body.properties.repo).toEqual({ type: "string", minLength: 1 });
+    expect(body.required).toEqual(["owner", "repo"]);
+
+    const permissions = body.properties.permissions;
+    // The permission key set is a constrained object, not a free-form record: a
+    // typo'd name is rejected at the boundary rather than minted as a 502.
+    expect(permissions.type).toBe("object");
+    expect(permissions.additionalProperties).toBe(false);
+
+    // Parity: the documented key set and per-key value enum match the runtime
+    // schema exactly, so the published contract and the runtime cannot drift.
+    const runtimeLevels = [...GITHUB_INSTALLATION_PERMISSION_LEVELS];
+    expect(Object.keys(permissions.properties).sort()).toEqual(
+      [...GITHUB_INSTALLATION_PERMISSION_NAMES].sort(),
+    );
+    for (const [name, value] of Object.entries(
+      permissions.properties as Record<string, { enum?: unknown[] }>,
+    )) {
+      expect(value.enum, `permissions.${name} value enum`).toEqual(runtimeLevels);
+    }
   });
 
   it("documents auth and reviewed response-code invariants", () => {

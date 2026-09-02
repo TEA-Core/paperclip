@@ -236,6 +236,7 @@ import {
   startAdapterAuthSessionRequestSchema,
 } from "@paperclipai/shared";
 import { dispatchQuiesceRequestSchema } from "./dispatch-quiesce.js";
+import { agentInstallationTokenRequestSchema } from "./agent-github-tokens.js";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
   companyImportTransferDeclarationSchema,
@@ -1866,13 +1867,7 @@ registry.registerPath({
   tags: ["agents"],
   summary: "Mint a GitHub App installation token for the current agent run",
   request: {
-    body: jsonBody(
-      z.object({
-        owner: z.string().min(1),
-        repo: z.string().min(1),
-        permissions: z.record(z.string(), z.unknown()).optional(),
-      }),
-    ),
+    body: jsonBody(agentInstallationTokenRequestSchema),
   },
   responses: {
     200: {
