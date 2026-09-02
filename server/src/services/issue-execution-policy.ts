@@ -55,6 +55,15 @@ type TransitionInput = {
   monitorExplicitlyUpdated?: boolean;
 };
 
+export type ReviewEscalationSignal = {
+  escalatedToUserId: string;
+  stageId: string;
+  stageType: string;
+  maxRounds: number;
+  changesRequestedCount: number;
+  returnAssignee: IssueExecutionStagePrincipal;
+};
+
 type TransitionResult = {
   patch: Record<string, unknown>;
   decision?: Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome" | "body">;
@@ -65,6 +74,16 @@ type TransitionResult = {
    * so the state stays scoped to the surviving policy revision (SUP-14590).
    */
   droppedStageIds?: string[];
+  /**
+   * Set ONLY when a changes-requested round cap is exhausted and the pending
+   * review is escalated to the responsible human instead of bouncing back to the
+   * implementer. This is a pure signal: the service does not create the
+   * interaction. The route that records the accompanying `changes_requested`
+   * decision uses it to mint exactly one review-escalation interaction addressed
+   * to that human (SUP-14805). The hold re-assertion path never sets this, so a
+   * re-asserting drift PATCH cannot mint a duplicate.
+   */
+  reviewEscalation?: ReviewEscalationSignal;
 };
 
 /**
@@ -1084,6 +1103,14 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               patch,
               decision,
               workflowControlledAssignment: true,
+              reviewEscalation: {
+                escalatedToUserId: escalationUserId,
+                stageId: activeStage.id,
+                stageType: activeStage.type,
+                maxRounds: resolveMaxReviewRounds(input.policy),
+                changesRequestedCount: nextRounds,
+                returnAssignee,
+              },
             };
           }
         }
