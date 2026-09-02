@@ -34,6 +34,10 @@ export type RunDatabaseBackupResult = {
   backupFile: string;
   sizeBytes: number;
   prunedCount: number;
+  /** Which engine produced `backupFile`. */
+  engine: "pg_dump" | "javascript";
+  /** Set only when `backupEngine: "auto"` fell back from pg_dump to the JavaScript engine. */
+  pgDumpFallbackReason?: string;
 };
 
 export type RunDatabaseRestoreOptions = {
@@ -534,6 +538,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const nullifiedColumnsByTable = normalizeNullifyColumnMap(opts.nullifyColumns);
   let sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
   let sqlClosed = false;
+  let pgDumpFallbackReason: string | undefined;
   const closeSql = async () => {
     if (sqlClosed) return;
     sqlClosed = true;
@@ -561,6 +566,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           backupFile,
           sizeBytes,
           prunedCount,
+          engine: "pg_dump",
         };
       } catch (error) {
         if (existsSync(backupFile)) {
@@ -569,6 +575,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         if (backupEngine === "pg_dump") {
           throw error;
         }
+        const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
+        const fallbackReason = error instanceof Error ? error.message : String(error);
+        pgDumpFallbackReason = fallbackReason;
+        console.warn(
+          `paperclip backup: backupEngine "auto" pg_dump step failed, falling back to the JavaScript engine. pg_dump binary: ${pgDumpBin}; error: ${fallbackReason}`,
+        );
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
         sqlClosed = false;
       }
@@ -1031,6 +1043,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       backupFile,
       sizeBytes,
       prunedCount,
+      engine: "javascript",
+      ...(pgDumpFallbackReason === undefined ? {} : { pgDumpFallbackReason }),
     };
   } catch (error) {
     await writer.abort();
@@ -1087,5 +1101,8 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
 export function formatDatabaseBackupResult(result: RunDatabaseBackupResult): string {
   const size = formatBackupSize(result.sizeBytes);
   const pruned = result.prunedCount > 0 ? `; pruned ${result.prunedCount} old backup(s)` : "";
-  return `${result.backupFile} (${size}${pruned})`;
+  const fallback = result.pgDumpFallbackReason
+    ? `; pg_dump fell back to javascript (${result.pgDumpFallbackReason.slice(0, 200)})`
+    : "";
+  return `${result.backupFile} [${result.engine}] (${size}${pruned}${fallback})`;
 }

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { gunzipSync } from "node:zlib";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
@@ -490,6 +490,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
       const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
       process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+      const warnSpy = vi.spyOn(console, "warn");
 
       try {
         await sourceSql.unsafe(`
@@ -520,6 +521,15 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
           backupEngine: "auto",
         });
 
+        expect(result.engine).toBe("javascript");
+        expect(typeof result.pgDumpFallbackReason).toBe("string");
+        expect(result.pgDumpFallbackReason?.length).toBeGreaterThan(0);
+        const fallbackWarnings = warnSpy.mock.calls
+          .map((call) => call.map(String).join(" "))
+          .filter((message) => message.includes("falling back to the JavaScript engine"));
+        expect(fallbackWarnings).toHaveLength(1);
+        expect(fallbackWarnings[0]).toContain(result.pgDumpFallbackReason);
+
         const backupSql = gunzipSync(await fs.promises.readFile(result.backupFile)).toString("utf8");
         expect(backupSql.indexOf("-- Data for: public.aaa_child_records")).toBeGreaterThan(-1);
         expect(backupSql.indexOf("-- Data for: public.aaa_child_records")).toBeLessThan(
@@ -538,6 +548,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         `);
         expect(rows).toEqual([{ note: "child emitted before parent", name: "parent" }]);
       } finally {
+        warnSpy.mockRestore();
         if (originalPgDumpPath === undefined) {
           delete process.env.PAPERCLIP_PG_DUMP_PATH;
         } else {
