@@ -168,8 +168,13 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     skippedStageIds?: string[];
     completedStageIds?: string[];
     seedDecision?: boolean;
-    /** Record the approving decision row as authored by the card's creator (self-approval). */
-    selfApprovedDecision?: boolean;
+    /**
+     * ADR-092: cast the approving decision row from the resolved return assignee
+     * (the guard-b illegal shape) instead of the default reviewer. With the seed's
+     * declared `returnAssigneeAgentId`, this makes the return assignee decide its
+     * own completed stage — the shape guard-b refuses.
+     */
+    returnAssigneeDecides?: boolean;
     /** Seed a linked PR external object + mention. */
     pr?: { owner: string; repo: string; number: number; headRefName: string | null } | null;
     deliveryBranch?: string | null;
@@ -181,6 +186,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
   async function seedIssue(opts: SeedOptions = {}) {
     const companyId = randomUUID();
     const reviewerAgentId = randomUUID();
+    const returnAssigneeAgentId = randomUUID();
     const issueId = randomUUID();
     const executionWorkspaceId = randomUUID();
     const projectId = randomUUID();
@@ -224,6 +230,21 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       id: reviewerAgentId,
       companyId,
       name: "Reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // ADR-092: the card carries a declared return assignee distinct from the
+    // reviewer/assignee that casts the approving decision, so the seed is a
+    // guard-b-legal card by default and the happy-path tests reach their intended
+    // head-resolution / publish behaviors instead of tripping the D3 fallback.
+    await db.insert(agents).values({
+      id: returnAssigneeAgentId,
+      companyId,
+      name: "Return Assignee",
       role: "engineer",
       status: "active",
       adapterType: "codex_local",
@@ -287,6 +308,10 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
       executionPolicy: {
         mode: "normal",
         commentRequired: true,
+        // ADR-092 D3: declare a return assignee distinct from the assignee/decision
+        // actor so the resolved gated principal does not collide with the reviewer
+        // that cast the approval (keeps the happy-path card guard-b-legal).
+        returnAssigneeAgentId,
         stages: [{ id: STAGE_ID, type: "approval", approvalsNeeded: 1 }],
       },
       executionState,
@@ -298,8 +323,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         issueId,
         stageId: STAGE_ID,
         stageType: "approval",
-        actorAgentId: opts.selfApprovedDecision ? null : reviewerAgentId,
-        actorUserId: opts.selfApprovedDecision ? USER_ID : null,
+        actorAgentId: opts.returnAssigneeDecides ? returnAssigneeAgentId : reviewerAgentId,
+        actorUserId: null,
         outcome: "approved",
         body: "Approved",
         createdAt: now,
@@ -403,19 +428,22 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
 
-  it("refuses with 409 when the approving decision was made by the card's author", async () => {
-    // The completed stage's latest decision was cast by the card's own creator —
-    // a self-approval, which stage-integrity (Guard B) refuses as fake approval.
+  it("refuses with 409 when the resolved return assignee decided its own completed stage", async () => {
+    // ADR-092: guard-b gates on the resolved return assignee
+    // (policy.returnAssigneeAgentId ?? state.returnAssignee ?? assignee). The card's
+    // creator term is no longer an input (D2), so an author self-approval no longer
+    // trips this guard; instead, when the declared return assignee cast the
+    // completed stage's decision, stage-integrity (Guard B) refuses it.
     const { companyId, issueId } = await seedIssue({
       lastDecisionOutcome: "approved",
-      selfApprovedDecision: true,
+      returnAssigneeDecides: true,
     });
     currentActor = boardActor(companyId);
 
     const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
 
     expect(res.status).toBe(409);
-    expect(res.body.reason).toBe("guard-b:decision-by-author-or-return-assignee");
+    expect(res.body.reason).toBe("guard-b:decision-by-return-assignee");
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
 
