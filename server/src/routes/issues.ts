@@ -250,6 +250,7 @@ import {
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
+  type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -599,6 +600,83 @@ function readObject(value: unknown): Record<string, unknown> {
 
 function hasOwn(record: Record<string, unknown>, key: string) {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Mint the single review-escalation interaction that a round-cap escalation
+ * leaves for the responsible human (SUP-14805). The execution-policy service is
+ * pure and only signals via `transition.reviewEscalation`; this is where the
+ * interaction is actually written — post-commit, in the route that recorded the
+ * accompanying `changes_requested` decision.
+ *
+ * The card is created as a user actor (the escalated human), not the reviewer
+ * agent: a set `createdByAgentId` would make `acceptRequestConfirmation` bounce
+ * the issue back to the creator agent on accept, undoing the escalation. With
+ * `createdByUserId` set and `createdByAgentId` null, accepting resolves the card
+ * in place. `human_only` keeps it resolvable only by a human; `wake_assignee`
+ * re-surfaces it to the assignee on both accept and reject.
+ */
+async function mintReviewEscalationInteraction(args: {
+  db: Db;
+  issue: { id: string; companyId: string; identifier?: string | null };
+  escalation: ReviewEscalationSignal;
+  decisionBody: string;
+  actorRunId?: string | null;
+}): Promise<{ id: string }> {
+  const { db, issue, escalation, decisionBody } = args;
+  const returnAssigneeLabel =
+    escalation.returnAssignee.type === "user"
+      ? `user ${escalation.returnAssignee.userId ?? ""}`.trim()
+      : `agent ${escalation.returnAssignee.agentId ?? ""}`.trim();
+  const issueLabel = issue.identifier ? `\`${issue.identifier}\`` : `\`${issue.id}\``;
+  const decisionBodyHash = createHash("sha256").update(decisionBody).digest("hex").slice(0, 16);
+  const idempotencyKey =
+    `review-escalation:${issue.id}:${escalation.stageId}:${escalation.changesRequestedCount}:${decisionBodyHash}`.slice(0, 255);
+  const sourceRunId =
+    args.actorRunId && UUID_PATTERN.test(args.actorRunId) ? args.actorRunId : null;
+  const detailsMarkdown = [
+    `Review stage \`${escalation.stageId}\` (\`${escalation.stageType}\`) on issue ${issueLabel} has requested changes ${escalation.changesRequestedCount} time(s), reaching the round cap of ${escalation.maxRounds}.`,
+    ``,
+    `The pending review has been escalated to you instead of bouncing back to the implementer.`,
+    ``,
+    `Reviewer's recorded decision:`,
+    `> ${decisionBody}`,
+    ``,
+    `Your decision (route: \`PATCH /issues/:id\`):`,
+    `- Approve and advance the stage.`,
+    `- Request changes again — this resets the round counter to 0 (a human send-back does not burn a round).`,
+    `- Re-scope the issue.`,
+    ``,
+    `Return assignee: ${returnAssigneeLabel}.`,
+  ].join("\n");
+  return issueThreadInteractionService(db).create(
+    issue,
+    {
+      kind: "request_confirmation",
+      title: "Review round cap reached — your decision is needed",
+      summary: `Review stage ${escalation.stageId} hit the ${escalation.maxRounds}-round change cap and was escalated to you.`,
+      addresseeAgentId: null,
+      resolverPolicy: "human_only",
+      continuationPolicy: "wake_assignee",
+      sourceRunId,
+      idempotencyKey,
+      payload: {
+        version: 1,
+        prompt: "Approve this review, or request further changes (round cap reached).",
+        acceptLabel: "Approve & advance",
+        rejectLabel: "Request changes",
+        rejectRequiresReason: true,
+        allowDeclineReason: true,
+        detailsMarkdown,
+      },
+    },
+    {
+      agentId: null,
+      userId: escalation.escalatedToUserId,
+    },
+  );
 }
 
 async function auditAgentIssueCreateAttributionSpoof(input: {
@@ -8142,6 +8220,11 @@ export function issueRoutes(
         .then((rows) => rows[0] ?? null);
       if (!lockedIssue) throw notFound("Issue not found");
 
+      let recoveryEscalationPayload: {
+        escalation: ReviewEscalationSignal;
+        decisionBody: string;
+        runId: string | null;
+      } | null = null;
       const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
         lockedIssue.companyId,
         lockedIssue.id,
@@ -8271,6 +8354,13 @@ export function issueRoutes(
               createdByRunId: actor.runId ?? null,
             });
           }
+          if (transition.reviewEscalation && transition.decision) {
+            recoveryEscalationPayload = {
+              escalation: transition.reviewEscalation,
+              decisionBody: transition.decision.body,
+              runId: actor.runId ?? null,
+            };
+          }
         }
 
         const updatedIssue = await svc.update(
@@ -8313,9 +8403,30 @@ export function issueRoutes(
       );
       if (!recoveryAction) throw notFound("Active recovery action not found");
 
-      return { issue, recoveryAction };
+      return { issue, recoveryAction, reviewEscalation: recoveryEscalationPayload };
     });
     for (const publication of postCommitActivityPublications) publishActivity(publication);
+
+    if (result.reviewEscalation) {
+      try {
+        await mintReviewEscalationInteraction({
+          db,
+          issue: {
+            id: result.issue.id,
+            companyId: result.issue.companyId,
+            identifier: result.issue.identifier ?? null,
+          },
+          escalation: result.reviewEscalation.escalation,
+          decisionBody: result.reviewEscalation.decisionBody,
+          actorRunId: result.reviewEscalation.runId,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, issueId: result.issue.id, stageId: result.reviewEscalation.escalation.stageId },
+          "failed to mint review escalation interaction (recovery resolve)",
+        );
+      }
+    }
 
     await routinesSvc.syncRunStatusForIssue(result.issue.id);
 
@@ -11818,6 +11929,22 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    if (transition.reviewEscalation && transition.decision) {
+      try {
+        await mintReviewEscalationInteraction({
+          db,
+          issue: { id: issue.id, companyId: issue.companyId, identifier: issue.identifier ?? null },
+          escalation: transition.reviewEscalation,
+          decisionBody: transition.decision.body,
+          actorRunId: actor.runId ?? null,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, stageId: transition.reviewEscalation.stageId },
+          "failed to mint review escalation interaction",
+        );
+      }
+    }
     for (const publication of postCommitActivityPublications) publishActivity(publication);
 
     if (transition.droppedStageIds?.length) {
@@ -14498,6 +14625,31 @@ export function issueRoutes(
             _previous: { status: issueBeforeCommentDecision.status },
           },
         });
+      }
+      // SUP-14805: this auto-approve comment door only ever requests `done`, so a
+      // round-cap escalation cannot originate here — but the same pure transition
+      // runs on this door, and ADR-085 treats a control waived at one door as no
+      // control at all. Guard every transition door symmetrically: if the
+      // transition ever surfaces an escalation signal, mint the card here too.
+      if (transition.reviewEscalation && transition.decision) {
+        try {
+          await mintReviewEscalationInteraction({
+            db,
+            issue: {
+              id: currentIssue.id,
+              companyId: currentIssue.companyId,
+              identifier: currentIssue.identifier ?? null,
+            },
+            escalation: transition.reviewEscalation,
+            decisionBody: transition.decision.body,
+            actorRunId: actor.runId ?? null,
+          });
+        } catch (err) {
+          logger.warn(
+            { err, issueId: currentIssue.id, stageId: transition.reviewEscalation.stageId },
+            "failed to mint review escalation interaction (auto-approve comment door)",
+          );
+        }
       }
       // SUP-13904: this comment door is a second door onto an approved review
       // decision, so it must run the same merge-arming post-hook as the PATCH

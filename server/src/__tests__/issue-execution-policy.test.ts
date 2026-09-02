@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -2998,6 +2998,8 @@ describe("review round circuit breaker", () => {
       status: "changes_requested",
       changesRequestedCount: 1,
     });
+    // Below the cap: no escalation signal is emitted.
+    expect(result.reviewEscalation).toBeUndefined();
   });
 
   it("carries the round count through the executor's resubmission", () => {
@@ -3056,6 +3058,46 @@ describe("review round circuit breaker", () => {
       currentStageId: reviewStageId,
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 3,
+    });
+  });
+
+  it("emits the reviewEscalation signal only on the round-cap escalation (SUP-14805)", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue({}, { changesRequestedCount: 2 }),
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Round three feedback — still not converging",
+    });
+
+    expect(result.reviewEscalation).toMatchObject({
+      escalatedToUserId: boardUserId,
+      stageId: reviewStageId,
+      stageType: "review",
+      maxRounds: DEFAULT_MAX_REVIEW_ROUNDS,
+      changesRequestedCount: 3,
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("honours a custom maxReviewRounds override in the escalation signal", () => {
+    const strictPolicy = { ...policy, maxReviewRounds: 1 } as typeof policy;
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue({ executionPolicy: strictPolicy }, { changesRequestedCount: 0 }),
+      policy: strictPolicy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Still not converging",
+    });
+
+    expect(result.patch.assigneeUserId).toBe(boardUserId);
+    expect(result.patch.assigneeAgentId).toBeNull();
+    expect(result.reviewEscalation).toMatchObject({
+      escalatedToUserId: boardUserId,
+      maxRounds: 1,
+      changesRequestedCount: 1,
     });
   });
 
@@ -3137,6 +3179,9 @@ describe("review round circuit breaker", () => {
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 3,
     });
+    // Drift re-assertion of an existing hold is idempotent: it must NOT emit a
+    // fresh escalation signal, otherwise every drift PATCH would mint a card.
+    expect(result.reviewEscalation).toBeUndefined();
   });
 
   it("resets the counter when the escalated human requests changes", () => {
@@ -3161,6 +3206,8 @@ describe("review round circuit breaker", () => {
       status: "changes_requested",
       changesRequestedCount: 0,
     });
+    // A human resetting the round is not an escalation: no signal.
+    expect(result.reviewEscalation).toBeUndefined();
   });
 
   it("lets the escalated human approve the stage", () => {
