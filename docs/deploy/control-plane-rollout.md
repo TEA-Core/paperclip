@@ -225,8 +225,11 @@ Pass criteria:
   and passes a check that should fail:
 
   ```bash
-  git fetch origin fold/tea-patches-v2026.722.0
-  git rev-parse origin/fold/tea-patches-v2026.722.0
+  # `&&`, not two statements: if the fetch fails (offline, auth, renamed branch)
+  # the rev-parse below would still succeed against the STALE tracking ref and
+  # quietly compare the plane to an old tip.
+  git fetch origin fold/tea-patches-v2026.722.0 \
+    && git rev-parse origin/fold/tea-patches-v2026.722.0
   ```
 
 **The "Fold buildability gate" workflow conclusion is NOT a liveness check.** It
@@ -251,8 +254,11 @@ if [ -z "$SERVED" ] || [ "$SERVED" = null ]; then
   echo "could not read the served commit from /api/health" >&2
 elif ! git rev-parse --verify --quiet "$SERVED^{commit}" >/dev/null; then
   echo "served commit $SERVED is not in this repo -- fetch, or check the branch" >&2
+elif ! git fetch origin fold/tea-patches-v2026.722.0; then
+  # Stop here rather than fall through: on a failed fetch the tracking ref below
+  # still resolves, to a stale tip, and would under-report the debt.
+  echo "could not refresh origin/fold/tea-patches-v2026.722.0 -- debt not computed" >&2
 else
-  git fetch origin fold/tea-patches-v2026.722.0
   git log --oneline "$SERVED..origin/fold/tea-patches-v2026.722.0"
 fi
 ```
