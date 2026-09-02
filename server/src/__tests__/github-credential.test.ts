@@ -11,6 +11,7 @@ import {
   appTokenCache,
   GITHUB_APP_ID,
   GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+  DEFAULT_GITHUB_APP,
 } from "../services/github-credential.js";
 import { GITHUB_PROBE_URL_BY_SCOPE } from "../routes/diagnostics.js";
 import type { Server } from "node:http";
@@ -678,6 +679,91 @@ describe("resolveAppInstallationToken — App identity selection", () => {
       );
       if (isGitHubTokenResolution(fleetApp) && isGitHubTokenResolution(fleetAppAgain)) {
         expect(fleetAppAgain.token).toBe(fleetApp.token);
+      }
+      expect(mintCount).toBe(2);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("does not serve a broad cached token to a caller requesting a narrowed permission set", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    let mintCount = 0;
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn((input: string | URL) => {
+      const target = typeof input === "string" ? input : input.toString();
+      if (target.includes("/repos/owner/repo/installation")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ id: Number(FIXTURE_INSTALLATION_ID) }), { status: 200 }),
+        );
+      }
+      if (target.includes("/access_tokens")) {
+        mintCount += 1;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              token: `ghs_perm_token_mint_${mintCount}`,
+              expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }) as any;
+
+    try {
+      // Broad: a permission-less caller mints and caches the broad token.
+      const broad = await resolveAppInstallationToken(
+        company,
+        mockSecretService,
+        owner,
+        repo,
+        undefined,
+        DEFAULT_GITHUB_APP,
+      );
+      expect(isGitHubTokenResolution(broad)).toBe(true);
+      expect(mintCount).toBe(1);
+
+      // Narrow: a narrowed permission set must mint its OWN token — it must NOT
+      // be served the broad token the permission-less caller cached for the same
+      // owner/repo. This is the regression the permissions-fingerprint key fixes.
+      const narrow = await resolveAppInstallationToken(
+        company,
+        mockSecretService,
+        owner,
+        repo,
+        undefined,
+        DEFAULT_GITHUB_APP,
+        { contents: "read" },
+      );
+      expect(isGitHubTokenResolution(narrow)).toBe(true);
+      if (isGitHubTokenResolution(broad) && isGitHubTokenResolution(narrow)) {
+        expect(broad.token).toBe("ghs_perm_token_mint_1");
+        expect(narrow.token).toBe("ghs_perm_token_mint_2");
+        expect(narrow.token).not.toBe(broad.token);
+      }
+      expect(mintCount).toBe(2);
+
+      // A repeat narrow request (same permission set) is a cache hit — no second narrow mint.
+      const narrowAgain = await resolveAppInstallationToken(
+        company,
+        mockSecretService,
+        owner,
+        repo,
+        undefined,
+        DEFAULT_GITHUB_APP,
+        { contents: "read" },
+      );
+      if (isGitHubTokenResolution(narrow) && isGitHubTokenResolution(narrowAgain)) {
+        expect(narrowAgain.token).toBe(narrow.token);
       }
       expect(mintCount).toBe(2);
     } finally {

@@ -1862,6 +1862,47 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/agents/me/github/installation-tokens",
+  tags: ["agents"],
+  summary: "Mint a GitHub App installation token for the current agent run",
+  request: {
+    body: jsonBody(
+      z.object({
+        owner: z.string().min(1),
+        repo: z.string().min(1),
+        permissions: z.record(z.string(), z.unknown()).optional(),
+      }),
+    ),
+  },
+  responses: {
+    200: {
+      description: "Minted installation token",
+      content: {
+        "application/json": {
+          schema: z.object({
+            token: z.string(),
+            expiresAt: z.number().int().optional(),
+            installationId: z.string().optional(),
+          }),
+        },
+      },
+    },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: {
+      description: "App not configured or repo unreachable",
+      content: { "application/json": { schema: ErrorSchema } },
+    },
+    502: {
+      description: "App configured but installation-token mint failed",
+      content: { "application/json": { schema: ErrorSchema } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/agents/me/connections/{connectionId}/token",
   tags: ["tools"],
   summary: "Mint a short-lived token for an agent connection",
