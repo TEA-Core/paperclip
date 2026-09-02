@@ -872,12 +872,23 @@ type BackfillOutcome =
 /**
  * A stable backfill refusal persisted on the card's executionState.approvalStatus
  * so the next reconciler tick can re-report it without re-reading the PR
- * timeline while the live head is unchanged (the backfill-repeat-fanout review
- * finding). `observedHeadSha` is the live head the refusal was derived against.
+ * timeline (the backfill-repeat-fanout review finding). A refusal is a function
+ * of the (live head, approval time) pair, so BOTH are stored: `observedHeadSha`
+ * is the live head the refusal was derived against and `approvedAtMs` is the
+ * approval decision's createdAt it was derived against. Either changing
+ * invalidates the cache and forces a fresh timeline read (a moved head, or a
+ * re-approval at a later time, can change the head-at-approval-time).
+ *
+ * Only DETERMINISTIC refusals are persisted. A transient timeline read failure
+ * (HTTP / network error, or an unparseable head-mutating event) is reported as a
+ * skip but NOT persisted, so the next tick retries the read instead of stranding
+ * a recoverable card on one transient error (backfill-refusal-caches-transient-
+ * failures).
  */
 type BackfillRefusal = {
   reason: string;
   observedHeadSha: string;
+  approvedAtMs: number;
   observedAt: string;
 };
 
@@ -895,9 +906,17 @@ function readBackfillRefusal(row: CandidateRow): BackfillRefusal | null {
   ) {
     return null;
   }
+  // The approval-time key must be a finite number to be trusted; a missing or
+  // non-finite value means the cache entry is not a valid keyed refusal, so it
+  // is ignored and the timeline is re-read (fail toward a fresh read, never a
+  // stale refusal).
+  if (typeof obj.approvedAtMs !== "number" || !Number.isFinite(obj.approvedAtMs)) {
+    return null;
+  }
   return {
     reason: obj.reason,
     observedHeadSha: obj.observedHeadSha,
+    approvedAtMs: obj.approvedAtMs,
     observedAt: typeof obj.observedAt === "string" ? obj.observedAt : "",
   };
 }
@@ -927,11 +946,14 @@ async function persistBackfillRefusal(
  * whose server-recorded `created_at` is at/before the approval), and — only when
  * that head still equals the live head — writes approvalStatus.approvedHeadSha +
  * approvedAt so the unmodified first-publish path certifies it. A head provable
- * only through committed (client-timed) events, or any head we cannot verify to a
- * server timestamp, is refused with a recorded reason and zero writes. A stable
- * refusal is persisted on the card so the next tick skips the timeline re-read
- * while the live head is unchanged (backfill-repeat-fanout).
- */
+  * only through committed (client-timed) events, or any head we cannot verify to a
+  * server timestamp, is refused with a recorded reason and zero writes. A
+  * DETERMINISTIC refusal is persisted on the card, keyed on both the live head and
+  * the approval time, so the next tick skips the timeline re-read while neither
+  * changes (backfill-repeat-fanout). A transient timeline read failure is NOT
+  * persisted, so it retries on the next tick instead of stranding the card on one
+  * transient error (backfill-refusal-caches-transient-failures).
+  */
 async function backfillPreDBApprovalAnchor(
   db: Db,
   row: CandidateRow,
@@ -960,17 +982,22 @@ async function backfillPreDBApprovalAnchor(
   }
   const approvalTimeMs = decision.createdAt.getTime();
 
-  // Finding 3 (backfill-repeat-fanout): a stable refusal is a deterministic
-  // function of (timeline, live head, approval time). While the live head is the
-  // same one the last refusal was derived against, re-report it and skip the
-  // timeline re-read. A new live head clears the marker (observedHeadSha
-  // mismatch) and forces a fresh read.
+  // A stable refusal is a deterministic function of (timeline, live head,
+  // approval time). It is cached against BOTH the live head and the approval
+  // time: while neither changes, re-report it and skip the timeline re-read
+  // (backfill-repeat-fanout). A new live head OR a re-approval at a later time
+  // invalidates the cache (either can change the head-at-approval-time) and
+  // forces a fresh read. A transient read failure is never cached.
   const cached = readBackfillRefusal(row);
-  if (cached && cached.observedHeadSha === currentHeadSha) {
+  if (
+    cached &&
+    cached.observedHeadSha === currentHeadSha &&
+    cached.approvedAtMs === approvalTimeMs
+  ) {
     return {
       kind: "skipped",
       reason: cached.reason,
-      detail: `backfill: stable refusal ${cached.reason} (observed head ${cached.observedHeadSha.slice(0, 7)} unchanged since ${cached.observedAt || "an earlier tick"}); skipping the timeline re-read for ${target.displayName}`,
+      detail: `backfill: stable refusal ${cached.reason} (observed head ${cached.observedHeadSha.slice(0, 7)} / approval ${new Date(cached.approvedAtMs).toISOString()} unchanged); skipping the timeline re-read for ${target.displayName}`,
     };
   }
 
@@ -983,17 +1010,22 @@ async function backfillPreDBApprovalAnchor(
     approvalTimeMs,
   );
   if (timeline.kind === "failed") {
-    await persistBackfillRefusal(db, row, {
+    // A failed read is a TRANSIENT condition (HTTP / network error, or an
+    // unparseable head-mutating event) — NOT a deterministic refusal. It is
+    // reported as a skip but deliberately NOT persisted as a stable refusal, so
+    // the next tick retries the read instead of stranding a recoverable card on
+    // one transient error (backfill-refusal-caches-transient-failures).
+    return {
+      kind: "skipped",
       reason: "backfill:timeline-read-failed",
-      observedHeadSha: currentHeadSha,
-      observedAt: new Date().toISOString(),
-    });
-    return { kind: "skipped", reason: "backfill:timeline-read-failed", detail: `backfill: ${timeline.detail}` };
+      detail: `backfill: ${timeline.detail}`,
+    };
   }
   if (timeline.kind === "truncated") {
     await persistBackfillRefusal(db, row, {
       reason: "backfill:timeline-truncated",
       observedHeadSha: currentHeadSha,
+      approvedAtMs: approvalTimeMs,
       observedAt: new Date().toISOString(),
     });
     return {
@@ -1013,6 +1045,7 @@ async function backfillPreDBApprovalAnchor(
     await persistBackfillRefusal(db, row, {
       reason,
       observedHeadSha: currentHeadSha,
+      approvedAtMs: approvalTimeMs,
       observedAt: new Date().toISOString(),
     });
     return { kind: "skipped", reason, detail };
@@ -1022,6 +1055,7 @@ async function backfillPreDBApprovalAnchor(
     await persistBackfillRefusal(db, row, {
       reason: "backfill:head-moved-since-approval",
       observedHeadSha: currentHeadSha,
+      approvedAtMs: approvalTimeMs,
       observedAt: new Date().toISOString(),
     });
     return {

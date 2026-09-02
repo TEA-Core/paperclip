@@ -120,6 +120,17 @@ const TIMELINE_NO_HEAD_EVENT_BODY = [
   { event: "labeled", created_at: "2026-08-19T09:00:00Z" },
   { event: "review_dismissed", created_at: "2026-08-19T09:30:00Z" },
 ];
+// Re-approval scenario: at the first approval time (APPROVED_AT) the newest
+// server-timed force-push is APPROVED_HEAD (≠ the live head NEW_HEAD), so the
+// backfill refuses head-moved-since-approval. The head is later force-pushed to
+// NEW_HEAD; a re-approval at a LATER time (2026-08-21) makes the head-at-approval
+// time equal the live head, so the backfill now succeeds. Drives the
+// approval-time keying of the refusal cache
+// (backfill-refusal-not-keyed-on-approval-time).
+const TIMELINE_REAPPROVAL_BODY = [
+  { event: "head_ref_force_pushed", commit_id: APPROVED_HEAD, created_at: "2026-08-19T09:00:00Z" },
+  { event: "head_ref_force_pushed", commit_id: NEW_HEAD, created_at: "2026-08-21T00:00:00Z" },
+];
 
 function zeroSummary(): ApprovalStatusReconcilerTickSummary {
   return {
@@ -1740,7 +1751,89 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
       expect(approvalStatus.approvedHeadSha).toBeNull();
       const refusal = approvalStatus.backfillRefusal as Record<string, unknown>;
-      expect(refusal).toMatchObject({ reason: "backfill:head-unverifiable", observedHeadSha: NEW_HEAD });
+      expect(refusal).toMatchObject({
+        reason: "backfill:head-unverifiable",
+        observedHeadSha: NEW_HEAD,
+        approvedAtMs: new Date(APPROVED_AT).getTime(),
+      });
+    });
+
+    it("does not persist a stable refusal on a transient timeline read failure, so the next tick retries the read (SUP-14747 D-E, backfill-refusal-caches-transient-failures)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        // A transient HTTP 500 on the timeline read (a rate-limit / network blip
+        // shares this branch with deterministic failures).
+        { url: TIMELINE_URL, ok: false, status: 500, body: { message: "server error" } },
+      ]);
+
+      const timelineCalls = () =>
+        mockGhFetch.mock.calls.filter((call) => String(call[0]) === TIMELINE_URL).length;
+
+      const summary1 = await runApprovalStatusReconcilerTick(db);
+      expect(summary1.skipped["backfill:timeline-read-failed"]).toBe(1);
+      expect(summary1.backfilled).toBe(0);
+      const readsAfterFirst = timelineCalls();
+      expect(readsAfterFirst).toBeGreaterThan(0);
+
+      // The transient failure must NOT be cached as a stable refusal: the
+      // persisted approvalStatus carries no backfillRefusal.
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.backfillRefusal).toBeUndefined();
+
+      // Second tick: because nothing was cached, the timeline read is retried
+      // rather than short-circuited on a cached refusal.
+      const summary2 = await runApprovalStatusReconcilerTick(db);
+      expect(summary2.skipped["backfill:timeline-read-failed"]).toBe(1);
+      expect(timelineCalls()).toBeGreaterThan(readsAfterFirst);
+    });
+
+    it("re-evaluates a cached backfill refusal when the card is re-approved at a later time with the live head unchanged (SUP-14747 D-E, backfill-refusal-not-keyed-on-approval-time)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId); // first approval at APPROVED_AT (2026-08-20T00:00:00Z)
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_REAPPROVAL_BODY },
+        { url: POST_STATUS_URL, body: { id: 12348 } },
+      ]);
+
+      // First approval time: the verified head at approval (APPROVED_HEAD)
+      // differs from the live head (NEW_HEAD), so the backfill refuses and
+      // caches the refusal against (head, first-approval-time).
+      const summary1 = await runApprovalStatusReconcilerTick(db);
+      expect(summary1.skipped["backfill:head-moved-since-approval"]).toBe(1);
+      expect(summary1.backfilled).toBe(0);
+
+      // Re-approval at a LATER time (after the head was force-pushed to
+      // NEW_HEAD): the head-at-approval-time now equals the live head. The live
+      // head is unchanged, so a cache keyed only on the head would wrongly reuse
+      // the stale head-moved refusal; keyed on the approval time too, the stale
+      // refusal is invalidated and the backfill re-runs — now it recovers the
+      // anchor and publishes.
+      await insertDecision(issueId, { createdAt: new Date("2026-08-21T00:00:00Z") });
+
+      const summary2 = await runApprovalStatusReconcilerTick(db);
+      expect(summary2.skipped["backfill:head-moved-since-approval"]).toBeUndefined();
+      expect(summary2.backfilled).toBe(1);
+      expect(summary2.republished).toBe(1);
     });
 
     it("recovers a stranded card's anchor but refuses to stamp it when the card is not the PR's delivering card (delivery-identity gate) (SUP-14747 D-E)", async () => {
