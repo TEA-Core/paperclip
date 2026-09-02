@@ -58,6 +58,7 @@ import {
   createCarrierPromotionSweepService,
   createCarrierStrandedSurfaceService,
   createDoneCloseLandingBackstopService,
+  createToastReadabilitySweepService,
   externalObjectService,
   executionWorkspaceService,
   heartbeatService,
@@ -1210,6 +1211,7 @@ export async function startServer(): Promise<StartedServer> {
     const prDelivery = prDeliveryService(db as any);
     const carrierOrphanJanitor = createCarrierOrphanJanitorService(db as any);
     const carrierStrandedSurface = createCarrierStrandedSurfaceService(db as any);
+    const toastReadability = createToastReadabilitySweepService(db as any);
     /** Fires one carrier promotion sweep on the heartbeat tick; logs when something was dispositioned, and the wrapper leaves a per-run liveness trace on every completion (SUP-14227). */
     const scheduleCarrierPromotionSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1254,6 +1256,16 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "carrier stranded surface failed");
         }), { name: "carrierStrandedSurface" });
+    };
+    /** Fires one TOAST readability sweep on the heartbeat tick (SUP-14582): cadence is gated inside the service (default daily) so a non-due tick is a cheap no-op, and a disabled sweep skips the wrapper entirely, leaving the tick unchanged. */
+    const scheduleToastReadabilitySweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      if (toastReadability.disabled) return;
+      trackHeartbeatSchedulerWork(toastReadability
+        .sweep()
+        .catch((err) => {
+          logger.error({ err }, "toast readability sweep failed");
+        }), { name: "toastReadability" });
     };
     const scheduleDoneCloseLandingBackstopSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1700,6 +1712,7 @@ export async function startServer(): Promise<StartedServer> {
         scheduleEnvironmentLeaseCleanupSweep();
         scheduleCarrierOrphanJanitor();
         scheduleCarrierStrandedSurface();
+        scheduleToastReadabilitySweep();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
