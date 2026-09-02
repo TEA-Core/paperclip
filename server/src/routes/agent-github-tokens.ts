@@ -1,7 +1,7 @@
 import { Router, type Response } from "express";
 import type { Db } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
-import { projectWorkspaces } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { issues, projectWorkspaces } from "@paperclipai/db";
 import { z } from "zod";
 import { validate } from "../middleware/validate.js";
 import { assertCompanyAccess } from "./authz.js";
@@ -136,16 +136,34 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
   const resolveToken = deps.resolveToken ?? resolveAppInstallationToken;
   const log = deps.log ?? logActivity;
 
-  // The repo must map to a company project workspace so an agent cannot mint a
-  // token for an arbitrary owner/repo it has no business touching.
-  async function assertRepoReachable(companyId: string, owner: string, repo: string) {
+  // The repo must map to a project workspace of a project the calling agent is
+  // actually assigned to (issues assigned to it in this company), not just any
+  // company project workspace — so an agent cannot mint a token for a project it
+  // has no business touching.
+  async function assertRepoReachable(companyId: string, agentId: string, owner: string, repo: string) {
     const normalizedRepo = normalizeRepoUrl(`${owner}/${repo}`);
-    const rows = await db
-      .select({ repoUrl: projectWorkspaces.repoUrl })
+
+    const assignedIssueRows = await db
+      .select({ projectId: issues.projectId })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.assigneeAgentId, agentId)));
+    const assignedProjectIds = new Set(
+      assignedIssueRows.map((row) => row.projectId).filter((id): id is string => typeof id === "string"),
+    );
+    if (assignedProjectIds.size === 0) {
+      throw notFound(`No project workspace for ${owner}/${repo}`);
+    }
+
+    const workspaceRows = await db
+      .select({ projectId: projectWorkspaces.projectId, repoUrl: projectWorkspaces.repoUrl })
       .from(projectWorkspaces)
       .where(eq(projectWorkspaces.companyId, companyId));
-    const reachable = rows.some(
-      (row) => typeof row.repoUrl === "string" && normalizeRepoUrl(row.repoUrl) === normalizedRepo,
+    const reachable = workspaceRows.some(
+      (row) =>
+        typeof row.projectId === "string" &&
+        typeof row.repoUrl === "string" &&
+        assignedProjectIds.has(row.projectId) &&
+        normalizeRepoUrl(row.repoUrl) === normalizedRepo,
     );
     if (!reachable) {
       throw notFound(`No project workspace for ${owner}/${repo}`);
@@ -168,7 +186,7 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
       assertCompanyAccess(req, companyId);
 
       const { owner, repo, permissions } = req.body as InstallationTokenBody;
-      await assertRepoReachable(companyId, owner, repo);
+      await assertRepoReachable(companyId, req.actor.agentId, owner, repo);
 
       const app = DEFAULT_GITHUB_APP;
 
