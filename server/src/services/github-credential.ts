@@ -136,7 +136,10 @@ export async function resolveAppInstallationToken(
   app: GitHubAppDescriptor = DEFAULT_GITHUB_APP,
   permissions?: Record<string, unknown>,
 ): Promise<GitHubTokenResolution | null> {
-  const cacheKey = `${companyId}:${app.appId}:${owner ?? ""}:${repo ?? ""}`;
+  const permissionsKey = permissions
+    ? JSON.stringify(Object.entries(permissions).sort(([a], [b]) => a.localeCompare(b)))
+    : "";
+  const cacheKey = `${companyId}:${app.appId}:${owner ?? ""}:${repo ?? ""}:${permissionsKey}`;
   const now = Date.now();
 
   const cached = appTokenCache.get(cacheKey);
