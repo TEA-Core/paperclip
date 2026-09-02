@@ -2,6 +2,7 @@ import express from "express";
 import { generateKeyPairSync } from "node:crypto";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { issues, projectWorkspaces } from "@paperclipai/db";
 import { agentGitHubTokenRoutes } from "../routes/agent-github-tokens.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import {
@@ -30,28 +31,43 @@ const { privateKey: FIXTURE_PRIVATE_KEY_PEM } = generateKeyPairSync("rsa", { mod
 const FIXTURE_PRIVATE_KEY = FIXTURE_PRIVATE_KEY_PEM.export({ type: "pkcs1", format: "pem" }, "utf8");
 const FIXTURE_TOKEN = "ghs_test_installation_token_for_agent_route_tests_only";
 const FIXTURE_INSTALLATION_ID = "12345678";
-const REACHABLE_REPO = [{ repoUrl: "https://github.com/owner/repo" }];
+
+type IssueRow = { projectId: string | null };
+type WorkspaceRow = { projectId: string; repoUrl: string | null };
+type FakeRows = { issues?: IssueRow[]; workspaces?: WorkspaceRow[] };
+
+// Defaults make the fixture agent reachable for owner/repo via project-x, so the
+// pre-existing happy-path tests (which don't exercise project scoping) keep
+// passing with no explicit rows.
+const DEFAULT_ISSUE_ROWS: IssueRow[] = [{ projectId: "project-x" }];
+const DEFAULT_WORKSPACE_ROWS: WorkspaceRow[] = [
+  { projectId: "project-x", repoUrl: "https://github.com/owner/repo" },
+];
 
 type RouteDeps = Parameters<typeof agentGitHubTokenRoutes>[1];
 
-function fakeDb(repoRows: Array<{ repoUrl: string | null }> = REACHABLE_REPO) {
+function fakeDb(rows: FakeRows = {}) {
+  const issueRows = rows.issues ?? DEFAULT_ISSUE_ROWS;
+  const workspaceRows = rows.workspaces ?? DEFAULT_WORKSPACE_ROWS;
   return {
     select: () => ({
-      from: () => ({
-        where: () => Promise.resolve(repoRows),
+      from: (table: unknown) => ({
+        // The route dispatches on the same singleton table objects it imports,
+        // so identity comparison selects the right fixture rows.
+        where: () => Promise.resolve(table === issues ? issueRows : workspaceRows),
       }),
     }),
   } as any;
 }
 
-function createApp(actor: Record<string, unknown>, deps: RouteDeps = {}, repoRows = REACHABLE_REPO) {
+function createApp(actor: Record<string, unknown>, deps: RouteDeps = {}, rows: FakeRows = {}) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", agentGitHubTokenRoutes(fakeDb(repoRows), deps));
+  app.use("/api", agentGitHubTokenRoutes(fakeDb(rows), deps));
   app.use(errorHandler);
   return app;
 }
@@ -113,10 +129,58 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
 
   it("rejects with 404 when the repo is not a company project workspace", async () => {
     const { deps, resolveToken } = fakeDeps();
-    const app = createApp(agentActor(), deps, []);
+    const app = createApp(agentActor(), deps, { workspaces: [] });
     const res = await request(app).post("/api/agents/me/github/installation-tokens").send({ owner: "owner", repo: "repo" });
     expect(res.status).toBe(404);
     expect(resolveToken).not.toHaveBeenCalled();
+  });
+
+  it("denies an agent with no assigned projects (404), even for a reachable company workspace, without minting", async () => {
+    const { deps, resolveToken } = fakeDeps();
+    const app = createApp(agentActor(), deps, {
+      issues: [],
+      workspaces: [{ projectId: "project-y", repoUrl: "https://github.com/owner/repo" }],
+    });
+    const res = await request(app).post("/api/agents/me/github/installation-tokens").send({ owner: "owner", repo: "repo" });
+    expect(res.status).toBe(404);
+    expect(resolveToken).not.toHaveBeenCalled();
+  });
+
+  it("allows an agent to mint for a project it is assigned to", async () => {
+    const { deps, resolveToken } = fakeDeps();
+    const app = createApp(agentActor(), deps, {
+      issues: [{ projectId: "project-x" }],
+      workspaces: [{ projectId: "project-x", repoUrl: "https://github.com/owner/repo" }],
+    });
+    const res = await request(app).post("/api/agents/me/github/installation-tokens").send({ owner: "owner", repo: "repo" });
+    expect(res.status).toBe(200);
+    expect(resolveToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("denies an agent minting for an unrelated company project it is not assigned to, while allowing its own", async () => {
+    const { deps, resolveToken } = fakeDeps();
+    const rows: FakeRows = {
+      issues: [{ projectId: "project-x" }],
+      workspaces: [
+        { projectId: "project-x", repoUrl: "https://github.com/owner/allowed" },
+        { projectId: "project-y", repoUrl: "https://github.com/owner/other" },
+      ],
+    };
+    const app = createApp(agentActor(), deps, rows);
+
+    // Unrelated project-y repo -> denied, no mint.
+    const denied = await request(app)
+      .post("/api/agents/me/github/installation-tokens")
+      .send({ owner: "owner", repo: "other" });
+    expect(denied.status).toBe(404);
+
+    // Own project-x repo -> allowed, single mint.
+    const allowed = await request(app)
+      .post("/api/agents/me/github/installation-tokens")
+      .send({ owner: "owner", repo: "allowed" });
+    expect(allowed.status).toBe(200);
+
+    expect(resolveToken).toHaveBeenCalledTimes(1);
   });
 
   it("returns 404 app_not_configured when the App private key is not set, without minting", async () => {
