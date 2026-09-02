@@ -58,6 +58,45 @@ GitHub repos for repo-only project workspaces and refreshing worktree base
 refs. See
 [Execution workspaces](../guides/board-operator/execution-workspaces-and-runtime-services.md#private-repositories-and-repo-only-project-workspaces).
 
+## Agent-Side GitHub App Git Credentials
+
+The server-side token above covers Paperclip's own git. For **agent-run** git
+and `gh`, Paperclip uses on-demand GitHub App installation tokens instead of a
+long-lived `GH_TOKEN`. Two scripts (shipped in the working tree under
+`scripts/`) implement this:
+
+- `scripts/paperclip-github-credential-helper.sh` — a git credential helper.
+- `scripts/paperclip-gh-wrapper.sh` — a thin wrapper that mints a token and
+  runs the real `gh` with `GH_TOKEN` set for a single invocation.
+
+How it is wired: when a process-adapter run starts, Paperclip sets git's
+`GIT_CONFIG_*` environment variables (process-scoped, no file written) so that
+`credential.helper` is cleared and `credential.https://github.com.helper` (and
+`www.github.com`) point at the helper script. This is applied only when the
+helper script is present in the run's working tree; non-repo workspaces are
+no-ops, and without it git falls back to ambient helpers / `GH_TOKEN` as before.
+
+When git needs github.com credentials, it invokes the helper. The helper
+determines the target `owner/repo` (from `PAPERCLIP_GIT_REPO`, the repo's
+`github.com` remote, or `PAPERCLIP_WORKSPACE_REPO_URL`), requests a short-lived
+installation token from the broker
+(`POST /api/agents/me/github/installation-tokens` using the run's
+`PAPERCLIP_API_URL` / `PAPERCLIP_API_KEY`), and returns it to git. `store` and
+`erase` are no-ops: the token is never persisted to disk or env.
+
+Security properties:
+
+- Ambient/stale credential helpers are cleared; only github.com is affected.
+- Each token is scoped to a single repo, the minimum required permissions
+  (`contents: write` for git; `PAPERCLIP_GIT_ACCESS` /
+  `PAPERCLIP_GH_PERMISSIONS` to override), and a short TTL.
+- Tokens are minted on demand and cached server-side; no token is written to
+  disk, logs, or the environment.
+
+This requires a fleet GitHub App to be configured on the server (with the
+target org/repos granted to it). Until that exists, the scripts are inert and
+git/gh behave as they did before.
+
 ## User-Specific Secrets
 
 User-specific secrets let a shared agent or project declare a slot such as

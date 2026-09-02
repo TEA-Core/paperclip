@@ -1,4 +1,6 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "../types.js";
+import fs from "node:fs";
+import path from "node:path";
 import {
   asString,
   asNumber,
@@ -12,6 +14,7 @@ import {
   resolveCommandForLogs,
   runChildProcess,
 } from "../utils.js";
+import { applyPaperclipGitHubCredentialHelperEnv } from "@paperclipai/adapter-utils/server-utils";
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, config, onLog, onMeta, authToken } = ctx;
@@ -35,6 +38,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   env.PAPERCLIP_RUN_ID = runId;
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
+  // Wire the agent-side GitHub App credential helper into this run's git so git/gh
+  // authenticate against github.com with on-demand, broker-minted installation
+  // tokens instead of a long-lived GH_TOKEN (SUP-14752). Only when the helper
+  // script is present in the run's working tree; non-repo workspaces are no-ops.
+  const ghCredentialHelperPath = path.join(path.resolve(cwd), "scripts", "paperclip-github-credential-helper.sh");
+  if (fs.existsSync(ghCredentialHelperPath)) {
+    applyPaperclipGitHubCredentialHelperEnv(env, ghCredentialHelperPath);
+  }
   // runtimeEnv is only used to resolve the command path and log HOME below;
   // the child env is built inside runChildProcess from
   // sanitizeInheritedPaperclipEnv(process.env) + env, so a PAPERCLIP_API_KEY

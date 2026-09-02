@@ -2265,6 +2265,46 @@ export function buildPaperclipEnv(agent: { id: string; companyId: string }): Rec
   return vars;
 }
 
+/**
+ * Wire the agent-side GitHub App credential helper (SUP-14752) into an agent
+ * run's environment so that git authenticates against github.com with
+ * on-demand, broker-minted installation tokens instead of a long-lived token.
+ *
+ * It is applied via git's `GIT_CONFIG_*` environment variables (highest
+ * precedence, process-scoped, no file written):
+ *   - `credential.helper` is cleared so no ambient/stale helper intercepts.
+ *   - `credential.https://github.com.helper` (and `www.github.com`) point at the
+ *     helper script.
+ *
+ * This does not mint anything itself; the helper reads the run's
+ * PAPERCLIP_API_URL/PAPERCLIP_API_KEY at git-invoke time. It merges with any
+ * pre-existing GIT_CONFIG_COUNT so injected config is not clobbered.
+ */
+export function applyPaperclipGitHubCredentialHelperEnv(
+  env: Record<string, string>,
+  helperPath: string,
+): Record<string, string> {
+  const trimmed = helperPath?.trim();
+  if (!trimmed) return env;
+
+  const parsed = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10);
+  let index = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  const setEntry = (i: number, key: string, value: string): void => {
+    env[`GIT_CONFIG_KEY_${i}`] = key;
+    env[`GIT_CONFIG_VALUE_${i}`] = value;
+  };
+
+  setEntry(index, "credential.helper", "");
+  index += 1;
+  setEntry(index, "credential.https://github.com.helper", trimmed);
+  index += 1;
+  setEntry(index, "credential.https://www.github.com.helper", trimmed);
+  index += 1;
+
+  env.GIT_CONFIG_COUNT = String(index);
+  return env;
+}
+
 export function applyPaperclipWorkspaceEnv(
   env: Record<string, string>,
   input: {
