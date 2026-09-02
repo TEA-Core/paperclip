@@ -179,6 +179,12 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     pr?: { owner: string; repo: string; number: number; headRefName: string | null } | null;
     deliveryBranch?: string | null;
     deliveryRepoUrl?: string | null;
+    /**
+     * SUP-14783: make the execution-workspace row a real `shared_workspace`
+     * row OWNED BY A DIFFERENT issue (a parent card is seeded to own it), which
+     * is the shape every card in a shared-workspace project carries.
+     */
+    sharedWorkspaceOwnedByParent?: boolean;
     /** Pre-seed executionState.approvalStatus.publishedHeadSha (idempotent path). */
     prePublishedHeadSha?: string | null;
   }
@@ -256,11 +262,27 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     const deliveryBranch = opts.deliveryBranch === undefined ? DELIVERY_BRANCH : opts.deliveryBranch;
     const deliveryRepoUrl =
       opts.deliveryRepoUrl === undefined ? REPO_URL : opts.deliveryRepoUrl;
+    // SUP-14783: the owning parent card must exist before the shared workspace
+    // row can point at it (execution_workspaces.source_issue_id is a real FK).
+    let parentOwnerIssueId: string | null = null;
+    if (opts.sharedWorkspaceOwnedByParent) {
+      parentOwnerIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: parentOwnerIssueId,
+        companyId,
+        projectId,
+        title: "Parent card owning the shared workspace",
+        status: "in_progress",
+        identifier: "SUP-14668",
+      });
+    }
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
       projectId,
-      mode: "isolated",
+      ...(parentOwnerIssueId
+        ? { mode: "shared_workspace", sourceIssueId: parentOwnerIssueId }
+        : { mode: "isolated" }),
       strategyType: "git_worktree",
       name: "card-workspace",
       status: "active",
@@ -582,4 +604,45 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     // The second call short-circuits before touching GitHub.
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
+
+  // SUP-14783: the shape every TSP card has — an execution-workspace row shared
+  // with (and owned by) a parent issue, whose single branch_name is the
+  // parent's. Before this, the route refused 409 on every such card and the
+  // ADR-091 first-publish dead-end had no recovery at all in that project.
+  it("arms a shared_workspace card whose PR carries its own identifier prefix", async () => {
+    const { companyId, issueId } = await seedIssue({
+      sharedWorkspaceOwnedByParent: true,
+      deliveryBranch: "SUP-14668-parent-architecture-review",
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: "SUP-14748-1-real-delivery" },
+    });
+    currentActor = boardActor(companyId);
+
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}` }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.outcome).toBe("armed");
+    expect(res.body.headSha).toBe(HEAD_SHA);
+  });
+
+  it("still refuses 409 on a shared_workspace card when the PR carries ANOTHER card's prefix", async () => {
+    const { companyId, issueId } = await seedIssue({
+      sharedWorkspaceOwnedByParent: true,
+      deliveryBranch: "SUP-14668-parent-architecture-review",
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: FOREIGN_BRANCH },
+    });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.reason).toBe("head_unresolvable");
+    expect(res.body.message).toContain("does not carry this card's identifier prefix");
+    expect(mockGhFetch).not.toHaveBeenCalled();
+  });
+
 });
