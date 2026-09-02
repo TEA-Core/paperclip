@@ -3017,11 +3017,52 @@ export function issueRoutes(
     decision,
     closingTransition,
   }: {
-    issue: { id: string; companyId: string; issueNumber: number | null; identifier: string | null; executionState: unknown };
+    issue: {
+      id: string;
+      companyId: string;
+      issueNumber: number | null;
+      identifier: string | null;
+      executionState: unknown;
+      executionPolicy: Record<string, unknown> | null;
+      createdByAgentId: string | null;
+      createdByUserId: string | null;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+    };
     decision: MergeArmingDecision | null | undefined;
     closingTransition: boolean;
   }): Promise<void> => {
     if (!shouldPublishApprovalStatus(decision)) return;
+    // ADR-092 D4: enforce stage-integrity at decision time. Both call sites
+    // invoke this hook after the transaction commits, so the decision row and
+    // completedStageIds are already durable — the predicate is evaluable here.
+    // D5: a finding refuses to stamp, never refuses to close.
+    const candidate: CandidateRow = {
+      id: issue.id,
+      companyId: issue.companyId,
+      identifier: issue.identifier,
+      createdByAgentId: issue.createdByAgentId,
+      createdByUserId: issue.createdByUserId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+      executionState: (issue.executionState ?? {}) as Record<string, unknown>,
+      executionPolicy: issue.executionPolicy,
+    };
+    try {
+      const integrity = await evaluateStageIntegrity(db, candidate);
+      if (integrity) {
+        const msg = `status:skipped:stage_integrity:${integrity.reason}: ${integrity.detail}`;
+        await svc.addComment(
+          issue.id,
+          `[Merge-arming] ${msg}`,
+          {},
+          { authorType: "system" },
+        );
+        return;
+      }
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "stage-integrity check at decision time failed");
+    }
     // SUP-14602: the live-discovery / decision-head needle must be the issue's
     // REAL identifier (company issuePrefix + number), not a hardcoded "SUP-".
     // Both resolveApprovalDecisionHead and publishApprovalStatus search open PRs
@@ -7413,7 +7454,7 @@ export function issueRoutes(
       return;
     }
 
-    // Guard B: ADR-073 stage-integrity, reused verbatim from the reconciler
+    // Guard B: ADR-073/092 stage-integrity, reused verbatim from the reconciler
     // (exported specifically so this route does not reimplement it).
     const candidate: CandidateRow = {
       id: issue.id,
@@ -7421,6 +7462,8 @@ export function issueRoutes(
       identifier: issue.identifier,
       createdByAgentId: issue.createdByAgentId,
       createdByUserId: issue.createdByUserId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
       executionState: state,
       executionPolicy: issue.executionPolicy,
     };

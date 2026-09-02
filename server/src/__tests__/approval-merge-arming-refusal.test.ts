@@ -11,6 +11,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issues,
   projectWorkspaces,
   projects,
@@ -362,5 +363,176 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     expect(comments).toHaveLength(2);
     expect(comments[0]!.body).toContain("status:published:");
     expect(comments[1]!.body).toContain("armed:");
+  });
+
+  it("stage-integrity refusal at the route (ADR-092 D4): guard-b finding suppresses merge arming, status transition is untouched", async () => {
+    const companyId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const issueId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const firstStageId = randomUUID();
+    const secondStageId = randomUUID();
+    const identifier = "DINT1-1";
+    const branchName = `${identifier}-test-branch`;
+    const repoUrl = "https://github.com/TEA-Core/paperclip";
+    const defaultRef = "fold/tea-patches-v2026.722.0";
+    const now = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "DINT1",
+      requireBoardApprovalForNewAgents: false,
+      mergeArmingEnabled: true,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "cloud-user-1",
+      status: "active",
+      membershipRole: "owner",
+      updatedAt: now,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Test Project",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: "/tmp/test",
+      isPrimary: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId: null,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: branchName,
+      status: "active",
+      cwd: "/tmp/test",
+      repoUrl,
+      baseRef: defaultRef,
+      branchName,
+      providerType: "git_worktree",
+      providerRef: "/tmp/test",
+      lastUsedAt: now,
+      openedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    // ADR-092 D3: no declared return assignee in the policy, no stored
+    // returnAssignee in the state. The assignee IS the participant and will
+    // decide their own stage — the D3 coverage gap.
+    const stages = [
+      {
+        id: firstStageId,
+        type: "review" as const,
+        approvalsNeeded: 1 as const,
+        participants: [{ type: "agent" as const, agentId: reviewerAgentId, userId: null }],
+      },
+      {
+        id: secondStageId,
+        type: "approval" as const,
+        approvalsNeeded: 1 as const,
+        participants: [{ type: "user" as const, agentId: null, userId: "cloud-user-1" }],
+      },
+    ];
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier,
+      issueNumber: 1,
+      title: "Stage-integrity refusal must suppress merge arming at the route",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: reviewerAgentId,
+      createdByUserId: "cloud-user-1",
+      executionWorkspaceId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages,
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: firstStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+        changesRequestedCount: 0,
+      },
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ sourceIssueId: issueId })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+    currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId };
+
+    mockResolveApprovalDecisionHead.mockResolvedValue({
+      kind: "resolved",
+      headSha: "deadbeefcafe",
+      displayName: "TEA-Core/paperclip#999",
+    });
+    mockPublishApprovalStatus.mockResolvedValue({
+      kind: "armed",
+      message: "status:published: would-arm-if-reached",
+      headSha: "deadbeefcafe",
+    });
+    mockArmMergeOnApproval.mockResolvedValue({ kind: "armed", message: "armed: must-not-run" });
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Stage 1 approved.\n\nkind: review\ndecision: approved" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("in_review");
+
+    expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(0);
+    expect(mockPublishApprovalStatus).toHaveBeenCalledTimes(0);
+    const comments = await mergeArmingComments(issueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.body).toContain("status:skipped:stage_integrity:");
+    expect(comments[0]!.body).toContain("guard-b:decision-by-return-assignee");
   });
 });
