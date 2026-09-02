@@ -1720,6 +1720,14 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     worktreePath: input.worktreePath,
     actualBranchName: input.actualBranchName,
   });
+  // SUP-14781: only a claim backed by a live queued/running execution is a
+  // competitor. A workspace row that still records the live branch but has no
+  // active run is a stale record (the dispatch that parked the worktree on that
+  // sibling branch already finished), and blocking the safe-restore on it
+  // dead-blocks every later dispatch on this shared worktree. Keep the full
+  // contention record in `evidence` for audit/reporting; the repair predicates
+  // below consult liveContention only.
+  const liveContention = contention?.activeRun ? contention : null;
   const basePlainLanguageReason = explainGitWorktreeBranchIncoherence({
     expectedBranchName: input.expectedBranchName,
     actualBranchName: input.actualBranchName,
@@ -1772,8 +1780,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   // abandons nothing: every commit stays reachable from that branch's own ref, under a name the
   // operator can see in `git branch`. Requiring containment here left every agent that ran
   // `git checkout -b` inside its worktree permanently dead-blocked behind
-  // workspace_validation_failed. Still fail-closed on contention, because yanking the worktree
-  // back would pull the rug out from under another workspace's live run.
+  // workspace_validation_failed. Still fail-closed on live contention, because yanking the
+  // worktree back would pull the rug out from under another workspace's live run. A stale
+  // claim with no active run is not live contention (SUP-14781).
   const canRestoreRecordedBranchOverLiveNamedBranch =
     cleanliness === "clean" &&
     expectedBranchExists &&
@@ -1782,14 +1791,14 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     input.actualBranchName !== null &&
     actualBranchExists === true &&
     ancestryVerdict !== "ancestor" &&
-    !contention;
+    !liveContention;
   // a detached HEAD that diverged from the recorded branch is refused by every
   // predicate above, because reattachment is only provably lossless when the recorded branch
   // already contains HEAD. But the hazard is narrower than the refusal: the detached commits are
   // reachable from no ref, so checking the recorded branch out would strand them. Naming them on
   // a rescue branch first — the same move the dirty-quarantine path already makes — removes that
   // hazard, and the restore becomes as safe as canRestoreRecordedBranchOverLiveNamedBranch.
-  // Fail-closed on contention, as everywhere else here.
+  // Fail-closed on live contention, as everywhere else here (SUP-14781).
   const canRescueDivergedDetachedHead =
     cleanliness === "clean" &&
     expectedBranchExists &&
@@ -1798,7 +1807,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     input.actualBranchName === null &&
     Boolean(actualHeadSha) &&
     ancestryVerdict !== "ancestor" &&
-    !contention;
+    !liveContention;
   const eligible =
     canCheckoutRecordedBranch ||
     canAdoptForwardActualBranch ||
@@ -1829,8 +1838,8 @@ async function inspectGitWorktreeBranchIncoherence(input: {
         ? "worktree path is not registered"
       : !registeredBranchMatchesHead
         ? "registered worktree branch does not match HEAD"
-      : contention
-        ? formatBranchContentionRefusal("recorded branch restore", contention)
+      : liveContention
+        ? formatBranchContentionRefusal("recorded branch restore", liveContention)
       : !expectedBranchExists
         ? actualBranchIsDefaultBranch
           ? "recorded branch is deleted but worktree is clean and already on the default branch"
