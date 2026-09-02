@@ -1629,6 +1629,40 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
+    it("recovers a stranded card's anchor but refuses to stamp it when the card is not the PR's delivering card (delivery-identity gate) (SUP-14747 D-E)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      // No delivery identity recorded: the card cannot be proven to have
+      // delivered the linked PR. The backfill still recovers a valid anchor
+      // (timeline head matches the live head), but the ADR-091 D1
+      // delivery-identity gate the first publish enforces must refuse the stamp.
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_SAME_HEAD_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.backfilled).toBe(1);
+      expect(summary.skipped["publish:skipped"]).toBe(1);
+      expect(summary.skippedDetails[0]).toContain("delivery_identity_unresolved");
+      expect(postStatusCalls()).toHaveLength(0);
+
+      // The backfill persisted the recovered anchor; no stamp was published.
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBe(NEW_HEAD);
+      expect(approvalStatus.publishedHeadSha).toBeNull();
+    });
+
     it("still fires the stage-integrity (self-approval) refusal on a first-publish-anchored card", async () => {
       await insertAgent(AGENT_AUTHOR, "Assignee");
       const issueId = await insertIssue({
