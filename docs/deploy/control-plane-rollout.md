@@ -62,7 +62,7 @@ lanes below for the cases where a human is required.
 
 A cron entry on wonton runs the driver once a day, unattended:
 
-```
+```text
 47 11 * * * auto-rollout.sh --execute --detach --retry-window 7200
 ```
 
@@ -95,7 +95,7 @@ prints a plausible-looking partial log. Alerts go to ntfy topic
 An agent that needs a fix rolled sooner than the daily window does **not** need
 host access. It files a board approval:
 
-```
+```text
 paperclipCreateApproval
   type:    "request_board_approval"
   payload: { kind:  "urgent_rollout",
@@ -180,11 +180,22 @@ few seconds of HTTP 503 is not the cost worth avoiding — the runs are.
 6. **Verify** — health 200, then the *heartbeat* path: `errorMissingColumn` and
    `heartbeat execution setup failed` must both be 0, measured against a baseline
    sampled **before** the quiesce. Any gate failing triggers an automatic
-   rollback to the anchor.
-7. **Resume** — via an EXIT trap, so dispatch returns even if the script dies
-   mid-flight. A quiesce that could not be released is retained in
-   `~/.paperclip/deploy-state/quiesced-by-deploy.txt` and blocks the next deploy
-   until cleared; recover with `./scripts/deploy-image.sh --resume-only`.
+   rollback to the anchor. **That rollback re-tags the image; it cannot undo a
+   schema change.** With `PAPERCLIP_MIGRATION_AUTO_APPLY=true`, an image that
+   applied migrations on startup leaves the OLD image running against the NEW
+   schema after a rollback — safe only if the migration is backward-compatible.
+   This is exactly why `auto-rollout.sh` refuses migration-carrying images
+   (lane 3); when you deploy one by hand, treat a gate failure as requiring
+   explicit operator recovery, not as a completed rollback.
+7. **Resume** — via an EXIT trap, so dispatch returns even when the script
+   aborts mid-flight. The trap only covers a normal Bash exit: `SIGKILL`, an OOM
+   kill or losing the host skips it, and dispatch stays quiesced. The quiesce is
+   recorded in `~/.paperclip/deploy-state/quiesced-by-deploy.txt` *before* the
+   call that engages it, so a deploy killed at any point leaves a trace; that
+   file then blocks the next deploy until cleared. Recover either termination
+   path with `./scripts/deploy-image.sh --resume-only`. The server-side quiesce
+   TTL (drain deadline + 10 minutes, clamped by the server to 6h) is the backstop
+   under all of it.
 
 Zero *work* loss, at the cost of a ~20s API gap during the swap.
 
@@ -209,8 +220,14 @@ Pass criteria:
   plane contains the target merge:
   `gh api repos/TEA-Core/paperclip/compare/<target-merge-sha>...<served-commit> --jq '.status, .behind_by'`.
   When the requirement is specifically "the plane serves the fold tip", require
-  exact SHA equality: `.commit` must equal
-  `git rev-parse origin/fold/tea-patches-v2026.722.0`.
+  exact SHA equality: `.commit` must equal the fold tip. Refresh the
+  remote-tracking ref first — a stale one silently compares against an old SHA
+  and passes a check that should fail:
+
+  ```bash
+  git fetch origin fold/tea-patches-v2026.722.0
+  git rev-parse origin/fold/tea-patches-v2026.722.0
+  ```
 
 **The "Fold buildability gate" workflow conclusion is NOT a liveness check.** It
 only proves the merged branch *can* be built. It does not publish the image the
@@ -225,9 +242,19 @@ Rollout debt is the set of merges that are on the fold branch but not in the
 served image. Compute it rather than reading a stale table:
 
 ```bash
-SERVED=$(curl -sf https://paperclip.dvit.io/api/health | jq -r .commit)
-git fetch origin fold/tea-patches-v2026.722.0
-git log --oneline "$SERVED..origin/fold/tea-patches-v2026.722.0"
+SERVED=$(curl -sf https://paperclip.dvit.io/api/health | jq -r '.commit // empty')
+
+# Guard before use. An unreachable plane, or a payload without `.commit`, leaves
+# $SERVED empty or "null" -- and `git log "..origin/<branch>"` with an empty left
+# side is a valid range that reports the WHOLE branch as debt. Check, don't assume.
+if [ -z "$SERVED" ] || [ "$SERVED" = null ]; then
+  echo "could not read the served commit from /api/health" >&2
+elif ! git rev-parse --verify --quiet "$SERVED^{commit}" >/dev/null; then
+  echo "served commit $SERVED is not in this repo -- fetch, or check the branch" >&2
+else
+  git fetch origin fold/tea-patches-v2026.722.0
+  git log --oneline "$SERVED..origin/fold/tea-patches-v2026.722.0"
+fi
 ```
 
 An empty list means the plane is current. A non-empty list is normal *within* a
