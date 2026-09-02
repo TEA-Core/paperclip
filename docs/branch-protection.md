@@ -89,6 +89,15 @@ contract violation (fake approval). The only sanctioned recovery is the
   `approved` decision, when ADR-073 stage-integrity (Guard B) does not hold,
   when the decision head cannot be positively resolved, or when the head moved
   between resolve and publish. Nothing is stamped in the failure case.
+- **Delivery identity depends on who owns the workspace branch.** A card that
+  owns its execution workspace is authorized against an exact match: the PR head
+  ref must equal the branch recorded on that workspace. A card whose workspace
+  row is a `shared_workspace` owned by a different issue has no branch of its
+  own on that row — the recorded branch is the owner's — so it is authorized
+  against its own identifier prefix on the PR head ref instead (`SUP-123-...`
+  for card `SUP-123`). The repo half is identical in both cases: a PR in another
+  repo is always refused (ADR-091 D5). A shared-workspace card whose head ref is
+  unreadable, or which carries another card's prefix, is still refused.
 
 ### Waiving a cardless PR
 
