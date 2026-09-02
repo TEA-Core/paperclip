@@ -155,6 +155,7 @@ import {
 } from "../services/merge-arming.js";
 import { evaluateStageIntegrity, type CandidateRow } from "../services/approval-status-reconciler.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
+import { prDeliveryService } from "../services/pr-delivery.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
 import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
@@ -500,6 +501,47 @@ function requiresPaperclipAttachmentMetadata(input: {
   const type = typeof input.type === "string" ? input.type : fallback?.type ?? null;
   const provider = typeof input.provider === "string" ? input.provider : fallback?.provider ?? null;
   return type === "artifact" && provider === "paperclip";
+}
+
+/**
+ * Detect a delivery-shaped `pull_request` work product and normalize its
+ * externalId to the canonical `owner/repo#N` form (SUP-14645). The signature
+ * is the delivery metadata (repository + prNumber) or a GitHub pull URL; a
+ * resolvable reference is what lets the merge sweep re-check it later. Returns
+ * null for non-PR work products or PRs with no resolvable GitHub reference, in
+ * which case the work product is recorded with no carrier fan-out.
+ */
+export function prDeliverySignature(input: {
+  type?: unknown;
+  externalId?: string | null;
+  url?: string | null;
+  metadata?: Record<string, unknown> | null;
+}): { repository: string; prNumber: number; externalId: string } | null {
+  if (input.type !== "pull_request") return null;
+  const metadata = input.metadata ?? {};
+  const metaRepo =
+    typeof metadata.repository === "string" &&
+    /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(metadata.repository)
+      ? metadata.repository
+      : null;
+  const metaPr =
+    typeof metadata.prNumber === "number" &&
+    Number.isInteger(metadata.prNumber) &&
+    metadata.prNumber > 0
+      ? metadata.prNumber
+      : null;
+  if (metaRepo && metaPr) {
+    return { repository: metaRepo, prNumber: metaPr, externalId: `${metaRepo}#${metaPr}` };
+  }
+  if (typeof input.url === "string") {
+    const match = input.url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+    if (match && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(match[1]) && Number(match[2]) > 0) {
+      const repo = match[1];
+      const prNum = Number(match[2]);
+      return { repository: repo, prNumber: prNum, externalId: `${repo}#${prNum}` };
+    }
+  }
+  return null;
 }
 
 const attachmentArtifactMetadataInputSchema = z.object({
@@ -3400,6 +3442,7 @@ export function issueRoutes(
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
+  const prDeliverySvc = prDeliveryService(db);
   const documentsSvc = documentService(db);
   const artifactReviewDocumentsSvc = artifactReviewDocumentService(db, storage);
   const companySkillsSvc = companySkillService(db);
@@ -9107,10 +9150,43 @@ export function issueRoutes(
         metadata: req.body.metadata ?? null,
       });
     }
+    const prDelivery = createInput.type === "pull_request" ? prDeliverySignature(createInput) : null;
+    if (prDelivery) {
+      // Canonical externalId (owner/repo#N) so the source row, the carrier
+      // child fan-out, and the one-shot backfill all de-duplicate on the same
+      // key (SUP-14645).
+      createInput.externalId = prDelivery.externalId;
+    }
     const product = await workProductsSvc.createForIssue(issue.id, issue.companyId, createInput);
     if (!product) {
       res.status(422).json({ error: "Invalid work product payload" });
       return;
+    }
+    if (prDelivery) {
+      // Carrier delivery: mirror the source row onto every descendant so each
+      // issue owns its own `pull_request` work product (SUP-14645). A no-op when
+      // the source issue has no descendants. A fan-out failure must not reject
+      // the request after the source row is already written (partial state + a
+      // client 500); log it and keep the 201 — the source row is the
+      // load-bearing one, and the fan-out rows are repaired by the next
+      // delivery or the merge sweep.
+      try {
+        await prDeliverySvc.recordCarrierFanOut({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          externalId: prDelivery.externalId,
+          url: product.url,
+          title: product.title,
+          status: product.status,
+          reviewState: product.reviewState,
+          metadata: product.metadata,
+        });
+      } catch (error) {
+        logger.warn(
+          { err: error, issueId: issue.id, companyId: issue.companyId, workProductId: product.id },
+          "PR delivery carrier fan-out failed after work product creation",
+        );
+      }
     }
     await logActivity(db, {
       companyId: issue.companyId,
