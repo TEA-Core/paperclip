@@ -176,6 +176,44 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     return issueId;
   }
 
+  // An escalated hold: the agent stalled, the card is parked on a human
+  // (assigneeUserId set, assigneeAgentId cleared), and the escalation preserved
+  // the agent the card should return to as executionState.returnAssignee. The
+  // hold user is also the pending executionState.currentParticipant, so both
+  // user-shaped review paths resolve to the same person — the exact shape the
+  // stalled-review release route was unreachable for (SUP-14806).
+  async function seedEscalatedHold(input: {
+    companyId: string;
+    identifier: string;
+    holdUserId: string;
+    returnAssigneeAgentId: string;
+  }) {
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: input.companyId,
+      identifier: input.identifier,
+      title: input.identifier,
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: input.holdUserId,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "approval",
+        currentParticipant: { type: "user", userId: input.holdUserId },
+        returnAssignee: { type: "agent", agentId: input.returnAssigneeAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    return issueId;
+  }
+
   function app(actor: Record<string, unknown>) {
     const testApp = express();
     testApp.use(express.json());
@@ -520,6 +558,64 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
         action: "request_changes",
         commentId: response.body.comment.id,
       },
+    });
+  });
+
+  it("releases an escalated hold and routes the send-back to the return assignee", async () => {
+    const seeded = await seedCompany("ESC");
+
+    // Approve on an escalated hold must succeed — the hold classifies as
+    // `stalled`, not `covered` (previously the release route 409'd here).
+    const approveIssueId = await seedEscalatedHold({
+      companyId: seeded.companyId,
+      identifier: "ESC-1",
+      holdUserId: seeded.memberUserId,
+      returnAssigneeAgentId: seeded.peerAgentId,
+    });
+    const approve = await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${approveIssueId}/stalled-review-decision`)
+      .send({ action: "approve" })
+      .expect(200);
+    expect(approve.body).toMatchObject({
+      action: "approve",
+      wakeQueued: false,
+      issue: { id: approveIssueId, status: "done" },
+    });
+
+    // A send-back lands the card in `todo` on the agent the escalation preserved
+    // as the return assignee — never the escalated human — and queues a wake for
+    // that agent instead of a null assignee (SUP-14806).
+    const sendBackIssueId = await seedEscalatedHold({
+      companyId: seeded.companyId,
+      identifier: "ESC-2",
+      holdUserId: seeded.memberUserId,
+      returnAssigneeAgentId: seeded.peerAgentId,
+    });
+    const sendBack = await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${sendBackIssueId}/stalled-review-decision`)
+      .send({ action: "send_back" })
+      .expect(200);
+    expect(sendBack.body).toMatchObject({
+      action: "send_back",
+      wakeQueued: true,
+      issue: {
+        id: sendBackIssueId,
+        status: "todo",
+        assigneeAgentId: seeded.peerAgentId,
+        assigneeUserId: null,
+      },
+    });
+    expect(enqueueWakeup.mock.calls[0]?.[0]).toBe(seeded.peerAgentId);
+
+    const [persisted] = await db.select({
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
+    }).from(issues).where(eq(issues.id, sendBackIssueId));
+    expect(persisted).toEqual({
+      status: "todo",
+      assigneeAgentId: seeded.peerAgentId,
+      assigneeUserId: null,
     });
   });
 

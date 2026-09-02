@@ -234,7 +234,7 @@ import {
   ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE,
   authorizationDeniedDetails,
 } from "../services/authorization.js";
-import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
+import { stalledReviewDecisionService, executionStateReturnAssigneeAgentId } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -10805,12 +10805,21 @@ export function issueRoutes(
       }
 
       let wakeQueued = false;
-      if (req.body.action !== "approve" && result.issue.assigneeAgentId) {
+      // A send-back must wake the agent the card returns to. For an escalated
+      // hold the service reassigns the issue to the execution-state return
+      // assignee, so `result.issue.assigneeAgentId` already is that agent. The
+      // fallback re-derives it from `executionState.returnAssignee` so the wake
+      // target stays real even if the durable reassign was skipped for some edge
+      // shape — never waking a null assignee (SUP-14806).
+      const sendBackAgentId = req.body.action !== "approve"
+        ? (result.issue.assigneeAgentId ?? executionStateReturnAssigneeAgentId(result.issue.executionState))
+        : null;
+      if (sendBackAgentId) {
         const userAuthoredNote = result.comment
           ? { commentId: result.comment.id, authorUserId: actor.actorId }
           : undefined;
         try {
-          const wake = await enqueueStalledReviewDecisionWakeup(result.issue.assigneeAgentId, {
+          const wake = await enqueueStalledReviewDecisionWakeup(sendBackAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "issue_status_changed",
@@ -10837,7 +10846,7 @@ export function issueRoutes(
           wakeQueued = wake !== null;
         } catch (err) {
           logger.warn(
-            { err, issueId: result.issue.id, agentId: result.issue.assigneeAgentId },
+            { err, issueId: result.issue.id, agentId: sendBackAgentId },
             "failed to enqueue stalled-review decision resume wake",
           );
         }
