@@ -8,17 +8,35 @@ import test from "node:test";
 const HELPER = new URL("paperclip-github-credential-helper.sh", import.meta.url).pathname;
 const WRAPPER = new URL("paperclip-gh-wrapper.sh", import.meta.url).pathname;
 
-// A fake `curl` that ignores its arguments and prints a canned broker body chosen by
-// FAKE_CURL_MODE, so the scripts can be exercised without a live broker.
+// A fake `curl` that records each requested `--data` body to $FAKE_CURL_CALLS (one JSON
+// body per line) and prints a canned broker body chosen by FAKE_CURL_MODE. The
+// `fail_then_ok` mode models the contents-only fallback: the FIRST mint fails (as if the
+// App lacks `workflows`) and the SECOND succeeds, so the scripts can be exercised
+// without a live broker.
 function writeFakeCurl(binDir) {
   const p = path.join(binDir, "curl");
   writeFileSync(
     p,
     [
       "#!/usr/bin/env bash",
-      "case \"${FAKE_CURL_MODE:-ok}\" in",
+      'body=""; prev=""',
+      'for a in "$@"; do',
+      '  if [ "$prev" = "--data" ]; then body="$a"; fi',
+      '  prev="$a"',
+      "done",
+      'calls="${FAKE_CURL_CALLS:-}"',
+      "n=0",
+      'if [ -n "$calls" ]; then',
+      '  if [ -f "$calls" ]; then',
+      '    n="$(wc -l < "$calls" | tr -d " ")"',
+      "  fi",
+      "  printf '%s\\n' \"$body\" >> \"$calls\"",
+      "fi",
+      'case "${FAKE_CURL_MODE:-ok}" in',
       "  not_configured) printf '%s' '{\"error\":\"GitHub App is not configured for this company\",\"code\":\"app_not_configured\"}' ;;",
       "  mint_fail) printf '%s' '{\"error\":\"mint exploded\",\"code\":\"internal\"}' ;;",
+      "  fail_then_ok)",
+      '    if [ "$n" -eq 0 ]; then printf \'%s\' \'{\"error\":\"workflows not granted\",\"code\":\"internal\"}\'; else printf \'%s\' \'{\"token\":\"MINTED_123\",\"installationId\":42}\'; fi ;;',
       "  *) printf '%s' '{\"token\":\"MINTED_123\",\"installationId\":42}' ;;",
       "esac",
       "",
@@ -39,13 +57,15 @@ function withRoot(fn) {
   }
 }
 
-function runHelper(root, { action, input, curlMode, apiBase } = {}) {
+function runHelper(root, { action, input, curlMode, apiBase, access } = {}) {
   const env = {
     ...process.env,
     PAPERCLIP_API_URL: apiBase ?? "http://broker.invalid",
     PAPERCLIP_API_KEY: "run-key",
     PAPERCLIP_GIT_REPO: "paperclipai/paperclip",
+    PAPERCLIP_GIT_ACCESS: access ?? "write",
     FAKE_CURL_MODE: curlMode ?? "ok",
+    FAKE_CURL_CALLS: path.join(root, "curl-calls.log"),
     PATH: `${root}/bin:${process.env.PATH}`,
   };
   return spawnSync("bash", [HELPER, action ?? "get"], {
@@ -54,6 +74,16 @@ function runHelper(root, { action, input, curlMode, apiBase } = {}) {
     cwd: root,
     encoding: "utf8",
   });
+}
+
+// Read back the requested broker bodies (one JSON object per line) captured by the fake
+// curl, so a test can assert exactly which permission set the helper requested.
+function readCalls(root) {
+  const f = path.join(root, "curl-calls.log");
+  return readFileSync(f, "utf8")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 function runWrapper(root, { args = [], curlMode, tokenFile } = {}) {
@@ -95,6 +125,78 @@ test("helper get hard-fails on a real mint failure (not the no-op path)", () => 
     assert.equal(res.stdout.trim(), "");
     assert.match(res.stderr, /GitHub token mint failed/);
     assert.match(res.stderr, /mint exploded/);
+  });
+});
+
+test("AC1: on write access the mint body requests contents AND workflows", () => {
+  withRoot((root) => {
+    const res = runHelper(root, { action: "get", curlMode: "ok", access: "write" });
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, /password=MINTED_123/);
+    const calls = readCalls(root);
+    assert.equal(calls.length, 1, "write access mints exactly once on a clean mint");
+    assert.ok(calls[0].includes('"contents":"write"'), `body must request contents:write, got: ${calls[0]}`);
+    assert.ok(calls[0].includes('"workflows":"write"'), `body must request workflows:write, got: ${calls[0]}`);
+  });
+});
+
+test("AC2: on read access the mint body keeps the tighter contents-only set (no workflows)", () => {
+  withRoot((root) => {
+    const res = runHelper(root, { action: "get", curlMode: "ok", access: "read" });
+    assert.equal(res.status, 0, res.stderr);
+    const calls = readCalls(root);
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].includes('"contents":"read"'), `body must request contents:read, got: ${calls[0]}`);
+    assert.ok(!calls[0].includes("workflows"), `read access must not request workflows, got: ${calls[0]}`);
+  });
+});
+
+test("AC2: on none access the mint body keeps the tighter contents-only set (no workflows)", () => {
+  withRoot((root) => {
+    const res = runHelper(root, { action: "get", curlMode: "ok", access: "none" });
+    assert.equal(res.status, 0, res.stderr);
+    const calls = readCalls(root);
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].includes('"contents":"none"'), `body must request contents:none, got: ${calls[0]}`);
+    assert.ok(!calls[0].includes("workflows"), `none access must not request workflows, got: ${calls[0]}`);
+  });
+});
+
+test("AC3: a workflows-mint failure retries exactly once with the contents-only body", () => {
+  withRoot((root) => {
+    const res = runHelper(root, { action: "get", curlMode: "fail_then_ok", access: "write" });
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, /password=MINTED_123/);
+    const calls = readCalls(root);
+    assert.equal(calls.length, 2, "exactly one retry on the workflows-mint failure");
+    assert.ok(calls[0].includes('"workflows":"write"'), `first attempt must request workflows, got: ${calls[0]}`);
+    assert.ok(calls[1].includes('"contents":"write"'), `retry must still request contents:write, got: ${calls[1]}`);
+    assert.ok(!calls[1].includes("workflows"), `retry must be contents-only, got: ${calls[1]}`);
+    // AC4: the first (failed) response body must not leak onto stdout.
+    assert.ok(!res.stdout.includes("workflows not granted"), "retry must not log the first response body to stdout");
+  });
+});
+
+test("AC3: if the contents-only fallback also fails, the helper exits with the legible error (no further retry)", () => {
+  withRoot((root) => {
+    const res = runHelper(root, { action: "get", curlMode: "mint_fail", access: "write" });
+    assert.equal(res.status, 1);
+    assert.equal(res.stdout.trim(), "");
+    assert.match(res.stderr, /GitHub token mint failed/);
+    assert.match(res.stderr, /mint exploded/);
+    const calls = readCalls(root);
+    assert.equal(calls.length, 2, "must not retry more than once");
+  });
+});
+
+test("AC3: app_not_configured stays a clean no-op and does not trigger the fallback retry", () => {
+  withRoot((root) => {
+    const res = runHelper(root, { action: "get", curlMode: "not_configured", access: "write" });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout.trim(), "");
+    assert.match(res.stderr, /not configured/);
+    const calls = readCalls(root);
+    assert.equal(calls.length, 1, "app_not_configured must not retry");
   });
 });
 
