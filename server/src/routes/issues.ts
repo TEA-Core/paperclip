@@ -150,6 +150,8 @@ import {
   publishApprovalStatus,
   resolveApprovalDecisionHead,
   shouldPublishApprovalStatus,
+  MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
+  MERGE_ARMING_ACTOR_ID,
   type ArmingOutcome,
   type MergeArmingDecision,
 } from "../services/merge-arming.js";
@@ -3266,6 +3268,37 @@ export function issueRoutes(
         {},
         { authorType: "system" },
       );
+
+      // SUP-14900: a CLOSING transition whose arming REFUSED (statusOutcome.kind ===
+      // "skipped" — head_unresolvable, not_delivered, no-pr, ambiguous, …) means the
+      // approval never certified a head and the merge was never armed, so the card is
+      // closing `done` while its linked PR provably cannot enter the merge queue via
+      // the approved path. That is the ghost-PASS path: it must not rest in `done`
+      // silently. A `[Merge-arming]` system comment alone is inert (never wakes or
+      // re-examines), so also record a durable, first-class, queryable signal that the
+      // card-side done-close-landing backstop keys on. This is a PRINCIPLED refusal,
+      // not a hook failure: `kind === "failed"` and a throw in the catch below stay
+      // non-fatal and raise no refusal signal (SUP-13904's original intent; AC#4).
+      if (closingTransition && statusOutcome.kind === "skipped") {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: MERGE_ARMING_ACTOR_ID,
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+          action: MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            refusalReason: statusOutcome.message,
+            headSha: statusOutcome.headSha ?? null,
+            decisionOutcome: decision?.outcome ?? null,
+          },
+        });
+      }
 
       // SUP-14722 (ADR-091 D-D): a refusal must suppress the merge action, not just
       // the status write. A non-`armed` statusOutcome — head_unresolvable, or any

@@ -7,9 +7,13 @@ import {
 import type { ExternalObjectResolveResult } from "./external-objects.js";
 
 const mockResolveLinkedPullRequestsWithState = vi.hoisted(() => vi.fn());
-vi.mock("./merge-arming.js", () => ({
-  resolveLinkedPullRequestsWithState: mockResolveLinkedPullRequestsWithState,
-}));
+vi.mock("./merge-arming.js", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("./merge-arming.js")>();
+  return {
+    ...orig,
+    resolveLinkedPullRequestsWithState: mockResolveLinkedPullRequestsWithState,
+  };
+});
 
 const mockCreateGitHubExternalObjectProvider = vi.hoisted(() => vi.fn());
 vi.mock("./github-external-object-provider.js", () => ({
@@ -103,16 +107,49 @@ function candidateRow(overrides: {
       skipReason: overrides.skipReason ?? reason,
       prs: "paperclipai/paperclip#3158",
     },
-    createdAt: new Date(createdAt),
-    issue: {
-      id: ISSUE,
-      companyId: COMPANY,
-      status: overrides.status ?? "done",
-      identifier: overrides.identifier ?? "SUP-13326",
-      assigneeAgentId: overrides.assigneeAgentId === undefined ? AGENT : overrides.assigneeAgentId,
-    },
-  };
-}
+      createdAt: new Date(createdAt),
+      issue: {
+        id: ISSUE,
+        companyId: COMPANY,
+        status: overrides.status ?? "done",
+        identifier: overrides.identifier ?? "SUP-13326",
+        assigneeAgentId: overrides.assigneeAgentId === undefined ? AGENT : overrides.assigneeAgentId,
+      },
+    };
+  }
+
+  // SUP-14900: an arming-refusal candidate — the closing transition's arming was
+  // refused (head_unresolvable, …), so the guard recorded no decision-carried skip
+  // and the only signal the sweep can key on is `refusalReason`.
+  function refusalCandidateRow(overrides: {
+    status?: string;
+    identifier?: string | null;
+    assigneeAgentId?: string | null;
+    createdAt?: string;
+    refusalReason?: string;
+  } = {}) {
+    const createdAt = overrides.createdAt ?? IN_WINDOW;
+    const refusalReason =
+      overrides.refusalReason ??
+      "status:skipped:head_unresolvable: no open PR carries the approved head for paperclipai/paperclip pull/364";
+    return {
+      details: {
+        identifier: "SUP-14849",
+        refusalReason,
+        headSha: null,
+        decisionOutcome: "approved",
+      },
+      createdAt: new Date(createdAt),
+      issue: {
+        id: ISSUE,
+        companyId: COMPANY,
+        status: overrides.status ?? "done",
+        identifier: overrides.identifier ?? "SUP-14849",
+        assigneeAgentId: overrides.assigneeAgentId === undefined ? AGENT : overrides.assigneeAgentId,
+      },
+    };
+  }
+
 
 const mergedSnapshot = {
   ok: true,
@@ -220,6 +257,7 @@ describe("createDoneCloseLandingBackstopService", () => {
         prState: "merged",
         closedAt: "2026-08-18T20:34:57Z",
         skipReason: "open_linked_prs_decision_carried:1",
+        refusal: false,
       },
     }));
     expect(mockAddComment).not.toHaveBeenCalled();
@@ -295,6 +333,73 @@ describe("createDoneCloseLandingBackstopService", () => {
     }));
     expect(mockAddComment).toHaveBeenCalledTimes(1);
     expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("emits issue.done_close_landing_failed for an arming-refusal card whose linked PR is still open (SUP-14900)", async () => {
+    const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+    const { service } = makeService(
+      { candidates: [refusalCandidateRow()], existingLandingRows: [] },
+      { wakeup },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 364, displayName: "paperclipai/paperclip#364" }),
+    ]);
+    mockResolver(async () => openSnapshot);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 1,
+      deferred: 0,
+    });
+
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_failed",
+      details: expect.objectContaining({
+        identifier: "SUP-14849",
+        pr: "paperclipai/paperclip#364",
+        prState: "open",
+        refusal: true,
+        skipReason: expect.stringContaining("head_unresolvable"),
+      }),
+    }));
+    expect(mockAddComment).toHaveBeenCalledTimes(1);
+    const [commentIssueId, commentBody] = mockAddComment.mock.calls[0]!;
+    expect(commentIssueId).toBe(ISSUE);
+    expect(commentBody).toContain("merge arming was REFUSED at close");
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("confirms (not flags) an arming-refusal card whose linked PR did merge (SUP-14900 negative)", async () => {
+    const { service } = makeService({
+      candidates: [refusalCandidateRow()],
+      existingLandingRows: [],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 364, displayName: "paperclipai/paperclip#364" }),
+    ]);
+    mockResolver(async () => mergedSnapshot);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 1,
+      failed: 0,
+      deferred: 0,
+    });
+
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_confirmed",
+      details: expect.objectContaining({
+        pr: "paperclipai/paperclip#364",
+        prState: "merged",
+        refusal: true,
+      }),
+    }));
+    expect(mockAddComment).not.toHaveBeenCalled();
   });
 
   it("never evaluates a done issue without the decision-carried skip row, and ignores other skip reasons", async () => {
