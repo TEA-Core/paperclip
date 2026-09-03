@@ -98,6 +98,21 @@ describeEmbeddedPostgres("recovery sweep reconcileStillbornAssignedBacklog", () 
       status: "backlog",
       priority: "high",
       assigneeAgentId: agentId,
+      createdAt: new Date(Date.now() - 120_000),
+    });
+    return issueId;
+  }
+
+  async function seedFreshlyCreatedCard(companyId: string, agentId: string) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Freshly created assigned backlog",
+      status: "backlog",
+      priority: "high",
+      assigneeAgentId: agentId,
+      createdAt: new Date(),
     });
     return issueId;
   }
@@ -328,5 +343,31 @@ describeEmbeddedPostgres("recovery sweep reconcileStillbornAssignedBacklog", () 
     expect(await recoveryActionRows(issueId)).toHaveLength(0);
     expect(await detectionRows(issueId)).toHaveLength(0);
     expect((await issueRow(issueId))?.status).toBe("backlog");
+  });
+
+  it("SUP-14907: does not escalate an issue created within the grace window", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await seedFreshlyCreatedCard(companyId, agentId);
+
+    const result = await makeSweep().reconcileStillbornAssignedBacklog();
+
+    expect(result.reported).toBe(0);
+    expect(result.skipped).toBe(0);
+    expect(result.issueIds).toEqual([]);
+    expect(await recoveryActionRows(issueId)).toHaveLength(0);
+    expect(await detectionRows(issueId)).toHaveLength(0);
+    expect((await issueRow(issueId))?.status).toBe("backlog");
+  });
+
+  it("SUP-14907: escalates an issue created before the grace window elapsed", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = await seedStillbornCard(companyId, agentId);
+
+    const result = await makeSweep().reconcileStillbornAssignedBacklog();
+
+    expect(result.reported).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    expect((await recoveryActionRows(issueId))).toHaveLength(1);
+    expect((await issueRow(issueId))?.status).toBe("blocked");
   });
 });
