@@ -3894,17 +3894,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const fingerprint = "recovery:terminal-source:fingerprint";
       const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
       const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
-      const svc = issueRecoveryActionService(db);
 
-      // Sweep escalates the action to 5/5 (escalated + exhausted).
       const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
       expect(sweep.maxAttemptsReached).toBe(1);
 
-      // Cancel the source issue.
       await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, sourceIssueId));
 
-      // A GET of the issue triggers revalidateActiveSourceRecoveryForRead,
-      // whose terminal branch must now pass boardResolution: true.
       const app = createApp();
       const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
 
@@ -3972,34 +3967,38 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
       expect(sweep.maxAttemptsReached).toBe(1);
 
-      // Cancel the source but concurrently resolve the action so the UPDATE
-      // in revalidateActiveSourceRecovery finds zero matching rows.
-      const svc = issueRecoveryActionService(db);
-      await svc.resolveActiveForIssue({
-        companyId,
-        sourceIssueId,
-        actionId,
-        status: "cancelled",
-        outcome: "cancelled",
-        resolutionNote: "Board cleared it first.",
-        boardResolution: true,
-      });
-
+      // Cancel the source issue (terminal).
       await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, sourceIssueId));
+
+      // Deterministically exercise the zero-row path: the action is still
+      // escalated+exhausted in the DB (so getActiveForIssue finds it), but we
+      // make resolveActiveForIssue return null — simulating the concurrent
+      // resolution race where another writer resolves the row between the
+      // read and the update inside revalidateActiveSourceRecovery.
+      const recoveryModule = await import("../services/issue-recovery-actions.js");
+      const originalFactory = recoveryModule.issueRecoveryActionService;
+      const resolveSpy = vi.fn(async () => null);
+      vi.spyOn(recoveryModule, "issueRecoveryActionService").mockImplementation((dbArg: any) => {
+        const realSvc = originalFactory(dbArg);
+        return { ...realSvc, resolveActiveForIssue: resolveSpy };
+      });
 
       const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
       const app = createApp();
       await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
 
-      // The zero-row miss should have been logged.
-      const zeroRowCalls = warnSpy.mock.calls.filter(
-        (call) => call[1] === "source revalidation recovery resolve matched zero rows (action may have been concurrently resolved)",
+      // AC4: the zero-row miss emitted a log line with the action's identity.
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ issueId: sourceIssueId, actionId, trigger: "read_projection" }),
+        "source revalidation recovery resolve matched zero rows (action may have been concurrently resolved)",
       );
-      expect(zeroRowCalls.length).toBeGreaterThanOrEqual(0);
-      // If the action was already resolved, getActiveForIssue returns null and
-      // the code returns early without calling resolveActiveForIssue.
-      // The log path is exercised when a concurrent resolution races the read.
-      warnSpy.mockRestore();
+
+      // The action was NOT cleared — the zero-row path returns the stale action.
+      const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(row.status).toBe("escalated");
+      expect(row.resolvedAt).toBeNull();
+
+      vi.restoreAllMocks();
     });
   });
 });
