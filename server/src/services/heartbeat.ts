@@ -18910,6 +18910,17 @@ function pendingCleanupAttemptsSql() {
         // directly, bypassing enqueueWakeup) never consulted.
         const deferredIsUserWake = deferred.requestedByActorType === "user";
 
+        // Interaction wakes carry the actor type of whoever produced the
+        // comment, which is routinely "agent" or "system" — the merged-PR sweep
+        // in issue-thread-interactions.ts enqueues `issue_commented` as
+        // `requestedByActorType: "system"`. The actor type alone is therefore
+        // not a proxy for "is this admissible on a blocked card": the dispatch
+        // gate admits any interaction wake regardless of actor. Mirror that
+        // predicate exactly rather than a stricter one (the *verified* variant
+        // used for the pause-hold gate above would drain wakes dispatch admits,
+        // which is the same mismatch in the other direction).
+        const deferredIsInteractionWake = allowsIssueInteractionWake(deferredContextSeed);
+
         // A bare `blocked` card (status "blocked" with NO unresolved blocker
         // edge) is not gated: the dispatch path intentionally still wakes it so
         // the assignee can re-evaluate. Only `blocked` WITH an unresolved
@@ -18918,7 +18929,7 @@ function pendingCleanupAttemptsSql() {
         // dispatch path relies on (issuesSvc listDependencyReadiness) — so a
         // promotion is drained precisely when a fresh dispatch would be
         // suppressed, and a board/operator (user) wake always reaches the agent.
-        if (issue.status === "blocked" && !deferredIsUserWake) {
+        if (issue.status === "blocked" && !deferredIsUserWake && !deferredIsInteractionWake) {
           const readinessMap = await issuesSvc.listDependencyReadiness(run.companyId, [issue.id], tx);
           const unresolvedBlockerCount = readinessMap.get(issue.id)?.unresolvedBlockerCount ?? 0;
           if (unresolvedBlockerCount > 0) {
@@ -18928,7 +18939,7 @@ function pendingCleanupAttemptsSql() {
                 status: "skipped",
                 reason: "issue_deferred_promotion_drained_blocked",
                 finishedAt: new Date(),
-                error: "Deferred wake drained: issue is blocked on an unresolved blocker and the wake is not board/operator input",
+                error: "Deferred wake drained: issue is blocked on an unresolved blocker and the wake is neither board/operator input nor an issue interaction",
                 updatedAt: new Date(),
               })
               .where(eq(agentWakeupRequests.id, deferred.id));
