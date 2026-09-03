@@ -132,6 +132,42 @@ Until the App is configured for a company:
 Once the App is configured and the flag is `on`, the same wiring mints
 installation tokens automatically.
 
+### Rollout flag: `PAPERCLIP_AGENT_GH_WRAPPER`
+
+Separate from the git credential helper above, the `gh` wrapper is off by
+default. Set `PAPERCLIP_AGENT_GH_WRAPPER=on` on the **server** process to enable
+it; only the value `on` (case- and whitespace-insensitive) activates it. Any
+other value — including unset — leaves agent-run `gh` behavior byte-identical to
+before the flag existed, keeping rollout a reversible env change.
+
+When the flag is `on` and the run has a scratch directory, Paperclip:
+
+- resolves `scripts/paperclip-gh-wrapper.sh` from the server's own install
+  (`server/dist/scripts/...` in a built package or image, falling back to the
+  repo-root `scripts/` and, last, the run's `scripts/`) — never from the run's
+  cwd;
+- sets `PAPERCLIP_GH_REAL` to the real `gh` binary, resolved from the inherited
+  PATH *before* the shim is prepended; and
+- materializes a `gh` symlink at `<run-scratch>/bin/gh` pointing at the wrapper
+  and prepends that bin dir to the child `PATH`, so the agent's `gh` calls the
+  wrapper, which mints a short-lived installation token and execs the real `gh`
+  for that single invocation only.
+
+The shim lives in the run's scratch directory and is removed with the run. If
+there is no scratch directory, no real `gh` on PATH, or the wrapper script cannot
+be resolved, the gate is a clean no-op (a one-line notice is written to the run's
+stderr) and `gh` behaves exactly as before against `GH_TOKEN`.
+
+**Do not enable this until the fleet GitHub App has at least `checks: read` on
+the target repo.** The wrapper mints the token with the repo's baseline
+permissions, so anything `gh` needs that the App is not granted will fail. When
+the App's permission set is tightened, `statuses` must be downgraded to at least
+`read`, **not removed** — `gh` still needs to read check/status state.
+
+This requires a fleet GitHub App to be configured on the server. Until the App is
+configured for a company, the wrapper reports a legible "App not configured"
+error instead of exec'ing `gh` without a token.
+
 ## User-Specific Secrets
 
 User-specific secrets let a shared agent or project declare a slot such as
