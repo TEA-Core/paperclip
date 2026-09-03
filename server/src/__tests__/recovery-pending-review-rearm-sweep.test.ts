@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issueExecutionDecisions,
   issueRecoveryActions,
   issueRelations,
   issues,
@@ -49,6 +50,7 @@ describeEmbeddedPostgres("recovery reconcilePendingReviewRearm", () => {
         "activity_log",
         "agent_wakeup_requests",
         "heartbeat_runs",
+        "issue_execution_decisions",
         "issue_recovery_actions",
         "issue_relations",
         "issues",
@@ -86,11 +88,11 @@ describeEmbeddedPostgres("recovery reconcilePendingReviewRearm", () => {
     return { companyId, agentId };
   }
 
-  function buildExecutionState(agentId: string, overrides: { lastDecisionId?: string | null } = {}) {
+  function buildExecutionState(agentId: string, overrides: { lastDecisionId?: string | null; currentStageId?: string; currentStageIndex?: number } = {}) {
     return {
       status: "pending",
-      currentStageId: randomUUID(),
-      currentStageIndex: 0,
+      currentStageId: overrides.currentStageId ?? randomUUID(),
+      currentStageIndex: overrides.currentStageIndex ?? 0,
       currentStageType: "review",
       currentParticipant: { type: "agent", agentId, userId: null },
       returnAssignee: null,
@@ -215,6 +217,7 @@ describeEmbeddedPostgres("recovery reconcilePendingReviewRearm", () => {
   it("skips issues whose review decision has already landed", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
+    const stageId = randomUUID();
     const now = new Date();
 
     await db.insert(issues).values({
@@ -223,8 +226,96 @@ describeEmbeddedPostgres("recovery reconcilePendingReviewRearm", () => {
       title: "Reviewed",
       status: "in_review",
       priority: "high",
-      executionState: buildExecutionState(agentId, { lastDecisionId: randomUUID() }),
+      executionState: buildExecutionState(agentId, { lastDecisionId: randomUUID(), currentStageId: stageId }),
       updatedAt: new Date(now.getTime() - 60_000),
+    });
+    await db.insert(issueExecutionDecisions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      stageId,
+      stageType: "review",
+      actorAgentId: agentId,
+      outcome: "approved",
+      body: "LGTM",
+    });
+
+    const { mockEnqueue } = makeMockEnqueueWakeup();
+    const recovery = recoveryService(db, { enqueueWakeup: mockEnqueue });
+    const result = await recovery.reconcilePendingReviewRearm({
+      now,
+      rearmWindowMs: 1000,
+      rearmMaxCount: 3,
+    });
+
+    expect(result.checked).toBe(0);
+    expect(result.reArmed).toBe(0);
+    expect(mockEnqueue).not.toHaveBeenCalled();
+  });
+
+  it("re-arms a multi-stage ladder parked at stage >= 1 with a prior-stage decision", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const currentStageId = randomUUID();
+    const previousDecisionId = randomUUID();
+    const now = new Date();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Multi-stage review",
+      status: "in_review",
+      priority: "high",
+      executionState: buildExecutionState(agentId, {
+        lastDecisionId: previousDecisionId,
+        currentStageId,
+        currentStageIndex: 1,
+      }),
+      updatedAt: new Date(now.getTime() - 60_000),
+    });
+
+    const { mockEnqueue } = makeMockEnqueueWakeup();
+    const recovery = recoveryService(db, { enqueueWakeup: mockEnqueue });
+    const result = await recovery.reconcilePendingReviewRearm({
+      now,
+      rearmWindowMs: 1000,
+      rearmMaxCount: 3,
+    });
+
+    expect(result.checked).toBe(1);
+    expect(result.reArmed).toBe(1);
+    expect(mockEnqueue).toHaveBeenCalledTimes(1);
+    expect(mockEnqueue.mock.calls[0]?.[0]).toBe(agentId);
+  });
+
+  it("skips a multi-stage ladder whose current stage already has a decision", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const currentStageId = randomUUID();
+    const now = new Date();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Current stage decided",
+      status: "in_review",
+      priority: "high",
+      executionState: buildExecutionState(agentId, {
+        lastDecisionId: randomUUID(),
+        currentStageId,
+        currentStageIndex: 1,
+      }),
+      updatedAt: new Date(now.getTime() - 60_000),
+    });
+    await db.insert(issueExecutionDecisions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      stageId: currentStageId,
+      stageType: "review",
+      actorAgentId: agentId,
+      outcome: "changes_requested",
+      body: "Please fix the issues",
     });
 
     const { mockEnqueue } = makeMockEnqueueWakeup();
