@@ -99,6 +99,44 @@ contract violation (fake approval). The only sanctioned recovery is the
   repo is always refused (ADR-091 D5). A shared-workspace card whose head ref is
   unreadable, or which carries another card's prefix, is still refused.
 
+### ADR-091 D1 delivery-identity evidence order (SUP-14824)
+
+When resolving a card's delivery identity (`resolveDeliveryIdentity`), the
+control plane consults evidence in strict priority order:
+
+1. **Recorded delivery identity** (`issues.execution_state.delivery`) —
+   written at the `in_review` transition by the run that holds the issue's
+   lease. Contains `{ repo: { owner, repo }, branch, headSha, recordedByRunId,
+   recordedAt }`. When present and repo-resolvable (non-empty `repo.owner`,
+   `repo.repo`, `branch`, and `headSha`), the D1 gate compares the linked PR's
+   head against the **recorded** branch; the execution-workspace row is not
+   consulted for the branch half.
+2. **Execution-workspace row** — when no recorded identity exists, the
+   delivery identity falls back to the card's `execution_workspaces` row
+   (`branchName` + `repoUrl`). This is the pre-D1 behavior, preserved
+   byte-identically for cards that have not yet been assigned a recorded
+   identity.
+3. **SUP-14783 shared-workspace fallbacks** — only reachable via the
+   execution-workspace row when the workspace is shared (multiple cards on
+   one branch). The `branchIsOwn` predicate (identifier-prefix match on the
+   branch name) is **never** entered when a recorded identity is present.
+
+**Fail-closed rule:** a recorded identity that is present but unusable
+(missing `repo.owner`/`repo.repo`/`branch`/`headSha`, or any of them empty)
+produces a named `delivery_identity_unresolved` refusal and never falls back
+to the execution-workspace row. The named reason identifies which field is
+missing so an operator can diagnose the write path.
+
+**Write path (control-plane consume-contract):** the `PATCH /issues/:id`
+route accepts a `deliveryIdentity` field. It is recorded only when:
+- the actor is an agent run holding the issue's lease (`executionRunId` or
+  `checkoutRunId` matches), and
+- the transition is **into** `in_review` (prior status was not `in_review`).
+
+Any other actor or transition is rejected with `422 delivery_identity_write_rejected`
+and no partial write occurs. `recordedByRunId` and `recordedAt` are
+server-owned (set from the actor context), never client-supplied.
+
 ### Waiving a cardless PR
 
 The fold's own changes are TEA-authored deliveries with Paperclip cards, so

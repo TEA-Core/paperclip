@@ -547,35 +547,71 @@ export interface PublishApprovalStatusOptions {
  * SUP-13313/SUP-13831 live-discovery path authorize against this, so it is
  * resolved through one helper: a gate that only covers one of the two stamp
  * paths is not a gate.
+ *
+ * ADR-091 D1 (SUP-14824): prefers the recorded delivery identity
+ * (executionState.delivery) over the execution-workspace row. A recorded
+ * identity that is present but unusable (no resolvable repo, missing/empty
+ * branch or headSha) fails closed with a named reason and never falls back to
+ * the workspace row.
  */
 async function resolveDeliveryIdentity(
   db: Db,
   companyId: string,
   issueId: string,
 ): Promise<{
-  branch: string | null;
-  repo: { owner: string; repo: string } | null;
-  /**
-   * ADR-091 D1 (SUP-14783): false ONLY when the execution-workspace row backing
-   * `branch` provably belongs to a DIFFERENT issue — a `shared_workspace` row
-   * inherited from a parent. The row carries one `branch_name`, so under
-   * sharing that name is the parent's branch and is NOT this card's delivery
-   * branch. Defaults to TRUE whenever ownership is unknown (`sourceIssueId`
-   * null, or no execution-workspace row at all) so the pre-existing verdict and
-   * refusal text stay byte-identical on every path that already worked.
-   */
-  branchIsOwn: boolean;
-  identifier: string | null;
-}> {
+   branch: string | null;
+   repo: { owner: string; repo: string } | null;
+   recordedUnusable?: string;
+   /**
+    * ADR-091 D1 (SUP-14783): false ONLY when the execution-workspace row backing
+    * `branch` provably belongs to a DIFFERENT issue — a `shared_workspace` row
+    * inherited from a parent. The row carries one `branch_name`, so under
+    * sharing that name is the parent's branch and is NOT this card's delivery
+    * branch. Defaults to TRUE whenever ownership is unknown (`sourceIssueId`
+    * null, or no execution-workspace row at all) so the pre-existing verdict and
+    * refusal text stay byte-identical on every path that already worked.
+    */
+   branchIsOwn: boolean;
+   identifier: string | null;
+ }> {
   const [issueRow] = await db
     .select({
       identifier: issues.identifier,
       projectId: issues.projectId,
       projectWorkspaceId: issues.projectWorkspaceId,
       executionWorkspaceId: issues.executionWorkspaceId,
+      executionState: issues.executionState,
     })
     .from(issues)
     .where(eq(issues.id, issueId));
+
+  // ADR-091 D1 (SUP-14824): prefer the recorded delivery identity.
+  const delivery = issueRow?.executionState?.delivery;
+  if (delivery && typeof delivery === "object" && !Array.isArray(delivery)) {
+    const record = delivery as Record<string, unknown>;
+    const branch = typeof record.branch === "string" && record.branch.length > 0 ? record.branch : null;
+    const headSha = typeof record.headSha === "string" && record.headSha.length > 0 ? record.headSha : null;
+    const repoRaw = record.repo;
+    const repo =
+      repoRaw && typeof repoRaw === "object" && !Array.isArray(repoRaw)
+        ? (() => {
+            const r = repoRaw as Record<string, unknown>;
+            if (typeof r.owner !== "string" || r.owner.length === 0 || typeof r.repo !== "string" || r.repo.length === 0)
+              return null;
+            return { owner: r.owner, repo: r.repo };
+          })()
+        : null;
+    if (!branch || !repo || !headSha) {
+      const reason = !repo
+        ? "recorded delivery identity has no resolvable repo"
+        : !branch
+          ? "recorded delivery identity has no branch"
+          : "recorded delivery identity has no headSha";
+      return { branch: null, repo: null, recordedUnusable: reason, branchIsOwn: true, identifier: issueRow?.identifier ?? null };
+    }
+    return { branch, repo, branchIsOwn: true, identifier: issueRow?.identifier ?? null };
+  }
+
   const ctx = await resolveIssueRepoContext(db, {
     companyId,
     projectId: issueRow?.projectId ?? null,
@@ -631,15 +667,14 @@ function isDeliveredByCardIdentifierPrefix(
 /** ADR-091 D4: the fail-closed refusal when delivery identity is unresolvable. */
 function deliveryIdentityUnresolvedOutcome(
   branch: string | null,
+  recordedUnusable?: string,
   missingIdentifier?: boolean,
 ): ArmingOutcome {
-  // SUP-14783: a shared-workspace card DOES have a branch recorded - it just
-  // belongs to another issue - so reporting "no delivery branch recorded" here
-  // would name the wrong missing thing and send an operator to the workspace
-  // instead of the card.
-  const missing = missingIdentifier
-    ? "this card's execution-workspace branch belongs to another issue and the card has no readable identifier to authorize against"
-    : !branch
+  const missing = recordedUnusable
+    ? recordedUnusable
+    : missingIdentifier
+      ? "this card's execution-workspace branch belongs to another issue and the card has no readable identifier to authorize against"
+      : !branch
       ? "no delivery branch recorded on this card's execution workspace"
       : "no delivery repo resolvable for this card's execution workspace";
   return {
@@ -727,7 +762,7 @@ function notDeliveredOutcome(
  */
 type DeliveryNarrow<T> =
   | { outcome: "narrowed"; delivered: T[]; deliveryBranch: string }
-  | { outcome: "identity-unresolved"; branch: string | null; missingIdentifier?: boolean }
+  | { outcome: "identity-unresolved"; branch: string | null; recordedUnusable?: string; missingIdentifier?: boolean }
   | {
       outcome: "not-delivered";
       rejected: T[];
@@ -740,7 +775,8 @@ type DeliveryNarrow<T> =
 async function narrowToDelivered<
   T extends { owner: string; repo: string; headRefName: string | null; displayName: string },
 >(db: Db, companyId: string, issueId: string, candidates: T[]): Promise<DeliveryNarrow<T>> {
-  const { branch, repo, branchIsOwn, identifier } = await resolveDeliveryIdentity(db, companyId, issueId);
+  const { branch, repo, recordedUnusable, branchIsOwn, identifier } = await resolveDeliveryIdentity(db, companyId, issueId);
+  if (recordedUnusable) return { outcome: "identity-unresolved", branch: null, recordedUnusable };
   if (!branch || !repo) return { outcome: "identity-unresolved", branch };
   // ADR-091 D1 (SUP-14783): a `shared_workspace` row belongs to the parent
   // issue and carries exactly one branch_name, so for every OTHER issue on that
@@ -792,7 +828,7 @@ export async function publishApprovalStatus(
     // ADR-091 D4: fail closed when the card's delivery identity cannot be
     // positively resolved — refuse to stamp on an unverified branch.
     if (narrowed.outcome === "identity-unresolved") {
-      return deliveryIdentityUnresolvedOutcome(narrowed.branch, narrowed.missingIdentifier);
+      return deliveryIdentityUnresolvedOutcome(narrowed.branch, narrowed.recordedUnusable, narrowed.missingIdentifier);
     }
     if (narrowed.outcome === "not-delivered") {
       return notDeliveredOutcome(
@@ -936,9 +972,9 @@ export async function publishApprovalStatus(
       const narrowed = await narrowToDelivered(db, companyId, issueId, matched);
       // ADR-091 D4: no branch (or no repo) recorded → refuse, never fall back to
       // identifier-substring authorization.
-      if (narrowed.outcome === "identity-unresolved") {
-        return deliveryIdentityUnresolvedOutcome(narrowed.branch, narrowed.missingIdentifier);
-      }
+       if (narrowed.outcome === "identity-unresolved") {
+         return deliveryIdentityUnresolvedOutcome(narrowed.branch, narrowed.recordedUnusable, narrowed.missingIdentifier);
+       }
       if (narrowed.outcome === "not-delivered") {
         return notDeliveredOutcome(
           narrowed.rejected,
@@ -1152,7 +1188,7 @@ export type DecisionHeadResolution =
  */
 function unresolvableFromNarrowing(
   narrowed:
-    | { outcome: "identity-unresolved"; branch: string | null; missingIdentifier?: boolean }
+    | { outcome: "identity-unresolved"; branch: string | null; recordedUnusable?: string; missingIdentifier?: boolean }
     | {
         outcome: "not-delivered";
         rejected: Array<{
@@ -1167,11 +1203,13 @@ function unresolvableFromNarrowing(
       },
 ): DecisionHeadResolution {
   if (narrowed.outcome === "identity-unresolved") {
-    const missing = narrowed.missingIdentifier
-      ? "this card's execution-workspace branch belongs to another issue and the card has no readable identifier to authorize against"
-      : !narrowed.branch
-        ? "no delivery branch recorded on this card's execution workspace"
-        : "no delivery repo resolvable for this card's execution workspace";
+    const missing = narrowed.recordedUnusable
+      ? narrowed.recordedUnusable
+      : narrowed.missingIdentifier
+        ? "this card's execution-workspace branch belongs to another issue and the card has no readable identifier to authorize against"
+        : !narrowed.branch
+          ? "no delivery branch recorded on this card's execution workspace"
+          : "no delivery repo resolvable for this card's execution workspace";
     return {
       kind: "unresolvable",
       reason: `delivery_identity_unresolved: ${missing}; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)`,

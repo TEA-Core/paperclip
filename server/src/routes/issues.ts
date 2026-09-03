@@ -297,10 +297,19 @@ const doneTransitionOverrideSchema = z.object({
   disposition: z.string().trim().min(1),
   reason: z.string().trim().min(1).max(2000).optional(),
 });
+const deliveryIdentitySchema = z.object({
+  repo: z.object({
+    owner: z.string().trim().min(1),
+    repo: z.string().trim().min(1),
+  }).strict(),
+  branch: z.string().trim().min(1),
+  headSha: z.string().trim().min(1),
+}).strict();
 const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObjectSchema.extend({
   interrupt: z.boolean().optional(),
   force: z.boolean().optional(),
   doneTransitionOverride: doneTransitionOverrideSchema.optional().nullable(),
+  deliveryIdentity: deliveryIdentitySchema.optional(),
 }));
 
 function prefersMinimalIssueUpdateResponse(req: Request) {
@@ -11095,6 +11104,7 @@ export function issueRoutes(
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
       onBehalfOfUserId: _requestedOnBehalfOfUserId,
+      deliveryIdentity: requestedDeliveryIdentity,
       ...updateFields
     } = req.body;
     const reviewPolicyChangeRequested =
@@ -11552,6 +11562,39 @@ export function issueRoutes(
       };
     }
     Object.assign(updateFields, transition.patch);
+
+    // ADR-091 D1 (SUP-14824): record the delivery identity on in_review transition.
+    // Only a run that holds the issue's lease may write it, and only on a transition
+    // INTO in_review. Any other actor or transition is rejected without partial write.
+    if (requestedDeliveryIdentity) {
+      const holdsLease =
+        actor.actorType === "agent"
+        && actor.runId != null
+        && (existing.executionRunId === actor.runId || existing.checkoutRunId === actor.runId);
+      const enteringReview = existing.status !== "in_review" && updateFields.status === "in_review";
+      if (!holdsLease || !enteringReview) {
+        res.status(422).json({
+          error: "deliveryIdentity may only be written by the lease-holding run on a transition into in_review",
+          code: "delivery_identity_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+          },
+        });
+        return;
+      }
+      const currentExecState = (updateFields.executionState ?? {}) as Record<string, unknown>;
+      updateFields.executionState = {
+        ...currentExecState,
+        delivery: {
+          ...requestedDeliveryIdentity,
+          recordedByRunId: actor.runId,
+          recordedAt: new Date().toISOString(),
+        },
+      };
+    }
 
     const nextStatus = updateFields.status ?? existing.status;
     if (updateFields.unblockDescriptor && nextStatus !== "blocked") {

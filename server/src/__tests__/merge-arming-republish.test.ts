@@ -11,6 +11,7 @@ import {
   executionWorkspaces,
   externalObjectMentions,
   externalObjects,
+  heartbeatRuns,
   issueExecutionDecisions,
   issues,
   projectWorkspaces,
@@ -645,4 +646,256 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
 
+});
+
+describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14824)", () => {
+  let db: Db;
+  let app: express.Express;
+  let currentActor: Express.Request["actor"];
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let previousSchedulingSuppression: string | undefined;
+
+  beforeAll(async () => {
+    previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-delivery-identity-write-");
+    db = createDb(tempDb.connectionString);
+    app = createApp();
+  }, 60_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+    if (previousSchedulingSuppression === undefined) {
+      delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    } else {
+      process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
+    }
+  });
+
+  beforeEach(async () => {
+    await db.delete(externalObjectMentions);
+    await db.delete(externalObjects);
+    await db.delete(issueExecutionDecisions);
+    await db.delete(issues);
+    await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(companyMemberships);
+    await db.delete(companies);
+  });
+
+  function createApp() {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = currentActor;
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as any));
+    app.use(errorHandler);
+    return app;
+  }
+
+  function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
+    return {
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId,
+    } as unknown as Express.Request["actor"];
+  }
+
+  interface SeedOpts {
+    executionRunId?: string | null;
+    status?: string;
+  }
+
+  async function seedIssue(opts: SeedOpts = {}) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const now = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Delivery Identity Co",
+      issuePrefix: "SUP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: USER_ID,
+      status: "active",
+      membershipRole: "owner",
+      updatedAt: now,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "TEA-Core/paperclip",
+      status: "in_progress",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: "/tmp/test",
+      isPrimary: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    if (opts.executionRunId) {
+      await db.insert(heartbeatRuns).values({
+        id: opts.executionRunId,
+        companyId,
+        agentId,
+        status: "running",
+      });
+    }
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated",
+      strategyType: "git_worktree",
+      name: "card-ws",
+      status: "active",
+      branchName: "SUP-14824-branch",
+      repoUrl: REPO_URL,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier: "SUP-14824-1",
+      issueNumber: 1,
+      title: "Delivery identity test card",
+      status: opts.status ?? "in_progress",
+      priority: "medium",
+      assigneeUserId: USER_ID,
+      createdByUserId: USER_ID,
+      projectId,
+      projectWorkspaceId,
+      executionWorkspaceId,
+      executionRunId: opts.executionRunId ?? null,
+    });
+
+    return { companyId, issueId, agentId };
+  }
+
+  it("persists deliveryIdentity on in_review transition from lease holder (AC4)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-delivery",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(200);
+    const [row] = await db
+      .select({ executionState: issues.executionState, status: issues.status })
+      .from(issues)
+      .where(issues.id === issueId);
+    expect(row!.status).toBe("in_review");
+    const delivery = (row!.executionState ?? {})?.delivery as Record<string, unknown> | undefined;
+    expect(delivery).toBeDefined();
+    expect(delivery!.repo).toEqual({ owner: OWNER, repo: REPO });
+    expect(delivery!.branch).toBe("SUP-14824-delivery");
+    expect(delivery!.headSha).toBe(HEAD_SHA);
+    expect(delivery!.recordedByRunId).toBe(runId);
+    expect(typeof delivery!.recordedAt).toBe("string");
+  });
+
+  it("rejects deliveryIdentity when actor does not hold the lease (AC4)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    // Use a DIFFERENT run ID — this actor does not hold the lease.
+    const otherRunId = randomUUID();
+    // Create a heartbeat run for the other runId so the route can resolve it.
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId,
+      status: "running",
+    });
+    currentActor = agentActor(companyId, agentId, otherRunId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-delivery",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_write_rejected");
+    expect(res.body.details.holdsLease).toBe(false);
+    // No partial write: status stays in_progress and no delivery recorded.
+    const [row] = await db
+      .select({ executionState: issues.executionState, status: issues.status })
+      .from(issues)
+      .where(issues.id === issueId);
+    expect(row!.status).toBe("in_progress");
+    expect((row!.executionState ?? {})?.delivery).toBeUndefined();
+  });
+
+  it("rejects deliveryIdentity on a non-in_review transition (AC4)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({
+      executionRunId: runId,
+      status: "in_progress",
+    });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    // Transition to done, NOT in_review — deliveryIdentity must be rejected.
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "done",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-delivery",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_write_rejected");
+    expect(res.body.details.enteringReview).toBe(false);
+  });
 });
