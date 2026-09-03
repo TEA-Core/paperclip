@@ -173,6 +173,16 @@ import {
 } from "../services/recovery/review-path-recovery.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
 import {
+  IN_PROGRESS_SETTLE_WINDOW_MS,
+  evaluateIssueContinuationPath,
+  toContinuationPathDate,
+} from "../services/issue-continuation-path.js";
+// ADR-093 D1 (SUP-14880): the §2a continuation-path predicate was cut in routes
+// (ADR-074 D1) and re-homed to services so the dispatch path
+// (services/heartbeat.ts) can reuse it. Re-export here so existing callers and
+// tests (issue-comment-reopen-routes) keep importing it from this module.
+export { IN_PROGRESS_SETTLE_WINDOW_MS, evaluateIssueContinuationPath, toContinuationPathDate };
+import {
   TASK_WATCHDOG_ORIGIN_KIND,
   resolveTaskWatchdogMutationScope,
   taskWatchdogScopeAllowsIssueMutation,
@@ -1106,68 +1116,12 @@ function withRecoveryActionsOnRelationSummaries(
   };
 }
 
-// SUP-14030 (ghost-pass-reporting.md §2a): "no activeRun" is NOT "no continuation
-// path". An issue remains live while any one of the four §2a disjuncts holds —
-// activeRun (queued|running), a monitor with a future nextCheckAt, a live
-// watchdog/scheduledRetry/activeRecoveryAction, or a successfulRunHandoff
-// preserving progress (hasLiveContinuation) — and an issue whose lastActivityAt
-// falls inside the 5-minute settle window is not a ghost even when none of
-// (1)-(4) are present (run stamping and status commit are not simultaneous).
-const IN_PROGRESS_SETTLE_WINDOW_MS = 5 * 60 * 1000;
-
-function toContinuationPathDate(value: Date | string | null | undefined): Date | null {
-  if (!value) return null;
-  const date = value instanceof Date ? value : new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-
-export function evaluateIssueContinuationPath(
-  evidence: {
-    activeRun: boolean;
-    monitorNextCheckAt: Date | string | null | undefined;
-    watchdog: unknown;
-    scheduledRetry: unknown;
-    activeRecoveryAction: unknown;
-    successfulRunHandoff: { hasLiveContinuation?: boolean | null } | null | undefined;
-    lastActivityAt: Date | string | null | undefined;
-  },
-  options: { now?: Date; settleWindowMs?: number } = {},
-): {
-  ok: boolean;
-  disjuncts: {
-    activeRun: boolean;
-    monitorNextCheckAtInFuture: boolean;
-    watchdog: boolean;
-    scheduledRetry: boolean;
-    activeRecoveryAction: boolean;
-    successfulRunHandoffLive: boolean;
-  };
-  settledWithinWindow: boolean;
-  lastActivityAt: Date | null;
-} {
-  const now = options.now ?? new Date();
-  const settleWindowMs = options.settleWindowMs ?? IN_PROGRESS_SETTLE_WINDOW_MS;
-  const monitorNextCheckAt = toContinuationPathDate(evidence.monitorNextCheckAt);
-  const lastActivityAt = toContinuationPathDate(evidence.lastActivityAt);
-  const disjuncts = {
-    activeRun: evidence.activeRun === true,
-    monitorNextCheckAtInFuture:
-      monitorNextCheckAt !== null && monitorNextCheckAt.getTime() > now.getTime(),
-    watchdog: evidence.watchdog !== null && evidence.watchdog !== undefined,
-    scheduledRetry: evidence.scheduledRetry !== null && evidence.scheduledRetry !== undefined,
-    activeRecoveryAction:
-      evidence.activeRecoveryAction !== null && evidence.activeRecoveryAction !== undefined,
-    successfulRunHandoffLive: evidence.successfulRunHandoff?.hasLiveContinuation === true,
-  };
-  const settledWithinWindow =
-    lastActivityAt !== null && now.getTime() - lastActivityAt.getTime() < settleWindowMs;
-  return {
-    ok: Object.values(disjuncts).some(Boolean) || settledWithinWindow,
-    disjuncts,
-    settledWithinWindow,
-    lastActivityAt,
-  };
-}
+// SUP-14030 / ADR-093 D1 (SUP-14880): the §2a "live continuation path" predicate
+// (IN_PROGRESS_SETTLE_WINDOW_MS, toContinuationPathDate,
+// evaluateIssueContinuationPath) was cut here in ADR-074 D1 and re-homed to
+// services/issue-continuation-path.js so the dispatch path
+// (services/heartbeat.ts) can reuse it. This file imports and re-exports those
+// three at the top; the write-path guard below (ADR-074 D1) keeps consuming them.
 
 type IssueBlockerDiagnosticReadableIssue = {
   id: string;
