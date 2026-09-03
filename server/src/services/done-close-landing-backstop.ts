@@ -1,4 +1,4 @@
-import { and, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -6,6 +6,7 @@ import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
 import {
   resolveLinkedPullRequestsWithState,
+  MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
 } from "./merge-arming.js";
 import { createGitHubExternalObjectProvider } from "./github-external-object-provider.js";
@@ -163,10 +164,18 @@ export function createDoneCloseLandingBackstopService(
 
     const windowStart = new Date(checkedAt.getTime() - lookbackMs);
     const graceCutoff = new Date(checkedAt.getTime() - graceMs);
-    // Decision-carried skips are recorded by evaluateDoneTransitionGuard
-    // (done-transition-guard.ts) as an `issue.done_transition_guard_skipped`
-    // activity row whose reason carries the `open_linked_prs_decision_carried:`
-    // prefix — a full discriminator for this exemption.
+    // Two candidate sources for a done card whose merge provably cannot enter the
+    // merge queue via the approved path, both recorded as first-class, queryable
+    // activity rows:
+    //   1. decision-carried close: the done-transition guard recorded an
+    //      `issue.done_transition_guard_skipped` row whose reason carries the
+    //      `open_linked_prs_decision_carried:` prefix (SUP-13352) — the merge was
+    //      armed but we now audit whether it landed.
+    //   2. arming refusal on close (SUP-14900): the post-approval hook recorded an
+    //      `issue.merge_arming_refused_on_close` row when a closing transition's
+    //      arming REFUSED (head_unresolvable, …). The guard could not see this case
+    //      (no PR resolvable at transition time), so the card-side sweep is the only
+    //      thing that can key on it and surface a linked PR that is still open/unmerged.
     const rows = await db
       .select({
         details: activityLog.details,
@@ -190,8 +199,13 @@ export function createDoneCloseLandingBackstopService(
       .where(
         and(
           eq(activityLog.entityType, "issue"),
-          eq(activityLog.action, SKIPPED_ACTION),
-          sql`${activityLog.details}->>'reason' LIKE 'open_linked_prs_decision_carried:%'`,
+          or(
+            and(
+              eq(activityLog.action, SKIPPED_ACTION),
+              sql`${activityLog.details}->>'reason' LIKE 'open_linked_prs_decision_carried:%'`,
+            ),
+            eq(activityLog.action, MERGE_ARMING_REFUSED_ON_CLOSE_ACTION),
+          ),
           gte(activityLog.createdAt, windowStart),
           lte(activityLog.createdAt, graceCutoff),
           eq(issues.status, "done"),
@@ -211,8 +225,11 @@ export function createDoneCloseLandingBackstopService(
       if (row.issue.status !== "done") return false;
       const createdAt = row.createdAt.getTime();
       if (createdAt < windowStart.getTime() || createdAt > graceCutoff.getTime()) return false;
-      const reason = readString(row.details?.reason);
-      return reason?.startsWith(DECISION_CARRIED_SKIP_REASON_PREFIX) === true;
+      const details = readRecord(row.details);
+      const isDecisionCarried =
+        readString(details?.reason)?.startsWith(DECISION_CARRIED_SKIP_REASON_PREFIX) === true;
+      const isArmingRefused = readString(details?.refusalReason) !== null;
+      return isDecisionCarried || isArmingRefused;
     });
     result.candidates = candidates.length;
     if (candidates.length === 0) return result;
@@ -245,8 +262,14 @@ export function createDoneCloseLandingBackstopService(
   ) {
     const issue = row.issue;
     const details = readRecord(row.details);
+    // SUP-14900: an arming-refusal candidate carries `refusalReason` (there is no
+    // guard `skipReason`/`reason` for it); a decision-carried candidate carries the
+    // guard's skipReason/reason. Prefer the refusal reason so the report names the
+    // actual cause.
+    const refusalReason = readString(details?.refusalReason);
+    const isArmingRefusal = refusalReason !== null;
     const skipReason =
-      readString(details?.skipReason) ?? readString(details?.reason);
+      refusalReason ?? readString(details?.skipReason) ?? readString(details?.reason);
     const prs: LinkedPullRequest[] = await resolveLinkedPullRequestsWithState(
       db,
       issue.companyId,
@@ -335,6 +358,7 @@ export function createDoneCloseLandingBackstopService(
           prState: state,
           closedAt,
           skipReason: skipReason ?? null,
+          refusal: isArmingRefusal,
         },
       });
       if (state === "merged") {
@@ -345,9 +369,12 @@ export function createDoneCloseLandingBackstopService(
       // Closed-unmerged or still open past the grace window: surface attention.
       // A comment alone never wakes a closed issue (issues route skipWake), so
       // the assignee wake is required alongside it.
+      const cause = isArmingRefusal
+        ? `merge arming was REFUSED at close (${refusalReason}) and the approved head was never certified`
+        : "the decision-carried merge never landed";
       await deps.svc.addComment(
         issue.id,
-        `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is ${state} past the done-close grace window — the decision-carried merge never landed. Re-open/merge the PR and verify the deliverable.`,
+        `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is ${state} past the done-close grace window — ${cause}. Re-open/merge the PR and verify the deliverable.`,
         {},
         { authorType: "system" },
       );

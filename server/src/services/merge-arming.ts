@@ -25,6 +25,15 @@ export {
   type GitHubTokenScope,
 } from "./github-credential.js";
 
+// SUP-14900: a closing transition whose merge arming REFUSED (a principled
+// refusal, `statusOutcome.kind === "skipped"`) must not rest the card in quiet
+// `done`. The post-approval hook records this durable, first-class signal; the
+// card-side done-close-landing backstop keys on it to surface a linked PR that
+// is still open/unmerged. A genuine hook failure (`kind === "failed"` or a throw
+// in the hook's catch) is NOT this signal (SUP-13904's original intent).
+export const MERGE_ARMING_REFUSED_ON_CLOSE_ACTION = "issue.merge_arming_refused_on_close";
+export const MERGE_ARMING_ACTOR_ID = "system:merge-arming";
+
 export interface MergeArmingDecision {
   stageId: string;
   stageType: string;
