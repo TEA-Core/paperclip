@@ -8167,6 +8167,30 @@ export function issueRoutes(
         ? "owner_completed"
         : outcome;
     const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
+    // T27 (SUP-14905): guard on the execution state the transition will install,
+    // not the current one. A card in `changes_requested` has no pending
+    // participant, so guarding on the current state 422s exactly the recovery
+    // lanes that exist to rescue it — even though the transition re-pends the
+    // stage and installs a participant microseconds later. Compute the
+    // transition first and feed its patch into the guard, matching the PATCH
+    // route's ordering.
+    if (sourceIssueStatus === "in_review" && existing.status !== "in_review") {
+      const executionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+      const transition = applyIssueExecutionPolicyTransition({
+        issue: existing,
+        policy: executionPolicy,
+        previousPolicy: executionPolicy,
+        requestedStatus: sourceIssueStatus,
+        requestedAssigneePatch: {},
+        actor: {
+          agentId: actor.agentId ?? null,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        allowBoardOverride: req.actor.type === "board",
+        commentBody: resolutionNote ?? null,
+      });
+      Object.assign(updateFields, transition.patch);
+    }
     await assertInReviewReviewPath({
       existing,
       updateFields,
@@ -8278,14 +8302,9 @@ export function issueRoutes(
 
         const updateFields: Record<string, unknown> = { status: sourceIssueStatus };
         if (!safeHandBack) {
-          await assertInReviewReviewPath({
-            existing: lockedIssue,
-            updateFields,
-            actorType: actor.actorType,
-            actorId: actor.actorId,
-            actorAgentId: actor.agentId,
-            actorRunId: actor.runId,
-          });
+          // T27 (SUP-14905): run the execution-policy transition before the
+          // review-path guard so the guard sees the participant the transition
+          // installs, not the pre-transition `changes_requested` state.
           const executionPolicy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
           const transition = applyIssueExecutionPolicyTransition({
             issue: lockedIssue,
@@ -8301,6 +8320,14 @@ export function issueRoutes(
             commentBody: resolutionNote ?? null,
           });
           Object.assign(updateFields, transition.patch);
+          await assertInReviewReviewPath({
+            existing: lockedIssue,
+            updateFields,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            actorAgentId: actor.agentId,
+            actorRunId: actor.runId,
+          });
           if (transition.decision) {
             const decisionId = randomUUID();
             const nextExecutionState = updateFields.executionState;
