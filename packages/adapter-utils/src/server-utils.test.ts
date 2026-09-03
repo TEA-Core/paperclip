@@ -2,11 +2,29 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
+import {
+  constants as fsConstants,
+  existsSync as fsExistsSync,
+  lstatSync as fsLstatSync,
+  readlinkSync as fsReadlinkSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  applyPaperclipGitHubCredentialHelperEnv,
+  applyPaperclipGitHubCredentialHelperGate,
+  isPaperclipGitHubCredentialHelperEnabled,
+  PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FLAG,
+  PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME,
+  resolvePaperclipGitHubCredentialHelperPath,
+  applyPaperclipGhWrapperGate,
+  isPaperclipGhWrapperEnabled,
+  PAPERCLIP_GH_WRAPPER_FLAG,
+  PAPERCLIP_GH_WRAPPER_FILENAME,
+  resolvePaperclipGhWrapperPath,
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
   buildPersistentSkillSnapshot,
@@ -2700,6 +2718,239 @@ describe("applyPaperclipWorkspaceEnv", () => {
   });
 });
 
+describe("applyPaperclipGitHubCredentialHelperEnv", () => {
+  it("clears the ambient credential helper, installs URL-scoped helpers, and sets GIT_TERMINAL_PROMPT=0", () => {
+    const env = applyPaperclipGitHubCredentialHelperEnv(
+      {},
+      "/opt/repo/scripts/paperclip-github-credential-helper.sh",
+    );
+
+    expect(env).toEqual({
+      GIT_CONFIG_COUNT: "3",
+      GIT_CONFIG_KEY_0: "credential.helper",
+      GIT_CONFIG_VALUE_0: "",
+      GIT_CONFIG_KEY_1: "credential.https://github.com.helper",
+      GIT_CONFIG_VALUE_1: "/opt/repo/scripts/paperclip-github-credential-helper.sh",
+      GIT_CONFIG_KEY_2: "credential.https://www.github.com.helper",
+      GIT_CONFIG_VALUE_2: "/opt/repo/scripts/paperclip-github-credential-helper.sh",
+      GIT_TERMINAL_PROMPT: "0",
+    });
+  });
+
+  it("merges with a pre-existing GIT_CONFIG_COUNT instead of clobbering it", () => {
+    const env = applyPaperclipGitHubCredentialHelperEnv(
+      {
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "core.hooksPath",
+        GIT_CONFIG_VALUE_0: "/opt/hooks",
+        GIT_CONFIG_KEY_1: "user.name",
+        GIT_CONFIG_VALUE_1: "paperclip",
+      },
+      "/opt/repo/scripts/paperclip-github-credential-helper.sh",
+    );
+
+    // Pre-existing keys are preserved...
+    expect(env.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("/opt/hooks");
+    expect(env.GIT_CONFIG_KEY_1).toBe("user.name");
+    expect(env.GIT_CONFIG_VALUE_1).toBe("paperclip");
+    // ...and our entries are appended at the next indices.
+    expect(env.GIT_CONFIG_COUNT).toBe("5");
+    expect(env.GIT_CONFIG_KEY_2).toBe("credential.helper");
+    expect(env.GIT_CONFIG_VALUE_2).toBe("");
+    expect(env.GIT_CONFIG_KEY_3).toBe("credential.https://github.com.helper");
+    expect(env.GIT_CONFIG_VALUE_3).toBe("/opt/repo/scripts/paperclip-github-credential-helper.sh");
+    expect(env.GIT_CONFIG_KEY_4).toBe("credential.https://www.github.com.helper");
+    expect(env.GIT_CONFIG_VALUE_4).toBe("/opt/repo/scripts/paperclip-github-credential-helper.sh");
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+  });
+
+  it("is a no-op when the helper path is empty or whitespace", () => {
+    expect(applyPaperclipGitHubCredentialHelperEnv({ FOO: "bar" }, "")).toEqual({
+      FOO: "bar",
+    });
+    expect(applyPaperclipGitHubCredentialHelperEnv({ FOO: "bar" }, "   ")).toEqual({
+      FOO: "bar",
+    });
+  });
+
+  it("starts from a clean 3-entry config when GIT_CONFIG_COUNT is malformed", () => {
+    const env = applyPaperclipGitHubCredentialHelperEnv(
+      { GIT_CONFIG_COUNT: "not-a-number" },
+      "/opt/repo/scripts/paperclip-github-credential-helper.sh",
+    );
+    expect(env.GIT_CONFIG_COUNT).toBe("3");
+    expect(env.GIT_CONFIG_KEY_0).toBe("credential.helper");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("");
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+  });
+});
+
+describe("applyPaperclipGitHubCredentialHelperGate (GH-APP-6)", () => {
+  const serverModuleDir = "/opt/paperclip/server/dist/adapters/process";
+  const serverDistScript = "/opt/paperclip/server/dist/scripts/paperclip-github-credential-helper.sh";
+  const serverRepoScript = "/opt/paperclip/scripts/paperclip-github-credential-helper.sh";
+
+  it("AC1: is byte-identical when the flag is unset — no env touched, no fs probes", () => {
+    const env: Record<string, string> = { PAPERCLIP_SOMETHING: "kept" };
+    const existsSpy = vi.fn(() => true);
+    const result = applyPaperclipGitHubCredentialHelperGate(env, {
+      flagEnv: {},
+      moduleDir: serverModuleDir,
+      cwd: "/tmp/non-repo",
+      existsSync: existsSpy,
+    });
+    expect(result).toBe(env);
+    expect(env).toEqual({ PAPERCLIP_SOMETHING: "kept" });
+    expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(env.GIT_TERMINAL_PROMPT).toBeUndefined();
+    expect(existsSpy).not.toHaveBeenCalled();
+  });
+
+  it("AC1: stays byte-identical for every non-`on` flag value, even if the script exists", () => {
+    for (const value of ["off", "no", "false", "0", "yes", "true", "1", "", "  "]) {
+      const env: Record<string, string> = { FOO: "bar" };
+      const result = applyPaperclipGitHubCredentialHelperGate(env, {
+        flagEnv: { PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: value },
+        moduleDir: serverModuleDir,
+        cwd: "/tmp/non-repo",
+        existsSync: () => true,
+      });
+      expect(result).toBe(env);
+      expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+      expect(env.GIT_TERMINAL_PROMPT).toBeUndefined();
+    }
+  });
+
+  it("AC2: applies when the flag is on and the run cwd is a non-repo temp dir with no scripts/", () => {
+    const env: Record<string, string> = {};
+    applyPaperclipGitHubCredentialHelperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "on" },
+      moduleDir: serverModuleDir,
+      cwd: "/tmp/non-repo-without-scripts",
+      existsSync: (p) => p === serverDistScript,
+    });
+    expect(env.GIT_CONFIG_COUNT).toBe("3");
+    expect(env.GIT_CONFIG_KEY_0).toBe("credential.helper");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("");
+    expect(env.GIT_CONFIG_KEY_1).toBe("credential.https://github.com.helper");
+    expect(env.GIT_CONFIG_VALUE_1).toBe(serverDistScript);
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+  });
+
+  it("AC3: resolves an absolute path from the server module root, identical across two different cwds", () => {
+    const exists = (p: string) => p === serverDistScript;
+    const cwdA = "/tmp/run-cwd-a";
+    const cwdB = "/tmp/run-cwd-b";
+    const resolvedA = resolvePaperclipGitHubCredentialHelperPath({
+      moduleDir: serverModuleDir,
+      cwd: cwdA,
+      existsSync: exists,
+    });
+    const resolvedB = resolvePaperclipGitHubCredentialHelperPath({
+      moduleDir: serverModuleDir,
+      cwd: cwdB,
+      existsSync: exists,
+    });
+    expect(resolvedA).toBe(resolvedB);
+    expect(resolvedA).toBe(serverDistScript);
+    expect(resolvedA).not.toBeNull();
+    expect(path.isAbsolute(resolvedA as string)).toBe(true);
+    expect(resolvedA).toContain("/opt/paperclip/server/");
+    expect(resolvedA).not.toContain(cwdA);
+    expect(resolvedA).not.toContain(cwdB);
+  });
+
+  it("prefers the built dist artifact over the repo-root and cwd fallbacks", () => {
+    const resolved = resolvePaperclipGitHubCredentialHelperPath({
+      moduleDir: serverModuleDir,
+      cwd: "/tmp/cwd",
+      existsSync: () => true,
+    });
+    expect(resolved).toBe(serverDistScript);
+  });
+
+  it("falls back to the repo-root script when the built dist artifact is absent", () => {
+    const resolved = resolvePaperclipGitHubCredentialHelperPath({
+      moduleDir: serverModuleDir,
+      existsSync: (p) => p === serverRepoScript,
+    });
+    expect(resolved).toBe(serverRepoScript);
+  });
+
+  it("uses the cwd legacy fallback only when no server candidate exists", () => {
+    const cwdScript = "/tmp/cwd/scripts/paperclip-github-credential-helper.sh";
+    const resolved = resolvePaperclipGitHubCredentialHelperPath({
+      moduleDir: serverModuleDir,
+      cwd: "/tmp/cwd",
+      existsSync: (p) => p === cwdScript,
+    });
+    expect(resolved).toBe(cwdScript);
+  });
+
+  it("is a no-op when the flag is on but the helper script is not found anywhere", () => {
+    const env: Record<string, string> = { FOO: "bar" };
+    const result = applyPaperclipGitHubCredentialHelperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "on" },
+      moduleDir: serverModuleDir,
+      cwd: "/tmp/non-repo",
+      existsSync: () => false,
+    });
+    expect(result).toBe(env);
+    expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(env.GIT_TERMINAL_PROMPT).toBeUndefined();
+  });
+
+  it("flag parsing: only `on` (case/whitespace-insensitive) enables the gate", () => {
+    expect(isPaperclipGitHubCredentialHelperEnabled({})).toBe(false);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({
+        PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: undefined,
+      }),
+    ).toBe(false);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({ PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "on" }),
+    ).toBe(true);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({ PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "ON" }),
+    ).toBe(true);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({ PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "  On  " }),
+    ).toBe(true);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({ PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "off" }),
+    ).toBe(false);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({ PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "true" }),
+    ).toBe(false);
+    expect(PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FLAG).toBe("PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER");
+    expect(PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME).toBe(
+      "paperclip-github-credential-helper.sh",
+    );
+  });
+});
+
+describe("GitHub credential helper packaging (GH-APP-6 AC4)", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+  const repoScript = path.join(
+    repoRoot,
+    "scripts",
+    PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME,
+  );
+
+  it("ships from a committed source of truth at scripts/", async () => {
+    await expect(fs.access(repoScript)).resolves.toBeUndefined();
+  });
+
+  it("the server build copies the helper into dist/scripts and guards for its presence", async () => {
+    const raw = await fs.readFile(path.join(repoRoot, "server", "package.json"), "utf8");
+    const pkg = JSON.parse(raw) as { scripts: { build: string } };
+    expect(pkg.scripts.build).toContain("dist/scripts");
+    expect(pkg.scripts.build).toContain(PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME);
+    expect(pkg.scripts.build).toContain("test -f dist/scripts/");
+  });
+});
+
 describe("shapePaperclipWorkspaceEnvForExecution", () => {
   it("rewrites workspace env paths for remote execution", () => {
     const shaped = shapePaperclipWorkspaceEnvForExecution({
@@ -3455,5 +3706,212 @@ describe("buildPaperclipEnv", () => {
       const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
       expect(env.PAPERCLIP_API_URL).toBe("http://localhost:3200");
     });
+  });
+});
+
+describe("applyPaperclipGhWrapperGate (GH-APP-7)", () => {
+  const serverModuleDir = "/opt/paperclip/server/dist/adapters/process";
+  const serverDistWrapper = "/opt/paperclip/server/dist/scripts/paperclip-gh-wrapper.sh";
+  const serverRepoWrapper = "/opt/paperclip/scripts/paperclip-gh-wrapper.sh";
+
+  let scratchDir: string;
+  let ghDir: string;
+  let fakeGhPath: string;
+
+  beforeEach(async () => {
+    scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "pc-gh-wrapper-scratch-"));
+    ghDir = await fs.mkdtemp(path.join(os.tmpdir(), "pc-gh-wrapper-ghbin-"));
+    fakeGhPath = path.join(ghDir, "gh");
+    await fs.writeFile(fakeGhPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.chmod(fakeGhPath, 0o755);
+  });
+
+  afterEach(async () => {
+    await fs.rm(scratchDir, { recursive: true, force: true });
+    await fs.rm(ghDir, { recursive: true, force: true });
+  });
+
+  it("AC1: is byte-identical when the flag is unset — no PATH written, no PAPERCLIP_GH_REAL, no fs probes, no bin dir", () => {
+    const env: Record<string, string> = {
+      PAPERCLIP_RUN_SCRATCH_DIR: scratchDir,
+      PAPERCLIP_SOMETHING: "kept",
+    };
+    const existsSpy = vi.fn(() => true);
+    const warns: string[] = [];
+    const result = applyPaperclipGhWrapperGate(env, {
+      flagEnv: {},
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      cwd: "/tmp/non-repo",
+      existsSync: existsSpy,
+      onWarn: (m) => warns.push(m),
+    });
+    expect(result).toBe(env);
+    expect(env).toEqual({ PAPERCLIP_RUN_SCRATCH_DIR: scratchDir, PAPERCLIP_SOMETHING: "kept" });
+    expect(env.PATH).toBeUndefined();
+    expect(env.PAPERCLIP_GH_REAL).toBeUndefined();
+    expect(existsSpy).not.toHaveBeenCalled();
+    expect(warns).toEqual([]);
+    expect(fsExistsSync(path.join(scratchDir, "bin"))).toBe(false);
+  });
+
+  it("AC1: stays byte-identical for every non-`on` flag value, even if the wrapper and gh exist", () => {
+    for (const value of ["off", "no", "false", "0", "yes", "true", "1", "", "  "]) {
+      const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir, FOO: "bar" };
+      const result = applyPaperclipGhWrapperGate(env, {
+        flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: value },
+        moduleDir: serverModuleDir,
+        basePath: ghDir,
+        existsSync: () => true,
+      });
+      expect(result).toBe(env);
+      expect(env.PATH).toBeUndefined();
+      expect(env.PAPERCLIP_GH_REAL).toBeUndefined();
+    }
+  });
+
+  it("AC2: when the flag is on, PATH is prepended with the run bin dir, PAPERCLIP_GH_REAL is set, and gh is an executable shim", () => {
+    const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir };
+    applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper || p === fakeGhPath,
+    });
+    const binDir = path.join(scratchDir, "bin");
+    expect(env.PATH).toBe([binDir, ghDir].join(path.delimiter));
+    expect(env.PAPERCLIP_GH_REAL).toBe(fakeGhPath);
+    const shim = path.join(binDir, "gh");
+    // lstat does not follow the link, so this proves the shim was created even
+    // though the (test-fake) wrapper target is not present on this filesystem.
+    expect(fsLstatSync(shim).isSymbolicLink()).toBe(true);
+    expect(fsReadlinkSync(shim)).toBe(serverDistWrapper);
+  });
+
+  it("AC3: PAPERCLIP_GH_REAL is an existing, executable binary NOT under the run bin dir", async () => {
+    const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir };
+    applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper || p === fakeGhPath,
+    });
+    const real = env.PAPERCLIP_GH_REAL;
+    expect(real).toBe(fakeGhPath);
+    expect(real).not.toContain(path.join(scratchDir, "bin"));
+    // executable + regular file
+    await expect(fs.access(real, fsConstants.X_OK)).resolves.toBeUndefined();
+    expect((await fs.stat(real)).isFile()).toBe(true);
+  });
+
+  it("AC4: the shim's bin dir is inside PAPERCLIP_RUN_SCRATCH_DIR and is the first PATH entry", () => {
+    const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir };
+    applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper || p === fakeGhPath,
+    });
+    expect(env.PATH?.startsWith(`${scratchDir}${path.sep}`)).toBe(true);
+    const firstEntry = env.PATH!.split(path.delimiter)[0];
+    expect(path.resolve(firstEntry)).toBe(path.join(scratchDir, "bin"));
+  });
+
+  it("preserves a pre-existing env.PATH, slotting the bin dir in front of it", () => {
+    const env: Record<string, string> = {
+      PAPERCLIP_RUN_SCRATCH_DIR: scratchDir,
+      PATH: "/usr/local/bin:/usr/bin",
+    };
+    applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper || p === fakeGhPath,
+    });
+    const binDir = path.join(scratchDir, "bin");
+    expect(env.PATH).toBe([binDir, "/usr/local/bin:/usr/bin"].join(path.delimiter));
+    expect(env.PAPERCLIP_GH_REAL).toBe(fakeGhPath);
+  });
+
+  it("trap A: flag on but no scratch dir — skips, warns once, no mkdtemp fallback, no PATH written", () => {
+    const env: Record<string, string> = { FOO: "bar" };
+    const warns: string[] = [];
+    const result = applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: () => true,
+      onWarn: (m) => warns.push(m),
+    });
+    expect(result).toBe(env);
+    expect(env.PATH).toBeUndefined();
+    expect(env.PAPERCLIP_GH_REAL).toBeUndefined();
+    expect(warns).toHaveLength(1);
+  });
+
+  it("fail-closed: flag on but no real gh on basePath — skips, warns, no shim written", () => {
+    const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir };
+    const warns: string[] = [];
+    const result = applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper,
+      onWarn: (m) => warns.push(m),
+    });
+    expect(result).toBe(env);
+    expect(env.PATH).toBeUndefined();
+    expect(env.PAPERCLIP_GH_REAL).toBeUndefined();
+    expect(warns).toHaveLength(1);
+    expect(fsExistsSync(path.join(scratchDir, "bin"))).toBe(false);
+  });
+
+  it("flag parsing: only `on` (case/whitespace-insensitive) enables the gate", () => {
+    expect(isPaperclipGhWrapperEnabled({})).toBe(false);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: undefined })).toBe(false);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: "on" })).toBe(true);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: "ON" })).toBe(true);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: "  On  " })).toBe(true);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: "off" })).toBe(false);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: "true" })).toBe(false);
+    expect(PAPERCLIP_GH_WRAPPER_FLAG).toBe("PAPERCLIP_AGENT_GH_WRAPPER");
+    expect(PAPERCLIP_GH_WRAPPER_FILENAME).toBe("paperclip-gh-wrapper.sh");
+  });
+
+  it("resolver: prefers the built dist artifact, falls back to repo-root, then cwd legacy", () => {
+    expect(resolvePaperclipGhWrapperPath({ moduleDir: serverModuleDir, existsSync: () => true })).toBe(
+      serverDistWrapper,
+    );
+    expect(
+      resolvePaperclipGhWrapperPath({
+        moduleDir: serverModuleDir,
+        existsSync: (p) => p === serverRepoWrapper,
+      }),
+    ).toBe(serverRepoWrapper);
+    const cwdScript = "/tmp/cwd/scripts/paperclip-gh-wrapper.sh";
+    expect(
+      resolvePaperclipGhWrapperPath({
+        moduleDir: serverModuleDir,
+        cwd: "/tmp/cwd",
+        existsSync: (p) => p === cwdScript,
+      }),
+    ).toBe(cwdScript);
+    expect(
+      resolvePaperclipGhWrapperPath({ moduleDir: serverModuleDir, existsSync: () => false }),
+    ).toBeNull();
+  });
+
+  it("ships the gh wrapper from a committed source of truth at scripts/", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+    const repoScript = path.join(repoRoot, "scripts", PAPERCLIP_GH_WRAPPER_FILENAME);
+    await expect(fs.access(repoScript)).resolves.toBeUndefined();
+  });
+
+  it("the server build copies the gh wrapper into dist/scripts and guards for its presence", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+    const raw = await fs.readFile(path.join(repoRoot, "server", "package.json"), "utf8");
+    const pkg = JSON.parse(raw) as { scripts: { build: string } };
+    expect(pkg.scripts.build).toContain(PAPERCLIP_GH_WRAPPER_FILENAME);
+    expect(pkg.scripts.build).toContain(`test -f dist/scripts/${PAPERCLIP_GH_WRAPPER_FILENAME}`);
   });
 });

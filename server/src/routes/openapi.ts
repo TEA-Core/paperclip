@@ -236,6 +236,7 @@ import {
   startAdapterAuthSessionRequestSchema,
 } from "@paperclipai/shared";
 import { dispatchQuiesceRequestSchema } from "./dispatch-quiesce.js";
+import { agentInstallationTokenRequestSchema } from "./agent-github-tokens.js";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
   companyImportTransferDeclarationSchema,
@@ -898,6 +899,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/reject",
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
   "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
+  "POST /api/issues/{id}/merge-arming/republish",
   "GET /api/companies/{companyId}/tools/gallery",
   "POST /api/companies/{companyId}/tools/apps/connect",
   "POST /api/companies/{companyId}/tools/apps/{connectionId}/finish",
@@ -971,6 +973,76 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/tool-gateway/gateway-tokens/{tokenId}/revoke",
   "POST /api/tool-gateway/action-requests/{id}/approve",
   "POST /api/tool-gateway/action-requests/{id}/decline",
+  // SUP-14798: board-only routes (handler calls assertBoard / assertBoardOrgAccess).
+  "POST /api/companies/{companyId}/activity",
+  "GET /api/adapters",
+  "GET /api/adapters/{type}",
+  "GET /api/adapters/{type}/config-schema",
+  "GET /api/adapters/{type}/ui-parser.js",
+  "DELETE /api/agents/{id}",
+  "DELETE /api/agents/{id}/keys/{keyId}",
+  "GET /api/agents/{id}/keys",
+  "GET /api/agents/{id}/runtime-state",
+  "GET /api/agents/{id}/task-sessions",
+  "POST /api/agents/{id}/approve",
+  "POST /api/agents/{id}/claude-login",
+  "POST /api/agents/{id}/clear-error",
+  "POST /api/agents/{id}/keys",
+  "POST /api/agents/{id}/pause",
+  "POST /api/agents/{id}/runtime-state/reset-session",
+  "POST /api/agents/{id}/terminate",
+  "POST /api/heartbeat-runs/{runId}/cancel",
+  "POST /api/approvals/{id}/approve",
+  "POST /api/approvals/{id}/reject",
+  "POST /api/approvals/{id}/request-revision",
+  "GET /api/companies/{companyId}/attention",
+  "GET /api/companies/{companyId}/costs/quota-windows",
+  "PATCH /api/agents/{agentId}/budgets",
+  "PATCH /api/companies/{companyId}/budgets",
+  "POST /api/companies/{companyId}/budget-incidents/{incidentId}/resolve",
+  "POST /api/companies/{companyId}/budgets/policies",
+  "POST /api/companies/{companyId}/finance-events",
+  "GET /api/companies/{companyId}/decision-training",
+  "GET /api/companies/{companyId}/decision-training/export.jsonl",
+  "GET /api/decision-training/{id}",
+  "GET /api/companies/{companyId}/decisions",
+  "GET /api/issues/{id}/tree-control/state",
+  "GET /api/issues/{id}/tree-holds",
+  "GET /api/issues/{id}/tree-holds/{holdId}",
+  "POST /api/issues/{id}/tree-control/preview",
+  "POST /api/issues/{id}/tree-holds",
+  "POST /api/issues/{id}/tree-holds/{holdId}/release",
+  "POST /api/issues/{id}/interactions",
+  "POST /api/issues/{id}/interactions/{interactionId}/cancel",
+  "POST /api/issues/{id}/recovery-actions/resolve",
+  "POST /api/issues/{id}/scheduled-retry/retry-now",
+  "POST /api/issues/{id}/stalled-review-decision",
+  "DELETE /api/secrets/{id}",
+  "GET /api/companies/{companyId}/secret-proposals",
+  "GET /api/companies/{companyId}/secret-providers",
+  "GET /api/companies/{companyId}/secrets",
+  "PATCH /api/secrets/{id}",
+  "POST /api/companies/{companyId}/secret-proposals/{id}/reject",
+  "POST /api/secrets/{id}/rotate",
+  "GET /api/tool-connections/{connectionId}/installs",
+  "PUT /api/tool-connections/{connectionId}/installs",
+  "GET /api/tool-gateway/audit",
+  "GET /api/tool-gateway/runtime-slots",
+  // SUP-14798: 10 additional board-only routes (handler calls assertBoard) discovered
+  // by the openapi-auth-parity regression test during SUP-14798; same defect class as
+  // the 54 above, all in companies.ts, previously published as agent-callable. The two
+  // bare-constant import routes (COMPANY_IMPORT_ROUTE_PATH / COMPANY_IMPORT_TRANSFERS_
+  // ROUTE_PATH) were the last blind spot — the scanner skipped unquoted path constants.
+  "GET /api/companies/{companyId}/feedback-traces",
+  "POST /api/companies/import",
+  "POST /api/companies/import/preview",
+  "POST /api/companies/import/transfers",
+  "POST /api/companies/{companyId}/archive",
+  "DELETE /api/companies/{companyId}",
+  "PUT /api/companies/import/transfers/{transferId}/parts/{partIndex}",
+  "GET /api/companies/import/transfers/{transferId}",
+  "POST /api/companies/import/transfers/{transferId}/preview",
+  "POST /api/companies/import/transfers/{transferId}/apply",
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
@@ -980,6 +1052,14 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
   "PUT /api/admin/users/{userId}/company-access",
+  // SUP-14798: instance-admin routes (handler calls assertInstanceAdmin).
+  "POST /api/invites/{inviteId}/revoke",
+  "DELETE /api/adapters/{type}",
+  "PATCH /api/adapters/{type}",
+  "PATCH /api/adapters/{type}/override",
+  "POST /api/adapters/install",
+  "POST /api/adapters/{type}/reinstall",
+  "POST /api/adapters/{type}/reload",
 ]);
 
 const CREATED_OPERATIONS = new Set([
@@ -1861,6 +1941,42 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/agents/me/github/installation-tokens",
+  tags: ["agents"],
+  summary: "Mint a GitHub App installation token for the current agent run",
+  request: {
+    body: jsonBody(agentInstallationTokenRequestSchema),
+  },
+  responses: {
+    200: {
+      description: "Minted installation token",
+      content: {
+        "application/json": {
+          schema: z.object({
+            token: z.string(),
+            expiresAt: z.number().int().optional(),
+            installationId: z.string().optional(),
+            appId: z.string(),
+          }),
+        },
+      },
+    },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: {
+      description: "App not configured or repo unreachable",
+      content: { "application/json": { schema: ErrorSchema } },
+    },
+    502: {
+      description: "App configured but installation-token mint failed",
+      content: { "application/json": { schema: ErrorSchema } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/agents/me/connections/{connectionId}/token",
   tags: ["tools"],
   summary: "Mint a short-lived token for an agent connection",
@@ -2292,25 +2408,6 @@ registry.registerPath({
     }).partial()),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound, 422: r.unprocessable },
-});
-
-registry.registerPath({
-  method: "post",
-  path: "/api/issues/{id}/stalled-review-decision",
-  tags: ["issues"],
-  summary: "Resolve a stalled issue review",
-  request: {
-    params: z.object({ id: z.string() }),
-    body: jsonBody(stalledReviewDecisionSchema),
-  },
-  responses: {
-    200: r.ok(),
-    400: r.badRequest,
-    401: r.unauthorized,
-    403: r.forbidden,
-    404: r.notFound,
-    409: r.conflict,
-  },
 });
 
 registry.registerPath({
@@ -4950,6 +5047,28 @@ registry.registerPath({
   summary: "Force-release an issue (admin)",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/merge-arming/republish",
+  tags: ["issues"],
+  summary: "Re-run the first paperclip/approved publish for a skipped stamp",
+  description:
+    "Operator recovery for a card whose approval decision is recorded but whose paperclip/approved " +
+    "stamp never landed. Board-only (company owner/admin); agent callers are refused 403 before any " +
+    "GitHub read or write. Idempotent: a card whose stamp is already published returns 200 " +
+    "already_published without a second write. Every refusal (no approved decision, stage-integrity " +
+    "failure, head_unresolvable, head_moved, not_delivered) returns 409 carrying the verbatim outcome " +
+    "message and performs zero GitHub writes.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({

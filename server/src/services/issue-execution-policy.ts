@@ -55,10 +55,35 @@ type TransitionInput = {
   monitorExplicitlyUpdated?: boolean;
 };
 
+export type ReviewEscalationSignal = {
+  escalatedToUserId: string;
+  stageId: string;
+  stageType: string;
+  maxRounds: number;
+  changesRequestedCount: number;
+  returnAssignee: IssueExecutionStagePrincipal;
+};
+
 type TransitionResult = {
   patch: Record<string, unknown>;
   decision?: Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome" | "body">;
   workflowControlledAssignment?: boolean;
+  /**
+   * Stage ids that were present in the incoming `executionState.completedStageIds`
+   * / `skippedStageIds` but no longer exist in the policy being written. Pruned
+   * so the state stays scoped to the surviving policy revision (SUP-14590).
+   */
+  droppedStageIds?: string[];
+  /**
+   * Set ONLY when a changes-requested round cap is exhausted and the pending
+   * review is escalated to the responsible human instead of bouncing back to the
+   * implementer. This is a pure signal: the service does not create the
+   * interaction. The route that records the accompanying `changes_requested`
+   * decision uses it to mint exactly one review-escalation interaction addressed
+   * to that human (SUP-14805). The hold re-assertion path never sets this, so a
+   * re-asserting drift PATCH cannot mint a duplicate.
+   */
+  reviewEscalation?: ReviewEscalationSignal;
 };
 
 /**
@@ -1078,6 +1103,14 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               patch,
               decision,
               workflowControlledAssignment: true,
+              reviewEscalation: {
+                escalatedToUserId: escalationUserId,
+                stageId: activeStage.id,
+                stageType: activeStage.type,
+                maxRounds: resolveMaxReviewRounds(input.policy),
+                changesRequestedCount: nextRounds,
+                returnAssignee,
+              },
             };
           }
         }
@@ -1420,10 +1453,78 @@ export function buildIssueMonitorClearedPatch(input: {
   };
 }
 
+export interface PruneExecutionStateResult {
+  state: IssueExecutionState | null;
+  droppedStageIds: string[];
+}
+
+/**
+ * Scope a persisted `executionState` to the stages that actually exist in a
+ * policy revision. `completedStageIds` and `skippedStageIds` only carry meaning
+ * for stage ids the issue was written under; when the policy is re-delivered
+ * with freshly-minted stage ids (see `normalizeIssueExecutionPolicy`), ids from
+ * the prior revision are orphans and must not survive. Enforces the invariant
+ * `completedStageIds ⊆ stages` and `skippedStageIds ⊆ stages` (SUP-14590).
+ */
+export function pruneExecutionStateForStages(
+  state: IssueExecutionState | null,
+  stageIds: string[],
+): PruneExecutionStateResult {
+  if (!state) return { state: null, droppedStageIds: [] };
+  const surviving = new Set(stageIds);
+  const completed = state.completedStageIds ?? [];
+  const skipped = state.skippedStageIds ?? [];
+  const survivingCompleted = completed.filter((id) => surviving.has(id));
+  const survivingSkipped = skipped.filter((id) => surviving.has(id));
+  const droppedStageIds = Array.from(
+    new Set([
+      ...completed.filter((id) => !surviving.has(id)),
+      ...skipped.filter((id) => !surviving.has(id)),
+    ]),
+  );
+  if (survivingCompleted.length === completed.length && survivingSkipped.length === skipped.length) {
+    return { state, droppedStageIds: [] };
+  }
+  return {
+    state: {
+      ...state,
+      completedStageIds: survivingCompleted,
+      skippedStageIds: survivingSkipped,
+    },
+    droppedStageIds,
+  };
+}
+
 export function applyIssueExecutionPolicyTransition(input: TransitionInput): TransitionResult {
-  const stageResult = applyIssueExecutionStageTransition(input);
-  const monitorPatch = applyMonitorTransition(input, stageResult.patch);
+  const survivingStageIds = input.policy?.stages.map((stage) => stage.id) ?? [];
+  const pruned = pruneExecutionStateForStages(parseIssueExecutionState(input.issue.executionState), survivingStageIds);
+  const scopedInput: TransitionInput = {
+    ...input,
+    issue: {
+      ...input.issue,
+      executionState: pruned.state as Record<string, unknown> | null,
+    },
+  };
+  const stageResult = applyIssueExecutionStageTransition(scopedInput);
+  const monitorPatch = applyMonitorTransition(scopedInput, stageResult.patch);
   Object.assign(stageResult.patch, monitorPatch);
+  if (pruned.droppedStageIds.length > 0) {
+    stageResult.droppedStageIds = pruned.droppedStageIds;
+    // Some transitions (e.g. a PATCH that only re-stamps the policy while the
+    // active stage is unchanged) return without touching executionState. The
+    // invariant must hold the moment the new stages are written, so persist the
+    // pruned arrays over the raw state, keeping every other field intact.
+    if (stageResult.patch.executionState === undefined) {
+      const rawState = input.issue.executionState;
+      if (rawState && typeof rawState === "object") {
+        stageResult.patch.executionState = {
+          ...rawState,
+          completedStageIds: pruned.state?.completedStageIds ?? [],
+          skippedStageIds: pruned.state?.skippedStageIds ?? [],
+        };
+      }
+    }
+  }
   return stageResult;
 }
 

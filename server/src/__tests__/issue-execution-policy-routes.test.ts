@@ -62,10 +62,36 @@ const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({
   innerJoin: () => ({ where: () => Promise.resolve([]) }),
 })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
+// Generic chainable/thenable for tx.insert/update/delete, which the
+// decision-recording transaction path needs (SUP-14805 escalation mints after
+// inserting an issue_execution_decisions row inside the same transaction).
+const mockTxWriteChain = vi.hoisted(() => {
+  const chain = (resolves: unknown[] = []) => {
+    const self: Record<string, unknown> = {
+      returning: () => chain(resolves),
+      where: () => chain(resolves),
+      set: () => chain(resolves),
+      values: () => chain(resolves),
+    };
+    self.then = (onF?: unknown, onR?: unknown) =>
+      Promise.resolve(resolves).then(
+        onF as (v: unknown) => unknown,
+        onR as (r: unknown) => unknown,
+      );
+    self.catch = (fn: (r: unknown) => unknown) => Promise.resolve(resolves).catch(fn);
+    return self;
+  };
+  return chain;
+});
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
-  transaction: vi.fn(async (callback: (tx: { select: typeof mockDbSelect }) => Promise<unknown>) =>
-    callback({ select: mockDbSelect })),
+  transaction: vi.fn(async (callback: (tx: Record<string, unknown>) => Promise<unknown>) =>
+    callback({
+      select: mockDbSelect,
+      insert: () => mockTxWriteChain([{}]),
+      update: () => mockTxWriteChain([]),
+      delete: () => mockTxWriteChain([]),
+    })),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
@@ -73,6 +99,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
+  create: vi.fn(async () => ({ id: "77777777-7777-4777-8777-777777777777" })),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
   listApprovalsForIssue: vi.fn(async () => []),
@@ -170,6 +197,17 @@ function registerModuleMocks() {
     }),
     workProductService: () => ({}),
   }));
+  vi.doMock("../services/external-objects.js", () => ({
+    externalObjectService: () => ({
+      syncCommentSafely: vi.fn(async () => undefined),
+      syncDocumentSafely: vi.fn(async () => undefined),
+      syncIssueSafely: vi.fn(async () => undefined),
+      listForIssue: vi.fn(async () => []),
+      getIssueSummary: vi.fn(async () => null),
+      getIssueSummaries: vi.fn(async () => []),
+      refreshIssueObjects: vi.fn(async () => []),
+    }),
+  }));
 }
 
 type TestActor =
@@ -217,16 +255,22 @@ describe("issue execution policy routes", () => {
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../middleware/index.js");
+    vi.doUnmock("../services/external-objects.js");
     registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
+    mockIssueService.addComment.mockImplementation(async (_id: string, body: string) => ({
+      id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+      body,
+    }));
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
+    mockIssueThreadInteractionService.create.mockResolvedValue({ id: "77777777-7777-4777-8777-777777777777" });
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({
@@ -1189,6 +1233,180 @@ describe("issue execution policy routes", () => {
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
 
+  function roundCapReviewIssue(overrides: Record<string, unknown> = {}, stateOverrides: Record<string, unknown> = {}) {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+        },
+      ],
+    })!;
+    return {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      responsibleUserId: "board-user",
+      createdByUserId: "local-board",
+      identifier: "PAP-2001",
+      title: "Round-cap review",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+        returnAssignee: { type: "agent", agentId: "44444444-4444-4444-8444-444444444444" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        ...stateOverrides,
+      },
+      ...overrides,
+    };
+  }
+
+  it("mints exactly one review-escalation interaction at the round cap (SUP-14805)", async () => {
+    const issue = roundCapReviewIssue({}, { changesRequestedCount: 2 });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(
+      await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "77777777-7777-4777-8777-777777777777",
+      }),
+    )
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_progress", comment: "Round three — still not converging" });
+
+    expect(res.status).toBe(200);
+    // The stage stays pending and the responsible human becomes the assignee.
+    const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(updatePatch.status).toBe("in_review");
+    expect(updatePatch.assigneeAgentId).toBeNull();
+    expect(updatePatch.assigneeUserId).toBe("board-user");
+    expect(updatePatch.executionState).toMatchObject({
+      status: "pending",
+      currentParticipant: { type: "user", userId: "board-user" },
+      changesRequestedCount: 3,
+    });
+
+    // Exactly one interaction is minted, as a user-actor request_confirmation.
+    expect(mockIssueThreadInteractionService.create).toHaveBeenCalledTimes(1);
+    const [createIssue, createOptions, createActor] =
+      mockIssueThreadInteractionService.create.mock.calls[0] as [
+        unknown,
+        Record<string, unknown>,
+        Record<string, unknown>,
+      ];
+    expect(createIssue).toEqual({
+      id: issue.id,
+      companyId: issue.companyId,
+      identifier: issue.identifier ?? null,
+    });
+    expect(createOptions).toMatchObject({
+      kind: "request_confirmation",
+      addresseeAgentId: null,
+      resolverPolicy: "human_only",
+      continuationPolicy: "wake_assignee",
+      sourceRunId: "77777777-7777-4777-8777-777777777777",
+    });
+    expect(createOptions.idempotencyKey).toMatch(
+      /^review-escalation:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:11111111-1111-4111-8111-111111111111:3:[a-f0-9]{16}$/,
+    );
+    expect(createOptions.payload).toMatchObject({
+      version: 1,
+      prompt: "Approve this review, or request further changes (round cap reached).",
+      acceptLabel: "Approve & advance",
+      rejectLabel: "Request changes",
+      rejectRequiresReason: true,
+      allowDeclineReason: true,
+    });
+    const details = (createOptions.payload as { detailsMarkdown: string }).detailsMarkdown;
+    expect(details).toContain("reaching the round cap of 3");
+    expect(details).toContain("> Round three — still not converging");
+    expect(details).toContain("Return assignee: agent 44444444-4444-4444-8444-444444444444");
+    expect(details).toContain("on issue `PAP-2001`");
+    expect(details).toContain("a human send-back does not burn a round");
+    // Created as the escalated human, not the reviewer agent.
+    expect(createActor).toEqual({ agentId: null, userId: "board-user" });
+  });
+
+  it("mints no interaction below the round cap", async () => {
+    const issue = roundCapReviewIssue({}, { changesRequestedCount: 1 });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(
+      await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "77777777-7777-4777-8777-777777777777",
+      }),
+    )
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_progress", comment: "Round two feedback" });
+
+    expect(res.status).toBe(200);
+    // Below the cap: hand back to the executor, no escalation, no card.
+    const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(updatePatch.status).toBe("in_progress");
+    expect(updatePatch.assigneeAgentId).toBe("44444444-4444-4444-8444-444444444444");
+    expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+  });
+
+  it("mints no second interaction when a drifted assignee re-asserts the escalated hold", async () => {
+    // The stage is already escalated (participant is the responsible human, round
+    // count at the cap), but the assignee drifted back to the agent reviewer.
+    // Re-asserting the hold must not mint a fresh card.
+    const issue = roundCapReviewIssue(
+      { assigneeAgentId: "33333333-3333-4333-8333-333333333333", assigneeUserId: null },
+      {
+        currentParticipant: { type: "user", userId: "board-user" },
+        changesRequestedCount: 3,
+      },
+    );
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(
+      await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "77777777-7777-4777-8777-777777777777",
+      }),
+    )
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ description: "Still working on the fix" });
+
+    expect(res.status).toBe(200);
+    // The hold re-asserts: the responsible human is the assignee again.
+    const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(updatePatch.assigneeAgentId).toBeNull();
+    expect(updatePatch.assigneeUserId).toBe("board-user");
+    expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+  });
   it("dissolves the review when a board user reassigns an in_review task to a non-participant", async () => {
     const policy = normalizeIssueExecutionPolicy({
       stages: [

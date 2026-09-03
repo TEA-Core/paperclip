@@ -271,7 +271,7 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return shardFiles.map((file) => byRepoPath.get(file));
 }
 
-function runVitest(args, label) {
+function runVitest(args, label, shardIndex = null, shardCount = null) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
   const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
@@ -283,6 +283,19 @@ function runVitest(args, label) {
     PAPERCLIP_HOME: path.join(testRoot, "h"),
     PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-${invocationIndex}`,
     TMPDIR: path.join(testRoot, "t"),
+    // Expose the CI shard partition to the test process. The server group shards
+    // by passing an explicit file list (not vitest's native --shard), so no
+    // VITEST_* variable distinguishes the shards — each runs in its own vitest
+    // process with maxWorkers=1, which makes VITEST_WORKER_ID/VITEST_POOL_ID
+    // constant across them. Suites that bind loopback ports (the exposure-pair
+    // reservation regressions) need the shard index to keep per-shard port lanes
+    // and stop sibling shards racing for the same fixed ports on one runner.
+    ...(shardIndex !== null && shardCount !== null
+      ? {
+          PAPERCLIP_TEST_SHARD_INDEX: String(shardIndex),
+          PAPERCLIP_TEST_SHARD_COUNT: String(shardCount),
+        }
+      : {}),
   };
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
@@ -315,7 +328,12 @@ function runProjectGroup(projects, groupName, shardIndex = null, shardCount = nu
     shardCount !== null && shardCount > 1 ? [`--shard=${shardIndex + 1}/${shardCount}`] : [];
   const shardSuffix = shardArgs.length > 0 ? ` shard ${shardIndex + 1}/${shardCount}` : "";
   for (const project of projects) {
-    runVitest(["--project", project, ...shardArgs], `${groupName} project ${project}${shardSuffix}`);
+    runVitest(
+      ["--project", project, ...shardArgs],
+      `${groupName} project ${project}${shardSuffix}`,
+      shardIndex,
+      shardCount,
+    );
   }
 }
 
@@ -343,6 +361,8 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
           ...shardFiles,
         ],
         `${groupName} shard ${shardIndex + 1}/${shardCount}`,
+        shardIndex,
+        shardCount,
       );
       return;
     }
@@ -393,6 +413,8 @@ function runSerializedSuites(routeTests, shardIndex, shardCount) {
         "--isolate",
       ],
       routeTest.repoPath,
+      shardIndex,
+      shardCount,
     );
   }
 }

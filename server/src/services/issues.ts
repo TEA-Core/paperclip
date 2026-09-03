@@ -3295,6 +3295,25 @@ function reviewAttentionNone(): IssueReviewAttention {
   return { state: "none", paths: [], reason: null };
 }
 
+// An escalated hold parks a user as the pending executionState.currentParticipant
+// and hands the assignment to that same user. That user's own paths are not a
+// maintained action path: the whole point of escalating is that the agent stopped
+// and a human is waiting, so counting their paths would mark the hold "covered"
+// and leave the stalled-review release route (which only accepts `stalled`)
+// unreachable for exactly the population it exists to serve (SUP-14806). Returns
+// the hold user id when the issue is that shape, else null. Narrow on purpose: a
+// plain human reviewer (assigneeUserId set, no user currentParticipant) still
+// reports its human_reviewer path and stays "covered".
+function escalatedHoldUserId(issue: IssueRow): string | null {
+  const state = parseObject(issue.executionState);
+  if (state.status !== "pending") return null;
+  const participant = state.currentParticipant;
+  if (!participant || typeof participant !== "object" || Array.isArray(participant)) return null;
+  const record = participant as Record<string, unknown>;
+  if (record.type !== "user") return null;
+  return typeof record.userId === "string" && record.userId.length > 0 ? record.userId : null;
+}
+
 async function listIssueReviewAttentionMap(
   dbOrTx: any,
   companyId: string,
@@ -3518,7 +3537,11 @@ async function listIssueReviewAttentionMap(
 
   for (const issue of reviewIssues) {
     const pathFacts = classifyIssueReviewPaths(livenessInput, livenessInput.issues.find((entry) => entry.id === issue.id)!);
-    const paths: IssueReviewAttentionPath[] = pathFacts.map((path) => {
+    const holdUserId = escalatedHoldUserId(issue);
+    const maintainedPathFacts = holdUserId
+      ? pathFacts.filter((path) => path.userId !== holdUserId)
+      : pathFacts;
+    const paths: IssueReviewAttentionPath[] = maintainedPathFacts.map((path) => {
       const interactionAudience = path.kind === "interaction" && path.ref
         ? interactionAudienceById.get(path.ref) ?? null
         : null;

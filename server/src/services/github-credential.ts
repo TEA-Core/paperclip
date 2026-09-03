@@ -12,6 +12,90 @@ export const GITHUB_APP_PRIVATE_KEY_SECRET_NAME = "GITHUB_APP_PRIVATE_KEY";
 
 export const GITHUB_APP_ID = "4595159";
 
+/**
+ * The identity of a GitHub App for installation-token minting: its numeric App id (used as
+ * the JWT `iss`) and the secret-store name holding its private key. `resolveAppInstallationToken`
+ * accepts one so a company can mint tokens for more than one installed App; the token cache is
+ * keyed by this identity so one App's token is never served to a caller asking for another.
+ */
+export interface GitHubAppDescriptor {
+  appId: string;
+  privateKeySecretName: string;
+}
+
+/** Default App identity: app 4595159, private key under GITHUB_APP_PRIVATE_KEY. */
+export const DEFAULT_GITHUB_APP: GitHubAppDescriptor = {
+  appId: GITHUB_APP_ID,
+  privateKeySecretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+};
+
+/**
+ * The fleet App identity: app 4809618, private key under GITHUB_APP_PRIVATE_KEY_FLEET. It is
+ * deliberately a separate, least-privilege identity from the CI App (4595159 / GITHUB_APP_PRIVATE_KEY)
+ * so agent runs do not share the identity GitHub Actions uses to open PRs.
+ */
+export const FLEET_GITHUB_APP_ID = "4809618";
+export const FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME = "GITHUB_APP_PRIVATE_KEY_FLEET";
+export const FLEET_GITHUB_APP: GitHubAppDescriptor = {
+  appId: FLEET_GITHUB_APP_ID,
+  privateKeySecretName: FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+};
+
+/**
+ * The registry of Apps the installation-token broker may select. Each entry is a single,
+ * pre-paired descriptor — `appId` and `privateKeySecretName` are authored together and selected
+ * together by name, so one App's id can never be paired with another App's key (the 401 that
+ * results from such a mix is impossible to express through this registry rather than merely
+ * discouraged). Selection is by NAME; there is no surface that assembles a descriptor from an
+ * independent appId and an independent secret name.
+ */
+export const GITHUB_APP_REGISTRY = {
+  default: DEFAULT_GITHUB_APP,
+  fleet: FLEET_GITHUB_APP,
+} as const;
+
+/** The name of a broker-selectable App, as stored in GITHUB_APP_REGISTRY. */
+export type GitHubAppDescriptorName = keyof typeof GITHUB_APP_REGISTRY;
+
+/** Env var naming which GITHUB_APP_REGISTRY entry the broker mints with (default "default"). */
+export const BROKER_GITHUB_APP_ENV = "PAPERCLIP_GITHUB_BROKER_APP";
+
+/**
+ * Thrown at load when the broker is configured to select an App descriptor that is not in the
+ * registry. Fail-fast is intentional: a silently-wrong App would mint a JWT under the wrong
+ * issuer and surface as an opaque 401 at request time, so a bad name must break startup, not
+ * the first mint.
+ */
+export class GitHubAppConfigurationError extends Error {
+  readonly code = "github_app_misconfigured" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "GitHubAppConfigurationError";
+  }
+}
+
+/**
+ * Resolve the installation-token broker's App descriptor from a registry name.
+ *
+ * An empty/absent name selects the default App so every existing caller keeps working untouched.
+ * A known name returns its pre-paired descriptor; an unknown name throws
+ * {@link GitHubAppConfigurationError} with the offending name and the valid set, rather than
+ * falling back to the default App (a silent fallback would mint under the wrong issuer).
+ */
+export function resolveBrokerGitHubApp(
+  name?: string,
+): GitHubAppDescriptor {
+  const trimmed = name?.trim();
+  if (!trimmed) return GITHUB_APP_REGISTRY.default;
+  if (!Object.hasOwn(GITHUB_APP_REGISTRY, trimmed)) {
+    throw new GitHubAppConfigurationError(
+      `Unknown GitHub App descriptor "${trimmed}"; valid names: ${Object.keys(GITHUB_APP_REGISTRY).join(", ")}`,
+    );
+  }
+  return GITHUB_APP_REGISTRY[trimmed as GitHubAppDescriptorName];
+}
+
 export type GitHubTokenScope = "app_installation" | "project_env" | "company";
 
 export interface GitHubTokenResolution {
@@ -19,6 +103,8 @@ export interface GitHubTokenResolution {
   scope: GitHubTokenScope;
   secretName: string;
   installationId?: string;
+  /** Epoch millis when the minted installation token expires (present for app_installation scope). */
+  expiresAt?: number;
 }
 
 export interface GitHubTokenResolutionFailure {
@@ -46,9 +132,9 @@ const GH_API_BASE = "https://api.github.com";
 
 const GH_FETCH_TIMEOUT_MS = 15_000;
 
-function generateAppJWT(privateKey: string): string {
+function generateAppJWT(privateKey: string, appId: string): string {
   const now = Math.floor(Date.now() / 1000);
-  const payload = { iat: now - 10, exp: now + 60, iss: GITHUB_APP_ID };
+  const payload = { iat: now - 10, exp: now + 60, iss: appId };
   const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
   const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const data = `${header}.${body}`;
@@ -56,7 +142,12 @@ function generateAppJWT(privateKey: string): string {
   return `${data}.${sig}`;
 }
 
-async function ghAppFetch(path: string, jwt: string, method = "GET"): Promise<any> {
+async function ghAppFetch(
+  path: string,
+  jwt: string,
+  method = "GET",
+  body?: Record<string, unknown>,
+): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(
     () => controller.abort(new Error(`GitHub App API timeout after ${GH_FETCH_TIMEOUT_MS}ms: ${path}`)),
@@ -72,6 +163,7 @@ async function ghAppFetch(path: string, jwt: string, method = "GET"): Promise<an
         "X-GitHub-Api-Version": "2022-11-28",
         ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
       },
+      ...(method === "POST" && body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
     const text = await res.text();
     if (!res.ok) {
@@ -92,7 +184,7 @@ function isExpired(cached: CachedAppToken, now: number): boolean {
  * `secretService(db)` so a credential provider (e.g. the git remote auth provider) can pass
  * its own secret deps without pulling the whole secret service along.
  */
-interface AppInstallationTokenSecrets {
+export interface AppInstallationTokenSecrets {
   getByName: (companyId: string, name: string) => Promise<{ id: string } | null | undefined>;
   resolveSecretValue: (
     companyId: string,
@@ -108,8 +200,13 @@ export async function resolveAppInstallationToken(
   owner?: string,
   repo?: string,
   accessContext?: Record<string, unknown>,
+  app: GitHubAppDescriptor = DEFAULT_GITHUB_APP,
+  permissions?: Record<string, unknown>,
 ): Promise<GitHubTokenResolution | null> {
-  const cacheKey = `${companyId}:${owner ?? ""}:${repo ?? ""}`;
+  const permissionsKey = permissions
+    ? JSON.stringify(Object.entries(permissions).sort(([a], [b]) => a.localeCompare(b)))
+    : "";
+  const cacheKey = `${companyId}:${app.appId}:${owner ?? ""}:${repo ?? ""}:${permissionsKey}`;
   const now = Date.now();
 
   const cached = appTokenCache.get(cacheKey);
@@ -117,12 +214,13 @@ export async function resolveAppInstallationToken(
     return {
       token: cached.token,
       scope: "app_installation",
-      secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+      secretName: app.privateKeySecretName,
       installationId: cached.installationId,
+      expiresAt: cached.expiresAt,
     };
   }
 
-  const secret = await secrets.getByName(companyId, GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+  const secret = await secrets.getByName(companyId, app.privateKeySecretName);
   if (!secret) return null;
 
   let privateKey: string;
@@ -135,7 +233,7 @@ export async function resolveAppInstallationToken(
     );
   } catch {
     logger.warn(
-      { companyId, secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME },
+      { companyId, secretName: app.privateKeySecretName },
       "Failed to resolve GitHub App private key secret; falling back to PAT",
     );
     return null;
@@ -143,7 +241,7 @@ export async function resolveAppInstallationToken(
 
   if (!privateKey || !privateKey.trim()) {
     logger.warn(
-      { companyId, secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME },
+      { companyId, secretName: app.privateKeySecretName },
       "GitHub App private key secret is empty; falling back to PAT",
     );
     return null;
@@ -151,10 +249,10 @@ export async function resolveAppInstallationToken(
 
   let jwt: string;
   try {
-    jwt = generateAppJWT(privateKey);
+    jwt = generateAppJWT(privateKey, app.appId);
   } catch {
     logger.warn(
-      { companyId, secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME },
+      { companyId, secretName: app.privateKeySecretName },
       "Failed to generate GitHub App JWT (malformed PEM); falling back to PAT",
     );
     return null;
@@ -188,7 +286,7 @@ export async function resolveAppInstallationToken(
     logger.warn(
       {
         companyId,
-        secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+        secretName: app.privateKeySecretName,
         error: err instanceof Error ? err.message : "unknown",
       },
       "GitHub App installation resolution failed; falling back to PAT",
@@ -196,18 +294,27 @@ export async function resolveAppInstallationToken(
     return null;
   }
 
+  // Narrow the minted installation token to the repo the caller was authorized
+  // for. Without `repositories` in the mint body GitHub issues an
+  // installation-wide token, so the credential would out-reach the repo the
+  // request-layer check already granted (owner/repo).
+  const mintBody: Record<string, unknown> = {};
+  if (permissions) mintBody.permissions = permissions;
+  if (owner && repo) mintBody.repositories = [repo];
+
   let tokenResponse: { token: string; expires_at: string };
   try {
     tokenResponse = await ghAppFetch(
       `/app/installations/${installationId}/access_tokens`,
       jwt,
       "POST",
+      Object.keys(mintBody).length > 0 ? mintBody : undefined,
     );
   } catch (err) {
     logger.warn(
       {
         companyId,
-        secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+        secretName: app.privateKeySecretName,
         error: err instanceof Error ? err.message : "unknown",
       },
       "GitHub App installation token minting failed; falling back to PAT",
@@ -217,24 +324,26 @@ export async function resolveAppInstallationToken(
 
   if (!tokenResponse.token) {
     logger.warn(
-      { companyId, secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME },
+      { companyId, secretName: app.privateKeySecretName },
       "GitHub App returned empty token; falling back to PAT",
     );
     return null;
   }
 
   const expiresAt = new Date(tokenResponse.expires_at).getTime();
+  const safeExpiresAt = isNaN(expiresAt) ? Date.now() + 60 * 60 * 1000 : expiresAt;
   appTokenCache.set(cacheKey, {
     token: tokenResponse.token,
     installationId,
-    expiresAt: isNaN(expiresAt) ? Date.now() + 60 * 60 * 1000 : expiresAt,
+    expiresAt: safeExpiresAt,
   });
 
   return {
     token: tokenResponse.token,
     scope: "app_installation",
-    secretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+    secretName: app.privateKeySecretName,
     installationId,
+    expiresAt: safeExpiresAt,
   };
 }
 

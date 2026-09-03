@@ -62,7 +62,103 @@ The non-pusher approval is real; it is recorded one layer up from GitHub.
   contains slashes — `gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-<N>-<sha>`.
   The queue-ref regex is `^gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$`; the
   single-component agent-tools pattern would never resolve a fold queue entry
-  and would deadlock the fold merge queue.
+   and would deadlock the fold merge queue.
+
+### First-publish recovery surface (SUP-14748)
+
+The first `publishApprovalStatus` call can skip for reasons only a human
+understands — a PR that was hand-merged or closed, a coordinating card that
+merely cited a PR rather than delivering it, a head that moved between the
+approval decision and the publish. The stamp cannot be manufactured by hand:
+the enforcer rejects it, and a locally-written `paperclip/approved` would be a
+contract violation (fake approval). The only sanctioned recovery is the
+**operator-invocable re-arm** route:
+
+- `POST /api/issues/:issueId/merge-arming/republish` — board owner/admin only.
+  An agent caller is refused (403) before any GitHub read or write. It is the
+  single surface a human may use to re-stamp; hand-writing the status on the PR
+  head is still forbidden.
+- It re-runs `publishApprovalStatus` **verbatim** — pinned to the decision-time
+  head and with delivery identity enforced — rather than re-deriving anything.
+  It is idempotent: if `executionState.approvalStatus.publishedHeadSha` is
+  already set it returns `200 already_published` with no GitHub I/O; otherwise
+  it resolves the decision head, re-publishes to the pinned head, and persists
+  the certified head back to `executionState.approvalStatus` (so the reconciler
+  and enforcer can verify it).
+- It fails closed: `409` with a verbatim refusal when the card has no recorded
+  `approved` decision, when ADR-073 stage-integrity (Guard B) does not hold,
+  when the decision head cannot be positively resolved, or when the head moved
+  between resolve and publish. Nothing is stamped in the failure case.
+- **Delivery identity depends on who owns the workspace branch.** A card that
+  owns its execution workspace is authorized against an exact match: the PR head
+  ref must equal the branch recorded on that workspace. A card whose workspace
+  row is a `shared_workspace` owned by a different issue has no branch of its
+  own on that row — the recorded branch is the owner's — so it is authorized
+  against its own identifier prefix on the PR head ref instead (`SUP-123-...`
+  for card `SUP-123`). The repo half is identical in both cases: a PR in another
+  repo is always refused (ADR-091 D5). A shared-workspace card whose head ref is
+  unreadable, or which carries another card's prefix, is still refused.
+
+### ADR-091 D1 delivery-identity evidence order (SUP-14824)
+
+When resolving a card's delivery identity (`resolveDeliveryIdentity`), the
+control plane consults evidence in strict priority order:
+
+1. **Recorded delivery identity** (`issues.execution_state.delivery`) —
+   written at the `in_review` transition by the run that holds the issue's
+   lease. Contains `{ repo: { owner, repo }, branch, headSha, recordedByRunId,
+   recordedAt }`. When present and repo-resolvable (non-empty `repo.owner`,
+   `repo.repo`, `branch`, and `headSha`), the D1 gate compares the linked PR's
+   head against the **recorded** branch; the execution-workspace row is not
+   consulted for the branch half.
+2. **Execution-workspace row** — when no recorded identity exists, the
+   delivery identity falls back to the card's `execution_workspaces` row
+   (`branchName` + `repoUrl`). This is the pre-D1 behavior, preserved
+   byte-identically for cards that have not yet been assigned a recorded
+   identity.
+3. **SUP-14783 shared-workspace fallbacks** — only reachable via the
+   execution-workspace row when the workspace is shared (multiple cards on
+   one branch). The `branchIsOwn` predicate (identifier-prefix match on the
+   branch name) is **never** entered when a recorded identity is present.
+
+**Fail-closed rule:** a recorded identity that is present but unusable
+(missing `repo.owner`/`repo.repo`/`branch`/`headSha`, or any of them empty)
+produces a named `delivery_identity_unresolved` refusal and never falls back
+to the execution-workspace row. The named reason identifies which field is
+missing so an operator can diagnose the write path.
+
+**Write path (control-plane consume-contract):** the `PATCH /issues/:id`
+route accepts a `deliveryIdentity` field. It is recorded only when:
+- the actor is an agent run holding the issue's lease (`executionRunId` or
+  `checkoutRunId` matches), and
+- the transition is **into** `in_review` (prior status was not `in_review`).
+
+Any other actor or transition is rejected with `422 delivery_identity_write_rejected`
+and no partial write occurs. `recordedByRunId` and `recordedAt` are
+server-owned (set from the actor context), never client-supplied.
+
+### Guard B actor-resolution order (ADR-092 D3, SUP-14826)
+
+Guard B forbids a completed stage's decision from being cast by the card's
+delivery principal (the "return assignee"). The principal is resolved in
+strict priority order:
+
+1. `executionPolicy.returnAssigneeAgentId` — explicitly declared at card
+   creation or delivery.
+2. `executionState.returnAssignee` — recorded in the execution state at stage
+   completion.
+3. `executionState.deliveryAuthor` — the ADR-091 D1 delivery identity, recorded
+   at delivery by `issue-execution-policy`.
+4. `issues.createdByAgentId` — the card's creator, a stable, non-rewritten
+   proxy for the deliverer.
+
+If none of the four tiers resolves an actor, the card is refused under the
+distinct reason `guard-b:return-assignee-unresolved` — "unprovable" is
+legible as itself and never conflated with a proven integrity violation
+(`guard-b:decision-by-return-assignee`). The current `assigneeAgentId` /
+`assigneeUserId` is **never** consulted: under ADR-072 a review stage
+transfers assignment to the reviewer and never hands it back, so at check
+time the assignee is the last decider, not the deliverer.
 
 ### Waiving a cardless PR
 

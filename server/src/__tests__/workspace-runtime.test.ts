@@ -8693,6 +8693,445 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
   }, 20_000);
 });
 
+describeEmbeddedPostgres("workspace sibling-branch safe restore (SUP-14781)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-workspace-sibling-restore-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  afterEach(async () => {
+    await db.delete(issues);
+    await db.delete(workspaceRuntimeServices);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(heartbeatRunEvents);
+    await db.delete(heartbeatRuns);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  async function createCleanDivergedRepo(input: {
+    expectedBranch: string;
+    actualBranch: string;
+  }) {
+    const repoRoot = await createTempRepo();
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", input.expectedBranch);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    const baseSha = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    await runGit(repoRoot, ["commit", "--allow-empty", "-m", "recorded tip"]);
+    await runGit(repoRoot, ["branch", input.expectedBranch]);
+    await runGit(repoRoot, ["reset", "--hard", baseSha]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, input.expectedBranch]);
+    await runGit(worktreePath, ["checkout", "-b", input.actualBranch, baseSha]);
+    await runGit(worktreePath, ["commit", "--allow-empty", "-m", "live sibling commit"]);
+    const actualBranchHead = await readGit(worktreePath, ["rev-parse", input.actualBranch]);
+    return { repoRoot, worktreePath, baseSha, actualBranchHead };
+  }
+
+  async function seedSiblingRestoreRecords(input: {
+    repoRoot: string;
+    worktreePath: string;
+    expectedBranch: string;
+    actualBranch: string;
+    sourceIdentifier?: string;
+    claimant?: "idle" | "active" | "none";
+    extraClaimants?: Array<{
+      kind: "idle" | "active";
+      lastUsedOffsetMs: number;
+      identifier?: string;
+    }>;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const sourceWorkspaceId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `Q${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Codex Coder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip App",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: input.repoRoot,
+      isPrimary: true,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: now,
+      updatedAt: now,
+    });
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Dispatch onto the shared worktree",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      identifier: input.sourceIdentifier ?? "PAP-9901",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: sourceWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId,
+      mode: "shared_workspace",
+      strategyType: "git_worktree",
+      name: input.expectedBranch,
+      status: "active",
+      cwd: input.worktreePath,
+      providerRef: input.worktreePath,
+      baseRef: "HEAD",
+      branchName: input.expectedBranch,
+      providerType: "git_worktree",
+      lastUsedAt: now,
+      updatedAt: now,
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: sourceWorkspaceId, executionRunId: runId, updatedAt: now })
+      .where(eq(issues.id, sourceIssueId));
+
+    let claimant:
+      | {
+        issueId: string;
+        workspaceId: string;
+        runId: string | null;
+        identifier: string;
+      }
+      | null = null;
+    if (input.claimant && input.claimant !== "none") {
+      const claimantIssueId = randomUUID();
+      const claimantWorkspaceId = randomUUID();
+      const claimantRunId = input.claimant === "active" ? randomUUID() : null;
+      const claimantIdentifier = "PAP-9990";
+      await db.insert(issues).values({
+        id: claimantIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Live branch claimant",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        identifier: claimantIdentifier,
+      });
+      if (claimantRunId) {
+        await db.insert(heartbeatRuns).values({
+          id: claimantRunId,
+          companyId,
+          agentId,
+          invocationSource: "manual",
+          status: "running",
+          startedAt: now,
+          updatedAt: now,
+        });
+      }
+      await db.insert(executionWorkspaces).values({
+        id: claimantWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId: claimantIssueId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: input.actualBranch,
+        status: "active",
+        cwd: path.join(input.repoRoot, ".paperclip", "claimants", claimantWorkspaceId),
+        providerRef: path.join(input.repoRoot, ".paperclip", "claimants", claimantWorkspaceId),
+        baseRef: "HEAD",
+        branchName: input.actualBranch,
+        providerType: "git_worktree",
+        lastUsedAt: new Date(now.getTime() + 1_000),
+        updatedAt: new Date(now.getTime() + 1_000),
+      });
+      await db
+        .update(issues)
+        .set({
+          executionWorkspaceId: claimantWorkspaceId,
+          executionRunId: claimantRunId,
+          updatedAt: now,
+        })
+        .where(eq(issues.id, claimantIssueId));
+      claimant = {
+        issueId: claimantIssueId,
+        workspaceId: claimantWorkspaceId,
+        runId: claimantRunId,
+        identifier: claimantIdentifier,
+      };
+    }
+
+    const extraClaimants: Array<{
+      issueId: string;
+      workspaceId: string;
+      runId: string | null;
+      identifier: string;
+    }> = [];
+    for (const extra of input.extraClaimants ?? []) {
+      const extraIssueId = randomUUID();
+      const extraWorkspaceId = randomUUID();
+      const extraRunId = extra.kind === "active" ? randomUUID() : null;
+      const extraIdentifier = extra.identifier ?? "PAP-9991";
+      await db.insert(issues).values({
+        id: extraIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Extra branch claimant",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        identifier: extraIdentifier,
+      });
+      if (extraRunId) {
+        await db.insert(heartbeatRuns).values({
+          id: extraRunId,
+          companyId,
+          agentId,
+          invocationSource: "manual",
+          status: "running",
+          startedAt: now,
+          updatedAt: now,
+        });
+      }
+      await db.insert(executionWorkspaces).values({
+        id: extraWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId: extraIssueId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: input.actualBranch,
+        status: "active",
+        cwd: path.join(input.repoRoot, ".paperclip", "claimants", extraWorkspaceId),
+        providerRef: path.join(input.repoRoot, ".paperclip", "claimants", extraWorkspaceId),
+        baseRef: "HEAD",
+        branchName: input.actualBranch,
+        providerType: "git_worktree",
+        lastUsedAt: new Date(now.getTime() + extra.lastUsedOffsetMs),
+        updatedAt: new Date(now.getTime() + extra.lastUsedOffsetMs),
+      });
+      await db
+        .update(issues)
+        .set({
+          executionWorkspaceId: extraWorkspaceId,
+          executionRunId: extraRunId,
+          updatedAt: now,
+        })
+        .where(eq(issues.id, extraIssueId));
+      extraClaimants.push({
+        issueId: extraIssueId,
+        workspaceId: extraWorkspaceId,
+        runId: extraRunId,
+        identifier: extraIdentifier,
+      });
+    }
+
+    return {
+      companyId,
+      agentId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId,
+      sourceWorkspaceId,
+      runId,
+      claimant,
+      extraClaimants,
+      sourceIdentifier: input.sourceIdentifier ?? "PAP-9901",
+    };
+  }
+
+  async function dispatchSiblingRestore(input: {
+    repoRoot: string;
+    worktreePath: string;
+    expectedBranch: string;
+    ids: Awaited<ReturnType<typeof seedSiblingRestoreRecords>>;
+  }) {
+    return ensurePersistedExecutionWorkspaceAvailable({
+      db,
+      base: {
+        baseCwd: input.repoRoot,
+        source: "project_primary",
+        projectId: input.ids.projectId,
+        workspaceId: input.ids.projectWorkspaceId,
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: input.ids.sourceWorkspaceId,
+        mode: "shared_workspace",
+        strategyType: "git_worktree",
+        cwd: input.worktreePath,
+        providerRef: input.worktreePath,
+        projectId: input.ids.projectId,
+        projectWorkspaceId: input.ids.projectWorkspaceId,
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: input.expectedBranch,
+        metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+      },
+      issue: {
+        id: input.ids.sourceIssueId,
+        identifier: input.ids.sourceIdentifier,
+        title: "Dispatch onto the shared worktree",
+      },
+      agent: {
+        id: input.ids.agentId,
+        name: "Codex Coder",
+        companyId: input.ids.companyId,
+      },
+      heartbeatRunId: input.ids.runId,
+      enableWorkspaceBranchReconcileForward: true,
+      enableWorkspaceDirtyQuarantineRepair: false,
+    });
+  }
+
+  it("restores the recorded branch when only a stale claimant (no active run) still records the live sibling branch", async () => {
+    const expectedBranch = "PAP-9901-recorded";
+    const actualBranch = "PAP-9901-live";
+    const { repoRoot, worktreePath, actualBranchHead } = await createCleanDivergedRepo({ expectedBranch, actualBranch });
+    const ids = await seedSiblingRestoreRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-9901",
+      claimant: "idle",
+    });
+
+    const restored = await dispatchSiblingRestore({ repoRoot, worktreePath, expectedBranch, ids });
+
+    expect(restored).not.toBeNull();
+    expect(restored!.branchName).toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+    const worktreeList = await readGit(repoRoot, ["worktree", "list", "--porcelain"]);
+    expect(worktreeList).toContain(`branch refs/heads/${expectedBranch}`);
+    await expect(readGit(repoRoot, ["rev-parse", actualBranch])).resolves.toBe(actualBranchHead);
+  }, 20_000);
+
+  it("still refuses the recorded branch restore when a live run holds the sibling branch", async () => {
+    const expectedBranch = "PAP-9902-recorded";
+    const actualBranch = "PAP-9902-live";
+    const { repoRoot, worktreePath } = await createCleanDivergedRepo({ expectedBranch, actualBranch });
+    const ids = await seedSiblingRestoreRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-9902",
+      claimant: "active",
+    });
+
+    await expect(dispatchSiblingRestore({ repoRoot, worktreePath, expectedBranch, ids })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          contention: expect.objectContaining({
+            claimedByWorkspaceId: ids.claimant!.workspaceId,
+            claimedByIssueIdentifier: ids.claimant!.identifier,
+            activeRun: expect.objectContaining({ status: "running" }),
+          }),
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            succeeded: false,
+            reason: expect.stringContaining("with active run"),
+          }),
+        }),
+      },
+    });
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  it("still fails closed when a stale claimant sorts ahead of a live claimant on the sibling branch", async () => {
+    const expectedBranch = "PAP-9903-recorded";
+    const actualBranch = "PAP-9903-live";
+    const { repoRoot, worktreePath } = await createCleanDivergedRepo({ expectedBranch, actualBranch });
+    const ids = await seedSiblingRestoreRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-9903",
+      claimant: "none",
+      extraClaimants: [
+        // Stale claimant: lastUsedAt +2000ms, so under `lastUsedAt desc` it sorts AHEAD of the
+        // live claimant (+1000ms). Its dispatch already finished, so it has no active run.
+        // First-match-only contention would return this row and mask the live one (fail-open).
+        { kind: "idle", lastUsedOffsetMs: 2_000, identifier: "PAP-9991" },
+        { kind: "active", lastUsedOffsetMs: 1_000, identifier: "PAP-9992" },
+      ],
+    });
+
+    const liveClaimant = ids.extraClaimants[1]!;
+    const staleClaimant = ids.extraClaimants[0]!;
+
+    await expect(dispatchSiblingRestore({ repoRoot, worktreePath, expectedBranch, ids })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          contention: expect.objectContaining({
+            claimedByWorkspaceId: liveClaimant.workspaceId,
+            claimedByIssueIdentifier: liveClaimant.identifier,
+            activeRun: expect.objectContaining({ status: "running" }),
+          }),
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            succeeded: false,
+            reason: expect.stringContaining("with active run"),
+          }),
+        }),
+      },
+    });
+    // The worktree must remain parked on the live sibling branch — the stale row that sorts
+    // first must not let the recorded branch yank it out from under the live run.
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+    expect(staleClaimant.workspaceId).not.toBe(liveClaimant.workspaceId);
+  }, 20_000);
+});
+
 describeEmbeddedPostgres("workspace runtime service control persistence", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;

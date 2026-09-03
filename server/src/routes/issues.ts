@@ -153,8 +153,9 @@ import {
   type ArmingOutcome,
   type MergeArmingDecision,
 } from "../services/merge-arming.js";
-import { evaluateStageIntegrity } from "../services/stage-integrity.js";
+import { evaluateStageIntegrity, type CandidateRow } from "../services/approval-status-reconciler.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
+import { prDeliveryService } from "../services/pr-delivery.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
 import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
@@ -233,7 +234,7 @@ import {
   ALLOW_DEFAULT_OPEN_VISIBLE_ISSUE_WRITE,
   authorizationDeniedDetails,
 } from "../services/authorization.js";
-import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
+import { stalledReviewDecisionService, executionStateReturnAssigneeAgentId } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -249,6 +250,7 @@ import {
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
+  type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -295,10 +297,19 @@ const doneTransitionOverrideSchema = z.object({
   disposition: z.string().trim().min(1),
   reason: z.string().trim().min(1).max(2000).optional(),
 });
+const deliveryIdentitySchema = z.object({
+  repo: z.object({
+    owner: z.string().trim().min(1),
+    repo: z.string().trim().min(1),
+  }).strict(),
+  branch: z.string().trim().min(1),
+  headSha: z.string().trim().min(1),
+}).strict();
 const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObjectSchema.extend({
   interrupt: z.boolean().optional(),
   force: z.boolean().optional(),
   doneTransitionOverride: doneTransitionOverrideSchema.optional().nullable(),
+  deliveryIdentity: deliveryIdentitySchema.optional(),
 }));
 
 function prefersMinimalIssueUpdateResponse(req: Request) {
@@ -502,6 +513,47 @@ function requiresPaperclipAttachmentMetadata(input: {
   return type === "artifact" && provider === "paperclip";
 }
 
+/**
+ * Detect a delivery-shaped `pull_request` work product and normalize its
+ * externalId to the canonical `owner/repo#N` form (SUP-14645). The signature
+ * is the delivery metadata (repository + prNumber) or a GitHub pull URL; a
+ * resolvable reference is what lets the merge sweep re-check it later. Returns
+ * null for non-PR work products or PRs with no resolvable GitHub reference, in
+ * which case the work product is recorded with no carrier fan-out.
+ */
+export function prDeliverySignature(input: {
+  type?: unknown;
+  externalId?: string | null;
+  url?: string | null;
+  metadata?: Record<string, unknown> | null;
+}): { repository: string; prNumber: number; externalId: string } | null {
+  if (input.type !== "pull_request") return null;
+  const metadata = input.metadata ?? {};
+  const metaRepo =
+    typeof metadata.repository === "string" &&
+    /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(metadata.repository)
+      ? metadata.repository
+      : null;
+  const metaPr =
+    typeof metadata.prNumber === "number" &&
+    Number.isInteger(metadata.prNumber) &&
+    metadata.prNumber > 0
+      ? metadata.prNumber
+      : null;
+  if (metaRepo && metaPr) {
+    return { repository: metaRepo, prNumber: metaPr, externalId: `${metaRepo}#${metaPr}` };
+  }
+  if (typeof input.url === "string") {
+    const match = input.url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+    if (match && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(match[1]) && Number(match[2]) > 0) {
+      const repo = match[1];
+      const prNum = Number(match[2]);
+      return { repository: repo, prNumber: prNum, externalId: `${repo}#${prNum}` };
+    }
+  }
+  return null;
+}
+
 const attachmentArtifactMetadataInputSchema = z.object({
   attachmentId: z.string().guid(),
 }).passthrough();
@@ -557,6 +609,83 @@ function readObject(value: unknown): Record<string, unknown> {
 
 function hasOwn(record: Record<string, unknown>, key: string) {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Mint the single review-escalation interaction that a round-cap escalation
+ * leaves for the responsible human (SUP-14805). The execution-policy service is
+ * pure and only signals via `transition.reviewEscalation`; this is where the
+ * interaction is actually written — post-commit, in the route that recorded the
+ * accompanying `changes_requested` decision.
+ *
+ * The card is created as a user actor (the escalated human), not the reviewer
+ * agent: a set `createdByAgentId` would make `acceptRequestConfirmation` bounce
+ * the issue back to the creator agent on accept, undoing the escalation. With
+ * `createdByUserId` set and `createdByAgentId` null, accepting resolves the card
+ * in place. `human_only` keeps it resolvable only by a human; `wake_assignee`
+ * re-surfaces it to the assignee on both accept and reject.
+ */
+async function mintReviewEscalationInteraction(args: {
+  db: Db;
+  issue: { id: string; companyId: string; identifier?: string | null };
+  escalation: ReviewEscalationSignal;
+  decisionBody: string;
+  actorRunId?: string | null;
+}): Promise<{ id: string }> {
+  const { db, issue, escalation, decisionBody } = args;
+  const returnAssigneeLabel =
+    escalation.returnAssignee.type === "user"
+      ? `user ${escalation.returnAssignee.userId ?? ""}`.trim()
+      : `agent ${escalation.returnAssignee.agentId ?? ""}`.trim();
+  const issueLabel = issue.identifier ? `\`${issue.identifier}\`` : `\`${issue.id}\``;
+  const decisionBodyHash = createHash("sha256").update(decisionBody).digest("hex").slice(0, 16);
+  const idempotencyKey =
+    `review-escalation:${issue.id}:${escalation.stageId}:${escalation.changesRequestedCount}:${decisionBodyHash}`.slice(0, 255);
+  const sourceRunId =
+    args.actorRunId && UUID_PATTERN.test(args.actorRunId) ? args.actorRunId : null;
+  const detailsMarkdown = [
+    `Review stage \`${escalation.stageId}\` (\`${escalation.stageType}\`) on issue ${issueLabel} has requested changes ${escalation.changesRequestedCount} time(s), reaching the round cap of ${escalation.maxRounds}.`,
+    ``,
+    `The pending review has been escalated to you instead of bouncing back to the implementer.`,
+    ``,
+    `Reviewer's recorded decision:`,
+    `> ${decisionBody}`,
+    ``,
+    `Your decision (route: \`PATCH /issues/:id\`):`,
+    `- Approve and advance the stage.`,
+    `- Request changes again — this resets the round counter to 0 (a human send-back does not burn a round).`,
+    `- Re-scope the issue.`,
+    ``,
+    `Return assignee: ${returnAssigneeLabel}.`,
+  ].join("\n");
+  return issueThreadInteractionService(db).create(
+    issue,
+    {
+      kind: "request_confirmation",
+      title: "Review round cap reached — your decision is needed",
+      summary: `Review stage ${escalation.stageId} hit the ${escalation.maxRounds}-round change cap and was escalated to you.`,
+      addresseeAgentId: null,
+      resolverPolicy: "human_only",
+      continuationPolicy: "wake_assignee",
+      sourceRunId,
+      idempotencyKey,
+      payload: {
+        version: 1,
+        prompt: "Approve this review, or request further changes (round cap reached).",
+        acceptLabel: "Approve & advance",
+        rejectLabel: "Request changes",
+        rejectRequiresReason: true,
+        allowDeclineReason: true,
+        detailsMarkdown,
+      },
+    },
+    {
+      agentId: null,
+      userId: escalation.escalatedToUserId,
+    },
+  );
 }
 
 async function auditAgentIssueCreateAttributionSpoof(input: {
@@ -2975,50 +3104,84 @@ export function issueRoutes(
     decision,
     closingTransition,
   }: {
-    issue: { id: string; companyId: string; issueNumber: number | null; executionState: unknown };
+    issue: {
+      id: string;
+      companyId: string;
+      issueNumber: number | null;
+      identifier: string | null;
+      executionState: unknown;
+      executionPolicy: Record<string, unknown> | null;
+      createdByAgentId: string | null;
+      createdByUserId: string | null;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+    };
     decision: MergeArmingDecision | null | undefined;
     closingTransition: boolean;
   }): Promise<void> => {
     if (!shouldPublishApprovalStatus(decision)) return;
-    const issueIdentifier = `SUP-${issue.issueNumber}`;
+    // ADR-092 D4: enforce stage-integrity at decision time. Both call sites
+    // invoke this hook after the transaction commits, so the decision row and
+    // completedStageIds are already durable — the predicate is evaluable here.
+    // D5: a finding refuses to stamp, never refuses to close.
+    // adr-092-d4-enforcement-fails-open (SUP-14792 round-2): fail CLOSED on
+    // error. An evaluateStageIntegrity throw (we could not positively verify the
+    // decision) or a finding whose [Merge-arming] refusal comment throws must
+    // refuse to stamp/arm, not fall through — a guard that reports integrity it
+    // is not enforcing is the exact defect ADR-092 eliminates. `return` skips
+    // only stamp/arm (the hook runs post-commit), so the status transition is
+    // untouched (ADR-073 D3 "never refuse to close" holds).
+    const candidate: CandidateRow = {
+      id: issue.id,
+      companyId: issue.companyId,
+      identifier: issue.identifier,
+      createdByAgentId: issue.createdByAgentId,
+      createdByUserId: issue.createdByUserId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+      executionState: (issue.executionState ?? {}) as Record<string, unknown>,
+      executionPolicy: issue.executionPolicy,
+    };
     try {
-      // ADR-091 D3: enforce the reconciler's ADR-073 stage-integrity predicate
-      // on the FIRST publish too — one predicate, two call sites (ADR-085). A
-      // card is only stamped when its recorded approval ladder is a real,
-      // non-self, non-auto-skipped one. An unverifiable integrity record
-      // (missing decision rows / unreadable execution state) refuses the first
-      // stamp (ADR-091 D4); a refusal maps to a skipped [Merge-arming] comment
-      // so the outcome stays diagnosable in-thread.
-      const [integrityRow] = await db
-        .select({
-          id: issueRows.id,
-          companyId: issueRows.companyId,
-          createdByAgentId: issueRows.createdByAgentId,
-          createdByUserId: issueRows.createdByUserId,
-          executionState: issueRows.executionState,
-          executionPolicy: issueRows.executionPolicy,
-        })
-        .from(issueRows)
-        .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId)));
-      if (!integrityRow) {
-        await svc.addComment(
-          issue.id,
-          "[Merge-arming] status:skipped:guard-b:unverifiable: issue row unreadable; refusing to publish the first stamp",
-          {},
-          { authorType: "system" },
-        );
+      const integrity = await evaluateStageIntegrity(db, candidate);
+      if (integrity) {
+        const msg = `status:skipped:stage_integrity:${integrity.reason}: ${integrity.detail}`;
+        try {
+          await svc.addComment(
+            issue.id,
+            `[Merge-arming] ${msg}`,
+            {},
+            { authorType: "system" },
+          );
+        } catch (commentErr) {
+          // Fail closed: even if the refusal comment cannot be written, the
+          // finding was positively identified, so we still must not stamp/arm.
+          logger.warn(
+            { err: commentErr, issueId: issue.id },
+            "stage-integrity refusal comment write failed; still refusing to stamp/arm",
+          );
+        }
         return;
       }
-      const integrity = await evaluateStageIntegrity(db, integrityRow);
-      if (!integrity.ok) {
-        await svc.addComment(
-          issue.id,
-          `[Merge-arming] status:skipped:${integrity.reason}: ${integrity.detail}`,
-          {},
-          { authorType: "system" },
-        );
-        return;
-      }
+    } catch (err) {
+      // Fail closed: an evaluateStageIntegrity throw means we could not
+      // positively verify the decision — that is a refusal, not a pass-through
+      // to stamp/arm.
+      logger.warn(
+        { err, issueId: issue.id },
+        "stage-integrity check at decision time threw; refusing to stamp/arm (fail-closed)",
+      );
+      return;
+    }
+    // SUP-14602: the live-discovery / decision-head needle must be the issue's
+    // REAL identifier (company issuePrefix + number), not a hardcoded "SUP-".
+    // Both resolveApprovalDecisionHead and publishApprovalStatus search open PRs
+    // for this string; for any company whose prefix is not "SUP" the literal
+    // needle matches none of its own PRs, so the producer re-resolves 0 PRs (or
+    // the wrong company's) and returns skipped:no-pr instead of certifying the
+    // card. issue.identifier is authoritative (stored issuePrefix-issueNumber).
+    const issueIdentifier = issue.identifier ?? `SUP-${issue.issueNumber}`;
+    try {
       // ADR-091 D2a: pin the FIRST publish to the head the approving decision
       // was rendered against. Resolve it up front, then hand it to
       // publishApprovalStatus as expectedHeadSha so a head that moves between
@@ -3064,25 +3227,83 @@ export function issueRoutes(
         };
       }
 
-      // SUP-13714 Guard A persistence: record which head this approval
-      // certified so the reconciler can verify content identity before
+      // SUP-13714 Guard A persistence + SUP-14715 D-B: record which head this
+      // approval certified so the reconciler can verify content identity before
       // subsequent re-publishes. Stored in issues.executionState (no migration;
       // the stage machine only rebuilds this blob on a subsequent transition,
       // which for an approved card is a new review cycle and is re-persisted).
-      if (statusOutcome.kind === "armed" && typeof statusOutcome.headSha === "string") {
+      //
+      // D-B: approvedHeadSha is written on EVERY outcome that positively
+      // resolved a head, so a skipped/failed FIRST publish leaves a real anchor
+      // the reconciler can later recover — it re-publishes by content identity
+      // and treats that first publish as a delivery-identity-gated write. It is
+      // deliberately distinct from publishedHeadSha: "certified at this head"
+      // (approvedHeadSha) vs "the paperclip/approved status was actually
+      // written at this head" (publishedHeadSha). A refusal that resolved no
+      // head (delivery_identity_unresolved, not_delivered, no-pr, ambiguous,
+      // ...) records nothing — an unverifiable head must not be anchored.
+      const resolvedHeadSha = decisionHead.kind === "resolved" ? decisionHead.headSha : null;
+      if (resolvedHeadSha !== null) {
         const currentState = (issue.executionState ?? {}) as Record<string, unknown>;
+        const approvalStatus: Record<string, unknown> = {
+          approvedHeadSha: resolvedHeadSha,
+          approvedAt: new Date().toISOString(),
+        };
+        if (statusOutcome.kind === "armed" && typeof statusOutcome.headSha === "string") {
+          approvalStatus.publishedHeadSha = statusOutcome.headSha;
+          approvalStatus.publishedAt = new Date().toISOString();
+        }
         await db
           .update(issueRows)
           .set({
             executionState: {
               ...currentState,
-              approvalStatus: {
-                publishedHeadSha: statusOutcome.headSha,
-                publishedAt: new Date().toISOString(),
-              },
+              approvalStatus,
             },
           })
           .where(eq(issueRows.id, issue.id));
+      } else {
+        // SUP-14602: an ambiguous decision cannot resolve a single certifiable
+        // head, but the certification the producer had in hand must not be
+        // discarded. Two sources carry the candidate heads: the decision-time
+        // resolver (ADR-091 D2a intercepts ambiguity BEFORE publishApprovalStatus
+        // runs, so the candidates come from decisionHead.pendingCandidates) and
+        // the publisher itself (ambiguity reached only at write time ->
+        // statusOutcome.skipCandidates). Persist the per-candidate approval-time
+        // heads so that, once the ambiguity resolves (a human or agent closes the
+        // duplicate PR), the approval-status reconciler can re-run the unmodified
+        // Guard A diff-vs-base check against a certified head instead of failing
+        // closed forever on guard-a:no-approved-head. publishedHeadSha semantics
+        // are untouched — it still means "published", never "considered".
+        const pendingCandidates =
+          statusOutcome.kind === "skipped" &&
+          Array.isArray(statusOutcome.skipCandidates) &&
+          statusOutcome.skipCandidates.length > 0
+            ? statusOutcome.skipCandidates
+            : decisionHead.kind === "unresolvable" &&
+                Array.isArray(decisionHead.pendingCandidates) &&
+                decisionHead.pendingCandidates.length > 0
+              ? decisionHead.pendingCandidates
+              : null;
+        if (pendingCandidates !== null) {
+          const currentState = (issue.executionState ?? {}) as Record<string, unknown>;
+          const existingApprovalStatus =
+            (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
+          await db
+            .update(issueRows)
+            .set({
+              executionState: {
+                ...currentState,
+                approvalStatus: {
+                  ...existingApprovalStatus,
+                  pendingCandidates,
+                  skipReason: statusOutcome.message,
+                  certifiedAt: new Date().toISOString(),
+                },
+              },
+            })
+            .where(eq(issueRows.id, issue.id));
+        }
       }
 
       await svc.addComment(
@@ -3091,6 +3312,17 @@ export function issueRoutes(
         {},
         { authorType: "system" },
       );
+
+      // SUP-14722 (ADR-091 D-D): a refusal must suppress the merge action, not just
+      // the status write. A non-`armed` statusOutcome — head_unresolvable, or any
+      // publishApprovalStatus skip (head_moved / not_delivered / no-pr / ambiguous) —
+      // means the approval never certified a head, yet armMergeOnApproval re-resolves
+      // linked PRs live and would arm auto-merge on whatever head is current. Refuse
+      // here (mirrors SUP-14678 D3's early-return refusal) so the two refusal paths
+      // in this hook read identically. Placed AFTER the Guard A / D-B anchor writes
+      // and the [Merge-arming] comment so the anchor persistence SUP-14717 (D-B) adds
+      // on non-`armed` outcomes still runs on the refusal path.
+      if (statusOutcome.kind !== "armed") return;
 
       const company = await db
         .select({ mergeArmingEnabled: companies.mergeArmingEnabled })
@@ -3361,6 +3593,7 @@ export function issueRoutes(
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
+  const prDeliverySvc = prDeliveryService(db);
   const documentsSvc = documentService(db);
   const artifactReviewDocumentsSvc = artifactReviewDocumentService(db, storage);
   const companySkillsSvc = companySkillService(db);
@@ -7255,6 +7488,213 @@ export function issueRoutes(
     res.json(removed);
   });
 
+  // SUP-14748: operator-invocable first-publish re-arm for a skipped
+  // paperclip/approved stamp. The first publish can skip for reasons only a human
+  // understands (a hand-merged PR, a closed PR, a coordinating card that merely
+  // cited a PR, a head that moved between approval and publish). This is the only
+  // sanctioned recovery: it re-runs publishApprovalStatus verbatim — pinned to the
+  // decision-time head, delivery-identity enforced — instead of a human
+  // hand-writing the status, which would manufacture a fake approval. Board-only;
+  // an agent caller is refused before any GitHub read or write.
+  router.post("/issues/:id/merge-arming/republish", async (req, res) => {
+    // Gate 1: board-only. Agent actors are refused here (403) before any GitHub
+    // read or write — the very agents whose card may have skipped must not be able
+    // to re-stamp it themselves.
+    assertBoard(req);
+
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+
+    // Gate 2: company owner/admin. Re-stamping is a judgment call, not a
+    // mechanical one. local_implicit (trusted local dev) is exempt, matching the
+    // other board-gated routes.
+    if (req.actor.source !== "local_implicit") {
+      const userId = req.actor.userId?.trim();
+      const membership = userId
+        ? await db
+            .select({ membershipRole: companyMemberships.membershipRole })
+            .from(companyMemberships)
+            .where(and(
+              eq(companyMemberships.companyId, issue.companyId),
+              eq(companyMemberships.principalType, "user"),
+              eq(companyMemberships.principalId, userId),
+              eq(companyMemberships.status, "active"),
+            ))
+            .then((rows) => rows[0] ?? null)
+        : null;
+      const role = membership?.membershipRole;
+      if (!role || (role !== "owner" && role !== "admin")) {
+        throw forbidden("Company owner or admin required to republish a skipped approval stamp");
+      }
+    }
+
+    const state: Record<string, unknown> = issue.executionState ?? {};
+    const approvalStatus = state.approvalStatus as Record<string, unknown> | undefined;
+
+    // Idempotent no-op FIRST: the stamp is already published for this card, so it
+    // is already green. Say so and stop — no guards, no GitHub I/O, never a second
+    // write. "already_published" is the definitive first check on this recovery
+    // surface: a card that is already stamped is not a recovery case.
+    const priorHeadSha =
+      approvalStatus && typeof approvalStatus.publishedHeadSha === "string"
+        ? approvalStatus.publishedHeadSha
+        : null;
+    if (priorHeadSha) {
+      res.status(200).json({
+        outcome: "already_published",
+        headSha: priorHeadSha,
+        message: `paperclip/approved is already published on ${priorHeadSha.slice(0, 7)}; nothing to re-arm.`,
+      });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+
+    // Guard A: the card must record a real "approved" decision. A card whose
+    // review stage auto-skipped (no decision row) or was never approved has
+    // nothing to stamp — this would manufacture a fake approval, not recover one.
+    // Mirrors the reconciler's candidate trigger (lastDecisionOutcome).
+    if (state.lastDecisionOutcome !== "approved") {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: "no_approved_decision",
+        message: "This card has no recorded 'approved' decision; there is nothing to re-stamp.",
+      });
+      return;
+    }
+
+    // Guard B: ADR-073/092 stage-integrity, reused verbatim from the reconciler
+    // (exported specifically so this route does not reimplement it).
+    const candidate: CandidateRow = {
+      id: issue.id,
+      companyId: issue.companyId,
+      identifier: issue.identifier,
+      createdByAgentId: issue.createdByAgentId,
+      createdByUserId: issue.createdByUserId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+      executionState: state,
+      executionPolicy: issue.executionPolicy,
+    };
+    const integrity = await evaluateStageIntegrity(db, candidate);
+    if (integrity) {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: integrity.reason,
+        message: integrity.detail,
+      });
+      return;
+    }
+
+    // The publish pins the decision head by matching the card identifier against
+    // the linked PR's head ref / title / body, so a card with no identifier cannot
+    // be pinned. Fail closed.
+    const identifier = issue.identifier;
+    if (!identifier) {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: "head_unresolvable",
+        message:
+          "status:skipped:head_unresolvable: this card has no identifier to pin the approval decision head against",
+      });
+      return;
+    }
+
+    // Resolve the decision-time head the way the decision-time arming did, so the
+    // publish is pinned to exactly the head the reviewer approved.
+    const decisionHead = await resolveApprovalDecisionHead(
+      db,
+      issue.companyId,
+      issue.id,
+      identifier,
+      true,
+    );
+    if (decisionHead.kind !== "resolved") {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: "head_unresolvable",
+        message: `status:skipped:head_unresolvable: ${decisionHead.reason}; refusing to stamp an unverifiable head`,
+      });
+      return;
+    }
+
+    // Re-run the first publish, pinned to the resolved head, delivery-identity
+    // enforced (a cited-but-not-delivered PR is refused, never stamped).
+    const publishOutcome = await publishApprovalStatus(
+      db,
+      issue.companyId,
+      issue.id,
+      identifier,
+      {
+        closingTransition: true,
+        expectedHeadSha: decisionHead.headSha,
+        enforceDeliveryIdentity: true,
+      },
+    );
+
+    if (publishOutcome.kind !== "armed" || typeof publishOutcome.headSha !== "string") {
+      logger.info(
+        {
+          issueId: issue.id,
+          companyId: issue.companyId,
+          outcome: publishOutcome.kind,
+          message: publishOutcome.message,
+        },
+        "merge-arming republish refused",
+      );
+      res.status(409).json({
+        outcome: publishOutcome.kind,
+        message: publishOutcome.message,
+        headSha: publishOutcome.headSha ?? null,
+      });
+      return;
+    }
+
+    // Persist the certified head so the reconciler (Guard A) and the enforcer can
+    // verify it — mirrors runApprovalMergeArming exactly (executionState.approvalStatus).
+    await db
+      .update(issueRows)
+      .set({
+        executionState: {
+          ...state,
+          approvalStatus: {
+            ...(approvalStatus ?? {}),
+            publishedHeadSha: publishOutcome.headSha,
+            publishedAt: new Date().toISOString(),
+          },
+        },
+      })
+      .where(eq(issueRows.id, issue.id));
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: "issue.merge_arming_republish",
+      entityType: "issue",
+      entityId: issue.id,
+      agentId: null,
+      runId: null,
+      details: {
+        outcome: publishOutcome.kind,
+        headSha: publishOutcome.headSha,
+        message: publishOutcome.message,
+      },
+    });
+
+    logger.info(
+      { issueId: issue.id, companyId: issue.companyId, headSha: publishOutcome.headSha },
+      "merge-arming republish: paperclip/approved re-published",
+    );
+
+    res.status(200).json({
+      outcome: "armed",
+      headSha: publishOutcome.headSha,
+      message: publishOutcome.message,
+    });
+  });
+
   router.get("/issues/:id/heartbeat-context", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
@@ -7789,6 +8229,11 @@ export function issueRoutes(
         .then((rows) => rows[0] ?? null);
       if (!lockedIssue) throw notFound("Issue not found");
 
+      let recoveryEscalationPayload: {
+        escalation: ReviewEscalationSignal;
+        decisionBody: string;
+        runId: string | null;
+      } | null = null;
       const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
         lockedIssue.companyId,
         lockedIssue.id,
@@ -7918,6 +8363,13 @@ export function issueRoutes(
               createdByRunId: actor.runId ?? null,
             });
           }
+          if (transition.reviewEscalation && transition.decision) {
+            recoveryEscalationPayload = {
+              escalation: transition.reviewEscalation,
+              decisionBody: transition.decision.body,
+              runId: actor.runId ?? null,
+            };
+          }
         }
 
         const updatedIssue = await svc.update(
@@ -7960,9 +8412,30 @@ export function issueRoutes(
       );
       if (!recoveryAction) throw notFound("Active recovery action not found");
 
-      return { issue, recoveryAction };
+      return { issue, recoveryAction, reviewEscalation: recoveryEscalationPayload };
     });
     for (const publication of postCommitActivityPublications) publishActivity(publication);
+
+    if (result.reviewEscalation) {
+      try {
+        await mintReviewEscalationInteraction({
+          db,
+          issue: {
+            id: result.issue.id,
+            companyId: result.issue.companyId,
+            identifier: result.issue.identifier ?? null,
+          },
+          escalation: result.reviewEscalation.escalation,
+          decisionBody: result.reviewEscalation.decisionBody,
+          actorRunId: result.reviewEscalation.runId,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, issueId: result.issue.id, stageId: result.reviewEscalation.escalation.stageId },
+          "failed to mint review escalation interaction (recovery resolve)",
+        );
+      }
+    }
 
     await routinesSvc.syncRunStatusForIssue(result.issue.id);
 
@@ -8863,10 +9336,43 @@ export function issueRoutes(
         metadata: req.body.metadata ?? null,
       });
     }
+    const prDelivery = createInput.type === "pull_request" ? prDeliverySignature(createInput) : null;
+    if (prDelivery) {
+      // Canonical externalId (owner/repo#N) so the source row, the carrier
+      // child fan-out, and the one-shot backfill all de-duplicate on the same
+      // key (SUP-14645).
+      createInput.externalId = prDelivery.externalId;
+    }
     const product = await workProductsSvc.createForIssue(issue.id, issue.companyId, createInput);
     if (!product) {
       res.status(422).json({ error: "Invalid work product payload" });
       return;
+    }
+    if (prDelivery) {
+      // Carrier delivery: mirror the source row onto every descendant so each
+      // issue owns its own `pull_request` work product (SUP-14645). A no-op when
+      // the source issue has no descendants. A fan-out failure must not reject
+      // the request after the source row is already written (partial state + a
+      // client 500); log it and keep the 201 — the source row is the
+      // load-bearing one, and the fan-out rows are repaired by the next
+      // delivery or the merge sweep.
+      try {
+        await prDeliverySvc.recordCarrierFanOut({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          externalId: prDelivery.externalId,
+          url: product.url,
+          title: product.title,
+          status: product.status,
+          reviewState: product.reviewState,
+          metadata: product.metadata,
+        });
+      } catch (error) {
+        logger.warn(
+          { err: error, issueId: issue.id, companyId: issue.companyId, workProductId: product.id },
+          "PR delivery carrier fan-out failed after work product creation",
+        );
+      }
     }
     await logActivity(db, {
       companyId: issue.companyId,
@@ -10419,12 +10925,21 @@ export function issueRoutes(
       }
 
       let wakeQueued = false;
-      if (req.body.action !== "approve" && result.issue.assigneeAgentId) {
+      // A send-back must wake the agent the card returns to. For an escalated
+      // hold the service reassigns the issue to the execution-state return
+      // assignee, so `result.issue.assigneeAgentId` already is that agent. The
+      // fallback re-derives it from `executionState.returnAssignee` so the wake
+      // target stays real even if the durable reassign was skipped for some edge
+      // shape — never waking a null assignee (SUP-14806).
+      const sendBackAgentId = req.body.action !== "approve"
+        ? (result.issue.assigneeAgentId ?? executionStateReturnAssigneeAgentId(result.issue.executionState))
+        : null;
+      if (sendBackAgentId) {
         const userAuthoredNote = result.comment
           ? { commentId: result.comment.id, authorUserId: actor.actorId }
           : undefined;
         try {
-          const wake = await enqueueStalledReviewDecisionWakeup(result.issue.assigneeAgentId, {
+          const wake = await enqueueStalledReviewDecisionWakeup(sendBackAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "issue_status_changed",
@@ -10451,7 +10966,7 @@ export function issueRoutes(
           wakeQueued = wake !== null;
         } catch (err) {
           logger.warn(
-            { err, issueId: result.issue.id, agentId: result.issue.assigneeAgentId },
+            { err, issueId: result.issue.id, agentId: sendBackAgentId },
             "failed to enqueue stalled-review decision resume wake",
           );
         }
@@ -10589,6 +11104,7 @@ export function issueRoutes(
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
       onBehalfOfUserId: _requestedOnBehalfOfUserId,
+      deliveryIdentity: requestedDeliveryIdentity,
       ...updateFields
     } = req.body;
     const reviewPolicyChangeRequested =
@@ -11047,6 +11563,39 @@ export function issueRoutes(
     }
     Object.assign(updateFields, transition.patch);
 
+    // ADR-091 D1 (SUP-14824): record the delivery identity on in_review transition.
+    // Only a run that holds the issue's lease may write it, and only on a transition
+    // INTO in_review. Any other actor or transition is rejected without partial write.
+    if (requestedDeliveryIdentity) {
+      const holdsLease =
+        actor.actorType === "agent"
+        && actor.runId != null
+        && (existing.executionRunId === actor.runId || existing.checkoutRunId === actor.runId);
+      const enteringReview = existing.status !== "in_review" && updateFields.status === "in_review";
+      if (!holdsLease || !enteringReview) {
+        res.status(422).json({
+          error: "deliveryIdentity may only be written by the lease-holding run on a transition into in_review",
+          code: "delivery_identity_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+          },
+        });
+        return;
+      }
+      const currentExecState = (updateFields.executionState ?? {}) as Record<string, unknown>;
+      updateFields.executionState = {
+        ...currentExecState,
+        delivery: {
+          ...requestedDeliveryIdentity,
+          recordedByRunId: actor.runId,
+          recordedAt: new Date().toISOString(),
+        },
+      };
+    }
+
     const nextStatus = updateFields.status ?? existing.status;
     if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
       throw unprocessable("unblockDescriptor requires blocked status");
@@ -11423,7 +11972,44 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    if (transition.reviewEscalation && transition.decision) {
+      try {
+        await mintReviewEscalationInteraction({
+          db,
+          issue: { id: issue.id, companyId: issue.companyId, identifier: issue.identifier ?? null },
+          escalation: transition.reviewEscalation,
+          decisionBody: transition.decision.body,
+          actorRunId: actor.runId ?? null,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, stageId: transition.reviewEscalation.stageId },
+          "failed to mint review escalation interaction",
+        );
+      }
+    }
     for (const publication of postCommitActivityPublications) publishActivity(publication);
+
+    if (transition.droppedStageIds?.length) {
+      void logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "execution-stage-prune",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "issue.execution_stage_ids_pruned",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          issueId: id,
+          droppedStageIds: transition.droppedStageIds,
+        },
+      }).catch((err) => {
+        logger.warn({ err, issueId: id }, "failed to write execution stage prune audit log");
+      });
+    }
 
     await runApprovalMergeArming({
       issue,
@@ -13786,7 +14372,39 @@ export function issueRoutes(
             actor,
           })
         : null;
-      const reopenedIssue = await svc.update(id, { status: "todo" });
+      // The implicit comment-reopen historically wrote `status: "todo"` with a bare
+      // `svc.update`, bypassing `applyIssueExecutionPolicyTransition` (SUP-14756).
+      // That left a reopened `done`/`cancelled` card carrying its pre-reopen
+      // `executionState` (e.g. `status: "completed"`); because the done/cancelled
+      // -> non-terminal reset is keyed on the pre-reopen status, no later PATCH could
+      // ever clear it. Route the status write through the same transition the PATCH
+      // route uses so the reset lands in this single write.
+      const reopenPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+      const reopenTransition = applyIssueExecutionPolicyTransition({
+        issue,
+        policy: reopenPolicy,
+        previousPolicy: reopenPolicy,
+        requestedStatus: "todo",
+        requestedAssigneePatch: {},
+        actor: {
+          agentId: actor.agentId ?? null,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        commentBody: req.body.body,
+      });
+      if (reopenTransition.decision) {
+        // A reopen moves the card back to `todo`; the transition should never mint
+        // a stage decision here. Fail loud rather than silently drop it.
+        throw new Error("Comment-reopen unexpectedly produced an execution stage decision");
+      }
+      const reopenedExecutionState =
+        reopenTransition.patch.executionState !== undefined
+          ? reopenTransition.patch.executionState
+          : issue.executionState;
+      const reopenedIssue = await svc.update(id, {
+        status: "todo",
+        ...reopenTransition.patch,
+      });
       if (!reopenedIssue) {
         res.status(404).json({ error: "Issue not found" });
         return;
@@ -13794,6 +14412,30 @@ export function issueRoutes(
       reopened = isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers);
       reopenFromStatus = reopened ? issue.status : null;
       currentIssue = reopenedIssue;
+
+      // Audit parity with the PATCH route and auto-approve path: the transition's
+      // done/cancelled reset prunes retired-revision stage ids out of the stale
+      // executionState; record that prune so the reopen is auditable (ADR-073 D4).
+      if (reopenTransition.droppedStageIds?.length) {
+        void logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "execution-stage-prune",
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+          action: "issue.execution_stage_ids_pruned",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            issueId: id,
+            droppedStageIds: reopenTransition.droppedStageIds,
+          },
+        }).catch((err) => {
+          logger.warn({ err, issueId: id }, "failed to write execution stage prune audit log");
+        });
+      }
 
       await logActivity(db, {
         companyId: currentIssue.companyId,
@@ -13807,6 +14449,7 @@ export function issueRoutes(
         entityId: currentIssue.id,
         details: {
           status: "todo",
+          executionState: reopenedExecutionState,
           ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
           ...(scheduledRetrySupersededByComment
             ? {
@@ -13983,6 +14626,26 @@ export function issueRoutes(
         throw err;
       }
       for (const publication of postCommitActivityPublications) publishActivity(publication);
+      if (transition.droppedStageIds?.length) {
+        void logActivity(db, {
+          companyId: currentIssue.companyId,
+          actorType: "system",
+          actorId: "execution-stage-prune",
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+          action: "issue.execution_stage_ids_pruned",
+          entityType: "issue",
+          entityId: currentIssue.id,
+          details: {
+            identifier: currentIssue.identifier,
+            issueId: id,
+            droppedStageIds: transition.droppedStageIds,
+          },
+        }).catch((err) => {
+          logger.warn({ err, issueId: id }, "failed to write execution stage prune audit log");
+        });
+      }
       comment = txResult.comment;
       currentIssue = txResult.issue;
       // Mirror the normal status-change audit trail: every other in_review -> done path
@@ -14005,6 +14668,31 @@ export function issueRoutes(
             _previous: { status: issueBeforeCommentDecision.status },
           },
         });
+      }
+      // SUP-14805: this auto-approve comment door only ever requests `done`, so a
+      // round-cap escalation cannot originate here — but the same pure transition
+      // runs on this door, and ADR-085 treats a control waived at one door as no
+      // control at all. Guard every transition door symmetrically: if the
+      // transition ever surfaces an escalation signal, mint the card here too.
+      if (transition.reviewEscalation && transition.decision) {
+        try {
+          await mintReviewEscalationInteraction({
+            db,
+            issue: {
+              id: currentIssue.id,
+              companyId: currentIssue.companyId,
+              identifier: currentIssue.identifier ?? null,
+            },
+            escalation: transition.reviewEscalation,
+            decisionBody: transition.decision.body,
+            actorRunId: actor.runId ?? null,
+          });
+        } catch (err) {
+          logger.warn(
+            { err, issueId: currentIssue.id, stageId: transition.reviewEscalation.stageId },
+            "failed to mint review escalation interaction (auto-approve comment door)",
+          );
+        }
       }
       // SUP-13904: this comment door is a second door onto an approved review
       // decision, so it must run the same merge-arming post-hook as the PATCH

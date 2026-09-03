@@ -1,4 +1,6 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "../types.js";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   asString,
   asNumber,
@@ -12,6 +14,10 @@ import {
   resolveCommandForLogs,
   runChildProcess,
 } from "../utils.js";
+import {
+  applyPaperclipGhWrapperGate,
+  applyPaperclipGitHubCredentialHelperGate,
+} from "@paperclipai/adapter-utils/server-utils";
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, config, onLog, onMeta, authToken } = ctx;
@@ -35,6 +41,38 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   env.PAPERCLIP_RUN_ID = runId;
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
+  // Wire the agent-side GitHub App credential helper into this run's git so
+  // git/gh authenticate against github.com with on-demand, broker-minted
+  // installation tokens instead of a long-lived GH_TOKEN (SUP-14752 / GH-APP-6).
+  // The helper ships with the server (not the run's workspace), so its path is
+  // resolved from the server's own module tree — independent of cwd. Activation
+  // is gated behind PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER (off by default) so
+  // rollout is a reversible env change; behavior is byte-identical when the
+  // flag is unset. When on, the existence check is the safety net — we never
+  // point git at a helper that is not present, and GIT_TERMINAL_PROMPT=0 makes
+  // git fail fast instead of prompting. See docs/deploy/secrets.md.
+  applyPaperclipGitHubCredentialHelperGate(env, {
+    flagEnv: process.env,
+    moduleDir: path.dirname(fileURLToPath(import.meta.url)),
+    cwd,
+  });
+  // GH-APP-7: materialize the agent-side `gh` wrapper as a `gh` shim in the
+  // run's scratch bin dir and prepend it to the child PATH so agent `gh` calls
+  // mint on-demand broker installation tokens instead of reading a shared
+  // long-lived PAT (SUP-14857). Gated behind PAPERCLIP_AGENT_GH_WRAPPER (off by
+  // default); byte-identical when unset. The gate is lane-agnostic: it reads the
+  // scratch dir from the run env and the base PATH from the argument, never
+  // process.env, and resolves the wrapper from the server install. See
+  // docs/deploy/secrets.md.
+  applyPaperclipGhWrapperGate(env, {
+    flagEnv: process.env,
+    moduleDir: path.dirname(fileURLToPath(import.meta.url)),
+    basePath: process.env.PATH ?? "",
+    cwd,
+    onWarn: (message) => {
+      void onLog("stderr", `paperclip-gh-wrapper: ${message}\n`);
+    },
+  });
   // runtimeEnv is only used to resolve the command path and log HOME below;
   // the child env is built inside runChildProcess from
   // sanitizeInheritedPaperclipEnv(process.env) + env, so a PAPERCLIP_API_KEY

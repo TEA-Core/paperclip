@@ -6,9 +6,17 @@ import {
   resolveGitHubToken,
   resolveGitHubTokenForRepo,
   resolveGitHubTokenCandidatesForRepo,
+  resolveAppInstallationToken,
+  resolveBrokerGitHubApp,
   isGitHubTokenResolution,
   appTokenCache,
+  GITHUB_APP_ID,
   GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+  FLEET_GITHUB_APP_ID,
+  FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+  GITHUB_APP_REGISTRY,
+  GitHubAppConfigurationError,
+  DEFAULT_GITHUB_APP,
 } from "../services/github-credential.js";
 import { GITHUB_PROBE_URL_BY_SCOPE } from "../routes/diagnostics.js";
 import type { Server } from "node:http";
@@ -587,6 +595,320 @@ describe("resolveGitHubToken — App installation token", () => {
     } finally {
       global.fetch = originalFetch;
       vi.useRealTimers();
+    }
+  });
+});
+
+describe("resolveAppInstallationToken — App identity selection", () => {
+  const company = "company-1";
+  const owner = "owner";
+  const repo = "repo";
+
+  beforeEach(() => {
+    mockSecretService.getByName.mockReset();
+    mockSecretService.resolveSecretValue.mockReset();
+    mockDb.select.mockReset();
+    appTokenCache.clear();
+  });
+
+  it("does not serve one App's cached token to a caller selecting a different App", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === "FLEET_APP_KEY") return { id: "fleet-key" };
+      if (name === "SECOND_APP_KEY") return { id: "second-key" };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    let mintCount = 0;
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn((input: string | URL) => {
+      const target = typeof input === "string" ? input : input.toString();
+      if (target.includes("/repos/owner/repo/installation")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ id: Number(FIXTURE_INSTALLATION_ID) }), { status: 200 }),
+        );
+      }
+      if (target.includes("/access_tokens")) {
+        mintCount += 1;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              token: `ghs_app_token_mint_${mintCount}`,
+              expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }) as any;
+
+    try {
+      const fleetApp = await resolveAppInstallationToken(
+        company,
+        mockSecretService,
+        owner,
+        repo,
+        undefined,
+        { appId: GITHUB_APP_ID, privateKeySecretName: "FLEET_APP_KEY" },
+      );
+      const secondApp = await resolveAppInstallationToken(
+        company,
+        mockSecretService,
+        owner,
+        repo,
+        undefined,
+        { appId: "9999001", privateKeySecretName: "SECOND_APP_KEY" },
+      );
+
+      expect(isGitHubTokenResolution(fleetApp)).toBe(true);
+      expect(isGitHubTokenResolution(secondApp)).toBe(true);
+      if (isGitHubTokenResolution(fleetApp) && isGitHubTokenResolution(secondApp)) {
+        // Two Apps on the same company/owner/repo each mint their own token —
+        // the second App did not reuse the first App's cache entry.
+        expect(fleetApp.token).toBe("ghs_app_token_mint_1");
+        expect(secondApp.token).toBe("ghs_app_token_mint_2");
+        expect(fleetApp.token).not.toBe(secondApp.token);
+        expect(secondApp.secretName).toBe("SECOND_APP_KEY");
+      }
+      expect(mintCount).toBe(2);
+
+      // Selecting the fleet App again is a cache hit — no additional mint.
+      const fleetAppAgain = await resolveAppInstallationToken(
+        company,
+        mockSecretService,
+        owner,
+        repo,
+        undefined,
+        { appId: GITHUB_APP_ID, privateKeySecretName: "FLEET_APP_KEY" },
+      );
+      if (isGitHubTokenResolution(fleetApp) && isGitHubTokenResolution(fleetAppAgain)) {
+        expect(fleetAppAgain.token).toBe(fleetApp.token);
+      }
+      expect(mintCount).toBe(2);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("does not serve a broad cached token to a caller requesting a narrowed permission set", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    let mintCount = 0;
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn((input: string | URL) => {
+      const target = typeof input === "string" ? input : input.toString();
+      if (target.includes("/repos/owner/repo/installation")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ id: Number(FIXTURE_INSTALLATION_ID) }), { status: 200 }),
+        );
+      }
+      if (target.includes("/access_tokens")) {
+        mintCount += 1;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              token: `ghs_perm_token_mint_${mintCount}`,
+              expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }) as any;
+
+    try {
+      // Broad: a permission-less caller mints and caches the broad token.
+      const broad = await resolveAppInstallationToken(
+        company,
+        mockSecretService,
+        owner,
+        repo,
+        undefined,
+        DEFAULT_GITHUB_APP,
+      );
+      expect(isGitHubTokenResolution(broad)).toBe(true);
+      expect(mintCount).toBe(1);
+
+      // Narrow: a narrowed permission set must mint its OWN token — it must NOT
+      // be served the broad token the permission-less caller cached for the same
+      // owner/repo. This is the regression the permissions-fingerprint key fixes.
+      const narrow = await resolveAppInstallationToken(
+        company,
+        mockSecretService,
+        owner,
+        repo,
+        undefined,
+        DEFAULT_GITHUB_APP,
+        { contents: "read" },
+      );
+      expect(isGitHubTokenResolution(narrow)).toBe(true);
+      if (isGitHubTokenResolution(broad) && isGitHubTokenResolution(narrow)) {
+        expect(broad.token).toBe("ghs_perm_token_mint_1");
+        expect(narrow.token).toBe("ghs_perm_token_mint_2");
+        expect(narrow.token).not.toBe(broad.token);
+      }
+      expect(mintCount).toBe(2);
+
+      // A repeat narrow request (same permission set) is a cache hit — no second narrow mint.
+      const narrowAgain = await resolveAppInstallationToken(
+        company,
+        mockSecretService,
+        owner,
+        repo,
+        undefined,
+        DEFAULT_GITHUB_APP,
+        { contents: "read" },
+      );
+      if (isGitHubTokenResolution(narrow) && isGitHubTokenResolution(narrowAgain)) {
+        expect(narrowAgain.token).toBe(narrow.token);
+      }
+      expect(mintCount).toBe(2);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("keys the token cache by the selected App id, including the default 4595159", async () => {
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) {
+        return { id: "app-key-1", name: GITHUB_APP_PRIVATE_KEY_SECRET_NAME };
+      }
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockResolvedValue(FIXTURE_PRIVATE_KEY);
+
+    const restoreFetch = mockAppFetchResponses([
+      {
+        url: "/app/installations",
+        response: [{ id: Number(FIXTURE_INSTALLATION_ID), account: { login: "tea-core" } }],
+      },
+      {
+        url: `/app/installations/${FIXTURE_INSTALLATION_ID}/access_tokens`,
+        response: {
+          token: FIXTURE_APP_TOKEN,
+          expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        },
+      },
+    ]);
+
+    try {
+      await resolveGitHubToken(mockDb, company);
+      const keys = [...appTokenCache.keys()];
+      expect(keys).toHaveLength(1);
+      expect(keys[0]).toContain(`${company}:${GITHUB_APP_ID}`);
+      expect(keys[0]).toContain(company);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it("never includes the private key or a minted token in log payloads for a non-default App", async () => {
+    const loggerModule = await import("../middleware/logger.js");
+    const loggerWarn = vi.mocked(loggerModule.logger.warn);
+    loggerWarn.mockClear();
+
+    mockSecretService.getByName.mockImplementation((_companyId, name) => {
+      if (name === "FLEET_APP_KEY") return { id: "fleet-key" };
+      if (name === "GITHUB_TOKEN") return { id: "secret-1", name: "GITHUB_TOKEN" };
+      return null;
+    });
+    mockSecretService.resolveSecretValue.mockImplementation((_companyId, secretId) => {
+      if (secretId === "fleet-key") return Promise.resolve(FIXTURE_PRIVATE_KEY);
+      return Promise.resolve(FIXTURE_TOKEN);
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn(() => Promise.reject(new Error("network failure"))) as any;
+
+    try {
+      const result = await resolveAppInstallationToken(
+        company,
+        mockSecretService,
+        owner,
+        repo,
+        undefined,
+        { appId: "9999001", privateKeySecretName: "FLEET_APP_KEY" },
+      );
+      expect(result).toBeNull();
+      const allCalls = loggerWarn.mock.calls;
+      expect(allCalls.length).toBeGreaterThan(0);
+      for (const call of allCalls) {
+        const serialized = JSON.stringify(call);
+        expect(serialized).not.toContain(FIXTURE_PRIVATE_KEY);
+        expect(serialized).not.toContain(FIXTURE_APP_TOKEN);
+        expect(serialized).not.toContain(FIXTURE_TOKEN);
+      }
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+});
+
+describe("resolveBrokerGitHubApp — configurable broker App descriptor", () => {
+  it("selects the default App when no name is given (absent, empty, or whitespace)", () => {
+    expect(resolveBrokerGitHubApp()).toBe(DEFAULT_GITHUB_APP);
+    expect(resolveBrokerGitHubApp("")).toBe(DEFAULT_GITHUB_APP);
+    expect(resolveBrokerGitHubApp("   ")).toBe(DEFAULT_GITHUB_APP);
+    expect(DEFAULT_GITHUB_APP).toEqual({
+      appId: GITHUB_APP_ID,
+      privateKeySecretName: GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+    });
+  });
+
+  it("selects the fleet App as a coherent pair — its id is always bound to its own secret", () => {
+    const fleet = resolveBrokerGitHubApp("fleet");
+    expect(fleet).toEqual({
+      appId: FLEET_GITHUB_APP_ID,
+      privateKeySecretName: FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME,
+    });
+    // The 401 from the issue is a fleet id signed with the default App's key; the fleet
+    // descriptor must never pair 4809618 with the default secret.
+    expect(fleet.privateKeySecretName).not.toBe(GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+  });
+
+  it("makes a mismatched appId/secret pairing impossible to express from any registry name", () => {
+    // Every registry entry keeps an App's id bound to that App's own key; no entry pairs
+    // 4595159 with the fleet key nor 4809618 with the default key.
+    for (const descriptor of Object.values(GITHUB_APP_REGISTRY)) {
+      if (descriptor.appId === FLEET_GITHUB_APP_ID) {
+        expect(descriptor.privateKeySecretName).toBe(FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+        expect(descriptor.privateKeySecretName).not.toBe(GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+      }
+      if (descriptor.appId === GITHUB_APP_ID) {
+        expect(descriptor.privateKeySecretName).toBe(GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+        expect(descriptor.privateKeySecretName).not.toBe(FLEET_GITHUB_APP_PRIVATE_KEY_SECRET_NAME);
+      }
+    }
+  });
+
+  it("throws a named error for an unknown App name instead of silently falling back to the default", () => {
+    expect(() => resolveBrokerGitHubApp("bogus")).toThrow(GitHubAppConfigurationError);
+    expect(() => resolveBrokerGitHubApp("bogus")).toThrow(
+      /Unknown GitHub App descriptor "bogus"; valid names: default, fleet/,
+    );
+    // A typo'd name must not resolve to the default App (which would mint under the wrong issuer).
+    // Names are matched case-sensitively, so "Default" is unknown.
+    expect(() => resolveBrokerGitHubApp("Default")).toThrow(GitHubAppConfigurationError);
+  });
+
+  it("rejects Object.prototype names instead of returning an inherited truthy property", () => {
+    // Indexing a plain-object registry by a user-supplied name would otherwise return
+    // Object.prototype members (toString, constructor, __proto__, ...) as a truthy
+    // non-descriptor, silently yielding undefined appId/privateKeySecretName. Each such
+    // name must fail fast with the same named error as any other unknown name.
+    for (const name of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
+      expect(() => resolveBrokerGitHubApp(name)).toThrow(GitHubAppConfigurationError);
+      expect(() => resolveBrokerGitHubApp(name)).toThrow(
+        /Unknown GitHub App descriptor ".*"; valid names: default, fleet/,
+      );
     }
   });
 });

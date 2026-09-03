@@ -58,6 +58,116 @@ GitHub repos for repo-only project workspaces and refreshing worktree base
 refs. See
 [Execution workspaces](../guides/board-operator/execution-workspaces-and-runtime-services.md#private-repositories-and-repo-only-project-workspaces).
 
+## Agent-Side GitHub App Git Credentials
+
+The server-side token above covers Paperclip's own git. For **agent-run** git
+and `gh`, Paperclip uses on-demand GitHub App installation tokens instead of a
+long-lived `GH_TOKEN`. Two scripts implement this; the canonical source lives
+in the repo under `scripts/`, and the server build ships the credential helper
+into `server/dist/scripts/` so it is present in the npm package and the Docker
+image:
+
+- `scripts/paperclip-github-credential-helper.sh` — a git credential helper.
+- `scripts/paperclip-gh-wrapper.sh` — a thin wrapper that mints a token and
+  runs the real `gh` with `GH_TOKEN` set for a single invocation.
+
+How it is wired: when a process-adapter run starts, Paperclip sets git's
+`GIT_CONFIG_*` environment variables (process-scoped, no file written) so that
+`credential.helper` is cleared and `credential.https://github.com.helper` (and
+`www.github.com`) point at the helper script. The helper path is resolved from
+the server's own install rather than the run's cwd: `server/dist/scripts/...`
+in a built package or image, falling back to the repo-root `scripts/` (dev /
+image) and, last, the run's `scripts/` (legacy). Activation is gated behind the
+`PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER` flag:
+
+### Rollout flag: `PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER`
+
+The git wiring is off by default. Set `PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER=on`
+on the **server** process to enable it; only the value `on` (case- and
+whitespace-insensitive) activates it. Any other value — including unset — leaves
+agent-run git behavior byte-identical to before the flag existed, which is what
+keeps rollout a reversible env change rather than a big-bang deploy.
+
+When the flag is `on` and the helper script is found:
+
+- Ambient/stale github.com credential helpers are cleared for that run (required
+  so the App token wins — a generic ambient helper shadows URL-scoped helpers);
+  non-github.com hosts are untouched.
+- `GIT_TERMINAL_PROMPT=0` is set so git fails fast and legibly instead of
+  hanging on an interactive prompt.
+- If the helper path cannot be resolved (no `dist/scripts` and no repo-root
+  `scripts/`), the wiring is a clean no-op and the run proceeds unchanged.
+
+When git needs github.com credentials, it invokes the helper. The helper
+determines the target `owner/repo` (from `PAPERCLIP_GIT_REPO`, the repo's
+`github.com` remote, or `PAPERCLIP_WORKSPACE_REPO_URL`), requests a short-lived
+installation token from the broker
+(`POST /api/agents/me/github/installation-tokens` using the run's
+`PAPERCLIP_API_URL` / `PAPERCLIP_API_KEY`), and returns it to git. `store` and
+`erase` are no-ops: the token is never persisted to disk or env.
+
+Security properties:
+
+- Ambient/stale credential helpers are cleared; only github.com is affected.
+- Each token is scoped to a single repo, the minimum required permissions
+  (`contents: write` for git; `PAPERCLIP_GIT_ACCESS` /
+  `PAPERCLIP_GH_PERMISSIONS` to override), and a short TTL.
+- Tokens are minted on demand and cached server-side; no token is written to
+  disk, logs, or the environment.
+
+This requires a fleet GitHub App to be configured on the server (with the target
+org/repos granted to it). The git wiring only activates when
+`PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER=on` **and** the helper script is present.
+Until the App is configured for a company:
+
+- The credential helper is a clean no-op for `get` (it emits no credential when the
+  broker reports `code=app_not_configured`), so git operations against github.com
+  fail fast and legibly under `GIT_TERMINAL_PROMPT=0` — no hang, no interactive prompt.
+- Ambient github.com credential helpers are cleared for that run (required so the App
+  token wins once configured — a generic ambient helper shadows URL-scoped helpers);
+  non-github.com hosts and non-repo workspaces are untouched.
+- The `gh` wrapper reports a legible "App not configured" error instead of exec'ing
+  `gh` without a token.
+
+Once the App is configured and the flag is `on`, the same wiring mints
+installation tokens automatically.
+
+### Rollout flag: `PAPERCLIP_AGENT_GH_WRAPPER`
+
+Separate from the git credential helper above, the `gh` wrapper is off by
+default. Set `PAPERCLIP_AGENT_GH_WRAPPER=on` on the **server** process to enable
+it; only the value `on` (case- and whitespace-insensitive) activates it. Any
+other value — including unset — leaves agent-run `gh` behavior byte-identical to
+before the flag existed, keeping rollout a reversible env change.
+
+When the flag is `on` and the run has a scratch directory, Paperclip:
+
+- resolves `scripts/paperclip-gh-wrapper.sh` from the server's own install
+  (`server/dist/scripts/...` in a built package or image, falling back to the
+  repo-root `scripts/` and, last, the run's `scripts/`) — never from the run's
+  cwd;
+- sets `PAPERCLIP_GH_REAL` to the real `gh` binary, resolved from the inherited
+  PATH *before* the shim is prepended; and
+- materializes a `gh` symlink at `<run-scratch>/bin/gh` pointing at the wrapper
+  and prepends that bin dir to the child `PATH`, so the agent's `gh` calls the
+  wrapper, which mints a short-lived installation token and execs the real `gh`
+  for that single invocation only.
+
+The shim lives in the run's scratch directory and is removed with the run. If
+there is no scratch directory, no real `gh` on PATH, or the wrapper script cannot
+be resolved, the gate is a clean no-op (a one-line notice is written to the run's
+stderr) and `gh` behaves exactly as before against `GH_TOKEN`.
+
+**Do not enable this until the fleet GitHub App has at least `checks: read` on
+the target repo.** The wrapper mints the token with the repo's baseline
+permissions, so anything `gh` needs that the App is not granted will fail. When
+the App's permission set is tightened, `statuses` must be downgraded to at least
+`read`, **not removed** — `gh` still needs to read check/status state.
+
+This requires a fleet GitHub App to be configured on the server. Until the App is
+configured for a company, the wrapper reports a legible "App not configured"
+error instead of exec'ing `gh` without a token.
+
 ## User-Specific Secrets
 
 User-specific secrets let a shared agent or project declare a slot such as

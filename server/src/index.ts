@@ -58,6 +58,7 @@ import {
   createCarrierPromotionSweepService,
   createCarrierStrandedSurfaceService,
   createDoneCloseLandingBackstopService,
+  createToastReadabilitySweepService,
   externalObjectService,
   executionWorkspaceService,
   heartbeatService,
@@ -74,6 +75,7 @@ import {
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createMergedOperatorMergeCardSweepService } from "./services/merged-operator-merge-cards.js";
+import { prDeliveryService } from "./services/pr-delivery.js";
 import { rotateOpenCodeLog } from "./services/opencode-log-rotation.js";
 import {
   armSweepLiveness,
@@ -1206,8 +1208,10 @@ export async function startServer(): Promise<StartedServer> {
       wakeup: heartbeat.wakeup,
     });
     const carrierPromotionSweep = createCarrierPromotionSweepService(db as any);
+    const prDelivery = prDeliveryService(db as any);
     const carrierOrphanJanitor = createCarrierOrphanJanitorService(db as any);
     const carrierStrandedSurface = createCarrierStrandedSurfaceService(db as any);
+    const toastReadability = createToastReadabilitySweepService(db as any);
     /** Fires one carrier promotion sweep on the heartbeat tick; logs when something was dispositioned, and the wrapper leaves a per-run liveness trace on every completion (SUP-14227). */
     const scheduleCarrierPromotionSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1253,6 +1257,16 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "carrier stranded surface failed");
         }), { name: "carrierStrandedSurface" });
     };
+    /** Fires one TOAST readability sweep on the heartbeat tick (SUP-14582): cadence is gated inside the service (default daily) so a non-due tick is a cheap no-op, and a disabled sweep skips the wrapper entirely, leaving the tick unchanged. */
+    const scheduleToastReadabilitySweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      if (toastReadability.disabled) return;
+      trackHeartbeatSchedulerWork(toastReadability
+        .sweep()
+        .catch((err) => {
+          logger.error({ err }, "toast readability sweep failed");
+        }), { name: "toastReadability" });
+    };
     const scheduleDoneCloseLandingBackstopSweep = () => {
       if (heartbeatSchedulerStopped) return;
       trackHeartbeatSchedulerWork(doneCloseLandingBackstop
@@ -1295,6 +1309,21 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "merged operator merge-card sweep failed");
         }), { name: "mergedOperatorMergeCard" });
+    };
+    /** Re-resolves recorded open delivery PRs against GitHub and flips them to `merged` once GitHub reports it, so the delivery predicate can read `merged_via_pr` (SUP-14645). */
+    const schedulePrMergeStateSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(prDelivery
+        .sweepMergeState()
+        .then((result) => {
+          if (result.flipped > 0) {
+            logger.info(result, "PR merge-state sweep flipped delivery pull requests to merged");
+          }
+          return result;
+        })
+        .catch((err) => {
+          logger.error({ err }, "PR merge-state sweep failed");
+        }), { name: "prMergeState" });
     };
     // Emit a periodic signal when the reaper inspects candidates but archives
     // none, so an inert reaper that skips every candidate is never fully silent.
@@ -1674,6 +1703,7 @@ export async function startServer(): Promise<StartedServer> {
         if (heartbeatSchedulerStopped) return;
         scheduleMergedPullRequestConfirmationSweep();
         scheduleMergedOperatorMergeCardSweep();
+        schedulePrMergeStateSweep();
         scheduleTerminalWorkspaceSweep();
         scheduleDoneCloseLandingBackstopSweep();
         scheduleCarrierPromotionSweep();
@@ -1682,6 +1712,7 @@ export async function startServer(): Promise<StartedServer> {
         scheduleEnvironmentLeaseCleanupSweep();
         scheduleCarrierOrphanJanitor();
         scheduleCarrierStrandedSurface();
+        scheduleToastReadabilitySweep();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines

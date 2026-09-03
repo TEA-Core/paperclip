@@ -1688,6 +1688,13 @@
       "when": 1788040969632,
       "tag": "0242_better_auth_account_issuer",
       "breakpoints": true
+    },
+    {
+      "idx": 241,
+      "version": "7",
+      "when": 1788040970632,
+      "tag": "0243_prune_execution_state_stale_stage_ids",
+      "breakpoints": true
     }
   ]
 }

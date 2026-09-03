@@ -50,6 +50,10 @@ function asBoolean(value: unknown) {
   return typeof value === "boolean" ? value : null;
 }
 
+function asNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function asNestedString(record: Record<string, unknown>, key: string, nestedKey: string) {
   const nested = asRecord(record[key]);
   return nested ? asString(nested[nestedKey]) : null;
@@ -201,6 +205,9 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
   const headSha = asNestedString(body, "head", "sha");
   const baseRef = asNestedString(body, "base", "ref");
   const reviewDecision = asString(body.review_decision);
+  const additions = asNumber(body.additions);
+  const deletions = asNumber(body.deletions);
+  const changedFiles = asNumber(body.changed_files);
 
   let statusKey = state;
   let statusLabel = state === "open" ? "Open" : state === "closed" ? "Closed" : "Unknown";
@@ -260,8 +267,12 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       ...(headSha ? { headSha } : {}),
       ...(baseRef ? { baseRef } : {}),
       ...(asString(body.merged_at) ? { merged_at: asString(body.merged_at) } : {}),
+      ...(asString(body.merge_commit_sha) ? { merge_commit_sha: asString(body.merge_commit_sha) } : {}),
       ...(asString(body.closed_at) ? { closed_at: asString(body.closed_at) } : {}),
       ...(reviewDecision ? { reviewDecision } : {}),
+      ...(additions != null ? { additions } : {}),
+      ...(deletions != null ? { deletions } : {}),
+      ...(changedFiles != null ? { changed_files: changedFiles } : {}),
     },
   };
 }

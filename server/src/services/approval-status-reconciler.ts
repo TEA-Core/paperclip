@@ -2,9 +2,10 @@ import type { Db } from "@paperclipai/db";
 import {
   externalObjectMentions,
   externalObjects,
+  issueExecutionDecisions,
   issues,
 } from "@paperclipai/db";
-import { and, ne, sql } from "drizzle-orm";
+import { and, desc, eq, ne, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import {
   resolveGitHubTokenCandidatesForRepo,
@@ -15,9 +16,9 @@ import {
   postPullRequestComment,
   publishApprovalStatus,
   resolveLinkedPullRequestsWithState,
+  type ApprovalCandidateAnchor,
   type LinkedPullRequest,
 } from "./merge-arming.js";
-import { evaluateStageIntegrity } from "./stage-integrity.js";
 
 // SUP-13535. The paperclip/approved commit status is written exactly once, on
 // the PR head that existed when the card was approved. When that head later
@@ -39,8 +40,15 @@ import { evaluateStageIntegrity } from "./stage-integrity.js";
 //   - Guard A (SUP-13714): the live head is only re-published when the PR's
 //     diff-vs-base is unchanged in substance from the head that was approved
 //     (exec-CTO ruling). The approval transition persists the certified head
-//     SHA in executionState.approvalStatus.publishedHeadSha. When the live
-//     head differs, the PR's base commit is resolved and the three-dot compare
+//     SHA: publishedHeadSha when the stamp was written, and — since SUP-14715
+//     D-B — approvedHeadSha on a skipped/failed first publish, so a skipped
+//     first publish leaves a real anchor this service can recover instead of a
+//     permanent guard-a:no-approved-head dead-end. The anchor head is read from
+//     publishedHeadSha, falling back to approvedHeadSha; when it came from
+//     approvedHeadSha the delegated publish below enforces the ADR-091 D1
+//     delivery-identity gate (a first publish), a re-publish does not. When the
+//     live head differs, the PR's base commit is resolved and the three-dot
+//     compare
 //     (merge-base-resolved) is fetched at each head; the per-file blob SHAs of
 //     the two diffs-vs-base are compared. This is what makes update-branch and
 //     rebase inert (the head tree gains the base's new files, but the PR's own
@@ -49,6 +57,20 @@ import { evaluateStageIntegrity } from "./stage-integrity.js";
 //     (failure, missing file list, truncated), or any map difference refuses
 //     the re-publish — the paperclip/approved stamp is an authorization, and
 //     may only certify content that was actually reviewed.
+//
+// SUP-14602. When the approval transition itself was skipped as ambiguous
+// (two linked open PRs), no publishedHeadSha was ever persisted and Guard A
+// could never fire. The producer now persists the per-candidate approval-time
+// heads in executionState.approvalStatus.pendingCandidates. When
+// publishedHeadSha is absent but pendingCandidates is present, the reconciler
+// live-checks every candidate: exactly one still open and unmerged selects
+// that candidate's headShaAtApproval as the approved head and the UNMODIFIED
+// Guard A diff-vs-base comparison runs against it. Every other shape — zero
+// open, still more than one open, an unverifiable live state, or a candidate
+// without a persisted anchor — refuses with a recorded reason and zero writes.
+// A successful recovery re-publish persists publishedHeadSha for that head so
+// the normal path takes over; the idempotency pre-check keeps re-runs at zero
+// writes.
 //
 // The write itself is delegated to publishApprovalStatus() from merge-arming.
 // The TOCTOU window (the delegated write re-resolves the head live) is closed
@@ -86,10 +108,20 @@ const DEFAULT_MAX_CANDIDATES = 20;
 const DEFAULT_INITIAL_DELAY_MS = 60 * 1000;
 const MAX_DETAIL_ENTRIES = 25;
 const USER_AGENT = "paperclip-approval-status-reconciler";
+// SUP-14747: bound on the PR-timeline fan-out for the pre-D-B anchor backfill.
+const MAX_BACKFILL_TIMELINE_PAGES = 5;
+const BACKFILL_TIMELINE_PER_PAGE = 100;
 
 export interface ApprovalStatusReconcilerTickOptions {
   /** Upper bound on candidates handled in one tick. Excess is reported as `capped`. */
   maxCandidates?: number;
+  /**
+   * SUP-14736. Resume the scan after this candidate identifier (keyset
+   * cursor), so consecutive ticks advance past the window instead of
+   * re-scanning the same lexicographic head forever. Omit / null to start
+   * from the beginning of the candidate set.
+   */
+  resumeAfter?: string | null;
 }
 
 export interface ApprovalStatusReconcilerTickSummary {
@@ -108,28 +140,44 @@ export interface ApprovalStatusReconcilerTickSummary {
   /** Candidates dropped by the per-tick cap. */
   capped: number;
   /**
+   * SUP-14736. The candidate identifier to pass back as `resumeAfter` on the
+   * next tick so the scan advances. Null when this tick reached the end of
+   * the candidate set — the next tick wraps around to the beginning.
+   */
+  nextScanKey: string | null;
+  /**
    * SUP-14049: voids observed this tick whose PR warning was ensured
    * (posted now, or already present from an earlier tick).
    */
   voidWarnings: number;
   /** Bounded "IDENTIFIER: detail" void-warning outcomes. */
   voidWarningDetails: string[];
+  /**
+   * SUP-14747: stranded pre-D-B first-publish cards whose approval anchor was
+   * recovered from the PR timeline this tick (the delegated first publish then
+   * proceeds; a backfilled card also counts under `republished` when it stamps).
+   */
+  backfilled: number;
+  /** Bounded "IDENTIFIER: detail" backfill outcomes. */
+  backfilledDetails: string[];
 }
 
-interface CandidateRow {
+export interface CandidateRow {
   id: string;
   companyId: string;
   identifier: string | null;
   createdByAgentId: string | null;
   createdByUserId: string | null;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
   executionState: Record<string, unknown> | null;
   executionPolicy: Record<string, unknown> | null;
 }
 
 type CandidateResult =
-  | { kind: "republished"; detail: string }
-  | { kind: "skipped"; reason: string; detail: string; voidWarning?: "posted" | "already-posted" }
-  | { kind: "failed"; detail: string };
+  | { kind: "republished"; detail: string; backfilledDetail?: string }
+  | { kind: "skipped"; reason: string; detail: string; backfilledDetail?: string; voidWarning?: "posted" | "already-posted" }
+  | { kind: "failed"; detail: string; backfilledDetail?: string };
 
 interface GitHubReadOutcome {
   ok: boolean;
@@ -139,26 +187,206 @@ interface GitHubReadOutcome {
 }
 
 interface ApprovedHeadRecord {
-  publishedHeadSha: string;
+  /** The anchor head the card's approval certified (publishedHeadSha, or the D-B approvedHeadSha fallback). */
+  anchorHeadSha: string;
   publishedAt?: string;
+  /**
+   * SUP-14715 D-B: true when the anchor head came from
+   * approvalStatus.approvedHeadSha — a head the approval certified but whose
+   * paperclip/approved status was never written (a skipped/failed FIRST
+   * publish). The delegated publish below is then a first publish and must
+   * enforce the ADR-091 D1 delivery-identity gate, because that gate never
+   * successfully ran for this head. False when the anchor is publishedHeadSha
+   * (a re-publish that certifies by content identity and leaves the gate
+   * unset, exactly as before).
+   */
+  firstPublish: boolean;
 }
 
 /**
- * The approved head persisted by the approval transition
- * (executionState.approvalStatus.publishedHeadSha), or null when the card was
- * approved before SUP-13714 shipped or the record was never written. A null
- * here is Guard A's approved-head-unrecoverable case: the reconciler refuses
- * to re-publish, because it cannot prove the live head was ever reviewed.
+ * The approved head the card's approval certified, or null when the card was
+ * approved before SUP-13714 shipped / the SUP-14715 D-B anchor, or the record
+ * was never written. A null here is Guard A's approved-head-unrecoverable case:
+ * the reconciler refuses to re-publish, because it cannot prove the live head
+ * was ever reviewed.
+ *
+ * Two anchors are distinguished (SUP-14715 D-B): publishedHeadSha (the status
+ * was actually written here — a re-publish, firstPublish: false) and, when that
+ * is absent, approvedHeadSha (certified at approval time but never published —
+ * a first publish, firstPublish: true). Guard A's content-identity compare is
+ * identical in both cases; only the delegated publish's delivery-identity gate
+ * differs.
  */
 function readApprovedHead(state: Record<string, unknown> | null | undefined): ApprovedHeadRecord | null {
   const approvalStatus = state?.approvalStatus as Record<string, unknown> | null | undefined;
   if (!approvalStatus || typeof approvalStatus !== "object") return null;
+
   const publishedHeadSha = approvalStatus.publishedHeadSha;
-  if (typeof publishedHeadSha !== "string" || publishedHeadSha.length === 0) return null;
-  return {
-    publishedHeadSha,
-    publishedAt: typeof approvalStatus.publishedAt === "string" ? approvalStatus.publishedAt : undefined,
-  };
+  if (typeof publishedHeadSha === "string" && publishedHeadSha.length > 0) {
+    return {
+      anchorHeadSha: publishedHeadSha,
+      publishedAt: typeof approvalStatus.publishedAt === "string" ? approvalStatus.publishedAt : undefined,
+      firstPublish: false,
+    };
+  }
+
+  const approvedHeadSha = approvalStatus.approvedHeadSha;
+  if (typeof approvedHeadSha === "string" && approvedHeadSha.length > 0) {
+    return {
+      anchorHeadSha: approvedHeadSha,
+      publishedAt: typeof approvalStatus.approvedAt === "string" ? approvalStatus.approvedAt : undefined,
+      firstPublish: true,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * SUP-14602: the pending candidate anchors persisted by an ambiguous
+ * approval-time skip (executionState.approvalStatus.pendingCandidates). Any
+ * entry that does not carry a positive owner/repo/number is dropped — a
+ * partially-shaped record is indistinguishable from a tampered one and must
+ * fail closed, not be inferred.
+ */
+function readPendingCandidates(state: Record<string, unknown> | null | undefined): ApprovalCandidateAnchor[] {
+  const approvalStatus = state?.approvalStatus as Record<string, unknown> | null | undefined;
+  if (!approvalStatus || typeof approvalStatus !== "object") return [];
+  const raw = approvalStatus.pendingCandidates;
+  if (!Array.isArray(raw)) return [];
+  const out: ApprovalCandidateAnchor[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (
+      typeof record.owner !== "string" ||
+      typeof record.repo !== "string" ||
+      record.owner.length === 0 ||
+      record.repo.length === 0 ||
+      typeof record.number !== "number" ||
+      !Number.isInteger(record.number)
+    ) {
+      continue;
+    }
+    const key = `${record.owner.toLowerCase()}/${record.repo.toLowerCase()}#${record.number}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      owner: record.owner,
+      repo: record.repo,
+      number: record.number,
+      headShaAtApproval:
+        typeof record.headShaAtApproval === "string" && record.headShaAtApproval.length > 0
+          ? record.headShaAtApproval
+          : null,
+    });
+  }
+  return out;
+}
+
+/** Stable, case-insensitive identity key for a candidate PR (used to compare candidate sets). */
+function candidateKey(pr: { owner: string; repo: string; number: number }): string {
+  return `${pr.owner.toLowerCase()}/${pr.repo.toLowerCase()}#${pr.number}`;
+}
+
+/** Human-readable owner/repo#number label for a candidate PR, used in skip/fail reason strings. */
+function candidateDisplayName(pr: { owner: string; repo: string; number: number }): string {
+  return `${pr.owner}/${pr.repo}#${pr.number}`;
+}
+
+type PendingCandidateSelection =
+  | { anchor: string }
+  | { reason: string; detail: string };
+
+/**
+ * SUP-14602: pick the certified head for a card that was approved on the
+ * skipped:ambiguous path. Exactly one pending candidate must be positively
+ * proven open and unmerged, and it must be the target itself — a certified
+ * head from a different PR must never be paired with the target's live
+ * diff. The target has already been live-verified open
+ * and unmerged earlier in the tick, so only the other candidates are re-read.
+ * Anything the live read cannot positively prove refuses with a recorded
+ * reason — zero writes.
+ */
+async function selectOpenPendingCandidate(
+  db: Db,
+  row: CandidateRow,
+  pending: ApprovalCandidateAnchor[],
+  target: LinkedPullRequest,
+): Promise<PendingCandidateSelection> {
+  const targetKey = candidateKey(target);
+  const openUnmerged: ApprovalCandidateAnchor[] = [];
+
+  for (const candidate of pending) {
+    if (candidateKey(candidate) === targetKey) {
+      openUnmerged.push(candidate);
+      continue;
+    }
+    const read = await ghReadJson(
+      db,
+      row.companyId,
+      candidate.owner,
+      candidate.repo,
+      `/pulls/${candidate.number}`,
+    );
+    const body = (read.body ?? null) as Record<string, unknown> | null;
+    const state = typeof body?.state === "string" ? (body.state as string) : null;
+    if (!read.ok || state === null) {
+      const suffix = read.message ? `${read.message}`.trim() : "";
+      return {
+        reason: "guard-a:ambiguity-unresolved",
+        detail:
+          `guard-a: live state of pending candidate ${candidateDisplayName(candidate)} is ` +
+          `unverifiable (HTTP ${read.status}${suffix ? ` ${suffix}` : ""}); ` +
+          `cannot prove exactly one candidate open; refusing`,
+      };
+    }
+    if (body?.merged === true || state !== "open") continue;
+    openUnmerged.push(candidate);
+  }
+
+  if (openUnmerged.length === 0) {
+    return {
+      reason: "guard-a:candidate-resolved",
+      detail:
+        `guard-a: all ${pending.length} pending candidate(s) are closed or merged; ` +
+        `nothing was approved that can be recovered — refusing to stamp unreviewed content`,
+    };
+  }
+  if (openUnmerged.length > 1) {
+    return {
+      reason: "guard-a:ambiguity-unresolved",
+      detail:
+        `guard-a: ${openUnmerged.length} pending candidates still open ` +
+        `(${openUnmerged.map(candidateDisplayName).join(", ")}); refusing until a human or ` +
+        `agent closes the duplicate PR`,
+    };
+  }
+  const surviving = openUnmerged[0]!;
+  if (candidateKey(surviving) !== targetKey) {
+    // The live target is open but was never an approval-time candidate, while
+    // exactly one certified candidate is still open. Pairing that candidate's
+    // certified head with the target's live diff would compare two different
+    // PRs — refuse with a recorded reason instead of a misleading
+    // changed-blob / void warning on the target.
+    return {
+      reason: "guard-a:candidate-not-target",
+      detail:
+        `guard-a: the only open pending candidate (${candidateDisplayName(surviving)}) is not the ` +
+        `live target (${candidateDisplayName(target)}); its certified head belongs to a different PR; ` +
+        `refusing to pair a foreign approved head`,
+    };
+  }
+  if (!surviving.headShaAtApproval) {
+    return {
+      reason: "guard-a:no-approved-head",
+      detail:
+        `guard-a: surviving candidate ${candidateDisplayName(surviving)} has no persisted ` +
+        `approval-time head anchor; refusing to re-publish unverified head`,
+    };
+  }
+  return { anchor: surviving.headShaAtApproval };
 }
 
 /**
@@ -363,10 +591,32 @@ async function postApprovalVoidWarning(
 
 /**
  * Cards whose recorded approval decision is still `approved`, that are not
- * cancelled, and that carry at least one linked GitHub PR. The trigger is the
- * control-plane record alone — nothing is inferred from commits or GitHub.
+ * cancelled, and that carry a linked GitHub PR the reconciler can still act
+ * on. The trigger is the control-plane record alone — nothing is inferred from
+ * commits or GitHub.
+ *
+ * SUP-14736: two fixes to `findApprovalCandidates`, which had been permanently
+ * wedged on the lexicographic first N candidates:
+ *
+ *   - The linked-PR EXISTS now requires at least one linked, non-draft PR whose
+ *     cached state is `open` or still unhydrated (null). Cards whose linked PRs
+ *     are all closed/merged were selected on every tick only to be disposed of
+ *     as `no-open-pr` after a pointless GitHub fan-out; nothing about a closed
+ *     PR ever changes, so they never left the set and consumed the whole window.
+ *     This mirrors the in-memory `resolveLinkedPullRequestsWithState` filter
+ *     (draft PRs are dropped there too) so the SQL set and the in-memory set
+ *     agree on which cards can act.
+ *   - A keyset cursor (`afterIdentifier`) pages the scan forward. `issues.identifier`
+ *     is globally unique, so `identifier > afterIdentifier ORDER BY identifier`
+ *     advances a bounded window across ticks instead of re-reading the same dead
+ *     head. When a tick reaches the end of the set the caller passes null to wrap
+ *     around, giving a round-robin over the live candidate set.
  */
-async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateRow[]> {
+async function findApprovalCandidates(
+  db: Db,
+  limit: number,
+  afterIdentifier: string | null = null,
+): Promise<CandidateRow[]> {
   return db
     .select({
       id: issues.id,
@@ -374,6 +624,8 @@ async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateR
       identifier: issues.identifier,
       createdByAgentId: issues.createdByAgentId,
       createdByUserId: issues.createdByUserId,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
       executionState: issues.executionState,
       executionPolicy: issues.executionPolicy,
     })
@@ -391,18 +643,740 @@ async function findApprovalCandidates(db: Db, limit: number): Promise<CandidateR
             and ${externalObjectMentions.sourceIssueId} = ${issues.id}
             and ${externalObjectMentions.objectType} = 'pull_request'
             and ${externalObjects.providerKey} = 'github'
+            and (${externalObjects.data} ->> 'state' = 'open'
+              or ${externalObjects.data} ->> 'state' is null)
+            and ${externalObjects.data} ->> 'draft' is distinct from 'true'
         ))`,
+        afterIdentifier != null ? sql`${issues.identifier} > ${afterIdentifier}` : undefined,
       ),
     )
     .orderBy(issues.identifier)
     .limit(limit);
 }
 
+/**
+ * ADR-073 / ADR-092 stage-integrity audit of the recorded approval. Returns a
+ * skip verdict when the "approved" record is not backed by a real, non-self
+ * decision: an auto-skipped review stage writes no decision row and lands in
+ * skippedStageIds, so it must never be treated as an approval. The gated
+ * principal is the resolved return assignee (ADR-092 D3):
+ * policy.returnAssigneeAgentId ?? state.returnAssignee ?? state.deliveryAuthor ??
+ * createdByAgentId ?? (unresolvable — refused under guard-b:return-assignee-unresolved).
+ */
+export async function evaluateStageIntegrity(
+  db: Db,
+  row: CandidateRow,
+): Promise<{ reason: string; detail: string } | null> {
+  const state: Record<string, unknown> = row.executionState ?? {};
+  const policy: Record<string, unknown> = row.executionPolicy ?? {};
+
+  const skippedStageIds = Array.isArray(state.skippedStageIds)
+    ? (state.skippedStageIds as unknown[]).filter((s): s is string => typeof s === "string")
+    : [];
+  if (skippedStageIds.length > 0) {
+    return {
+      reason: "guard-b:skipped-stage",
+      detail: `skipped stages present: ${skippedStageIds.join(", ")}`,
+    };
+  }
+
+  const policyStageIds = new Set(
+    (Array.isArray(policy.stages)
+      ? (policy.stages as Array<Record<string, unknown> | null | undefined>)
+      : []
+    )
+      .map((stage) => (stage && typeof stage.id === "string" ? stage.id : null))
+      .filter((id): id is string => id !== null),
+  );
+
+  const completedStageIds = Array.isArray(state.completedStageIds)
+    ? (state.completedStageIds as unknown[]).filter((s): s is string => typeof s === "string")
+    : [];
+  if (completedStageIds.length === 0) {
+    return {
+      reason: "guard-b:no-completed-stage",
+      detail: "no completed stages recorded in executionState",
+    };
+  }
+  for (const stageId of completedStageIds) {
+    if (!policyStageIds.has(stageId)) {
+      return {
+        reason: "guard-b:stage-not-in-policy",
+        detail: `completed stage ${stageId} is not in executionPolicy.stages`,
+      };
+    }
+  }
+
+  const decisions = await db
+    .select({
+      stageId: issueExecutionDecisions.stageId,
+      actorAgentId: issueExecutionDecisions.actorAgentId,
+      actorUserId: issueExecutionDecisions.actorUserId,
+      createdAt: issueExecutionDecisions.createdAt,
+    })
+    .from(issueExecutionDecisions)
+    .where(
+      and(
+        eq(issueExecutionDecisions.issueId, row.id),
+        eq(issueExecutionDecisions.companyId, row.companyId),
+      ),
+    );
+
+  const latestByStage = new Map<string, { actorAgentId: string | null; actorUserId: string | null; createdAt: Date }>();
+  for (const decision of decisions) {
+    const existing = latestByStage.get(decision.stageId);
+    if (!existing || decision.createdAt.getTime() >= existing.createdAt.getTime()) {
+      latestByStage.set(decision.stageId, {
+        actorAgentId: decision.actorAgentId,
+        actorUserId: decision.actorUserId,
+        createdAt: decision.createdAt,
+      });
+    }
+  }
+  for (const stageId of completedStageIds) {
+    if (!latestByStage.has(stageId)) {
+      return {
+        reason: "guard-b:stage-without-decision",
+        detail: `completed stage ${stageId} has no issue_execution_decisions row`,
+      };
+    }
+  }
+
+  const forbiddenAgents = new Set<string>();
+  const forbiddenUsers = new Set<string>();
+  if (typeof policy.returnAssigneeAgentId === "string" && policy.returnAssigneeAgentId) {
+    forbiddenAgents.add(policy.returnAssigneeAgentId);
+  } else {
+    const returnAssignee = state.returnAssignee as
+      | { type?: unknown; agentId?: unknown; userId?: unknown }
+      | null
+      | undefined;
+    if (returnAssignee && typeof returnAssignee === "object") {
+      if (returnAssignee.type === "agent" && typeof returnAssignee.agentId === "string") {
+        forbiddenAgents.add(returnAssignee.agentId);
+      } else if (returnAssignee.type === "user" && typeof returnAssignee.userId === "string") {
+        forbiddenUsers.add(returnAssignee.userId);
+      }
+    }
+    if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
+      const deliveryAuthor = state.deliveryAuthor as
+        | { type?: unknown; agentId?: unknown; userId?: unknown }
+        | null
+        | undefined;
+      if (deliveryAuthor && typeof deliveryAuthor === "object") {
+        if (deliveryAuthor.type === "agent" && typeof deliveryAuthor.agentId === "string") {
+          forbiddenAgents.add(deliveryAuthor.agentId);
+        } else if (deliveryAuthor.type === "user" && typeof deliveryAuthor.userId === "string") {
+          forbiddenUsers.add(deliveryAuthor.userId);
+        }
+      }
+    }
+    if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
+      if (row.createdByAgentId) forbiddenAgents.add(row.createdByAgentId);
+    }
+    if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
+      return {
+        reason: "guard-b:return-assignee-unresolved",
+        detail: "no return assignee, delivery author, or creator agent recorded",
+      };
+    }
+  }
+
+  for (const stageId of completedStageIds) {
+    const latest = latestByStage.get(stageId)!;
+    if ((latest.actorAgentId && forbiddenAgents.has(latest.actorAgentId)) ||
+        (latest.actorUserId && forbiddenUsers.has(latest.actorUserId))) {
+      return {
+        reason: "guard-b:decision-by-return-assignee",
+        detail: `stage ${stageId} decided by the resolved return assignee`,
+      };
+    }
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// SUP-14747 (D-E): pre-D-B approval-anchor backfill.
+//
+// A first publish that ran before SUP-14715 D-B landed (or whose D-B write
+// failed) leaves no publishedHeadSha and no approvedHeadSha — a stranded card
+// that the Guard A no-approved-head dead-end can never recover. The approval
+// itself is still recorded (issue_execution_decisions), and the PR's head at
+// approval time is derivable from the PR timeline. This recovers the lost D-B
+// anchor so the UNMODIFIED first-publish path below can certify it with the
+// ADR-091 D1 delivery-identity gate enforced.
+//
+// The anchor is the last head-mutating event (committed / head_ref_force_pushed)
+// at or before the approval decision's createdAt — the head that was actually
+// reviewed. Fail-closed invariant: the backfill only writes when that head
+// equals the live PR head. A head that moved after approval is refused (the
+// reviewed code is no longer the head), leaving the card stranded for re-review.
+// Any unverifiable timeline (read failure, truncation, unparseable event, or no
+// head-mutating event at/before the approval) is a recorded refusal, zero writes.
+// ---------------------------------------------------------------------------
+
+type HeadEvidence =
+  | { kind: "force_pushed"; sha: string; timeMs: number }
+  | { kind: "committed"; sha: string }
+  | { kind: "unparseable" };
+
+/**
+ * Extract a head-mutating event's evidence. `head_ref_force_pushed` events carry
+ * a server-recorded `created_at` (the moment the push reached GitHub) and are the
+ * only events trusted to place the head "at or before the approval time".
+ * `committed` events carry only client-set `committer.date` / `author.date` and
+ * NO server `created_at` — the API returns none for them, and GitHub orders the
+ * timeline by commit timestamp, not push time — so they are recorded but never
+ * trusted to place the head: a head provable only through committed events is
+ * refused as unverifiable (the backfill-committed-event-timing review finding). A
+ * head-mutating event that cannot be placed (a force-push missing its
+ * `created_at`/`commit_id`, a commit missing its sha) is `unparseable` — a
+ * fail-closed refusal, never a silent skip. Non head-mutating events return null.
+ */
+function extractHeadEvidence(event: Record<string, unknown>): HeadEvidence | null {
+  const kind = typeof event.event === "string" ? event.event : null;
+  if (kind === "head_ref_force_pushed") {
+    const sha =
+      typeof event.commit_id === "string" && event.commit_id.length > 0 ? event.commit_id : null;
+    const createdStr = typeof event.created_at === "string" ? event.created_at : null;
+    const timeMs = createdStr ? Date.parse(createdStr) : NaN;
+    return sha && !Number.isNaN(timeMs) ? { kind: "force_pushed", sha, timeMs } : { kind: "unparseable" };
+  }
+  if (kind === "committed") {
+    const sha = typeof event.sha === "string" && event.sha.length > 0 ? event.sha : null;
+    // No server timestamp: the sha is recorded, but the event cannot place the
+    // head at a trustworthy time.
+    return sha ? { kind: "committed", sha } : { kind: "unparseable" };
+  }
+  return null;
+}
+
+type TimelineHeadEvents =
+  | { kind: "ok"; headAtApproval: string | null; sawCommittedHeadEvent: boolean; sawPostApprovalForcePush: boolean }
+  | { kind: "truncated"; headAtApproval: string | null; sawCommittedHeadEvent: boolean; sawPostApprovalForcePush: boolean }
+  | { kind: "failed"; detail: string }
+  | { kind: "unparseable"; detail: string };
+
+/**
+ * Fetch the PR timeline and recover the verified head-at-approval: the newest
+ * `head_ref_force_pushed` event whose server-recorded `created_at` is at or
+ * before `cutoffMs` (in chronological order — the PR timeline's own order). The
+ * loop reads oldest-first and stops as soon as it reaches a force-push past the
+ * approval time, so every at/before-approval push is already captured. `committed`
+ * events are recorded (`sawCommittedHeadEvent`) but never trusted to place the
+ * head. A bounded fan-out that exhausts its pages without reaching the end of the
+ * timeline (or passing the approval time via a force-push) is reported
+ * `truncated` so the caller refuses rather than anchoring a head it cannot prove.
+ */
+async function readPrTimelineHeadEvents(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  number: number,
+  cutoffMs: number,
+): Promise<TimelineHeadEvents> {
+  let headAtApproval: string | null = null;
+  let sawCommittedHeadEvent = false;
+  let sawPostApprovalForcePush = false;
+  let complete = false;
+
+  outer: for (let page = 1; page <= MAX_BACKFILL_TIMELINE_PAGES; page++) {
+    const read = await ghReadJson(
+      db,
+      companyId,
+      owner,
+      repo,
+      `/issues/${number}/timeline?per_page=${BACKFILL_TIMELINE_PER_PAGE}&page=${page}`,
+    );
+    if (!read.ok) {
+      return { kind: "failed", detail: `timeline-read-failed: HTTP ${read.status} ${read.message ?? ""}`.trim() };
+    }
+    const items = Array.isArray(read.body) ? (read.body as Array<Record<string, unknown>>) : null;
+    if (!items) {
+      return { kind: "failed", detail: "timeline-read-failed: unexpected non-array body" };
+    }
+    for (const event of items) {
+      if (!event || typeof event !== "object") continue;
+      const info = extractHeadEvidence(event);
+      if (info === null) continue;
+      if (info.kind === "unparseable") {
+        // A structurally malformed head-mutating event is DETERMINISTIC, not a
+        // transient read failure. Report it as its own outcome so the caller can
+        // apply a different caching policy than the HTTP/network `failed` case
+        // (backfill-unparseable-event-misclassified-transient).
+        return {
+          kind: "unparseable",
+          detail: "unparseable head-mutating event; refusing to anchor",
+        };
+      }
+      if (info.kind === "committed") {
+        sawCommittedHeadEvent = true;
+        continue;
+      }
+      // force_pushed — the only events with a trustworthy server timestamp.
+      if (info.timeMs <= cutoffMs) {
+        headAtApproval = info.sha;
+      } else {
+        sawPostApprovalForcePush = true;
+        complete = true;
+        break outer;
+      }
+    }
+    if (items.length < BACKFILL_TIMELINE_PER_PAGE) {
+      complete = true;
+      break;
+    }
+  }
+
+  return complete
+    ? { kind: "ok", headAtApproval, sawCommittedHeadEvent, sawPostApprovalForcePush }
+    : { kind: "truncated", headAtApproval, sawCommittedHeadEvent, sawPostApprovalForcePush };
+}
+
+type ShaServerTimestampResult =
+  | { ok: true; minTimestampMs: number }
+  | { ok: false; transient: boolean; detail: string };
+
+/**
+ * SUP-14844 (round 1): read `/commits/{sha}/check-runs` and return the minimum
+ * server-assigned `created_at` across the check runs GitHub triggered on this
+ * PR's own head branch (`check_suite.head_branch === headRefName`). That is the
+ * server-attested evidence that the sha existed on this branch at/before that
+ * time.
+ *
+ * Two guards keep the proof honest (round-1 review findings):
+ *   - `check_run.started_at` is CLIENT-supplied and is deliberately ignored;
+ *     only the server-assigned `check_run.created_at` counts.
+ *   - A check run only counts as THIS PR's evidence when its check suite's head
+ *     branch equals the card's PR head ref. A commit reachable from another
+ *     branch otherwise lends its older, unrelated cross-branch check-run
+ *     timestamps to this sha and would wrongly anchor it (the laundering trace:
+ *     head A approved, branch fast-forwarded to a pre-existing sha B whose CI
+ *     ran on a different branch before the approval).
+ *
+ * A read failure (HTTP / network error) or an unreadable head ref is TRANSIENT
+ * (`transient: true`): reported as a skip, not persisted, so the next tick
+ * retries. The ABSENCE of any branch-bound server-timed evidence is a
+ * DETERMINISTIC refusal (`transient: false`) — the check runs for a given sha on
+ * a given branch are immutable history, so it is persisted as a stable refusal.
+ */
+async function readShaServerTimestamp(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  sha: string,
+  headRefName: string | null,
+): Promise<ShaServerTimestampResult> {
+  // Without the PR's head ref we cannot prove a check run belongs to this
+  // branch, so the binding cannot be established. Treat as transient: the
+  // cached head ref may populate on the next external-object refresh.
+  if (headRefName === null || headRefName === "") {
+    return {
+      ok: false,
+      transient: true,
+      detail: "sha-branch-binding: PR head ref is unavailable; cannot establish branch-bound check-run evidence",
+    };
+  }
+
+  const checkRunsRead = await ghReadJson(
+    db,
+    companyId,
+    owner,
+    repo,
+    `/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`,
+  );
+  if (!checkRunsRead.ok) {
+    return {
+      ok: false,
+      transient: true,
+      detail: `check-runs-read-failed: HTTP ${checkRunsRead.status} ${checkRunsRead.message ?? ""}`.trim(),
+    };
+  }
+
+  let minTimestampMs: number | null = null;
+  let sawBranchBoundRun = false;
+
+  const checkRunsBody = checkRunsRead.body as Record<string, unknown> | null;
+  const checkRuns = Array.isArray(checkRunsBody?.check_runs)
+    ? (checkRunsBody!.check_runs as Array<Record<string, unknown>>)
+    : [];
+  for (const run of checkRuns) {
+    const suite = run.check_suite as Record<string, unknown> | null | undefined;
+    const runHeadBranch = suite && typeof suite.head_branch === "string" ? suite.head_branch : null;
+    if (runHeadBranch !== headRefName) continue;
+    sawBranchBoundRun = true;
+    // Only the server-assigned created_at counts; started_at is client-supplied.
+    const createdAt = typeof run.created_at === "string" ? run.created_at : null;
+    if (!createdAt) continue;
+    const ms = Date.parse(createdAt);
+    if (!Number.isNaN(ms) && (minTimestampMs === null || ms < minTimestampMs)) {
+      minTimestampMs = ms;
+    }
+  }
+
+  if (!sawBranchBoundRun) {
+    // No check run triggered on this PR's head branch for this sha: we cannot
+    // show the sha existed on this branch, so the binding cannot be shown. This
+    // is deterministic (immutable check-run history), not a read failure.
+    return {
+      ok: false,
+      transient: false,
+      detail: `sha-branch-binding: no check run on the PR head branch (${headRefName}) found for head sha ${sha.slice(0, 7)}`,
+    };
+  }
+
+  if (minTimestampMs === null) {
+    // Branch-bound runs exist but carry no parseable server created_at: treat as
+    // a read/parse blip to retry rather than strand the card (fail toward retry).
+    return {
+      ok: false,
+      transient: true,
+      detail: "sha-server-timestamp: no parseable server created_at on the branch-bound check runs",
+    };
+  }
+
+  return { ok: true, minTimestampMs };
+}
+
+type BackfillOutcome =
+  | { kind: "backfilled"; anchorHeadSha: string; detail: string }
+  | { kind: "skipped"; reason: string; detail: string };
+
+/**
+ * A stable backfill refusal persisted on the card's executionState.approvalStatus
+ * so the next reconciler tick can re-report it without re-reading the PR
+ * timeline (the backfill-repeat-fanout review finding). A refusal is a function
+ * of the (live head, approval time) pair, so BOTH are stored: `observedHeadSha`
+ * is the live head the refusal was derived against and `approvedAtMs` is the
+ * approval decision's createdAt it was derived against. Either changing
+ * invalidates the cache and forces a fresh timeline read (a moved head, or a
+ * re-approval at a later time, can change the head-at-approval-time).
+ *
+ * Only DETERMINISTIC refusals are persisted. A transient timeline read failure
+ * (HTTP / network error, or an unparseable head-mutating event) is reported as a
+ * skip but NOT persisted, so the next tick retries the read instead of stranding
+ * a recoverable card on one transient error (backfill-refusal-caches-transient-
+ * failures).
+ */
+type BackfillRefusal = {
+  reason: string;
+  observedHeadSha: string;
+  approvedAtMs: number;
+  observedAt: string;
+};
+
+function readBackfillRefusal(row: CandidateRow): BackfillRefusal | null {
+  const approvalStatus =
+    (row.executionState?.approvalStatus as Record<string, unknown> | null | undefined) ?? null;
+  if (!approvalStatus || typeof approvalStatus !== "object") return null;
+  const raw = approvalStatus.backfillRefusal;
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (
+    typeof obj.reason !== "string" ||
+    typeof obj.observedHeadSha !== "string" ||
+    obj.observedHeadSha.length === 0
+  ) {
+    return null;
+  }
+  // The approval-time key must be a finite number to be trusted; a missing or
+  // non-finite value means the cache entry is not a valid keyed refusal, so it
+  // is ignored and the timeline is re-read (fail toward a fresh read, never a
+  // stale refusal).
+  if (typeof obj.approvedAtMs !== "number" || !Number.isFinite(obj.approvedAtMs)) {
+    return null;
+  }
+  return {
+    reason: obj.reason,
+    observedHeadSha: obj.observedHeadSha,
+    approvedAtMs: obj.approvedAtMs,
+    observedAt: typeof obj.observedAt === "string" ? obj.observedAt : "",
+  };
+}
+
+async function persistBackfillRefusal(
+  db: Db,
+  row: CandidateRow,
+  refusal: BackfillRefusal,
+): Promise<void> {
+  const currentState = row.executionState ?? {};
+  const existing = (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
+  const nextExecutionState: Record<string, unknown> = {
+    ...currentState,
+    approvalStatus: { ...existing, backfillRefusal: refusal },
+  };
+  await db
+    .update(issues)
+    .set({ executionState: nextExecutionState })
+    .where(eq(issues.id, row.id));
+  row.executionState = nextExecutionState;
+}
+
+/**
+ * SUP-14747: recover the D-B approval anchor for a stranded pre-D-B first
+ * publish. Reads the card's approval time (latest approved decision), derives
+ * the verified head-at-approval-time from the PR timeline (the newest force-push
+ * whose server-recorded `created_at` is at/before the approval), and — only when
+ * that head still equals the live head — writes approvalStatus.approvedHeadSha +
+ * approvedAt so the unmodified first-publish path certifies it. A head provable
+  * only through committed (client-timed) events, or any head we cannot verify to a
+  * server timestamp, is refused with a recorded reason and zero writes. A
+  * DETERMINISTIC refusal is persisted on the card, keyed on both the live head and
+  * the approval time, so the next tick skips the timeline re-read while neither
+  * changes (backfill-repeat-fanout). A transient timeline read failure is NOT
+  * persisted, so it retries on the next tick instead of stranding the card on one
+  * transient error (backfill-refusal-caches-transient-failures).
+  */
+async function backfillPreDBApprovalAnchor(
+  db: Db,
+  row: CandidateRow,
+  target: LinkedPullRequest,
+  currentHeadSha: string,
+): Promise<BackfillOutcome> {
+  const label = row.identifier ?? row.id;
+
+  const [decision] = await db
+    .select({ createdAt: issueExecutionDecisions.createdAt })
+    .from(issueExecutionDecisions)
+    .where(
+      and(
+        eq(issueExecutionDecisions.issueId, row.id),
+        eq(issueExecutionDecisions.outcome, "approved"),
+      ),
+    )
+    .orderBy(desc(issueExecutionDecisions.createdAt))
+    .limit(1);
+  if (!decision || !(decision.createdAt instanceof Date) || Number.isNaN(decision.createdAt.getTime())) {
+    return {
+      kind: "skipped",
+      reason: "backfill:no-approval-decision",
+      detail: `backfill: no approved issue_execution_decisions row for ${label}; cannot determine the approval time; refusing`,
+    };
+  }
+  const approvalTimeMs = decision.createdAt.getTime();
+
+  // A stable refusal is a deterministic function of (timeline, live head,
+  // approval time). It is cached against BOTH the live head and the approval
+  // time: while neither changes, re-report it and skip the timeline re-read
+  // (backfill-repeat-fanout). A new live head OR a re-approval at a later time
+  // invalidates the cache (either can change the head-at-approval-time) and
+  // forces a fresh read. A transient read failure is never cached.
+  const cached = readBackfillRefusal(row);
+  if (
+    cached &&
+    cached.observedHeadSha === currentHeadSha &&
+    cached.approvedAtMs === approvalTimeMs
+  ) {
+    return {
+      kind: "skipped",
+      reason: cached.reason,
+      detail: `backfill: stable refusal ${cached.reason} (observed head ${cached.observedHeadSha.slice(0, 7)} / approval ${new Date(cached.approvedAtMs).toISOString()} unchanged); skipping the timeline re-read for ${target.displayName}`,
+    };
+  }
+
+  const timeline = await readPrTimelineHeadEvents(
+    db,
+    row.companyId,
+    target.owner,
+    target.repo,
+    target.number,
+    approvalTimeMs,
+  );
+  if (timeline.kind === "failed") {
+    // A failed read is a TRANSIENT condition (HTTP / network error, or an
+    // unparseable head-mutating event) — NOT a deterministic refusal. It is
+    // reported as a skip but deliberately NOT persisted as a stable refusal, so
+    // the next tick retries the read instead of stranding a recoverable card on
+    // one transient error (backfill-refusal-caches-transient-failures).
+    return {
+      kind: "skipped",
+      reason: "backfill:timeline-read-failed",
+      detail: `backfill: ${timeline.detail}`,
+    };
+  }
+  if (timeline.kind === "unparseable") {
+    // A structurally malformed but stable event (e.g. a head_ref_force_pushed
+    // with a null commit_id) is a DETERMINISTIC refusal: the same bytes are read
+    // on every tick, so persist a named refusal keyed on (live head, approval
+    // time) and skip the timeline re-read while neither changes. This is the
+    // mirror image of the transient `failed` branch above, which stays
+    // non-cached so a recoverable card retries instead of stranding on one
+    // blip (backfill-unparseable-event-misclassified-transient).
+    await persistBackfillRefusal(db, row, {
+      reason: "backfill:unparseable-force-push",
+      observedHeadSha: currentHeadSha,
+      approvedAtMs: approvalTimeMs,
+      observedAt: new Date().toISOString(),
+    });
+    return {
+      kind: "skipped",
+      reason: "backfill:unparseable-force-push",
+      detail: `backfill: ${timeline.detail}`,
+    };
+  }
+  if (timeline.kind === "truncated") {
+    await persistBackfillRefusal(db, row, {
+      reason: "backfill:timeline-truncated",
+      observedHeadSha: currentHeadSha,
+      approvedAtMs: approvalTimeMs,
+      observedAt: new Date().toISOString(),
+    });
+    return {
+      kind: "skipped",
+      reason: "backfill:timeline-truncated",
+      detail: `backfill: PR timeline for ${target.displayName} is incomplete and cannot be positively read up to the approval time; refusing to anchor an unverifiable head`,
+    };
+  }
+
+  if (timeline.headAtApproval === null) {
+    if (!timeline.sawCommittedHeadEvent) {
+      const detail = `backfill: no committed / head_ref_force_pushed event at or before the approval time for ${target.displayName}; refusing to anchor an unverifiable head`;
+      await persistBackfillRefusal(db, row, {
+        reason: "backfill:no-head-mutating-event",
+        observedHeadSha: currentHeadSha,
+        approvedAtMs: approvalTimeMs,
+        observedAt: new Date().toISOString(),
+      });
+      return { kind: "skipped", reason: "backfill:no-head-mutating-event", detail };
+    }
+
+    if (timeline.sawPostApprovalForcePush) {
+      const detail = `backfill: ${target.displayName} shows a post-approval force-push event; the head-at-approval cannot be verified via sha existence (the push-A/push-B/force-push-back-to-A hole); refusing to anchor an unverifiable head`;
+      await persistBackfillRefusal(db, row, {
+        reason: "backfill:head-unverifiable",
+        observedHeadSha: currentHeadSha,
+        approvedAtMs: approvalTimeMs,
+        observedAt: new Date().toISOString(),
+      });
+      return { kind: "skipped", reason: "backfill:head-unverifiable", detail };
+    }
+
+    // SUP-14844: the timeline carries only committed (client-timed) head events
+    // at/before the approval — no force-push. Attempt the server-timed,
+    // branch-bound sha existence proof: if the live head sha has a check run
+    // GitHub triggered on THIS PR's head branch (check_suite.head_branch === the
+    // card's PR head ref) whose server-assigned created_at is at/before the
+    // approval time, the sha provably existed on this branch at that time and no
+    // force-push moved it, so it was the head at approval.
+    const shaTimestamp = await readShaServerTimestamp(
+      db,
+      row.companyId,
+      target.owner,
+      target.repo,
+      currentHeadSha,
+      target.headRefName,
+    );
+    if (!shaTimestamp.ok) {
+      if (shaTimestamp.transient) {
+        // A failed read (or an unreadable head ref) is TRANSIENT — report a
+        // skip but do NOT persist, so the next tick retries (mirror the
+        // timeline-read-failed branch).
+        return {
+          kind: "skipped",
+          reason: "backfill:sha-existence-read-failed",
+          detail: `backfill: ${shaTimestamp.detail}; will retry on the next tick`,
+        };
+      }
+      // No branch-bound server-timed evidence is a DETERMINISTIC refusal: the
+      // sha cannot be shown to have existed on this branch at/before the
+      // approval, so persist a stable refusal and leave the card for re-review.
+      const detail = `backfill: ${shaTimestamp.detail}; refusing to anchor an unverifiable head`;
+      await persistBackfillRefusal(db, row, {
+        reason: "backfill:head-unverifiable",
+        observedHeadSha: currentHeadSha,
+        approvedAtMs: approvalTimeMs,
+        observedAt: new Date().toISOString(),
+      });
+      return { kind: "skipped", reason: "backfill:head-unverifiable", detail };
+    }
+
+    if (shaTimestamp.minTimestampMs > approvalTimeMs) {
+      const detail = `backfill: ${target.displayName} head ${currentHeadSha.slice(0, 7)} has no server-timestamped evidence at or before the approval ${decision.createdAt.toISOString()} (earliest: ${new Date(shaTimestamp.minTimestampMs).toISOString()}); refusing to anchor an unverifiable head`;
+      await persistBackfillRefusal(db, row, {
+        reason: "backfill:head-unverifiable",
+        observedHeadSha: currentHeadSha,
+        approvedAtMs: approvalTimeMs,
+        observedAt: new Date().toISOString(),
+      });
+      return { kind: "skipped", reason: "backfill:head-unverifiable", detail };
+    }
+
+    // The sha has server-attested existence at/before the approval time, and no
+    // post-approval force-push moved it. Anchor and proceed to the first-publish
+    // path with enforceDeliveryIdentity (the same path a force-push-verified
+    // backfill uses).
+    const existingApprovalStatus =
+      ((row.executionState?.approvalStatus as Record<string, unknown> | null | undefined) ?? {});
+    const nextApprovalStatus: Record<string, unknown> = {
+      ...existingApprovalStatus,
+      approvedHeadSha: currentHeadSha,
+      approvedAt: decision.createdAt.toISOString(),
+    };
+    delete nextApprovalStatus.backfillRefusal;
+    const nextExecutionState: Record<string, unknown> = {
+      ...(row.executionState ?? {}),
+      approvalStatus: nextApprovalStatus,
+    };
+    await db
+      .update(issues)
+      .set({ executionState: nextExecutionState })
+      .where(eq(issues.id, row.id));
+    row.executionState = nextExecutionState;
+
+    return {
+      kind: "backfilled",
+      anchorHeadSha: currentHeadSha,
+      detail: `backfill: anchored ${currentHeadSha.slice(0, 7)} via server-timed sha existence (earliest ${new Date(shaTimestamp.minTimestampMs).toISOString()}) on the ${target.displayName} timeline (approved ${decision.createdAt.toISOString()})`,
+    };
+  }
+
+  if (timeline.headAtApproval !== currentHeadSha) {
+    await persistBackfillRefusal(db, row, {
+      reason: "backfill:head-moved-since-approval",
+      observedHeadSha: currentHeadSha,
+      approvedAtMs: approvalTimeMs,
+      observedAt: new Date().toISOString(),
+    });
+    return {
+      kind: "skipped",
+      reason: "backfill:head-moved-since-approval",
+      detail: `backfill: verified head at approval time ${timeline.headAtApproval.slice(0, 7)} differs from the live head ${currentHeadSha.slice(0, 7)}; the reviewed code is no longer the head; refusing and leaving the card for re-review`,
+    };
+  }
+
+  const existingApprovalStatus =
+    ((row.executionState?.approvalStatus as Record<string, unknown> | null | undefined) ?? {});
+  const nextApprovalStatus: Record<string, unknown> = {
+    ...existingApprovalStatus,
+    approvedHeadSha: timeline.headAtApproval,
+    approvedAt: decision.createdAt.toISOString(),
+  };
+  delete nextApprovalStatus.backfillRefusal;
+  const nextExecutionState: Record<string, unknown> = {
+    ...(row.executionState ?? {}),
+    approvalStatus: nextApprovalStatus,
+  };
+  await db
+    .update(issues)
+    .set({ executionState: nextExecutionState })
+    .where(eq(issues.id, row.id));
+  row.executionState = nextExecutionState;
+
+  return {
+    kind: "backfilled",
+    anchorHeadSha: timeline.headAtApproval,
+    detail: `backfill: anchored ${timeline.headAtApproval.slice(0, 7)} from the ${target.displayName} timeline (approved ${decision.createdAt.toISOString()})`,
+  };
+}
+
 async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateResult> {
   const label = row.identifier ?? row.id;
 
   const integrity = await evaluateStageIntegrity(db, row);
-  if (!integrity.ok) {
+  if (integrity) {
     return { kind: "skipped", reason: integrity.reason, detail: `guard-b ${integrity.detail}` };
   }
 
@@ -474,8 +1448,9 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   // Guard A — content-identity anti-laundering check (SUP-13714). The
   // paperclip/approved status is an authorization: it may only certify content
   // that was actually reviewed. The approval transition persisted the exact
-  // head it certified (executionState.approvalStatus.publishedHeadSha). When
-  // the live head differs, re-publish only if the PR's diff-vs-base is
+  // head it certified — publishedHeadSha when the stamp was written, or the
+  // SUP-14715 D-B approvedHeadSha fallback on a skipped/failed first publish.
+  // When the live head differs, re-publish only if the PR's diff-vs-base is
   // unchanged in substance from the approved head (exec-CTO ruling): resolve
   // the PR's base commit, fetch the three-dot compare (merge-base-resolved) at
   // each head, and compare the per-file blob SHAs. This makes update-branch and
@@ -484,14 +1459,46 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   // added/removed file. Any case we cannot positively verify is a refusal with
   // a recorded reason — never a re-publish.
   const approvedHead = readApprovedHead(row.executionState);
-  if (!approvedHead) {
-    return {
-      kind: "skipped",
-      reason: "guard-a:no-approved-head",
-      detail: `guard-a: no persisted approved head for ${label}; refusing to re-publish unverified head ${headSha.slice(0, 7)}`,
-    };
-  }
-  if (approvedHead.publishedHeadSha !== headSha) {
+  let approvedHeadSha: string | null = approvedHead ? approvedHead.anchorHeadSha : null;
+  // SUP-14715 D-B: the anchor came from approvalStatus.approvedHeadSha (a
+  // certified but never-published FIRST publish) when approvedHead.firstPublish —
+  // the ADR-091 D1 delivery-identity gate never ran for that head, so the
+   // delegated publish below enforces it. A re-publish (anchor from
+   // publishedHeadSha) and a SUP-14602 pending-candidate recovery
+   // (approvedHead === null) both certify by content identity without the gate.
+   // A SUP-14747 backfill recovers a never-published anchor, so it too is a
+   // first publish that enforces the gate.
+   let enforceDeliveryIdentity = approvedHead ? approvedHead.firstPublish : false;
+   let backfilledDetail: string | undefined;
+   if (approvedHeadSha === null) {
+     // SUP-14602: no published head, but the approval-time certification may
+     // have survived the skipped:ambiguous transition as pending candidates.
+     const pending = readPendingCandidates(row.executionState);
+     if (pending.length === 0) {
+       // SUP-14747 (D-E): a stranded pre-D-B first publish (no publishedHeadSha,
+       // no approvedHeadSha, no pendingCandidates) has a lost anchor. Recover it
+       // from the PR timeline — the last head-mutating event at/before the
+       // approval decision — and only when that head still equals the live head.
+       // On success the unmodified first-publish path below certifies it; on any
+       // refusal the card is left exactly as found for re-review.
+       const backfill = await backfillPreDBApprovalAnchor(db, row, target, headSha);
+       if (backfill.kind === "backfilled") {
+         approvedHeadSha = backfill.anchorHeadSha;
+         enforceDeliveryIdentity = true;
+         backfilledDetail = backfill.detail;
+       } else {
+         return { kind: "skipped", reason: backfill.reason, detail: backfill.detail };
+       }
+     } else {
+       const selection = await selectOpenPendingCandidate(db, row, pending, target);
+       if ("anchor" in selection) {
+         approvedHeadSha = selection.anchor;
+       } else {
+         return { kind: "skipped", reason: selection.reason, detail: selection.detail };
+       }
+     }
+   }
+  if (approvedHeadSha !== headSha) {
     const baseSha = ((prBody?.base as Record<string, unknown> | undefined)?.sha as string | undefined) ?? null;
     if (!baseSha) {
       return {
@@ -505,13 +1512,13 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
       row.companyId,
       target.owner,
       target.repo,
-      `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(approvedHead.publishedHeadSha)}`,
+      `/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(approvedHeadSha)}`,
     );
     if (!approvedDiff.ok) {
       return {
         kind: "skipped",
         reason: "guard-a:compare-failed",
-        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHead.publishedHeadSha.slice(0, 7)} failed (HTTP ${approvedDiff.status} ${approvedDiff.message ?? ""}); refusing to re-publish`,
+        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHeadSha.slice(0, 7)} failed (HTTP ${approvedDiff.status} ${approvedDiff.message ?? ""}); refusing to re-publish`,
       };
     }
     const approvedFiles = fileMapFromCompare(approvedDiff.body);
@@ -519,7 +1526,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
       return {
         kind: "skipped",
         reason: "guard-a:unverifiable",
-        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHead.publishedHeadSha.slice(0, 7)} returned no usable file list; cannot prove ${headSha.slice(0, 7)} was reviewed; refusing to re-publish`,
+        detail: `guard-a: approved diff-vs-base ${baseSha.slice(0, 7)}...${approvedHeadSha.slice(0, 7)} returned no usable file list; cannot prove ${headSha.slice(0, 7)} was reviewed; refusing to re-publish`,
       };
     }
     const liveDiff = await ghReadJson(
@@ -552,7 +1559,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
         db,
         row,
         target,
-        approvedHead.publishedHeadSha,
+        approvedHeadSha,
         headSha,
         substanceChange,
       );
@@ -574,20 +1581,54 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     }
   }
 
-  const outcome = await publishApprovalStatus(db, row.companyId, row.id, row.identifier ?? "", {
+  const publishOptions: { expectedHeadSha: string; enforceDeliveryIdentity?: boolean } = {
     expectedHeadSha: headSha,
-  });
+  };
+  // SUP-14715 D-B: when the anchor came from approvedHeadSha, the ADR-091 D1
+  // delivery-identity gate never successfully ran for this head — the arming
+  // attempt that certified it skipped/failed before the stamp was written. So
+  // this delegated write is a FIRST publish and enforces the delivery-identity
+  // gate, taking the same integrity gate as any other first publish. A
+  // re-publish (anchor from publishedHeadSha) and a SUP-14602 pending-candidate
+  // recovery (approvedHead === null) certify by content identity and leave the
+  // gate unset.
+  if (enforceDeliveryIdentity) {
+    publishOptions.enforceDeliveryIdentity = true;
+  }
+  const outcome = await publishApprovalStatus(db, row.companyId, row.id, row.identifier ?? "", publishOptions);
   if (outcome.kind === "armed") {
-    return { kind: "republished", detail: `republished ${target.displayName}: ${outcome.message}` };
+    if (approvedHead === null) {
+      // SUP-14602: the recovery path certified this head through the same
+      // unmodified Guard A comparison, so the normal publishedHeadSha path
+      // takes over from here. pendingCandidates stays as the historical
+      // record; the idempotency pre-check keeps re-runs at zero writes.
+      const currentState = row.executionState ?? {};
+      const existingApprovalStatus =
+        (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            ...currentState,
+            approvalStatus: {
+              ...existingApprovalStatus,
+              publishedHeadSha: headSha,
+              publishedAt: new Date().toISOString(),
+            },
+          },
+        })
+        .where(eq(issues.id, row.id));
+    }
+    return { kind: "republished", detail: `republished ${target.displayName}: ${outcome.message}`, backfilledDetail };
   }
   if (outcome.kind === "skipped") {
     const reason = outcome.message.startsWith("status:skipped:head_moved")
       ? "guard-a:head-moved-during-write"
       : "publish:skipped";
-    return { kind: "skipped", reason, detail: `publish skipped: ${outcome.message}` };
+    return { kind: "skipped", reason, detail: `publish skipped: ${outcome.message}`, backfilledDetail };
   }
   const truncated = outcome.message.length > 200 ? `${outcome.message.slice(0, 200)}...` : outcome.message;
-  return { kind: "failed", detail: `publish failed: ${truncated}` };
+  return { kind: "failed", detail: `publish failed: ${truncated}`, backfilledDetail };
 }
 
 export async function runApprovalStatusReconcilerTick(
@@ -595,9 +1636,18 @@ export async function runApprovalStatusReconcilerTick(
   options: ApprovalStatusReconcilerTickOptions = {},
 ): Promise<ApprovalStatusReconcilerTickSummary> {
   const maxCandidates = options.maxCandidates ?? DEFAULT_MAX_CANDIDATES;
-  const rows = await findApprovalCandidates(db, maxCandidates + 1);
+  const resumeAfter = options.resumeAfter ?? null;
+  const rows = await findApprovalCandidates(db, maxCandidates + 1, resumeAfter);
   const capped = Math.max(0, rows.length - maxCandidates);
   const batch = capped > 0 ? rows.slice(0, maxCandidates) : rows;
+
+  // SUP-14736: advance the keyset cursor past the candidates this tick
+  // consumed so the next tick resumes after them instead of re-reading the
+  // same lexicographic head. When this tick reached the end of the set
+  // (rows.length <= maxCandidates) the cursor wraps to null; the scheduler
+  // feeds the returned value back via `resumeAfter`.
+  const nextScanKey =
+    capped > 0 && batch.length > 0 ? (batch[batch.length - 1]?.identifier ?? null) : null;
 
   const summary: ApprovalStatusReconcilerTickSummary = {
     scanned: 0,
@@ -607,8 +1657,11 @@ export async function runApprovalStatusReconcilerTick(
     failed: 0,
     failedDetails: [],
     capped,
+    nextScanKey,
     voidWarnings: 0,
     voidWarningDetails: [],
+    backfilled: 0,
+    backfilledDetails: [],
   };
 
   for (const row of batch) {
@@ -635,6 +1688,12 @@ export async function runApprovalStatusReconcilerTick(
           summary.failedDetails.push(`${label}: ${result.detail}`);
         }
       }
+      if (result.backfilledDetail !== undefined) {
+        summary.backfilled += 1;
+        if (summary.backfilledDetails.length < MAX_DETAIL_ENTRIES) {
+          summary.backfilledDetails.push(`${label}: ${result.backfilledDetail}`);
+        }
+      }
     } catch (err) {
       summary.failed += 1;
       if (summary.failedDetails.length < MAX_DETAIL_ENTRIES) {
@@ -656,6 +1715,8 @@ export async function runApprovalStatusReconcilerTick(
       capped: summary.capped,
       voidWarnings: summary.voidWarnings,
       voidWarningDetails: summary.voidWarningDetails,
+      backfilled: summary.backfilled,
+      backfilledDetails: summary.backfilledDetails,
     },
     "approval status reconciler tick",
   );
@@ -688,7 +1749,13 @@ export function startApprovalStatusReconciler(
   schedule: ApprovalStatusReconcilerSchedule,
 ): () => void {
   const runTick = schedule.runTick ?? ((tickOptions) => runApprovalStatusReconcilerTick(db, tickOptions));
-  const tickOptions: ApprovalStatusReconcilerTickOptions = { maxCandidates: schedule.maxCandidates };
+  const baseOptions: ApprovalStatusReconcilerTickOptions = { maxCandidates: schedule.maxCandidates };
+  // SUP-14736: in-process keyset cursor. The candidate scan walks the set in
+  // identifier order; when a tick consumes a full window the summary's
+  // `nextScanKey` tells the next tick where to resume, so the set is traversed
+  // round-robin instead of re-reading the same lexicographic head every
+  // interval. When a tick reaches the end of the set the cursor wraps to null.
+  let cursor: string | null = null;
   let inFlight = false;
   let stopped = false;
 
@@ -699,7 +1766,10 @@ export function startApprovalStatusReconciler(
       return;
     }
     inFlight = true;
-    void Promise.resolve(runTick(tickOptions))
+    void Promise.resolve(runTick({ ...baseOptions, resumeAfter: cursor }))
+      .then((summary) => {
+        cursor = summary && typeof summary.nextScanKey === "string" ? summary.nextScanKey : null;
+      })
       .catch((err) => {
         logger.warn({ err }, "approval status reconciler tick threw");
       })

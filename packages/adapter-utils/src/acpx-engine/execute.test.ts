@@ -245,15 +245,33 @@ async function runExecutor(
   return { logs, meta, events, runtimeOptions, configOptions, sessionInputs, result };
 }
 
-// Under `vi.useFakeTimers()`, the setup work before a run reaches its
-// `ensureSession` call (staging, warm-handle lookups, real `fs` calls) still
-// runs through ordinary promise chains, not timers. `advanceTimersByTimeAsync`
-// only drains microtasks in the windows between the timer ticks it processes;
-// with no timer due yet, a single call can return before that setup chain
-// finishes unwinding. Flushing a few zero-length advances first lets it fully
-// unwind before the real, deadline-length advance below.
+// The engine's pre-handshake bring-up (staging, warm-handle lookups, real `fs`
+// calls) runs through ordinary promise chains, not timers. Under
+// `vi.useFakeTimers()` that chain still only advances on real event-loop turns,
+// so `advanceTimersByTimeAsync` alone cannot reliably unwind it: with no timer
+// due yet, a single call returns before the setup chain reaches the guarded
+// `ensureSession` call, and a deadline advance that runs before the guard's
+// timer is registered fires nothing — the run then hangs until the test's own
+// wall-clock budget kills it (the `Test timed out in 5000ms` ejections). Interleave
+// real macrotask turns (a real `setTimeout`, captured before fake timers are
+// installed) with zero-length advances until the guard arms (`getTimerCount`
+// reaches the guard's timeout + transport-poll pair), then advance past the
+// deadline. The second flush + deadline advance covers a guard that armed only
+// after the first advance, and lets the settlement unwind on real turns too.
+const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+const realMacrotaskTurn = (): Promise<void> =>
+  new Promise((resolve) => {
+    realSetTimeout(resolve, 0);
+  });
+
 async function flushSetupThenAdvanceTimersByTimeAsync(ms: number): Promise<void> {
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 500 && vi.getTimerCount() < 2; i++) {
+    await realMacrotaskTurn();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  await vi.advanceTimersByTimeAsync(ms);
+  for (let i = 0; i < 20; i++) {
+    await realMacrotaskTurn();
     await vi.advanceTimersByTimeAsync(0);
   }
   await vi.advanceTimersByTimeAsync(ms);

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   companies,
   createDb,
@@ -147,7 +148,20 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     await db.delete(companies);
   });
 
-  async function insertIssue(overrides: { identifier?: string; deliveryIdentity?: boolean } = {}) {
+  async function insertIssue(
+    overrides: {
+      identifier?: string;
+      deliveryIdentity?: boolean;
+      /**
+       * SUP-14783: make the card's execution-workspace row a `shared_workspace`
+       * OWNED BY ANOTHER ISSUE, carrying that owner's branch — the shape every
+       * TSP child card has. Default undefined leaves the row's sourceIssueId
+       * null, which is the pre-existing fixture and must keep its verdicts.
+       */
+      sharedWorkspaceOwnerIssueId?: string;
+      branchName?: string;
+    } = {},
+  ) {
     const issueId = randomUUID();
     let projectId: string | null = null;
     let executionWorkspaceId: string | null = null;
@@ -176,8 +190,11 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           strategyType: "git_worktree",
           name: "card-workspace",
           status: "active",
-          branchName: "SUP-42-branch",
+          branchName: overrides.branchName ?? "SUP-42-branch",
           repoUrl: `https://github.com/${OWNER}/${REPO}`,
+          ...(overrides.sharedWorkspaceOwnerIssueId
+            ? { mode: "shared_workspace", sourceIssueId: overrides.sharedWorkspaceOwnerIssueId }
+            : {}),
         })
         .returning();
       executionWorkspaceId = ewRow!.id;
@@ -196,9 +213,18 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
   async function insertMention(
     issueId: string,
-    overrides: { state?: string | null; draft?: boolean; number?: number; headRefName?: string } = {},
+    overrides: {
+      state?: string | null;
+      draft?: boolean;
+      number?: number;
+      headRefName?: string;
+      owner?: string;
+      repo?: string;
+    } = {},
   ) {
     const number = overrides.number ?? 42;
+    const owner = overrides.owner ?? OWNER;
+    const repo = overrides.repo ?? REPO;
     const data: Record<string, unknown> = {
       state: overrides.state ?? "open",
       draft: overrides.draft ?? false,
@@ -212,7 +238,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         companyId,
         providerKey: "github",
         objectType: "pull_request",
-        externalId: `${OWNER}/${REPO}#pull/${number}`,
+        externalId: `${owner}/${repo}#pull/${number}`,
         data,
       })
       .returning();
@@ -323,6 +349,83 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    // ADR-091 D5 (SUP-14734): the not_delivered refusal must name the mismatched
+    // half. The two halves: a REPO mismatch (head branch can equal the delivery
+    // branch yet the head repo differs) vs a REF mismatch (repo matches, ref
+    // differs). The repo half must not read as "branch X is not branch X".
+    it("names the repo mismatch (not a branch-vs-itself sentence) when the head branch equals the delivery branch but the head repo differs", async () => {
+      const issueId = await insertIssue();
+      // Same branch as the card's delivery branch, but in a DIFFERENT repo.
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch", owner: "other-org", repo: "other-repo" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          `not_delivered: other-org/other-repo#42 head repo other-org/other-repo is not this card's delivery repo ${OWNER}/${REPO}; a deliverable in other-org/other-repo must be filed under a project bound to that repo (ADR-091 D5)`,
+        );
+        expect(result.reason).not.toContain("is not this card's delivery branch");
+      }
+    });
+
+    it("keeps branch language when the head repo matches but the head ref differs", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-99-other-branch" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          `not_delivered: ${OWNER}/${REPO}#42 head ${OWNER}/${REPO}:SUP-99-other-branch is not this card's delivery branch SUP-42-branch`,
+        );
+      }
+    });
+
+    it("names the repo mismatch (the decisive half) when BOTH the head repo and head ref differ", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-99-other-branch", owner: "other-org", repo: "other-repo" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          `not_delivered: other-org/other-repo#42 head repo other-org/other-repo is not this card's delivery repo ${OWNER}/${REPO}; a deliverable in other-org/other-repo must be filed under a project bound to that repo (ADR-091 D5)`,
+        );
+        expect(result.reason).not.toContain("is not this card's delivery branch");
+      }
+    });
+
+    it("emits the SAME not_delivered fragment from resolveApprovalDecisionHead and publishApprovalStatus (one fixture)", async () => {
+      const issueId = await insertIssue();
+      // One repo-mismatch candidate; both entry points must surface the same text.
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch", owner: "other-org", repo: "other-repo" });
+      installRoutes([]);
+
+      const decision = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(decision.kind).toBe("unresolvable");
+      const decisionReason = decision.kind === "unresolvable" ? decision.reason : "";
+      expect(decisionReason.startsWith("not_delivered: ")).toBe(true);
+      const decisionFragment = decisionReason.slice("not_delivered: ".length);
+
+      const publish = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        enforceDeliveryIdentity: true,
+      });
+      expect(publish.kind).toBe("skipped");
+      expect(publish.message.startsWith("status:skipped:not_delivered: ")).toBe(true);
+      const publishFragment = publish.message.slice("status:skipped:not_delivered: ".length);
+
+      expect(publishFragment).toBe(decisionFragment);
+      expect(decisionFragment).toBe(
+        `other-org/other-repo#42 head repo other-org/other-repo is not this card's delivery repo ${OWNER}/${REPO}; a deliverable in other-org/other-repo must be filed under a project bound to that repo (ADR-091 D5)`,
+      );
+    });
+
     it("refuses with delivery_identity_unresolved when the card's delivery identity cannot be resolved", async () => {
       // No execution workspace -> no delivery branch; fail closed (ADR-091 D4).
       const issueId = await insertIssue({ deliveryIdentity: false });
@@ -402,4 +505,372 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // ADR-091 D1 / SUP-14783: shared_workspace delivery identity.
+  //
+  // A shared execution-workspace row belongs to the PARENT issue and carries
+  // exactly one branch_name. Every OTHER card on that row was therefore being
+  // compared against a sibling's branch, so the gate refused structurally and
+  // no first-publish recovery was possible for any of them. These tests pin
+  // both halves: the recovery now works, AND every laundering vector D1 exists
+  // to block is still blocked on that same shared row.
+  // ─────────────────────────────────────────────────────────────────────────
+  describe("shared_workspace delivery identity (SUP-14783)", () => {
+    const PARENT_BRANCH = "SUP-1-parent-architecture-review";
+
+    async function insertSharedCard(overrides: { identifier?: string } = {}) {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
+      return insertIssue({
+        identifier: overrides.identifier ?? "SUP-42",
+        sharedWorkspaceOwnerIssueId: ownerIssueId,
+        branchName: PARENT_BRANCH,
+      });
+    }
+
+    it("resolves the head for a card whose PR carries its own identifier prefix on a shared workspace", async () => {
+      const issueId = await insertSharedCard();
+      // The card's real delivery: branch named for THIS card, on the project repo.
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-adr-074-alarm-pin-tamper" });
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+      }
+    });
+
+    it("still refuses a PR the shared card merely CITED (another card's identifier prefix)", async () => {
+      const issueId = await insertSharedCard();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-99-other-card-branch" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^not_delivered:/);
+        expect(result.reason).toContain("does not carry this card's identifier prefix SUP-42-");
+        // The refusal must NOT tell an operator to match the sibling's branch.
+        expect(result.reason).not.toContain("is not this card's delivery branch");
+      }
+    });
+
+    it("still refuses the PARENT's own PR — a child must not stamp the branch it merely shares a worktree with", async () => {
+      const issueId = await insertSharedCard();
+      await insertMention(issueId, { number: 42, headRefName: PARENT_BRANCH });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^not_delivered:/);
+      }
+    });
+
+    it("keeps D5 cross-repo closure: a correctly-prefixed branch in ANOTHER repo is still refused", async () => {
+      const issueId = await insertSharedCard();
+      await insertMention(issueId, {
+        number: 42,
+        headRefName: "SUP-42-adr-074-alarm-pin-tamper",
+        owner: "other-org",
+        repo: "other-repo",
+      });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("is not this card's delivery repo");
+        expect(result.reason).toContain("ADR-091 D5");
+      }
+    });
+
+    it("fails closed when the head ref is unreadable on a shared workspace", async () => {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
+      const issueId = await insertIssue({
+        identifier: "SUP-42",
+        sharedWorkspaceOwnerIssueId: ownerIssueId,
+        branchName: PARENT_BRANCH,
+      });
+      const [externalObj] = await db
+        .insert(externalObjects)
+        .values({
+          companyId,
+          providerKey: "github",
+          objectType: "pull_request",
+          externalId: `${OWNER}/${REPO}#pull/42`,
+          data: { state: "open", draft: false, title: "no head ref anywhere" },
+        })
+        .returning();
+      await db.insert(externalObjectMentions).values({
+        companyId,
+        sourceIssueId: issueId,
+        sourceKind: "comment",
+        objectId: externalObj!.id,
+        objectType: "pull_request",
+        providerKey: "github",
+      });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^not_delivered:/);
+      }
+    });
+
+    // CodeRabbit on PR #473: the fail-closed branch previously reported "no
+    // delivery branch recorded", which is false for a shared-workspace card -
+    // a branch IS recorded, it just belongs to another issue. The refusal must
+    // name the identifier as the missing thing, or it sends an operator to
+    // inspect the workspace instead of the card.
+    it("names the MISSING IDENTIFIER, not a missing branch, when a shared card has no identifier", async () => {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
+      const issueId = await insertIssue({
+        identifier: "SUP-42",
+        sharedWorkspaceOwnerIssueId: ownerIssueId,
+        branchName: PARENT_BRANCH,
+      });
+      // Strip the identifier so ownership is disproven AND no prefix exists.
+      await db.update(issues).set({ identifier: null }).where(eq(issues.id, issueId));
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-adr-074-alarm-pin-tamper" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^delivery_identity_unresolved:/);
+        expect(result.reason).toContain("no readable identifier to authorize against");
+        expect(result.reason).not.toContain("no delivery branch recorded");
+      }
+    });
+
+    it("an ISOLATED card is untouched — exact-branch matching still governs and its refusal text is unchanged", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-some-other-branch" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      // Shares this card's identifier prefix, but the card owns its workspace,
+      // so the strict branch check still applies and still refuses.
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          `not_delivered: ${OWNER}/${REPO}#42 head ${OWNER}/${REPO}:SUP-42-some-other-branch is not this card's delivery branch SUP-42-branch`,
+        );
+      }
+    });
+  });
+
+  describe("ADR-091 D1 SUP-14824: recorded delivery identity", () => {
+    it("prefers the recorded identity over the workspace row (AC1)", async () => {
+      const issueId = await insertIssue();
+      // The workspace row says branch "SUP-42-branch" (the default). The recorded
+      // identity says branch "RECORDED-BRANCH" — the D1 gate must narrow against
+      // the recorded branch, NOT the workspace row.
+      await db.update(issues).set({
+        executionState: {
+          delivery: {
+            repo: { owner: OWNER, repo: REPO },
+            branch: "RECORDED-BRANCH",
+            headSha: "aaa111bbb222ccc333ddd444eee555fff6660000",
+            recordedByRunId: randomUUID(),
+            recordedAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      }).where(eq(issues.id, issueId));
+
+      // The PR sits on the WORKSPACE branch (not the recorded branch).
+      // Without the recorded identity, this would resolve (workspace fallback).
+      // With the recorded identity, it must be REFUSED — proving the recorded
+      // branch takes precedence.
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          `not_delivered: ${OWNER}/${REPO}#42 head ${OWNER}/${REPO}:SUP-42-branch is not this card's delivery branch RECORDED-BRANCH`,
+        );
+      }
+
+      // Positive: a PR on the RECORDED branch resolves fine.
+      await db.delete(externalObjectMentions).where(eq(externalObjectMentions.sourceIssueId, issueId));
+      await db.delete(externalObjects).where(eq(externalObjects.companyId, companyId));
+      await insertMention(issueId, { number: 42, headRefName: "RECORDED-BRANCH" });
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
+
+      const result2 = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result2.kind).toBe("resolved");
+      if (result2.kind === "resolved") {
+        expect(result2.headSha).toBe(APPROVED_HEAD);
+      }
+    });
+
+    it("fails closed when the recorded identity has no resolvable repo (AC3)", async () => {
+      const issueId = await insertIssue();
+      await db.update(issues).set({
+        executionState: {
+          delivery: {
+            repo: { owner: "", repo: "" },
+            branch: "RECORDED-BRANCH",
+            headSha: "aaa111bbb222ccc333ddd444eee555fff6660000",
+            recordedByRunId: randomUUID(),
+            recordedAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      }).where(eq(issues.id, issueId));
+      await insertMention(issueId, { number: 42, headRefName: "RECORDED-BRANCH" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          "delivery_identity_unresolved: recorded delivery identity has no resolvable repo; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+        );
+      }
+    });
+
+    it("fails closed when the recorded identity has no branch (AC3)", async () => {
+      const issueId = await insertIssue();
+      await db.update(issues).set({
+        executionState: {
+          delivery: {
+            repo: { owner: OWNER, repo: REPO },
+            branch: "",
+            headSha: "aaa111bbb222ccc333ddd444eee555fff6660000",
+            recordedByRunId: randomUUID(),
+            recordedAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      }).where(eq(issues.id, issueId));
+      await insertMention(issueId, { number: 42, headRefName: "RECORDED-BRANCH" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          "delivery_identity_unresolved: recorded delivery identity has no branch; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+        );
+      }
+    });
+
+    it("fails closed when the recorded identity has no headSha (AC3)", async () => {
+      const issueId = await insertIssue();
+      await db.update(issues).set({
+        executionState: {
+          delivery: {
+            repo: { owner: OWNER, repo: REPO },
+            branch: "RECORDED-BRANCH",
+            headSha: "",
+            recordedByRunId: randomUUID(),
+            recordedAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      }).where(eq(issues.id, issueId));
+      await insertMention(issueId, { number: 42, headRefName: "RECORDED-BRANCH" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          "delivery_identity_unresolved: recorded delivery identity has no headSha; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+        );
+      }
+    });
+
+    it("surfaces the recorded-unusable reason from publishApprovalStatus (AC3)", async () => {
+      const issueId = await insertIssue();
+      await db.update(issues).set({
+        executionState: {
+          delivery: {
+            repo: { owner: "bad", repo: "" },
+            branch: "BR",
+            headSha: "sha",
+            recordedByRunId: randomUUID(),
+            recordedAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      }).where(eq(issues.id, issueId));
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      installRoutes([]);
+
+      const outcome = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        enforceDeliveryIdentity: true,
+      });
+      expect(outcome.kind).toBe("skipped");
+      expect(outcome.message).toBe(
+        "status:skipped:delivery_identity_unresolved: recorded delivery identity has no resolvable repo; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+      );
+    });
+
+    // AC2: byte-identical regression — pin the existing refusal strings when
+    // no recorded identity is present.
+    it("byte-identical: isolated-workspace match resolves the delivered PR", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("byte-identical: isolated-workspace mismatch refuses with not_delivered", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-99-other-branch" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          `not_delivered: ${OWNER}/${REPO}#42 head ${OWNER}/${REPO}:SUP-99-other-branch is not this card's delivery branch SUP-42-branch`,
+        );
+      }
+    });
+
+    it("byte-identical: shared-workspace carrier (head == row branch_name) resolves", async () => {
+      // A card on a shared workspace: the row's branchName is the shared branch,
+      // and the PR head equals that branch. Without a recorded identity, this
+      // path still works (the workspace row IS the identity).
+      const issueId = await insertIssue();
+      // The execution workspace row has branchName "SUP-42-branch" (from insertIssue default).
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("resolved");
+    });
+
+    it("byte-identical: shared-workspace own-branch (identifier prefix) refuses when no prefix match", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, headRefName: "some-unrelated-branch" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          `not_delivered: ${OWNER}/${REPO}#42 head ${OWNER}/${REPO}:some-unrelated-branch is not this card's delivery branch SUP-42-branch`,
+        );
+      }
+    });
+  });
+
 });

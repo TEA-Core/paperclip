@@ -407,7 +407,7 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
 export const resolveIssueRecoveryActionSchema = z.object({
   actionId: z.string().guid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-  sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+  sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked", "cancelled"]),
   resolutionNote: multilineTextSchema.optional().nullable(),
 }).strict().superRefine((value, ctx) => {
   if (value.outcome === "restored") {
@@ -439,13 +439,16 @@ export const resolveIssueRecoveryActionSchema = z.object({
   if (value.outcome === "false_positive" || value.outcome === "cancelled") {
     // A false-positive/cancelled verdict is a statement that the alert was never valid, not that
     // the work closed. `sourceIssueStatus` is applied verbatim as the card's new status, so
-    // `todo` leaves a live card exactly where it is. The only status that must stay off-limits is
-    // `blocked`: a bogus alert must never be the thing that force-blocks a card. Board-only
+    // `todo` leaves a live card exactly where it is, and `cancelled` is an honest no-op for a card
+    // that is already terminal: without it the matrix has no value that both satisfies the refine
+    // and leaves a `cancelled` source truthful, so a recovery action on a cancelled source issue
+    // has no legal disposition (SUP-13874 / SUP-14035). The only status that must stay off-limits
+    // is `blocked`: a bogus alert must never be the thing that force-blocks a card. Board-only
     // enforcement for these outcomes lives in the route (`assertBoard`), not in this schema.
     if (value.sourceIssueStatus === "blocked") {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "This recovery outcome requires sourceIssueStatus to be todo, done, or in_review",
+        message: "This recovery outcome requires sourceIssueStatus to be todo, done, in_review, or cancelled",
         path: ["sourceIssueStatus"],
       });
     }
@@ -509,8 +512,13 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(schema: z.ZodObje
  * that set dependencies at create time produced a tree that looked fired and had zero dependency
  * edges. Strictness turns every such payload into a 400 that names the offending key.
  *
- * `.strict()` propagates through `.partial()`, `.omit()` and `.extend()`, so the update, input and
- * child schemas derived from this one inherit it.
+ * `.strict()` propagates through `.partial()`, `.omit()` and `.extend()`, so the input and
+ * child schemas derived from this one inherit it. The update schema is one exception to the
+ * inheritance: `objectWithoutDefaults` rebuilds the shape with a bare `z.object()` and drops the
+ * base strictness, so `updateIssueObjectSchema` re-asserts `.strict()` by hand. The end result is
+ * that create and update agree on unknown-key handling — both reject an unrecognized key with a
+ * 400 that names it — so neither path can silently discard a supplied field such as a misspelled
+ * parent reference (`parentIssueId` for `parentId`).
  */
 const createIssueBaseSchema = z.object({
   projectId: z.string().guid().optional().nullable(),

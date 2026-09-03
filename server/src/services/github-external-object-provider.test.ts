@@ -233,5 +233,99 @@ describe("github-external-object-provider", () => {
       expect(snapshot.data?.closed_at).toBe("2026-08-18T20:34:57Z");
       expect(snapshot.data?.merged_at).toBeUndefined();
     });
+
+    it("carries additions, deletions and changed_files on the snapshot data when the GitHub PR body has them", async () => {
+      const tokenProvider = vi.fn().mockResolvedValue(null);
+      const mockFetch = makeFetchMock({
+        id: 3158,
+        state: "closed",
+        merged: true,
+        merged_at: "2026-08-18T20:34:57Z",
+        additions: 320,
+        deletions: 140,
+        changed_files: 42,
+        title: "test",
+      });
+
+      const { resolvers } = createGitHubExternalObjectProvider({} as Db, {
+        fetch: mockFetch.fetch,
+        tokenProvider,
+      });
+
+      const pullRequestResolver = resolvers.find((r) => r.objectType === "pull_request")!;
+      const result = await pullRequestResolver.resolve({
+        companyId: "test-company",
+        object: makeObject("owner/repo#pull/3158"),
+      });
+
+      expect(result.ok).toBe(true);
+      const snapshot = (result as Extract<ExternalObjectResolveResult, { ok: true }>).snapshot;
+      expect(snapshot.data?.additions).toBe(320);
+      expect(snapshot.data?.deletions).toBe(140);
+      expect(snapshot.data?.changed_files).toBe(42);
+    });
+
+    it("omits additions, deletions and changed_files on the snapshot data when the GitHub PR body lacks them", async () => {
+      const tokenProvider = vi.fn().mockResolvedValue(null);
+      const mockFetch = makeFetchMock({
+        id: 3158,
+        state: "closed",
+        merged: true,
+        merged_at: "2026-08-18T20:34:57Z",
+        title: "test",
+      });
+
+      const { resolvers } = createGitHubExternalObjectProvider({} as Db, {
+        fetch: mockFetch.fetch,
+        tokenProvider,
+      });
+
+      const pullRequestResolver = resolvers.find((r) => r.objectType === "pull_request")!;
+      const result = await pullRequestResolver.resolve({
+        companyId: "test-company",
+        object: makeObject("owner/repo#pull/3158"),
+      });
+
+      expect(result.ok).toBe(true);
+      const snapshot = (result as Extract<ExternalObjectResolveResult, { ok: true }>).snapshot;
+      expect(snapshot.data?.additions).toBeUndefined();
+      expect(snapshot.data?.deletions).toBeUndefined();
+      expect(snapshot.data?.changed_files).toBeUndefined();
+      // Absent LOC fields must not break the snapshot: it is still a merged PR.
+      expect(snapshot.statusKey).toBe("merged");
+      expect(snapshot.data?.merged).toBe(true);
+    });
+
+    it("preserves a genuine zero additions/deletions/changed_files rather than dropping it", async () => {
+      const tokenProvider = vi.fn().mockResolvedValue(null);
+      const mockFetch = makeFetchMock({
+        id: 3158,
+        state: "closed",
+        merged: true,
+        merged_at: "2026-08-18T20:34:57Z",
+        additions: 0,
+        deletions: 0,
+        changed_files: 0,
+        title: "test",
+      });
+
+      const { resolvers } = createGitHubExternalObjectProvider({} as Db, {
+        fetch: mockFetch.fetch,
+        tokenProvider,
+      });
+
+      const pullRequestResolver = resolvers.find((r) => r.objectType === "pull_request")!;
+      const result = await pullRequestResolver.resolve({
+        companyId: "test-company",
+        object: makeObject("owner/repo#pull/3158"),
+      });
+
+      expect(result.ok).toBe(true);
+      const snapshot = (result as Extract<ExternalObjectResolveResult, { ok: true }>).snapshot;
+      // A genuine zero-diff must survive projection, distinct from the absent case.
+      expect(snapshot.data?.additions).toBe(0);
+      expect(snapshot.data?.deletions).toBe(0);
+      expect(snapshot.data?.changed_files).toBe(0);
+    });
   });
 });
