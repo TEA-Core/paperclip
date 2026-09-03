@@ -137,6 +137,29 @@ Any other actor or transition is rejected with `422 delivery_identity_write_reje
 and no partial write occurs. `recordedByRunId` and `recordedAt` are
 server-owned (set from the actor context), never client-supplied.
 
+### Guard B actor-resolution order (ADR-092 D3, SUP-14826)
+
+Guard B forbids a completed stage's decision from being cast by the card's
+delivery principal (the "return assignee"). The principal is resolved in
+strict priority order:
+
+1. `executionPolicy.returnAssigneeAgentId` — explicitly declared at card
+   creation or delivery.
+2. `executionState.returnAssignee` — recorded in the execution state at stage
+   completion.
+3. `executionState.deliveryAuthor` — the ADR-091 D1 delivery identity, recorded
+   at delivery by `issue-execution-policy`.
+4. `issues.createdByAgentId` — the card's creator, a stable, non-rewritten
+   proxy for the deliverer.
+
+If none of the four tiers resolves an actor, the card is refused under the
+distinct reason `guard-b:return-assignee-unresolved` — "unprovable" is
+legible as itself and never conflated with a proven integrity violation
+(`guard-b:decision-by-return-assignee`). The current `assigneeAgentId` /
+`assigneeUserId` is **never** consulted: under ADR-072 a review stage
+transfers assignment to the reviewer and never hands it back, so at check
+time the assignee is the last decider, not the deliverer.
+
 ### Waiving a cardless PR
 
 The fold's own changes are TEA-authored deliveries with Paperclip cards, so
