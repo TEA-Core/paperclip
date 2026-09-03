@@ -295,6 +295,19 @@ function candidateDisplayName(pr: { owner: string; repo: string; number: number 
   return `${pr.owner}/${pr.repo}#${pr.number}`;
 }
 
+/**
+ * SUP-14911: a lastErrorCode that indicates the external object is
+ * terminally unresolvable — the provider answered that the credentials
+ * cannot access this repo (401 = no installation, 403 = forbidden). These
+ * errors will not clear on retry; they mean the repo does not exist or has
+ * no App installation. Transient errors (rate_limit, unreachable, network)
+ * are NOT terminal: the next refresh may succeed.
+ */
+function isTerminalResolutionError(code: string | null): boolean {
+  if (code === null) return false;
+  return code === "github_auth_required" || code === "github_forbidden";
+}
+
 type PendingCandidateSelection =
   | { anchor: string }
   | { reason: string; detail: string };
@@ -1382,7 +1395,14 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
 
   const linked = await resolveLinkedPullRequestsWithState(db, row.companyId, row.id);
   const openPrs = linked.filter((pr) => pr.cachedState === "open");
-  const unhydratedPrs = linked.filter((pr) => pr.cachedState === null);
+  // SUP-14911: an object whose last refresh failed with a terminal auth error
+  // (the repo does not exist or has no App installation) will never hydrate.
+  // A null cachedState with a terminal error code means "hydration was
+  // attempted and is impossible", not "not hydrated yet". Only objects with no
+  // terminal error are genuinely pending hydration and worth selecting.
+  const unhydratedPrs = linked.filter(
+    (pr) => pr.cachedState === null && !isTerminalResolutionError(pr.lastErrorCode),
+  );
   let target: LinkedPullRequest | null = null;
   if (openPrs.length === 1) {
     target = openPrs[0];
@@ -1390,20 +1410,28 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     target = unhydratedPrs[0];
   }
   if (!target) {
+    const deadUnhydrated = linked.filter(
+      (pr) => pr.cachedState === null && isTerminalResolutionError(pr.lastErrorCode),
+    );
     const reason =
       openPrs.length > 1 || (openPrs.length === 0 && unhydratedPrs.length > 1)
         ? "ambiguous-pr"
-        : "no-open-pr";
+        : deadUnhydrated.length > 0
+          ? "dead-unhydrated-pr"
+          : "no-open-pr";
     const cached =
       linked.length > 0
-        ? linked.map((pr) => `${pr.displayName} state=${pr.cachedState ?? "unhydrated"}`).join(", ")
+        ? linked.map((pr) => `${pr.displayName} state=${pr.cachedState ?? "unhydrated"}${pr.lastErrorCode ? ` err=${pr.lastErrorCode}` : ""}`).join(", ")
         : "none";
     return { kind: "skipped", reason, detail: `${reason}: linked mentions: ${cached}` };
   }
 
   const prRead = await ghReadJson(db, row.companyId, target.owner, target.repo, `/pulls/${target.number}`);
   if (!prRead.ok) {
-    return { kind: "failed", detail: `pr-fetch-failed: HTTP ${prRead.status} ${prRead.message ?? ""}`.trim() };
+    return {
+      kind: "failed",
+      detail: `pr-fetch-failed: ${target.displayName} HTTP ${prRead.status} ${prRead.message ?? ""}`.trim(),
+    };
   }
   const prBody = prRead.body as Record<string, unknown> | null;
   const headSha = ((prBody?.head as Record<string, unknown> | undefined)?.sha as string | undefined) ?? null;
