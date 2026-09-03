@@ -285,11 +285,17 @@ function runVitest(args, label, shardIndex = null, shardCount = null) {
     TMPDIR: path.join(testRoot, "t"),
     // Expose the CI shard partition to the test process. The server group shards
     // by passing an explicit file list (not vitest's native --shard), so no
-    // VITEST_* variable distinguishes the shards — each runs in its own vitest
-    // process with maxWorkers=1, which makes VITEST_WORKER_ID/VITEST_POOL_ID
-    // constant across them. Suites that bind loopback ports (the exposure-pair
-    // reservation regressions) need the shard index to keep per-shard port lanes
-    // and stop sibling shards racing for the same fixed ports on one runner.
+    // VITEST_* variable distinguishes the shards. Suites that bind loopback
+    // ports (the exposure-pair reservation regressions) need the shard index to
+    // keep per-shard port lanes and stop sibling shards racing for the same
+    // fixed ports on one runner.
+    //
+    // VITEST_WORKER_ID cannot stand in for this, and is NOT constant within a
+    // shard: the server config runs pool=forks with isolate=true, so vitest
+    // spawns a fresh child per test FILE and increments the id each time even
+    // at maxWorkers=1 (30 files produce ids 0..29). Consumers must treat it as
+    // a per-file counter, not a bounded worker slot — see
+    // server/src/__tests__/helpers/exposure-port-lane.ts.
     ...(shardIndex !== null && shardCount !== null
       ? {
           PAPERCLIP_TEST_SHARD_INDEX: String(shardIndex),
