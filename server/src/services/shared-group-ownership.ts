@@ -16,11 +16,34 @@ const DEFAULT_SHARED_GROUP_NAME = "agents";
 // O_NOFOLLOW prevents the leaf component from being a symlink. Ancestor
 // symlinks are still followed, so post-open containment is verified via
 // /proc/self/fd on Linux.
-const O_RDONLY_NOFOLLOW =
-  fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW ?? 0);
+// O_NONBLOCK keeps the open from blocking on a FIFO (named pipe): a blocking
+// O_RDONLY open of a FIFO hangs until a writer connects, which would stall the
+// repair and, with enough FIFOs, exhaust the libuv thread pool (SUP-14865). A
+// non-blocking open of a FIFO resolves immediately; the special-file check
+// below then refuses to mutate it.
+const O_RDONLY_NOFOLLOW_NONBLOCK =
+  fsSync.constants.O_RDONLY |
+  (fsSync.constants.O_NOFOLLOW ?? 0) |
+  (fsSync.constants.O_NONBLOCK ?? 0);
+
+// File types the shared-group traversal repair must never mutate. These are
+// special files (named pipes, character/block devices, sockets), not
+// directories or regular files, so adding setgid/group bits to them is
+// meaningless at best and a surprising side effect at worst.
+const SPECIAL_FILE_TYPES = new Set<number>([
+  fsSync.constants.S_IFIFO,
+  fsSync.constants.S_IFCHR,
+  fsSync.constants.S_IFBLK,
+  fsSync.constants.S_IFSOCK,
+]);
+
+function isSpecialFileType(mode: number): boolean {
+  return SPECIAL_FILE_TYPES.has(mode & fsSync.constants.S_IFMT);
+}
 
 let missingGroupWarned = false;
 let chgrpFailedWarned = false;
+let specialFileWarned = false;
 
 function resolveDefaultMasterKeyDir(): string {
   return resolveSecretsKeyDir();
@@ -141,7 +164,9 @@ export async function ensureSharedGroupTraversalPath(
  * path. A concurrent symlink swap between stat and chown redirected the
  * mutation to an external target. The new implementation:
  *
- * 1. Opens the target with O_RDONLY|O_NOFOLLOW (leaf must not be a symlink).
+ * 1. Opens the target with O_RDONLY|O_NOFOLLOW|O_NONBLOCK (leaf must not be a
+ *    symlink; O_NONBLOCK keeps a FIFO/named-pipe target from blocking the open,
+ *    which would otherwise hang the repair and exhaust the libuv thread pool).
  * 2. Verifies the opened fd's real path via /proc/self/fd (Linux) to catch
  *    ancestor symlinks that O_NOFOLLOW does not prevent.
  * 3. If a containmentRoot is specified, refuses mutation when the verified
@@ -149,12 +174,16 @@ export async function ensureSharedGroupTraversalPath(
  * 4. Checks the denied-server-owned-dirs guard against the VERIFIED (real)
  *    path, not the lexical path, and denies both ancestor and descendant
  *    relationships.
- * 5. Mutates via the file descriptor (handle.chown / handle.chmod), so the
+ * 5. Skips with a warning when the opened inode is a special file (FIFO,
+ *    character/block device, or socket): group-ownership repair only applies
+ *    to directories and regular files.
+ * 6. Mutates via the file descriptor (handle.chown / handle.chmod), so the
  *    mutation targets the exact inode that was opened and verified,
  *    regardless of any subsequent path-level symlink swap.
  *
- * Fail-closed: any error (ELOOP, EACCES, ENOENT, containment violation)
- * results in no mutation and a warning. There is no path-based fallback.
+ * Fail-closed: any error (ELOOP, EACCES, ENOENT, EWOULDBLOCK/ENXIO, containment
+ * violation, special-file target) results in no mutation and a warning. There
+ * is no path-based fallback.
  */
 export async function ensureSharedGroupOwnership(
   dirPath: string,
@@ -171,11 +200,14 @@ export async function ensureSharedGroupOwnership(
 
   let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
-    handle = await fs.open(dirPath, O_RDONLY_NOFOLLOW);
+    handle = await fs.open(dirPath, O_RDONLY_NOFOLLOW_NONBLOCK);
   } catch (err) {
     // ELOOP: leaf is a symlink (O_NOFOLLOW rejected it).
     // EACCES/EPERM: cannot open (e.g. chmod 0o000).
     // ENOENT: path vanished between probe and repair.
+    // EWOULDBLOCK/ENXIO: a special file (FIFO) whose non-blocking open cannot
+    // be established on this platform — O_NONBLOCK already prevents the common
+    // Linux read-open case; on any platform that still surfaces these, we skip.
     // All fail-closed: no mutation, no path-based fallback.
     if (!chgrpFailedWarned) {
       chgrpFailedWarned = true;
@@ -273,6 +305,22 @@ export async function ensureSharedGroupOwnership(
     // is not exploitable in practice because the caller (worktree self-repair)
     // only operates on git-tracked paths within the containment root.
     const stat = await handle.stat();
+    // A special file (FIFO, character/block device, socket) is not a directory
+    // or a regular file. O_NONBLOCK already kept the open from hanging on a
+    // FIFO; now refuse to add setgid/group bits to it. Fail closed: no
+    // mutation, no path-based fallback, one warned skip.
+    if (isSpecialFileType(stat.mode)) {
+      if (!specialFileWarned) {
+        specialFileWarned = true;
+        warn(
+          `Paperclip: skipping shared-group ownership on ${dirPath} — the opened target is a ` +
+            `special file (FIFO, character/block device, or socket), not a directory or regular ` +
+            `file. Shared-group traversal repair applies to directories and regular files only. ` +
+            `No mutation performed.`,
+        );
+      }
+      return;
+    }
     await handle.chown(stat.uid, gid);
     const currentMode = stat.mode & 0o7777;
     // Directories need setgid + group rwx for group inheritance and traversal.

@@ -2,6 +2,8 @@ import { describe, expect, it, vi, beforeEach, beforeAll, afterAll } from "vites
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
+import { execFileSync } from "node:child_process";
 
 // --- Mock infrastructure ---
 // The new implementation opens the target by fd and mutates via handle methods.
@@ -202,6 +204,34 @@ describe("shared-group-ownership", () => {
 
       expect(warnSpy).toHaveBeenCalledTimes(1);
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("cannot open"));
+    });
+
+    it("skips a FIFO target with exactly one warning and no mutation (special file)", async () => {
+      const { ensureSharedGroupOwnership } = await loadFreshModule();
+      const warnSpy = vi.fn();
+      const fifo = path.join(os.tmpdir(), "paperclip-shared-group-test-fifo");
+      // O_NONBLOCK lets the open of a FIFO resolve immediately (no hang); the
+      // opened inode is then identified as a FIFO via its mode and skipped.
+      const handle = setupOpenSuccess(fifo, {
+        stat: vi.fn().mockResolvedValue({
+          uid: 1000,
+          mode: fsSync.constants.S_IFIFO | 0o644,
+          isDirectory: () => false,
+          isFIFO: () => true,
+        }),
+      });
+
+      await ensureSharedGroupOwnership(fifo, {
+        resolveGid: async () => REAL_GID,
+        resolveMasterKeyDir: () => path.join(os.tmpdir(), "nonexistent-secrets"),
+        warn: warnSpy,
+      });
+
+      expect(handle.chown).not.toHaveBeenCalled();
+      expect(handle.chmod).not.toHaveBeenCalled();
+      expect(handle.close).toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("special file"));
     });
   });
 
@@ -696,5 +726,33 @@ describe("shared-group-ownership regression (real fs)", () => {
     const afterStat = await realFs.stat(secretSubdir);
     expect(afterStat.mode).toBe(beforeStat.mode);
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("refusing shared-group ownership"));
+  });
+
+  it("regression: FIFO target does not hang and is skipped with one warning (O_NONBLOCK)", async () => {
+    const { ensureSharedGroupOwnership } = await loadFreshModule();
+    const warnSpy = vi.fn();
+
+    const worktree = path.join(tmpRoot, "worktree-fifo");
+    await realFs.mkdir(worktree, { recursive: true });
+    const fifoPath = path.join(worktree, "pipe");
+    // node:fs lacks a usable mkfifo here (and fs/promises has none); create a
+    // real FIFO via the POSIX mkfifo utility.
+    execFileSync("mkfifo", [fifoPath]);
+
+    // A blocking O_RDONLY open of this FIFO would hang until a writer
+    // connects. O_NONBLOCK makes the open return immediately, after which the
+    // special-file check skips the repair. If O_NONBLOCK regressed, this test
+    // would stall and fail on the per-test timeout.
+    await ensureSharedGroupOwnership(fifoPath, {
+      resolveGid: async () => REAL_GID,
+      resolveMasterKeyDir: () => path.join(tmpRoot, "nonexistent-secrets"),
+      warn: warnSpy,
+    });
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("special file"));
+
+    const st = await realFs.stat(fifoPath);
+    expect(st.isFIFO()).toBe(true);
   });
 });
