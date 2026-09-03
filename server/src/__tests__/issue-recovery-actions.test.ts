@@ -3628,4 +3628,137 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(bumped.attemptCount).toBe(5);
     expect(bumped.attemptCount).toBeLessThanOrEqual(bumped.maxAttempts ?? 5);
   });
+
+  // ADR-093 D2 (SUP-14879): an escalated recovery action (ladder dead, parked on
+  // the board) is NOT a live continuation path. `getLiveContinuationForIssue` is
+  // the reader the continuation-path disjunct must consume; `getActiveForIssue`
+  // keeps counting escalated rows for the write-path guard and board sweep.
+  describe("ADR-093 D2: live continuation reader vs active reader", () => {
+    // Backdate the source issue so the 5-minute settle window is not itself a
+    // live disjunct — otherwise every continuation-path test passes on the
+    // settle-window disjunct and never exercises the recovery-action disjunct.
+    async function backdateIssue(sourceIssueId: string, status: string) {
+      await db
+        .update(issues)
+        .set({ status, updatedAt: new Date("2026-05-09T18:00:00.000Z") })
+        .where(eq(issues.id, sourceIssueId));
+    }
+
+    async function seedEscaltedAction(input: { companyId: string; managerId: string; sourceIssueId: string }) {
+      const actionId = randomUUID();
+      await db.insert(issueRecoveryActions).values({
+        id: actionId,
+        companyId: input.companyId,
+        sourceIssueId: input.sourceIssueId,
+        recoveryIssueId: null,
+        kind: "missing_disposition",
+        status: "escalated",
+        ownerType: "board",
+        ownerAgentId: null,
+        ownerUserId: null,
+        previousOwnerAgentId: input.managerId,
+        returnOwnerAgentId: null,
+        cause: "successful_run_missing_state",
+        fingerprint: "missing-state:escalated",
+        evidence: {},
+        nextAction: "Board decision required.",
+        wakePolicy: null,
+        monitorPolicy: null,
+        attemptCount: 1,
+        maxAttempts: 1,
+        timeoutAt: null,
+        lastAttemptAt: new Date("2026-05-09T19:30:00.000Z"),
+        outcome: "exhausted",
+        resolutionNote: null,
+        resolvedAt: null,
+      });
+      return actionId;
+    }
+
+    it("returns null for an escalated action while getActiveForIssue still returns it", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const actionId = await seedEscaltedAction({ companyId, managerId, sourceIssueId });
+      const svc = issueRecoveryActionService(db);
+
+      // The shared reader still sees the escalated row — narrowing it would mint
+      // duplicate recovery actions on top of an escalated one (the regression
+      // ADR-093 D2 forbids).
+      expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+        id: actionId,
+        status: "escalated",
+      });
+      // The live-continuation reader does not: the ladder is dead and parked on a human.
+      expect(await svc.getLiveContinuationForIssue(companyId, sourceIssueId)).toBeNull();
+    });
+
+    it("returns the live row for a genuinely active action", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const svc = issueRecoveryActionService(db);
+      const action = await svc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "live:active",
+        nextAction: "Restore a live execution path.",
+        wakePolicy: { type: "wake_owner" },
+      });
+
+      expect(await svc.getLiveContinuationForIssue(companyId, sourceIssueId)).toMatchObject({
+        id: action.id,
+        status: "active",
+      });
+      expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({ id: action.id });
+    });
+
+    it("refuses in_progress when the only continuation evidence is an escalated recovery action", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await backdateIssue(sourceIssueId, "todo");
+      await seedEscaltedAction({ companyId, managerId, sourceIssueId });
+      const app = createApp();
+
+      const res = await request(app)
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ status: "in_progress" });
+
+      // On the old getActiveForIssue wiring this would be 200 (escalated counted
+      // as live). Now the escalation is excluded, so the gate rejects it and
+      // reports the activeRecoveryAction disjunct as absent.
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("in_progress_requires_continuation_path");
+      expect(res.body.details.disjuncts.activeRecoveryAction).toBe(false);
+      expect(res.body.details.absentDisjuncts).toContain("activeRecoveryAction");
+      const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(after.status).toBe("todo");
+    });
+
+    it("allows in_progress when a genuinely active recovery action is live (no false-positive suppression)", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await backdateIssue(sourceIssueId, "todo");
+      await issueRecoveryActionService(db).upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "live:route",
+        nextAction: "Restore a live execution path.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const res = await request(app)
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ status: "in_progress" });
+
+      // The live recovery action is a §2a disjunct, so the gate must NOT fire.
+      expect(res.status).toBe(200);
+      expect(res.body.code).not.toBe("in_progress_requires_continuation_path");
+      const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(after.status).toBe("in_progress");
+    });
+  });
 });
