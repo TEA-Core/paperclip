@@ -209,6 +209,15 @@ A change is done when all are true:
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
 
+## 12. Delivery Protocol Checklist
+
+When marking an issue `in_review`, verify the following:
+
+- **Branch pushed**: The execution branch is pushed to `origin` and visible on the remote
+- **PR open**: A pull request exists, is open (not closed/merged), and references this issue
+- **`deliver.sh` invoked**: `deliver.sh` was run, or if not possible, document why in the issue comment (e.g. `$RUNTIME_SCRIPTS_DIR` unset, expanding to `/deliver.sh` ENOENT)
+- **Manual delivery fallback**: If `deliver.sh` cannot run, record a sanctioned no-deliverable-head disposition (e.g. `upstream-equivalent-fix-no-deliverable-head`, `child-delivery-parent-close`, or `merged-elsewhere`) via `doneTransitionOverride`
+
 ## Design system
 
 `DESIGN.md` at the repo root is the source of truth for UI design decisions. The token-only rule applies to all `ui/` changes: every color, spacing, radius, type, shadow, and motion value in `ui/src/components/**` and `ui/src/pages/**` comes from the token layer in `ui/src/index.css` — no hex, raw px, arbitrary Tailwind bracket values, or raw `font-size`/`fontSize` declarations in components, outside the documented allowlist in `ui/src/index.css`. Run `pnpm check:token-gates` (`scripts/check-token-gates.mjs`) before committing UI changes — it fails on any violation not covered by that allowlist.
