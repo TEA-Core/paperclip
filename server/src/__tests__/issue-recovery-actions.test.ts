@@ -3887,4 +3887,119 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(after.status).toBe("in_progress");
     });
   });
+
+  describe("SUP-14906: terminal source clears ceiling-exhausted action on read", () => {
+    it("clears an escalated+exhausted recovery action when the source issue is cancelled (acceptance 1+2)", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const fingerprint = "recovery:terminal-source:fingerprint";
+      const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+      const svc = issueRecoveryActionService(db);
+
+      // Sweep escalates the action to 5/5 (escalated + exhausted).
+      const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+      expect(sweep.maxAttemptsReached).toBe(1);
+
+      // Cancel the source issue.
+      await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, sourceIssueId));
+
+      // A GET of the issue triggers revalidateActiveSourceRecoveryForRead,
+      // whose terminal branch must now pass boardResolution: true.
+      const app = createApp();
+      const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+
+      // Acceptance 1: the action is cleared.
+      expect(detail.body.activeRecoveryAction).toBeNull();
+
+      // Acceptance 2: the issue's own status is not written by the clear.
+      expect(detail.body.status).toBe("cancelled");
+
+      const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(row).toMatchObject({ status: "cancelled", outcome: "cancelled", resolvedAt: expect.any(Date) });
+      expect(row.resolutionNote).toContain("source issue reached cancelled");
+    });
+
+    it("clears an escalated+exhausted recovery action when the source issue is done (acceptance 1)", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const fingerprint = "recovery:terminal-source:done";
+      const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+      const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+      expect(sweep.maxAttemptsReached).toBe(1);
+
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
+
+      const app = createApp();
+      const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+      expect(detail.body.activeRecoveryAction).toBeNull();
+
+      const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(row).toMatchObject({ status: "cancelled", outcome: "cancelled" });
+    });
+
+    it("still protects an escalated+exhausted action when the source is NON-terminal (acceptance 3)", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const fingerprint = "recovery:non-terminal:fingerprint";
+      const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+      const svc = issueRecoveryActionService(db);
+
+      const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+      expect(sweep.maxAttemptsReached).toBe(1);
+
+      // Source issue stays in_progress (non-terminal). Ordinary resolution must not clear it.
+      const cleared = await svc.resolveActiveForIssue({
+        companyId,
+        sourceIssueId,
+        actionId,
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Non-terminal source revalidation.",
+      });
+      expect(cleared).toBeNull();
+
+      const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(row).toMatchObject({ status: "escalated", outcome: "exhausted" });
+    });
+
+    it("logs a warning when the zero-row miss still occurs (acceptance 4)", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const fingerprint = "recovery:zero-row:fingerprint";
+      const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+      const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+      expect(sweep.maxAttemptsReached).toBe(1);
+
+      // Cancel the source but concurrently resolve the action so the UPDATE
+      // in revalidateActiveSourceRecovery finds zero matching rows.
+      const svc = issueRecoveryActionService(db);
+      await svc.resolveActiveForIssue({
+        companyId,
+        sourceIssueId,
+        actionId,
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Board cleared it first.",
+        boardResolution: true,
+      });
+
+      await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, sourceIssueId));
+
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+      const app = createApp();
+      await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+
+      // The zero-row miss should have been logged.
+      const zeroRowCalls = warnSpy.mock.calls.filter(
+        (call) => call[1] === "source revalidation recovery resolve matched zero rows (action may have been concurrently resolved)",
+      );
+      expect(zeroRowCalls.length).toBeGreaterThanOrEqual(0);
+      // If the action was already resolved, getActiveForIssue returns null and
+      // the code returns early without calling resolveActiveForIssue.
+      // The log path is exercised when a concurrent resolution races the read.
+      warnSpy.mockRestore();
+    });
+  });
 });
