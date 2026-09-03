@@ -6398,7 +6398,11 @@ export function issueRoutes(
     ] = await Promise.all([
       taskWatchdogsSvc.getActiveForIssue(issue.companyId, issue.id),
       svc.getCurrentScheduledRetry(issue.id),
-      recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
+      // ADR-093 D2: use the live-only reader. An `escalated` recovery action
+      // (ladder dead, parked on the board) must NOT count as a live
+      // continuation path; only a genuinely `active` action does. The write-path
+      // guard and board sweep still read `getActiveForIssue` (active + escalated).
+      recoveryActionsSvc.getLiveContinuationForIssue(issue.companyId, issue.id),
       listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id]),
       db
         .select({ latestCommentAt: sql<Date | null>`MAX(${issueComments.createdAt})` })
