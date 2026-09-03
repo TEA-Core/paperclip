@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, existsSync, promises as fs, type Dirent } from "node:fs";
+import { constants as fsConstants, existsSync, mkdirSync, rmSync, symlinkSync, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
@@ -2392,6 +2392,156 @@ export function applyPaperclipGitHubCredentialHelperGate(
   });
   if (!helperPath) return env;
   return applyPaperclipGitHubCredentialHelperEnv(env, helperPath);
+}
+
+/**
+ * Rollout flag that gates activation of the agent-side `gh` wrapper (GH-APP-7).
+ * When `on`, the wrapper is materialized as a `gh` shim in the run's scratch bin
+ * dir and prepended to the child PATH so agent `gh` calls mint on-demand broker
+ * installation tokens instead of reading a shared long-lived PAT. Unset / any
+ * other value keeps behavior byte-identical: nothing is written.
+ */
+export const PAPERCLIP_GH_WRAPPER_FLAG = "PAPERCLIP_AGENT_GH_WRAPPER";
+
+export const PAPERCLIP_GH_WRAPPER_FILENAME = "paperclip-gh-wrapper.sh";
+
+export function isPaperclipGhWrapperEnabled(
+  flagEnv: Record<string, string | undefined>,
+): boolean {
+  return flagEnv[PAPERCLIP_GH_WRAPPER_FLAG]?.trim().toLowerCase() === "on";
+}
+
+/**
+ * Resolve the absolute path of the `gh` wrapper script that ships with the
+ * server, anchored to the server's own module tree (independent of the run's
+ * cwd). Mirrors `resolvePaperclipGitHubCredentialHelperPath` for the wrapper
+ * script. Candidates are tried in order and the first that exists wins.
+ */
+export function resolvePaperclipGhWrapperPath(input: {
+  /** Directory of the compiled module that wires `gh` (dirname of import.meta.url). */
+  moduleDir: string;
+  /** The run's cwd, retained only as a last-resort legacy fallback candidate. */
+  cwd?: string;
+  /** Injectable existence check for tests; defaults to node:fs `existsSync`. */
+  existsSync?: (p: string) => boolean;
+}): string | null {
+  const exists = input.existsSync ?? existsSync;
+  // The wiring lives at <server>/{dist|src}/adapters/process/execute.{js,ts},
+  // so the server package root is three levels above its module directory.
+  const packageRoot = path.resolve(input.moduleDir, "..", "..", "..");
+  const candidates = [
+    path.resolve(packageRoot, "dist", "scripts", PAPERCLIP_GH_WRAPPER_FILENAME),
+    path.resolve(packageRoot, "..", "scripts", PAPERCLIP_GH_WRAPPER_FILENAME),
+  ];
+  if (input.cwd) {
+    candidates.push(path.resolve(input.cwd, "scripts", PAPERCLIP_GH_WRAPPER_FILENAME));
+  }
+  for (const candidate of candidates) {
+    if (exists(candidate)) return candidate;
+  }
+  return null;
+}
+
+function resolveRealGhFromPath(
+  pathValue: string | undefined,
+  exists: (p: string) => boolean,
+): string | null {
+  if (!pathValue) return null;
+  for (const dir of pathValue.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, "gh");
+    if (exists(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Gate + materialize the agent-side `gh` wrapper (GH-APP-7). Lane-agnostic: it
+ * takes the run env and an explicit inherited base PATH and reads nothing from
+ * `process.env`, config, or ctx, so the process-adapter lane (this card) and the
+ * ACP / opencode-local lanes (SUP-14869) share the same helper.
+ *
+ * - Byte-identical when the flag is not `on`: nothing is written and no fs
+ *   probes run.
+ * - When the flag is `on`:
+ *   - the run scratch dir is read from `env.PAPERCLIP_RUN_SCRATCH_DIR`; if
+ *     absent the gate skips (warns) — it never `mkdtemps` its own dir.
+ *   - the wrapper script path is resolved from the server install (never the
+ *     run's cwd); if absent the gate skips (warns).
+ *   - the real `gh` is resolved from the inherited base PATH (before the bin
+ *     dir is prepended); if absent the gate skips (warns, fail-closed).
+ *   - otherwise a run-owned `<scratch>/bin/gh` symlink to the wrapper is
+ *     created (the bin dir is `0o775` so a shared-workspace uid/gid split stays
+ *     traversable), `PAPERCLIP_GH_REAL` is set to the real binary, and
+ *     `<scratch>/bin` is prepended to `env.PATH`. The scratch dir is removed by
+ *     run teardown, so the shim is cleaned up with the run.
+ */
+export function applyPaperclipGhWrapperGate(
+  env: Record<string, string>,
+  input: {
+    /** The server process environment, where the rollout flag lives. */
+    flagEnv: Record<string, string | undefined>;
+    /** Directory of the compiled module that wires `gh` (dirname of import.meta.url). */
+    moduleDir: string;
+    /** The inherited PATH the child will have before this gate prepends its bin dir. */
+    basePath: string;
+    /** The run's cwd, retained only as a last-resort legacy fallback candidate. */
+    cwd?: string;
+    /** Injectable existence check for tests; defaults to node:fs `existsSync`. */
+    existsSync?: (p: string) => boolean;
+    /** Optional warn sink for the skip cases; never throws. */
+    onWarn?: (message: string) => void;
+  },
+): Record<string, string> {
+  if (!isPaperclipGhWrapperEnabled(input.flagEnv)) return env;
+
+  const exists = input.existsSync ?? existsSync;
+
+  const scratchDir = env.PAPERCLIP_RUN_SCRATCH_DIR?.trim();
+  if (!scratchDir) {
+    input.onWarn?.(
+      "PAPERCLIP_AGENT_GH_WRAPPER is on but no run scratch dir is available; the gh wrapper was not installed for this run.",
+    );
+    return env;
+  }
+
+  const wrapperPath = resolvePaperclipGhWrapperPath({
+    moduleDir: input.moduleDir,
+    cwd: input.cwd,
+    existsSync: input.existsSync,
+  });
+  if (!wrapperPath) {
+    input.onWarn?.(
+      "PAPERCLIP_AGENT_GH_WRAPPER is on but the gh wrapper script was not found in the server install; the gh wrapper was not installed for this run.",
+    );
+    return env;
+  }
+
+  const realGh = resolveRealGhFromPath(input.basePath, exists);
+  if (!realGh) {
+    input.onWarn?.(
+      "PAPERCLIP_AGENT_GH_WRAPPER is on but no real `gh` binary was found on PATH; the gh wrapper was not installed for this run.",
+    );
+    return env;
+  }
+
+  const binDir = path.join(scratchDir, "bin");
+  const shimPath = path.join(binDir, "gh");
+  try {
+    mkdirSync(binDir, { recursive: true, mode: 0o775 });
+    rmSync(shimPath, { force: true });
+    symlinkSync(wrapperPath, shimPath);
+  } catch {
+    input.onWarn?.(
+      "PAPERCLIP_AGENT_GH_WRAPPER is on but the gh shim could not be materialized in the run scratch dir; the gh wrapper was not installed for this run.",
+    );
+    return env;
+  }
+
+  env.PAPERCLIP_GH_REAL = realGh;
+  const priorPath = env.PATH || input.basePath;
+  env.PATH = [binDir, priorPath].filter(Boolean).join(path.delimiter);
+  return env;
 }
 
 export function applyPaperclipWorkspaceEnv(

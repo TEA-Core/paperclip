@@ -2,6 +2,12 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
+import {
+  constants as fsConstants,
+  existsSync as fsExistsSync,
+  lstatSync as fsLstatSync,
+  readlinkSync as fsReadlinkSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +20,11 @@ import {
   PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FLAG,
   PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME,
   resolvePaperclipGitHubCredentialHelperPath,
+  applyPaperclipGhWrapperGate,
+  isPaperclipGhWrapperEnabled,
+  PAPERCLIP_GH_WRAPPER_FLAG,
+  PAPERCLIP_GH_WRAPPER_FILENAME,
+  resolvePaperclipGhWrapperPath,
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
   buildPersistentSkillSnapshot,
@@ -3695,5 +3706,212 @@ describe("buildPaperclipEnv", () => {
       const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
       expect(env.PAPERCLIP_API_URL).toBe("http://localhost:3200");
     });
+  });
+});
+
+describe("applyPaperclipGhWrapperGate (GH-APP-7)", () => {
+  const serverModuleDir = "/opt/paperclip/server/dist/adapters/process";
+  const serverDistWrapper = "/opt/paperclip/server/dist/scripts/paperclip-gh-wrapper.sh";
+  const serverRepoWrapper = "/opt/paperclip/scripts/paperclip-gh-wrapper.sh";
+
+  let scratchDir: string;
+  let ghDir: string;
+  let fakeGhPath: string;
+
+  beforeEach(async () => {
+    scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "pc-gh-wrapper-scratch-"));
+    ghDir = await fs.mkdtemp(path.join(os.tmpdir(), "pc-gh-wrapper-ghbin-"));
+    fakeGhPath = path.join(ghDir, "gh");
+    await fs.writeFile(fakeGhPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.chmod(fakeGhPath, 0o755);
+  });
+
+  afterEach(async () => {
+    await fs.rm(scratchDir, { recursive: true, force: true });
+    await fs.rm(ghDir, { recursive: true, force: true });
+  });
+
+  it("AC1: is byte-identical when the flag is unset — no PATH written, no PAPERCLIP_GH_REAL, no fs probes, no bin dir", () => {
+    const env: Record<string, string> = {
+      PAPERCLIP_RUN_SCRATCH_DIR: scratchDir,
+      PAPERCLIP_SOMETHING: "kept",
+    };
+    const existsSpy = vi.fn(() => true);
+    const warns: string[] = [];
+    const result = applyPaperclipGhWrapperGate(env, {
+      flagEnv: {},
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      cwd: "/tmp/non-repo",
+      existsSync: existsSpy,
+      onWarn: (m) => warns.push(m),
+    });
+    expect(result).toBe(env);
+    expect(env).toEqual({ PAPERCLIP_RUN_SCRATCH_DIR: scratchDir, PAPERCLIP_SOMETHING: "kept" });
+    expect(env.PATH).toBeUndefined();
+    expect(env.PAPERCLIP_GH_REAL).toBeUndefined();
+    expect(existsSpy).not.toHaveBeenCalled();
+    expect(warns).toEqual([]);
+    expect(fsExistsSync(path.join(scratchDir, "bin"))).toBe(false);
+  });
+
+  it("AC1: stays byte-identical for every non-`on` flag value, even if the wrapper and gh exist", () => {
+    for (const value of ["off", "no", "false", "0", "yes", "true", "1", "", "  "]) {
+      const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir, FOO: "bar" };
+      const result = applyPaperclipGhWrapperGate(env, {
+        flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: value },
+        moduleDir: serverModuleDir,
+        basePath: ghDir,
+        existsSync: () => true,
+      });
+      expect(result).toBe(env);
+      expect(env.PATH).toBeUndefined();
+      expect(env.PAPERCLIP_GH_REAL).toBeUndefined();
+    }
+  });
+
+  it("AC2: when the flag is on, PATH is prepended with the run bin dir, PAPERCLIP_GH_REAL is set, and gh is an executable shim", () => {
+    const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir };
+    applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper || p === fakeGhPath,
+    });
+    const binDir = path.join(scratchDir, "bin");
+    expect(env.PATH).toBe([binDir, ghDir].join(path.delimiter));
+    expect(env.PAPERCLIP_GH_REAL).toBe(fakeGhPath);
+    const shim = path.join(binDir, "gh");
+    // lstat does not follow the link, so this proves the shim was created even
+    // though the (test-fake) wrapper target is not present on this filesystem.
+    expect(fsLstatSync(shim).isSymbolicLink()).toBe(true);
+    expect(fsReadlinkSync(shim)).toBe(serverDistWrapper);
+  });
+
+  it("AC3: PAPERCLIP_GH_REAL is an existing, executable binary NOT under the run bin dir", async () => {
+    const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir };
+    applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper || p === fakeGhPath,
+    });
+    const real = env.PAPERCLIP_GH_REAL;
+    expect(real).toBe(fakeGhPath);
+    expect(real).not.toContain(path.join(scratchDir, "bin"));
+    // executable + regular file
+    await expect(fs.access(real, fsConstants.X_OK)).resolves.toBeUndefined();
+    expect((await fs.stat(real)).isFile()).toBe(true);
+  });
+
+  it("AC4: the shim's bin dir is inside PAPERCLIP_RUN_SCRATCH_DIR and is the first PATH entry", () => {
+    const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir };
+    applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper || p === fakeGhPath,
+    });
+    expect(env.PATH?.startsWith(`${scratchDir}${path.sep}`)).toBe(true);
+    const firstEntry = env.PATH!.split(path.delimiter)[0];
+    expect(path.resolve(firstEntry)).toBe(path.join(scratchDir, "bin"));
+  });
+
+  it("preserves a pre-existing env.PATH, slotting the bin dir in front of it", () => {
+    const env: Record<string, string> = {
+      PAPERCLIP_RUN_SCRATCH_DIR: scratchDir,
+      PATH: "/usr/local/bin:/usr/bin",
+    };
+    applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper || p === fakeGhPath,
+    });
+    const binDir = path.join(scratchDir, "bin");
+    expect(env.PATH).toBe([binDir, "/usr/local/bin:/usr/bin"].join(path.delimiter));
+    expect(env.PAPERCLIP_GH_REAL).toBe(fakeGhPath);
+  });
+
+  it("trap A: flag on but no scratch dir — skips, warns once, no mkdtemp fallback, no PATH written", () => {
+    const env: Record<string, string> = { FOO: "bar" };
+    const warns: string[] = [];
+    const result = applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: () => true,
+      onWarn: (m) => warns.push(m),
+    });
+    expect(result).toBe(env);
+    expect(env.PATH).toBeUndefined();
+    expect(env.PAPERCLIP_GH_REAL).toBeUndefined();
+    expect(warns).toHaveLength(1);
+  });
+
+  it("fail-closed: flag on but no real gh on basePath — skips, warns, no shim written", () => {
+    const env: Record<string, string> = { PAPERCLIP_RUN_SCRATCH_DIR: scratchDir };
+    const warns: string[] = [];
+    const result = applyPaperclipGhWrapperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GH_WRAPPER: "on" },
+      moduleDir: serverModuleDir,
+      basePath: ghDir,
+      existsSync: (p) => p === serverDistWrapper,
+      onWarn: (m) => warns.push(m),
+    });
+    expect(result).toBe(env);
+    expect(env.PATH).toBeUndefined();
+    expect(env.PAPERCLIP_GH_REAL).toBeUndefined();
+    expect(warns).toHaveLength(1);
+    expect(fsExistsSync(path.join(scratchDir, "bin"))).toBe(false);
+  });
+
+  it("flag parsing: only `on` (case/whitespace-insensitive) enables the gate", () => {
+    expect(isPaperclipGhWrapperEnabled({})).toBe(false);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: undefined })).toBe(false);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: "on" })).toBe(true);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: "ON" })).toBe(true);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: "  On  " })).toBe(true);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: "off" })).toBe(false);
+    expect(isPaperclipGhWrapperEnabled({ PAPERCLIP_AGENT_GH_WRAPPER: "true" })).toBe(false);
+    expect(PAPERCLIP_GH_WRAPPER_FLAG).toBe("PAPERCLIP_AGENT_GH_WRAPPER");
+    expect(PAPERCLIP_GH_WRAPPER_FILENAME).toBe("paperclip-gh-wrapper.sh");
+  });
+
+  it("resolver: prefers the built dist artifact, falls back to repo-root, then cwd legacy", () => {
+    expect(resolvePaperclipGhWrapperPath({ moduleDir: serverModuleDir, existsSync: () => true })).toBe(
+      serverDistWrapper,
+    );
+    expect(
+      resolvePaperclipGhWrapperPath({
+        moduleDir: serverModuleDir,
+        existsSync: (p) => p === serverRepoWrapper,
+      }),
+    ).toBe(serverRepoWrapper);
+    const cwdScript = "/tmp/cwd/scripts/paperclip-gh-wrapper.sh";
+    expect(
+      resolvePaperclipGhWrapperPath({
+        moduleDir: serverModuleDir,
+        cwd: "/tmp/cwd",
+        existsSync: (p) => p === cwdScript,
+      }),
+    ).toBe(cwdScript);
+    expect(
+      resolvePaperclipGhWrapperPath({ moduleDir: serverModuleDir, existsSync: () => false }),
+    ).toBeNull();
+  });
+
+  it("ships the gh wrapper from a committed source of truth at scripts/", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+    const repoScript = path.join(repoRoot, "scripts", PAPERCLIP_GH_WRAPPER_FILENAME);
+    await expect(fs.access(repoScript)).resolves.toBeUndefined();
+  });
+
+  it("the server build copies the gh wrapper into dist/scripts and guards for its presence", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+    const raw = await fs.readFile(path.join(repoRoot, "server", "package.json"), "utf8");
+    const pkg = JSON.parse(raw) as { scripts: { build: string } };
+    expect(pkg.scripts.build).toContain(PAPERCLIP_GH_WRAPPER_FILENAME);
+    expect(pkg.scripts.build).toContain(`test -f dist/scripts/${PAPERCLIP_GH_WRAPPER_FILENAME}`);
   });
 });
