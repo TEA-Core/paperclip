@@ -62,8 +62,10 @@ refs. See
 
 The server-side token above covers Paperclip's own git. For **agent-run** git
 and `gh`, Paperclip uses on-demand GitHub App installation tokens instead of a
-long-lived `GH_TOKEN`. Two scripts (shipped in the working tree under
-`scripts/`) implement this:
+long-lived `GH_TOKEN`. Two scripts implement this; the canonical source lives
+in the repo under `scripts/`, and the server build ships the credential helper
+into `server/dist/scripts/` so it is present in the npm package and the Docker
+image:
 
 - `scripts/paperclip-github-credential-helper.sh` — a git credential helper.
 - `scripts/paperclip-gh-wrapper.sh` — a thin wrapper that mints a token and
@@ -72,9 +74,29 @@ long-lived `GH_TOKEN`. Two scripts (shipped in the working tree under
 How it is wired: when a process-adapter run starts, Paperclip sets git's
 `GIT_CONFIG_*` environment variables (process-scoped, no file written) so that
 `credential.helper` is cleared and `credential.https://github.com.helper` (and
-`www.github.com`) point at the helper script. This is applied only when the
-helper script is present in the run's working tree; non-repo workspaces are
-no-ops, and without it git falls back to ambient helpers / `GH_TOKEN` as before.
+`www.github.com`) point at the helper script. The helper path is resolved from
+the server's own install rather than the run's cwd: `server/dist/scripts/...`
+in a built package or image, falling back to the repo-root `scripts/` (dev /
+image) and, last, the run's `scripts/` (legacy). Activation is gated behind the
+`PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER` flag:
+
+### Rollout flag: `PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER`
+
+The git wiring is off by default. Set `PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER=on`
+on the **server** process to enable it; only the value `on` (case- and
+whitespace-insensitive) activates it. Any other value — including unset — leaves
+agent-run git behavior byte-identical to before the flag existed, which is what
+keeps rollout a reversible env change rather than a big-bang deploy.
+
+When the flag is `on` and the helper script is found:
+
+- Ambient/stale github.com credential helpers are cleared for that run (required
+  so the App token wins — a generic ambient helper shadows URL-scoped helpers);
+  non-github.com hosts are untouched.
+- `GIT_TERMINAL_PROMPT=0` is set so git fails fast and legibly instead of
+  hanging on an interactive prompt.
+- If the helper path cannot be resolved (no `dist/scripts` and no repo-root
+  `scripts/`), the wiring is a clean no-op and the run proceeds unchanged.
 
 When git needs github.com credentials, it invokes the helper. The helper
 determines the target `owner/repo` (from `PAPERCLIP_GIT_REPO`, the repo's
@@ -94,8 +116,9 @@ Security properties:
   disk, logs, or the environment.
 
 This requires a fleet GitHub App to be configured on the server (with the target
-org/repos granted to it). The wiring activates whenever the helper script is present
-in a repo workspace. Until the App is configured for a company:
+org/repos granted to it). The git wiring only activates when
+`PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER=on` **and** the helper script is present.
+Until the App is configured for a company:
 
 - The credential helper is a clean no-op for `get` (it emits no credential when the
   broker reports `code=app_not_configured`), so git operations against github.com
@@ -106,7 +129,8 @@ in a repo workspace. Until the App is configured for a company:
 - The `gh` wrapper reports a legible "App not configured" error instead of exec'ing
   `gh` without a token.
 
-Once the App is configured, the same wiring mints installation tokens automatically.
+Once the App is configured and the flag is `on`, the same wiring mints
+installation tokens automatically.
 
 ## User-Specific Secrets
 

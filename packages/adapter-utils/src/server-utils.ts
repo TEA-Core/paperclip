@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
+import { constants as fsConstants, existsSync, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
@@ -2310,6 +2310,88 @@ export function applyPaperclipGitHubCredentialHelperEnv(
   // when the fleet GitHub App is not yet configured. Mirrors buildGitAuthInvocation.
   env.GIT_TERMINAL_PROMPT = "0";
   return env;
+}
+
+/**
+ * Rollout flag that gates activation of the agent-side GitHub credential
+ * helper (GH-APP-6). The helper ships with the server and is wired into an
+ * agent run's git environment only when this flag is explicitly set to `on`.
+ * Unset / any other value keeps behavior byte-identical to before the flag
+ * existed: no environment is touched.
+ */
+export const PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FLAG = "PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER";
+
+export const PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME = "paperclip-github-credential-helper.sh";
+
+export function isPaperclipGitHubCredentialHelperEnabled(
+  flagEnv: Record<string, string | undefined>,
+): boolean {
+  return flagEnv[PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FLAG]?.trim().toLowerCase() === "on";
+}
+
+/**
+ * Resolve the absolute path of the GitHub credential helper script that ships
+ * with the server, anchored to the server's own module tree (independent of
+ * the run's cwd). The build copies the helper into `dist/scripts/`; a checkout
+ * or Docker image where the repo root is present provides the second
+ * candidate. Candidates are tried in order and the first that exists wins.
+ */
+export function resolvePaperclipGitHubCredentialHelperPath(input: {
+  /** Directory of the compiled module that wires git (dirname of import.meta.url). */
+  moduleDir: string;
+  /** The run's cwd, retained only as a last-resort legacy fallback candidate. */
+  cwd?: string;
+  /** Injectable existence check for tests; defaults to node:fs `existsSync`. */
+  existsSync?: (p: string) => boolean;
+}): string | null {
+  const exists = input.existsSync ?? existsSync;
+  // The wiring lives at <server>/{dist|src}/adapters/process/execute.{js,ts},
+  // so the server package root is three levels above its module directory.
+  const packageRoot = path.resolve(input.moduleDir, "..", "..", "..");
+  const candidates = [
+    path.resolve(packageRoot, "dist", "scripts", PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME),
+    path.resolve(packageRoot, "..", "scripts", PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME),
+  ];
+  if (input.cwd) {
+    candidates.push(path.resolve(input.cwd, "scripts", PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME));
+  }
+  for (const candidate of candidates) {
+    if (exists(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Gate + wire the agent-side GitHub credential helper (GH-APP-6).
+ *
+ * - Byte-identical when the rollout flag is not `on`: no environment is
+ *   touched and no filesystem probes run.
+ * - When the flag is `on`, the helper script path is resolved from the server
+ *   install (never from the run's cwd); if that path exists on disk, the git
+ *   environment is wired. The existence check is the safety net — we never
+ *   point git at a helper that is not actually present.
+ */
+export function applyPaperclipGitHubCredentialHelperGate(
+  env: Record<string, string>,
+  input: {
+    /** The server process environment, where the rollout flag lives. */
+    flagEnv: Record<string, string | undefined>;
+    /** Directory of the compiled module that wires git (dirname of import.meta.url). */
+    moduleDir: string;
+    /** The run's cwd, retained only as a last-resort legacy fallback candidate. */
+    cwd?: string;
+    /** Injectable existence check for tests; defaults to node:fs `existsSync`. */
+    existsSync?: (p: string) => boolean;
+  },
+): Record<string, string> {
+  if (!isPaperclipGitHubCredentialHelperEnabled(input.flagEnv)) return env;
+  const helperPath = resolvePaperclipGitHubCredentialHelperPath({
+    moduleDir: input.moduleDir,
+    cwd: input.cwd,
+    existsSync: input.existsSync,
+  });
+  if (!helperPath) return env;
+  return applyPaperclipGitHubCredentialHelperEnv(env, helperPath);
 }
 
 export function applyPaperclipWorkspaceEnv(
