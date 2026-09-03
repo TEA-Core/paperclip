@@ -10,7 +10,14 @@
 #
 #     POST $PAPERCLIP_API_URL/api/agents/me/github/installation-tokens
 #     Authorization: Bearer $PAPERCLIP_API_KEY
-#     body: {"owner":"<o>","repo":"<r>","permissions":{"contents":"<access>"}}
+#     body: {"owner":"<o>","repo":"<r>","permissions":{"contents":"<access>"[,"workflows":"write"]}}
+#
+#   - A *write* credential requests `workflows: write` alongside `contents` (GitHub
+#     refuses any App-authenticated push that creates/updates a file under
+#     .github/workflows/** unless the token carries `workflows`). If that mint fails,
+#     the helper retries exactly once with a contents-only body, so an App not yet
+#     granted `workflows` cannot strand every push. read/none/admin keep the tighter
+#     contents-only set.
 #
 # Security discipline (mirrors server/src/services/git-credentials.ts):
 #   - The minted token is passed from git via stdin (never on argv) and returned
@@ -125,44 +132,89 @@ REPO="${OWNER_REPO#*/}"
 ACCESS="${PAPERCLIP_GIT_ACCESS:-write}"
 case "$ACCESS" in read|write|admin|none) ;; *) ACCESS="write" ;; esac
 
-BODY="$(printf '{"owner":"%s","repo":"%s","permissions":{"contents":"%s"}}' "$OWNER" "$REPO" "$ACCESS")"
+# A push that creates/updates anything under .github/workflows/** is refused unless the
+# token also carries `workflows`, so a *write* credential requests workflows alongside
+# contents. read/none/admin keep the tighter contents-only set. The helper cannot be made
+# path-conditional (git only hands it protocol+host, never the refs/paths pushed), so
+# `workflows` is in the minted set or it is not. When the workflows-bearing body fails to
+# mint, we fall back to a contents-only body (exactly one retry, below).
 API_BASE="${PAPERCLIP_API_URL%/}"
 ENDPOINT="$API_BASE/api/agents/me/github/installation-tokens"
+
+if [ "$ACCESS" = "write" ]; then
+  BODY_PRIMARY="$(printf '{"owner":"%s","repo":"%s","permissions":{"contents":"write","workflows":"write"}}' "$OWNER" "$REPO")"
+  BODY_FALLBACK="$(printf '{"owner":"%s","repo":"%s","permissions":{"contents":"write"}}' "$OWNER" "$REPO")"
+else
+  BODY_PRIMARY="$(printf '{"owner":"%s","repo":"%s","permissions":{"contents":"%s"}}' "$OWNER" "$REPO" "$ACCESS")"
+  BODY_FALLBACK=""
+fi
 
 CURL_ERR="$(mktemp 2>/dev/null)"
 [ -n "$CURL_ERR" ] || fail "mktemp is unavailable; cannot safely capture broker/curl errors (refusing to fall back to a predictable /tmp path)."
 trap 'rm -f "$CURL_ERR" 2>/dev/null' EXIT
-RESPONSE="$(curl -sS -m 30 -X POST "$ENDPOINT" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H 'Content-Type: application/json' \
-  --data "$BODY" 2>"$CURL_ERR")" || RESPONSE=""
+
+# POST $1 to the broker, capturing the body into RESPONSE. Never echoes the request body,
+# response body, or token to any log; the token reaches git only via stdout, at the end.
+mint() {
+  RESPONSE="$(curl -sS -m 30 -X POST "$ENDPOINT" \
+    -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+    -H 'Content-Type: application/json' \
+    --data "$1" 2>"$CURL_ERR")" || RESPONSE=""
+}
+
+# Pull token/error/code out of the broker JSON in $RESPONSE into the globals
+# TOKEN/ERR_MSG/ERR_CODE. Works with or without jq.
+parse_response() {
+  TOKEN=""
+  ERR_MSG=""
+  ERR_CODE=""
+  if command -v jq >/dev/null 2>&1; then
+    TOKEN="$(printf '%s' "$RESPONSE" | jq -r '.token // empty' 2>/dev/null || true)"
+    ERR_MSG="$(printf '%s' "$RESPONSE" | jq -r '.error // .message // empty' 2>/dev/null || true)"
+    ERR_CODE="$(printf '%s' "$RESPONSE" | jq -r '.code // empty' 2>/dev/null || true)"
+  else
+    TOKEN="$(printf '%s' "$RESPONSE" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    ERR_MSG="$(printf '%s' "$RESPONSE" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    ERR_CODE="$(printf '%s' "$RESPONSE" | sed -n 's/.*"code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  fi
+}
+
+no_op_not_configured() {
+  # "App not configured" is a transition state, not a fault: the fleet GitHub App simply
+  # has no installation key for this company yet. Emit no credential on stdout (a clean
+  # no-op, so git falls through to any other credential source and fails fast under
+  # GIT_TERMINAL_PROMPT=0 instead of hanging or prompting) and note it on stderr.
+  printf 'paperclip-github-credential-helper: no github.com credentials: the fleet GitHub App is not configured for this company (broker code=app_not_configured).\n' >&2
+  exit 0
+}
+
+mint "$BODY_PRIMARY"
 
 if [ -z "$RESPONSE" ]; then
   err="$(cat "$CURL_ERR" 2>/dev/null | tr '\n' ' ' | tr -d '\0' | sed -E 's/.*(error|timed out|Could not|Connection|refused).*[a-z]"?$/\1/')"
   fail "could not reach the Paperclip broker at $ENDPOINT${err:+ ($err)}."
 fi
 
-TOKEN=""
-ERR_MSG=""
-ERR_CODE=""
-if command -v jq >/dev/null 2>&1; then
-  TOKEN="$(printf '%s' "$RESPONSE" | jq -r '.token // empty' 2>/dev/null || true)"
-  ERR_MSG="$(printf '%s' "$RESPONSE" | jq -r '.error // .message // empty' 2>/dev/null || true)"
-  ERR_CODE="$(printf '%s' "$RESPONSE" | jq -r '.code // empty' 2>/dev/null || true)"
-else
-  TOKEN="$(printf '%s' "$RESPONSE" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  ERR_MSG="$(printf '%s' "$RESPONSE" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  ERR_CODE="$(printf '%s' "$RESPONSE" | sed -n 's/.*"code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+parse_response
+
+if [ -z "$TOKEN" ] && [ "$ERR_CODE" = "app_not_configured" ]; then
+  no_op_not_configured
 fi
 
-# "App not configured" is a transition state, not a fault: the fleet GitHub App simply
-# has no installation key for this company yet. Emit no credential on stdout (a clean
-# no-op, so git falls through to any other credential source and fails fast under
-# GIT_TERMINAL_PROMPT=0 instead of hanging or prompting) and note it on stderr. Every
-# other failure hard-fails below with a legible message.
+# The primary (workflows-bearing) body minted no token and it requested `workflows`:
+# retry exactly once with the contents-only body so an App not yet granted `workflows`
+# cannot strand every push. The first response body is never logged.
+if [ -z "$TOKEN" ] && [ -n "$BODY_FALLBACK" ]; then
+  mint "$BODY_FALLBACK"
+  if [ -n "$RESPONSE" ]; then
+    parse_response
+  else
+    TOKEN=""; ERR_MSG=""; ERR_CODE=""
+  fi
+fi
+
 if [ -z "$TOKEN" ] && [ "$ERR_CODE" = "app_not_configured" ]; then
-  printf 'paperclip-github-credential-helper: no github.com credentials: the fleet GitHub App is not configured for this company (broker code=app_not_configured).\n' >&2
-  exit 0
+  no_op_not_configured
 fi
 
 [ -n "$TOKEN" ] || fail "GitHub token mint failed${ERR_MSG:+: $ERR_MSG} (owner/repo: $OWNER_REPO)."
