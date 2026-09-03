@@ -1,5 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { agents as agentsTable, issues as issuesTable } from "@paperclipai/db";
+import {
+  agents as agentsTable,
+  issueExecutionDecisions as issueExecutionDecisionsTable,
+  issues as issuesTable,
+} from "@paperclipai/db";
 import {
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
@@ -86,7 +90,7 @@ function mockProjectRow(row: Partial<Record<string, unknown>> = {}) {
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; agents?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[] }) {
   // SUP-14561: the guard now also reads the issues table (child ladder scan).
   // Dispatch by table identity when `rows.issues` is seeded; otherwise every
   // select().from().where() resolves to the executionWorkspaces rows exactly
@@ -103,6 +107,19 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.agents ?? []),
     then: vi.fn().mockResolvedValue(rows.agents ?? []),
+  };
+  // SUP-14912: the guard reads issue_execution_decisions (approved-decision
+  // recovery for a nulled projection). Dispatch by table identity. The mock
+  // applies the guard's `outcome = 'approved'` filter client-side so raw rows
+  // can be seeded — a changes_requested row does not recover the stage.
+  const decisionsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(
+      (rows.issueExecutionDecisions ?? []).filter((r) => r.outcome === "approved"),
+    ),
+    then: vi.fn().mockResolvedValue(
+      (rows.issueExecutionDecisions ?? []).filter((r) => r.outcome === "approved"),
+    ),
   };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
@@ -131,6 +148,7 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
       from: function (table: unknown) {
         if (table === issuesTable && rows.issues !== undefined) return issuesChain;
         if (table === agentsTable && rows.agents !== undefined) return agentsChain;
+        if (table === issueExecutionDecisionsTable) return decisionsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -529,6 +547,129 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("Review ladder unsatisfied");
       expect(result.reason).not.toContain("open linked PR");
+    });
+  });
+
+  describe("review ladder recovered from issue_execution_decisions (SUP-14912)", () => {
+    const stageA = "aaaaaaaa-0000-4000-8000-0000000000aa";
+    const stageB = "bbbbbbbb-0000-4000-8000-0000000000bb";
+
+    const decisionRow = (stageId: string, outcome: string) => ({
+      id: `dec-${stageId}`,
+      companyId: "company-1",
+      issueId: "issue-1",
+      stageId,
+      stageType: "review",
+      outcome,
+      body: null,
+      createdByRunId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    it("satisfies a nulled-projection stage backed by an approved decision (AC2 / main regression)", async () => {
+      setupDbMock({ issueExecutionDecisions: [decisionRow(stageA, "approved")] });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: { stages: [{ id: stageA, type: "review" }] },
+          executionState: null,
+        },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.ladderUnsatisfied).toBeUndefined();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_recovered_from_decisions",
+          details: expect.objectContaining({
+            reason: "review_ladder_recovered_from_decisions",
+          }),
+        }),
+      );
+    });
+
+    it("does NOT satisfy a stage whose only recorded decision is changes_requested (AC3 — no bypass)", async () => {
+      // The mock applies the guard's `outcome = 'approved'` filter, so a
+      // changes_requested row yields an empty approved set: the stage stays
+      // unsatisfied and the close fails closed.
+      setupDbMock({ issueExecutionDecisions: [decisionRow(stageA, "changes_requested")] });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: { stages: [{ id: stageA, type: "review" }] },
+          executionState: null,
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.ladderUnsatisfied).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_recovered_from_decisions",
+        }),
+      );
+    });
+
+    it("still fails closed when the nulled-projection stage has no decision row at all (AC3)", async () => {
+      setupDbMock({ issueExecutionDecisions: [] });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: { stages: [{ id: stageA, type: "review" }] },
+          executionState: null,
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.ladderUnsatisfied).toBe(true);
+    });
+
+    it("recovers only the decided stage, leaving an undecided later stage unsatisfied (AC1 — no blanket satisfy)", async () => {
+      // Two-stage ladder, projection nulled; only stage A has an approved
+      // decision. Stage B has no decision, so the ladder is still unsatisfied.
+      setupDbMock({ issueExecutionDecisions: [decisionRow(stageA, "approved")] });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: {
+            stages: [
+              { id: stageA, type: "review" },
+              { id: stageB, type: "review" },
+            ],
+          },
+          executionState: null,
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.ladderUnsatisfied).toBe(true);
+      expect(result.reason).toContain("stage 2 of 2");
+      expect(result.reason).toContain(stageB);
+    });
+
+    it("no longer advertises doneTransitionOverride for a ladder refusal (AC4)", async () => {
+      setupDbMock({ issueExecutionDecisions: [] });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: { stages: [{ id: stageA, type: "review" }] },
+          executionState: null,
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Review ladder unsatisfied");
+      expect(result.reason).toContain("neither completedStageIds nor skippedStageIds");
+      expect(result.reason).not.toContain("doneTransitionOverride");
+      expect(result.ladderUnsatisfied).toBe(true);
     });
   });
 

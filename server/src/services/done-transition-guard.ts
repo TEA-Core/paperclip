@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { and, eq, inArray } from "drizzle-orm";
-import { agents, issues, type Db } from "@paperclipai/db";
+import { agents, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -70,6 +70,8 @@ export interface DoneTransitionGuardResult {
   defaultRef: string | null;
   owner: string | null;
   repo: string | null;
+  /** True when the refusal is a review-ladder refusal (mechanism C): a no-deliverable-head override does not clear it. */
+  ladderUnsatisfied?: boolean;
   skipped: boolean;
   skipReason: string | null;
 }
@@ -692,6 +694,33 @@ async function liveDiscoverOpenLinkedPullRequests(
 }
 
 /**
+ * SUP-14912: the set of stage ids on this issue backed by a durable `approved`
+ * decision row in `issue_execution_decisions`. The reopen path nulls the
+ * `executionState` projection when a done/cancelled issue moves back to a
+ * non-terminal status, but the decision rows survive. Only `approved` counts —
+ * a `changes_requested` decision leaves the stage unsatisfied (fail closed, no
+ * bypass). Mirrors the mechanism A count query: no try/catch, so a DB error
+ * propagates and fails the close closed.
+ */
+async function listDecisionSatisfiedStageIds(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<Set<string>> {
+  const rows = await db
+    .select({ stageId: issueExecutionDecisions.stageId })
+    .from(issueExecutionDecisions)
+    .where(
+      and(
+        eq(issueExecutionDecisions.issueId, issueId),
+        eq(issueExecutionDecisions.companyId, companyId),
+        eq(issueExecutionDecisions.outcome, "approved"),
+      ),
+    );
+  return new Set(rows.map((row) => row.stageId));
+}
+
+/**
  * SUP-14446 mechanism C: a close to `done` must account for the issue's own
  * review ladder. An issue carrying a populated `executionPolicy.stages` can
  * otherwise reach `done` with zero stage decisions recorded (SUP-8098: parked
@@ -707,6 +736,14 @@ async function liveDiscoverOpenLinkedPullRequests(
  * the approval circuit — so a policy stage currently pending is treated as
  * satisfied in that case only.
  *
+ * `decisionSatisfiedStageIds` is the set of stage ids backed by a durable
+ * `approved` decision row in `issue_execution_decisions` (SUP-14912). A card
+ * reopen nulls the `executionState` projection while the decision rows
+ * survive; a stage in this set is satisfied even when the projection is
+ * null/absent or missing the stage, so a recovered approval no longer deadlocks
+ * the close. Only `approved` decisions ever populate this set — a
+ * `changes_requested` decision does NOT satisfy.
+ *
  * Returns null when the issue carries no ladder (out of scope for this
  * mechanism; the pre-existing null-policy path is unchanged).
  */
@@ -714,6 +751,7 @@ function evaluateReviewLadderSatisfaction(
   executionPolicy: unknown,
   executionState: unknown,
   decisionCarried: boolean,
+  decisionSatisfiedStageIds?: ReadonlySet<string>,
 ): {
   satisfied: boolean;
   totalStages: number;
@@ -744,6 +782,13 @@ function evaluateReviewLadderSatisfaction(
   const state = parseIssueExecutionState(executionState);
   const completed = new Set<string>(state?.completedStageIds ?? []);
   const skipped = new Set<string>(state?.skippedStageIds ?? []);
+
+  // SUP-14912: a stage backed by a durable approved decision is satisfied even
+  // when the projection (completedStageIds) is null/missing it — a reopen can
+  // null the projection while the decision row survives.
+  if (decisionSatisfiedStageIds) {
+    for (const id of decisionSatisfiedStageIds) completed.add(id);
+  }
 
   if (decisionCarried && state !== null && state.status === "pending" && state.currentStageId !== null) {
     if (stages.some((stage) => stage.id === state.currentStageId)) {
@@ -948,11 +993,42 @@ export async function evaluateDoneTransitionGuard(
     skipReason: skipReason && prSkipReason ? `${skipReason}; ${prSkipReason}` : (skipReason ?? prSkipReason),
   });
 
-  const reviewLadder = evaluateReviewLadderSatisfaction(
+  let reviewLadder = evaluateReviewLadderSatisfaction(
     issue.executionPolicy,
     issue.executionState,
     decisionCarried,
   );
+
+  // SUP-14912: a reopen nulls the `executionState` projection while the durable
+  // decision rows survive. Before refusing, recover satisfaction from
+  // `issue_execution_decisions` — a stage with a recorded `approved` decision is
+  // satisfied regardless of the projection. Runs only in the fallback case
+  // (ladder present and unsatisfied by the projection); on a DB error it throws
+  // and fails the close closed, same as mechanism A.
+  if (reviewLadder !== null && !reviewLadder.satisfied) {
+    const decisionSatisfiedStageIds = await listDecisionSatisfiedStageIds(
+      db,
+      issue.companyId,
+      issue.id,
+    );
+    const recovered = evaluateReviewLadderSatisfaction(
+      issue.executionPolicy,
+      issue.executionState,
+      decisionCarried,
+      decisionSatisfiedStageIds,
+    );
+    if (recovered !== null) {
+      reviewLadder = recovered;
+      if (recovered.satisfied) {
+        void writeAuditLog(db, issue, "issue.done_transition_ladder_recovered_from_decisions", {
+          reason: "review_ladder_recovered_from_decisions",
+          completedStageIds: recovered.completedStageIds,
+          skippedStageIds: recovered.skippedStageIds,
+          decisionCarried,
+        });
+      }
+    }
+  }
 
   // SUP-14561 (mechanism A): a ladder-less parent is only suspect when its
   // children demonstrably ran ladders. Query the decomposition only in that
@@ -1019,14 +1095,15 @@ export async function evaluateDoneTransitionGuard(
       reason:
         `Review ladder unsatisfied: stage ${reviewLadder.firstUnsatisfiedIndex + 1} of ` +
         `${reviewLadder.totalStages} (${first?.type ?? "unknown"}, ${first?.id ?? "unknown"}) has no recorded decision — ` +
-        "its id is in neither completedStageIds nor skippedStageIds. " +
-        "Complete or skip the stage before marking done, or set doneTransitionOverride to a " +
-        `sanctioned no-deliverable-head disposition (${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
+        "its id is in neither completedStageIds nor skippedStageIds, and no approved decision row is recorded for it. " +
+        "Record the stage's approval (or skip it) before marking the issue done. " +
+        "A no-deliverable-head override does not clear a review-ladder refusal.",
       aheadBy: null,
       branch: null,
       defaultRef: null,
       owner: null,
       repo: null,
+      ladderUnsatisfied: true,
       skipped: false,
       skipReason: null,
     };

@@ -3405,9 +3405,11 @@ export function issueRoutes(
             owner: guardResult.owner,
             repo: guardResult.repo,
             decisionCarried,
-            remedy: decisionCarried
-              ? "Merge the issue's pull request before approving this review stage — a review approval decides code quality, not merge/land state. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
-              : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition.",
+            remedy: guardResult.ladderUnsatisfied
+              ? "Record the unsatisfied review stage's approval (or skip it) before marking the issue done — the review ladder must be complete before a close, and a no-deliverable-head override does not clear a review-ladder refusal."
+              : decisionCarried
+                ? "Merge the issue's pull request before approving this review stage — a review approval decides code quality, not merge/land state. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition."
+                : "Run deliver.sh to deliver the branch (open or merge a pull request) before marking the issue done. Alternatively, set doneTransitionOverride to a sanctioned no-deliverable-head disposition.",
           },
         },
       };
