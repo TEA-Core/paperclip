@@ -715,7 +715,12 @@ export async function evaluateStageIntegrity(
       createdAt: issueExecutionDecisions.createdAt,
     })
     .from(issueExecutionDecisions)
-    .where(eq(issueExecutionDecisions.issueId, row.id));
+    .where(
+      and(
+        eq(issueExecutionDecisions.issueId, row.id),
+        eq(issueExecutionDecisions.companyId, row.companyId),
+      ),
+    );
 
   const latestByStage = new Map<string, { actorAgentId: string | null; actorUserId: string | null; createdAt: Date }>();
   for (const decision of decisions) {
