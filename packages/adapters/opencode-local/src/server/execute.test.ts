@@ -1090,3 +1090,115 @@ describe("execute — sanitizeInheritedPaperclipEnv at spawn points", () => {
     expect(runtimeEnv!.ZZZ_SENTINEL).toBe("sentinel-value");
   });
 });
+
+// SUP-14869 (GH-APP-8): the opencode-local lane wires the agent-side GitHub App
+// credential helper (GH-APP-6) and the `gh` wrapper (GH-APP-7) into the run env
+// so the spawned child authenticates to github.com with broker-minted
+// installation tokens instead of a long-lived GH_TOKEN / shared PAT. These tests
+// assert the gates' effects actually reach the child env the lane composes for
+// the spawn — the wiring this card adds — on top of the helper-level behavior
+// already covered in adapter-utils/server-utils.test.ts.
+describe("execute — GitHub App run-env gates (SUP-14869)", () => {
+  let scratchDir: string;
+  let fakeGhDir: string;
+  let savedPath: string | undefined;
+
+  function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
+    return {
+      runId: "run-gh-app",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Agent",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { model: "router/coder", cwd: process.cwd() },
+      context: {},
+      onLog: async () => {},
+      ...overrides,
+    };
+  }
+
+  function spawnEnv(): Record<string, string> {
+    const call = runAdapterExecutionTargetProcessMock.mock.calls.at(-1);
+    const options = call?.[4] as { env?: Record<string, string> } | undefined;
+    return options?.env ?? {};
+  }
+
+  async function runOnce(configEnv: Record<string, string>): Promise<void> {
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: [JSON.stringify({ type: "text", part: { text: "ok", messageID: "m1" } })].join("\n"),
+      stderr: "",
+    }));
+    await execute(
+      makeCtx({
+        config: { model: "router/coder", cwd: process.cwd(), env: configEnv },
+      }),
+    );
+  }
+
+  beforeEach(async () => {
+    // A real scratch dir the gh gate can materialise its bin shim into, and a
+    // throwaway `gh` on PATH so the gate's real-binary probe succeeds.
+    scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gh-scratch-"));
+    fakeGhDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gh-bin-"));
+    const fakeGh = path.join(fakeGhDir, "gh");
+    await fs.writeFile(fakeGh, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.chmod(fakeGh, 0o755);
+    savedPath = process.env.PATH;
+    process.env.PATH = `${fakeGhDir}${path.delimiter}${savedPath ?? ""}`;
+    delete process.env.PAPERCLIP_AGENT_GH_WRAPPER;
+    delete process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER;
+  });
+
+  afterEach(async () => {
+    process.env.PATH = savedPath;
+    delete process.env.PAPERCLIP_AGENT_GH_WRAPPER;
+    delete process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER;
+    vi.restoreAllMocks();
+    await fs.rm(scratchDir, { recursive: true, force: true });
+    await fs.rm(fakeGhDir, { recursive: true, force: true });
+  });
+
+  it("leaves the child env untouched when both rollout flags are unset (AC1)", async () => {
+    await runOnce({ PAPERCLIP_RUN_SCRATCH_DIR: scratchDir });
+    const env = spawnEnv();
+    expect(env.PAPERCLIP_GH_REAL).toBeUndefined();
+    expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(env.GIT_TERMINAL_PROMPT).toBeUndefined();
+    // The gh gate must not have put its run scratch bin dir on the child PATH.
+    const binDir = path.join(scratchDir, "bin");
+    const pathEntries = (env.PATH ?? "").split(path.delimiter).filter(Boolean);
+    expect(pathEntries).not.toContain(binDir);
+  });
+
+  it("prepends the run bin dir to the child PATH and sets PAPERCLIP_GH_REAL when the gh wrapper flag is on (AC2)", async () => {
+    process.env.PAPERCLIP_AGENT_GH_WRAPPER = "on";
+    await runOnce({ PAPERCLIP_RUN_SCRATCH_DIR: scratchDir });
+    const env = spawnEnv();
+    const binDir = path.join(scratchDir, "bin");
+    expect(env.PATH?.startsWith(`${binDir}${path.delimiter}`)).toBe(true);
+    expect(env.PAPERCLIP_GH_REAL).toBe(path.join(fakeGhDir, "gh"));
+  });
+
+  it("installs the git credential helper config when the credential helper flag is on (AC3)", async () => {
+    process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER = "on";
+    await runOnce({ PAPERCLIP_RUN_SCRATCH_DIR: scratchDir });
+    const env = spawnEnv();
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(env.GIT_CONFIG_COUNT).toBeDefined();
+    const count = Number(env.GIT_CONFIG_COUNT);
+    const keys: string[] = [];
+    for (let i = 0; i < count; i += 1) {
+      keys.push(env[`GIT_CONFIG_KEY_${i}`]);
+    }
+    expect(keys).toContain("credential.helper");
+    expect(keys).toContain("credential.https://github.com.helper");
+  });
+});

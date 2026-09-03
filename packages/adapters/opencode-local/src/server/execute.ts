@@ -31,6 +31,8 @@ import {
   asStringArray,
   parseObject,
   buildPaperclipEnv,
+  applyPaperclipGhWrapperGate,
+  applyPaperclipGitHubCredentialHelperGate,
   joinPromptSections,
   renderRunDeadlineNotice,
   buildRunDeadlineEnv,
@@ -555,6 +557,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
+  // Wire the agent-side GitHub App credential helper (GH-APP-6 / SUP-14752) and
+  // the `gh` wrapper (GH-APP-7 / SUP-14857) into this run's env so git/gh
+  // authenticate against github.com with on-demand, broker-minted installation
+  // tokens instead of a long-lived GH_TOKEN / shared PAT (SUP-14869). The
+  // helpers ship with the server, so their paths resolve from the server's own
+  // module tree — independent of the run's cwd. Both gates read the rollout flag
+  // from the server process env and are byte-identical no-ops when their flag is
+  // unset. The gh gate reads the scratch bin dir from PAPERCLIP_RUN_SCRATCH_DIR in
+  // the run env and the inherited base PATH from the argument (never process.env),
+  // matching the process-adapter reference wiring. These mutations run BEFORE
+  // prepareOpenCodeRuntimeConfig so they flow into preparedRuntimeConfig.env, the
+  // object that composes the child env. `__moduleDir` is one level deeper than
+  // the process-adapter wiring this resolver was calibrated against, so step up
+  // one directory — that makes the resolver's repo-root candidate resolve to the
+  // server's `scripts/` dir rather than a `packages/` subpath.
+  applyPaperclipGitHubCredentialHelperGate(env, {
+    flagEnv: process.env,
+    moduleDir: path.resolve(__moduleDir, ".."),
+    cwd,
+  });
+  applyPaperclipGhWrapperGate(env, {
+    flagEnv: process.env,
+    moduleDir: path.resolve(__moduleDir, ".."),
+    basePath: process.env.PATH ?? "",
+    cwd,
+    onWarn: (message) => {
+      void onLog("stderr", `paperclip-gh-wrapper: ${message}\n`);
+    },
+  });
   const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
   const localRuntimeConfigHome = preparedRuntimeConfig.runtimeConfigHome;
   try {

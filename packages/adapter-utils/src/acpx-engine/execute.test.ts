@@ -7404,3 +7404,101 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     }
   });
 });
+
+// SUP-14869 (GH-APP-8): the ACP/acpx-engine lane wires the agent-side GitHub
+// App credential helper (GH-APP-6) and the `gh` wrapper (GH-APP-7) into the run
+// env so the spawned ACP agent authenticates to github.com with broker-minted
+// installation tokens instead of a long-lived GH_TOKEN / shared PAT. The
+// executor's buildRuntime composes the child session env as
+// `ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env })`,
+// so the gate mutations on `env` reach the acpx session options. These tests
+// assert that wiring at the child-session-env boundary, on top of the
+// helper-level behavior already covered in adapter-utils/server-utils.test.ts.
+describe("acpx-engine — GitHub App run-env gates (SUP-14869)", () => {
+  let scratchDir: string;
+  let fakeGhDir: string;
+  let savedPath: string | undefined;
+
+  async function sessionEnv(envConfig: Record<string, string>): Promise<Record<string, string>> {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const { sessionInputs } = await runExecutor(
+      {
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        env: envConfig,
+      },
+      {
+        authToken: "runtime-secret-token",
+        context: { taskId: "issue-real", wakeReason: "issue_assigned" },
+      },
+    );
+    return (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+  }
+
+  beforeEach(async () => {
+    // A real scratch dir the gh gate can materialise its bin shim into, and a
+    // throwaway `gh` on PATH so the gate's real-binary probe succeeds.
+    scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-acpx-gh-scratch-"));
+    fakeGhDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-acpx-gh-bin-"));
+    const fakeGh = path.join(fakeGhDir, "gh");
+    await fs.writeFile(fakeGh, "#!/bin/sh\nexit 0\n", "utf8");
+    savedPath = process.env.PATH;
+    process.env.PATH = `${fakeGhDir}:${savedPath ?? ""}`;
+    delete process.env.PAPERCLIP_AGENT_GH_WRAPPER;
+    delete process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER;
+  });
+
+  afterEach(async () => {
+    process.env.PATH = savedPath;
+    delete process.env.PAPERCLIP_AGENT_GH_WRAPPER;
+    delete process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER;
+    await fs.rm(scratchDir, { recursive: true, force: true });
+    await fs.rm(fakeGhDir, { recursive: true, force: true });
+  });
+
+  it("leaves the child session env untouched when both rollout flags are unset (AC1)", async () => {
+    const env = await sessionEnv({ PAPERCLIP_RUN_SCRATCH_DIR: scratchDir });
+    expect(env.PAPERCLIP_GH_REAL).toBeUndefined();
+    // The gh gate must not have put its run scratch bin dir on the child PATH.
+    const binDir = path.join(scratchDir, "bin");
+    const pathEntries = (env.PATH ?? "").split(path.delimiter).filter(Boolean);
+    expect(pathEntries).not.toContain(binDir);
+    // The credential-helper gate must not have written its git config keys.
+    // The run legitimately carries an ambient GIT_CONFIG_* baseline (e.g. the
+    // harness's safe.directory entry) inherited into the ACP child env, so we
+    // assert the gate's own keys are absent rather than that GIT_CONFIG_COUNT
+    // is undefined.
+    const count = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10);
+    const keys: string[] = [];
+    for (let i = 0; i < count; i += 1) {
+      keys.push(env[`GIT_CONFIG_KEY_${i}`]);
+    }
+    expect(keys).not.toContain("credential.helper");
+    expect(keys).not.toContain("credential.https://github.com.helper");
+    expect(keys).not.toContain("credential.https://www.github.com.helper");
+  });
+
+  it("prepends the run bin dir to the child PATH and sets PAPERCLIP_GH_REAL when the gh wrapper flag is on (AC2)", async () => {
+    process.env.PAPERCLIP_AGENT_GH_WRAPPER = "on";
+    const env = await sessionEnv({ PAPERCLIP_RUN_SCRATCH_DIR: scratchDir });
+    const binDir = path.join(scratchDir, "bin");
+    const entries = (env.PATH ?? "").split(path.delimiter).filter(Boolean);
+    expect(entries[0]).toBe(binDir);
+    expect(env.PAPERCLIP_GH_REAL).toBe(path.join(fakeGhDir, "gh"));
+  });
+
+  it("installs the git credential helper config when the credential helper flag is on (AC3)", async () => {
+    process.env.PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER = "on";
+    const env = await sessionEnv({ PAPERCLIP_RUN_SCRATCH_DIR: scratchDir });
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(env.GIT_CONFIG_COUNT).toBeDefined();
+    const count = Number(env.GIT_CONFIG_COUNT);
+    const keys: string[] = [];
+    for (let i = 0; i < count; i += 1) {
+      keys.push(env[`GIT_CONFIG_KEY_${i}`]);
+    }
+    expect(keys).toContain("credential.helper");
+    expect(keys).toContain("credential.https://github.com.helper");
+  });
+});

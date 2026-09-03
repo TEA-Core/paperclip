@@ -45,6 +45,8 @@ import {
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   applyPaperclipWorkspaceEnv,
+  applyPaperclipGhWrapperGate,
+  applyPaperclipGitHubCredentialHelperGate,
   asBoolean,
   asNumber,
   asString,
@@ -2001,6 +2003,30 @@ async function buildRuntime(input: {
     resolvedAdapterEnv[key] = value;
   }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
+  // Wire the agent-side GitHub App credential helper (GH-APP-6 / SUP-14752) and
+  // the `gh` wrapper (GH-APP-7 / SUP-14857) into this run's env so git/gh
+  // authenticate against github.com with on-demand, broker-minted installation
+  // tokens instead of a long-lived GH_TOKEN / shared PAT (SUP-14869). The
+  // helpers ship with the server, so their paths resolve from the server's own
+  // module tree — independent of the run's cwd. Both gates read the rollout flag
+  // from the server process env and are byte-identical no-ops when their flag
+  // is unset. The gh gate reads the scratch bin dir from PAPERCLIP_RUN_SCRATCH_DIR
+  // in the run env and the inherited base PATH from the argument (never
+  // process.env), matching the process-adapter reference wiring.
+  applyPaperclipGitHubCredentialHelperGate(env, {
+    flagEnv: process.env,
+    moduleDir: defaultModuleDir,
+    cwd,
+  });
+  applyPaperclipGhWrapperGate(env, {
+    flagEnv: process.env,
+    moduleDir: defaultModuleDir,
+    basePath: process.env.PATH ?? "",
+    cwd,
+    onWarn: (message) => {
+      void input.ctx.onLog("stderr", `paperclip-gh-wrapper: ${message}\n`);
+    },
+  });
   // Local managed-home seam (adapter-provided; the local-lane counterpart of
   // `prepareRemoteManagedHome`). Invoked ONLY on the local execution-target
   // lane (`executionTargetIsRemote` is false — an absent target is the local
