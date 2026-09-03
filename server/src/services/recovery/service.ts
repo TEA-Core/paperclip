@@ -29,6 +29,7 @@ import {
   issueAttachments,
   issueComments,
   issueApprovals,
+  issueExecutionDecisions,
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
@@ -6655,7 +6656,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       visibleIssueCondition(),
       sql`${issues.executionState}->>'status' = 'pending'`,
       sql`${issues.executionState}->>'currentStageType' = 'review'`,
-      sql`${issues.executionState}->>'lastDecisionId' is null`,
+      sql`NOT EXISTS (
+        SELECT 1
+        FROM ${issueExecutionDecisions}
+        WHERE ${issueExecutionDecisions.issueId} = ${issues.id}
+          AND ${issueExecutionDecisions.stageId}::text = ${issues.executionState}->>'currentStageId'
+      )`,
       sql`${issues.executionState}->'currentParticipant'->>'type' = 'agent'`,
       sql`${issues.executionState}->'currentParticipant'->>'agentId' is not null`,
       lt(issues.updatedAt, cutoff),
