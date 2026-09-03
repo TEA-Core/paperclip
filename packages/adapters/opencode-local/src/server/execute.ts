@@ -563,24 +563,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // tokens instead of a long-lived GH_TOKEN / shared PAT (SUP-14869). The
   // helpers ship with the server, so their paths resolve from the server's own
   // module tree — independent of the run's cwd. Both gates read the rollout flag
-  // from the server process env and are byte-identical no-ops when their flag is
-  // unset. The gh gate reads the scratch bin dir from PAPERCLIP_RUN_SCRATCH_DIR in
-  // the run env and the inherited base PATH from the argument (never process.env),
-  // matching the process-adapter reference wiring. These mutations run BEFORE
-  // prepareOpenCodeRuntimeConfig so they flow into preparedRuntimeConfig.env, the
-  // object that composes the child env. `__moduleDir` is one level deeper than
+  // from the server process env — a read-only reference (`flagEnv`), never copied
+  // into the child env — and are byte-identical no-ops when their flag is unset.
+  // The gh gate also resolves the real `gh` from the inherited base PATH
+  // (read-only `basePath`) and the scratch bin dir from PAPERCLIP_RUN_SCRATCH_DIR
+  // in the run env, matching the process-adapter reference wiring. These
+  // mutations run BEFORE prepareOpenCodeRuntimeConfig so they flow into
+  // preparedRuntimeConfig.env, the object that composes the child env. `__moduleDir`
+  // is one level deeper than
   // the process-adapter wiring this resolver was calibrated against, so step up
   // one directory — that makes the resolver's repo-root candidate resolve to the
   // server's `scripts/` dir rather than a `packages/` subpath.
   applyPaperclipGitHubCredentialHelperGate(env, {
-    flagEnv: process.env,
+    flagEnv: process.env, // spawn-env-guard: read-only — gate only reads the rollout flag; nothing is copied into the child env
     moduleDir: path.resolve(__moduleDir, ".."),
     cwd,
   });
   applyPaperclipGhWrapperGate(env, {
-    flagEnv: process.env,
+    flagEnv: process.env, // spawn-env-guard: read-only — gate only reads the rollout flag; nothing is copied into the child env
     moduleDir: path.resolve(__moduleDir, ".."),
-    basePath: process.env.PATH ?? "",
+    basePath: process.env.PATH ?? "", // spawn-env-guard: read-only — gate only resolves the real `gh` from the inherited PATH; not written to the child env
     cwd,
     onWarn: (message) => {
       void onLog("stderr", `paperclip-gh-wrapper: ${message}\n`);
