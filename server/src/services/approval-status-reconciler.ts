@@ -913,15 +913,30 @@ async function readPrTimelineHeadEvents(
 
 type ShaServerTimestampResult =
   | { ok: true; minTimestampMs: number }
-  | { ok: false; detail: string };
+  | { ok: false; transient: boolean; detail: string };
 
 /**
- * SUP-14844: read `/commits/{sha}/check-runs` and `/commits/{sha}/statuses`
- * and return the minimum server timestamp (`started_at` / `created_at`) across
- * both endpoints. This provides server-attested evidence that the sha existed
- * at/before that time. A read failure (HTTP / network error) is reported as
- * `ok: false` so the caller treats it as a transient skip rather than a
- * deterministic refusal.
+ * SUP-14844 (round 1): read `/commits/{sha}/check-runs` and return the minimum
+ * server-assigned `created_at` across the check runs GitHub triggered on this
+ * PR's own head branch (`check_suite.head_branch === headRefName`). That is the
+ * server-attested evidence that the sha existed on this branch at/before that
+ * time.
+ *
+ * Two guards keep the proof honest (round-1 review findings):
+ *   - `check_run.started_at` is CLIENT-supplied and is deliberately ignored;
+ *     only the server-assigned `check_run.created_at` counts.
+ *   - A check run only counts as THIS PR's evidence when its check suite's head
+ *     branch equals the card's PR head ref. A commit reachable from another
+ *     branch otherwise lends its older, unrelated cross-branch check-run
+ *     timestamps to this sha and would wrongly anchor it (the laundering trace:
+ *     head A approved, branch fast-forwarded to a pre-existing sha B whose CI
+ *     ran on a different branch before the approval).
+ *
+ * A read failure (HTTP / network error) or an unreadable head ref is TRANSIENT
+ * (`transient: true`): reported as a skip, not persisted, so the next tick
+ * retries. The ABSENCE of any branch-bound server-timed evidence is a
+ * DETERMINISTIC refusal (`transient: false`) — the check runs for a given sha on
+ * a given branch are immutable history, so it is persisted as a stable refusal.
  */
 async function readShaServerTimestamp(
   db: Db,
@@ -929,7 +944,19 @@ async function readShaServerTimestamp(
   owner: string,
   repo: string,
   sha: string,
+  headRefName: string | null,
 ): Promise<ShaServerTimestampResult> {
+  // Without the PR's head ref we cannot prove a check run belongs to this
+  // branch, so the binding cannot be established. Treat as transient: the
+  // cached head ref may populate on the next external-object refresh.
+  if (headRefName === null || headRefName === "") {
+    return {
+      ok: false,
+      transient: true,
+      detail: "sha-branch-binding: PR head ref is unavailable; cannot establish branch-bound check-run evidence",
+    };
+  }
+
   const checkRunsRead = await ghReadJson(
     db,
     companyId,
@@ -938,50 +965,53 @@ async function readShaServerTimestamp(
     `/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`,
   );
   if (!checkRunsRead.ok) {
-    return { ok: false, detail: `check-runs-read-failed: HTTP ${checkRunsRead.status} ${checkRunsRead.message ?? ""}`.trim() };
-  }
-  const statusesRead = await ghReadJson(
-    db,
-    companyId,
-    owner,
-    repo,
-    `/commits/${encodeURIComponent(sha)}/statuses?per_page=100`,
-  );
-  if (!statusesRead.ok) {
-    return { ok: false, detail: `statuses-read-failed: HTTP ${statusesRead.status} ${statusesRead.message ?? ""}`.trim() };
+    return {
+      ok: false,
+      transient: true,
+      detail: `check-runs-read-failed: HTTP ${checkRunsRead.status} ${checkRunsRead.message ?? ""}`.trim(),
+    };
   }
 
   let minTimestampMs: number | null = null;
+  let sawBranchBoundRun = false;
 
   const checkRunsBody = checkRunsRead.body as Record<string, unknown> | null;
   const checkRuns = Array.isArray(checkRunsBody?.check_runs)
     ? (checkRunsBody!.check_runs as Array<Record<string, unknown>>)
     : [];
   for (const run of checkRuns) {
-    const startedAt = typeof run.started_at === "string" ? run.started_at : null;
-    if (!startedAt) continue;
-    const ms = Date.parse(startedAt);
+    const suite = run.check_suite as Record<string, unknown> | null | undefined;
+    const runHeadBranch = suite && typeof suite.head_branch === "string" ? suite.head_branch : null;
+    if (runHeadBranch !== headRefName) continue;
+    sawBranchBoundRun = true;
+    // Only the server-assigned created_at counts; started_at is client-supplied.
+    const createdAt = typeof run.created_at === "string" ? run.created_at : null;
+    if (!createdAt) continue;
+    const ms = Date.parse(createdAt);
     if (!Number.isNaN(ms) && (minTimestampMs === null || ms < minTimestampMs)) {
       minTimestampMs = ms;
     }
   }
 
-  const statusesBody = Array.isArray(statusesRead.body)
-    ? (statusesRead.body as Array<Record<string, unknown>>)
-    : null;
-  if (statusesBody) {
-    for (const status of statusesBody) {
-      const createdAt = typeof status.created_at === "string" ? status.created_at : null;
-      if (!createdAt) continue;
-      const ms = Date.parse(createdAt);
-      if (!Number.isNaN(ms) && (minTimestampMs === null || ms < minTimestampMs)) {
-        minTimestampMs = ms;
-      }
-    }
+  if (!sawBranchBoundRun) {
+    // No check run triggered on this PR's head branch for this sha: we cannot
+    // show the sha existed on this branch, so the binding cannot be shown. This
+    // is deterministic (immutable check-run history), not a read failure.
+    return {
+      ok: false,
+      transient: false,
+      detail: `sha-branch-binding: no check run on the PR head branch (${headRefName}) found for head sha ${sha.slice(0, 7)}`,
+    };
   }
 
   if (minTimestampMs === null) {
-    return { ok: false, detail: "sha-server-timestamp: no check-runs or statuses found for the head sha" };
+    // Branch-bound runs exist but carry no parseable server created_at: treat as
+    // a read/parse blip to retry rather than strand the card (fail toward retry).
+    return {
+      ok: false,
+      transient: true,
+      detail: "sha-server-timestamp: no parseable server created_at on the branch-bound check runs",
+    };
   }
 
   return { ok: true, minTimestampMs };
@@ -1201,25 +1231,42 @@ async function backfillPreDBApprovalAnchor(
     }
 
     // SUP-14844: the timeline carries only committed (client-timed) head events
-    // at/before the approval — no force-push. Attempt the server-timed sha
-    // existence proof: if the live head sha has a check-run started_at or status
-    // created_at at/before the approval time, the sha provably existed at that
-    // time and no force-push moved it, so it was the head at approval.
+    // at/before the approval — no force-push. Attempt the server-timed,
+    // branch-bound sha existence proof: if the live head sha has a check run
+    // GitHub triggered on THIS PR's head branch (check_suite.head_branch === the
+    // card's PR head ref) whose server-assigned created_at is at/before the
+    // approval time, the sha provably existed on this branch at that time and no
+    // force-push moved it, so it was the head at approval.
     const shaTimestamp = await readShaServerTimestamp(
       db,
       row.companyId,
       target.owner,
       target.repo,
       currentHeadSha,
+      target.headRefName,
     );
     if (!shaTimestamp.ok) {
-      // A failed read is TRANSIENT — report a skip but do NOT persist, so the
-      // next tick retries (mirror the timeline-read-failed branch).
-      return {
-        kind: "skipped",
-        reason: "backfill:sha-existence-read-failed",
-        detail: `backfill: ${shaTimestamp.detail}; will retry on the next tick`,
-      };
+      if (shaTimestamp.transient) {
+        // A failed read (or an unreadable head ref) is TRANSIENT — report a
+        // skip but do NOT persist, so the next tick retries (mirror the
+        // timeline-read-failed branch).
+        return {
+          kind: "skipped",
+          reason: "backfill:sha-existence-read-failed",
+          detail: `backfill: ${shaTimestamp.detail}; will retry on the next tick`,
+        };
+      }
+      // No branch-bound server-timed evidence is a DETERMINISTIC refusal: the
+      // sha cannot be shown to have existed on this branch at/before the
+      // approval, so persist a stable refusal and leave the card for re-review.
+      const detail = `backfill: ${shaTimestamp.detail}; refusing to anchor an unverifiable head`;
+      await persistBackfillRefusal(db, row, {
+        reason: "backfill:head-unverifiable",
+        observedHeadSha: currentHeadSha,
+        approvedAtMs: approvalTimeMs,
+        observedAt: new Date().toISOString(),
+      });
+      return { kind: "skipped", reason: "backfill:head-unverifiable", detail };
     }
 
     if (shaTimestamp.minTimestampMs > approvalTimeMs) {
