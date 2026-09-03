@@ -233,6 +233,84 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     }
   });
 
+  it("refresh records delivered net LOC plus raw additions/deletions when the snapshot carries them", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "merged",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+        mergedAt: "2026-08-31T17:26:58Z",
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+        additions: 320,
+        deletions: 140,
+      })),
+    });
+    await service.recordAtOpen(input());
+    await service.refreshMergeState(input());
+
+    const rows = await readRows();
+    expect(rows).toHaveLength(5);
+    for (const row of rows) {
+      expect(row.status).toBe("merged");
+      const metadata = row.metadata as Record<string, unknown>;
+      expect(metadata.additions).toBe(320);
+      expect(metadata.deletions).toBe(140);
+      expect(metadata.deliveredNetLoc).toBe(180);
+    }
+  });
+
+  it("refresh records no LOC when the snapshot lacks additions/deletions (never a 0)", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "merged",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+        mergedAt: "2026-08-31T17:26:58Z",
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+      })),
+    });
+    await service.recordAtOpen(input());
+    await service.refreshMergeState(input());
+
+    const rows = await readRows();
+    expect(rows).toHaveLength(5);
+    for (const row of rows) {
+      expect(row.status).toBe("merged");
+      const metadata = row.metadata as Record<string, unknown>;
+      // A missing measurement is recorded as absent, not as a bogus 0.
+      expect(metadata.additions).toBeUndefined();
+      expect(metadata.deletions).toBeUndefined();
+      expect(metadata.deliveredNetLoc).toBeUndefined();
+      // The merge marker is still stamped: only the LOC measurement is absent.
+      expect(metadata.mergedAt).toBe("2026-08-31T17:26:58Z");
+      expect(metadata.mergeCommitSha).toBe("3fc37fe91c6190ab695a651224ad057db0a38aba");
+    }
+  });
+
+  it("refresh records a genuine zero-diff as deliveredNetLoc 0, distinct from absent", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "merged",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+        mergedAt: "2026-08-31T17:26:58Z",
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+        additions: 0,
+        deletions: 0,
+      })),
+    });
+    await service.recordAtOpen(input());
+    await service.refreshMergeState(input());
+
+    const rows = await readRows();
+    for (const row of rows) {
+      const metadata = row.metadata as Record<string, unknown>;
+      expect(metadata.additions).toBe(0);
+      expect(metadata.deletions).toBe(0);
+      expect(metadata.deliveredNetLoc).toBe(0);
+    }
+  });
+
   it("never merges an open PR: rows stay ready_for_review with no mergedAt", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
@@ -345,6 +423,33 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       expect(metadata.mergeCommitSha).toBe("3fc37fe91c6190ab695a651224ad057db0a38aba");
       expect(metadata.prNumber).toBe(PR_NUMBER);
       expect(metadata.mergeStateCheckedAt).toBeTruthy();
+    }
+  });
+
+  it("sweepMergeState records delivered net LOC when the snapshot carries it", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "merged",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+        mergedAt: "2026-08-31T17:26:58Z",
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+        additions: 250,
+        deletions: 90,
+      })),
+    });
+    await service.recordAtOpen(input());
+    const swept = await service.sweepMergeState();
+    expect(swept.flipped).toBe(5);
+
+    const rows = await readRows();
+    expect(rows).toHaveLength(5);
+    for (const row of rows) {
+      expect(row.status).toBe("merged");
+      const metadata = row.metadata as Record<string, unknown>;
+      expect(metadata.additions).toBe(250);
+      expect(metadata.deletions).toBe(90);
+      expect(metadata.deliveredNetLoc).toBe(160);
     }
   });
 
