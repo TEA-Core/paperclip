@@ -147,8 +147,10 @@ import {
 } from "../services/index.js";
 import {
   armMergeOnApproval,
+  parseRepoUrl,
   publishApprovalStatus,
   resolveApprovalDecisionHead,
+  resolveIssueRepoContext,
   shouldPublishApprovalStatus,
   type ArmingOutcome,
   type MergeArmingDecision,
@@ -11585,7 +11587,41 @@ export function issueRoutes(
         });
         return;
       }
-      const currentExecState = (updateFields.executionState ?? {}) as Record<string, unknown>;
+      // SUP-14824 F1: the recorded repo must equal this card's PROJECT repo. The
+      // repo half is a control-plane fact (resolveIssueRepoContext), never the
+      // agent's claim — so a deliveryIdentity that names a different repo is
+      // rejected before any write lands (mirror of the service-side cross-check).
+      const ctx = await resolveIssueRepoContext(db, {
+        companyId: existing.companyId,
+        projectId: existing.projectId ?? null,
+        projectWorkspaceId: existing.projectWorkspaceId ?? null,
+        executionWorkspaceId: existing.executionWorkspaceId ?? null,
+      });
+      const projectRepo = ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null;
+      const recordedRepo = requestedDeliveryIdentity.repo;
+      if (
+        projectRepo === null ||
+        recordedRepo.owner.toLowerCase() !== projectRepo.owner.toLowerCase() ||
+        recordedRepo.repo.toLowerCase() !== projectRepo.repo.toLowerCase()
+      ) {
+        res.status(422).json({
+          error: "deliveryIdentity.repo must match this card's project repo",
+          code: "delivery_identity_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+            recordedRepo: `${recordedRepo.owner}/${recordedRepo.repo}`,
+            projectRepo: projectRepo ? `${projectRepo.owner}/${projectRepo.repo}` : null,
+          },
+        });
+        return;
+      }
+      // SUP-14824 F2: base the delivery write on the STORED execution state (not
+      // just the patch) so a patch that omits executionState cannot drop stored
+      // fields — same pattern as the execution-state patch paths.
+      const currentExecState = (updateFields.executionState ?? existing.executionState ?? {}) as Record<string, unknown>;
       updateFields.executionState = {
         ...currentExecState,
         delivery: {

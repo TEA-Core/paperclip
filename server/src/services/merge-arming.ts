@@ -549,10 +549,15 @@ export interface PublishApprovalStatusOptions {
  * paths is not a gate.
  *
  * ADR-091 D1 (SUP-14824): prefers the recorded delivery identity
- * (executionState.delivery) over the execution-workspace row. A recorded
- * identity that is present but unusable (no resolvable repo, missing/empty
- * branch or headSha) fails closed with a named reason and never falls back to
- * the workspace row.
+ * (executionState.delivery) over the execution-workspace row. Only the branch
+ * half is taken from the record; the repo is always the card's PROJECT repo
+ * (resolveIssueRepoContext, a control-plane fact) and the record is
+ * cross-checked against it (SUP-14824 F1 — the agent-asserted repo can never
+ * substitute the repo half, so D5's cross-repo closure holds). A recorded
+ * identity that is present but unusable — not a usable object (F3), missing or
+ * empty branch/headSha, a repo that does not resolve, cannot be anchored to the
+ * project repo, or a repo that differs from the project repo (F1) — fails
+ * closed with a named reason and never falls back to the workspace row.
  */
 async function resolveDeliveryIdentity(
   db: Db,
@@ -585,39 +590,111 @@ async function resolveDeliveryIdentity(
     .from(issues)
     .where(eq(issues.id, issueId));
 
-  // ADR-091 D1 (SUP-14824): prefer the recorded delivery identity.
-  const delivery = issueRow?.executionState?.delivery;
-  if (delivery && typeof delivery === "object" && !Array.isArray(delivery)) {
-    const record = delivery as Record<string, unknown>;
-    const branch = typeof record.branch === "string" && record.branch.length > 0 ? record.branch : null;
-    const headSha = typeof record.headSha === "string" && record.headSha.length > 0 ? record.headSha : null;
-    const repoRaw = record.repo;
-    const repo =
-      repoRaw && typeof repoRaw === "object" && !Array.isArray(repoRaw)
-        ? (() => {
-            const r = repoRaw as Record<string, unknown>;
-            if (typeof r.owner !== "string" || r.owner.length === 0 || typeof r.repo !== "string" || r.repo.length === 0)
-              return null;
-            return { owner: r.owner, repo: r.repo };
-          })()
-        : null;
-    if (!branch || !repo || !headSha) {
-      const reason = !repo
-        ? "recorded delivery identity has no resolvable repo"
-        : !branch
-          ? "recorded delivery identity has no branch"
-          : "recorded delivery identity has no headSha";
-      return { branch: null, repo: null, recordedUnusable: reason, branchIsOwn: true, identifier: issueRow?.identifier ?? null };
-    }
-    return { branch, repo, branchIsOwn: true, identifier: issueRow?.identifier ?? null };
-  }
-
+  // ADR-091 D5 (SUP-14824 F1): the delivery repo is ALWAYS the card's project
+  // repo, resolved from the project binding — a control-plane fact. It is never
+  // taken from the agent-asserted recorded delivery identity, which would
+  // re-open the cross-repo laundering vector D1 exists to block. Both the
+  // recorded-identity path and the workspace-row path resolve it from here.
   const ctx = await resolveIssueRepoContext(db, {
     companyId,
     projectId: issueRow?.projectId ?? null,
     projectWorkspaceId: issueRow?.projectWorkspaceId ?? null,
     executionWorkspaceId: issueRow?.executionWorkspaceId ?? null,
   });
+  const projectRepo = ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null;
+  const identifier = issueRow?.identifier ?? null;
+
+  // ADR-091 D1 (SUP-14824): prefer the recorded delivery identity. Only the
+  // BRANCH half is taken from the record; the repo is always the project repo,
+  // and the record is cross-checked against it (never trusted to carry the repo
+  // half). A recorded identity that is present but unusable fails closed with a
+  // named reason and never falls back to the workspace row.
+  const delivery = issueRow?.executionState?.delivery;
+  const isRecordedObject =
+    delivery !== undefined && delivery !== null && typeof delivery === "object" && !Array.isArray(delivery);
+  if (delivery !== undefined && delivery !== null && !isRecordedObject) {
+    // SUP-14824 F3: present but not an object (string/array/number) is the
+    // record being unusable — fail closed, never silently fall back to the row.
+    return {
+      branch: null,
+      repo: null,
+      recordedUnusable: "recorded delivery identity is not a usable object",
+      branchIsOwn: true,
+      identifier,
+    };
+  }
+  if (isRecordedObject) {
+    const record = delivery as Record<string, unknown>;
+    const branch = typeof record.branch === "string" && record.branch.length > 0 ? record.branch : null;
+    const headSha = typeof record.headSha === "string" && record.headSha.length > 0 ? record.headSha : null;
+    const recordedRepoRaw = record.repo;
+    const recordedRepo =
+      recordedRepoRaw !== undefined &&
+      recordedRepoRaw !== null &&
+      typeof recordedRepoRaw === "object" &&
+      !Array.isArray(recordedRepoRaw)
+        ? (() => {
+            const r = recordedRepoRaw as Record<string, unknown>;
+            if (typeof r.owner !== "string" || r.owner.length === 0 || typeof r.repo !== "string" || r.repo.length === 0)
+              return null;
+            return { owner: r.owner, repo: r.repo };
+          })()
+        : null;
+    if (!branch) {
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable: "recorded delivery identity has no branch",
+        branchIsOwn: true,
+        identifier,
+      };
+    }
+    if (!headSha) {
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable: "recorded delivery identity has no headSha",
+        branchIsOwn: true,
+        identifier,
+      };
+    }
+    if (recordedRepo === null) {
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable: "recorded delivery identity has no resolvable repo",
+        branchIsOwn: true,
+        identifier,
+      };
+    }
+    if (projectRepo === null) {
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable: "recorded delivery identity cannot be anchored to this card's project repo",
+        branchIsOwn: true,
+        identifier,
+      };
+    }
+    // SUP-14824 F1: the recorded repo must equal the project-bound repo
+    // (case-insensitive, same comparison as isDeliveredByCard). A recorded repo
+    // that differs is the recorded identity being unusable — fail closed, never
+    // prefer either side.
+    if (
+      recordedRepo.owner.toLowerCase() !== projectRepo.owner.toLowerCase() ||
+      recordedRepo.repo.toLowerCase() !== projectRepo.repo.toLowerCase()
+    ) {
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable: "recorded delivery identity's repo does not match this card's project repo",
+        branchIsOwn: true,
+        identifier,
+      };
+    }
+    return { branch, repo: projectRepo, branchIsOwn: true, identifier };
+  }
+
   let branchIsOwn = true;
   if (issueRow?.executionWorkspaceId) {
     const [wsRow] = await db
@@ -628,9 +705,9 @@ async function resolveDeliveryIdentity(
   }
   return {
     branch: ctx?.branch ?? null,
-    repo: ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null,
+    repo: projectRepo,
     branchIsOwn,
-    identifier: issueRow?.identifier ?? null,
+    identifier,
   };
 }
 

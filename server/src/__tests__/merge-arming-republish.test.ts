@@ -917,4 +917,37 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(res.body.code).toBe("delivery_identity_write_rejected");
     expect(res.body.details.enteringReview).toBe(false);
   });
+
+  it("rejects deliveryIdentity when the recorded repo is not the card's project repo (F1)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    // The card's project repo is TEA-Core/paperclip (REPO_URL). Naming a sibling
+    // repo in deliveryIdentity must be rejected BEFORE any write lands.
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: "OTHER", repo: "other-repo" },
+          branch: "SUP-14824-delivery",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_write_rejected");
+    expect(res.body.details.holdsLease).toBe(true);
+    expect(res.body.details.enteringReview).toBe(true);
+    expect(res.body.details.recordedRepo).toBe("OTHER/other-repo");
+    expect(res.body.details.projectRepo).toBe("TEA-Core/paperclip");
+    // No partial write: status stays in_progress and no delivery recorded.
+    const [row] = await db
+      .select({ executionState: issues.executionState, status: issues.status })
+      .from(issues)
+      .where(issues.id === issueId);
+    expect(row!.status).toBe("in_progress");
+    expect((row!.executionState ?? {})?.delivery).toBeUndefined();
+  });
 });
