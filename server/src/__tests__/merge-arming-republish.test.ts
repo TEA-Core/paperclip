@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -568,7 +569,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     const [row] = await db
       .select({ executionState: issues.executionState })
       .from(issues)
-      .where(issues.id === issueId);
+      .where(eq(issues.id, issueId));
     const approvalStatus = (row?.executionState ?? {})?.approvalStatus as Record<string, unknown> | undefined;
     expect(approvalStatus?.publishedHeadSha).toBe(HEAD_SHA);
   });
@@ -596,7 +597,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     const [row] = await db
       .select({ executionState: issues.executionState })
       .from(issues)
-      .where(issues.id === issueId);
+      .where(eq(issues.id, issueId));
     const approvalStatus = (row?.executionState ?? {})?.approvalStatus as Record<string, unknown> | undefined;
     expect(approvalStatus?.publishedHeadSha).toBeUndefined();
   });
@@ -845,7 +846,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     const [row] = await db
       .select({ executionState: issues.executionState, status: issues.status })
       .from(issues)
-      .where(issues.id === issueId);
+      .where(eq(issues.id, issueId));
     expect(row!.status).toBe("in_review");
     const delivery = (row!.executionState ?? {})?.delivery as Record<string, unknown> | undefined;
     expect(delivery).toBeDefined();
@@ -888,7 +889,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     const [row] = await db
       .select({ executionState: issues.executionState, status: issues.status })
       .from(issues)
-      .where(issues.id === issueId);
+      .where(eq(issues.id, issueId));
     expect(row!.status).toBe("in_progress");
     expect((row!.executionState ?? {})?.delivery).toBeUndefined();
   });
