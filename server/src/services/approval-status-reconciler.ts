@@ -660,7 +660,8 @@ async function findApprovalCandidates(
  * decision: an auto-skipped review stage writes no decision row and lands in
  * skippedStageIds, so it must never be treated as an approval. The gated
  * principal is the resolved return assignee (ADR-092 D3):
- * policy.returnAssigneeAgentId ?? state.returnAssignee ?? assigneeAgentId.
+ * policy.returnAssigneeAgentId ?? state.returnAssignee ?? state.deliveryAuthor ??
+ * createdByAgentId ?? (unresolvable — refused under guard-b:return-assignee-unresolved).
  */
 export async function evaluateStageIntegrity(
   db: Db,
@@ -753,8 +754,26 @@ export async function evaluateStageIntegrity(
       }
     }
     if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
-      if (row.assigneeAgentId) forbiddenAgents.add(row.assigneeAgentId);
-      if (row.assigneeUserId) forbiddenUsers.add(row.assigneeUserId);
+      const deliveryAuthor = state.deliveryAuthor as
+        | { type?: unknown; agentId?: unknown; userId?: unknown }
+        | null
+        | undefined;
+      if (deliveryAuthor && typeof deliveryAuthor === "object") {
+        if (deliveryAuthor.type === "agent" && typeof deliveryAuthor.agentId === "string") {
+          forbiddenAgents.add(deliveryAuthor.agentId);
+        } else if (deliveryAuthor.type === "user" && typeof deliveryAuthor.userId === "string") {
+          forbiddenUsers.add(deliveryAuthor.userId);
+        }
+      }
+    }
+    if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
+      if (row.createdByAgentId) forbiddenAgents.add(row.createdByAgentId);
+    }
+    if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
+      return {
+        reason: "guard-b:return-assignee-unresolved",
+        detail: "no return assignee, delivery author, or creator agent recorded",
+      };
     }
   }
 

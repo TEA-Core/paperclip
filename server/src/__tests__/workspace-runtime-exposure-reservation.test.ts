@@ -18,10 +18,13 @@
  *
  * The broker is a fake, so no Tailscale Serve state is ever read or mutated.
  * Allocation is driven by an injected `isPortAvailable` that models a synthetic
- * host, and the only ports it will ever return are the `425xx`/`525xx` pairs
- * named below — deliberately far from a canary lane on `42000`/`42001`, which
- * this suite must not disturb. Guests do bind those two pairs on loopback, so
- * the readiness and exposure lifecycle is exercised for real; they are reaped in
+ * host, and the only ports it will ever return are the two `425xx`/`525xx`
+ * pairs named below — deliberately far from a canary lane on `42000`/`42001`,
+ * which this suite must not disturb. The pair numbers are offset per vitest
+ * shard (see `derivePortLaneOffset` below), so sibling shards running
+ * concurrently on one runner bind distinct loopback ports instead of racing for
+ * the same fixed pair. Guests do bind those two pairs on loopback, so the
+ * readiness and exposure lifecycle is exercised for real; they are reaped in
  * `afterEach`. `PAPERCLIP_HOME` is redirected to a temp dir so the local-service
  * registry never touches the real instance on this host.
  */
@@ -30,6 +33,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  RUNTIME_EXPOSURE_APP_PORT_MAX,
+  RUNTIME_EXPOSURE_APP_PORT_MIN,
+} from "@paperclipai/shared";
 import {
   activityLog,
   companies,
@@ -54,12 +61,73 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
+/**
+ * Per-shard port lane.
+ *
+ * The two pairs lane B and a relocated allocation use are fixed *relative* to
+ * each other (leased then next, app then HMR at +10000) but their absolute
+ * values are shifted per vitest shard. The suite drives real guests that bind
+ * these ports on loopback, so two shards on one runner sharing a lane would
+ * collide with EADDRINUSE at guest bind time — exactly the merge_group flake
+ * (SUP-14712). Shifting the lane by the shard index keeps the regression's
+ * assertions byte-for-byte identical while making the lane unique per shard.
+ *
+ * The CI shard partition is not visible to the test process through vitest
+ * itself: `scripts/run-vitest-stable.mjs` shards the server group by passing an
+ * explicit file list (not vitest's native `--shard`), so every shard runs in
+ * its own vitest process with `maxWorkers=1` and `VITEST_WORKER_ID` /
+ * `VITEST_POOL_ID` are constant across them. The wrapper therefore exports
+ * `PAPERCLIP_TEST_SHARD_INDEX`; `VITEST_WORKER_ID`/`VITEST_POOL_ID` still
+ * separate workers when the suite is run with parallelism instead of the pinned
+ * serial shard.
+ */
+const BASE_LEASED_APP_PORT = 42_501;
+const BASE_LEASED_HMR_PORT = 52_501;
+const BASE_NEXT_APP_PORT = 42_502;
+const BASE_NEXT_HMR_PORT = 52_502;
+
+/** Ports consumed by one shard lane (leased app, next app, + HMR companions). */
+const SHARD_LANE_STRIDE = 100;
+/** Extra lane per additional worker inside a shard for unsharded parallel runs. */
+const WORKER_LANE_STRIDE = 4;
+
+function readNonNegativeEnvInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+/**
+ * Where this process's lane sits inside the dedicated app range. The CI shard
+ * index is the primary discriminator; `VITEST_WORKER_ID`/`VITEST_POOL_ID`
+ * separate workers when the suite runs with parallelism. Fails loudly at load
+ * time if the derived lane would leave the range instead of silently colliding.
+ */
+function derivePortLaneOffset(): number {
+  const shardIndex = readNonNegativeEnvInt("PAPERCLIP_TEST_SHARD_INDEX", 0);
+  const workerIndex = Math.max(0, readNonNegativeEnvInt("VITEST_WORKER_ID", 1) - 1);
+  const poolIndex = Math.max(0, readNonNegativeEnvInt("VITEST_POOL_ID", 1) - 1);
+  const offset = shardIndex * SHARD_LANE_STRIDE + workerIndex * WORKER_LANE_STRIDE + poolIndex;
+  const maxOffset = RUNTIME_EXPOSURE_APP_PORT_MAX - BASE_NEXT_APP_PORT;
+  if (offset > maxOffset) {
+    throw new Error(
+      `exposure-reservation lane offset ${offset} exceeds the dedicated app range ` +
+        `[${RUNTIME_EXPOSURE_APP_PORT_MIN}, ${RUNTIME_EXPOSURE_APP_PORT_MAX}]; ` +
+        `check PAPERCLIP_TEST_SHARD_INDEX/VITEST_WORKER_ID/VITEST_POOL_ID`,
+    );
+  }
+  return offset;
+}
+
+const PORT_LANE_OFFSET = derivePortLaneOffset();
+
 /** The pair lane B holds under an open lease. */
-const LEASED_APP_PORT = 42_501;
-const LEASED_HMR_PORT = 52_501;
+const LEASED_APP_PORT = BASE_LEASED_APP_PORT + PORT_LANE_OFFSET;
+const LEASED_HMR_PORT = BASE_LEASED_HMR_PORT + PORT_LANE_OFFSET;
 /** The next pair a correct allocator must relocate to. */
-const NEXT_APP_PORT = 42_502;
-const NEXT_HMR_PORT = 52_502;
+const NEXT_APP_PORT = BASE_NEXT_APP_PORT + PORT_LANE_OFFSET;
+const NEXT_HMR_PORT = BASE_NEXT_HMR_PORT + PORT_LANE_OFFSET;
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 

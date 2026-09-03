@@ -176,6 +176,8 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
      * own completed stage — the shape guard-b refuses.
      */
     returnAssigneeDecides?: boolean;
+    /** Omit returnAssigneeAgentId from the execution policy (unresolvable guard-b path). */
+    noReturnAssignee?: boolean;
     /** Seed a linked PR external object + mention. */
     pr?: { owner: string; repo: string; number: number; headRefName: string | null } | null;
     deliveryBranch?: string | null;
@@ -334,7 +336,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         // ADR-092 D3: declare a return assignee distinct from the assignee/decision
         // actor so the resolved gated principal does not collide with the reviewer
         // that cast the approval (keeps the happy-path card guard-b-legal).
-        returnAssigneeAgentId,
+        ...(opts.noReturnAssignee ? {} : { returnAssigneeAgentId }),
         stages: [{ id: STAGE_ID, type: "approval", approvalsNeeded: 1 }],
       },
       executionState,
@@ -453,10 +455,9 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
 
   it("refuses with 409 when the resolved return assignee decided its own completed stage", async () => {
     // ADR-092: guard-b gates on the resolved return assignee
-    // (policy.returnAssigneeAgentId ?? state.returnAssignee ?? assignee). The card's
-    // creator term is no longer an input (D2), so an author self-approval no longer
-    // trips this guard; instead, when the declared return assignee cast the
-    // completed stage's decision, stage-integrity (Guard B) refuses it.
+    // (policy.returnAssigneeAgentId ?? state.returnAssignee ?? state.deliveryAuthor ??
+    //  createdByAgentId ?? unresolved). The card's declared return assignee
+    // cast the completed stage's decision, so stage-integrity (Guard B) refuses it.
     const { companyId, issueId } = await seedIssue({
       lastDecisionOutcome: "approved",
       returnAssigneeDecides: true,
@@ -467,6 +468,24 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
 
     expect(res.status).toBe(409);
     expect(res.body.reason).toBe("guard-b:decision-by-return-assignee");
+    expect(mockGhFetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses with 409 guard-b:return-assignee-unresolved when no return assignee, delivery author, or creator agent is recorded", async () => {
+    // SUP-14826: when policy.returnAssigneeAgentId is absent, executionState
+    // has no returnAssignee and no deliveryAuthor, and the issue has no
+    // createdByAgentId, Guard B cannot resolve the gated principal and
+    // refuses under the distinct "unresolved" reason.
+    const { companyId, issueId } = await seedIssue({
+      lastDecisionOutcome: "approved",
+      noReturnAssignee: true,
+    });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.reason).toBe("guard-b:return-assignee-unresolved");
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
 

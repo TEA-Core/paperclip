@@ -60,6 +60,7 @@ const PAPERCLIP_APPROVED = "paperclip/approved";
 const AGENT_REVIEWER = "11111111-1111-1111-1111-111111111111";
 const AGENT_AUTHOR = "22222222-2222-2222-2222-222222222222";
 const AGENT_LEAD = "33333333-3333-3333-3333-333333333333";
+const AGENT_CREATOR = "44444444-4444-4444-4444-444444444444";
 const USER_REVIEWER = "reviewer-user";
 
 const PR_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/42";
@@ -265,6 +266,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       })
       .returning();
     companyId = companyRows[0]!.id;
+    await db.insert(agents).values({ id: AGENT_CREATOR, companyId, name: "Creator" });
   });
 
   afterEach(async () => {
@@ -303,7 +305,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       identifier: overrides.identifier ?? "SUP-42",
       executionPolicy: overrides.executionPolicy ?? EXECUTION_POLICY,
       executionState: overrides.executionState ?? approvedState(),
-      createdByAgentId: overrides.createdByAgentId ?? null,
+      createdByAgentId: "createdByAgentId" in overrides ? overrides.createdByAgentId! : AGENT_CREATOR,
       createdByUserId: overrides.createdByUserId ?? null,
       assigneeAgentId: overrides.assigneeAgentId ?? null,
       assigneeUserId: overrides.assigneeUserId ?? null,
@@ -959,8 +961,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
-    it("skips when the approval was made by the card's assignee (guard B, ADR-092 D3 fallback)", async () => {
-      await insertAgent(AGENT_AUTHOR, "Assignee");
+    it("skips when the approval was made by the card's createdByAgentId (guard B, ADR-092 D3 createdByAgentId fallback)", async () => {
+      await insertAgent(AGENT_AUTHOR, "Creator");
       const issueId = await insertIssue({ createdByAgentId: AGENT_AUTHOR, assigneeAgentId: AGENT_AUTHOR });
       await insertDecision(issueId, { actorAgentId: AGENT_AUTHOR });
       await insertMention(issueId);
@@ -987,13 +989,14 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
 
-    it("refuses when the assignee decided its own stage with no declared or stored return assignee (ADR-092 D3 fallback)", async () => {
+    it("refuses when no return assignee, delivery author, or creator agent is recorded (guard B, unresolvable)", async () => {
       const stage2Id = "00000000-0000-0000-0000-0000000000b1";
       const stage3Id = "00000000-0000-0000-0000-0000000000b2";
       await insertAgent(AGENT_AUTHOR, "Assignee");
       await insertAgent(AGENT_REVIEWER, "Reviewer");
       const issueId = await insertIssue({
         assigneeAgentId: AGENT_AUTHOR,
+        createdByAgentId: null,
         executionPolicy: {
           mode: "normal",
           commentRequired: true,
@@ -1013,9 +1016,43 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
 
       const summary = await runApprovalStatusReconcilerTick(db);
 
-      expect(summary.skipped["guard-b:decision-by-return-assignee"]).toBe(1);
+      expect(summary.skipped["guard-b:return-assignee-unresolved"]).toBe(1);
       expect(postStatusCalls()).toHaveLength(0);
       expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("does not refuse when the current assignee decided but delivery author is a different agent (SUP-13568 regression)", async () => {
+      await insertAgent(AGENT_REVIEWER, "Reviewer");
+      await insertAgent(AGENT_LEAD, "Deliverer");
+      const issueId = await insertIssue({
+        assigneeAgentId: AGENT_REVIEWER,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            { id: REVIEW_STAGE_ID, type: "review", approvalsNeeded: 1 },
+          ],
+        },
+        executionState: approvedState({
+          completedStageIds: [REVIEW_STAGE_ID],
+          returnAssignee: null,
+          deliveryAuthor: { type: "agent", agentId: AGENT_LEAD, userId: null },
+        }),
+      });
+      await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorAgentId: AGENT_REVIEWER, actorUserId: null });
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { statuses: [] } },
+        { url: POST_STATUS_URL, body: {} },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["guard-b:decision-by-return-assignee"]).toBeUndefined();
+      expect(summary.skipped["guard-b:return-assignee-unresolved"]).toBeUndefined();
+      expect(summary.republished).toBe(1);
     });
 
     it("passes when creator=assignee, declared return assignee is a third agent, none decided by return assignee (ADR-092 D7 legal shape)", async () => {
