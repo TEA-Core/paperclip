@@ -1163,8 +1163,7 @@ export async function evaluateDoneTransitionGuard(
         `but ${mechanismA.count} child issues each ran one (${mechanismA.identifiers.join(", ")}). ` +
         "The decomposed work was gated at the children; closing the parent ungated would ship it " +
         "with no verification gate and no approval. Attach an execution policy with a review ladder " +
-        "to this issue, or set doneTransitionOverride to a sanctioned no-deliverable-head disposition " +
-        `(${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
+        "to this issue.",
       aheadBy: null,
       branch: null,
       defaultRef: null,
@@ -1194,9 +1193,7 @@ export async function evaluateDoneTransitionGuard(
         `decomposed parent over ${ladderShape.ladderedChildCount} laddered children ` +
         `(${ladderShape.ladderedChildIdentifiers.join(", ")}), but its review ladder is missing ` +
         `the ADR-072 close-ladder stage(s): ${ladderShape.missingStageLabels.join(", ")}. ` +
-        "Add the missing review/approval stages to this issue's execution policy, or set " +
-        `doneTransitionOverride to a sanctioned no-deliverable-head disposition ` +
-        `(${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
+        "Add the missing review/approval stages to this issue's execution policy.",
       aheadBy: null,
       branch: null,
       defaultRef: null,
