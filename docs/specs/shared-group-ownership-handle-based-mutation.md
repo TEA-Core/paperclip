@@ -2,7 +2,8 @@
 
 Architecture ruling for SUP-14684 (ADR-023 chain-depth breaker, 3rd surfacing of
 `Finding signature: worktree-writability-repair-symlink-escape`).
-Status: **decided** (exec-CTO, 2026-09-01). Implemented by SUP-14687 as a fixup on carrier PR #433.
+Status: **decided** (exec-CTO, 2026-09-01). Implemented by SUP-14687 as a fixup on carrier PR #433;
+FIFO/special-file hardening (`O_NONBLOCK`) shipped by SUP-14865 / PR #482 (commit `70c067649`).
 
 Root: SUP-14642. Prior swings: SUP-14667 (leaf `lstat` guard), SUP-14674 (realpath containment,
 commit `1cc0a9ec`).
@@ -71,8 +72,14 @@ the fix, not the fix.
 let handle;
 try {
   // The open itself is inside the guarded section: ELOOP on a leaf symlink, EACCES,
-  // and ENOENT all throw here, and §4 requires every one of them to skip, not fall back.
-  handle = await fs.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  // ENOENT, and EWOULDBLOCK/ENXIO all throw here, and §4 requires every one of them to
+  // skip, not fall back. O_NONBLOCK is load-bearing: without it, opening a FIFO (named
+  // pipe) blocks until a writer connects, hanging the repair and, at scale, exhausting
+  // the libuv thread pool (SUP-14865, commit 70c067649).
+  handle = await fs.open(
+    target,
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+  );
   // Containment is checked on the object we are holding, not on a name that can
   // be re-pointed. /proc/self/fd/<fd> names the inode this fd actually refers to.
   const verified = await fs.realpath(`/proc/self/fd/${handle.fd}`);
@@ -98,6 +105,19 @@ try {
     return;
   }
   const st = await handle.stat();
+  // A special file (FIFO, character/block device, socket) is not a directory or a
+  // regular file; group-ownership repair does not apply. O_NONBLOCK already kept the
+  // open from hanging on a FIFO; now refuse to mutate the inode. Fail closed: one
+  // warned skip, no mutation, no path-based fallback.
+  if (isSpecialFileType(st.mode)) {
+    warn(
+      `Paperclip: skipping shared-group ownership on ${dirPath} — the opened target is a ` +
+        `special file (FIFO, character/block device, or socket), not a directory or regular ` +
+        `file. Shared-group traversal repair applies to directories and regular files only. ` +
+        `No mutation performed.`,
+    );
+    return;
+  }
   await handle.chown(st.uid, gid);            // fchown — no path resolution
   await handle.chmod((st.mode & 0o7777) | 0o2070); // fchmod — no path resolution
 } catch (err) {
@@ -110,13 +130,15 @@ try {
 }
 ```
 
-Every skip is a **warned** skip, not a bare `return`. The two branches above and §4's `catch`
-are the three exits, and each emits exactly one `warn`. This is load-bearing, not cosmetic:
-`shared-group-ownership.test.ts` asserts `warnSpy` was called exactly once with
-`expect.stringContaining("refusing shared-group ownership")` at **seven** sites — `:169`, `:189`,
-`:208`, `:253`, `:273`, `:292`, `:398`. A silent skip turns a live escape attempt into an
-invisible no-op and fails all seven. Keep that substring in the denied-dir message; the
-containment refusal is a new case and needs its own test.
+Every skip is a **warned** skip, not a bare `return`. The containment branch, the denied-dir
+branch, the special-file skip, and §4's `catch` are the four exits, and each emits exactly one
+`warn`. This is load-bearing, not cosmetic: `shared-group-ownership.test.ts` asserts `warnSpy`
+was called exactly once with `expect.stringContaining("refusing shared-group ownership")` at
+**seven** sites — `:169`, `:189`, `:208`, `:253`, `:273`, `:292`, `:398` — and the special-file
+skip has its own assertion (`expect.stringContaining("special file")`, shipped in `70c067649`).
+A silent skip turns a live escape attempt into an invisible no-op and fails all of them. Keep
+the `refusing shared-group ownership` substring in the denied-dir message; the containment
+refusal and the special-file skip are separate cases, each with its own test.
 
 The `finally` swallow is likewise not style. Probed on this platform:
 
@@ -155,12 +177,22 @@ leaf symlink open rejected: ELOOP
 Node core exposes no `openat(2)`, so a component-by-component descent is not available in pure
 JS; `/proc/self/fd` is the supported equivalent and this server runs on Linux.
 
+**FIFO and special files.** `O_NONBLOCK` plus the `isSpecialFileType` skip is the shipped
+behaviour, not a future addition. It shipped as SUP-14865 / PR #482 (commit `70c067649`,
+merged on `fold`), which added `O_NONBLOCK` to the open and a `SPECIAL_FILE_TYPES` set
+(`S_IFIFO`/`S_IFCHR`/`S_IFBLK`/`S_IFSOCK`) so that any special-file target — identified after
+`handle.stat()` by its `mode & S_IFMT` — is skipped with exactly one warning and no `chown`/`chmod`.
+Special files are neither directories nor regular files, so applying group-ownership repair to
+them is meaningless at best and a surprising side effect at worst.
+
 ### 4. Fail closed, always
 
 Every error path — `ELOOP` (leaf symlink), `EACCES` (unopenable), `ENOENT` (vanished),
-non-Linux, `/proc` unavailable — **skips the repair with a warning**. There is no fallback to
-path-based mutation. Skipping degrades to the pre-existing operator-facing error, which is
-safe; falling back reintroduces the escape on exactly the paths an attacker can arrange.
+`EWOULDBLOCK`/`ENXIO` (a special file whose non-blocking open cannot be established on this
+platform), a special-file target (FIFO, character/block device, socket), non-Linux, `/proc`
+unavailable — **skips the repair with a warning**. There is no fallback to path-based
+mutation. Skipping degrades to the pre-existing operator-facing error, which is safe; falling
+back reintroduces the escape on exactly the paths an attacker can arrange.
 
 ### 5. Fix the denied-dir guard while it is open
 
