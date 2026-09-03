@@ -4,10 +4,16 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyPaperclipGitHubCredentialHelperEnv,
+  applyPaperclipGitHubCredentialHelperGate,
+  isPaperclipGitHubCredentialHelperEnabled,
+  PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FLAG,
+  PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME,
+  resolvePaperclipGitHubCredentialHelperPath,
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
   buildPersistentSkillSnapshot,
@@ -2766,6 +2772,171 @@ describe("applyPaperclipGitHubCredentialHelperEnv", () => {
     expect(env.GIT_CONFIG_KEY_0).toBe("credential.helper");
     expect(env.GIT_CONFIG_VALUE_0).toBe("");
     expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+  });
+});
+
+describe("applyPaperclipGitHubCredentialHelperGate (GH-APP-6)", () => {
+  const serverModuleDir = "/opt/paperclip/server/dist/adapters/process";
+  const serverDistScript = "/opt/paperclip/server/dist/scripts/paperclip-github-credential-helper.sh";
+  const serverRepoScript = "/opt/paperclip/scripts/paperclip-github-credential-helper.sh";
+
+  it("AC1: is byte-identical when the flag is unset — no env touched, no fs probes", () => {
+    const env: Record<string, string> = { PAPERCLIP_SOMETHING: "kept" };
+    const existsSpy = vi.fn(() => true);
+    const result = applyPaperclipGitHubCredentialHelperGate(env, {
+      flagEnv: {},
+      moduleDir: serverModuleDir,
+      cwd: "/tmp/non-repo",
+      existsSync: existsSpy,
+    });
+    expect(result).toBe(env);
+    expect(env).toEqual({ PAPERCLIP_SOMETHING: "kept" });
+    expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(env.GIT_TERMINAL_PROMPT).toBeUndefined();
+    expect(existsSpy).not.toHaveBeenCalled();
+  });
+
+  it("AC1: stays byte-identical for every non-`on` flag value, even if the script exists", () => {
+    for (const value of ["off", "no", "false", "0", "yes", "true", "1", "", "  "]) {
+      const env: Record<string, string> = { FOO: "bar" };
+      const result = applyPaperclipGitHubCredentialHelperGate(env, {
+        flagEnv: { PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: value },
+        moduleDir: serverModuleDir,
+        cwd: "/tmp/non-repo",
+        existsSync: () => true,
+      });
+      expect(result).toBe(env);
+      expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+      expect(env.GIT_TERMINAL_PROMPT).toBeUndefined();
+    }
+  });
+
+  it("AC2: applies when the flag is on and the run cwd is a non-repo temp dir with no scripts/", () => {
+    const env: Record<string, string> = {};
+    applyPaperclipGitHubCredentialHelperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "on" },
+      moduleDir: serverModuleDir,
+      cwd: "/tmp/non-repo-without-scripts",
+      existsSync: (p) => p === serverDistScript,
+    });
+    expect(env.GIT_CONFIG_COUNT).toBe("3");
+    expect(env.GIT_CONFIG_KEY_0).toBe("credential.helper");
+    expect(env.GIT_CONFIG_VALUE_0).toBe("");
+    expect(env.GIT_CONFIG_KEY_1).toBe("credential.https://github.com.helper");
+    expect(env.GIT_CONFIG_VALUE_1).toBe(serverDistScript);
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+  });
+
+  it("AC3: resolves an absolute path from the server module root, identical across two different cwds", () => {
+    const exists = (p: string) => p === serverDistScript;
+    const cwdA = "/tmp/run-cwd-a";
+    const cwdB = "/tmp/run-cwd-b";
+    const resolvedA = resolvePaperclipGitHubCredentialHelperPath({
+      moduleDir: serverModuleDir,
+      cwd: cwdA,
+      existsSync: exists,
+    });
+    const resolvedB = resolvePaperclipGitHubCredentialHelperPath({
+      moduleDir: serverModuleDir,
+      cwd: cwdB,
+      existsSync: exists,
+    });
+    expect(resolvedA).toBe(resolvedB);
+    expect(resolvedA).toBe(serverDistScript);
+    expect(resolvedA).not.toBeNull();
+    expect(path.isAbsolute(resolvedA as string)).toBe(true);
+    expect(resolvedA).toContain("/opt/paperclip/server/");
+    expect(resolvedA).not.toContain(cwdA);
+    expect(resolvedA).not.toContain(cwdB);
+  });
+
+  it("prefers the built dist artifact over the repo-root and cwd fallbacks", () => {
+    const resolved = resolvePaperclipGitHubCredentialHelperPath({
+      moduleDir: serverModuleDir,
+      cwd: "/tmp/cwd",
+      existsSync: () => true,
+    });
+    expect(resolved).toBe(serverDistScript);
+  });
+
+  it("falls back to the repo-root script when the built dist artifact is absent", () => {
+    const resolved = resolvePaperclipGitHubCredentialHelperPath({
+      moduleDir: serverModuleDir,
+      existsSync: (p) => p === serverRepoScript,
+    });
+    expect(resolved).toBe(serverRepoScript);
+  });
+
+  it("uses the cwd legacy fallback only when no server candidate exists", () => {
+    const cwdScript = "/tmp/cwd/scripts/paperclip-github-credential-helper.sh";
+    const resolved = resolvePaperclipGitHubCredentialHelperPath({
+      moduleDir: serverModuleDir,
+      cwd: "/tmp/cwd",
+      existsSync: (p) => p === cwdScript,
+    });
+    expect(resolved).toBe(cwdScript);
+  });
+
+  it("is a no-op when the flag is on but the helper script is not found anywhere", () => {
+    const env: Record<string, string> = { FOO: "bar" };
+    const result = applyPaperclipGitHubCredentialHelperGate(env, {
+      flagEnv: { PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "on" },
+      moduleDir: serverModuleDir,
+      cwd: "/tmp/non-repo",
+      existsSync: () => false,
+    });
+    expect(result).toBe(env);
+    expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(env.GIT_TERMINAL_PROMPT).toBeUndefined();
+  });
+
+  it("flag parsing: only `on` (case/whitespace-insensitive) enables the gate", () => {
+    expect(isPaperclipGitHubCredentialHelperEnabled({})).toBe(false);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({
+        PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: undefined,
+      }),
+    ).toBe(false);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({ PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "on" }),
+    ).toBe(true);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({ PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "ON" }),
+    ).toBe(true);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({ PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "  On  " }),
+    ).toBe(true);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({ PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "off" }),
+    ).toBe(false);
+    expect(
+      isPaperclipGitHubCredentialHelperEnabled({ PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER: "true" }),
+    ).toBe(false);
+    expect(PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FLAG).toBe("PAPERCLIP_AGENT_GIT_CREDENTIAL_HELPER");
+    expect(PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME).toBe(
+      "paperclip-github-credential-helper.sh",
+    );
+  });
+});
+
+describe("GitHub credential helper packaging (GH-APP-6 AC4)", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+  const repoScript = path.join(
+    repoRoot,
+    "scripts",
+    PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME,
+  );
+
+  it("ships from a committed source of truth at scripts/", async () => {
+    await expect(fs.access(repoScript)).resolves.toBeUndefined();
+  });
+
+  it("the server build copies the helper into dist/scripts and guards for its presence", async () => {
+    const raw = await fs.readFile(path.join(repoRoot, "server", "package.json"), "utf8");
+    const pkg = JSON.parse(raw) as { scripts: { build: string } };
+    expect(pkg.scripts.build).toContain("dist/scripts");
+    expect(pkg.scripts.build).toContain(PAPERCLIP_GITHUB_CREDENTIAL_HELPER_FILENAME);
+    expect(pkg.scripts.build).toContain("test -f dist/scripts/");
   });
 });
 
