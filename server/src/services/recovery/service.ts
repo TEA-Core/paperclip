@@ -87,11 +87,16 @@ import {
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
 import {
+  buildDispatchSuppressionParkNotice,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
   buildExecutionReviewParticipantUnavailableNoticeSeed,
   buildStrandedRecoveryEscalationNotice,
   type StrandedRecoveryNoticeSeed,
 } from "./stranded-notice.js";
+import {
+  TIMER_DISPATCH_SUPPRESSED_ACTION,
+  type ContinuationPathDisjuncts,
+} from "../issue-continuation-path.js";
 import {
   RECOVERY_ORIGIN_KINDS,
   buildIssueGraphLivenessLeafKey,
@@ -143,6 +148,14 @@ const PENDING_REVIEW_REARM_CANDIDATE_LIMIT = 500;
 const PENDING_REVIEW_REARM_REASON = "execution_review_requested";
 const BLOCKED_WITHOUT_BLOCKERS_CANDIDATE_LIMIT = 100;
 const BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS = 15 * 60 * 1000;
+// ADR-093 D3 (SUP-14881): an in_progress card whose dispatch has been
+// suppressed for this sustained window — and which still has no live execution
+// path — is parked onto the blocked_without_blockers surface so the existing
+// escalation/heal machinery makes it board-visible. 2h comfortably exceeds D1's
+// 5-min settle + 10-min suppression dedup, so only genuinely persistent ghosts
+// park; a card that regains a live path inside the window never does.
+const DISPATCH_SUPPRESSED_PARK_SUSTAINED_MS = 2 * 60 * 60 * 1000;
+const DISPATCH_SUPPRESSED_PARK_CANDIDATE_LIMIT = 100;
 const STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT = 100;
 const STILLBORN_ASSIGNED_BACKLOG_RELOG_INTERVAL_MS = 5 * 60_000;
 const CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = 250;
@@ -6943,6 +6956,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       dependencyWakeReArmCapEscalated: 0,
       dependencyWakeReArmCapEscalatedIssueIds: [] as string[],
       dependencyWakeIssueIds: [] as string[],
+      dispatchSuppressionParked: 0,
+      dispatchSuppressionParkedIssueIds: [] as string[],
+      dispatchSuppressionParkedLivePathSkipped: 0,
+      dispatchSuppressionParkedSustainedWindowSkipped: 0,
+      dispatchSuppressionParkedAlreadyActionedSkipped: 0,
       blockedWithoutBlockersChecked: 0,
       blockedWithoutBlockersHealed: 0,
       blockedWithoutBlockersEscalated: 0,
@@ -6981,6 +6999,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.dependencyWakeReArmCapEscalated = dependencyWakeBackstop.reArmCapEscalated;
     result.dependencyWakeReArmCapEscalatedIssueIds = dependencyWakeBackstop.reArmCapEscalatedIssueIds;
     result.dependencyWakeIssueIds = dependencyWakeBackstop.issueIds;
+
+    const dispatchSuppressionPark = await reconcileDispatchSuppressionParks({
+      runId: opts?.runId ?? null,
+      now,
+    });
+    result.dispatchSuppressionParked = dispatchSuppressionPark.parked;
+    result.dispatchSuppressionParkedIssueIds = dispatchSuppressionPark.issueIds;
+    result.dispatchSuppressionParkedLivePathSkipped = dispatchSuppressionPark.livePathSkipped;
+    result.dispatchSuppressionParkedSustainedWindowSkipped = dispatchSuppressionPark.sustainedWindowSkipped;
+    result.dispatchSuppressionParkedAlreadyActionedSkipped = dispatchSuppressionPark.alreadyActionedSkipped;
 
     const blockedWithoutBlockers = await reconcileBlockedWithoutBlockers({
       runId: opts?.runId ?? null,
@@ -7746,6 +7774,265 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       logger.info(
         { healed: result.healed, issueIds: result.issueIds, source },
         "blocked-without-blockers auto-healed and dispatched",
+      );
+    }
+
+    return result;
+  }
+
+  /**
+   * ADR-093 D3 (SUP-14881): park a persistently dispatch-suppressed in_progress
+   * card onto the blocked_without_blockers surface so the existing
+   * reconcileBlockedWithoutBlockers sweep escalates it to the board (exactly
+   * once) and later heals it through the existing `_healed` path.
+   *
+   * A card qualifies when ALL hold:
+   *   (A) status = in_progress;
+   *   (B) D1 has suppressed it within the trailing window — a
+   *       `issue.timer_dispatch_suppressed` row confirms the gate is firing and
+   *       supplies the failing §2a disjuncts for the notice;
+   *   (C) its last *real* activity — max(updated_at, latest comment, latest
+   *       non-suppression activity-log row) — is older than the sustained
+   *       window. Suppression rows are excluded on purpose: D1's gate counts
+   *       them as activity, so including them would keep the anchor fresh
+   *       forever and the card would never park (the exact invisibility this
+   *       card fixes);
+   *   (D) it has no live execution path right now (symmetric with the sweep's
+   *       heal predicate); and
+   *   (E) it has no active blocked_without_blockers recovery action (dedupe).
+   *
+   * Parking sets status to `blocked`, which immediately drops the card out of
+   * this in_progress candidate set, so it parks at most once per
+   * park/escalate cycle — never once per suppression tick.
+   */
+  async function reconcileDispatchSuppressionParks(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+  }) {
+    const result = {
+      checked: 0,
+      parked: 0,
+      livePathSkipped: 0,
+      sustainedWindowSkipped: 0,
+      notSuppressedSkipped: 0,
+      alreadyActionedSkipped: 0,
+      candidateLimitSkipped: 0,
+      issueIds: [] as string[],
+    };
+
+    const source = "issue_graph_liveness.dispatch_suppression_park";
+    const now = opts?.now ?? new Date();
+    const windowStart = new Date(now.getTime() - DISPATCH_SUPPRESSED_PARK_SUSTAINED_MS);
+
+    const suppressionFilters = [
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.action, TIMER_DISPATCH_SUPPRESSED_ACTION),
+      gte(activityLog.createdAt, windowStart),
+    ];
+    if (opts?.companyId) suppressionFilters.push(eq(activityLog.companyId, opts.companyId));
+
+    const suppressionRows = await db
+      .select({
+        entityId: activityLog.entityId,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(and(...suppressionFilters))
+      .orderBy(activityLog.entityId, desc(activityLog.createdAt));
+
+    // Latest suppression row per issue (for its §2a disjuncts payload).
+    const latestSuppressionById = new Map<string, unknown>();
+    for (const row of suppressionRows) {
+      if (!latestSuppressionById.has(row.entityId)) latestSuppressionById.set(row.entityId, row.details);
+    }
+
+    const candidateIds = [...latestSuppressionById.keys()];
+    if (candidateIds.length === 0) return result;
+
+    const issueFilters = [
+      inArray(issues.id, candidateIds),
+      eq(issues.status, "in_progress"),
+      visibleIssueCondition(),
+    ];
+    if (opts?.companyId) issueFilters.push(eq(issues.companyId, opts.companyId));
+
+    const issueRows = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        assigneeAgentId: issues.assigneeAgentId,
+        updatedAt: issues.updatedAt,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        totalCount: sql<number>`count(*) over()::int`,
+      })
+      .from(issues)
+      .where(and(...issueFilters))
+      .orderBy(asc(issues.id))
+      .limit(DISPATCH_SUPPRESSED_PARK_CANDIDATE_LIMIT);
+
+    result.checked = issueRows.length;
+    result.candidateLimitSkipped = Math.max(0, (issueRows[0]?.totalCount ?? 0) - issueRows.length);
+
+    if (issueRows.length === 0) return result;
+
+    const candidateIdList = issueRows.map((row) => row.id);
+    const companyId = opts?.companyId;
+
+    // (C) batched last-real-activity anchors, excluding suppression rows.
+    const commentRows = await db
+      .select({
+        issueId: issueComments.issueId,
+        latestCommentAt: sql<Date | null>`MAX(${issueComments.createdAt})`,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          inArray(issueComments.issueId, candidateIdList),
+          companyId ? eq(issueComments.companyId, companyId) : sql`true`,
+        ),
+      )
+      .groupBy(issueComments.issueId);
+    const commentLatestById = new Map(
+      commentRows.map((row) => [row.issueId, row.latestCommentAt] as const),
+    );
+
+    const logFilters = [
+      eq(activityLog.entityType, "issue"),
+      inArray(activityLog.entityId, candidateIdList),
+      ne(activityLog.action, TIMER_DISPATCH_SUPPRESSED_ACTION),
+    ];
+    if (companyId) logFilters.push(eq(activityLog.companyId, companyId));
+    const logRows = await db
+      .select({
+        issueId: activityLog.entityId,
+        latestLogAt: sql<Date | null>`MAX(${activityLog.createdAt})`,
+      })
+      .from(activityLog)
+      .where(and(...logFilters))
+      .groupBy(activityLog.entityId);
+    const logLatestById = new Map(
+      logRows.map((row) => [row.issueId, row.latestLogAt] as const),
+    );
+
+    const assigneeIds = [
+      ...new Set(
+        issueRows.map((row) => row.assigneeAgentId).filter((id): id is string => Boolean(id)),
+      ),
+    ];
+    const assigneeRows =
+      assigneeIds.length > 0
+        ? await db
+            .select({ id: agents.id, name: agents.name })
+            .from(agents)
+            .where(inArray(agents.id, assigneeIds))
+        : [];
+    const assigneeNameById = new Map(
+      assigneeRows.map((row) => [row.id, row.name] as const),
+    );
+
+    const recoveryActionsSvc = issueRecoveryActionService(db);
+
+    for (const candidate of issueRows) {
+      const lastRealActivity = [
+        candidate.updatedAt,
+        commentLatestById.get(candidate.id) ?? null,
+        logLatestById.get(candidate.id) ?? null,
+      ].reduce<Date | null>((latest, value) => {
+        const parsed = value ? new Date(value) : null;
+        if (!parsed || Number.isNaN(parsed.getTime())) return latest;
+        return latest === null || parsed.getTime() > latest.getTime() ? parsed : latest;
+      }, null);
+
+      // (C) sustained window not yet elapsed — the card is not persistently stuck.
+      if (!lastRealActivity || now.getTime() - lastRealActivity.getTime() < DISPATCH_SUPPRESSED_PARK_SUSTAINED_MS) {
+        result.sustainedWindowSkipped++;
+        continue;
+      }
+
+      // (D) a live execution path reappeared — never park a live card.
+      if (
+        await hasActiveExecutionPath(
+          candidate.companyId,
+          candidate.id,
+          candidate.assigneeAgentId,
+          candidate.monitorNextCheckAt,
+        )
+      ) {
+        result.livePathSkipped++;
+        continue;
+      }
+
+      // (E) already surfaced on the blocked_without_blockers surface.
+      const existingAction = await recoveryActionsSvc.getActiveForIssue(candidate.companyId, candidate.id);
+      if (existingAction?.kind === "blocked_without_blockers") {
+        result.alreadyActionedSkipped++;
+        continue;
+      }
+
+      // (B) confirm D1 suppression and read the failing §2a disjuncts.
+      const suppressionDetails = latestSuppressionById.get(candidate.id);
+      if (suppressionDetails === undefined) {
+        result.notSuppressedSkipped++;
+        continue;
+      }
+      const rawDisjuncts = parseObject(suppressionDetails).disjuncts;
+      const disjuncts: ContinuationPathDisjuncts = {
+        activeRun: asBoolean(parseObject(rawDisjuncts).activeRun, false),
+        monitorNextCheckAtInFuture: asBoolean(parseObject(rawDisjuncts).monitorNextCheckAtInFuture, false),
+        watchdog: asBoolean(parseObject(rawDisjuncts).watchdog, false),
+        scheduledRetry: asBoolean(parseObject(rawDisjuncts).scheduledRetry, false),
+        activeRecoveryAction: asBoolean(parseObject(rawDisjuncts).activeRecoveryAction, false),
+        successfulRunHandoffLive: asBoolean(parseObject(rawDisjuncts).successfulRunHandoffLive, false),
+      };
+
+      // Park onto the surface: the existing sweep owns escalation and healing.
+      await issuesSvc.update(candidate.id, { status: "blocked" });
+
+      const notice = buildDispatchSuppressionParkNotice({
+        disjuncts,
+        identifier: candidate.identifier,
+        assignee: candidate.assigneeAgentId
+          ? {
+              id: candidate.assigneeAgentId,
+              name: assigneeNameById.get(candidate.assigneeAgentId) ?? null,
+            }
+          : null,
+      });
+      await issuesSvc.addComment(candidate.id, notice.body, {}, {
+        authorType: "system",
+        presentation: notice.presentation,
+        metadata: notice.metadata,
+      });
+
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: source,
+        runId: opts?.runId ?? null,
+        agentId: candidate.assigneeAgentId ?? null,
+        action: "issue.dispatch_suppression_parked",
+        entityType: "issue",
+        entityId: candidate.id,
+        details: {
+          source,
+          identifier: candidate.identifier,
+          disjuncts,
+          lastRealActivityAt: lastRealActivity.toISOString(),
+          sustainedMs: now.getTime() - lastRealActivity.getTime(),
+          adr: "ADR-093-D3",
+        },
+      });
+
+      result.parked++;
+      result.issueIds.push(candidate.id);
+    }
+
+    if (result.parked > 0) {
+      logger.warn(
+        { parked: result.parked, issueIds: result.issueIds, source },
+        "dispatch-suppressed in_progress cards parked onto blocked_without_blockers surface",
       );
     }
 
@@ -8860,6 +9147,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
     reconcileBlockedWithoutBlockers,
+    reconcileDispatchSuppressionParks,
     reconcilePendingReviewRearm,
     reconcileStaleRecoveryActionWakes,
     reconcileUnfinalizableWorkspaceBarriers,
