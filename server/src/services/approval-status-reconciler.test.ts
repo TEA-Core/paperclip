@@ -2253,6 +2253,127 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     });
   });
 
+  describe("SUP-14911: terminal resolution error on unhydrated PR", () => {
+    /**
+     * Insert a phantom external object that mimics a typo'd GitHub URL:
+     * never successfully resolved (state=null), lastErrorCode set to a
+     * terminal auth error. This is the exact shape that wedged the
+     * reconciler on SUP-14747.
+     */
+    async function insertPhantomMention(issueId: string, externalId: string, lastErrorCode: string) {
+      const data: Record<string, unknown> = {};
+      const [externalObj] = await db
+        .insert(externalObjects)
+        .values({
+          companyId,
+          providerKey: "github",
+          objectType: "pull_request",
+          externalId,
+          data,
+          lastErrorCode,
+        })
+        .returning();
+      await db.insert(externalObjectMentions).values({
+        companyId,
+        sourceIssueId: issueId,
+        sourceKind: "comment",
+        objectId: externalObj!.id,
+        objectType: "pull_request",
+        providerKey: "github",
+      });
+      return externalObj;
+    }
+
+    it("skips with dead-unhydrated-pr when the only unhydrated link has a terminal auth error (zero fetches)", async () => {
+      // Merged real PR + phantom pairclip PR = the exact SUP-14747 shape.
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      // Real PR is merged.
+      await insertMention(issueId, { state: "merged", number: 461 });
+      // Phantom: typo'd repo, never resolved, terminal auth error.
+      await insertPhantomMention(issueId, "TEA-Core/pairclip#pull/461", "github_auth_required");
+
+      // No routes needed: the fix must perform ZERO GitHub fetches.
+      mockGhFetch.mockImplementation(async (url: string) => {
+        throw new Error(`unexpected ghFetch call: ${url}`);
+      });
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.scanned).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["dead-unhydrated-pr"]).toBe(1);
+      expect(summary.skippedDetails[0]).toContain("TEA-Core/pairclip#461");
+      expect(summary.skippedDetails[0]).toContain("err=github_auth_required");
+      // Zero fetches: the terminal-error object was excluded before any call.
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("still selects and fetches a genuinely unhydrated PR with no error (negative test AC3)", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      // Genuinely unhydrated: state=null, lastErrorCode=null (never attempted).
+      const [phantom] = await db
+        .insert(externalObjects)
+        .values({
+          companyId,
+          providerKey: "github",
+          objectType: "pull_request",
+          externalId: "TEA-Core/paperclip#pull/461",
+          data: {},
+          lastErrorCode: null,
+        })
+        .returning();
+      await db.insert(externalObjectMentions).values({
+        companyId,
+        sourceIssueId: issueId,
+        sourceKind: "comment",
+        objectId: phantom!.id,
+        objectType: "pull_request",
+        providerKey: "github",
+      });
+
+      const PHANTOM_PR_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/461";
+      installRoutes([
+        { url: PHANTOM_PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      // The PR was selected, fetched, and republished — not skipped.
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["dead-unhydrated-pr"]).toBeUndefined();
+      expect(mockGhFetch).toHaveBeenCalled();
+    });
+
+    it("reports failed with owner/repo/number when a legitimate open PR 401s (AC4 + AC5)", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      // A real PR that is cached as open but whose live fetch will 401.
+      await insertMention(issueId, { state: "open", number: 461 });
+
+      const LEGIT_PR_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/461";
+      mockGhFetch.mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: async () => ({ message: "Bad credentials" }),
+      } as unknown as Response);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      // A genuine credential failure on a real, previously-hydrated PR still fails.
+      expect(summary.failed).toBe(1);
+      expect(summary.skipped["dead-unhydrated-pr"]).toBeUndefined();
+      // AC5: the error detail names the owner/repo/number fetched.
+      expect(summary.failedDetails[0]).toContain("TEA-Core/paperclip#461");
+      expect(summary.failedDetails[0]).toContain("401");
+    });
+  });
+
   describe("startApprovalStatusReconciler", () => {
     it("runs ticks on the interval and stops on request", async () => {
       vi.useFakeTimers();
