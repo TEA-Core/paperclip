@@ -2425,6 +2425,132 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     );
   });
 
+  // T27 (SUP-14905): the recovery-resolve guard ran on the wrong side of the
+  // execution-policy transition, so a bounced `changes_requested` card (no
+  // pending participant yet) was refused at in_review even though the
+  // transition re-pends the review and installs a participant microseconds
+  // later. These pin the ordering so the lane is reachable without a prior
+  // PATCH.
+  it("resolves a changes_requested card to in_review without a prior PATCH (T27 / SUP-14905)", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    // A distinct reviewer so the review stage re-pends to a real participant.
+    const qaId = randomUUID();
+    await db.insert(agents).values({
+      id: qaId,
+      companyId,
+      name: "QA",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const reviewStageId = randomUUID();
+    // A bounced review: status is in_progress, execution state is
+    // changes_requested, and no other review path is present (no human
+    // assignee, no scheduled monitor, no pending interactions, no approvals).
+    await db.update(issues).set({
+      status: "in_progress",
+      assigneeAgentId: coderId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            id: reviewStageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "agent", agentId: qaId }],
+          },
+        ],
+      },
+      executionState: {
+        status: "changes_requested",
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaId },
+        returnAssignee: { type: "agent", agentId: coderId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: "changes_requested",
+      },
+    }).where(eq(issues.id, sourceIssueId));
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:t27",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    // Before the fix this 422'd with missing: "review_path". The transition now
+    // runs first and installs the pending participant the guard checks.
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "in_review",
+        resolutionNote: "Restore the review lane.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({ id: sourceIssueId, status: "in_review" });
+    expect(resolved.body.issue.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: reviewStageId,
+      currentParticipant: { type: "agent", agentId: qaId },
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({ status: "resolved" });
+  });
+
+  it("still refuses an in_review resolve with no review policy and no review path (T27 / SUP-14905)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:t27-no-policy",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const rejected = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "in_review",
+        resolutionNote: "No review path available.",
+      })
+      .expect(422);
+
+    expect(rejected.body.error).toContain("invalid_issue_disposition");
+    expect(rejected.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "review_path",
+    });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(issue.status).toBe("in_progress");
+  });
+
   it("lets a board declare a live (todo) card a false positive without force-closing it", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     // A live card: the alert fired while the work is legitimately still open.
