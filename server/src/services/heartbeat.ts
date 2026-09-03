@@ -18909,15 +18909,26 @@ function pendingCleanupAttemptsSql() {
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
         const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
-        // Local-CLI agents post comments under user auth, so a self-comment from
-        // the run that is now ending would otherwise look like a real human
-        // comment and trigger a reopen on the very issue this run just closed.
-        // Suppress reopen only when every referenced comment came from this run;
-        // mixed batches must still reopen because they contain a real follow-up.
+        // A deferred comment wake revives a terminal issue only when it carries a
+        // genuine third-party follow-up. Two independent signals mark a comment as
+        // the assignee's own close write-up rather than an intent to reopen:
+        //   1. it was created by the exact run now finalizing (the common same-run
+        //      case, e.g. a local-CLI agent that closes and comments in one run), or
+        //   2. its author agent is the issue's assignee — read from the comment's
+        //      authorAgentId, or resolved through its createdByRunId's owning run when
+        //      the agent id was not stamped directly. Signal 2 covers the case where
+        //      the authoring run differs from the run now promoting the wake, or the
+        //      run stamp is unreliable; keying only on run id let a self write-up
+        //      reopen the card it just closed (SUP-14913).
+        // Suppress reopen only when every referenced comment is the assignee's own;
+        // a mixed batch (self + a real third party) must still reopen.
         let deferredCommentWakeIsSelfAuthored = false;
         if (deferredCommentIds.length > 0) {
           const deferredComments = await tx
-            .select({ createdByRunId: issueComments.createdByRunId })
+            .select({
+              createdByRunId: issueComments.createdByRunId,
+              authorAgentId: issueComments.authorAgentId,
+            })
             .from(issueComments)
             .where(
               and(
@@ -18927,9 +18938,50 @@ function pendingCleanupAttemptsSql() {
               ),
             )
             .then((rows) => rows);
+          const assigneeAgentId =
+            typeof issue.assigneeAgentId === "string" && issue.assigneeAgentId.length > 0
+              ? issue.assigneeAgentId
+              : null;
+          // Resolve the owning agent for comments that only carry a run id, so a
+          // close write-up is still recognized when its run differs from the run
+          // now finalizing.
+          const authoringRunIds = [
+            ...new Set(
+              deferredComments
+                .filter((comment) => !comment.authorAgentId)
+                .map((comment) => comment.createdByRunId)
+                .filter((id): id is string => typeof id === "string" && id.length > 0),
+            ),
+          ];
+          const owningAgentByRunId = new Map<string, string>();
+          if (assigneeAgentId && authoringRunIds.length > 0) {
+            const authoringRuns = await tx
+              .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, issue.companyId),
+                  inArray(heartbeatRuns.id, authoringRunIds),
+                ),
+              )
+              .then((rows) => rows);
+            for (const authoringRun of authoringRuns) {
+              owningAgentByRunId.set(authoringRun.id, authoringRun.agentId);
+            }
+          }
           deferredCommentWakeIsSelfAuthored =
             deferredComments.length > 0 &&
-            deferredComments.every((comment) => comment.createdByRunId === run.id);
+            deferredComments.every((comment) => {
+              if (comment.createdByRunId === run.id) return true;
+              if (!assigneeAgentId) return false;
+              if (typeof comment.authorAgentId === "string" && comment.authorAgentId.length > 0) {
+                return comment.authorAgentId === assigneeAgentId;
+              }
+              const owningAgentId = comment.createdByRunId
+                ? (owningAgentByRunId.get(comment.createdByRunId) ?? null)
+                : null;
+              return owningAgentId !== null && owningAgentId === assigneeAgentId;
+            });
         }
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
