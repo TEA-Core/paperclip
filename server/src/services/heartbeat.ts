@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -28,6 +28,7 @@ import {
   type RoutineRevisionSnapshotV1,
   type RunLivenessState,
   type SourceTrustMetadata,
+  type SuccessfulRunHandoffState,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -58,6 +59,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  issueWatchdogs,
   issueWorkProducts,
   nativeRunFinalizations,
   projects,
@@ -89,6 +91,16 @@ import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { resolveLiveExecutionLeases, type LiveExecutionLease } from "./issue-execution-lease.js";
+import {
+  buildTimerDispatchSuppressionDetails,
+  evaluateIssueContinuationPath,
+  isTimerCandidateActionable,
+  TIMER_DISPATCH_SUPPRESSED_ACTION,
+  type ContinuationPathEvidence,
+  type ContinuationPathResult,
+} from "./issue-continuation-path.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
+import { hydrateSuccessfulRunHandoffLiveness } from "./successful-run-handoff-state.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
@@ -13183,10 +13195,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * already executing (SUP-14286 / SUP-14299). `allLeased` is only true when
    * candidates exist, so "nothing assigned" (possible starvation) stays
    * distinct from "everything assigned is live elsewhere" (healthy).
+   *
+   * ADR-093 D1 (SUP-14880) adds a second term to the same actionability test:
+   * an `in_progress` card is only actionable while it keeps a live continuation
+   * path (the §2a predicate shared with the write-path guard). A card that is
+   * `in_progress` with `executionRunId: null`, no live lease and no live
+   * disjunct is a ghost that would otherwise keep this agent's timer actionable
+   * forever (the SUP-14761 burn). A `todo` card has no continuation to have
+   * lost, so it stays actionable (subject to the lease). Every suppressed
+   * in_progress candidate writes one observability activity row naming the
+   * failing disjuncts (ADR-093 D1/D3 observability contract).
    */
   async function timerWorkLeaseState(agent: typeof agents.$inferSelect): Promise<TimerWorkLeaseState> {
     const candidates = await db
-      .select({ id: issues.id })
+      .select({
+        id: issues.id,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        executionRunId: issues.executionRunId,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        updatedAt: issues.updatedAt,
+      })
       .from(issues)
       .where(
         and(
@@ -13208,11 +13237,306 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const leased = candidates
       .filter((row) => leases.has(row.id))
       .map((row) => ({ issueId: row.id, holder: leases.get(row.id)! }));
+
+    // ADR-093 D1 (SUP-14880): resolve the §2a continuation-path evidence for
+    // only the unleased in_progress candidates; a todo card needs none.
+    const inProgressUnleased = candidates.filter(
+      (row) => row.status === "in_progress" && !leases.has(row.id),
+    );
+    const continuationByIssueId =
+      inProgressUnleased.length > 0
+        ? await resolveTimerContinuationEvidence(agent, inProgressUnleased)
+        : new Map<string, ContinuationPathResult>();
+    for (const candidate of inProgressUnleased) {
+      const path = continuationByIssueId.get(candidate.id);
+      if (!path || path.ok) continue;
+      await maybeLogTimerDispatchSuppressed(agent, candidate.id, path);
+    }
+
+    let actionable = false;
+    for (const candidate of candidates) {
+      const leasedBy = leases.has(candidate.id);
+      if (leasedBy) continue;
+      const candidateActionable = isTimerCandidateActionable({
+        status: candidate.status,
+        leased: leasedBy,
+        continuationOk: candidate.status === "in_progress"
+          ? continuationByIssueId.get(candidate.id)?.ok
+          : undefined,
+      });
+      if (!candidateActionable) continue;
+      actionable = true;
+      break;
+    }
     return {
-      actionable: leased.length < candidates.length,
+      actionable,
       allLeased: leased.length === candidates.length,
       leased,
     };
+  }
+
+  /**
+   * ADR-093 D1 (SUP-14880): resolve the §2a live-continuation-path evidence for
+   * the assigned in_progress candidates a timer wake is considering, and
+   * evaluate each with the shared pure predicate (services/issue-continuation-path.js).
+   *
+   * Mirrors the routes resolver (evaluateContinuationPathForIssue in
+   * routes/issues.ts) disjunct-for-disjunct, but batched across the whole
+   * candidate set in a handful of `IN` queries instead of one round-trip per
+   * issue, so the per-tick gate does not fan out N+1. The activeRecoveryAction
+   * disjunct uses the ADR-093 D2 live-only reader (SUP-14879): an `escalated`
+   * action (ladder dead, parked on the board) is NOT a live continuation.
+   */
+  async function resolveTimerContinuationEvidence(
+    agent: typeof agents.$inferSelect,
+    candidates: Array<{
+      id: string;
+      assigneeAgentId: string | null;
+      executionRunId: string | null;
+      monitorNextCheckAt: Date | string | null;
+      updatedAt: Date | string | null;
+    }>,
+  ): Promise<Map<string, ContinuationPathResult>> {
+    const result = new Map<string, ContinuationPathResult>();
+    if (candidates.length === 0) return result;
+    const companyId = agent.companyId;
+    const ids = candidates.map((row) => row.id);
+
+    const issueRunContextId = sql<string>`coalesce(
+      ${heartbeatRuns.contextSnapshot} ->> 'issueId',
+      ${heartbeatRuns.contextSnapshot} ->> 'taskId'
+    )`;
+
+    // §2a disjunct 1 (activeRun): a queued|running run stamped on executionRunId,
+    // or the assignee's live running run targeting this issue.
+    const executionRunIds = candidates
+      .map((row) => row.executionRunId)
+      .filter((value): value is string => Boolean(value));
+    const executionRunRows =
+      executionRunIds.length > 0
+        ? await db
+            .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(inArray(heartbeatRuns.id, executionRunIds))
+        : [];
+    const executionRunStatusById = new Map(
+      executionRunRows.map((row) => [row.id, row.status] as const),
+    );
+    const assigneeRunningRows = await db
+      .select({ issueId: issueRunContextId })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agent.id),
+          eq(heartbeatRuns.status, "running"),
+          inArray(issueRunContextId, ids),
+        ),
+      );
+    const assigneeRunningIssueIds = new Set(
+      assigneeRunningRows
+        .map((row) => row.issueId)
+        .filter((value): value is string => Boolean(value)),
+    );
+
+    // §2a disjunct 3 (watchdog): a live task watchdog on the issue.
+    const watchdogRows = await db
+      .select({ issueId: issueWatchdogs.issueId })
+      .from(issueWatchdogs)
+      .where(
+        and(
+          eq(issueWatchdogs.companyId, companyId),
+          inArray(issueWatchdogs.issueId, ids),
+          eq(issueWatchdogs.status, "active"),
+        ),
+      );
+    const watchdogIssueIds = new Set(watchdogRows.map((row) => row.issueId));
+
+    // §2a disjunct 4 (scheduledRetry): a scheduled_retry/queued/running run with a
+    // scheduledRetryReason targeting this issue (same rule as the current-
+    // scheduled-retry reader).
+    const scheduledRetryRows = await db
+      .select({ issueId: issueRunContextId })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.status, ["scheduled_retry", "queued", "running"]),
+          isNotNull(heartbeatRuns.scheduledRetryReason),
+          inArray(issueRunContextId, ids),
+        ),
+      );
+    const scheduledRetryIssueIds = new Set(
+      scheduledRetryRows
+        .map((row) => row.issueId)
+        .filter((value): value is string => Boolean(value)),
+    );
+
+    // §2a disjunct 5 (successfulRunHandoff): an outstanding required/escalated
+    // handoff whose liveness hydrates to live.
+    const handoffRows = await db
+      .select({
+        entityId: activityLog.entityId,
+        action: activityLog.action,
+        agentId: activityLog.agentId,
+        runId: activityLog.runId,
+        details: activityLog.details,
+        createdAt: activityLog.createdAt,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          inArray(activityLog.entityId, ids),
+          inArray(activityLog.action, [
+            "issue.successful_run_handoff_required",
+            "issue.successful_run_handoff_resolved",
+            "issue.successful_run_handoff_escalated",
+          ]),
+        ),
+      )
+      .orderBy(activityLog.entityId, desc(activityLog.createdAt), desc(activityLog.id));
+    const handoffStates = new Map<string, SuccessfulRunHandoffState>();
+    for (const row of handoffRows) {
+      if (handoffStates.has(row.entityId)) continue;
+      const state =
+        row.action === "issue.successful_run_handoff_required"
+          ? "required"
+          : row.action === "issue.successful_run_handoff_resolved"
+            ? "resolved"
+            : row.action === "issue.successful_run_handoff_escalated"
+              ? "escalated"
+              : null;
+      if (!state) continue;
+      handoffStates.set(row.entityId, {
+        state,
+        required: state === "required",
+        hasLiveContinuation: false,
+        sourceRunId: null,
+        correctiveRunId: null,
+        assigneeAgentId: row.agentId ?? null,
+        detectedProgressSummary: null,
+        createdAt: row.createdAt,
+      });
+    }
+    if (handoffStates.size > 0) {
+      await hydrateSuccessfulRunHandoffLiveness(db, companyId, handoffStates);
+    }
+
+    // lastActivityAt (settle-window input): max(updatedAt, latest comment,
+    // latest activity-log) — the same three sources the routes resolver uses.
+    const commentRows = await db
+      .select({
+        issueId: issueComments.issueId,
+        latestCommentAt: sql<Date | null>`MAX(${issueComments.createdAt})`,
+      })
+      .from(issueComments)
+      .where(and(eq(issueComments.companyId, companyId), inArray(issueComments.issueId, ids)))
+      .groupBy(issueComments.issueId);
+    const commentLatestById = new Map(
+      commentRows.map((row) => [row.issueId, row.latestCommentAt] as const),
+    );
+    const logRows = await db
+      .select({
+        issueId: activityLog.entityId,
+        latestLogAt: sql<Date | null>`MAX(${activityLog.createdAt})`,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          inArray(activityLog.entityId, ids),
+        ),
+      )
+      .groupBy(activityLog.entityId);
+    const logLatestById = new Map(
+      logRows.map((row) => [row.issueId, row.latestLogAt] as const),
+    );
+
+    const recoveryActionsSvc = issueRecoveryActionService(db);
+    for (const candidate of candidates) {
+      const executionRunId = candidate.executionRunId;
+      const executionRunStatus = executionRunId
+        ? executionRunStatusById.get(executionRunId)
+        : undefined;
+      const activeRun =
+        executionRunStatus === "queued" ||
+        executionRunStatus === "running" ||
+        assigneeRunningIssueIds.has(candidate.id);
+      const lastActivityAt = [
+        candidate.updatedAt,
+        commentLatestById.get(candidate.id) ?? null,
+        logLatestById.get(candidate.id) ?? null,
+      ].reduce<Date | null>((latest, value) => {
+        const parsed = value ? new Date(value) : null;
+        if (!parsed || Number.isNaN(parsed.getTime())) return latest;
+        return latest === null || parsed.getTime() > latest.getTime() ? parsed : latest;
+      }, null);
+      const evidence: ContinuationPathEvidence = {
+        activeRun,
+        monitorNextCheckAt: candidate.monitorNextCheckAt,
+        watchdog: watchdogIssueIds.has(candidate.id) ? { present: true } : null,
+        scheduledRetry: scheduledRetryIssueIds.has(candidate.id) ? { present: true } : null,
+        activeRecoveryAction: null,
+        successfulRunHandoff: handoffStates.get(candidate.id) ?? null,
+        lastActivityAt,
+      };
+      // §2a disjunct 6 (activeRecoveryAction): the D2 live-only reader.
+      evidence.activeRecoveryAction = await recoveryActionsSvc.getLiveContinuationForIssue(
+        companyId,
+        candidate.id,
+      );
+      result.set(candidate.id, evaluateIssueContinuationPath(evidence));
+    }
+    return result;
+  }
+
+  /**
+   * ADR-093 D1 (SUP-14880): write one observability activity row for a
+   * dispatch-suppressed in_progress candidate. timerWorkLeaseState runs on both
+   * the enqueue and claim paths and can run on successive ticks, so a single
+   * stuck card must not emit a row per tick — at most one row per issue in the
+   * trailing 10 minutes. The row names the failing disjuncts, so a suppressed
+   * card is auditable before the D3 board-visible park lands.
+   */
+  async function maybeLogTimerDispatchSuppressed(
+    agent: typeof agents.$inferSelect,
+    issueId: string,
+    path: ContinuationPathResult,
+  ): Promise<void> {
+    const windowStart = new Date(Date.now() - 10 * 60 * 1000);
+    const [recent] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, agent.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, TIMER_DISPATCH_SUPPRESSED_ACTION),
+          gte(activityLog.createdAt, windowStart),
+        ),
+      )
+      .limit(1);
+    if (recent) return;
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: agent.id,
+      runId: null,
+      action: TIMER_DISPATCH_SUPPRESSED_ACTION,
+      entityType: "issue",
+      entityId: issueId,
+      details: buildTimerDispatchSuppressionDetails({
+        issueId,
+        status: "in_progress",
+        disjuncts: path.disjuncts,
+        settledWithinWindow: path.settledWithinWindow,
+        lastActivityAt: path.lastActivityAt,
+      }),
+    });
   }
 
   async function markTimerHeartbeatChecked(agentId: string, source: WakeupOptions["source"]) {
