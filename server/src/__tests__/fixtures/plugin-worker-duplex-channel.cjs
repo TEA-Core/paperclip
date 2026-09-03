@@ -2,6 +2,14 @@
 // fixture drives the manager route state machine through the four typed methods
 // (open, write, stop, close) and the data and exit notifications.
 //
+// `batchWithOpenReply: false` (the default) means the scripted frames arrive in a
+// SEPARATE stdout write from the open reply, so the host binds the route before
+// the frames land. Under merge_group load the host's event loop can be delayed
+// long enough that a `setImmediate` frame coalesces with the open reply in one
+// pipe read, so the non-batched path defers the frame by a small fixed delay to
+// keep the read ordering deterministic. The delay is far below the buffered-data
+// settle waits in the spec, so those tests still observe the frames buffered.
+//
 // The duplex channel is generic. It carries no command allowlist. The test
 // encodes a JSON directive in the forwarded `providerLeaseId`, so one fixture
 // serves every route case:
@@ -51,6 +59,11 @@
 //     reply and the notifications in one batch, so a test proves the host holds
 //     and replays a frame that arrives before the route binds.
 const readline = require("node:readline");
+
+// Small fixed delay (ms) that separates the non-batched scripted frames from the
+// open reply in the pipe, so the host binds the route before the frames land.
+// See the header comment for why this matters under load.
+const NON_BATCHED_FRAME_DELAY_MS = 40;
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -221,10 +234,13 @@ rl.on("line", (line) => {
 
     // Emit the scripted data and the exit after the open reply, so the host
     // binds the route first. Each frame echoes the exact pair; a test overrides
-    // `sid` or `rid` to force a mismatch.
-    setImmediate(() => {
+    // `sid` or `rid` to force a mismatch. The fixed delay keeps this frame in a
+    // separate pipe read from the open reply even when the host event loop is
+    // starved by merge_group load (a `setImmediate` here could coalesce with the
+    // open reply and land the frame in the pre-bind hold instead).
+    setTimeout(() => {
       process.stdout.write(scriptedFrameLines(directive, hostRouteId, workerSessionId));
-    });
+    }, NON_BATCHED_FRAME_DELAY_MS);
     return;
   }
 
