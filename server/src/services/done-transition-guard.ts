@@ -694,13 +694,16 @@ async function liveDiscoverOpenLinkedPullRequests(
 }
 
 /**
- * SUP-14912: the set of stage ids on this issue backed by a durable `approved`
- * decision row in `issue_execution_decisions`. The reopen path nulls the
+ * SUP-14912: the set of stage ids on this issue whose LATEST durable decision in
+ * `issue_execution_decisions` is `approved`. The reopen path nulls the
  * `executionState` projection when a done/cancelled issue moves back to a
- * non-terminal status, but the decision rows survive. Only `approved` counts —
- * a `changes_requested` decision leaves the stage unsatisfied (fail closed, no
- * bypass). Mirrors the mechanism A count query: no try/catch, so a DB error
- * propagates and fails the close closed.
+ * non-terminal status, but the decision rows survive. A stage is satisfied only
+ * when its most recent decision is `approved`: a later `changes_requested` (or
+ * any non-approved outcome) supersedes an earlier approval and leaves the stage
+ * unsatisfied (fail closed, no bypass). Keying on *any* approved row would
+ * resurrect a stage a reviewer reopened after it, so we resolve the latest
+ * decision per stage instead. Mirrors the mechanism A count query: no
+ * try/catch, so a DB error propagates and fails the close closed.
  */
 async function listDecisionSatisfiedStageIds(
   db: Db,
@@ -708,16 +711,46 @@ async function listDecisionSatisfiedStageIds(
   issueId: string,
 ): Promise<Set<string>> {
   const rows = await db
-    .select({ stageId: issueExecutionDecisions.stageId })
+    .select({
+      stageId: issueExecutionDecisions.stageId,
+      outcome: issueExecutionDecisions.outcome,
+      createdAt: issueExecutionDecisions.createdAt,
+      id: issueExecutionDecisions.id,
+    })
     .from(issueExecutionDecisions)
     .where(
       and(
         eq(issueExecutionDecisions.issueId, issueId),
         eq(issueExecutionDecisions.companyId, companyId),
-        eq(issueExecutionDecisions.outcome, "approved"),
       ),
     );
-  return new Set(rows.map((row) => row.stageId));
+  // Keep only the most recent decision per stage (createdAt, id tie-break),
+  // then satisfy only the stages whose most recent decision is `approved`.
+  // Computing the max in JS makes this independent of DB row ordering.
+  const latestByStage = new Map<
+    string,
+    { createdAtMs: number; id: string; outcome: string }
+  >();
+  for (const row of rows) {
+    const cur = {
+      createdAtMs: row.createdAt.getTime(),
+      id: row.id,
+      outcome: row.outcome,
+    };
+    const prev = latestByStage.get(row.stageId);
+    if (
+      prev === undefined ||
+      cur.createdAtMs > prev.createdAtMs ||
+      (cur.createdAtMs === prev.createdAtMs && cur.id > prev.id)
+    ) {
+      latestByStage.set(row.stageId, cur);
+    }
+  }
+  const satisfied = new Set<string>();
+  for (const [stageId, latest] of latestByStage) {
+    if (latest.outcome === "approved") satisfied.add(stageId);
+  }
+  return satisfied;
 }
 
 /**
@@ -736,13 +769,14 @@ async function listDecisionSatisfiedStageIds(
  * the approval circuit — so a policy stage currently pending is treated as
  * satisfied in that case only.
  *
- * `decisionSatisfiedStageIds` is the set of stage ids backed by a durable
- * `approved` decision row in `issue_execution_decisions` (SUP-14912). A card
- * reopen nulls the `executionState` projection while the decision rows
- * survive; a stage in this set is satisfied even when the projection is
- * null/absent or missing the stage, so a recovered approval no longer deadlocks
- * the close. Only `approved` decisions ever populate this set — a
- * `changes_requested` decision does NOT satisfy.
+  * `decisionSatisfiedStageIds` is the set of stage ids whose LATEST durable
+  * decision row in `issue_execution_decisions` is `approved` (SUP-14912). A card
+  * reopen nulls the `executionState` projection while the decision rows
+  * survive; a stage in this set is satisfied even when the projection is
+  * null/absent or missing the stage, so a recovered approval no longer deadlocks
+  * the close. Only a stage whose most recent decision is `approved` populates
+  * this set — a later `changes_requested` supersedes the approval and does NOT
+  * satisfy.
  *
  * Returns null when the issue carries no ladder (out of scope for this
  * mechanism; the pre-existing null-policy path is unchanged).
@@ -1001,10 +1035,11 @@ export async function evaluateDoneTransitionGuard(
 
   // SUP-14912: a reopen nulls the `executionState` projection while the durable
   // decision rows survive. Before refusing, recover satisfaction from
-  // `issue_execution_decisions` — a stage with a recorded `approved` decision is
-  // satisfied regardless of the projection. Runs only in the fallback case
-  // (ladder present and unsatisfied by the projection); on a DB error it throws
-  // and fails the close closed, same as mechanism A.
+  // `issue_execution_decisions` — a stage whose LATEST decision is `approved` is
+  // satisfied regardless of the projection (a later `changes_requested`
+  // supersedes the approval and is not recovered). Runs only in the fallback
+  // case (ladder present and unsatisfied by the projection); on a DB error it
+  // throws and fails the close closed, same as mechanism A.
   if (reviewLadder !== null && !reviewLadder.satisfied) {
     const decisionSatisfiedStageIds = await listDecisionSatisfiedStageIds(
       db,

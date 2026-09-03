@@ -109,17 +109,14 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     then: vi.fn().mockResolvedValue(rows.agents ?? []),
   };
   // SUP-14912: the guard reads issue_execution_decisions (approved-decision
-  // recovery for a nulled projection). Dispatch by table identity. The mock
-  // applies the guard's `outcome = 'approved'` filter client-side so raw rows
-  // can be seeded — a changes_requested row does not recover the stage.
+  // recovery for a nulled projection). Dispatch by table identity. The guard
+  // fetches every decision row for the issue and resolves the LATEST decision
+  // per stage in JS (a later changes_requested supersedes an earlier approved),
+  // so the mock returns the seeded rows unfiltered and in seed order.
   const decisionsChain = {
     from: vi.fn().mockReturnThis(),
-    where: vi.fn().mockResolvedValue(
-      (rows.issueExecutionDecisions ?? []).filter((r) => r.outcome === "approved"),
-    ),
-    then: vi.fn().mockResolvedValue(
-      (rows.issueExecutionDecisions ?? []).filter((r) => r.outcome === "approved"),
-    ),
+    where: vi.fn().mockResolvedValue(rows.issueExecutionDecisions ?? []),
+    then: vi.fn().mockResolvedValue(rows.issueExecutionDecisions ?? []),
   };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
@@ -554,8 +551,8 @@ describe("evaluateDoneTransitionGuard", () => {
     const stageA = "aaaaaaaa-0000-4000-8000-0000000000aa";
     const stageB = "bbbbbbbb-0000-4000-8000-0000000000bb";
 
-    const decisionRow = (stageId: string, outcome: string) => ({
-      id: `dec-${stageId}`,
+    const decisionRow = (stageId: string, outcome: string, createdAt?: Date, suffix = "") => ({
+      id: suffix ? `dec-${stageId}-${suffix}` : `dec-${stageId}`,
       companyId: "company-1",
       issueId: "issue-1",
       stageId,
@@ -563,8 +560,8 @@ describe("evaluateDoneTransitionGuard", () => {
       outcome,
       body: null,
       createdByRunId: null,
-      createdAt: new Date(),
-      updatedAt: new Date(),
+      createdAt: createdAt ?? new Date(),
+      updatedAt: createdAt ?? new Date(),
     });
 
     it("satisfies a nulled-projection stage backed by an approved decision (AC2 / main regression)", async () => {
@@ -592,9 +589,9 @@ describe("evaluateDoneTransitionGuard", () => {
     });
 
     it("does NOT satisfy a stage whose only recorded decision is changes_requested (AC3 — no bypass)", async () => {
-      // The mock applies the guard's `outcome = 'approved'` filter, so a
-      // changes_requested row yields an empty approved set: the stage stays
-      // unsatisfied and the close fails closed.
+      // The stage's latest (and only) decision is changes_requested, so it is
+      // not in the recovered set: the stage stays unsatisfied and the close
+      // fails closed.
       setupDbMock({ issueExecutionDecisions: [decisionRow(stageA, "changes_requested")] });
       const result = await evaluateDoneTransitionGuard(
         mockDb,
@@ -608,6 +605,72 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(false);
       expect(result.ladderUnsatisfied).toBe(true);
       expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_recovered_from_decisions",
+        }),
+      );
+    });
+
+    it("does NOT satisfy a stage whose LATEST decision is changes_requested, even though an earlier approved row survives (finding ladder-recovery-matches-any-approved-row-not-latest-decision)", async () => {
+      // Repro of the finding: approve stage A (card closes), reopen, re-pend,
+      // reviewer requests changes. The earlier approved row still exists, but
+      // the LATER changes_requested row supersedes it. Recovering from "any
+      // approved row" would resurrect the stage and let the card close despite
+      // the open changes_requested — a bypass. Keying on the latest decision
+      // keeps the stage unsatisfied.
+      const approvedAt = new Date("2026-09-03T19:00:40.775Z");
+      const changesRequestedAt = new Date("2026-09-03T19:56:23.986Z");
+      setupDbMock({
+        issueExecutionDecisions: [
+          decisionRow(stageA, "approved", approvedAt, "approved"),
+          decisionRow(stageA, "changes_requested", changesRequestedAt, "changes_requested"),
+        ],
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: { stages: [{ id: stageA, type: "review" }] },
+          executionState: null,
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.ladderUnsatisfied).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_recovered_from_decisions",
+        }),
+      );
+    });
+
+    it("satisfies a stage when the LATEST decision is approved after an earlier changes_requested", async () => {
+      // Inverse of the above: the reviewer first requested changes, then the
+      // implementer re-delivered and the stage was re-approved. The latest
+      // decision is approved, so the stage recovers even from a nulled
+      // projection.
+      const changesRequestedAt = new Date("2026-09-03T19:00:40.775Z");
+      const approvedAt = new Date("2026-09-03T19:56:23.986Z");
+      setupDbMock({
+        issueExecutionDecisions: [
+          decisionRow(stageA, "changes_requested", changesRequestedAt, "changes_requested"),
+          decisionRow(stageA, "approved", approvedAt, "approved"),
+        ],
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: { stages: [{ id: stageA, type: "review" }] },
+          executionState: null,
+        },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.ladderUnsatisfied).toBeUndefined();
+      expect(logActivity).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
           action: "issue.done_transition_ladder_recovered_from_decisions",
