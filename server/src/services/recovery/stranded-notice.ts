@@ -7,6 +7,7 @@ import {
   type NoticeMetadataRow,
   type NoticeMetadataSection,
 } from "./notice-format.js";
+import type { ContinuationPathDisjuncts } from "../issue-continuation-path.js";
 
 // Short human-readable body plus the presentation header for one recovery
 // family. The escalation path merges in the metadata rows only it knows
@@ -152,6 +153,85 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     metadata: {
       version: 1,
       sourceRunId: input.sourceRun?.id ?? null,
+      sections,
+    },
+  };
+}
+
+export type DispatchSuppressionParkNotice = {
+  body: string;
+  presentation: IssueCommentPresentation;
+  metadata: IssueCommentMetadata;
+};
+
+// §2a disjunct labels, keyed off the D1 suppression row's `disjuncts` payload
+// (shape fixed by SUP-14880). Only the disjuncts that are NOT live are named in
+// the notice, so the board sees exactly what is missing and what to restore.
+const DISPATCH_SUPPRESSED_DISJUNCT_LABELS: Array<{
+  key: keyof ContinuationPathDisjuncts;
+  label: string;
+}> = [
+  { key: "activeRun", label: "no active or queued run" },
+  { key: "monitorNextCheckAtInFuture", label: "no monitor with a future next check" },
+  { key: "watchdog", label: "no live task watchdog" },
+  { key: "scheduledRetry", label: "no scheduled retry" },
+  { key: "activeRecoveryAction", label: "no live recovery action" },
+  { key: "successfulRunHandoffLive", label: "no live successful-run handoff" },
+];
+
+// ADR-093 D3 (SUP-14881) — the board-visible notice posted when a persistently
+// dispatch-suppressed in_progress card is parked onto the
+// blocked_without_blockers surface. Names the failing §2a disjuncts (from the
+// D1 suppression row) and a concrete unblock action, so the board gets something
+// actionable — the defect that left SUP-14761's escalation untellable.
+export function buildDispatchSuppressionParkNotice(input: {
+  disjuncts: ContinuationPathDisjuncts;
+  identifier: string | null;
+  assignee: { id: string; name: string | null } | null;
+}): DispatchSuppressionParkNotice {
+  const failing = DISPATCH_SUPPRESSED_DISJUNCT_LABELS.filter(
+    ({ key }) => input.disjuncts[key] !== true,
+  );
+  const disjunctSummary =
+    failing.length > 0
+      ? failing.map((entry) => entry.label).join("; ")
+      : "none detected (unexpected)";
+  const cardRef = input.identifier ? ` \`${input.identifier}\`` : "";
+
+  const body =
+    `Paperclip stopped dispatching timer runs for this${cardRef} ` +
+    "`in_progress` card because no live continuation path remains. " +
+    `Missing §2a disjuncts: ${disjunctSummary}. ` +
+    "The card has been parked on the blocked_without_blockers surface and will stay there until a live path returns. " +
+    "Unblock it by re-arming a monitor next check, restoring a watchdog, reassigning it to a live run, " +
+    "or recording the intended resolution.";
+
+  const disjunctRows: NoticeMetadataRow[] =
+    failing.length > 0
+      ? failing.map((entry) => keyValueRow(entry.label, "absent"))
+      : [keyValueRow("Continuation path", "unexpectedly live")];
+
+  const actionRows: NoticeMetadataRow[] = [
+    input.assignee
+      ? agentLinkRow("Unblock owner", input.assignee)
+      : keyValueRow("Unblock owner", "Board decision required"),
+    keyValueRow(
+      "Next action",
+      "Restore a live continuation path (monitor next check, watchdog, live run, or recovery action), add valid blockers, or record the intended resolution",
+    ),
+  ];
+
+  const sections: NoticeMetadataSection[] = [
+    { title: "Missing continuation", rows: disjunctRows },
+    { title: "Action", rows: actionRows },
+  ];
+
+  return {
+    body,
+    presentation: systemNoticePresentation({ tone: "danger", title: "Dispatch suppressed — parked" }),
+    metadata: {
+      version: 1,
+      sourceRunId: null,
       sections,
     },
   };
