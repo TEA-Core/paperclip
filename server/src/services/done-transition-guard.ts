@@ -904,15 +904,21 @@ async function findMissingAdr072CloseLadderStages(
 }
 
 /**
- * Gate an issue's transition to `done`. Runs the pre-network fail-closed gates
- * first — a sanctioned no-deliverable-head `override` (which lands the close
- * with an audit row), mechanism C (an unrun review ladder, SUP-14446),
- * mechanism A (a ladder-less decomposed parent over 2+ laddered children,
- * SUP-14561), and mechanism D (a shape-incomplete ADR-072 close ladder,
- * SUP-14579) — then verifies the PR/GitHub delivery and tier declaration and
- * applies the open-PR block. `decisionCarried` applies the ADR-074 D6
- * carve-out for decision-carrying board closes. Every refusal, override, and
- * skip records an audit row.
+ * Gate an issue's transition to `done`. Runs the pre-network fail-closed review
+ * gates first — mechanism C (an unrun review ladder, SUP-14446), mechanism A
+ * (a ladder-less decomposed parent over 2+ laddered children, SUP-14561), and
+ * mechanism D (a shape-incomplete ADR-072 close ladder, SUP-14579) — and only
+ * then the sanctioned no-deliverable-head `override`, which lands the close
+ * with an audit row and waives ONLY the linked-PR / branch-ahead head check.
+ * Because the override sits after the three refusals, a parent that owes a
+ * ladder (unrun, ungated decomposed, or shape-incomplete) is refused before the
+ * disposition is ever read — it cannot reach them and waive them (SUP-13724 §1:
+ * the disposition may arm a ladder, never replace one). A card that genuinely
+ * owes no content and owes no ladder reaches the override unchanged. Then the
+ * guard verifies the PR/GitHub delivery and tier declaration and applies the
+ * open-PR block. `decisionCarried` applies the ADR-074 D6 carve-out for
+ * decision-carrying board closes. Every refusal, override, and skip records an
+ * audit row.
  */
 export async function evaluateDoneTransitionGuard(
   db: Db,
@@ -988,95 +994,10 @@ export async function evaluateDoneTransitionGuard(
     }
   }
 
-  if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
-    void writeAuditLog(db, issue, "issue.done_transition_override", {
-      disposition: override.disposition,
-      overrideReason: override.reason ?? null,
-      source: "done_transition_guard",
-    });
-    if (reviewLadder !== null && !reviewLadder.satisfied) {
-      void writeAuditLog(db, issue, "issue.done_transition_ladder_override", {
-        disposition: override.disposition,
-        overrideReason: override.reason ?? null,
-        reason: `review_ladder_unsatisfied:${reviewLadder.firstUnsatisfiedStage?.id ?? "unknown"}`,
-        unsatisfiedStageIds: reviewLadder.unsatisfiedStageIds,
-        completedStageIds: reviewLadder.completedStageIds,
-        skippedStageIds: reviewLadder.skippedStageIds,
-        source: "done_transition_guard",
-      });
-      return {
-        allowed: true,
-        reason:
-          `Override accepted: ${override.disposition} ` +
-          `(review ladder bypassed — unsatisfied stages: ${reviewLadder.unsatisfiedStageIds.join(", ")})`,
-        aheadBy: null,
-        branch: null,
-        defaultRef: null,
-        owner: null,
-        repo: null,
-        skipped: false,
-        skipReason: null,
-      };
-    }
-    if (mechanismA !== null && mechanismA.count >= 2) {
-      void writeAuditLog(db, issue, "issue.done_transition_null_policy_override", {
-        disposition: override.disposition,
-        overrideReason: override.reason ?? null,
-        ladderedChildCount: mechanismA.count,
-        ladderedChildIdentifiers: mechanismA.identifiers,
-        source: "done_transition_guard",
-      });
-      return {
-        allowed: true,
-        reason:
-          `Override accepted: ${override.disposition} ` +
-          `(ungated decomposed-parent close bypassed — ${mechanismA.count} laddered children: ` +
-          `${mechanismA.identifiers.join(", ")})`,
-        aheadBy: null,
-        branch: null,
-        defaultRef: null,
-        owner: null,
-        repo: null,
-        skipped: false,
-        skipReason: null,
-      };
-    }
-    if (ladderShape !== null) {
-      void writeAuditLog(db, issue, "issue.done_transition_ladder_shape_override", {
-        disposition: override.disposition,
-        overrideReason: override.reason ?? null,
-        missingStageLabels: ladderShape.missingStageLabels,
-        ladderedChildCount: ladderShape.ladderedChildCount,
-        ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
-        source: "done_transition_guard",
-      });
-      return {
-        allowed: true,
-        reason:
-          `Override accepted: ${override.disposition} ` +
-          `(ADR-072 close-ladder shape bypassed — missing stages: ` +
-          `${ladderShape.missingStageLabels.join(", ")})`,
-        aheadBy: null,
-        branch: null,
-        defaultRef: null,
-        owner: null,
-        repo: null,
-        skipped: false,
-        skipReason: null,
-      };
-    }
-    return {
-      allowed: true,
-      reason: `Override accepted: ${override.disposition}`,
-      aheadBy: null,
-      branch: null,
-      defaultRef: null,
-      owner: null,
-      repo: null,
-      skipped: false,
-      skipReason: null,
-    };
-  }
+  // SUP-14878: the no-deliverable-head override is a HEAD-CHECK WAIVER, not a
+  // review-gate waiver. It is consumed after the mechanism C / A / D refusals
+  // below (see the block immediately before the linked-PR zone) so a disposition
+  // can no longer reach — and waive — a ladder this parent owes.
 
   // SUP-14446 mechanism C: fail closed on an unrun review ladder. This runs
   // before any GitHub/network path so an unsatisfied ladder can never be
@@ -1164,6 +1085,32 @@ export async function evaluateDoneTransitionGuard(
         "Add the missing review/approval stages to this issue's execution policy, or set " +
         `doneTransitionOverride to a sanctioned no-deliverable-head disposition ` +
         `(${[...NO_DELIVERABLE_HEAD_DISPOSITIONS].join(" / ")}).`,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
+
+  // SUP-14878: head-check waiver. A card that passed all three review gates
+  // above (or owes none) may still carry a no-deliverable-head disposition. It
+  // lands the close with an audit row and waives ONLY the linked-PR /
+  // branch-ahead checks that follow — those never run. Placing it here, after
+  // the mechanism C / A / D refusals, is the fix: the disposition is a waiver of
+  // the head check, and it can no longer reach (or waive) a ladder this parent
+  // owes (SUP-13724 §1). A card that owes a ladder was already refused above.
+  if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
+    void writeAuditLog(db, issue, "issue.done_transition_override", {
+      disposition: override.disposition,
+      overrideReason: override.reason ?? null,
+      source: "done_transition_guard",
+    });
+    return {
+      allowed: true,
+      reason: `Override accepted: ${override.disposition}`,
       aheadBy: null,
       branch: null,
       defaultRef: null,

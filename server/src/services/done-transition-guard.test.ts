@@ -420,36 +420,38 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
-    it("lets a sanctioned override land the close and records the ladder bypass with the authorising disposition (AC5)", async () => {
+    it("refuses the override against an unsatisfied review ladder: the disposition cannot waive mechanism C (AC5 / SUP-14878)", async () => {
       const result = await evaluateDoneTransitionGuard(
         mockDb,
         { ...issue, executionPolicy: ladderPolicy, executionState: {} },
         { disposition: "merged-elsewhere", reason: "PR merged on main by ops" },
       );
-      expect(result.allowed).toBe(true);
-      expect(result.reason).toContain("Override accepted: merged-elsewhere");
-      expect(result.reason).toContain("review ladder bypassed");
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Review ladder unsatisfied");
+      expect(result.reason).toContain("stage 1 of 3");
+      // Fail closed BEFORE any external probe: no GitHub call, no PR resolution.
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      // The refusal is mechanism C's — not an override.
       expect(logActivity).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
-          action: "issue.done_transition_override",
+          action: "issue.done_transition_ladder_refused",
           details: expect.objectContaining({
-            disposition: "merged-elsewhere",
-            overrideReason: "PR merged on main by ops",
-          }),
-        }),
-      );
-      expect(logActivity).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          action: "issue.done_transition_ladder_override",
-          details: expect.objectContaining({
-            disposition: "merged-elsewhere",
-            overrideReason: "PR merged on main by ops",
             reason: `review_ladder_unsatisfied:${stageA}`,
             unsatisfiedStageIds: [stageA, stageB, stageC],
           }),
         }),
+      );
+      // The head-check waiver receipt must NOT be written — the disposition
+      // never reached the head zone (SUP-13724 §1).
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_override" }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_override" }),
       );
     });
 
@@ -744,26 +746,39 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
-    it("lets a sanctioned override land the close and records the shape bypass with the authorising disposition (AC6)", async () => {
+    it("refuses the override against a shape-incomplete close ladder: the disposition cannot waive mechanism D (AC6 / SUP-14878)", async () => {
       setupDbMock({ issues: twoLadderedChildren, agents });
       const result = await evaluateDoneTransitionGuard(
         mockDb,
         { ...issue, parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
         { disposition: "merged-elsewhere", reason: "closed out by ops" },
       );
-      expect(result.allowed).toBe(true);
-      expect(result.reason).toContain("Override accepted: merged-elsewhere");
-      expect(result.reason).toContain("ADR-072 close-ladder shape bypassed");
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism D");
+      expect(result.reason).toContain("review:coder-LE");
+      expect(result.reason).toContain("approval:exec-CTO");
+      // Fail closed before any external probe: no GitHub call, no PR resolution.
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
       expect(logActivity).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
-          action: "issue.done_transition_ladder_shape_override",
+          action: "issue.done_transition_ladder_shape_refused",
           details: expect.objectContaining({
-            disposition: "merged-elsewhere",
-            overrideReason: "closed out by ops",
             missingStageLabels: ["review:coder-LE", "approval:exec-CTO"],
+            ladderedChildCount: 2,
           }),
         }),
+      );
+      // The head-check waiver receipt must NOT be written — the disposition
+      // never reached the head zone (SUP-13724 §1).
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_override" }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_override" }),
       );
     });
   });
@@ -890,34 +905,72 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
-    it("lets a sanctioned override land the close and records the mechanism-A bypass (AC5)", async () => {
+    it("refuses the override on a null-policy parent over laddered children: the disposition cannot waive mechanism A (AC5 / SUP-14878)", async () => {
       const f = mechanismACorpus.find((x) => x.identifier === "SUP-14023");
       expect(f).toBeDefined();
       setupDbMock({ issues: f!.children });
       const result = await evaluateDoneTransitionGuard(
         mockDb,
         fixtureIssue(f!),
-        { disposition: "merged-elsewhere", reason: "children merged; parent is the rollout record" },
+        { disposition: "child-delivery-parent-close", reason: "my children delivered this" },
       );
-      expect(result.allowed).toBe(true);
-      expect(result.reason).toContain("Override accepted: merged-elsewhere");
-      expect(result.reason).toContain("ungated decomposed-parent close bypassed");
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism A");
+      // Fail closed BEFORE any external probe: no GitHub call, no PR resolution.
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
       expect(logActivity).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
-          action: "issue.done_transition_override",
-          details: expect.objectContaining({ disposition: "merged-elsewhere" }),
-        }),
-      );
-      expect(logActivity).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          action: "issue.done_transition_null_policy_override",
+          action: "issue.done_transition_null_policy_refused",
           details: expect.objectContaining({
-            disposition: "merged-elsewhere",
+            reason: "ungated_decomposed_parent",
             ladderedChildCount: 3,
           }),
         }),
+      );
+      // The head-check waiver receipt must NOT be written — the disposition
+      // never reached the head zone (SUP-13724 §1).
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_override" }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_override" }),
+      );
+    });
+
+    it("refuses the child-delivery-parent-close override on a null-policy parent over 5 laddered children — the SUP-14668 shape (AC2 / SUP-14878)", async () => {
+      // SUP-14306 is the corpus entry whose parent closed exactly like SUP-14668:
+      // executionPolicy null, five children each running their own ladder. The
+      // disposition that SUP-14668 attached is precisely mechanism A's predicate.
+      const f = mechanismACorpus.find((x) => x.identifier === "SUP-14306");
+      expect(f).toBeDefined();
+      expect(f!.executionPolicy).toBeNull();
+      setupDbMock({ issues: f!.children });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        fixtureIssue(f!),
+        { disposition: "child-delivery-parent-close", reason: "child-delivery-parent-close" },
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism A");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_null_policy_refused",
+          details: expect.objectContaining({
+            reason: "ungated_decomposed_parent",
+            ladderedChildCount: 5,
+          }),
+        }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_override" }),
       );
     });
 
@@ -1482,6 +1535,37 @@ describe("evaluateDoneTransitionGuard", () => {
       const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
       expect(result.allowed).toBe(true);
       expect(result.reason).toContain("upstream-equivalent-fix-no-deliverable-head");
+    });
+
+    it("waives only the head check for a no-ladder card: child-delivery-parent-close closes over open linked PRs (SUP-12850/SUP-14470 shapes stay lawful, AC4 / SUP-14878)", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 274, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#274", cachedState: "open", lastErrorCode: null },
+      ]);
+      // No execution policy, no laddered children: mechanism A count=0,
+      // mechanism D not armed. The disposition reaches the head zone and waives
+      // the open-PR / branch-ahead checks — it is the disposition's only job now.
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: null, executionState: null },
+        { disposition: "child-delivery-parent-close", reason: "children merged; parent is the rollout record" },
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("Override accepted: child-delivery-parent-close");
+      // The head check was waived before any PR resolution or GitHub call.
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      // The waiver receipt IS written; no refusal audit row is.
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_override",
+          details: expect.objectContaining({ disposition: "child-delivery-parent-close" }),
+        }),
+      );
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
     });
   });
 
