@@ -829,8 +829,8 @@ function extractHeadEvidence(event: Record<string, unknown>): HeadEvidence | nul
 }
 
 type TimelineHeadEvents =
-  | { kind: "ok"; headAtApproval: string | null; sawCommittedHeadEvent: boolean }
-  | { kind: "truncated"; headAtApproval: string | null; sawCommittedHeadEvent: boolean }
+  | { kind: "ok"; headAtApproval: string | null; sawCommittedHeadEvent: boolean; sawPostApprovalForcePush: boolean }
+  | { kind: "truncated"; headAtApproval: string | null; sawCommittedHeadEvent: boolean; sawPostApprovalForcePush: boolean }
   | { kind: "failed"; detail: string }
   | { kind: "unparseable"; detail: string };
 
@@ -855,6 +855,7 @@ async function readPrTimelineHeadEvents(
 ): Promise<TimelineHeadEvents> {
   let headAtApproval: string | null = null;
   let sawCommittedHeadEvent = false;
+  let sawPostApprovalForcePush = false;
   let complete = false;
 
   outer: for (let page = 1; page <= MAX_BACKFILL_TIMELINE_PAGES; page++) {
@@ -894,6 +895,7 @@ async function readPrTimelineHeadEvents(
       if (info.timeMs <= cutoffMs) {
         headAtApproval = info.sha;
       } else {
+        sawPostApprovalForcePush = true;
         complete = true;
         break outer;
       }
@@ -905,8 +907,84 @@ async function readPrTimelineHeadEvents(
   }
 
   return complete
-    ? { kind: "ok", headAtApproval, sawCommittedHeadEvent }
-    : { kind: "truncated", headAtApproval, sawCommittedHeadEvent };
+    ? { kind: "ok", headAtApproval, sawCommittedHeadEvent, sawPostApprovalForcePush }
+    : { kind: "truncated", headAtApproval, sawCommittedHeadEvent, sawPostApprovalForcePush };
+}
+
+type ShaServerTimestampResult =
+  | { ok: true; minTimestampMs: number }
+  | { ok: false; detail: string };
+
+/**
+ * SUP-14844: read `/commits/{sha}/check-runs` and `/commits/{sha}/statuses`
+ * and return the minimum server timestamp (`started_at` / `created_at`) across
+ * both endpoints. This provides server-attested evidence that the sha existed
+ * at/before that time. A read failure (HTTP / network error) is reported as
+ * `ok: false` so the caller treats it as a transient skip rather than a
+ * deterministic refusal.
+ */
+async function readShaServerTimestamp(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  sha: string,
+): Promise<ShaServerTimestampResult> {
+  const checkRunsRead = await ghReadJson(
+    db,
+    companyId,
+    owner,
+    repo,
+    `/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`,
+  );
+  if (!checkRunsRead.ok) {
+    return { ok: false, detail: `check-runs-read-failed: HTTP ${checkRunsRead.status} ${checkRunsRead.message ?? ""}`.trim() };
+  }
+  const statusesRead = await ghReadJson(
+    db,
+    companyId,
+    owner,
+    repo,
+    `/commits/${encodeURIComponent(sha)}/statuses?per_page=100`,
+  );
+  if (!statusesRead.ok) {
+    return { ok: false, detail: `statuses-read-failed: HTTP ${statusesRead.status} ${statusesRead.message ?? ""}`.trim() };
+  }
+
+  let minTimestampMs: number | null = null;
+
+  const checkRunsBody = checkRunsRead.body as Record<string, unknown> | null;
+  const checkRuns = Array.isArray(checkRunsBody?.check_runs)
+    ? (checkRunsBody!.check_runs as Array<Record<string, unknown>>)
+    : [];
+  for (const run of checkRuns) {
+    const startedAt = typeof run.started_at === "string" ? run.started_at : null;
+    if (!startedAt) continue;
+    const ms = Date.parse(startedAt);
+    if (!Number.isNaN(ms) && (minTimestampMs === null || ms < minTimestampMs)) {
+      minTimestampMs = ms;
+    }
+  }
+
+  const statusesBody = Array.isArray(statusesRead.body)
+    ? (statusesRead.body as Array<Record<string, unknown>>)
+    : null;
+  if (statusesBody) {
+    for (const status of statusesBody) {
+      const createdAt = typeof status.created_at === "string" ? status.created_at : null;
+      if (!createdAt) continue;
+      const ms = Date.parse(createdAt);
+      if (!Number.isNaN(ms) && (minTimestampMs === null || ms < minTimestampMs)) {
+        minTimestampMs = ms;
+      }
+    }
+  }
+
+  if (minTimestampMs === null) {
+    return { ok: false, detail: "sha-server-timestamp: no check-runs or statuses found for the head sha" };
+  }
+
+  return { ok: true, minTimestampMs };
 }
 
 type BackfillOutcome =
@@ -1100,19 +1178,88 @@ async function backfillPreDBApprovalAnchor(
   }
 
   if (timeline.headAtApproval === null) {
-    const reason = timeline.sawCommittedHeadEvent
-      ? "backfill:head-unverifiable"
-      : "backfill:no-head-mutating-event";
-    const detail = timeline.sawCommittedHeadEvent
-      ? `backfill: ${target.displayName} shows only committed (client-timed) head events at or before the approval ${decision.createdAt.toISOString()} and no force-pushed (server-timed) head; the head-at-approval cannot be verified to a server timestamp; refusing to anchor an unverifiable head`
-      : `backfill: no committed / head_ref_force_pushed event at or before the approval time for ${target.displayName}; refusing to anchor an unverifiable head`;
-    await persistBackfillRefusal(db, row, {
-      reason,
-      observedHeadSha: currentHeadSha,
-      approvedAtMs: approvalTimeMs,
-      observedAt: new Date().toISOString(),
-    });
-    return { kind: "skipped", reason, detail };
+    if (!timeline.sawCommittedHeadEvent) {
+      const detail = `backfill: no committed / head_ref_force_pushed event at or before the approval time for ${target.displayName}; refusing to anchor an unverifiable head`;
+      await persistBackfillRefusal(db, row, {
+        reason: "backfill:no-head-mutating-event",
+        observedHeadSha: currentHeadSha,
+        approvedAtMs: approvalTimeMs,
+        observedAt: new Date().toISOString(),
+      });
+      return { kind: "skipped", reason: "backfill:no-head-mutating-event", detail };
+    }
+
+    if (timeline.sawPostApprovalForcePush) {
+      const detail = `backfill: ${target.displayName} shows a post-approval force-push event; the head-at-approval cannot be verified via sha existence (the push-A/push-B/force-push-back-to-A hole); refusing to anchor an unverifiable head`;
+      await persistBackfillRefusal(db, row, {
+        reason: "backfill:head-unverifiable",
+        observedHeadSha: currentHeadSha,
+        approvedAtMs: approvalTimeMs,
+        observedAt: new Date().toISOString(),
+      });
+      return { kind: "skipped", reason: "backfill:head-unverifiable", detail };
+    }
+
+    // SUP-14844: the timeline carries only committed (client-timed) head events
+    // at/before the approval — no force-push. Attempt the server-timed sha
+    // existence proof: if the live head sha has a check-run started_at or status
+    // created_at at/before the approval time, the sha provably existed at that
+    // time and no force-push moved it, so it was the head at approval.
+    const shaTimestamp = await readShaServerTimestamp(
+      db,
+      row.companyId,
+      target.owner,
+      target.repo,
+      currentHeadSha,
+    );
+    if (!shaTimestamp.ok) {
+      // A failed read is TRANSIENT — report a skip but do NOT persist, so the
+      // next tick retries (mirror the timeline-read-failed branch).
+      return {
+        kind: "skipped",
+        reason: "backfill:sha-existence-read-failed",
+        detail: `backfill: ${shaTimestamp.detail}; will retry on the next tick`,
+      };
+    }
+
+    if (shaTimestamp.minTimestampMs > approvalTimeMs) {
+      const detail = `backfill: ${target.displayName} head ${currentHeadSha.slice(0, 7)} has no server-timestamped evidence at or before the approval ${decision.createdAt.toISOString()} (earliest: ${new Date(shaTimestamp.minTimestampMs).toISOString()}); refusing to anchor an unverifiable head`;
+      await persistBackfillRefusal(db, row, {
+        reason: "backfill:head-unverifiable",
+        observedHeadSha: currentHeadSha,
+        approvedAtMs: approvalTimeMs,
+        observedAt: new Date().toISOString(),
+      });
+      return { kind: "skipped", reason: "backfill:head-unverifiable", detail };
+    }
+
+    // The sha has server-attested existence at/before the approval time, and no
+    // post-approval force-push moved it. Anchor and proceed to the first-publish
+    // path with enforceDeliveryIdentity (the same path a force-push-verified
+    // backfill uses).
+    const existingApprovalStatus =
+      ((row.executionState?.approvalStatus as Record<string, unknown> | null | undefined) ?? {});
+    const nextApprovalStatus: Record<string, unknown> = {
+      ...existingApprovalStatus,
+      approvedHeadSha: currentHeadSha,
+      approvedAt: decision.createdAt.toISOString(),
+    };
+    delete nextApprovalStatus.backfillRefusal;
+    const nextExecutionState: Record<string, unknown> = {
+      ...(row.executionState ?? {}),
+      approvalStatus: nextApprovalStatus,
+    };
+    await db
+      .update(issues)
+      .set({ executionState: nextExecutionState })
+      .where(eq(issues.id, row.id));
+    row.executionState = nextExecutionState;
+
+    return {
+      kind: "backfilled",
+      anchorHeadSha: currentHeadSha,
+      detail: `backfill: anchored ${currentHeadSha.slice(0, 7)} via server-timed sha existence (earliest ${new Date(shaTimestamp.minTimestampMs).toISOString()}) on the ${target.displayName} timeline (approved ${decision.createdAt.toISOString()})`,
+    };
   }
 
   if (timeline.headAtApproval !== currentHeadSha) {

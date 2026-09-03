@@ -72,6 +72,8 @@ const APPROVED_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compa
 const LIVE_DIFF_URL = `https://api.github.com/repos/TEA-Core/paperclip/compare/${BASE_SHA}...${NEW_HEAD}`;
 const COMMENT_LIST_URL = "https://api.github.com/repos/TEA-Core/paperclip/issues/42/comments?per_page=100&direction=desc";
 const COMMENT_POST_URL = "https://api.github.com/repos/TEA-Core/paperclip/issues/42/comments";
+const CHECK_RUNS_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/check-runs?per_page=100`;
+const STATUSES_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/statuses?per_page=100`;
 const CLOSED_43_BODY = { state: "closed", merged: false, head: { ref: "dup-branch", sha: "closed430000000000000000000000000000000000" }, base: { ref: "main", sha: BASE_SHA } };
 const MERGED_44_BODY = { state: "closed", merged: true, head: { ref: "dup-branch-44", sha: "merged440000000000000000000000000000000000" }, base: { ref: "main", sha: BASE_SHA } };
 const OPEN_43_BODY = { state: "open", merged: false, head: { ref: "dup-branch", sha: "open43000000000000000000000000000000000000" }, base: { ref: "main", sha: BASE_SHA } };
@@ -1748,7 +1750,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
-    it("refuses the backfill when the head is provable only through committed (client-timed) events, writing no anchor (SUP-14747 D-E, backfill-committed-event-timing)", async () => {
+    it("refuses the backfill when the head is provable only through committed (client-timed) events and the earliest server timestamp is after the approval, writing no anchor (SUP-14747 D-E, backfill-committed-event-timing)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
           approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
@@ -1762,6 +1764,11 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        {
+          url: CHECK_RUNS_URL,
+          body: { total_count: 1, check_runs: [{ started_at: "2026-08-20T01:00:00Z" }] },
+        },
+        { url: STATUSES_URL, body: [{ created_at: "2026-08-20T01:00:00Z" }] },
       ]);
 
       const summary = await runApprovalStatusReconcilerTick(db);
@@ -1810,6 +1817,99 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(approvalStatus.publishedHeadSha).toBeNull();
     });
 
+    it("anchors a never-force-pushed PR whose head has a check run started at/before the approval time (SUP-14844)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        {
+          url: CHECK_RUNS_URL,
+          body: { total_count: 1, check_runs: [{ started_at: "2026-08-19T12:00:00Z" }] },
+        },
+        { url: STATUSES_URL, body: [{ created_at: "2026-08-19T14:00:00Z" }] },
+        { url: POST_STATUS_URL, body: { id: 12348 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(summary.backfilled).toBe(1);
+      expect(Object.keys(summary.skipped)).toEqual([]);
+      expect(postStatusCalls()).toHaveLength(1);
+      expect(postStatusBodies()[0]).toMatchObject({ state: "success", context: PAPERCLIP_APPROVED });
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBe(NEW_HEAD);
+      expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
+    });
+
+    it("reports a transient skip and does not persist when check-runs read fails (SUP-14844)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        { url: CHECK_RUNS_URL, body: {}, ok: false, status: 500 },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["backfill:sha-existence-read-failed"]).toBe(1);
+      expect(summary.backfilled).toBe(0);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      expect(approvalStatus.backfillRefusal).toBeUndefined();
+    });
+
+    it("anchors via status created_at when check-runs have no timestamps (SUP-14844)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { approvedHeadSha: null, publishedHeadSha: null },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        { url: CHECK_RUNS_URL, body: { total_count: 0, check_runs: [] } },
+        { url: STATUSES_URL, body: [{ created_at: "2026-08-19T23:00:00Z" }] },
+        { url: POST_STATUS_URL, body: { id: 12348 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(summary.backfilled).toBe(1);
+      expect(postStatusCalls()).toHaveLength(1);
+    });
+
     it("skips the timeline re-read on a stable refusal while the live head is unchanged (SUP-14747 D-E, backfill-repeat-fanout)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
@@ -1824,6 +1924,11 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         { url: PR_URL, body: OPEN_PR_BODY },
         { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
         { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        {
+          url: CHECK_RUNS_URL,
+          body: { total_count: 1, check_runs: [{ started_at: "2026-08-20T01:00:00Z" }] },
+        },
+        { url: STATUSES_URL, body: [{ created_at: "2026-08-20T01:00:00Z" }] },
       ]);
 
       const timelineCalls = () =>
