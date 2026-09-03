@@ -16,6 +16,8 @@ export type PullRequestMergeDetails = {
   headSha: string | null;
   mergedAt?: string | null;
   mergeCommitSha?: string | null;
+  additions?: number | null;
+  deletions?: number | null;
 };
 
 export type PullRequestMergeStateResolver = (
@@ -105,6 +107,8 @@ export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeD
       headSha: typeof data?.headSha === "string" ? data.headSha : null,
       mergedAt: typeof data?.merged_at === "string" ? data.merged_at : null,
       mergeCommitSha: typeof data?.merge_commit_sha === "string" ? data.merge_commit_sha : null,
+      additions: typeof data?.additions === "number" ? data.additions : null,
+      deletions: typeof data?.deletions === "number" ? data.deletions : null,
     };
   };
 }

@@ -141,6 +141,29 @@ function openMetadata(input: PrDeliveryInput): Record<string, unknown> {
   };
 }
 
+/**
+ * Build the delivered-LOC metadata patch for a `pull_request` work product that
+ * just merged (SUP-14813). GitHub reports `additions`/`deletions` on the PR and
+ * net LOC is their difference. This is observability, not enforcement: it
+ * records what shipped so the human/CEO LOC judgement has a feedback signal, and
+ * adds no gate, cap, or validation on the number.
+ *
+ * Absent measurements record nothing (never a `0`): a missing measurement and a
+ * genuine zero-diff must stay distinguishable, so `0` is only ever written when
+ * GitHub actually reported `0`.
+ */
+function deliveredLocMetadata(
+  additions: number | null | undefined,
+  deletions: number | null | undefined,
+): Record<string, unknown> {
+  if (additions == null || deletions == null) return {};
+  return {
+    additions,
+    deletions,
+    deliveredNetLoc: additions - deletions,
+  };
+}
+
 // The merge sweep re-resolves open delivery PRs against GitHub on the heartbeat
 // tick (30s cadence). This cooldown caps the live re-resolution to once per row
 // in the window, so a long-open PR does not hammer the GitHub API every tick.
@@ -335,6 +358,7 @@ export function prDeliveryService(
             ...((existing.metadata as Record<string, unknown> | null) ?? {}),
             ...(mergedAt ? { mergedAt } : {}),
             ...(mergeCommitSha ? { mergeCommitSha } : {}),
+            ...deliveredLocMetadata(details.additions, details.deletions),
           };
           await tx
             .update(issueWorkProducts)
@@ -524,6 +548,7 @@ export function prDeliveryService(
         if (details.state === "merged") {
           if (details.mergedAt) nextMetadata.mergedAt = details.mergedAt;
           if (details.mergeCommitSha) nextMetadata.mergeCommitSha = details.mergeCommitSha;
+          Object.assign(nextMetadata, deliveredLocMetadata(details.additions, details.deletions));
           await db
             .update(issueWorkProducts)
             .set({ status: "merged", metadata: nextMetadata, updatedAt: new Date(now) })
