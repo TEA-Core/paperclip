@@ -3,6 +3,23 @@ title: AWS ECS Fargate
 summary: Deploy Paperclip to AWS using ECS Fargate, RDS Postgres, and EFS
 ---
 
+> **This file is product documentation, not this fork's control plane.**
+> It describes how a user deploys their own Paperclip to *their* AWS account
+> (ECS Fargate + ECR + RDS + EFS). It is **not** how the Paperclip fork's own
+> control plane is rolled. The fork's control plane is a Docker Compose stack
+> on the intranet host `wonton` (10.10.10.3, `paperclip.internal`), rolled by
+> `~/stack-admin/paperclip-docker/scripts/deploy-image.sh`. It has no AWS
+> infrastructure: no ECR repository, no ECS cluster, no ECS service.
+>
+> **Agents: do not source control-plane rollout or operator cards from this
+> file.** The `docker push` + `aws ecs update-service --force-new-deployment`
+> block under "Deploying Updates" is the exact text that was copied into the
+> operator cards SUP-14768, SUP-14774 and SUP-14823 (see SUP-14864). For how
+> the fork's own plane is actually rolled, use
+> [`control-plane-rollout.md`](control-plane-rollout.md). A control-plane roll
+> card should name `deploy-image.sh` on wonton, or name no mechanism at all —
+> never ECR/ECS.
+
 Deploy Paperclip to AWS with ECS Fargate (compute), RDS Postgres 17 (database), and EFS (persistent storage). This guide uses the AWS CLI and produces a single-task ECS service behind an ALB with HTTPS.
 
 ## Prerequisites
