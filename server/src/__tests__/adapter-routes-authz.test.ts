@@ -238,7 +238,10 @@ function resetInstalledExternalAdapterState() {
 describe.sequential("adapter management route authorization", () => {
   beforeEach(async () => {
     vi.resetModules();
-    vi.doUnmock("node:child_process");
+    // node:child_process stays mocked for the whole file (its vi.mock at the
+    // top never gets unmocked here). Unmocking it each beforeEach lets vitest's
+    // pending mock-action queue briefly leave the builtin real while the route
+    // graph evaluates, so install binds the real execFile and spawns npm.
     vi.doUnmock("../services/adapter-plugin-store.js");
     vi.doUnmock("../adapters/plugin-loader.js");
     vi.doUnmock("../routes/adapters.js");
@@ -248,11 +251,19 @@ describe.sequential("adapter management route authorization", () => {
     registerRouteMocks();
     vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
 
-    const [routes, middleware, registry] = await Promise.all([
-      vi.importActual<typeof import("../routes/adapters.js")>("../routes/adapters.js"),
-      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-      vi.importActual<typeof import("../adapters/registry.js")>("../adapters/registry.js"),
-    ]);
+    // Load the real modules one at a time: doUnmock/doMock only queue actions
+    // into a shared pending list vitest drains on the next module fetch. Three
+    // concurrent importActual fetches (Promise.all) can drain it in parallel and
+    // apply an unmock after a mock; serial fetches drain it once, in order.
+    const registry = await vi.importActual<typeof import("../adapters/registry.js")>(
+      "../adapters/registry.js",
+    );
+    const middleware = await vi.importActual<typeof import("../middleware/index.js")>(
+      "../middleware/index.js",
+    );
+    const routes = await vi.importActual<typeof import("../routes/adapters.js")>(
+      "../routes/adapters.js",
+    );
     adapterRoutes = routes.adapterRoutes;
     errorHandler = middleware.errorHandler;
     registerServerAdapter = registry.registerServerAdapter;
