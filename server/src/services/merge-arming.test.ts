@@ -816,6 +816,85 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       );
     });
 
+    // SUP-14824 F1: the recorded identity names a SIBLING repo. The repo half is
+    // always the card's project repo (a control-plane fact), never the record's —
+    // so a recorded repo that differs from the project repo is unusable and both
+    // stamp paths fail closed. This is the D5-axis gap the original card missed.
+    it("fails closed when the recorded repo does not match the card's project repo (F1)", async () => {
+      const issueId = await insertIssue();
+      await db.update(issues).set({
+        executionState: {
+          delivery: {
+            repo: { owner: "OTHER", repo: "other-repo" },
+            branch: "RECORDED-BRANCH",
+            headSha: "aaa111bbb222ccc333ddd444eee555fff6660000",
+            recordedByRunId: randomUUID(),
+            recordedAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      }).where(eq(issues.id, issueId));
+      // A PR cited in that sibling repo (the laundering shape). The recorded repo
+      // disagrees with the project-bound repo, so the identity is unusable before
+      // the PR is ever matched.
+      await insertMention(issueId, { number: 42, headRefName: "RECORDED-BRANCH", owner: "OTHER", repo: "other-repo" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          "delivery_identity_unresolved: recorded delivery identity's repo does not match this card's project repo; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+        );
+      }
+    });
+
+    it("surfaces the recorded-repo-mismatch reason from publishApprovalStatus (F1)", async () => {
+      const issueId = await insertIssue();
+      await db.update(issues).set({
+        executionState: {
+          delivery: {
+            repo: { owner: "OTHER", repo: "other-repo" },
+            branch: "RECORDED-BRANCH",
+            headSha: "sha",
+            recordedByRunId: randomUUID(),
+            recordedAt: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      }).where(eq(issues.id, issueId));
+      await insertMention(issueId, { number: 42, headRefName: "RECORDED-BRANCH", owner: "OTHER", repo: "other-repo" });
+      installRoutes([]);
+
+      const outcome = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        enforceDeliveryIdentity: true,
+      });
+      expect(outcome.kind).toBe("skipped");
+      expect(outcome.message).toBe(
+        "status:skipped:delivery_identity_unresolved: recorded delivery identity's repo does not match this card's project repo; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+      );
+    });
+
+    // SUP-14824 F3: a recorded identity that is present but NOT an object (e.g. a
+    // string) is the record being unusable — it fails closed instead of silently
+    // falling back to the workspace row.
+    it("fails closed when the recorded identity is present but not an object (F3)", async () => {
+      const issueId = await insertIssue();
+      await db.update(issues).set({
+        executionState: {
+          delivery: "not-an-object",
+        },
+      }).where(eq(issues.id, issueId));
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      installRoutes([]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe(
+          "delivery_identity_unresolved: recorded delivery identity is not a usable object; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+        );
+      }
+    });
+
     // AC2: byte-identical regression — pin the existing refusal strings when
     // no recorded identity is present.
     it("byte-identical: isolated-workspace match resolves the delivered PR", async () => {
