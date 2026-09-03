@@ -182,6 +182,39 @@ export function issueRecoveryActionService(db: Db) {
     return row ? toReadModel(row) : null;
   }
 
+  // ADR-093 D2: `getActiveForIssue` counts BOTH `active` and `escalated` rows
+  // because the re-entrancy guard, attempt-ceiling lookups, and the board sweep
+  // all need to see an escalated action (it is still "in flight" for those
+  // purposes). The continuation-path disjunct, however, asks a different
+  // question: "is there a *live* recovery ladder that will actually run?" An
+  // action that has exhausted its handoff ceiling and escalated to the board
+  // (`status: 'escalated'`, `ownerType: 'board'`, `ownerAgentId: null`) is the
+  // opposite of live — the ladder is dead and parked on a human. Filtering on
+  // `active` only is what keeps an escalated action from masquerading as a live
+  // continuation path (the SUP-14761 defect). This reader is deliberately a
+  // second reader, not a narrowing of `ACTIVE_RECOVERY_ACTION_STATUSES`, so the
+  // write-path guard and sweep keep seeing escalated rows.
+  async function getLiveContinuationForIssue(
+    companyId: string,
+    sourceIssueId: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const row = await dbOrTx
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          eq(issueRecoveryActions.status, "active"),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return row ? toReadModel(row) : null;
+  }
+
   async function getLatestResolvedForIssue(
     companyId: string,
     sourceIssueId: string,
@@ -552,6 +585,7 @@ export function issueRecoveryActionService(db: Db) {
 
   return {
     getActiveForIssue,
+    getLiveContinuationForIssue,
     getLatestResolvedForIssue,
     getLatestForFingerprint,
     listActiveForIssues,
