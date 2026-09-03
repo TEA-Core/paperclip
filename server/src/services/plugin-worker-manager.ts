@@ -1779,6 +1779,10 @@ export function createPluginWorkerHandle(
   interface HeldDuplexExitEvent {
     workerSessionId: string;
     exitCode: number | null;
+    // A reason-less transport close carries this discriminator to the wait. The
+    // pre-bind hold must retain it, so an exit held before the bind replays with
+    // the same result the post-bind path produces.
+    transportClosed: boolean;
   }
 
   interface DuplexChannelRoute {
@@ -2181,9 +2185,15 @@ export function createPluginWorkerHandle(
     }
     if (notification.method === DUPLEX_CHANNEL_EXIT_NOTIFICATION) {
       // Normalize the exit to the narrow duplex-event schema. A replaced exit
-      // simply overwrites the earlier held exit.
+      // simply overwrites the earlier held exit. Keep the transport-close
+      // discriminator, so the replay settles the wait with the same result the
+      // post-bind path would.
       const exitCode = typeof params.exitCode === "number" ? params.exitCode : null;
-      route.preBindExit = { workerSessionId, exitCode };
+      route.preBindExit = {
+        workerSessionId,
+        exitCode,
+        transportClosed: params.transportClosed === true,
+      };
       return;
     }
     // A data event. Validate and normalize it to the narrow duplex-event schema
@@ -2244,14 +2254,18 @@ export function createPluginWorkerHandle(
     if (heldExit) {
       // Resolve the wait through the exact-pair routing when the route still lives.
       if (!route.terminalized) {
+        const exitParams: Record<string, unknown> = {
+          hostRouteId: route.hostRouteId,
+          workerSessionId: heldExit.workerSessionId,
+          exitCode: heldExit.exitCode,
+        };
+        // Re-carry the transport-close discriminator the hold retained, so the
+        // replayed exit settles the wait with the same result the live path does.
+        if (heldExit.transportClosed) exitParams.transportClosed = true;
         routeDuplexChannelExit({
           jsonrpc: "2.0",
           method: DUPLEX_CHANNEL_EXIT_NOTIFICATION,
-          params: {
-            hostRouteId: route.hostRouteId,
-            workerSessionId: heldExit.workerSessionId,
-            exitCode: heldExit.exitCode,
-          },
+          params: exitParams,
         });
       }
     }
