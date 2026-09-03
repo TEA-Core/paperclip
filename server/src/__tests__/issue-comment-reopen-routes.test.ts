@@ -96,6 +96,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
 }));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
+  getLiveContinuationForIssue: vi.fn(async () => null),
 }));
 const mockIssueTreeControlService = vi.hoisted(() => ({
   getActivePauseHoldGate: vi.fn(async () => null),
@@ -320,6 +321,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockRoutineService.syncRunStatusForIssue.mockReset();
     mockIssueThreadInteractionService.listForIssue.mockReset();
     mockIssueRecoveryActionService.getActiveForIssue.mockReset();
+    mockIssueRecoveryActionService.getLiveContinuationForIssue.mockReset();
     mockIssueTreeControlService.getActivePauseHoldGate.mockReset();
     mockExternalObjectService.syncCommentSafely.mockReset();
     mockExternalObjectService.syncIssueSafely.mockReset();
@@ -386,6 +388,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockIssueRecoveryActionService.getLiveContinuationForIssue.mockResolvedValue(null);
     mockIssueTreeControlService.getActivePauseHoldGate.mockResolvedValue(null);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-1",
@@ -4045,7 +4048,7 @@ describe.sequential("issue comment reopen routes", () => {
       const issue = makeIssue("todo");
       mockIssueService.getById.mockResolvedValue(issue);
       mockRunningReceipt(issue);
-      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      mockIssueRecoveryActionService.getLiveContinuationForIssue.mockResolvedValue({
         id: "recovery-1",
         state: "active",
       });
