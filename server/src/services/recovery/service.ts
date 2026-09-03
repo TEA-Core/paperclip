@@ -7601,13 +7601,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               continue;
             }
           }
-          const resolvedAction = existingAction
+          const existingActionIsBwob = existingAction?.kind === "blocked_without_blockers";
+          const resolvedAction = existingActionIsBwob
             ? null
             : await recoveryActionsSvc.getLatestResolvedForIssue(companyId, candidate.id, "blocked_without_blockers");
           const healAttemptCount =
-            (existingAction?.evidence?.healAttemptCount as number | undefined) ??
-            (resolvedAction?.evidence?.healAttemptCount as number | undefined) ??
-            0;
+            (existingActionIsBwob
+              ? (existingAction?.evidence?.healAttemptCount as number | undefined)
+              : (resolvedAction?.evidence?.healAttemptCount as number | undefined)) ?? 0;
           const isAtCeiling = healAttemptCount >= MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
           if (!isAtCeiling) {
             const nextHealAttemptCount = healAttemptCount + 1;
