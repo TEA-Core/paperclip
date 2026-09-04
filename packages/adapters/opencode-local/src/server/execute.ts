@@ -459,7 +459,12 @@ export type OpenCodeSessionResumeDecision =
   | {
       resume: false;
       sessionId: string | null;
-      reason: "no_session" | "unknown_cwd" | "cwd_mismatch" | "execution_target_mismatch";
+      reason:
+        | "no_session"
+        | "unknown_cwd"
+        | "cwd_mismatch"
+        | "execution_target_mismatch"
+        | "session_too_large";
     };
 
 // `opencode run --session <s> --dir <d>` hangs forever when <d> is not the
@@ -474,11 +479,130 @@ export type OpenCodeSessionResumeDecision =
 // and resuming those into whatever workspace resolution picked is exactly how
 // the hang was reached. A fresh session that works beats a resumed session that
 // hangs.
+// SUP-14964: bound cross-run session reuse by the size of the session's replayed
+// transcript. opencode assembles every resumed run's prompt from the session's
+// accumulated messages, so a session that keeps growing monotonically across runs
+// eventually sends a prompt past the router's context ceiling and hard-fails
+// (503 no_eligible_rung -> opencode_exit_1, zero tokens). Nothing else bounds the
+// transcript: the per-agent database is deliberately kept (see the per-agent
+// partitioning note above resolveOpenCodeDatabaseFile), and the db-guard's 256 MB
+// per-run GROWTH limit is ~61x larger than the ~4.2 MB prompt that already
+// exceeded the ceiling on the first failing run, so it cannot fire first.
+// Starting a fresh session instead of resuming an oversized one is the cheap
+// lever that is fully in our control; transcript compaction is a separate, larger
+// design and out of scope here.
+//
+// Measured mapping (recorded BEFORE choosing the threshold):
+//   * Live router (07953a7d, SUP-14904): 4,194,304 prompt chars -> 932,158
+//     prompt_tokens (200 OK); 5,200,000 chars -> 503 no_eligible_rung. That is
+//     4.50 chars/token (0.22223 tokens/char).
+//   * Local per-agent opencode DB, 3 largest sessions:
+//     SUM(LENGTH(part.data)) + SUM(LENGTH(message.data)) equals 1.01-1.02x the
+//     reconstructed text length, i.e. the stored transcript bytes are ~1:1 with
+//     the prompt chars and slightly overstate them (the safe direction for a
+//     guard). The `event` table is the full-snapshot stream opencode rewrites per
+//     delta; it never re-enters the prompt, so it is deliberately excluded.
+//   * Route ceiling: both coder-le-default rungs declare maxContextTokens =
+//     1,048,576.
+//
+// The byte value that maps to the ceiling exactly is 1,048,576 / 0.22223 =
+// 4,718,400. The default cap of 4,000,000 bytes therefore holds the estimated
+// resumed prompt at ~888,920 tokens, ~159,656 tokens (~15.2%) under the ceiling --
+// headroom that also covers the fixed system prompt, tool definitions, and the
+// new wake payload that ride along with the transcript.
+const DEFAULT_OPENCODE_SESSION_RESUME_MAX_BYTES = 4_000_000;
+
+/**
+ * Byte cap on a session's replayed transcript for cross-run resume.
+ * `PAPERCLIP_OPENCODE_SESSION_MAX_BYTES` overrides it; a non-positive value
+ * disables the size gate entirely (resume on a valid same-cwd session, as before
+ * this change). A malformed value falls back to the default rather than
+ * silently disabling the gate.
+ */
+export function resolveOpenCodeSessionResumeMaxBytes(input: {
+  env: Record<string, string>;
+  processEnv?: NodeJS.ProcessEnv;
+}): number {
+  const processEnv = input.processEnv ?? process.env;
+  const raw = (
+    typeof input.env.PAPERCLIP_OPENCODE_SESSION_MAX_BYTES === "string"
+      ? input.env.PAPERCLIP_OPENCODE_SESSION_MAX_BYTES
+      : processEnv.PAPERCLIP_OPENCODE_SESSION_MAX_BYTES ?? ""
+  ).trim();
+  if (raw.length === 0) return DEFAULT_OPENCODE_SESSION_RESUME_MAX_BYTES;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return DEFAULT_OPENCODE_SESSION_RESUME_MAX_BYTES;
+  if (parsed <= 0) return 0;
+  return Math.floor(parsed);
+}
+
+/**
+ * On-disk bytes of one opencode session's replayed transcript: its message parts
+ * plus its message rows. This is what opencode re-sends into the next resumed
+ * prompt, so it is the size the router's context ceiling actually constrains.
+ *
+ * Read-only and deliberately tolerant, exactly like db-guard's per-session
+ * accounting: a schema that does not match, a database that cannot be opened, or
+ * a missing driver all return null, and the caller falls back to the unbounded
+ * resume behaviour rather than to a wrong number.
+ */
+export async function measureOpenCodeSessionTranscriptBytes(
+  databasePath: string,
+  sessionId: string,
+): Promise<number | null> {
+  if (sessionId.trim().length === 0) return null;
+  try {
+    const sqlite = (await import("node:sqlite")) as unknown as {
+      DatabaseSync: new (
+        path: string,
+        options?: { readOnly?: boolean },
+      ) => {
+        prepare: (sql: string) => { get: (...params: unknown[]) => Record<string, unknown> | undefined };
+        close: () => void;
+      };
+    };
+    const db = new sqlite.DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const readSum = (sql: string) => {
+        const row = db.prepare(sql).get(sessionId);
+        const value = row?.bytes;
+        if (typeof value === "bigint") return Number(value);
+        return typeof value === "number" && Number.isFinite(value) ? value : 0;
+      };
+      // The replayed transcript is the session's messages and their parts. The
+      // `event` snapshot stream (which db-guard's growth accounting sums) is
+      // deliberately excluded: it is full-snapshot data opencode rewrites per
+      // delta and it never re-enters the resumed prompt, so including it would
+      // overstate the prompt ~2x and start fresh sessions far too early.
+      return (
+        readSum("SELECT SUM(LENGTH(data)) AS bytes FROM part WHERE session_id = ?") +
+        readSum("SELECT SUM(LENGTH(data)) AS bytes FROM message WHERE session_id = ?")
+      );
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
 export function resolveOpenCodeSessionResume(input: {
   sessionId: string;
   sessionCwd: string;
   executionCwd: string;
   executionTargetMatches: boolean;
+  /**
+   * Measured bytes of the session's replayed transcript (see
+   * measureOpenCodeSessionTranscriptBytes). null/undefined = not measured, which
+   * skips the size gate so the session behaves exactly as it did before this
+   * change.
+   */
+  sessionTranscriptBytes?: number | null;
+  /**
+   * Byte cap for sessionTranscriptBytes; a value of 0 disables the gate. Defaults
+   * to DEFAULT_OPENCODE_SESSION_RESUME_MAX_BYTES when omitted.
+   */
+  maxSessionTranscriptBytes?: number;
 }): OpenCodeSessionResumeDecision {
   if (input.sessionId.length === 0) {
     return { resume: false, sessionId: null, reason: "no_session" };
@@ -491,6 +615,20 @@ export function resolveOpenCodeSessionResume(input: {
   }
   if (path.resolve(input.sessionCwd) !== path.resolve(input.executionCwd)) {
     return { resume: false, sessionId: input.sessionId, reason: "cwd_mismatch" };
+  }
+  // SUP-14964: last gate. Only reached when every hard correctness check above
+  // passed and the session would otherwise resume. Declining an oversized
+  // session here starts a fresh one instead of resuming into a prompt the router
+  // cannot serve.
+  const maxBytes = input.maxSessionTranscriptBytes ?? DEFAULT_OPENCODE_SESSION_RESUME_MAX_BYTES;
+  const transcriptBytes = input.sessionTranscriptBytes;
+  if (
+    typeof transcriptBytes === "number" &&
+    Number.isFinite(transcriptBytes) &&
+    maxBytes > 0 &&
+    transcriptBytes > maxBytes
+  ) {
+    return { resume: false, sessionId: input.sessionId, reason: "session_too_large" };
   }
   return { resume: true, sessionId: input.sessionId };
 }
@@ -831,6 +969,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
     const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
     const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
+    // SUP-14964: measure the session's replayed transcript BEFORE deciding to
+    // resume, so an oversized session drops to a fresh session instead of
+    // resuming into a prompt the router cannot serve. Only measurable on the
+    // per-agent database this adapter set up itself on a local target; on the
+    // shared DB or a remote target the size is unknown and the gate is skipped,
+    // preserving the previous resume behaviour.
+    const sessionResumeMaxBytes = resolveOpenCodeSessionResumeMaxBytes({ env: runtimeEnv });
+    let sessionTranscriptBytes: number | null = null;
+    if (runtimeSessionId && openCodeDatabaseFile && !executionTargetIsRemote) {
+      const sessionTranscriptDbPath = resolveOpenCodeDatabasePath({
+        databaseFile: openCodeDatabaseFile,
+        env: runtimeEnv,
+      });
+      if (sessionTranscriptDbPath) {
+        sessionTranscriptBytes = await measureOpenCodeSessionTranscriptBytes(
+          sessionTranscriptDbPath,
+          runtimeSessionId,
+        );
+      }
+    }
     const resumeDecision = resolveOpenCodeSessionResume({
       sessionId: runtimeSessionId,
       sessionCwd: runtimeSessionCwd,
@@ -839,6 +997,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runtimeRemoteExecution,
         runtimeExecutionTarget,
       ),
+      sessionTranscriptBytes,
+      maxSessionTranscriptBytes: sessionResumeMaxBytes,
     });
     const sessionId = resumeDecision.resume ? resumeDecision.sessionId : null;
     if (!resumeDecision.resume && resumeDecision.reason === "execution_target_mismatch") {
@@ -855,6 +1015,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await onLog(
         "stdout",
         `[paperclip] OpenCode session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
+      );
+    } else if (!resumeDecision.resume && resumeDecision.reason === "session_too_large") {
+      // SUP-14964: make the size-based fresh-session start observable in the run
+      // record so it is never silently indistinguishable from a lost session.
+      await onLog(
+        "stdout",
+        `[paperclip] OpenCode session "${runtimeSessionId}" replayed transcript is ${formatBytes(sessionTranscriptBytes ?? 0)}, above the ${formatBytes(sessionResumeMaxBytes)} resume cap, so resuming it would push the prompt past the router's context ceiling. Not resuming; starting a fresh session.\n`,
       );
     }
     const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
