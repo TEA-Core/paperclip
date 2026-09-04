@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 
 const execFileAsync = promisify(execFile);
 
@@ -331,18 +332,31 @@ Options:
 `);
 }
 
-async function resolveGitHubToken(): Promise<string> {
-  const envToken = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  if (envToken) {
-    return envToken;
-  }
+export type TokenCommandRunner = (
+  file: string,
+  args: string[],
+  options?: Parameters<typeof execFileAsync>[2],
+) => Promise<{ stdout: string; stderr: string }>;
 
-  const { stdout } = await execFileAsync("gh", ["auth", "token"]);
-  const token = stdout.trim();
-  if (!token) {
-    throw new Error("Unable to resolve a GitHub token. Set GITHUB_TOKEN/GH_TOKEN or run `gh auth login`.");
+const defaultTokenCommandRunner: TokenCommandRunner = (file, args, options) =>
+  execFileAsync(file, args, { ...options, encoding: "utf8" });
+
+export async function resolveGitHubToken(
+  runCommand: TokenCommandRunner = defaultTokenCommandRunner,
+): Promise<string> {
+  let ghToken = "";
+  try {
+    const { stdout } = await runCommand("gh", ["auth", "token"]);
+    ghToken = stdout.trim();
+  } catch {
+    ghToken = "";
   }
-  return token;
+  if (ghToken) return ghToken;
+
+  const envToken = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  if (envToken) return envToken;
+
+  throw new Error("Unable to resolve a GitHub token. Set GITHUB_TOKEN/GH_TOKEN or run `gh auth login`.");
 }
 
 async function loadCache(cacheFile: string, options: CliOptions): Promise<CacheFile> {
@@ -866,7 +880,14 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+const isDirectRun =
+  typeof process.argv[1] === "string" &&
+  process.argv[1].length > 0 &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}

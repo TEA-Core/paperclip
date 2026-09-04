@@ -137,15 +137,27 @@ export function resolveGitInstallRequest(options: InstallOptions): { repo: strin
   return { repo, ref, pinned: /^[0-9a-f]{7,40}$/i.test(ref) };
 }
 
+async function resolveGitHubCurlToken(runCommand: CommandRunner): Promise<string | undefined> {
+  try {
+    const { stdout } = await runCommand("gh", ["auth", "token"]);
+    const ghToken = stdout.trim();
+    if (ghToken) return ghToken;
+  } catch {
+    // gh is unavailable or logged out; fall back to an ambient token.
+  }
+  return process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+}
+
 async function runGitHubCurl(
   args: string[],
   runCommand: CommandRunner,
   options?: Parameters<CommandRunner>[2],
 ): Promise<{ stdout: string; stderr: string }> {
   // Anonymous GitHub requests are rate-limited per source IP (CI runners and
-  // corporate NAT exhaust the shared quota); honor an ambient token when present.
+  // corporate NAT exhaust the shared quota); prefer the gh credential (the App
+  // broker inside an agent run) and honor an ambient token as a fallback.
   // The token travels via a curl --config file so it never appears in process args.
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+  const token = await resolveGitHubCurlToken(runCommand);
   if (!token) return runCommand("curl", args, options);
   const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclipai-gh-"));
   const configFile = path.join(configDir, "headers");

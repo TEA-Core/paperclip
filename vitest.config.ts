@@ -23,6 +23,7 @@ export default defineConfig({
       "server",
       "ui",
       "cli",
+      "scripts",
     ],
   },
 });
