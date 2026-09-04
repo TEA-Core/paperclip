@@ -803,7 +803,7 @@ export async function fetchGitHubNodeId(
   return { ok: true, status: response.status, message: null, nodeId };
 }
 
-async function enableAutoMerge(
+export async function enableAutoMerge(
   token: string,
   nodeId: string,
 ): Promise<{ success: boolean; alreadyQueued: boolean; error: string | null; status: number }> {

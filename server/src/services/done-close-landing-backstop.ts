@@ -1,11 +1,15 @@
 import { and, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, issues } from "@paperclipai/db";
+import { activityLog, companies, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
 import {
+  enableAutoMerge,
+  fetchGitHubNodeId,
+  isGitHubTokenResolution,
   resolveCardPullRequest,
+  resolveGitHubTokenForRepo,
   resolveLinkedPullRequestsWithState,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
@@ -42,6 +46,8 @@ const DEFAULT_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 export const DONE_CLOSE_LANDING_ACTOR_ID = "system:done-close-landing-backstop";
 export const DONE_CLOSE_LANDING_CONFIRMED_ACTION = "issue.done_close_landing_confirmed";
 export const DONE_CLOSE_LANDING_FAILED_ACTION = "issue.done_close_landing_failed";
+export const DONE_CLOSE_LANDING_REENQUEUED_ACTION = "issue.done_close_landing_reenqueued";
+export const DONE_CLOSE_LANDING_ESCALATED_ACTION = "issue.done_close_landing_escalated";
 const DECISION_CARRIED_SKIP_REASON_PREFIX = "open_linked_prs_decision_carried:";
 const SKIPPED_ACTION = "issue.done_transition_guard_skipped";
 
@@ -72,6 +78,8 @@ export interface DoneCloseLandingSweepResult {
   confirmed: number;
   failed: number;
   deferred: number;
+  reenqueued: number;
+  escalated: number;
 }
 
 export type MeasuredPullRequestState = "merged" | "closed" | "open";
@@ -94,6 +102,8 @@ interface SweepCounts {
   confirmed: number;
   failed: number;
   deferred: number;
+  reenqueued: number;
+  escalated: number;
 }
 
 function readMsEnv(name: string, fallbackMs: number): number {
@@ -111,6 +121,89 @@ function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+/**
+ * Build (but do not execute) the discovery query for done cards whose linked PR
+ * may not have landed. Extracted so the exact WHERE predicate can be asserted in
+ * isolation (AC1) rather than only through an injected candidate set.
+ *
+ * Two candidate sources, both first-class activity rows:
+ *   1. decision-carried close: `issue.done_transition_guard_skipped` whose
+ *      `details->>'reason'` carries the `open_linked_prs_decision_carried:`
+ *      prefix (SUP-13352). The guard writes this row on a decision-carrying close
+ *      with an open linked PR regardless of `mergeArmingEnabled`, so a
+ *      never-armed card still produces it (SUP-14959/#514 carries exactly this row).
+ *   2. arming refusal on close (SUP-14900): `issue.merge_arming_refused_on_close`.
+ */
+export function buildDiscoveryQuery(db: Db, windowStart: Date, graceCutoff: Date) {
+  const issueIdAsText = sql<string>`${issues.id}::text`;
+  return db
+    .select({
+      details: activityLog.details,
+      createdAt: activityLog.createdAt,
+      issue: {
+        id: issues.id,
+        companyId: issues.companyId,
+        status: issues.status,
+        identifier: issues.identifier,
+        assigneeAgentId: issues.assigneeAgentId,
+      },
+    })
+    .from(activityLog)
+    .innerJoin(
+      issues,
+      and(
+        eq(activityLog.entityId, issueIdAsText),
+        eq(activityLog.companyId, issues.companyId),
+      ),
+    )
+    .where(
+      and(
+        eq(activityLog.entityType, "issue"),
+        or(
+          and(
+            eq(activityLog.action, SKIPPED_ACTION),
+            sql`${activityLog.details}->>'reason' LIKE 'open_linked_prs_decision_carried:%'`,
+          ),
+          eq(activityLog.action, MERGE_ARMING_REFUSED_ON_CLOSE_ACTION),
+        ),
+        gte(activityLog.createdAt, windowStart),
+        lte(activityLog.createdAt, graceCutoff),
+        eq(issues.status, "done"),
+      ),
+    );
+}
+
+/**
+ * Qualify raw discovery rows into candidate cards: keep only the LATEST
+ * transition-of-record per issue, require it to be `done` and inside the
+ * lookback/grace window, and require it to carry a decision-carried skip reason
+ * or an arming-refusal reason. Mirrors the discovery WHERE so a row the query
+ * returns is always re-validated before it is measured.
+ */
+export function selectLandingCandidates(
+  rows: CandidateRow[],
+  windowStart: Date,
+  graceCutoff: Date,
+): CandidateRow[] {
+  const latestByIssue = new Map<string, CandidateRow>();
+  for (const row of rows) {
+    const existing = latestByIssue.get(row.issue.id);
+    if (!existing || row.createdAt.getTime() > existing.createdAt.getTime()) {
+      latestByIssue.set(row.issue.id, row);
+    }
+  }
+  return [...latestByIssue.values()].filter((row) => {
+    if (row.issue.status !== "done") return false;
+    const createdAt = row.createdAt.getTime();
+    if (createdAt < windowStart.getTime() || createdAt > graceCutoff.getTime()) return false;
+    const details = readRecord(row.details);
+    const isDecisionCarried =
+      readString(details?.reason)?.startsWith(DECISION_CARRIED_SKIP_REASON_PREFIX) === true;
+    const isArmingRefused = readString(details?.refusalReason) !== null;
+    return isDecisionCarried || isArmingRefused;
+  });
 }
 
 /**
@@ -145,14 +238,12 @@ export function createDoneCloseLandingBackstopService(
   const now = opts.now ?? (() => new Date());
   let lastRunAt: number | null = null;
 
-  const issueIdAsText = sql<string>`${issues.id}::text`;
-
   async function sweep(): Promise<DoneCloseLandingSweepResult> {
     const checkedAt = now();
     // The heartbeat tick fires every 30s; GitHub measurement is expensive, so
     // every non-due tick is a no-op.
     if (lastRunAt !== null && checkedAt.getTime() - lastRunAt < sweepIntervalMs) {
-      return { due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0 };
+      return { due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 };
     }
     lastRunAt = checkedAt.getTime();
     const result: DoneCloseLandingSweepResult = {
@@ -161,77 +252,14 @@ export function createDoneCloseLandingBackstopService(
       confirmed: 0,
       failed: 0,
       deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
     };
 
     const windowStart = new Date(checkedAt.getTime() - lookbackMs);
     const graceCutoff = new Date(checkedAt.getTime() - graceMs);
-    // Two candidate sources for a done card whose merge provably cannot enter the
-    // merge queue via the approved path, both recorded as first-class, queryable
-    // activity rows:
-    //   1. decision-carried close: the done-transition guard recorded an
-    //      `issue.done_transition_guard_skipped` row whose reason carries the
-    //      `open_linked_prs_decision_carried:` prefix (SUP-13352) — the merge was
-    //      armed but we now audit whether it landed.
-    //   2. arming refusal on close (SUP-14900): the post-approval hook recorded an
-    //      `issue.merge_arming_refused_on_close` row when a closing transition's
-    //      arming REFUSED (head_unresolvable, …). The guard could not see this case
-    //      (no PR resolvable at transition time), so the card-side sweep is the only
-    //      thing that can key on it and surface a linked PR that is still open/unmerged.
-    const rows = await db
-      .select({
-        details: activityLog.details,
-        createdAt: activityLog.createdAt,
-        issue: {
-          id: issues.id,
-          companyId: issues.companyId,
-          status: issues.status,
-          identifier: issues.identifier,
-          assigneeAgentId: issues.assigneeAgentId,
-        },
-      })
-      .from(activityLog)
-      .innerJoin(
-        issues,
-        and(
-          eq(activityLog.entityId, issueIdAsText),
-          eq(activityLog.companyId, issues.companyId),
-        ),
-      )
-      .where(
-        and(
-          eq(activityLog.entityType, "issue"),
-          or(
-            and(
-              eq(activityLog.action, SKIPPED_ACTION),
-              sql`${activityLog.details}->>'reason' LIKE 'open_linked_prs_decision_carried:%'`,
-            ),
-            eq(activityLog.action, MERGE_ARMING_REFUSED_ON_CLOSE_ACTION),
-          ),
-          gte(activityLog.createdAt, windowStart),
-          lte(activityLog.createdAt, graceCutoff),
-          eq(issues.status, "done"),
-        ),
-      );
-
-    // A card can be approved -> changes-requested -> approved again: keep only
-    // the LATEST transition-of-record per issue.
-    const latestByIssue = new Map<string, CandidateRow>();
-    for (const row of rows) {
-      const existing = latestByIssue.get(row.issue.id);
-      if (!existing || row.createdAt.getTime() > existing.createdAt.getTime()) {
-        latestByIssue.set(row.issue.id, row);
-      }
-    }
-    const candidates = [...latestByIssue.values()].filter((row) => {
-      if (row.issue.status !== "done") return false;
-      const createdAt = row.createdAt.getTime();
-      if (createdAt < windowStart.getTime() || createdAt > graceCutoff.getTime()) return false;
-      const details = readRecord(row.details);
-      const isDecisionCarried =
-        readString(details?.reason)?.startsWith(DECISION_CARRIED_SKIP_REASON_PREFIX) === true;
-      const isArmingRefused = readString(details?.refusalReason) !== null;
-      return isDecisionCarried || isArmingRefused;
-    });
+    const rows = await buildDiscoveryQuery(db, windowStart, graceCutoff);
+    const candidates = selectLandingCandidates(rows, windowStart, graceCutoff);
     result.candidates = candidates.length;
     if (candidates.length === 0) return result;
 
@@ -240,7 +268,7 @@ export function createDoneCloseLandingBackstopService(
     const svc = issueService(db);
 
     for (const row of candidates) {
-      const counts: SweepCounts = { confirmed: 0, failed: 0, deferred: 0 };
+      const counts: SweepCounts = { confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 };
       try {
         await sweepCandidate(row, counts, { resolver, svc });
       } catch (err) {
@@ -252,6 +280,8 @@ export function createDoneCloseLandingBackstopService(
       result.confirmed += counts.confirmed;
       result.failed += counts.failed;
       result.deferred += counts.deferred;
+      result.reenqueued += counts.reenqueued;
+      result.escalated += counts.escalated;
     }
     return result;
   }
@@ -271,6 +301,13 @@ export function createDoneCloseLandingBackstopService(
     const isArmingRefusal = refusalReason !== null;
     const skipReason =
       refusalReason ?? readString(details?.skipReason) ?? readString(details?.reason);
+
+    const companyRow = await db
+      .select({ mergeArmingEnabled: companies.mergeArmingEnabled })
+      .from(companies)
+      .where(eq(companies.id, issue.companyId));
+    const mergeArmingEnabled = companyRow[0]?.mergeArmingEnabled === true;
+
     const prs: LinkedPullRequest[] = await resolveLinkedPullRequestsWithState(
       db,
       issue.companyId,
@@ -323,22 +360,43 @@ export function createDoneCloseLandingBackstopService(
           eq(activityLog.entityId, issue.id),
           inArray(
             activityLog.action,
-            [DONE_CLOSE_LANDING_CONFIRMED_ACTION, DONE_CLOSE_LANDING_FAILED_ACTION],
+            [
+              DONE_CLOSE_LANDING_CONFIRMED_ACTION,
+              DONE_CLOSE_LANDING_FAILED_ACTION,
+              DONE_CLOSE_LANDING_REENQUEUED_ACTION,
+              DONE_CLOSE_LANDING_ESCALATED_ACTION,
+            ],
           ),
         ),
       );
-    const alreadyMeasured = new Set(
+    const alreadyConfirmed = new Set(
       existing
-        .filter((r) =>
-          r.action === DONE_CLOSE_LANDING_CONFIRMED_ACTION
-          || r.action === DONE_CLOSE_LANDING_FAILED_ACTION)
+        .filter((r) => r.action === DONE_CLOSE_LANDING_CONFIRMED_ACTION)
+        .map((r) => readString(readRecord(r.details)?.pr))
+        .filter((value): value is string => value !== null),
+    );
+    const alreadyFailed = new Set(
+      existing
+        .filter((r) => r.action === DONE_CLOSE_LANDING_FAILED_ACTION)
+        .map((r) => readString(readRecord(r.details)?.pr))
+        .filter((value): value is string => value !== null),
+    );
+    const alreadyReenqueued = new Set(
+      existing
+        .filter((r) => r.action === DONE_CLOSE_LANDING_REENQUEUED_ACTION)
+        .map((r) => readString(readRecord(r.details)?.pr))
+        .filter((value): value is string => value !== null),
+    );
+    const alreadyEscalated = new Set(
+      existing
+        .filter((r) => r.action === DONE_CLOSE_LANDING_ESCALATED_ACTION)
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
     );
 
     for (const pr of prs) {
       const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
-      if (alreadyMeasured.has(prKey)) continue;
+      if (alreadyConfirmed.has(prKey) || alreadyFailed.has(prKey)) continue;
 
       if (!deps.resolver) {
         counts.deferred += 1;
@@ -371,55 +429,196 @@ export function createDoneCloseLandingBackstopService(
           : state === "closed"
             ? readString(data?.closed_at)
             : null;
-      const action =
-        state === "merged" ? DONE_CLOSE_LANDING_CONFIRMED_ACTION : DONE_CLOSE_LANDING_FAILED_ACTION;
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: "system",
-        actorId: DONE_CLOSE_LANDING_ACTOR_ID,
-        agentId: null,
-        runId: null,
-        agentApiKeyId: null,
-        action,
-        entityType: "issue",
-        entityId: issue.id,
-        issueId: issue.id,
-        details: {
-          identifier: issue.identifier ?? null,
-          pr: prKey,
-          prState: state,
-          closedAt,
-          skipReason: skipReason ?? null,
-          refusal: isArmingRefusal,
-        },
-      });
+
       if (state === "merged") {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+          action: DONE_CLOSE_LANDING_CONFIRMED_ACTION,
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            pr: prKey,
+            prState: state,
+            closedAt,
+            skipReason: skipReason ?? null,
+            refusal: isArmingRefusal,
+          },
+        });
         counts.confirmed += 1;
         continue;
       }
 
-      // Closed-unmerged or still open past the grace window: surface attention.
-      // A comment alone never wakes a closed issue (issues route skipWake), so
-      // the assignee wake is required alongside it.
-      const cause = isArmingRefusal
-        ? `merge arming was REFUSED at close (${refusalReason}) and the approved head was never certified`
-        : "the decision-carried merge never landed";
-      await deps.svc.addComment(
-        issue.id,
-        `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is ${state} past the done-close grace window — ${cause}. Re-open/merge the PR and verify the deliverable.`,
-        {},
-        { authorType: "system" },
-      );
-      if (opts.wakeup && issue.assigneeAgentId) {
-        await opts.wakeup(issue.assigneeAgentId, {
-          source: "automation",
-          triggerDetail: "system",
-          reason: "issue_commented",
-          payload: { issueId: issue.id, mutation: "comment" },
+      if (state === "closed") {
+        // Closed-unmerged: surface attention (existing behavior).
+        const cause = isArmingRefusal
+          ? `merge arming was REFUSED at close (${refusalReason}) and the approved head was never certified`
+          : "the decision-carried merge never landed";
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+          action: DONE_CLOSE_LANDING_FAILED_ACTION,
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            pr: prKey,
+            prState: state,
+            closedAt,
+            skipReason: skipReason ?? null,
+            refusal: isArmingRefusal,
+          },
         });
+        await deps.svc.addComment(
+          issue.id,
+          `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is closed-unmerged past the done-close grace window — ${cause}. Re-open/merge the PR and verify the deliverable.`,
+          {},
+          { authorType: "system" },
+        );
+        if (opts.wakeup && issue.assigneeAgentId) {
+          await opts.wakeup(issue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_commented",
+            payload: { issueId: issue.id, mutation: "comment" },
+          });
+        }
+        counts.failed += 1;
+        continue;
       }
-      counts.failed += 1;
+
+      // state === "open" past the grace window: re-enqueue or escalate.
+      // If a prior sweep already re-enqueued this PR, it is in the merge queue
+      // waiting for CI — skip; the confirm path will fire when it merges.
+      if (alreadyReenqueued.has(prKey)) continue;
+
+      let reenqueueSucceeded = false;
+      if (mergeArmingEnabled) {
+        reenqueueSucceeded = await attemptReenqueue(
+          issue.companyId,
+          pr,
+        );
+        if (reenqueueSucceeded) {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: DONE_CLOSE_LANDING_REENQUEUED_ACTION,
+            entityType: "issue",
+            entityId: issue.id,
+            issueId: issue.id,
+            details: {
+              identifier: issue.identifier ?? null,
+              pr: prKey,
+              prState: "open",
+              skipReason: skipReason ?? null,
+              refusal: isArmingRefusal,
+            },
+          });
+          counts.reenqueued += 1;
+          continue;
+        }
+      }
+
+      // Escalate: lane closed, re-enqueue not attempted, or re-enqueue failed.
+      if (!alreadyEscalated.has(prKey)) {
+        const reason = mergeArmingEnabled
+          ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
+          : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+          action: DONE_CLOSE_LANDING_ESCALATED_ACTION,
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            pr: prKey,
+            prState: "open",
+            reason,
+            skipReason: skipReason ?? null,
+            refusal: isArmingRefusal,
+          },
+        });
+        await deps.svc.addComment(
+          issue.id,
+          `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window and cannot be re-enqueued by an agent — ${reason}. Board/operator must manually enable merge arming or merge the PR.`,
+          {},
+          { authorType: "system" },
+        );
+        await deps.svc.update(issue.id, {
+          status: "blocked",
+          unblockDescriptor: {
+            owner: "board",
+            action: `Manually merge or re-enqueue PR ${prKey} into the merge queue (merge arming lane is ${mergeArmingEnabled ? "open but re-enqueue failed" : "closed for this company"})`,
+          },
+        });
+        if (opts.wakeup && issue.assigneeAgentId) {
+          await opts.wakeup(issue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_commented",
+            payload: { issueId: issue.id, mutation: "comment" },
+          });
+        }
+        counts.escalated += 1;
+      }
     }
+  }
+
+  async function attemptReenqueue(
+    companyId: string,
+    pr: LinkedPullRequest,
+  ): Promise<boolean> {
+    const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
+    if (!isGitHubTokenResolution(tokenResult)) {
+      logger.info(
+        { companyId, owner: pr.owner, repo: pr.repo, reason: tokenResult.reason },
+        "done-close backstop: re-enqueue skipped — no GitHub token",
+      );
+      return false;
+    }
+    const nodeId = pr.nodeId
+      ?? (await fetchGitHubNodeId(tokenResult.token, pr.owner, pr.repo, pr.number)).nodeId;
+    if (!nodeId) {
+      logger.info(
+        { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}` },
+        "done-close backstop: re-enqueue skipped — could not resolve PR node ID",
+      );
+      return false;
+    }
+    const result = await enableAutoMerge(tokenResult.token, nodeId);
+    if (!result.success) {
+      logger.info(
+        { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, error: result.error },
+        "done-close backstop: re-enqueue failed",
+      );
+      return false;
+    }
+    logger.info(
+      { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, alreadyQueued: result.alreadyQueued },
+      "done-close backstop: re-enqueued PR into merge queue",
+    );
+    return true;
   }
 
   return { sweep };
