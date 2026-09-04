@@ -817,14 +817,77 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
 
       // Advisory-only signal, visible on the PR itself: one comment naming both
-      // SHAs and carrying the dedup marker — and nothing written to
-      // paperclip/approved.
+      // SHAs, the owning card, the approval timestamp, the remedies, and the
+      // dedup marker — and nothing written to paperclip/approved.
       expect(postCommentCalls()).toHaveLength(1);
       const body = postCommentBodies()[0]!;
-      expect(body).toContain(`This PR was approved at ${APPROVED_HEAD} (SUP-42)`);
+      expect(body).toContain(`This PR was approved at ${APPROVED_HEAD} (SUP-42, ${APPROVED_AT})`);
       expect(body).toContain(`head ${NEW_HEAD} voids that approval`);
+      expect(body).toContain("the merge queue will reject this PR");
+      expect(body).toContain("re-approve at the live head");
+      expect(body).toContain(`move the late commit to its own PR and reset this branch back to ${APPROVED_HEAD}`);
+      expect(body).toContain("a reset needs no new review");
       expect(body).toContain(`[paperclip:approval-voided ${APPROVED_HEAD} -> ${NEW_HEAD}]`);
       expect(body).not.toContain("context");
+    });
+
+    it("warns when the head move only ADDED an unreviewed file over byte-identical reviewed blobs (SUP-14996 #349 repro)", async () => {
+      // PR #349 shape: every reviewed file has a byte-identical blob SHA at
+      // both heads and the only delta is one added markdown spec — Guard A
+      // refuses (an added file is unreviewed content) and the PR must be told.
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        {
+          url: APPROVED_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 7,
+            files: [
+              { filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000001", status: "modified" },
+              { filename: "docs/spec.md", sha: "blob0000000000000000000000000000000000000002", status: "modified" },
+            ],
+          },
+        },
+        {
+          url: LIVE_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 8,
+            files: [
+              { filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000001", status: "modified" },
+              { filename: "docs/spec.md", sha: "blob0000000000000000000000000000000000000002", status: "modified" },
+              { filename: "docs/sup-13870.md", sha: "blob0000000000000000000000000000000000000003", status: "added" },
+            ],
+          },
+        },
+        { url: COMMENT_LIST_URL, body: [] },
+        { url: COMMENT_POST_URL, body: { id: 9003 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+      expect(summary.voidWarnings).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      expect(postCommentCalls()).toHaveLength(1);
+      const body = postCommentBodies()[0]!;
+      expect(body).toContain(`This PR was approved at ${APPROVED_HEAD} (SUP-42, ${APPROVED_AT})`);
+      expect(body).toContain(`head ${NEW_HEAD} voids that approval`);
+      expect(body).toContain("docs/sup-13870.md (added)");
+      expect(body).toContain("re-approve at the live head");
+      expect(body).toContain("no new review");
+      expect(body).toContain(`[paperclip:approval-voided ${APPROVED_HEAD} -> ${NEW_HEAD}]`);
     });
 
     it("does not re-post the void warning when the same pair was already warned (dedup)", async () => {
