@@ -651,6 +651,66 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(approvalStatus.workspaceDiscovery).toBeUndefined();
     });
 
+    it("stops re-selecting a card whose linked PRs are all closed (SUP-14959)", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      // The 343-shape census card: an approval anchor (publishedHeadSha) + a
+      // workspace context, but every linked PR mention is closed. The mention
+      // arm's EXISTS is false (no open/unhydrated PR) and, post-fix, the OR arm's
+      // NOT-EXISTS also excludes it because a pull_request mention row exists.
+      // Before the fix this card was re-selected on every tick and disposed as
+      // no-open-pr, consuming the whole window.
+      await insertMention(issueId, { state: "closed", number: 42 });
+      await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+      // No routes: the card must not be selected, so no GitHub call is made.
+      installRoutes([]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.scanned).toBe(0);
+      expect(summary.capped).toBe(0);
+      expect(summary.skipped["no-open-pr"]).toBeUndefined();
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("stops re-selecting a card with several closed mentions (SUP-14959, multi-PR)", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      // A card whose linked PRs are all closed (the census's `#3248 closed,
+      // #3287 closed` shape) is still excluded once any closed mention exists.
+      await insertMention(issueId, { state: "closed", number: 42 });
+      await insertMention(issueId, { state: "closed", number: 43 });
+      await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([]);
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.scanned).toBe(0);
+      expect(summary.skipped["no-open-pr"]).toBeUndefined();
+    });
+
+    it("still selects a card with an open mention alongside a closed one (mention arm unchanged, SUP-14959 AC2)", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      // #42 open, #43 closed. The mention arm's EXISTS matches the open PR, so
+      // the card is still a candidate even though a closed mention row also
+      // exists — the OR arm's NOT-EXISTS is irrelevant because the mention arm
+      // admits it. The in-memory resolver picks the single open PR as the target.
+      await insertMention(issueId, { state: "open", number: 42 });
+      await insertMention(issueId, { state: "closed", number: 43 });
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.scanned).toBe(1);
+      expect(summary.republished).toBe(1);
+      expect(Object.keys(summary.skipped)).toEqual([]);
+      expect(postStatusCalls()).toHaveLength(1);
+    });
+
     it("performs zero writes when the head already carries paperclip/approved=success", async () => {
       const issueId = await insertIssue();
       await insertDecision(issueId);

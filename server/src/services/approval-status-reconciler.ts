@@ -662,6 +662,17 @@ async function findApprovalCandidates(
         // zero-mention card whose discovery already returned `none` would match
         // forever. Exclude it once a terminal `none` verdict is persisted, and
         // re-admit it when the card is updated again (a new PR arrived).
+        // SUP-14959: the OR arm must not disagree with the mention arm's cached
+        // state. A card whose linked PRs are ALL closed/merged has a mention row
+        // (so it is not the zero-mention shape) yet matches the anchor + workspace
+        // clauses above and would be re-admitted on every tick only to be disposed
+        // as `no-open-pr` — the mention arm already declined to scan it. The OR
+        // arm therefore admits a card only when it has NO linked pull_request
+        // mention at all (the genuine SUP-14917 zero-mention shape, disposal still
+        // handled by SUP-14926's marker); a card with at least one open/unhydrated
+        // mention is admitted by the mention arm's EXISTS above, so this NOT-EXISTS
+        // is the complete disposal path. It mirrors the mention arm's
+        // `object_type = 'pull_request'` filter.
         sql`(
           (exists (
             select 1
@@ -691,6 +702,13 @@ async function findApprovalCandidates(
             and (
               ${issues.executionState} -> 'approvalStatus' -> 'workspaceDiscovery' ->> 'verdict' is distinct from 'none'
               or ${issues.updatedAt} > (${issues.executionState} -> 'approvalStatus' -> 'workspaceDiscovery' ->> 'at')::timestamptz
+            )
+            and not exists (
+              select 1
+              from ${externalObjectMentions}
+              where ${externalObjectMentions.companyId} = ${issues.companyId}
+                and ${externalObjectMentions.sourceIssueId} = ${issues.id}
+                and ${externalObjectMentions.objectType} = 'pull_request'
             )
           )
         )`,
