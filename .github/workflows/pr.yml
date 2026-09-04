@@ -28,7 +28,7 @@ concurrency:
 jobs:
   policy:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
     # Every diff-based step below needs a base and a head. The `pull_request`
