@@ -68,12 +68,59 @@ describe("managed install commands", () => {
     for (const ref of ["master", "v1.2.3", sha, sha.slice(0, 12)]) {
       await expect(resolveGitHubRef("paperclipai/paperclip", ref, runCommand)).resolves.toBe(sha);
     }
-    expect(runCommand.mock.calls.map((call) => call[1].at(-1))).toEqual([
+    expect(runCommand.mock.calls.filter((call) => call[0] === "curl").map((call) => call[1].at(-1))).toEqual([
       "https://api.github.com/repos/paperclipai/paperclip/commits/master",
       "https://api.github.com/repos/paperclipai/paperclip/commits/v1.2.3",
       `https://api.github.com/repos/paperclipai/paperclip/commits/${sha}`,
       `https://api.github.com/repos/paperclipai/paperclip/commits/${sha.slice(0, 12)}`,
     ]);
+  });
+
+  const GH_SHA = "a".repeat(40);
+
+  function curlTokenRunner(opts: { gh: "success" | "fail"; ghToken?: string }) {
+    const curlArgs: string[][] = [];
+    const configContents: string[] = [];
+    const runCommand: CommandRunner = async (file, args) => {
+      if (file === "gh") {
+        if (opts.gh === "fail") throw new Error("gh is not available");
+        return { stdout: opts.ghToken ?? "ghs_default_token", stderr: "" };
+      }
+      if (file === "curl") {
+        curlArgs.push([...args]);
+        const configIndex = args.indexOf("--config");
+        if (configIndex !== -1) configContents.push(fs.readFileSync(args[configIndex + 1], "utf8"));
+        return { stdout: JSON.stringify({ sha: GH_SHA }), stderr: "" };
+      }
+      throw new Error(`unexpected command ${file}`);
+    };
+    return { runCommand, curlArgs, configContents };
+  }
+
+  it("prefers the gh token over an ambient GH_TOKEN when gh succeeds", async () => {
+    process.env.GH_TOKEN = "ambient-env-token";
+    const { runCommand, curlArgs, configContents } = curlTokenRunner({ gh: "success", ghToken: "ghs_scoped_token" });
+    await expect(resolveGitHubRef("paperclipai/paperclip", "main", runCommand)).resolves.toBe(GH_SHA);
+    expect(curlArgs[0]).toContain("--config");
+    expect(configContents[0]).toContain("Bearer ghs_scoped_token");
+    expect(configContents[0]).not.toContain("ambient-env-token");
+  });
+
+  it("falls back to the ambient GH_TOKEN when gh is unavailable", async () => {
+    process.env.GH_TOKEN = "ambient-env-token";
+    const { runCommand, curlArgs, configContents } = curlTokenRunner({ gh: "fail" });
+    await expect(resolveGitHubRef("paperclipai/paperclip", "main", runCommand)).resolves.toBe(GH_SHA);
+    expect(curlArgs[0]).toContain("--config");
+    expect(configContents[0]).toContain("Bearer ambient-env-token");
+  });
+
+  it("makes an anonymous request when neither gh nor an ambient token is available", async () => {
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    const { runCommand, curlArgs, configContents } = curlTokenRunner({ gh: "fail" });
+    await expect(resolveGitHubRef("paperclipai/paperclip", "main", runCommand)).resolves.toBe(GH_SHA);
+    expect(curlArgs[0]).not.toContain("--config");
+    expect(configContents).toHaveLength(0);
   });
 
   it("supports fork overrides and classifies SHA refs as pinned", () => {
