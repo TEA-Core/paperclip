@@ -7,6 +7,8 @@ import {
   externalObjectProviderLabel,
   externalObjectToneSeverity,
   externalObjectTypeLabel,
+  formatDeliveredNetLoc,
+  type DeliveredNetLocFigure,
 } from "../../lib/external-objects";
 import {
   externalObjectStatusIcon,
@@ -82,6 +84,17 @@ function isMergedExternalObject(group: IssueExternalObjectGroup): boolean {
   return group.pill.statusIconKey === "git-merge" || statusLabel.toLowerCase() === "merged";
 }
 
+/**
+ * The delivered net LOC figure for a merged GitHub PR row, or `null` for any
+ * other row so they render byte-identical to today (SUP-14965).
+ */
+function deliveredNetLocFigure(group: IssueExternalObjectGroup): DeliveredNetLocFigure | null {
+  const { pill } = group;
+  if (pill.providerKey !== "github" || pill.objectType !== "pull_request") return null;
+  if (!isMergedExternalObject(group)) return null;
+  return formatDeliveredNetLoc(group.group.object?.data ?? null);
+}
+
 function externalObjectPropertyTone(group: IssueExternalObjectGroup): string {
   const tone = isMergedExternalObject(group)
     ? externalObjectStatusIcon.merged
@@ -106,6 +119,8 @@ function ExternalObjectPropertyValue({ group }: { group: IssueExternalObjectGrou
   const providerLabel = externalObjectProviderLabel(pill.providerKey);
   const typeLabel = externalObjectTypeLabel(pill.objectType);
   const value = externalObjectPropertyValue(group);
+  const figure = deliveredNetLocFigure(group);
+  const accessibleValue = figure ? `${value} - ${figure.label}` : value;
   const content = (
     <>
       <ExternalObjectStatusIcon
@@ -115,7 +130,20 @@ function ExternalObjectPropertyValue({ group }: { group: IssueExternalObjectGrou
         sizeClassName="h-3.5 w-3.5"
         label={`${providerLabel}: ${statusLabel}`}
       />
-      <span className="min-w-0 truncate">{value}</span>
+      <span className="min-w-0 truncate">
+        {value}
+        {figure ? (
+          <>
+            {" - "}
+            <span
+              className={cn(figure.exceedsDoctrineSoftCap && "font-semibold")}
+              title={figure.exceedsDoctrineSoftCap ? figure.doctrineNote : undefined}
+            >
+              {figure.label}
+            </span>
+          </>
+        ) : null}
+      </span>
     </>
   );
   const className = cn(
@@ -135,7 +163,7 @@ function ExternalObjectPropertyValue({ group }: { group: IssueExternalObjectGrou
         data-external-liveness={pill.liveness}
         className={className}
         title={externalObjectPropertyTitle(group)}
-        aria-label={`${providerLabel} ${typeLabel} - ${statusLabel}: ${pill.displayTitle ?? value}`}
+        aria-label={`${providerLabel} ${typeLabel} - ${statusLabel}: ${pill.displayTitle ?? accessibleValue}`}
       >
         {content}
       </a>
@@ -149,7 +177,7 @@ function ExternalObjectPropertyValue({ group }: { group: IssueExternalObjectGrou
       data-external-liveness={pill.liveness}
       className={className}
       title={externalObjectPropertyTitle(group)}
-      aria-label={`${providerLabel} ${typeLabel} - ${statusLabel}: ${pill.displayTitle ?? value}`}
+      aria-label={`${providerLabel} ${typeLabel} - ${statusLabel}: ${pill.displayTitle ?? accessibleValue}`}
     >
       {content}
     </span>

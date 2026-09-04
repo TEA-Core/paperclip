@@ -6,6 +6,7 @@ import {
   fetchIssueExternalObjectSummariesInBatches,
 } from "../hooks/useIssueExternalObjects";
 import {
+  DOCTRINE_NET_LOC_SOFT_CAP,
   dominantExternalObjectTone,
   externalObjectCategoryLabel,
   externalObjectDisplayStatusLabel,
@@ -18,6 +19,7 @@ import {
   externalObjectProviderLabel,
   externalObjectToneSeverity,
   externalObjectTypeLabel,
+  formatDeliveredNetLoc,
   sortExternalObjectsBySeverity,
 } from "./external-objects";
 import { normalizeExternalObjectHref } from "./external-object-href";
@@ -231,5 +233,70 @@ describe("external-objects helpers", () => {
     };
     expect(dominantExternalObjectTone(summary)).toBe("danger");
     expect(externalObjectDominantCount(summary)).toBe(3);
+  });
+});
+
+describe("formatDeliveredNetLoc", () => {
+  it("derives net LOC when both additions and deletions are present numbers", () => {
+    const figure = formatDeliveredNetLoc({ additions: 220, deletions: 1 });
+    expect(figure).not.toBeNull();
+    expect(figure!.additions).toBe(220);
+    expect(figure!.deletions).toBe(1);
+    expect(figure!.net).toBe(219);
+    expect(figure!.label).toBe("+220/-1 net +219");
+    expect(figure!.exceedsDoctrineSoftCap).toBe(false);
+  });
+
+  it("returns null when only additions is present", () => {
+    expect(formatDeliveredNetLoc({ additions: 220 })).toBeNull();
+  });
+
+  it("returns null when only deletions is present", () => {
+    expect(formatDeliveredNetLoc({ deletions: 1 })).toBeNull();
+  });
+
+  it("returns null when neither field is present", () => {
+    expect(formatDeliveredNetLoc({})).toBeNull();
+    expect(formatDeliveredNetLoc({ provider: "github" })).toBeNull();
+  });
+
+  it("returns null for missing or non-number measurements", () => {
+    expect(formatDeliveredNetLoc(null)).toBeNull();
+    expect(formatDeliveredNetLoc(undefined)).toBeNull();
+    expect(formatDeliveredNetLoc({ additions: "220", deletions: 1 })).toBeNull();
+    expect(formatDeliveredNetLoc({ additions: 220, deletions: "1" })).toBeNull();
+    expect(formatDeliveredNetLoc({ additions: Number.NaN, deletions: 1 })).toBeNull();
+  });
+
+  it("renders a genuine zero-diff as net 0 instead of suppressing it", () => {
+    const figure = formatDeliveredNetLoc({ additions: 0, deletions: 0 });
+    expect(figure).not.toBeNull();
+    expect(figure!.net).toBe(0);
+    expect(figure!.label).toBe("+0/-0 net 0");
+    expect(figure!.exceedsDoctrineSoftCap).toBe(false);
+  });
+
+  it("flags net over the doctrine soft cap for emphasis and names the doctrine", () => {
+    const figure = formatDeliveredNetLoc({ additions: 813, deletions: 1 });
+    expect(figure).not.toBeNull();
+    expect(figure!.net).toBe(812);
+    expect(figure!.exceedsDoctrineSoftCap).toBe(true);
+    expect(figure!.label).toBe("+813/-1 net +812");
+    expect(figure!.doctrineNote).toContain(String(DOCTRINE_NET_LOC_SOFT_CAP));
+    expect(figure!.doctrineNote).toContain("812");
+  });
+
+  it("treats exactly the doctrine cap as not exceeding it", () => {
+    const figure = formatDeliveredNetLoc({ additions: DOCTRINE_NET_LOC_SOFT_CAP + 1, deletions: 1 });
+    expect(figure!.net).toBe(DOCTRINE_NET_LOC_SOFT_CAP);
+    expect(figure!.exceedsDoctrineSoftCap).toBe(false);
+  });
+
+  it("computes a negative net for a pure-deletion PR", () => {
+    const figure = formatDeliveredNetLoc({ additions: 5, deletions: 50 });
+    expect(figure).not.toBeNull();
+    expect(figure!.net).toBe(-45);
+    expect(figure!.label).toBe("+5/-50 net -45");
+    expect(figure!.exceedsDoctrineSoftCap).toBe(false);
   });
 });
