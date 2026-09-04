@@ -1,0 +1,11 @@
+[
+  {
+    "sourceIssueId": "d380faef-c7b1-48cd-82f2-b875e43996d1",
+    "repository": "TEA-Core/Trading-Signal-Platform",
+    "prNumber": 3417,
+    "url": "https://github.com/TEA-Core/Trading-Signal-Platform/pull/3417",
+    "headRef": "carrier-branch",
+    "baseRef": "main",
+    "label": "SUP-14605 (example, already backfilled — safe idempotent sample)"
+  }
+]
