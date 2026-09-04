@@ -86,7 +86,7 @@ function makeDb(state: DbState) {
   };
 }
 
-function mockResolver(implementation: () => Promise<unknown>) {
+function mockResolver(implementation: (input: unknown) => Promise<unknown>) {
   const resolve = vi.fn(implementation);
   mockCreateGitHubExternalObjectProvider.mockReset();
   mockCreateGitHubExternalObjectProvider.mockReturnValue({
@@ -684,6 +684,91 @@ describe("createDoneCloseLandingBackstopService", () => {
       });
       expect(mockLogActivity).not.toHaveBeenCalled();
       expect(mockAddComment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("SUP-14971: superseded-carrier reconciliation across the card's PR set", () => {
+    it("reports a closed-unmerged carrier as superseded (audit row, no comment/wake, no failed count) when a sibling merged (AC2, SUP-14849 shape)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        { candidates: [refusalCandidateRow()], existingLandingRows: [] },
+        { wakeup },
+      );
+      // Two linked PRs on one card: #364 closed-unmerged (the carrier), #368 merged
+      // (where the work actually landed). Both are measured in the same sweep.
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 364, displayName: "paperclipai/paperclip#364" }),
+        linkedPr({ id: "eo-368", number: 368, displayName: "paperclipai/paperclip#368" }),
+      ]);
+      mockResolver(async (input: unknown) =>
+        (input as { object: { externalId: string } }).object.externalId.endsWith("pull/364")
+          ? closedSnapshot
+          : mergedSnapshot,
+      );
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 1,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 0,
+      });
+
+      // Two audit rows: the merged sibling confirmed, the closed carrier recorded
+      // as superseded and named against the merged sibling. No attention taken.
+      expect(mockLogActivity).toHaveBeenCalledTimes(2);
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_confirmed",
+        details: expect.objectContaining({ pr: "paperclipai/paperclip#368", prState: "merged" }),
+      }));
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_failed",
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#364",
+          prState: "closed",
+          supersededBy: "paperclipai/paperclip#368",
+        }),
+      }));
+      expect(mockAddComment).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
+    });
+
+    it("still emits the comment and assignee wake for every closed-unmerged PR when no sibling merged (AC3)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        { candidates: [refusalCandidateRow()], existingLandingRows: [] },
+        { wakeup },
+      );
+      // Two closed-unmerged PRs, no merged sibling: both are genuinely stranded.
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 364, displayName: "paperclipai/paperclip#364" }),
+        linkedPr({ id: "eo-368", number: 368, displayName: "paperclipai/paperclip#368" }),
+      ]);
+      mockResolver(async () => closedSnapshot);
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 2,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 0,
+      });
+
+      expect(mockAddComment).toHaveBeenCalledTimes(2);
+      expect(wakeup).toHaveBeenCalledTimes(2);
+      // Both rows are ordinary failures (attention path) with no supersededBy detail.
+      const failedDetails = mockLogActivity.mock.calls
+        .map((call) => call[1] as { action: string; details: Record<string, unknown> })
+        .filter((record) => record.action === "issue.done_close_landing_failed")
+        .map((record) => record.details);
+      expect(failedDetails).toHaveLength(2);
+      for (const details of failedDetails) {
+        expect(details).not.toHaveProperty("supersededBy");
+      }
     });
   });
 
