@@ -1330,6 +1330,175 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     }
   }, 120_000);
 
+  it("does not reopen a finished issue when the deferred comment wake is the assignee's own write-up from a different run", async () => {
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Local CLI Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: {
+            "x-openclaw-token": "gateway-token",
+          },
+          payloadTemplate: {
+            message: "wake now",
+          },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Self write-up from another run must not reopen",
+        status: "todo",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+        },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+      });
+
+      expect(firstRun).not.toBeNull();
+      await waitFor(async () => {
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, firstRun!.id))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === "running";
+      });
+
+      // The assignee's own approval write-up. It carries the assignee's agent id
+      // directly, but its createdByRunId is a run that is NOT the one now finalizing
+      // (the authoring run differs from the promoting run). Keying the self-author
+      // check only on `createdByRunId === run.id` missed this and let the close
+      // write-up reopen the card (SUP-14913).
+      const selfWriteUp = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          createdByRunId: null,
+          body: "Approval write-up posted by the assignee after closing",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const deferredRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId, commentId: selfWriteUp.id },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          commentId: selfWriteUp.id,
+          wakeCommentId: selfWriteUp.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "local-cli-user",
+      });
+
+      expect(deferredRun).toBeNull();
+
+      await waitFor(async () => {
+        const deferred = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        return Boolean(deferred);
+      });
+
+      await db
+        .update(issues)
+        .set({
+          status: "done",
+          completedAt: new Date(),
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, issueId));
+
+      gateway.releaseFirstWait();
+
+      // The deferred wake still promotes (the assignee gets the message), but the
+      // issue must remain `done` because the only referenced comment is the
+      // assignee's own write-up, not a third-party follow-up.
+      await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
+      await waitFor(async () => {
+        const runs = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+      }, 90_000);
+
+      const issueAfterPromotion = await db
+        .select({
+          status: issues.status,
+          completedAt: issues.completedAt,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+
+      expect(issueAfterPromotion).toMatchObject({
+        status: "done",
+      });
+      expect(issueAfterPromotion?.completedAt).not.toBeNull();
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 120_000);
+
   it("still reopens a finished issue when a deferred batch mixes self-authored and human comments", async () => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
