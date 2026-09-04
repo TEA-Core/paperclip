@@ -89,6 +89,7 @@ import {
   execute,
   resolveOpenCodeDatabaseFile,
   resolveOpenCodeSessionResume,
+  resolveOpenCodeSessionResumeMaxBytes,
 } from "./execute.js";
 
 describe("buildOpenCodeRunArgs", () => {
@@ -206,6 +207,128 @@ describe("resolveOpenCodeSessionResume", () => {
     ).toEqual({ resume: false, sessionId: null, reason: "no_session" });
   });
 
+  // SUP-14964: the resume decision is bounded by the session's replayed
+  // transcript size. The default cap is 4,000,000 bytes (~889K estimated tokens
+  // against the 1,048,576-token route ceiling, ~15% headroom) -- see the
+  // measurement comment above resolveOpenCodeSessionResumeMaxBytes.
+  it("resumes a session whose transcript is just under the cap", () => {
+    expect(
+      resolveOpenCodeSessionResume({
+        ...base,
+        sessionId: "ses_123",
+        sessionCwd: "/workspaces/wt-a",
+        sessionTranscriptBytes: 3_999_999,
+      }),
+    ).toEqual({ resume: true, sessionId: "ses_123" });
+  });
+
+  it("declines a session whose transcript is just over the cap with session_too_large", () => {
+    expect(
+      resolveOpenCodeSessionResume({
+        ...base,
+        sessionId: "ses_123",
+        sessionCwd: "/workspaces/wt-a",
+        sessionTranscriptBytes: 4_000_001,
+      }),
+    ).toEqual({ resume: false, sessionId: "ses_123", reason: "session_too_large" });
+  });
+
+  it("leaves the size gate off when the transcript size was not measured", () => {
+    expect(
+      resolveOpenCodeSessionResume({
+        ...base,
+        sessionId: "ses_123",
+        sessionCwd: "/workspaces/wt-a",
+        sessionTranscriptBytes: null,
+      }),
+    ).toEqual({ resume: true, sessionId: "ses_123" });
+  });
+
+  it("honours an explicit, lowered resume cap", () => {
+    expect(
+      resolveOpenCodeSessionResume({
+        ...base,
+        sessionId: "ses_123",
+        sessionCwd: "/workspaces/wt-a",
+        sessionTranscriptBytes: 2_000_001,
+        maxSessionTranscriptBytes: 2_000_000,
+      }),
+    ).toEqual({ resume: false, sessionId: "ses_123", reason: "session_too_large" });
+  });
+
+  it("treats a cap of 0 as the size gate being disabled", () => {
+    expect(
+      resolveOpenCodeSessionResume({
+        ...base,
+        sessionId: "ses_123",
+        sessionCwd: "/workspaces/wt-a",
+        sessionTranscriptBytes: 50_000_000,
+        maxSessionTranscriptBytes: 0,
+      }),
+    ).toEqual({ resume: true, sessionId: "ses_123" });
+  });
+
+  it("drops --session from the argv when the session is too large to resume", () => {
+    const decision = resolveOpenCodeSessionResume({
+      ...base,
+      sessionId: "ses_123",
+      sessionCwd: "/workspaces/wt-a",
+      sessionTranscriptBytes: 4_000_001,
+    });
+    expect(decision).toEqual({ resume: false, sessionId: "ses_123", reason: "session_too_large" });
+    expect(
+      buildOpenCodeRunArgs({
+        dir: base.executionCwd,
+        model: "router/coder",
+        variant: "",
+        extraArgs: [],
+        printLogs: false,
+        resumeSessionId: decision.resume ? decision.sessionId : null,
+      }),
+    ).not.toContain("--session");
+  });
+});
+
+describe("resolveOpenCodeSessionResumeMaxBytes", () => {
+  afterEach(() => {
+    delete process.env.PAPERCLIP_OPENCODE_SESSION_MAX_BYTES;
+  });
+
+  it("defaults to 4,000,000 bytes when the knob is unset", () => {
+    expect(resolveOpenCodeSessionResumeMaxBytes({ env: {} })).toBe(4_000_000);
+  });
+
+  it("honours an explicit override from the run env", () => {
+    expect(
+      resolveOpenCodeSessionResumeMaxBytes({ env: { PAPERCLIP_OPENCODE_SESSION_MAX_BYTES: "100000" } }),
+    ).toBe(100_000);
+  });
+
+  it("reads the knob from the process env when the run env omits it", () => {
+    process.env.PAPERCLIP_OPENCODE_SESSION_MAX_BYTES = "77777";
+    expect(resolveOpenCodeSessionResumeMaxBytes({ env: {} })).toBe(77_777);
+  });
+
+  it("disables the gate on a non-positive value", () => {
+    expect(
+      resolveOpenCodeSessionResumeMaxBytes({ env: { PAPERCLIP_OPENCODE_SESSION_MAX_BYTES: "0" } }),
+    ).toBe(0);
+  });
+
+  it("falls back to the default on a malformed value instead of disabling it", () => {
+    expect(
+      resolveOpenCodeSessionResumeMaxBytes({
+        env: { PAPERCLIP_OPENCODE_SESSION_MAX_BYTES: "not-a-number" },
+      }),
+    ).toBe(4_000_000);
+  });
+});
+
+describe("resolveOpenCodeSessionResume (legacy argv)", () => {
+  const base = {
+    executionCwd: "/workspaces/wt-a",
+    executionTargetMatches: true,
+  };
   it("drops --session from the argv when the session cannot be resumed", () => {
     const decision = resolveOpenCodeSessionResume({
       ...base,
