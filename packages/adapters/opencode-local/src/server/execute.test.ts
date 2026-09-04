@@ -448,6 +448,77 @@ describe("classifyOpenCodeFailure", () => {
     const { errorMeta } = classifyOpenCodeFailure({ ...base, exitCode: 1, signal: null, adapterSessionId: null });
     expect(errorMeta.adapterSessionId).toBeNull();
   });
+
+  // SUP-14939: a router admission refusal (503 {"reason","type":"router_abort"})
+  // makes opencode exit non-zero. The exit code used to win and flatten the cause
+  // to opencode_exit_<N>. The router body reaches the adapter on the stdout JSONL
+  // error event (parsedError) — verified on opencode 1.18.27 — so it must be
+  // detected before the exit-code branch and classified distinctly.
+  it("classifies a router admission refusal as a distinct router_abort code, not opencode_exit_<N>", () => {
+    const parsedError = 'Service Unavailable: {"reason":"no_eligible_rung","type":"router_abort"}';
+    const { errorCode, errorMeta } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 1,
+      signal: null,
+      parsedError,
+    });
+    expect(errorCode).toBe("router_abort_no_eligible_rung");
+    expect(errorMeta.routerAbort).toBe(true);
+    expect(errorMeta.routerAbortReason).toBe("no_eligible_rung");
+    // The 503 body stays queryable on the run record too.
+    expect(errorMeta.parsedError).toBe(parsedError);
+  });
+
+  it("detects a router abort on stderr when the body is not on the JSONL stream", () => {
+    const stderr = '503 {"reason":"no eligible target","type":"router_abort"}';
+    const { errorCode, errorMeta } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 1,
+      signal: null,
+      stderr,
+      stderrLine: stderr,
+    });
+    expect(errorCode).toBe("router_abort_no_eligible_target");
+    expect(errorMeta.routerAbort).toBe(true);
+    expect(errorMeta.routerAbortReason).toBe("no eligible target");
+  });
+
+  it("prefers the parsedError channel for the router reason over stderr", () => {
+    const { errorCode, errorMeta } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 1,
+      signal: null,
+      parsedError: '{"reason":"no_eligible_rung","type":"router_abort"}',
+      stderr: '{"reason":"no eligible target","type":"router_abort"}',
+    });
+    expect(errorCode).toBe("router_abort_no_eligible_rung");
+    expect(errorMeta.routerAbortReason).toBe("no_eligible_rung");
+  });
+
+  it("falls back to a bare router_abort code when the reason is not extractable", () => {
+    const { errorCode, errorMeta } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 1,
+      signal: null,
+      parsedError: "provider rejected the request: type=router_abort",
+    });
+    expect(errorCode).toBe("router_abort");
+    expect(errorMeta.routerAbort).toBe(true);
+    expect(errorMeta.routerAbortReason).toBeUndefined();
+  });
+
+  // Regression guard (AC#5): a non-router non-zero exit must keep classifying as
+  // opencode_exit_<N>, including a 5xx-ish stderr that lacks the router body.
+  it("keeps a non-router non-zero exit as opencode_exit_<N> even on a 5xx-ish stderr", () => {
+    const { errorCode } = classifyOpenCodeFailure({
+      ...base,
+      exitCode: 1,
+      signal: null,
+      stderrLine: "Service Unavailable: provider overloaded",
+      stderr: "Service Unavailable: provider overloaded\n",
+    });
+    expect(errorCode).toBe("opencode_exit_1");
+  });
 });
 
 // SUP-13963: a failure that records a non-null errorCode used to leave no
@@ -700,6 +771,84 @@ describe("execute — SUP-13963 failure log line", () => {
     expect(result.errorCode ?? null).toBeNull();
     expect(logs.some((chunk) => chunk.includes("opencode_adapter_failure"))).toBe(false);
   });
+});
+
+// SUP-14939: end-to-end wiring. The stdout below is the EXACT JSONL `error`
+// event opencode 1.18.27 emitted after exhausting 503 retries against a router
+// admission refusal (verified live, 2026-09-04). It must flow through
+// parseOpenCodeJsonl → parsed.errorMessage → classifyOpenCodeFailure and land on
+// the run result as a distinct router_abort code, not opencode_exit_1.
+describe("execute — SUP-14939 router admission refusal classification", () => {
+  const ROUTER_ABORT_STDOUT = JSON.stringify({
+    type: "error",
+    sessionID: "ses_router_abort",
+    error: {
+      name: "APIError",
+      data: {
+        message: 'Service Unavailable: {"reason":"no_eligible_rung","type":"router_abort"}',
+        statusCode: 503,
+        isRetryable: true,
+      },
+    },
+  });
+
+  function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
+    return {
+      runId: "run-router-abort",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Agent",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { model: "router/coder", cwd: process.cwd() },
+      context: {},
+      onLog: async () => {},
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    runAdapterExecutionTargetProcessMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("classifies a live router-abort stdout as router_abort_no_eligible_rung, not opencode_exit_1", async () => {
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: ROUTER_ABORT_STDOUT,
+      stderr: "",
+    }));
+
+    const result = await execute(makeCtx());
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("router_abort_no_eligible_rung");
+    expect(result.errorMeta?.routerAbort).toBe(true);
+    expect(result.errorMeta?.routerAbortReason).toBe("no_eligible_rung");
+  }, 15000);
+
+  it("still classifies a plain non-zero exit with a router-free stderr as opencode_exit_1", async () => {
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "OpenCode exited with an unexpected error",
+    }));
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("opencode_exit_1");
+    expect(result.errorMeta?.routerAbort).toBeUndefined();
+  }, 15000);
 });
 
 // SUP-10914: every opencode_local run wrote to ONE shared SQLite database

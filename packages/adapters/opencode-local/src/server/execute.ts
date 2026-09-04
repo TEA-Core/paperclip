@@ -113,12 +113,72 @@ function stderrTail(text: string, maxLines = 10): string {
   return lines.slice(-maxLines).join("\n");
 }
 
+// SUP-14939: when the smart router refuses admission it returns 503 with a body
+// like {"reason":"no_eligible_rung","type":"router_abort"}, and opencode exits
+// non-zero. That used to classify as opencode_exit_<N> — the SAME code as a
+// genuine agent bug, a tool crash, or a model fault — because a non-zero exit
+// code is this classifier's top-priority input and the 503 body was only
+// reachable inside free-text stderrTail. The router body DOES reach the
+// adapter: opencode emits the provider error as a stdout JSONL `error` event,
+// which parseOpenCodeJsonl folds into parsedError (verified on opencode 1.18.27,
+// 2026-09-04; stderr stays empty on this path). It can also surface on stderr
+// under --print-logs, so scan both. Detect it BEFORE the exit-code branch, and
+// only on a run that actually failed, so a healthy run whose log happens to
+// mention the router is never mislabelled.
+const ROUTER_ABORT_SIGNATURES: RegExp[] = [
+  /router_abort/i,
+  /no_eligible_rung/i,
+  /no_eligible_target/i,
+  /no eligible (?:rungs?|target)/i,
+];
+
+function hasRouterAbortSignature(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return ROUTER_ABORT_SIGNATURES.some((pattern) => pattern.test(text));
+}
+
+// Pull the router `reason` out of the 503 body. Prefers the JSON `"reason"`
+// field (clean or backslash-escaped), then the prose form, else "".
+function extractRouterAbortReason(text: string): string {
+  if (!text) return "";
+  const clean = text.match(/"reason"\s*:\s*"([^"\\]+)"/);
+  if (clean) return clean[1].trim();
+  const escaped = text.match(/\\"reason\\"\s*:\s*\\"([^"\\]+)\\"/);
+  if (escaped) return escaped[1].trim();
+  const prose = text.match(/no eligible (?:rungs?|target)/i);
+  if (prose) return prose[0].toLowerCase().replace(/\s+/g, "_");
+  return "";
+}
+
+// Collapse a reason into a stable errorCode suffix: "no eligible target" ->
+// "no_eligible_target". Returns "" when there is nothing to collapse.
+function sanitizeRouterAbortReasonToken(reason: string): string {
+  return reason
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+// Check the router body on the channels it can reach, in priority order
+// (parsedError first, then stderr). Returns the extracted reason — "" when a
+// signature is present but no reason is extractable — or null when no signature
+// is found at all.
+function detectRouterAbortReason(parsedError: string, stderr: string): string | null {
+  for (const text of [parsedError, stderr]) {
+    if (hasRouterAbortSignature(text)) {
+      return extractRouterAbortReason(text);
+    }
+  }
+  return null;
+}
+
 /**
  * Classify the underlying cause of a non-timeout adapter failure into a
  * structured errorCode + errorMeta, so the heartbeat layer and downstream
  * consumers get a machine-readable reason instead of a bare ANSI string.
  *
  * Priority order:
+ *   0. router admission refusal → router_abort[_<reason>]  (SUP-14939)
  *   1. non-zero exit code → opencode_exit_<N>
  *   2. signal termination → opencode_signal_<SIGNAL>
  *   3. parsed JSONL error → opencode_tool_error
@@ -140,7 +200,17 @@ export function classifyOpenCodeFailure(input: {
     stderrTail: stderrTail(stderr),
   };
   let errorCode: string | null = null;
-  if (exitCode !== null && exitCode !== 0) {
+  const runFailed =
+    (exitCode !== null && exitCode !== 0) || signal !== null || parsedError.length > 0;
+  const routerAbortReason = runFailed ? detectRouterAbortReason(parsedError, stderr) : null;
+  if (routerAbortReason !== null) {
+    const token = sanitizeRouterAbortReasonToken(routerAbortReason);
+    errorCode = token ? `router_abort_${token}` : "router_abort";
+    errorMeta.routerAbort = true;
+    if (routerAbortReason) {
+      errorMeta.routerAbortReason = routerAbortReason;
+    }
+  } else if (exitCode !== null && exitCode !== 0) {
     errorCode = `opencode_exit_${exitCode}`;
   } else if (signal) {
     errorCode = `opencode_signal_${signal}`;
