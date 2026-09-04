@@ -85,6 +85,38 @@ export const ISSUE_PROGRESS_ACTIVITY_ACTIONS: string[] = [
 ];
 
 /**
+ * SUP-14737: activity actions that count as *issue-state* progress for the
+ * deferred-wake promotion gate. Narrower than ISSUE_PROGRESS_ACTIVITY_ACTIONS:
+ * re-commenting an unchanged card, writing documents/work products, or toggling
+ * attachments does not move the card, so it does NOT break the no-progress
+ * streak that backs the promotion backoff. A genuine status/ownership/structure
+ * change (or a new actionable interaction) does. This is what stops a run that
+ * merely "restates the same blocked state" from re-arming itself within
+ * milliseconds.
+ */
+export const ISSUE_STATE_PROGRESS_ACTIVITY_ACTIONS: string[] = [
+  "issue.updated",
+  "issue.created",
+  "issue.assigned",
+  "issue.released",
+  "issue.child_created",
+  "issue.blockers_updated",
+  "issue.blockers_resolved_wake_emitted",
+  "issue.monitor_scheduled",
+  "issue.approval_linked",
+  "issue.thread_interaction_created",
+];
+
+/**
+ * SUP-14737: base cooldown for the deferred-wake *promotion* gate, well above a
+ * typical run duration so a no-progress self-wake is held back long enough for a
+ * genuine external event (or a human) to arrive instead of re-arming the same
+ * run within ~100 ms of the previous one finishing. Escalates and caps the same
+ * way as the enqueue-time gate.
+ */
+export const ISSUE_REWAKE_PROMOTION_BASE_COOLDOWN_MS = 5 * 60_000;
+
+/**
  * Activity on the issue that counts as new external input since the last run
  * finished — anything a waiting agent should be woken for, including board
  * responses to interactions.
@@ -125,16 +157,6 @@ export interface RecentIssueRunSample {
   finishedAt: Date | null;
 }
 
-export interface IssueRewakeThrottleInput {
-  now: Date;
-  /** Terminal runs for the same (agent, issue), newest finish first. */
-  recentTerminalRuns: RecentIssueRunSample[];
-  /** Runs among the sample that produced issue-visible progress. */
-  runIdsWithIssueProgress: ReadonlySet<string>;
-  /** New issue input landed after the newest run finished. */
-  hasNewIssueInputSinceLastRun: boolean;
-}
-
 export type IssueRewakeThrottleDecision =
   | { blocked: false; noProgressStreak: number }
   | {
@@ -145,11 +167,30 @@ export type IssueRewakeThrottleDecision =
       nextAllowedAt: Date;
     };
 
-export function computeIssueRewakeCooldownMs(noProgressStreak: number): number {
+export function computeIssueRewakeCooldownMs(
+  noProgressStreak: number,
+  baseCooldownMs: number = ISSUE_REWAKE_BASE_COOLDOWN_MS,
+): number {
   const doublings = Math.max(0, noProgressStreak - ISSUE_REWAKE_NO_PROGRESS_THRESHOLD);
   // Guard the exponent so an absurd streak can't overflow into Infinity.
   const factor = 2 ** Math.min(doublings, 16);
-  return Math.min(ISSUE_REWAKE_BASE_COOLDOWN_MS * factor, ISSUE_REWAKE_MAX_COOLDOWN_MS);
+  return Math.min(baseCooldownMs * factor, ISSUE_REWAKE_MAX_COOLDOWN_MS);
+}
+
+export interface IssueRewakeThrottleInput {
+  now: Date;
+  /** Terminal runs for the same (agent, issue), newest finish first. */
+  recentTerminalRuns: RecentIssueRunSample[];
+  /** Runs among the sample that produced issue-visible progress. */
+  runIdsWithIssueProgress: ReadonlySet<string>;
+  /** New issue input landed after the newest run finished. */
+  hasNewIssueInputSinceLastRun: boolean;
+  /**
+   * SUP-14737: optional base cooldown for the backoff. The deferred-wake
+   * promotion gate passes ISSUE_REWAKE_PROMOTION_BASE_COOLDOWN_MS (well above
+   * run duration); the enqueue-time gate keeps the default.
+   */
+  baseCooldownMs?: number;
 }
 
 export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): IssueRewakeThrottleDecision {
@@ -173,7 +214,7 @@ export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): Is
   const lastRunFinishedAt = runs[0]?.finishedAt;
   if (!lastRunFinishedAt) return { blocked: false, noProgressStreak };
 
-  const cooldownMs = computeIssueRewakeCooldownMs(noProgressStreak);
+  const cooldownMs = computeIssueRewakeCooldownMs(noProgressStreak, input.baseCooldownMs);
   const nextAllowedAt = new Date(lastRunFinishedAt.getTime() + cooldownMs);
   if (input.now.getTime() < nextAllowedAt.getTime()) {
     return { blocked: true, noProgressStreak, cooldownMs, lastRunFinishedAt, nextAllowedAt };
