@@ -288,6 +288,103 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
+  describe("refusal text does not advertise the unreachable override (SUP-14914)", () => {
+    // SUP-14878 moved the no-deliverable-head override to consume AFTER the
+    // mechanism C / A / D refusals, so a disposition can no longer reach — and
+    // waive — any of those three gates. Their refusal reasons must stop
+    // advertising the override (unreachable by construction) and instead name
+    // the action that actually clears each gate. Each test below fails against
+    // the pre-SUP-14914 text, which ended with the dead override clause.
+
+    it("mechanism C: the ladder refusal stops advertising doneTransitionOverride and names the real remedy", async () => {
+      const stageId = "c-stage-00000000000000000001";
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          executionPolicy: { stages: [{ id: stageId, type: "review" }] },
+          executionState: {},
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Review ladder unsatisfied");
+      expect(result.reason).not.toContain("doneTransitionOverride");
+      // SUP-14912 (#505) landed first and rewrote this same message. Its wording
+      // supersedes the one SUP-14914 proposed and already satisfies this card's
+      // requirement: it drops the override advertisement and, going further,
+      // states outright that an override does not clear a ladder refusal.
+      expect(result.reason).toContain("Record the stage's approval (or skip it) before marking the issue done.");
+      expect(result.reason).toContain(
+        "A no-deliverable-head override does not clear a review-ladder refusal.",
+      );
+    });
+
+    it("mechanism A: the ungated-decomposed-parent refusal stops advertising doneTransitionOverride and names the real remedy", async () => {
+      const f = mechanismACorpus.find((x) => x.identifier === "SUP-14306");
+      expect(f).toBeDefined();
+      setupDbMock({ issues: f!.children });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, identifier: f!.identifier, executionPolicy: f!.executionPolicy, executionState: f!.executionState },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism A");
+      expect(result.reason).not.toContain("doneTransitionOverride");
+      expect(result.reason).toContain("Attach an execution policy with a review ladder to this issue.");
+    });
+
+    it("mechanism D: the close-ladder-shape refusal stops advertising doneTransitionOverride and names the real remedy", async () => {
+      // Stage ids must be UUIDs: `parseIssueExecutionState` validates the
+      // state schema, so a malformed id silently drops the whole state and the
+      // ladder would read as unsatisfied (mechanism C) instead of shape-incomplete.
+      const supportQaeId = "aaaaaaa1-0000-4000-8000-000000000001";
+      const parentStageId = "30000000-0000-4000-8000-000000000003";
+      const child1StageId = "40000000-0000-4000-8000-000000000001";
+      const child2StageId = "50000000-0000-4000-8000-000000000002";
+      const ladderedState = (stageId: string) => ({
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [stageId],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      });
+      setupDbMock({
+        issues: [
+          { identifier: "SUP-9001", executionPolicy: { stages: [{ id: child1StageId, type: "review" }] }, executionState: ladderedState(child1StageId) },
+          { identifier: "SUP-9002", executionPolicy: { stages: [{ id: child2StageId, type: "review" }] }, executionState: ladderedState(child2StageId) },
+        ],
+        agents: [{ id: supportQaeId, name: "support-QAE", role: "support" }],
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          parentId: null,
+          executionPolicy: {
+            stages: [
+              { id: parentStageId, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+            ],
+          },
+          executionState: ladderedState(parentStageId),
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism D");
+      expect(result.reason).toContain("review:coder-LE");
+      expect(result.reason).toContain("approval:exec-CTO");
+      expect(result.reason).not.toContain("doneTransitionOverride");
+      expect(result.reason).toContain("Add the missing review/approval stages to this issue's execution policy.");
+    });
+  });
+
   describe("review ladder refusal (SUP-14446 mechanism C)", () => {
     const stageA = "11111111-1111-4111-8111-111111111111";
     const stageB = "22222222-2222-4222-8222-222222222222";
