@@ -668,6 +668,65 @@ async function findApprovalCandidates(
 }
 
 /**
+ * SUP-14923 / ADR-073 D3. Candidate selector for the on-demand
+ * stage-integrity audit route. Unlike {@link findApprovalCandidates} it is
+ * gated on **status** rather than on the recorded approval + a linked open PR:
+ *
+ *   - no `lastDecisionOutcome = 'approved'` gate — a no-deliverable-head close
+ *     typically carries a null `executionState`, so that condition excludes it;
+ *   - no linked-`pull_request` EXISTS — the override fires precisely because
+ *     there is no PR, so that condition independently excludes it.
+ *
+ * Both complementary, non-overlapping controls of {@link findApprovalCandidates}
+ * therefore leave the class this audit must see entirely unexamined. This
+ * selector takes every terminal (`done`) issue in the company that carries a
+ * non-empty `executionPolicy.stages`, returning the same row shape
+ * {@link evaluateStageIntegrity} consumes (plus `completedAt`, which the caller
+ * uses to exclude pre-decision-table closes as indeterminate). It never
+ * re-implements the check: the caller feeds each row to
+ * {@link evaluateStageIntegrity} verbatim.
+ */
+export type StageIntegrityAuditCandidate = CandidateRow & {
+  completedAt: Date | null;
+};
+
+export async function findStageIntegrityAuditCandidates(
+  db: Db,
+  companyId: string,
+  limit?: number,
+): Promise<StageIntegrityAuditCandidate[]> {
+  const query = db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      identifier: issues.identifier,
+      createdByAgentId: issues.createdByAgentId,
+      createdByUserId: issues.createdByUserId,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
+      executionState: issues.executionState,
+      executionPolicy: issues.executionPolicy,
+      completedAt: issues.completedAt,
+    })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        eq(issues.status, "done"),
+        sql`${issues.identifier} is not null`,
+        sql`jsonb_typeof(${issues.executionPolicy} -> 'stages') = 'array'
+             and jsonb_array_length(${issues.executionPolicy} -> 'stages') > 0`,
+      ),
+    )
+    .orderBy(issues.identifier);
+
+  if (limit !== undefined && limit > 0) {
+    return query.limit(limit);
+  }
+  return query;
+}
+
+/**
  * ADR-073 / ADR-092 stage-integrity audit of the recorded approval. Returns a
  * skip verdict when the "approved" record is not backed by a real, non-self
  * decision: an auto-skipped review stage writes no decision row and lands in

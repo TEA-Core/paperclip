@@ -3681,6 +3681,34 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/audit/stage-integrity",
+  tags: ["activity"],
+  summary: "Audit terminal issues for stage-integrity violations (ADR-073, on-demand)",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      limit: z.coerce.number().int().min(1).max(100000).optional(),
+    }),
+  },
+  responses: {
+    200: r.ok(
+      z.array(
+        z.object({
+          identifier: z.string(),
+          id: z.string(),
+          reason: z.string(),
+          detail: z.string(),
+        }),
+      ),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/companies/{companyId}/activity",
   tags: ["activity"],

@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { z } from "zod";
+import { eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { issueExecutionDecisions } from "@paperclipai/db";
 import { normalizeIssueIdentifier } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { activityService, normalizeActivityLimit } from "../services/activity.js";
@@ -10,6 +12,10 @@ import { sanitizeRecord } from "../redaction.js";
 import { badRequest, forbidden } from "../errors.js";
 import { agentActionAuditService } from "../services/agent-action-audit.js";
 import { logActivity } from "../services/activity-log.js";
+import {
+  evaluateStageIntegrity,
+  findStageIntegrityAuditCandidates,
+} from "../services/approval-status-reconciler.js";
 
 /** Max rows a single CSV export will stream (guards against runaway exports). */
 const AUDIT_CSV_EXPORT_MAX_ROWS = 10_000;
@@ -121,6 +127,10 @@ const companyActivityQuerySchema = z.object({
   actorType: z.enum(["agent", "user", "system", "plugin"]).optional(),
   from: z.coerce.date().optional(),
   to: z.coerce.date().optional(),
+});
+
+const stageIntegrityAuditQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100000).optional(),
 });
 
 export function activityRoutes(db: Db) {
@@ -346,6 +356,71 @@ export function activityRoutes(db: Db) {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="agent-audit-${companyId}.csv"`);
     res.send(auditRowsToCsv(rows));
+  });
+
+  // SUP-14923 / ADR-073 D3. On-demand stage-integrity audit. Runs the existing
+  // evaluateStageIntegrity check over terminal issues WITHOUT the PR/approval
+  // gating of the reconciler's candidate scan, so a card that closed `done`
+  // through the no-deliverable-head override (no PR, typically a null
+  // executionState) is reachable. Report-only and on-demand: no recurring
+  // sweep, no per-issue activity row (AC6).
+  router.get("/companies/:companyId/audit/stage-integrity", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(await assertCompanyScopeReadAllowed(req, res, companyId))) return;
+
+    const parsedQuery = stageIntegrityAuditQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      throw badRequest("Invalid stage-integrity audit query", parsedQuery.error.issues);
+    }
+    const { limit } = parsedQuery.data;
+
+    // Pre-decision-table boundary: a close that predates the earliest
+    // issue_execution_decisions row in this company cannot be judged on the
+    // presence of a decision row — that mechanism did not yet record anything,
+    // so a missing row is indeterminate, not a finding.
+    const [minDecisionRow] = await db
+      .select({ earliest: sql`min(${issueExecutionDecisions.createdAt})` })
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.companyId, companyId));
+    const rawEarliest = minDecisionRow?.earliest ?? null;
+    let earliestDecisionMs: number | null = null;
+    if (rawEarliest instanceof Date) {
+      earliestDecisionMs = rawEarliest.getTime();
+    } else if (typeof rawEarliest === "string") {
+      earliestDecisionMs = Date.parse(rawEarliest);
+    }
+
+    const candidates = await findStageIntegrityAuditCandidates(db, companyId, limit);
+
+    const findings: Array<{
+      identifier: string;
+      id: string;
+      reason: string;
+      detail: string;
+    }> = [];
+    for (const row of candidates) {
+      if (
+        earliestDecisionMs !== null &&
+        row.completedAt !== null &&
+        row.completedAt.getTime() < earliestDecisionMs
+      ) {
+        continue;
+      }
+      const verdict = await evaluateStageIntegrity(db, row);
+      if (!verdict) continue;
+      // A lawfully auto-skipped stage writes no decision row on purpose
+      // (skippedStageIds); that is not a stage-integrity finding.
+      if (verdict.reason === "guard-b:skipped-stage") continue;
+      findings.push({
+        identifier: row.identifier ?? row.id,
+        id: row.id,
+        reason: verdict.reason,
+        detail: verdict.detail,
+      });
+    }
+
+    res.json(findings);
   });
 
   router.post("/companies/:companyId/activity", validate(createActivitySchema), async (req, res) => {
