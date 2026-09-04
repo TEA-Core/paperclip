@@ -208,6 +208,58 @@ export function externalObjectDisplayLabel(
 }
 
 /**
+ * Doctrine soft cap on delivered net LOC per card (decomposition.md). A PR that
+ * ships more than this in a single card is a sizing smell worth a look. This is
+ * observability only — the figure is emphasised, never gated (SUP-14813).
+ */
+export const DOCTRINE_NET_LOC_SOFT_CAP = 400;
+
+export interface DeliveredNetLocFigure {
+  additions: number;
+  deletions: number;
+  /** `additions - deletions`. May be negative for a net-deletion PR. */
+  net: number;
+  /** Human-readable figure, e.g. `"+220/-1 net +219"`. */
+  label: string;
+  /** True when `net` exceeds the doctrine soft cap. Drives emphasis only. */
+  exceedsDoctrineSoftCap: boolean;
+  /** Doctrine-reference copy for a `title` when the soft cap is exceeded. */
+  doctrineNote: string;
+}
+
+function signedNetLoc(net: number): string {
+  if (net > 0) return `+${net}`;
+  if (net < 0) return `${net}`;
+  return "0";
+}
+
+/**
+ * Derive the delivered net LOC for a GitHub PR from the snapshot `data` blob.
+ * Returns `null` unless BOTH `additions` and `deletions` are present numbers, so
+ * a missing measurement never renders as `0`. A genuine zero-diff
+ * (`additions: 0, deletions: 0`) returns a figure with `net: 0` and does render.
+ * Mirrors the server-side invariant in `pr-delivery.ts` (`deliveredLocMetadata`).
+ */
+export function formatDeliveredNetLoc(
+  data: Record<string, unknown> | null | undefined,
+): DeliveredNetLocFigure | null {
+  if (!data) return null;
+  const additions = data.additions;
+  const deletions = data.deletions;
+  if (typeof additions !== "number" || typeof deletions !== "number") return null;
+  if (!Number.isFinite(additions) || !Number.isFinite(deletions)) return null;
+  const net = additions - deletions;
+  return {
+    additions,
+    deletions,
+    net,
+    label: `+${additions}/-${deletions} net ${signedNetLoc(net)}`,
+    exceedsDoctrineSoftCap: net > DOCTRINE_NET_LOC_SOFT_CAP,
+    doctrineNote: `Net LOC ${net} exceeds the doctrine soft cap of ${DOCTRINE_NET_LOC_SOFT_CAP} net LOC per card (decomposition.md; SUP-14813). Observability only - not a gate.`,
+  };
+}
+
+/**
  * Sort summary items by severity-first ordering: danger → warning → info →
  * success → muted/neutral. Within a tone, items keep their incoming order so
  * server-side ordering (e.g. most recent change first) is preserved.
