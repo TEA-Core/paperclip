@@ -637,9 +637,11 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
  * The card is created as a user actor (the escalated human), not the reviewer
  * agent: a set `createdByAgentId` would make `acceptRequestConfirmation` bounce
  * the issue back to the creator agent on accept, undoing the escalation. With
- * `createdByUserId` set and `createdByAgentId` null, accepting resolves the card
- * in place. `human_only` keeps it resolvable only by a human; `wake_assignee`
- * re-surfaces it to the assignee on both accept and reject.
+ * `createdByUserId` set and `createdByAgentId` null, the release stays with the
+ * escalated human. `human_only` keeps it resolvable only by a human; `wake_assignee`
+ * re-surfaces it to the assignee on both accept and reject. SUP-14919: resolving
+ * the confirmation now ALSO records the stage decision and hands the card back to
+ * `executionState.returnAssignee`, so the wake has an agent assignee to land on.
  */
 async function mintReviewEscalationInteraction(args: {
   db: Db;
@@ -667,8 +669,8 @@ async function mintReviewEscalationInteraction(args: {
     `Reviewer's recorded decision:`,
     `> ${decisionBody}`,
     ``,
-    `Your decision (route: \`PATCH /issues/:id\`):`,
-    `- Approve and advance the stage.`,
+    `Your decision (respond on this confirmation):`,
+    `- Approve & advance: accepts the confirmation and advances the review stage.`,
     `- Request changes again — this resets the round counter to 0 (a human send-back does not burn a round).`,
     `- Re-scope the issue.`,
     ``,
@@ -700,6 +702,124 @@ async function mintReviewEscalationInteraction(args: {
       userId: escalation.escalatedToUserId,
     },
   );
+}
+
+const REVIEW_ESCALATION_INTERACTION_KEY_PREFIX = "review-escalation:";
+const REVIEW_ESCALATION_APPROVED_DECISION_BODY =
+  "Review approved via the round-cap escalation.";
+
+type ReviewEscalationDecisionIssue = {
+  id: string;
+  companyId: string;
+  status: string;
+  assigneeAgentId?: string | null;
+  assigneeUserId?: string | null;
+  responsibleUserId?: string | null;
+  createdByUserId?: string | null;
+  executionPolicy?: Record<string, unknown> | null;
+  executionState?: Record<string, unknown> | null;
+};
+
+function isReviewEscalationInteraction(interaction: { idempotencyKey?: string | null }): boolean {
+  return interaction.idempotencyKey?.startsWith(REVIEW_ESCALATION_INTERACTION_KEY_PREFIX) ?? false;
+}
+
+/**
+ * SUP-14919: a review round-cap escalation is resolved on an interaction (accept
+ * or reject) rather than through a PATCH, but the stage's decision must still be
+ * recorded and the card handed to its return assignee. Without this the
+ * confirmation resolves in a void: no `issue_execution_decisions` row is written,
+ * `assigneeAgentId` stays null, and `queueResolvedInteractionContinuationWakeup`
+ * wakes nobody — the card strands permanently.
+ *
+ * Runs the pure execution-policy transition as the escalated human, stamps the
+ * decision id onto the patched state, then in one transaction inserts the
+ * decision row and applies the patch. For a final-stage approval the engine
+ * completes every stage without touching the issue status, so the card is routed
+ * back to its return assignee in_progress — matching what a changes-requested
+ * hand-back produces and what the issue's continuation wake expects.
+ */
+async function applyReviewEscalationDecision(args: {
+  db: Db;
+  issue: ReviewEscalationDecisionIssue;
+  requestedStatus: "done" | "in_progress";
+  decisionBody: string;
+  actor: { agentId: string | null; userId: string | null; runId: string | null };
+}): Promise<{
+  id: string;
+  status: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+} | null> {
+  const { db, issue, requestedStatus, decisionBody, actor } = args;
+  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+  const existingState = parseIssueExecutionState(issue.executionState);
+  if (!policy || !existingState) return null;
+
+  const transition = applyIssueExecutionPolicyTransition({
+    issue,
+    policy,
+    previousPolicy: policy,
+    requestedStatus,
+    requestedAssigneePatch: {},
+    actor,
+    commentBody: decisionBody,
+  });
+  if (!transition.decision) return null;
+  const decisionId = randomUUID();
+  const nextExecutionState = transition.patch.executionState;
+  if (!nextExecutionState || typeof nextExecutionState !== "object") {
+    throw new Error("Review escalation decision patch is missing executionState");
+  }
+  const updateFields: Record<string, unknown> = {
+    ...transition.patch,
+    executionState: {
+      ...(nextExecutionState as Record<string, unknown>),
+      lastDecisionId: decisionId,
+    },
+  };
+  // A final-stage approval completes every execution stage; the engine leaves the
+  // issue status untouched, so route the card back to its return assignee to close.
+  if (requestedStatus === "done" && updateFields.status === undefined) {
+    const returnAssignee = existingState.returnAssignee ?? null;
+    updateFields.status = "in_progress";
+    if (returnAssignee?.type === "agent") {
+      updateFields.assigneeAgentId = returnAssignee.agentId ?? null;
+      updateFields.assigneeUserId = null;
+    } else if (returnAssignee?.type === "user") {
+      updateFields.assigneeAgentId = null;
+      updateFields.assigneeUserId = returnAssignee.userId ?? null;
+    }
+  }
+  updateFields.actorAgentId = actor.agentId ?? null;
+  updateFields.actorUserId = actor.userId ?? null;
+
+  await db.transaction(async (tx) => {
+    await tx.insert(issueExecutionDecisions).values({
+      id: decisionId,
+      companyId: issue.companyId,
+      issueId: issue.id,
+      stageId: transition.decision!.stageId,
+      stageType: transition.decision!.stageType,
+      actorAgentId: actor.agentId ?? null,
+      actorUserId: actor.userId ?? null,
+      outcome: transition.decision!.outcome,
+      body: transition.decision!.body,
+      createdByRunId: actor.runId ?? null,
+    });
+    await issueService(db).update(
+      issue.id,
+      updateFields,
+      tx,
+    );
+  });
+
+  return {
+    id: issue.id,
+    status: updateFields.status as string,
+    assigneeAgentId: (updateFields.assigneeAgentId as string | null) ?? null,
+    assigneeUserId: (updateFields.assigneeUserId as string | null) ?? null,
+  };
 }
 
 async function auditAgentIssueCreateAttributionSpoof(input: {
@@ -13460,6 +13580,32 @@ export function issueRoutes(
         resolverPolicyRestriction: resolutionAuthorization.resolverPolicyRestriction,
         suggestedTaskEffectsAuthorized,
       });
+      let resolvedContinuationIssue = continuationIssue;
+      // SUP-14919: accepting a review round-cap escalation resolves the stage as
+      // a decision instead of vanishing. The interaction's own resolution leaves
+      // the card with a null assignee and no wake target, so record the approval
+      // and route the card back to its return assignee before the continuation
+      // wake below.
+      if (
+        interaction.kind === "request_confirmation"
+        && interaction.status === "accepted"
+        && isReviewEscalationInteraction(current)
+      ) {
+        const escalationResolution = await applyReviewEscalationDecision({
+          db,
+          issue,
+          requestedStatus: "done",
+          decisionBody: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
+          actor: {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+            runId: actor.runId,
+          },
+        });
+        if (escalationResolution) {
+          resolvedContinuationIssue = escalationResolution;
+        }
+      }
       const toolAction = interaction.payload && typeof interaction.payload === "object"
         ? (interaction.payload as { toolAction?: { actionRequestId?: unknown } }).toolAction
         : null;
@@ -13577,7 +13723,7 @@ export function issueRoutes(
           }
         }
       }
-      const continuationWakeIssue = continuationIssue ?? issue;
+      const continuationWakeIssue = resolvedContinuationIssue ?? issue;
 
       await logActivity(db, {
         companyId: issue.companyId,
@@ -13612,7 +13758,7 @@ export function issueRoutes(
         },
       });
 
-      if (continuationIssue) {
+      if (resolvedContinuationIssue) {
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: actor.actorType,
@@ -13625,9 +13771,9 @@ export function issueRoutes(
           entityId: issue.id,
           details: {
             identifier: issue.identifier,
-            status: continuationIssue.status,
-            assigneeAgentId: continuationIssue.assigneeAgentId ?? null,
-            assigneeUserId: continuationIssue.assigneeUserId ?? null,
+            status: resolvedContinuationIssue.status,
+            assigneeAgentId: resolvedContinuationIssue.assigneeAgentId ?? null,
+            assigneeUserId: resolvedContinuationIssue.assigneeUserId ?? null,
             source: "request_confirmation_accept",
             interactionId: interaction.id,
             _previous: {
@@ -13689,7 +13835,7 @@ export function issueRoutes(
         interactionId,
       );
       if (!authorizedResolution) return;
-      const { interactionSvc, resolutionAuthorization } = authorizedResolution;
+      const { interactionSvc, current, resolutionAuthorization } = authorizedResolution;
 
       const actor = getActorInfo(req);
       const interaction = await interactionSvc.rejectInteraction(issue, interactionId, req.body, {
@@ -13698,6 +13844,39 @@ export function issueRoutes(
         userId: actor.actorType === "user" ? actor.actorId : null,
         resolverPolicyRestriction: resolutionAuthorization.resolverPolicyRestriction,
       });
+      let resolvedContinuationIssue: {
+        id: string;
+        status: string;
+        assigneeAgentId: string | null;
+        assigneeUserId: string | null;
+      } | null = null;
+      // SUP-14919: rejecting a review round-cap escalation records a
+      // changes-requested decision and hands the card back to its return
+      // assignee so the continuation wake below has an agent to wake.
+      if (
+        interaction.kind === "request_confirmation"
+        && interaction.status === "rejected"
+        && isReviewEscalationInteraction(current)
+      ) {
+        const reason =
+          typeof interaction.result?.reason === "string" && interaction.result.reason.trim().length > 0
+            ? interaction.result.reason.trim()
+            : "Review changes requested via the round-cap escalation.";
+        const escalationResolution = await applyReviewEscalationDecision({
+          db,
+          issue,
+          requestedStatus: "in_progress",
+          decisionBody: reason,
+          actor: {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+            runId: actor.runId,
+          },
+        });
+        if (escalationResolution) {
+          resolvedContinuationIssue = escalationResolution;
+        }
+      }
 
       await logActivity(db, {
         companyId: issue.companyId,
@@ -13733,7 +13912,9 @@ export function issueRoutes(
       await queueResolvedInteractionContinuationWakeup({
         db,
         heartbeat,
-        issue,
+        issue: resolvedContinuationIssue
+          ? { ...resolvedContinuationIssue, companyId: issue.companyId }
+          : issue,
         interaction,
         actor,
         source: "issue.interaction.reject",
