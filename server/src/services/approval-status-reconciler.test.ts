@@ -64,6 +64,7 @@ const AGENT_CREATOR = "44444444-4444-4444-4444-444444444444";
 const USER_REVIEWER = "reviewer-user";
 
 const PR_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/42";
+const OPEN_PRS_LIST_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100";
 const PR_43_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/43";
 const PR_44_URL = "https://api.github.com/repos/TEA-Core/paperclip/pulls/44";
 const COMBINED_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/status`;
@@ -445,6 +446,115 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       // so no PR warning.
       expect(postCommentCalls()).toHaveLength(0);
       expect(summary.voidWarnings).toBe(0);
+    });
+
+    it("scans and evaluates the head of a zero-mention approved card via live workspace discovery (AC1)", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      // NO external-object mention at all — the SUP-14737 / PR 455 shape. The card
+      // still carries an approval anchor (approvedState().approvalStatus.publishedHeadSha)
+      // and a delivery identity, so the widened candidate SQL now surfaces it.
+      await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        // The shared resolver's live open-PR list probe discovers PR 42 by its
+        // delivery branch (SUP-42-branch contains the card's identifier).
+        {
+          url: OPEN_PRS_LIST_URL,
+          body: [
+            { number: 42, draft: false, head: { ref: "SUP-42-branch" }, title: "Unify PR resolution (SUP-42)", body: null },
+          ],
+        },
+        // The reconciler then reads the discovered PR and its head combined status.
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.scanned).toBe(1);
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(Object.keys(summary.skipped)).toEqual([]);
+
+      const calls = postStatusCalls();
+      expect(calls).toHaveLength(1);
+      expect(calls[0]![0]).toBe(POST_STATUS_URL);
+      expect(postStatusBodies()[0]).toMatchObject({
+        state: "success",
+        context: PAPERCLIP_APPROVED,
+        description: "SUP-42 approved via Paperclip",
+      });
+    });
+
+    it("defers (not a permanent no-open-pr) when live workspace discovery fails terminally for a zero-mention card", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        // Live discovery 404s — terminal for this tick, but NOT the no-open-pr wedge.
+        { url: OPEN_PRS_LIST_URL, ok: false, status: 404, body: { message: "Not Found" } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.scanned).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["pr-undetermined"]).toBe(1);
+      expect(summary.skipped["no-open-pr"]).toBeUndefined();
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
+    it("still refuses a newly-reachable zero-mention card under Guard A when the head moved (AC5)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      // Zero mentions + a delivery identity: the widened SQL + live discovery make
+      // this card scannable, but Guard A must still refuse the moved head.
+      await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        {
+          url: OPEN_PRS_LIST_URL,
+          body: [
+            { number: 42, draft: false, head: { ref: "SUP-42-branch" }, title: "Unify PR resolution (SUP-42)", body: null },
+          ],
+        },
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        {
+          url: APPROVED_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 1,
+            files: [{ filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000000000001", status: "modified" }],
+          },
+        },
+        {
+          url: LIVE_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 2,
+            files: [{ filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000000000002", status: "modified" }],
+          },
+        },
+        { url: COMMENT_LIST_URL, body: [] },
+        { url: COMMENT_POST_URL, body: { id: 9001 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      // Scanned (the discovery widening works) but NOT published — Guard A holds.
+      expect(summary.scanned).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
     });
 
     it("performs zero writes when the head already carries paperclip/approved=success", async () => {

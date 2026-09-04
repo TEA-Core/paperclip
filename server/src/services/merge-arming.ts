@@ -369,6 +369,391 @@ export async function resolveLinkedPullRequestsWithState(
   return results;
 }
 
+// ---------------------------------------------------------------------------
+// SUP-14917: card pull-request resolution.
+//
+// A card's PR could be resolved two ways that lived in DIFFERENT places:
+//   - merge-arming's zero-mention live re-resolve (derive the repo pair from the
+//     card's own workspace context and ask GitHub for open PRs naming the
+//     card's identifier), and
+//   - the approval-status reconciler / done-close-landing backstop, which only
+//     looked at cached external-object mentions and therefore could NOT see a
+//     card whose PR was delivered from a workspace with zero external-object
+//     mentions ever posted (the SUP-14737 / PR 455 shape).
+// This unifies the live discovery into one function the three call sites share,
+// so they can no longer disagree about WHICH PR a card delivered.
+// ---------------------------------------------------------------------------
+
+/**
+ * One open PR discovered by the shared live workspace re-resolve, tagged with
+ * the token candidate that read it so a caller can issue a follow-up (head SHA,
+ * commit-status write) under the same credential.
+ */
+export interface WorkspacePullRequestMatch {
+  owner: string;
+  repo: string;
+  number: number;
+  displayName: string;
+  headRefName: string | null;
+  candidate: GitHubTokenResolution;
+}
+
+/**
+ * A terminal failure of the shared live workspace discovery, captured as DATA
+ * (not an outcome) so each caller maps it to ITS OWN message/verdict form
+ * (publishApprovalStatus's `status:failed:` strings vs
+ * resolveApprovalDecisionHead's bare reasons) without the discovery code
+ * knowing either format.
+ */
+export interface WorkspaceDiscoveryFailure {
+  owner: string;
+  repo: string;
+  /** GitHub HTTP status; -1 sentinel for the no-token case. */
+  status: number;
+  message: string | null;
+  /** True when no usable token candidate resolved for the pair. */
+  noToken: boolean;
+  /** tokenResult.reason when noToken && !isGitHubTokenResolution. */
+  tokenReason: string | null;
+  /** True when noToken && isGitHubTokenResolution ("no GitHub token resolvable"). */
+  tokenUnresolvable: boolean;
+  /** Terminal 401/403 candidate's scope/secretName (single-candidate suffix form). */
+  terminalScope: string | null;
+  terminalSecretName: string | null;
+  /** `${scope}/${secretName}` per candidate, for the multi-candidate "(tried: ...)" form. */
+  tried: string[];
+  /** Number of token candidates at the failure point (single vs multi). */
+  candidateCount: number;
+}
+
+export interface WorkspaceDiscoveryResult {
+  matched: WorkspacePullRequestMatch[];
+  terminalFailure: WorkspaceDiscoveryFailure | null;
+}
+
+/**
+ * SUP-14917: the shared live workspace re-resolve. Derives candidate
+ * owner/repo pairs from the card's cached mentions (any state) and, when there
+ * are none, from the card's own repo context (closing transitions only). For
+ * each pair it walks the resolvable GitHub token candidates and asks GitHub for
+ * open, non-draft PRs whose head ref / title / body names the card's
+ * identifier. This is EXACTLY the loop merge-arming's two zero-mention
+ * fallbacks used to inline; it now returns the matches + a terminal failure as
+ * data so all three call sites share one discovery algorithm.
+ *
+ * `withState` is the card's cached external-object PR rows in ALL states
+ * (drafts already dropped) — the caller resolves them so the discovery derives
+ * pairs without a second query and so `resolveCardPullRequest` can cross-check
+ * the mention set against the live result.
+ */
+async function discoverCardPullRequestByWorkspace(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  issueIdentifier: string,
+  closingTransition: boolean,
+  withState: LinkedPullRequest[],
+): Promise<WorkspaceDiscoveryResult> {
+  const pairs: Array<{ owner: string; repo: string }> = [];
+  const seenPairs = new Set<string>();
+  for (const row of withState) {
+    const key = `${row.owner.toLowerCase()}/${row.repo.toLowerCase()}`;
+    if (seenPairs.has(key)) continue;
+    seenPairs.add(key);
+    pairs.push({ owner: row.owner, repo: row.repo });
+  }
+
+  if (pairs.length === 0 && closingTransition) {
+    const [issueRow] = await db
+      .select({
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+        executionWorkspaceId: issues.executionWorkspaceId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const ctx = await resolveIssueRepoContext(db, {
+      companyId,
+      projectId: issueRow?.projectId ?? null,
+      projectWorkspaceId: issueRow?.projectWorkspaceId ?? null,
+      executionWorkspaceId: issueRow?.executionWorkspaceId ?? null,
+    });
+    const parsed = ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null;
+    if (parsed) pairs.push({ owner: parsed.owner, repo: parsed.repo });
+  }
+
+  const needle = issueIdentifier.toLowerCase();
+  const matched: WorkspacePullRequestMatch[] = [];
+  let terminalFailure: WorkspaceDiscoveryFailure | null = null;
+
+  for (const pair of pairs) {
+    const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pair.owner, pair.repo);
+    if (candidates.length === 0) {
+      const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pair.owner, pair.repo);
+      const unresolvable = isGitHubTokenResolution(tokenResult);
+      terminalFailure = {
+        owner: pair.owner,
+        repo: pair.repo,
+        status: -1,
+        message: null,
+        noToken: true,
+        tokenUnresolvable: unresolvable,
+        tokenReason: unresolvable ? null : tokenResult.reason,
+        terminalScope: null,
+        terminalSecretName: null,
+        tried: [],
+        candidateCount: 0,
+      };
+      break;
+    }
+
+    for (const candidate of candidates) {
+      const listResult = await fetchOpenPullRequests(candidate.token, pair.owner, pair.repo);
+      if (!listResult.ok) {
+        const { status, message } = listResult;
+        const isLast = candidate === candidates[candidates.length - 1];
+        const tried = candidates.map((c) => `${c.scope}/${c.secretName}`);
+        if (status === 401 || status === 403) {
+          if (isLast) {
+            terminalFailure = {
+              owner: pair.owner,
+              repo: pair.repo,
+              status,
+              message,
+              noToken: false,
+              tokenUnresolvable: false,
+              tokenReason: null,
+              terminalScope: candidate.scope,
+              terminalSecretName: candidate.secretName,
+              tried,
+              candidateCount: candidates.length,
+            };
+          }
+          if (!isLast) continue;
+        } else {
+          terminalFailure = {
+            owner: pair.owner,
+            repo: pair.repo,
+            status,
+            message,
+            noToken: false,
+            tokenUnresolvable: false,
+            tokenReason: null,
+            terminalScope: null,
+            terminalSecretName: null,
+            tried,
+            candidateCount: candidates.length,
+          };
+        }
+        break;
+      }
+
+      for (const item of listResult.items) {
+        if (item.draft === true) continue;
+        const headRef = (item.headRef ?? "").toLowerCase();
+        const title = (item.title ?? "").toLowerCase();
+        const body = (item.body ?? "").toLowerCase();
+        if (!headRef.includes(needle) && !title.includes(needle) && !body.includes(needle)) continue;
+        matched.push({
+          owner: pair.owner,
+          repo: pair.repo,
+          number: item.number,
+          displayName: `${pair.owner}/${pair.repo}#${item.number}`,
+          headRefName: item.headRef ?? null,
+          candidate,
+        });
+      }
+      break;
+    }
+    if (terminalFailure) break;
+  }
+
+  return { matched, terminalFailure };
+}
+
+/**
+ * SUP-14917: map a shared live-discovery terminal failure to
+ * publishApprovalStatus's `status:failed:` outcome form. Byte-identical to the
+ * strings the publisher used to emit inline, so the publisher's message
+ * contract is unchanged whether or not the discovery is extracted.
+ */
+function armingFailureFromWorkspaceDiscovery(f: WorkspaceDiscoveryFailure): ArmingOutcome {
+  if (f.noToken) {
+    if (f.tokenUnresolvable) {
+      return {
+        kind: "failed",
+        message: `status:failed:auth_required: No GitHub token resolvable for ${f.owner}/${f.repo} (scope=null, secretName=null)`,
+      };
+    }
+    return {
+      kind: "failed",
+      message: `status:failed:auth_required: ${f.tokenReason} (scope=null, secretName=null)`,
+    };
+  }
+  if (f.status === 404) {
+    return { kind: "failed", message: `status:failed:pr_not_found: HTTP 404 ${f.message ?? ""}` };
+  }
+  if (f.status === 429) {
+    return { kind: "failed", message: `status:failed:pr_rate_limited: HTTP 429 ${f.message ?? ""}` };
+  }
+  if (f.status === 0) {
+    return { kind: "failed", message: `status:failed:pr_network: ${f.message ?? "network_error"}` };
+  }
+  if (f.status === 401 || f.status === 403) {
+    if (f.candidateCount === 1) {
+      return {
+        kind: "failed",
+        message: `status:failed:pr_auth: HTTP ${f.status} ${f.message ?? ""} (scope=${f.terminalScope}, secretName=${f.terminalSecretName})`,
+      };
+    }
+    return {
+      kind: "failed",
+      message: `status:failed:pr_auth: HTTP ${f.status} ${f.message ?? ""} (tried: ${f.tried.join(", ")})`,
+    };
+  }
+  return { kind: "failed", message: `status:failed:pr_error: HTTP ${f.status} ${f.message ?? ""}` };
+}
+
+/**
+ * SUP-14917: map a shared live-discovery terminal failure to
+ * resolveApprovalDecisionHead's bare `reason` form. These are deliberately
+ * SHORTER than the publisher's strings (no `status:failed:` prefix, no
+ * scope/secretName suffix, no `${message}` on 404/429) — matching the
+ * resolver's existing reason contract byte-for-byte.
+ */
+function decisionHeadFailureFromWorkspaceDiscovery(f: WorkspaceDiscoveryFailure): DecisionHeadResolution {
+  if (f.noToken) {
+    if (f.tokenUnresolvable) {
+      return {
+        kind: "unresolvable",
+        reason: `auth_required: no GitHub token resolvable for ${f.owner}/${f.repo}`,
+      };
+    }
+    return { kind: "unresolvable", reason: `auth_required: ${f.tokenReason}` };
+  }
+  if (f.status === 404) return { kind: "unresolvable", reason: "pr_not_found: HTTP 404" };
+  if (f.status === 429) return { kind: "unresolvable", reason: "pr_rate_limited: HTTP 429" };
+  if (f.status === 0) {
+    return { kind: "unresolvable", reason: `pr_network: ${f.message ?? "network_error"}` };
+  }
+  if (f.status === 401 || f.status === 403) {
+    return { kind: "unresolvable", reason: `pr_auth: HTTP ${f.status} ${f.message ?? ""}` };
+  }
+  return { kind: "unresolvable", reason: `pr_error: HTTP ${f.status} ${f.message ?? ""}` };
+}
+
+/**
+ * SUP-14917: the card-level "which PR did this card deliver?" verdict, shared by
+ * the approval-status reconciler and the done-close-landing backstop so they can
+ * no longer disagree with merge-arming about the card's PR.
+ *
+ *   - mention-resolved: the cached OPEN-mention set is authoritative. Exactly one
+ *     open mention -> `single` (source "mention"); more than one -> `ambiguous`.
+ *     NO live GitHub call is made on this path.
+ *   - workspace-resolved: zero cached open mentions -> run the shared live
+ *     workspace discovery. A terminal live failure -> `undetermined` (the caller
+ *     skips transiently, never treats it as "no PR"); zero matches -> `none`;
+ *     one match with no conflicting cached mention -> `single` (source
+ *     "workspace"); two or more matches, or a cached mention (closed/unhydrated)
+ *     that DISAGREES with the single live match -> `ambiguous` (AC4).
+ */
+export type CardPullRequestResolution =
+  | {
+      kind: "single";
+      owner: string;
+      repo: string;
+      number: number;
+      displayName: string;
+      headRefName: string | null;
+      source: "mention" | "workspace";
+    }
+  | { kind: "ambiguous"; reason: string; displayNames: string[] }
+  | { kind: "none" }
+  | { kind: "undetermined"; reason: string; failure: WorkspaceDiscoveryFailure };
+
+export async function resolveCardPullRequest(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  issueIdentifier: string,
+  options: { closingTransition?: boolean } = {},
+): Promise<CardPullRequestResolution> {
+  const openMentions = await resolveLinkedPullRequests(db, companyId, issueId);
+
+  if (openMentions.length > 0) {
+    if (openMentions.length === 1) {
+      const pr = openMentions[0]!;
+      return {
+        kind: "single",
+        owner: pr.owner,
+        repo: pr.repo,
+        number: pr.number,
+        displayName: pr.displayName,
+        headRefName: pr.headRefName,
+        source: "mention",
+      };
+    }
+    return {
+      kind: "ambiguous",
+      reason: "multiple-cached-open-mentions",
+      displayNames: openMentions.map((pr) => pr.displayName),
+    };
+  }
+
+  const withState = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+  const discovery = await discoverCardPullRequestByWorkspace(
+    db,
+    companyId,
+    issueId,
+    issueIdentifier,
+    options.closingTransition ?? true,
+    withState,
+  );
+  if (discovery.terminalFailure) {
+    return {
+      kind: "undetermined",
+      reason: "live-discovery-failed",
+      failure: discovery.terminalFailure,
+    };
+  }
+  if (discovery.matched.length === 0) {
+    return { kind: "none" };
+  }
+  if (discovery.matched.length > 1) {
+    return {
+      kind: "ambiguous",
+      reason: "multiple-live-matches",
+      displayNames: discovery.matched.map((pr) => pr.displayName),
+    };
+  }
+
+  const single = discovery.matched[0]!;
+  const singleKey = `${single.owner.toLowerCase()}/${single.repo.toLowerCase()}#${single.number}`;
+  // AC4: a cached mention (closed or unhydrated — hence filtered out of the open
+  // set above) that points at a DIFFERENT PR than the one the live workspace
+  // discovery found means the mention-resolved and workspace-resolved answers
+  // disagree. That is ambiguous, not a single.
+  for (const row of withState) {
+    const key = `${row.owner.toLowerCase()}/${row.repo.toLowerCase()}#${row.number}`;
+    if (key !== singleKey && row.cachedState !== "open") {
+      return {
+        kind: "ambiguous",
+        reason: "mention-workspace-disagreement",
+        displayNames: [single.displayName, row.displayName],
+      };
+    }
+  }
+  return {
+    kind: "single",
+    owner: single.owner,
+    repo: single.repo,
+    number: single.number,
+    displayName: single.displayName,
+    headRefName: single.headRefName,
+    source: "workspace",
+  };
+}
+
 export interface GitHubFetchResult {
   ok: boolean;
   status: number;
@@ -857,118 +1242,23 @@ export async function publishApprovalStatus(
     // that carry the issue identifier before giving up.
     const withState = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
 
-    const pairs: Array<{ owner: string; repo: string }> = [];
-    const seenPairs = new Set<string>();
-    for (const row of withState) {
-      const key = `${row.owner.toLowerCase()}/${row.repo.toLowerCase()}`;
-      if (seenPairs.has(key)) continue;
-      seenPairs.add(key);
-      pairs.push({ owner: row.owner, repo: row.repo });
+    // SUP-14917: the shared live workspace re-resolve (formerly inlined here).
+    // It returns the matches + a terminal failure as data, so this publisher maps
+    // the failure to its own `status:failed:` strings via
+    // armingFailureFromWorkspaceDiscovery — the same strings the inline loop
+    // used to emit, byte-for-byte.
+    const discovery = await discoverCardPullRequestByWorkspace(
+      db,
+      companyId,
+      issueId,
+      issueIdentifier,
+      options?.closingTransition ?? true,
+      withState,
+    );
+    if (discovery.terminalFailure) {
+      return armingFailureFromWorkspaceDiscovery(discovery.terminalFailure);
     }
-
-    if (pairs.length === 0 && (options?.closingTransition ?? true)) {
-      // SUP-13831: zero cached mention rows (the PR was never posted with its
-      // full URL in-thread) leave the live re-resolve with no owner/repo pair
-      // to ask GitHub. Derive one from the issue's own repo context instead of
-      // giving up with skipped:no-pr. This is a delivery probe, so it runs
-      // only for closing transitions (closingTransition); a stage approval
-      // that advances to a LATER stage must make no delivery probe at all.
-      const [issueRow] = await db
-        .select({
-          projectId: issues.projectId,
-          projectWorkspaceId: issues.projectWorkspaceId,
-          executionWorkspaceId: issues.executionWorkspaceId,
-        })
-        .from(issues)
-        .where(eq(issues.id, issueId));
-      const ctx = await resolveIssueRepoContext(db, {
-        companyId,
-        projectId: issueRow?.projectId ?? null,
-        projectWorkspaceId: issueRow?.projectWorkspaceId ?? null,
-        executionWorkspaceId: issueRow?.executionWorkspaceId ?? null,
-      });
-      const parsed = ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null;
-      if (parsed) {
-        pairs.push({ owner: parsed.owner, repo: parsed.repo });
-      }
-    }
-
-    let matched: Array<{
-      owner: string;
-      repo: string;
-      number: number;
-      displayName: string;
-      headRefName: string | null;
-      candidate: GitHubTokenResolution;
-    }> = [];
-    const needle = issueIdentifier.toLowerCase();
-
-    for (const pair of pairs) {
-      const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pair.owner, pair.repo);
-      if (candidates.length === 0) {
-        const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pair.owner, pair.repo);
-        if (!isGitHubTokenResolution(tokenResult)) {
-          return {
-            kind: "failed",
-            message: `status:failed:auth_required: ${tokenResult.reason} (scope=null, secretName=null)`,
-          };
-        }
-        return {
-          kind: "failed",
-          message: `status:failed:auth_required: No GitHub token resolvable for ${pair.owner}/${pair.repo} (scope=null, secretName=null)`,
-        };
-      }
-
-      for (const candidate of candidates) {
-        const listResult = await fetchOpenPullRequests(candidate.token, pair.owner, pair.repo);
-        if (!listResult.ok) {
-          const { status, message } = listResult;
-          if (status === 401 || status === 403) {
-            if (candidate === candidates[candidates.length - 1]) {
-              if (candidates.length === 1) {
-                return {
-                  kind: "failed",
-                  message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""} (scope=${candidate.scope}, secretName=${candidate.secretName})`,
-                };
-              }
-              const tried = candidates.map((c) => `${c.scope}/${c.secretName}`).join(", ");
-              return {
-                kind: "failed",
-                message: `status:failed:pr_auth: HTTP ${status} ${message ?? ""} (tried: ${tried})`,
-              };
-            }
-            continue;
-          }
-          if (status === 404) {
-            return { kind: "failed", message: `status:failed:pr_not_found: HTTP 404 ${message ?? ""}` };
-          }
-          if (status === 429) {
-            return { kind: "failed", message: `status:failed:pr_rate_limited: HTTP 429 ${message ?? ""}` };
-          }
-          if (status === 0) {
-            return { kind: "failed", message: `status:failed:pr_network: ${message ?? "network_error"}` };
-          }
-          return { kind: "failed", message: `status:failed:pr_error: HTTP ${status} ${message ?? ""}` };
-        }
-
-        for (const item of listResult.items) {
-          if (item.draft === true) continue;
-          const headRef = (item.headRef ?? "").toLowerCase();
-          const title = (item.title ?? "").toLowerCase();
-          const body = (item.body ?? "").toLowerCase();
-          if (!headRef.includes(needle) && !title.includes(needle) && !body.includes(needle)) continue;
-          matched.push({
-            owner: pair.owner,
-            repo: pair.repo,
-            number: item.number,
-            displayName: `${pair.owner}/${pair.repo}#${item.number}`,
-            headRefName: item.headRef ?? null,
-            candidate,
-          });
-        }
-        break;
-      }
-    }
+    let matched = discovery.matched;
 
     // ADR-091 D1 (SUP-14676): the live-discovery candidates above are matched by
     // identifier SUBSTRING on head ref / title / body — pure citation. They are
@@ -1291,84 +1581,24 @@ export async function resolveApprovalDecisionHead(
   // Zero cached linked PRs: mirror publishApprovalStatus's live re-resolve so
   // the decision-time head matches what the publish would have resolved.
   const withState = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
-  const pairs: Array<{ owner: string; repo: string }> = [];
-  const seenPairs = new Set<string>();
-  for (const row of withState) {
-    const key = `${row.owner.toLowerCase()}/${row.repo.toLowerCase()}`;
-    if (seenPairs.has(key)) continue;
-    seenPairs.add(key);
-    pairs.push({ owner: row.owner, repo: row.repo });
-  }
 
-  if (pairs.length === 0 && closingTransition) {
-    const [issueRow] = await db
-      .select({
-        projectId: issues.projectId,
-        projectWorkspaceId: issues.projectWorkspaceId,
-        executionWorkspaceId: issues.executionWorkspaceId,
-      })
-      .from(issues)
-      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
-    const ctx = await resolveIssueRepoContext(db, {
-      companyId,
-      projectId: issueRow?.projectId ?? null,
-      projectWorkspaceId: issueRow?.projectWorkspaceId ?? null,
-      executionWorkspaceId: issueRow?.executionWorkspaceId ?? null,
-    });
-    const parsed = ctx?.repoUrl ? parseRepoUrl(ctx.repoUrl) : null;
-    if (parsed) pairs.push({ owner: parsed.owner, repo: parsed.repo });
+  // SUP-14917: the shared live workspace re-resolve (formerly inlined here). It
+  // returns the matches + a terminal failure as data, so this resolver maps the
+  // failure to its own bare `reason` form via
+  // decisionHeadFailureFromWorkspaceDiscovery — the same reasons the inline loop
+  // used to return, byte-for-byte.
+  const discovery = await discoverCardPullRequestByWorkspace(
+    db,
+    companyId,
+    issueId,
+    issueIdentifier,
+    closingTransition,
+    withState,
+  );
+  if (discovery.terminalFailure) {
+    return decisionHeadFailureFromWorkspaceDiscovery(discovery.terminalFailure);
   }
-
-  const needle = issueIdentifier.toLowerCase();
-  const matched: Array<{
-    owner: string;
-    repo: string;
-    number: number;
-    displayName: string;
-    headRefName: string | null;
-  }> = [];
-
-  for (const pair of pairs) {
-    const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pair.owner, pair.repo);
-    if (candidates.length === 0) {
-      const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pair.owner, pair.repo);
-      const reason = isGitHubTokenResolution(tokenResult)
-        ? `auth_required: no GitHub token resolvable for ${pair.owner}/${pair.repo}`
-        : `auth_required: ${tokenResult.reason}`;
-      return { kind: "unresolvable", reason };
-    }
-    for (const candidate of candidates) {
-      const listResult = await fetchOpenPullRequests(candidate.token, pair.owner, pair.repo);
-      if (!listResult.ok) {
-        const { status, message } = listResult;
-        if (status === 401 || status === 403) {
-          if (candidate !== candidates[candidates.length - 1]) continue;
-          return { kind: "unresolvable", reason: `pr_auth: HTTP ${status} ${message ?? ""}` };
-        }
-        if (status === 404) return { kind: "unresolvable", reason: "pr_not_found: HTTP 404" };
-        if (status === 429) return { kind: "unresolvable", reason: "pr_rate_limited: HTTP 429" };
-        if (status === 0) {
-          return { kind: "unresolvable", reason: `pr_network: ${message ?? "network_error"}` };
-        }
-        return { kind: "unresolvable", reason: `pr_error: HTTP ${status} ${message ?? ""}` };
-      }
-      for (const item of listResult.items) {
-        if (item.draft === true) continue;
-        const headRef = (item.headRef ?? "").toLowerCase();
-        const title = (item.title ?? "").toLowerCase();
-        const body = (item.body ?? "").toLowerCase();
-        if (!headRef.includes(needle) && !title.includes(needle) && !body.includes(needle)) continue;
-        matched.push({
-          owner: pair.owner,
-          repo: pair.repo,
-          number: item.number,
-          displayName: `${pair.owner}/${pair.repo}#${item.number}`,
-          headRefName: item.headRef ?? null,
-        });
-      }
-      break;
-    }
-  }
+  const matched = discovery.matched;
 
   // ADR-091 D1 (SUP-14676): the live-discovery candidates above are matched by
   // identifier substring — pure citation. They take the SAME delivery-identity
