@@ -87,13 +87,22 @@ import {
 // ejects it. The refusal itself is already recorded in this service's
 // summary; the void is additionally surfaced ON the PR as an advisory
 // comment naming both SHAs ("this PR was approved at <sha>; head <new-sha>
-// voids that approval"). The warning:
+// voids that approval"). The warning (SUP-14996):
 //   - is advisory only — it is a plain PR comment and never creates, mocks,
 //     or writes the paperclip/approved status (the consume-contract);
+//   - names both SHAs, the owning card identifier, and the approval
+//     timestamp (when the card persisted one) — enough to act without
+//     re-deriving anything from GitHub;
+//   - states both remedies: re-approve at the live head (a fresh review), or
+//     move the late commit to its own PR and reset the branch back to the
+//     already-stamped SHA (a reset needs no new review);
 //   - fires only on positive evidence (changed-blob). Guard A's
 //     can-not-verify refusals (compare failure, truncated/missing file
 //     list, no base sha) self-heal or retry on the next tick and must not
 //     manufacture a false "voided" claim;
+//   - stays quiet on the Guard-A-recoverable case (rebase / update-branch,
+//     diff-vs-base unchanged): the reconciler re-publishes there, so a
+//     warning would be noise ignored within a week;
 //   - is deduplicated by an embedded marker carrying the exact
 //     approved->head pair, so a head that stays voided across ticks posts
 //     at most one comment per (approved, voiding) pair;
@@ -520,36 +529,48 @@ function voidWarningMarker(approvedHeadSha: string, headSha: string): string {
 }
 
 /**
- * SUP-14049: the body of the void warning, landed on the PR itself so the
- * stranded stamp is visible where the PR reads green — not only in
- * control-plane logs. Advisory only: it names both SHAs and states what
- * happens next (a human or the review stage decides; no auto re-approval).
+ * SUP-14049 / SUP-14996: the body of the void warning, landed on the PR itself
+ * so the stranded stamp is visible where the PR reads green — not only in
+ * control-plane logs. Advisory only: it names both SHAs, the owning card, the
+ * approval timestamp (when persisted), the substance change, and the two
+ * remedies (a fresh approval at the live head, or splitting the late commit
+ * out and resetting to the already-stamped SHA). It never re-stamps — a human
+ * or the review stage decides next steps.
  */
 function voidWarningBody(
   identifier: string,
   approvedHeadSha: string,
   headSha: string,
   substanceChange: string,
+  approvedAtLabel: string | null | undefined,
 ): string {
+  const approvedAt = approvedAtLabel ? `, ${approvedAtLabel}` : "";
   return (
-    `[Paperclip approval voided] This PR was approved at ${approvedHeadSha} (${identifier}); ` +
+    `[Paperclip approval voided] This PR was approved at ${approvedHeadSha} (${identifier}${approvedAt}); ` +
     `head ${headSha} voids that approval.\n\n` +
     `The paperclip/approved stamp is stranded on ${approvedHeadSha} and no longer covers this head: ` +
-    `the PR's diff-vs-base changed in substance after approval (${substanceChange}). ` +
-    `The approval-status reconciler refuses to re-stamp content that was never reviewed ` +
-    `(Guard A) and does not auto re-approve — a human or the review stage decides next steps.\n\n` +
+    `the PR's diff-vs-base changed in substance after approval (${substanceChange}), so the merge ` +
+    `queue will reject this PR. Guard A refuses to re-stamp content that was never reviewed and the ` +
+    `reconciler does not auto re-approve.\n\n` +
+    `To make the merge queue accept this PR again, either:\n` +
+    `- re-approve at the live head ${headSha} — a fresh review of the current content; or\n` +
+    `- move the late commit to its own PR and reset this branch back to ${approvedHeadSha} — that ` +
+    `head already carries paperclip/approved=success, so a reset needs no new review.\n\n` +
     voidWarningMarker(approvedHeadSha, headSha)
   );
 }
 
 /**
- * SUP-14049: surface the void on the PR. Dedupes by re-reading the newest
- * page of the PR conversation for this exact approved->head marker before
- * posting, so a head that stays voided across ticks posts at most one
+ * SUP-14049 / SUP-14996: surface the void on the PR. Dedupes by re-reading the
+ * newest page of the PR conversation for this exact approved->head marker
+ * before posting, so a head that stays voided across ticks posts at most one
  * comment (the marker we posted is the most recent comment, hence
  * direction=desc). A failed read fails the post (a write we cannot dedup
  * must not be attempted); a failed post is reported, never fatal — the
  * Guard A refusal is the primary verdict and the warning is advisory.
+ * `approvedAtLabel` is the persisted stamp/certification timestamp when the
+ * card carries one (SUP-14996); null/undefined when the anchor was recovered
+ * without a persisted time — the comment then simply omits it.
  */
 async function postApprovalVoidWarning(
   db: Db,
@@ -558,6 +579,7 @@ async function postApprovalVoidWarning(
   approvedHeadSha: string,
   headSha: string,
   substanceChange: string,
+  approvedAtLabel: string | null | undefined,
 ): Promise<{ kind: "posted" } | { kind: "already-posted" } | { kind: "failed"; detail: string }> {
   const marker = voidWarningMarker(approvedHeadSha, headSha);
   const listing = await ghReadJson(
@@ -591,7 +613,7 @@ async function postApprovalVoidWarning(
       target.owner,
       target.repo,
       target.number,
-      voidWarningBody(row.identifier ?? row.id, approvedHeadSha, headSha, substanceChange),
+      voidWarningBody(row.identifier ?? row.id, approvedHeadSha, headSha, substanceChange, approvedAtLabel),
     );
     if (result.success) return { kind: "posted" };
     if ((result.status === 401 || result.status === 403) && i < candidates.length - 1) continue;
@@ -1774,8 +1796,9 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     }
     const substanceChange = diffSubstanceChange(approvedFiles, liveFiles);
     if (substanceChange) {
-      // SUP-14049: positive evidence the new head voids the published
-      // approval — surface it on the PR itself, advisory-only.
+      // SUP-14049 / SUP-14996: positive evidence the new head voids the
+      // published approval — surface it on the PR itself, advisory-only,
+      // naming the approved timestamp when the card persisted one.
       const voidWarning = await postApprovalVoidWarning(
         db,
         row,
@@ -1783,6 +1806,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
         approvedHeadSha,
         headSha,
         substanceChange,
+        approvedHead?.publishedAt ?? null,
       );
       const voidNote =
         voidWarning.kind === "posted"
