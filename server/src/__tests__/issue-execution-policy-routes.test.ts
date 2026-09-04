@@ -100,6 +100,9 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   create: vi.fn(async () => ({ id: "77777777-7777-4777-8777-777777777777" })),
+  getForIssue: vi.fn(),
+  acceptInteraction: vi.fn(),
+  rejectInteraction: vi.fn(),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
   listApprovalsForIssue: vi.fn(async () => []),
@@ -271,6 +274,13 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueThreadInteractionService.create.mockResolvedValue({ id: "77777777-7777-4777-8777-777777777777" });
+    mockIssueThreadInteractionService.getForIssue.mockResolvedValue(null);
+    mockIssueThreadInteractionService.acceptInteraction.mockResolvedValue({
+      interaction: null,
+      createdIssues: [],
+      continuationIssue: null,
+    });
+    mockIssueThreadInteractionService.rejectInteraction.mockResolvedValue(null);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({
@@ -2434,6 +2444,268 @@ describe("issue execution policy routes", () => {
       expect(res.body.details).toBeDefined();
       expect(res.body.details[0].field).toBe("executionPolicy");
       expect(mockIssueService.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("SUP-14919: review round-cap escalation resolution records a decision and wakes the return assignee", () => {
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const interactionId = "interaction-escalation-1";
+    const stageId = "11111111-1111-4111-8111-111111111111";
+    const returnAssigneeAgentId = "44444444-4444-4444-8444-444444444444";
+
+    function escalatedRoundCapIssue() {
+      return roundCapReviewIssue(
+        {
+          assigneeAgentId: null,
+          assigneeUserId: "board-user",
+        },
+        {
+          changesRequestedCount: 3,
+          currentParticipant: { type: "user", userId: "board-user" },
+        },
+      );
+    }
+
+    function pendingEscalationInteraction() {
+      return {
+        id: interactionId,
+        companyId: "company-1",
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        createdByAgentId: null,
+        createdByUserId: "board-user",
+        addresseeAgentId: null,
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        sourceRunId: null,
+        idempotencyKey:
+          `review-escalation:${issueId}:${stageId}:3:0123456789abcdef`,
+        payload: {
+          version: 1,
+          prompt: "Approve this review, or request further changes (round cap reached).",
+        },
+      };
+    }
+
+    function captureDecisionInsert() {
+      let insertedDecision: Record<string, unknown> | null = null;
+      mockDb.transaction.mockImplementation(
+        async (callback: (tx: Record<string, unknown>) => Promise<unknown>) => {
+          await callback({
+            select: mockDbSelect,
+            insert: () => ({
+              values: async (values: Record<string, unknown>) => {
+                insertedDecision = values;
+                return [{ id: values.id }];
+              },
+            }),
+            update: () => mockTxWriteChain([]),
+            delete: () => mockTxWriteChain([]),
+          });
+          return "committed";
+        },
+      );
+      return () => insertedDecision;
+    }
+
+    it("accepting the escalation records an approved decision, completes the stage, and wakes the return assignee", async () => {
+      const issue = escalatedRoundCapIssue();
+      const pending = pendingEscalationInteraction();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue({
+        ...issue,
+        status: "in_progress",
+        assigneeAgentId: returnAssigneeAgentId,
+        assigneeUserId: null,
+      } as any);
+      mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
+      mockIssueThreadInteractionService.acceptInteraction.mockResolvedValueOnce({
+        interaction: {
+          ...pending,
+          status: "accepted",
+          result: { version: 1, outcome: "accepted" },
+        },
+        createdIssues: [],
+        continuationIssue: null,
+      });
+      const readInsertedDecision = captureDecisionInsert();
+      // The accept route's review-verdict binding probe queries the activity log
+      // through an orderBy/limit chain the default mock where() does not model.
+      mockDbSelectWhere.mockImplementation(() => {
+        const resolveDefault = (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([{
+            id: "55555555-5555-4555-8555-555555555555",
+            companyId: "company-1",
+            agentId: "33333333-3333-4333-8333-333333333333",
+            contextSnapshot: { issueId },
+            permissions: null,
+          }]).then(onFulfilled, onRejected);
+        const chain: Record<string, unknown> = {
+          for: () => ({ then: resolveDefault }),
+          orderBy: () => chain,
+          limit: () => chain,
+          then: resolveDefault,
+        };
+        return chain;
+      });
+
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        companyIds: ["company-1"],
+        source: "local_implicit",
+        isInstanceAdmin: false,
+      });
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/interactions/${interactionId}/accept`)
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(updatePatch).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: returnAssigneeAgentId,
+        assigneeUserId: null,
+        actorAgentId: null,
+        actorUserId: "board-user",
+      });
+      const executionState = updatePatch.executionState as Record<string, unknown>;
+      expect(executionState).toMatchObject({
+        status: "completed",
+        currentStageId: null,
+        currentStageType: null,
+        currentParticipant: null,
+        completedStageIds: [stageId],
+        lastDecisionOutcome: "approved",
+        returnAssignee: { type: "agent", agentId: returnAssigneeAgentId },
+      });
+      const decisionId = executionState.lastDecisionId as string;
+      expect(decisionId).toBeTruthy();
+
+      const insertedDecision = readInsertedDecision();
+      expect(insertedDecision).toMatchObject({
+        companyId: "company-1",
+        issueId,
+        stageId,
+        stageType: "review",
+        actorAgentId: null,
+        actorUserId: "board-user",
+        outcome: "approved",
+        body: "Review approved via the round-cap escalation.",
+        createdByRunId: null,
+      });
+      expect(insertedDecision?.id).toBe(decisionId);
+
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        returnAssigneeAgentId,
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            issueId,
+            interactionId,
+            interactionKind: "request_confirmation",
+            interactionStatus: "accepted",
+          }),
+        }),
+      );
+    });
+
+    it("rejecting the escalation records a changes_requested decision, resets rounds, and returns the card to the return assignee", async () => {
+      const issue = escalatedRoundCapIssue();
+      const pending = pendingEscalationInteraction();
+      const reason = "Human review: needs more edge-case tests before approval.";
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue({
+        ...issue,
+        status: "in_progress",
+        assigneeAgentId: returnAssigneeAgentId,
+        assigneeUserId: null,
+      } as any);
+      mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
+      mockIssueThreadInteractionService.rejectInteraction.mockResolvedValueOnce({
+        ...pending,
+        status: "rejected",
+        result: { version: 1, outcome: "rejected", reason },
+      });
+      const readInsertedDecision = captureDecisionInsert();
+      mockDbSelectWhere.mockImplementation(() => {
+        const resolveDefault = (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([{
+            id: "55555555-5555-4555-8555-555555555555",
+            companyId: "company-1",
+            agentId: "33333333-3333-4333-8333-333333333333",
+            contextSnapshot: { issueId },
+            permissions: null,
+          }]).then(onFulfilled, onRejected);
+        const chain: Record<string, unknown> = {
+          for: () => ({ then: resolveDefault }),
+          orderBy: () => chain,
+          limit: () => chain,
+          then: resolveDefault,
+        };
+        return chain;
+      });
+
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        companyIds: ["company-1"],
+        source: "local_implicit",
+        isInstanceAdmin: false,
+      });
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/interactions/${interactionId}/reject`)
+        .send({ reason });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(updatePatch).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: returnAssigneeAgentId,
+        assigneeUserId: null,
+        actorAgentId: null,
+        actorUserId: "board-user",
+      });
+      const executionState = updatePatch.executionState as Record<string, unknown>;
+      expect(executionState).toMatchObject({
+        status: "changes_requested",
+        currentStageId: stageId,
+        currentStageType: "review",
+        returnAssignee: { type: "agent", agentId: returnAssigneeAgentId },
+        lastDecisionOutcome: "changes_requested",
+        changesRequestedCount: 0,
+      });
+      const decisionId = executionState.lastDecisionId as string;
+      expect(decisionId).toBeTruthy();
+
+      const insertedDecision = readInsertedDecision();
+      expect(insertedDecision).toMatchObject({
+        companyId: "company-1",
+        issueId,
+        stageId,
+        stageType: "review",
+        actorAgentId: null,
+        actorUserId: "board-user",
+        outcome: "changes_requested",
+        body: reason,
+        createdByRunId: null,
+      });
+      expect(insertedDecision?.id).toBe(decisionId);
+
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        returnAssigneeAgentId,
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            issueId,
+            interactionId,
+            interactionKind: "request_confirmation",
+            interactionStatus: "rejected",
+          }),
+        }),
+      );
     });
   });
 });
