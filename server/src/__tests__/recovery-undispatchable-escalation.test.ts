@@ -138,6 +138,23 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
   }
 
+  // A queued wakeup on the source card. `sourceHasNewPathOutsideRecoveryAction`
+  // treats any queued/claimed/deferred wakeup whose recoveryActionId differs from
+  // the open action as a "new execution path", but `hasActiveExecutionPath`
+  // (which the mint sweep keys off) only counts `deferred_issue_execution`, so a
+  // plain `queued` wakeup reproduces the faulty resolve-side signal without
+  // making the mint sweep skip the card.
+  async function seedQueuedWakeup(companyId: string, agentId: string, issueId: string) {
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      source: "test",
+      status: "queued",
+      payload: { issueId },
+    });
+  }
+
   async function openEscalation(companyId: string, pullOnlyAgentId: string, issueId: string) {
     const sweep = makeSweep();
     await sweep.reconcileUndispatchableAssignedIssues();
@@ -547,5 +564,79 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
       );
     expect(detections).toHaveLength(1);
     expect(detections[0].details).toMatchObject({ assigneeAgentId: pullOnlyAgentId });
+  });
+
+  it("does not resolve the open action on a pull-only assignee's own run/wake (SUP-14992)", async () => {
+    const companyId = await seedCompany();
+    const pullOnlyAgentId = await seedAgent(companyId, "process");
+    const issueId = await seedCard(companyId, pullOnlyAgentId);
+
+    const { action } = await openEscalation(companyId, pullOnlyAgentId, issueId);
+
+    // A queued wakeup on the card that the faulty `new_source_execution_path`
+    // predicate would treat as proof the card is dispatchable again. It is not:
+    // the assignee is still a pull-only adapter and can never be woken.
+    await seedQueuedWakeup(companyId, pullOnlyAgentId, issueId);
+
+    const result = await makeSweep().reconcileActiveRecoveryActions();
+    expect(result.resolved).toBe(0);
+
+    const [row] = await recoveryActionRows(issueId);
+    expect(row.id).toBe(action.id);
+    expect(row.status).toBe("active");
+    expect(row.outcome).toBeNull();
+    expect(row.attemptCount).toBe(1);
+  });
+
+  it("still resolves the open action once the assignee leaves the pull-only set", async () => {
+    const companyId = await seedCompany();
+    const pullOnlyAgentId = await seedAgent(companyId, "process");
+    const dispatchableAgentId = await seedAgent(companyId, "codex_local");
+    const issueId = await seedCard(companyId, pullOnlyAgentId);
+
+    const { action } = await openEscalation(companyId, pullOnlyAgentId, issueId);
+    await seedQueuedWakeup(companyId, pullOnlyAgentId, issueId);
+
+    // Reassignment to a dispatchable agent is what actually clears the
+    // condition; a run/wake on the card is now legitimate recovery evidence.
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: dispatchableAgentId })
+      .where(eq(issues.id, issueId));
+
+    const result = await makeSweep().reconcileActiveRecoveryActions();
+    expect(result.resolved).toBe(1);
+
+    const [row] = await recoveryActionRows(issueId);
+    expect(row.id).toBe(action.id);
+    expect(row.status).toBe("resolved");
+    expect(row.outcome).toBe("restored");
+    expect(row.resolutionNote).toBe("new_source_execution_path");
+  });
+
+  it("survives two mint->resolve sweep pairs as one stable action (flap regression)", async () => {
+    const companyId = await seedCompany();
+    const pullOnlyAgentId = await seedAgent(companyId, "process");
+    const issueId = await seedCard(companyId, pullOnlyAgentId);
+
+    const { sweep, action } = await openEscalation(companyId, pullOnlyAgentId, issueId);
+    await seedQueuedWakeup(companyId, pullOnlyAgentId, issueId);
+
+    // The production flap: each 30s tick the resolve sweep "restored" the
+    // action on the pull-only assignee's own run/wake, so the next mint sweep
+    // re-confirmed and minted a fresh action with a new attempt budget, until
+    // the card walked to a false terminal board escalation. Reuse one sweep
+    // instance so the in-memory confirmation counter stays past first-sight.
+    for (let pair = 0; pair < 2; pair += 1) {
+      const mint = await sweep.reconcileUndispatchableAssignedIssues();
+      expect(mint.escalated).toBe(0);
+      await sweep.reconcileActiveRecoveryActions();
+    }
+
+    const rows = await recoveryActionRows(issueId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(action.id);
+    expect(rows[0].status).toBe("active");
+    expect(rows[0].attemptCount).toBe(1);
   });
 });
