@@ -75,6 +75,7 @@ import {
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createMergedOperatorMergeCardSweepService } from "./services/merged-operator-merge-cards.js";
+import { createBranchPrReconcilerSweepService } from "./services/branch-pr-reconciler.js";
 import { prDeliveryService } from "./services/pr-delivery.js";
 import { rotateOpenCodeLog } from "./services/opencode-log-rotation.js";
 import {
@@ -1209,6 +1210,9 @@ export async function startServer(): Promise<StartedServer> {
     });
     const carrierPromotionSweep = createCarrierPromotionSweepService(db as any);
     const prDelivery = prDeliveryService(db as any);
+    const branchPrReconciler = createBranchPrReconcilerSweepService(db as any, {
+      recordAtOpen: prDelivery.recordAtOpen,
+    });
     const carrierOrphanJanitor = createCarrierOrphanJanitorService(db as any);
     const carrierStrandedSurface = createCarrierStrandedSurfaceService(db as any);
     const toastReadability = createToastReadabilitySweepService(db as any);
@@ -1324,6 +1328,21 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "PR merge-state sweep failed");
         }), { name: "prMergeState" });
+    };
+    /** Fills in missing pull_request work products from GitHub for active workspaces that have a repo + branch but no PR product (WS-ARCHIVE T4); the per-workspace cooldown gate lives inside the service so a non-due workspace is a cheap no-op. */
+    const scheduleBranchPrReconcilerSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(branchPrReconciler
+        .sweep()
+        .then((result) => {
+          if (result.created > 0 || result.skipped > 0 || result.rateLimited > 0 || result.failed > 0) {
+            logger.info(result, "branch-to-merged-PR reconciler sweep dispositioned active workspaces");
+          }
+          return result;
+        })
+        .catch((err) => {
+          logger.error({ err }, "branch-to-merged-PR reconciler sweep failed");
+        }), { name: "branchPrReconcile" });
     };
     // Emit a periodic signal when the reaper inspects candidates but archives
     // none, so an inert reaper that skips every candidate is never fully silent.
@@ -1704,6 +1723,7 @@ export async function startServer(): Promise<StartedServer> {
         scheduleMergedPullRequestConfirmationSweep();
         scheduleMergedOperatorMergeCardSweep();
         schedulePrMergeStateSweep();
+        scheduleBranchPrReconcilerSweep();
         scheduleTerminalWorkspaceSweep();
         scheduleDoneCloseLandingBackstopSweep();
         scheduleCarrierPromotionSweep();

@@ -277,13 +277,33 @@ async function githubMergedPrCountForIdentifier(
   }
 }
 
-async function githubBranchHasMergedPr(
+/**
+ * Result of probing a branch for a merged pull request. The boolean is the
+ * guard's original decision; the number/repository are the merged PR's identity
+ * so a caller (the WS-ARCHIVE T4 branch-to-merged-PR reconciler) can record a
+ * delivery work product without re-querying GitHub. `mergedPrNumber` is null
+ * when the flag is false, or when a merged PR is present but its `number` was
+ * absent from the API payload.
+ */
+export interface BranchMergedPrProbe {
+  hasMergedPr: boolean;
+  mergedPrNumber: number | null;
+  mergedPrRepository: string | null;
+}
+
+/**
+ * Probes a branch for a merged pull request on GitHub and, when one is found,
+ * yields its number and owning `owner/repo`. Strictly keys on the branch
+ * (`head=${owner}:${branch}`), never on an issue identifier. Throws on auth
+ * (401/403) and any other non-2xx so callers can fail open (auth) or retry.
+ */
+export async function githubBranchHasMergedPr(
   hostname: string,
   owner: string,
   repo: string,
   branch: string,
   token: string,
-): Promise<boolean> {
+): Promise<BranchMergedPrProbe> {
   const apiBase = gitHubApiBase(hostname);
   const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=closed&per_page=100`;
   const headers: Record<string, string> = {
@@ -301,11 +321,18 @@ async function githubBranchHasMergedPr(
   }
   const body = await response.json().catch(() => null);
   const pulls = Array.isArray(body) ? body : [];
-  return pulls.some((pr) => {
+  let hasMergedPr = false;
+  let mergedPrNumber: number | null = null;
+  for (const pr of pulls) {
     const record = pr as Record<string, unknown>;
     const merged = record.merged === true || typeof record.merged_at === "string";
-    return merged;
-  });
+    if (!merged) continue;
+    hasMergedPr = true;
+    if (mergedPrNumber === null && typeof record.number === "number") {
+      mergedPrNumber = record.number;
+    }
+  }
+  return { hasMergedPr, mergedPrNumber, mergedPrRepository: `${owner}/${repo}` };
 }
 
 async function writeAuditLog(
@@ -1830,7 +1857,7 @@ export async function evaluateDoneTransitionGuard(
 
   let hasMergedPr: boolean;
   try {
-    hasMergedPr = await githubBranchHasMergedPr(parsed.hostname, parsed.owner, parsed.repo, branch, token);
+    hasMergedPr = (await githubBranchHasMergedPr(parsed.hostname, parsed.owner, parsed.repo, branch, token)).hasMergedPr;
   } catch (err) {
     if (err instanceof GitHubAuthError) {
       return fallback(
