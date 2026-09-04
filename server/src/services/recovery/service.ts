@@ -3705,6 +3705,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Boolean(run || wake);
   }
 
+  // The undispatchable_assignee condition clears only when the assignee stops
+  // being a pull-only adapter agent. A heartbeat run or queued wakeup on the
+  // source issue owned by that same pull-only assignee is NOT evidence the card
+  // became dispatchable (a process-adapter agent can never be woken), so the
+  // execution-path predicate above must not be trusted for this kind.
+  async function sourceAssigneeIsStillPullOnly(issue: typeof issues.$inferSelect) {
+    if (!issue.assigneeAgentId) return false;
+    const [assignee] = await db
+      .select({ adapterType: agents.adapterType })
+      .from(agents)
+      .where(eq(agents.id, issue.assigneeAgentId));
+    return !!assignee && isPullOnlyAdapterType(assignee.adapterType);
+  }
+
 
   async function reconcileActiveRecoveryActions() {
     const rows = await db
@@ -3752,8 +3766,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         healthyOpenChildIssues(issue),
         sourceHasNewPathOutsideRecoveryAction(action),
       ]);
+      // undispatchable_assignee: the execution-path arm must only fire once the
+      // condition has genuinely cleared (the assignee left the pull-only adapter
+      // set). A run or queued wakeup belonging to the pull-only assignee itself
+      // would otherwise resolve-and-re-mint the action every cycle, burning its
+      // attempt budget into a false terminal board escalation. Other kinds keep
+      // the generic run/wake predicate.
+      const effectiveNewSourcePath =
+        action.kind === UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND && hasNewSourcePath
+          ? !(await sourceAssigneeIsStillPullOnly(issue))
+          : hasNewSourcePath;
       const durablePathRestored = action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
-      if (durablePathRestored || healthyChildren.length > 0 || hasNewSourcePath) {
+      if (durablePathRestored || healthyChildren.length > 0 || effectiveNewSourcePath) {
         if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
           const blockerIds = await existingUnresolvedBlockerIssueIds(issue.companyId, issue.id);
           await issuesSvc.update(issue.id, {
@@ -9160,6 +9184,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileDispatchSuppressionParks,
     reconcilePendingReviewRearm,
     reconcileStaleRecoveryActionWakes,
+    reconcileActiveRecoveryActions,
     reconcileUnfinalizableWorkspaceBarriers,
     ingestStaleInReviewChildIssues,
     buildIssueGraphLivenessAutoRecoveryPreview,
