@@ -15,6 +15,7 @@ import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   postPullRequestComment,
   publishApprovalStatus,
+  resolveCardPullRequest,
   resolveLinkedPullRequestsWithState,
   type ApprovalCandidateAnchor,
   type LinkedPullRequest,
@@ -648,18 +649,43 @@ async function findApprovalCandidates(
         ne(issues.status, "cancelled"),
         sql`(${issues.executionState} ->> 'lastDecisionOutcome') = 'approved'`,
         sql`${issues.identifier} is not null`,
-        sql`(exists (
-          select 1
-          from ${externalObjectMentions}
-          inner join ${externalObjects} on ${externalObjects.id} = ${externalObjectMentions.objectId}
-          where ${externalObjectMentions.companyId} = ${issues.companyId}
-            and ${externalObjectMentions.sourceIssueId} = ${issues.id}
-            and ${externalObjectMentions.objectType} = 'pull_request'
-            and ${externalObjects.providerKey} = 'github'
-            and (${externalObjects.data} ->> 'state' = 'open'
-              or ${externalObjects.data} ->> 'state' is null)
-            and ${externalObjects.data} ->> 'draft' is distinct from 'true'
-        ))`,
+        // SUP-14736: the card is scannable when it has a linked, non-draft PR
+        // whose cached state is `open` or still unhydrated (null) — mirroring
+        // the in-memory `resolveLinkedPullRequestsWithState` filter.
+        // SUP-14917: OR it carries an approval anchor (the decision certified a
+        // head / a publish was written / ambiguous candidates were persisted)
+        // AND a workspace context to discover a PR from — the shape whose PR was
+        // delivered from a workspace with zero external-object mentions ever
+        // posted. Widening DISCOVERY only: the Guard A / Guard B gates below are
+        // untouched, so a wider scan cannot authorize a stamp it would refuse.
+        sql`(
+          (exists (
+            select 1
+            from ${externalObjectMentions}
+            inner join ${externalObjects} on ${externalObjects.id} = ${externalObjectMentions.objectId}
+            where ${externalObjectMentions.companyId} = ${issues.companyId}
+              and ${externalObjectMentions.sourceIssueId} = ${issues.id}
+              and ${externalObjectMentions.objectType} = 'pull_request'
+              and ${externalObjects.providerKey} = 'github'
+              and (${externalObjects.data} ->> 'state' = 'open'
+                or ${externalObjects.data} ->> 'state' is null)
+              and ${externalObjects.data} ->> 'draft' is distinct from 'true'
+          ))
+          or (
+            (
+              ${issues.executionState} -> 'approvalStatus' ->> 'approvedHeadSha' is not null
+              or ${issues.executionState} -> 'approvalStatus' ->> 'publishedHeadSha' is not null
+              or jsonb_array_length(
+                coalesce(${issues.executionState} -> 'approvalStatus' -> 'pendingCandidates', '[]'::jsonb)
+              ) > 0
+            )
+            and (
+              ${issues.executionWorkspaceId} is not null
+              or ${issues.projectWorkspaceId} is not null
+              or ${issues.projectId} is not null
+            )
+          )
+        )`,
         afterIdentifier != null ? sql`${issues.identifier} > ${afterIdentifier}` : undefined,
       ),
     )
@@ -1408,6 +1434,53 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     target = openPrs[0];
   } else if (openPrs.length === 0 && unhydratedPrs.length === 1) {
     target = unhydratedPrs[0];
+  } else if (linked.length === 0) {
+    // SUP-14917: zero cached mentions — the PR was delivered from a workspace and
+    // never posted in-thread, so the reconciler used to wedge this card forever as
+    // no-open-pr. Resolve it the SAME way merge-arming does (shared live workspace
+    // discovery), so the two call sites can no longer disagree about which PR the
+    // card delivered. Multi/closed-mention cards keep the existing verdict above.
+    const resolution = await resolveCardPullRequest(db, row.companyId, row.id, row.identifier ?? "", {
+      closingTransition: true,
+    });
+    if (resolution.kind === "undetermined") {
+      const failure = resolution.failure;
+      const why = failure.noToken
+        ? `auth_required for ${failure.owner}/${failure.repo}`
+        : `HTTP ${failure.status} ${failure.message ?? ""}`.trim();
+      return {
+        kind: "skipped",
+        reason: "pr-undetermined",
+        detail: `pr-undetermined: live workspace discovery failed (${why}); skipping transiently, not treating as no-open-pr`,
+      };
+    }
+    if (resolution.kind === "none") {
+      return {
+        kind: "skipped",
+        reason: "no-open-pr",
+        detail: "no-open-pr: no linked mentions and no open workspace PR resolvable",
+      };
+    }
+    if (resolution.kind === "ambiguous") {
+      return {
+        kind: "skipped",
+        reason: "ambiguous-pr",
+        detail: `ambiguous-pr: ${resolution.reason}: ${resolution.displayNames.join(", ")}`,
+      };
+    }
+    target = {
+      id: "workspace-discovered",
+      owner: resolution.owner,
+      repo: resolution.repo,
+      number: resolution.number,
+      nodeId: null,
+      headRefName: resolution.headRefName,
+      displayName: resolution.displayName,
+      title: null,
+      cachedState: null,
+      lastErrorCode: null,
+      reviewDecision: null,
+    };
   }
   if (!target) {
     const deadUnhydrated = linked.filter(

@@ -7,11 +7,13 @@ import {
 import type { ExternalObjectResolveResult } from "./external-objects.js";
 
 const mockResolveLinkedPullRequestsWithState = vi.hoisted(() => vi.fn());
+const mockResolveCardPullRequest = vi.hoisted(() => vi.fn());
 vi.mock("./merge-arming.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("./merge-arming.js")>();
   return {
     ...orig,
     resolveLinkedPullRequestsWithState: mockResolveLinkedPullRequestsWithState,
+    resolveCardPullRequest: mockResolveCardPullRequest,
   };
 });
 
@@ -214,6 +216,7 @@ beforeEach(() => {
   mockLogActivity.mockClear();
   mockAddComment.mockClear();
   mockResolveLinkedPullRequestsWithState.mockReset();
+  mockResolveCardPullRequest.mockReset();
   mockCreateGitHubExternalObjectProvider.mockReset();
 });
 
@@ -400,6 +403,93 @@ describe("createDoneCloseLandingBackstopService", () => {
       }),
     }));
     expect(mockAddComment).not.toHaveBeenCalled();
+  });
+
+  describe("SUP-14917: zero cached mentions resolved via the shared workspace discovery", () => {
+    const workspacePr = {
+      kind: "single" as const,
+      owner: "paperclipai",
+      repo: "paperclip",
+      number: 455,
+      displayName: "paperclipai/paperclip#455",
+      headRefName: "SUP-branch",
+      source: "workspace" as const,
+    };
+
+    it("reports a done card whose workspace-resolved PR is open past the grace window (AC2)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        { candidates: [candidateRow()], existingLandingRows: [] },
+        { wakeup },
+      );
+      // Zero cached mentions; the shared resolution finds the delivered PR by workspace.
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+      mockResolveCardPullRequest.mockResolvedValue(workspacePr);
+      mockResolver(async () => openSnapshot);
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 1,
+        deferred: 0,
+      });
+
+      expect(mockResolveCardPullRequest).toHaveBeenCalledTimes(1);
+      expect(mockLogActivity).toHaveBeenCalledTimes(1);
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_failed",
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#455",
+          prState: "open",
+        }),
+      }));
+      expect(wakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("stays silent when the shared resolution finds no PR by any path (AC3)", async () => {
+      const { service } = makeService({
+        candidates: [candidateRow()],
+        existingLandingRows: [],
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+      mockResolveCardPullRequest.mockResolvedValue({ kind: "none" });
+      mockResolver(async () => openSnapshot);
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+      });
+      expect(mockLogActivity).not.toHaveBeenCalled();
+      expect(mockAddComment).not.toHaveBeenCalled();
+    });
+
+    it("defers (never reports) when the shared resolution is ambiguous or undetermined (AC4)", async () => {
+      const { service } = makeService({
+        candidates: [candidateRow()],
+        existingLandingRows: [],
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+      mockResolveCardPullRequest.mockResolvedValue({
+        kind: "ambiguous",
+        reason: "mention-workspace-disagreement",
+        displayNames: ["paperclipai/paperclip#455", "paperclipai/paperclip#42"],
+      });
+      mockResolver(async () => openSnapshot);
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 1,
+      });
+      expect(mockLogActivity).not.toHaveBeenCalled();
+      expect(mockAddComment).not.toHaveBeenCalled();
+    });
   });
 
   it("never evaluates a done issue without the decision-carried skip row, and ignores other skip reasons", async () => {

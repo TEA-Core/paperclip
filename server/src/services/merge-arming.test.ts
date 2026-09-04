@@ -19,6 +19,7 @@ import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from ".
 import {
   publishApprovalStatus,
   resolveApprovalDecisionHead,
+  resolveCardPullRequest,
 } from "./merge-arming.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
@@ -58,6 +59,18 @@ const REPO = "paperclip";
 const PR_URL = `https://api.github.com/repos/${OWNER}/${REPO}/pulls/42`;
 const POST_STATUS_URL = (sha: string) =>
   `https://api.github.com/repos/${OWNER}/${REPO}/statuses/${sha}`;
+// The shared live workspace re-resolve lists open PRs by identifier substring.
+const OPEN_PRS_LIST_URL = `https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100`;
+function openPrsListItem(overrides: Record<string, unknown> = {}) {
+  return {
+    number: 455,
+    draft: false,
+    head: { ref: "SUP-42-branch" },
+    title: "Unify PR resolution",
+    body: "Closes SUP-42",
+    ...overrides,
+  };
+}
 
 function prHeadBody(sha: string) {
   return { state: "open", merged: false, head: { ref: "SUP-42-branch", sha } };
@@ -437,6 +450,146 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(result.kind).toBe("unresolvable");
       if (result.kind === "unresolvable") {
         expect(result.reason).toMatch(/^delivery_identity_unresolved:/);
+      }
+    });
+  });
+
+  describe("resolveCardPullRequest (SUP-14917 shared resolution)", () => {
+    it("resolves a single cached OPEN mention with no live GitHub call (source=mention)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      // No live route: any GitHub call would throw, proving the open-mention
+      // short-circuit makes no discovery call.
+      installRoutes([]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution).toEqual({
+        kind: "single",
+        owner: OWNER,
+        repo: REPO,
+        number: 42,
+        displayName: `${OWNER}/${REPO}#42`,
+        headRefName: "SUP-42-branch",
+        source: "mention",
+      });
+    });
+
+    it("reports ambiguous when two cached OPEN mentions exist", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      await insertMention(issueId, { number: 43, headRefName: "SUP-43-other-card-branch" });
+      installRoutes([]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution.kind).toBe("ambiguous");
+      if (resolution.kind === "ambiguous") {
+        expect(resolution.reason).toBe("multiple-cached-open-mentions");
+        expect(resolution.displayNames).toHaveLength(2);
+      }
+    });
+
+    it("resolves a zero-mention card from live workspace discovery (source=workspace)", async () => {
+      const issueId = await insertIssue();
+      // No external-object mentions at all — the SUP-14737 / PR 455 shape.
+      installRoutes([{ url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 455 })] }]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution).toEqual({
+        kind: "single",
+        owner: OWNER,
+        repo: REPO,
+        number: 455,
+        displayName: `${OWNER}/${REPO}#455`,
+        headRefName: "SUP-42-branch",
+        source: "workspace",
+      });
+    });
+
+    it("returns none when zero mentions and live discovery finds no matching open PR (AC3)", async () => {
+      const issueId = await insertIssue();
+      installRoutes([{ url: OPEN_PRS_LIST_URL, body: [] }]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution).toEqual({ kind: "none" });
+    });
+
+    it("returns undetermined (not none) when live discovery fails terminally (transient, AC3)", async () => {
+      const issueId = await insertIssue();
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, ok: false, status: 404, body: { message: "Not Found" } },
+      ]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution.kind).toBe("undetermined");
+      if (resolution.kind === "undetermined") {
+        expect(resolution.reason).toBe("live-discovery-failed");
+        expect(resolution.failure.status).toBe(404);
+        expect(resolution.failure.noToken).toBe(false);
+      }
+    });
+
+    it("returns undetermined when no GitHub token resolves for the workspace pair", async () => {
+      const issueId = await insertIssue();
+      mockGetByName.mockResolvedValue(null);
+      installRoutes([]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution.kind).toBe("undetermined");
+      if (resolution.kind === "undetermined") {
+        expect(resolution.failure.noToken).toBe(true);
+      }
+    });
+
+    it("reports ambiguous when a closed cached mention DISAGREES with the live match (AC4)", async () => {
+      const issueId = await insertIssue();
+      // A closed (hence non-open) cached mention pointing at PR #42...
+      await insertMention(issueId, { number: 42, state: "closed", headRefName: "SUP-42-branch" });
+      // ...while the live workspace discovery finds a DIFFERENT open PR (#455).
+      installRoutes([{ url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 455 })] }]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution.kind).toBe("ambiguous");
+      if (resolution.kind === "ambiguous") {
+        expect(resolution.reason).toBe("mention-workspace-disagreement");
+        expect(resolution.displayNames).toContain(`${OWNER}/${REPO}#455`);
+        expect(resolution.displayNames).toContain(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("does NOT flag disagreement when the closed cached mention matches the live PR", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 455, state: "closed", headRefName: "SUP-42-branch" });
+      installRoutes([{ url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 455 })] }]);
+
+      const resolution = await resolveCardPullRequest(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+      });
+
+      expect(resolution.kind).toBe("single");
+      if (resolution.kind === "single") {
+        expect(resolution.source).toBe("workspace");
+        expect(resolution.number).toBe(455);
       }
     });
   });

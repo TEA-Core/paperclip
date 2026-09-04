@@ -5,6 +5,7 @@ import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
 import {
+  resolveCardPullRequest,
   resolveLinkedPullRequestsWithState,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
@@ -275,7 +276,38 @@ export function createDoneCloseLandingBackstopService(
       issue.companyId,
       issue.id,
     );
-    if (prs.length === 0) return;
+    if (prs.length === 0) {
+      // SUP-14917: zero cached mentions — the PR was delivered from a workspace and
+      // never posted in-thread, so this sweep used to see nothing. Resolve it the
+      // SAME way merge-arming does (shared live workspace discovery) so the card is
+      // visible here too instead of silently unaudited forever.
+      const resolution = await resolveCardPullRequest(
+        db,
+        issue.companyId,
+        issue.id,
+        issue.identifier ?? "",
+        { closingTransition: true },
+      );
+      if (resolution.kind === "none") return;
+      if (resolution.kind === "undetermined" || resolution.kind === "ambiguous") {
+        // Not positively provable this tick; defer to a later sweep — never report.
+        counts.deferred += 1;
+        return;
+      }
+      prs.push({
+        id: "workspace-discovered",
+        owner: resolution.owner,
+        repo: resolution.repo,
+        number: resolution.number,
+        nodeId: null,
+        headRefName: resolution.headRefName,
+        displayName: resolution.displayName,
+        title: null,
+        cachedState: null,
+        lastErrorCode: null,
+        reviewDecision: null,
+      });
+    }
 
     // Idempotency with no new column/table: any prior landing row for this
     // (issue, PR) means the pair was already dispositioned by an earlier sweep.
