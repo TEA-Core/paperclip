@@ -158,6 +158,11 @@ const DISPATCH_SUPPRESSED_PARK_SUSTAINED_MS = 2 * 60 * 60 * 1000;
 const DISPATCH_SUPPRESSED_PARK_CANDIDATE_LIMIT = 100;
 const STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT = 100;
 const STILLBORN_ASSIGNED_BACKLOG_RELOG_INTERVAL_MS = 5 * 60_000;
+// SUP-14907: grace window so the detector does not fire against an issue that
+// is still mid-filing (create → assign → promote sequence takes ~10–30 s).
+// Observed worst-case filing duration on SUP-14873 was 9 s; 60 s gives a
+// comfortable margin while keeping the stillborn-detection latency acceptable.
+const STILLBORN_ASSIGNED_BACKLOG_GRACE_MS = 60_000;
 const CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT = 250;
 const CANCELLED_ONLY_BLOCKER_DEPENDENT_RELOG_INTERVAL_MS = 5 * 60_000;
 let lastStillbornAssignedBacklogLogAt: Date | null = null;
@@ -8778,6 +8783,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function reconcileStillbornAssignedBacklog(opts?: { issueCreatedAtGte?: Date | null }) {
     const result = { reported: 0, skipped: 0, issueIds: [] as string[] };
 
+    // SUP-14907: exclude issues younger than the grace window so the detector
+    // does not fire against cards still being filed (create → assign → promote).
+    const graceCutoff = new Date(Date.now() - STILLBORN_ASSIGNED_BACKLOG_GRACE_MS);
+
     const candidates = await db
       .select()
       .from(issues)
@@ -8787,6 +8796,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           sql`${issues.assigneeAgentId} is not null`,
           visibleIssueCondition(),
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
+          lt(issues.createdAt, graceCutoff),
         ),
       )
       .orderBy(asc(issues.id))
