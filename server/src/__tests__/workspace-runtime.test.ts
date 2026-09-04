@@ -11975,6 +11975,103 @@ describe("preserveUnpushedWorktreeCommits", () => {
 
     await runGit(repoRoot, ["worktree", "remove", "--force", worktreePath]);
   });
+
+  it("consults resolveGitAuth for the origin URL and applies its configArgs to the push (SUP-14982)", async () => {
+    const { repoRoot, remoteRoot } = await createTempRepoWithRemote();
+
+    await runGit(repoRoot, ["checkout", "-b", "feature-branch"]);
+    await fs.writeFile(path.join(repoRoot, "feature.txt"), "feature\n", "utf8");
+    await runGit(repoRoot, ["add", "feature.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add feature"]);
+
+    // Re-point only the push at a nonexistent local path. If the resolved invocation's
+    // configArgs are NOT threaded into the git process, the push would succeed against the
+    // real origin and this assertion fails — so the test proves the args reached git.
+    const deadPushUrl = path.join(os.tmpdir(), `paperclip-worktree-dead-push-${randomUUID()}`);
+    const resolveGitAuth = vi.fn(async () => ({
+      configArgs: ["-c", `remote.origin.pushurl=${deadPushUrl}`],
+      env: { PAPERCLIP_GIT_TOKEN: "resolved-token" },
+    }));
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "feature-branch",
+      issueIdentifier: "SUP-14982",
+      repoRoot,
+      resolveGitAuth,
+    });
+
+    expect(resolveGitAuth).toHaveBeenCalledTimes(1);
+    expect(resolveGitAuth).toHaveBeenCalledWith(remoteRoot);
+    expect(result.preserved).toBe(false);
+    expect(result.warning).toBeTruthy();
+    expect(result.warning).toContain("Could not push");
+  });
+
+  it("applies the resolved auth invocation's env to the push (SUP-14982)", async () => {
+    const { repoRoot, remoteRoot } = await createTempRepoWithRemote();
+
+    await runGit(repoRoot, ["checkout", "-b", "feature-branch"]);
+    await fs.writeFile(path.join(repoRoot, "feature.txt"), "feature\n", "utf8");
+    await runGit(repoRoot, ["add", "feature.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add feature"]);
+
+    const deadPushUrl = path.join(os.tmpdir(), `paperclip-worktree-dead-push-${randomUUID()}`);
+    const resolveGitAuth = vi.fn(async () => ({
+      configArgs: [],
+      env: {
+        PAPERCLIP_GIT_TOKEN: "resolved-token",
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "remote.origin.pushurl",
+        GIT_CONFIG_VALUE_0: deadPushUrl,
+      },
+    }));
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "feature-branch",
+      issueIdentifier: "SUP-14982",
+      repoRoot,
+      resolveGitAuth,
+    });
+
+    expect(resolveGitAuth).toHaveBeenCalledWith(remoteRoot);
+    expect(result.preserved).toBe(false);
+    expect(result.warning).toBeTruthy();
+    expect(result.warning).toContain("Could not push");
+  });
+
+  it("keeps ambient push behavior when resolveGitAuth resolves nothing (SUP-14982)", async () => {
+    const { repoRoot, remoteRoot } = await createTempRepoWithRemote();
+
+    await runGit(repoRoot, ["checkout", "-b", "feature-branch"]);
+    await fs.writeFile(path.join(repoRoot, "feature.txt"), "feature\n", "utf8");
+    await runGit(repoRoot, ["add", "feature.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add feature"]);
+
+    const resolveGitAuth = vi.fn(async () => null);
+
+    const result = await preserveUnpushedWorktreeCommits({
+      workspacePath: repoRoot,
+      branchName: "feature-branch",
+      issueIdentifier: "SUP-14982",
+      repoRoot,
+      resolveGitAuth,
+    });
+
+    expect(resolveGitAuth).toHaveBeenCalledWith(remoteRoot);
+    expect(result.preserved).toBe(true);
+    expect(result.preservedRef).toBe("refs/preserved/SUP-14982/feature-branch");
+    expect(result.warning).toBeNull();
+
+    const refExists = await readGit(remoteRoot, [
+      "show-ref",
+      "--verify",
+      "--quiet",
+      "refs/preserved/SUP-14982/feature-branch",
+    ]);
+    expect(refExists).toBe("");
+  });
 });
 
 describe("ensurePersistedExecutionWorkspaceAvailable base repo hygiene", () => {
