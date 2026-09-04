@@ -658,6 +658,10 @@ async function findApprovalCandidates(
         // delivered from a workspace with zero external-object mentions ever
         // posted. Widening DISCOVERY only: the Guard A / Guard B gates below are
         // untouched, so a wider scan cannot authorize a stamp it would refuse.
+        // SUP-14926: the OR arm has no mention row to carry PR state, so a
+        // zero-mention card whose discovery already returned `none` would match
+        // forever. Exclude it once a terminal `none` verdict is persisted, and
+        // re-admit it when the card is updated again (a new PR arrived).
         sql`(
           (exists (
             select 1
@@ -683,6 +687,10 @@ async function findApprovalCandidates(
               ${issues.executionWorkspaceId} is not null
               or ${issues.projectWorkspaceId} is not null
               or ${issues.projectId} is not null
+            )
+            and (
+              ${issues.executionState} -> 'approvalStatus' -> 'workspaceDiscovery' ->> 'verdict' is distinct from 'none'
+              or ${issues.updatedAt} > (${issues.executionState} -> 'approvalStatus' -> 'workspaceDiscovery' ->> 'at')::timestamptz
             )
           )
         )`,
@@ -1411,6 +1419,40 @@ async function backfillPreDBApprovalAnchor(
   };
 }
 
+/**
+ * SUP-14926: persist a terminal `none` workspace-discovery verdict on the card.
+ * A zero-mention approved card has no mention row to carry PR state, so once the
+ * live workspace discovery concludes there is no open PR, nothing about the card
+ * changes on its own and it would be re-scanned (and re-fan-out to GitHub) on
+ * every tick. The persisted verdict lets the candidate SQL exclude it until the
+ * card is updated again (a new PR arrives), which re-admits it. Only the
+ * deterministic `none` outcome is persisted — `undetermined` (transient
+ * auth/HTTP) and `ambiguous` (operator attention) must keep retrying and are
+ * never silenced.
+ */
+async function persistWorkspaceDiscoveryVerdict(
+  db: Db,
+  row: CandidateRow,
+): Promise<void> {
+  const anchorHeadSha = readApprovedHead(row.executionState)?.anchorHeadSha ?? null;
+  const currentState = row.executionState ?? {};
+  const existing = (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
+  const marker = {
+    verdict: "none",
+    at: new Date().toISOString(),
+    headSha: anchorHeadSha,
+  };
+  const nextExecutionState: Record<string, unknown> = {
+    ...currentState,
+    approvalStatus: { ...existing, workspaceDiscovery: marker },
+  };
+  await db
+    .update(issues)
+    .set({ executionState: nextExecutionState })
+    .where(eq(issues.id, row.id));
+  row.executionState = nextExecutionState;
+}
+
 async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateResult> {
   const label = row.identifier ?? row.id;
 
@@ -1455,6 +1497,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
       };
     }
     if (resolution.kind === "none") {
+      await persistWorkspaceDiscoveryVerdict(db, row);
       return {
         kind: "skipped",
         reason: "no-open-pr",

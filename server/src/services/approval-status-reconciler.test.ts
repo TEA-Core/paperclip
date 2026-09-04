@@ -557,6 +557,100 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
+    it("persists a terminal `none` verdict and stops re-selecting the zero-mention card (SUP-14926 AC1)", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+      // The live open-PR list resolves to zero matches, so workspace discovery
+      // returns `none` — the deterministic terminal verdict.
+      installRoutes([{ url: OPEN_PRS_LIST_URL, body: [] }]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.scanned).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["no-open-pr"]).toBe(1);
+
+      // The terminal verdict is persisted with the anchor head and a timestamp.
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      const wd = approvalStatus.workspaceDiscovery as Record<string, unknown>;
+      expect(wd.verdict).toBe("none");
+      expect(wd.headSha).toBe(NEW_HEAD);
+      expect(typeof wd.at).toBe("string");
+
+      // The following tick no longer selects the card (AC1).
+      const summary2 = await runApprovalStatusReconcilerTick(db);
+      expect(summary2.scanned).toBe(0);
+      expect(summary2.skipped["no-open-pr"]).toBeUndefined();
+    });
+
+    it("re-selects a zero-mention card whose updated_at advances past the persisted verdict (SUP-14926 AC2)", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([{ url: OPEN_PRS_LIST_URL, body: [] }]);
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.scanned).toBe(1);
+      expect(summary.skipped["no-open-pr"]).toBe(1);
+
+      const summary2 = await runApprovalStatusReconcilerTick(db);
+      expect(summary2.scanned).toBe(0);
+
+      // A new PR / activity arrives after the verdict was recorded, moving the
+      // card's updated_at past the recorded `at` and re-admitting it.
+      await db
+        .update(issues)
+        .set({ updatedAt: new Date(Date.now() + 60_000) })
+        .where(eq(issues.id, issueId));
+
+      const summary3 = await runApprovalStatusReconcilerTick(db);
+      expect(summary3.scanned).toBe(1);
+      expect(summary3.skipped["no-open-pr"]).toBe(1);
+    });
+
+    it("does not persist a verdict when live workspace discovery is undetermined (SUP-14926 AC3)", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+      // Live discovery 404s — transient (auth/HTTP), never a terminal verdict.
+      installRoutes([{ url: OPEN_PRS_LIST_URL, ok: false, status: 404, body: { message: "Not Found" } }]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.scanned).toBe(1);
+      expect(summary.skipped["pr-undetermined"]).toBe(1);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.workspaceDiscovery).toBeUndefined();
+    });
+
+    it("does not persist a verdict when live workspace discovery is ambiguous (SUP-14926 AC4)", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        {
+          url: OPEN_PRS_LIST_URL,
+          body: [
+            { number: 42, draft: false, head: { ref: "SUP-42-branch" }, title: "First (SUP-42)", body: null },
+            { number: 43, draft: false, head: { ref: "SUP-42-branch-2" }, title: "Second (SUP-42)", body: null },
+          ],
+        },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.scanned).toBe(1);
+      expect(summary.skipped["ambiguous-pr"]).toBe(1);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.workspaceDiscovery).toBeUndefined();
+    });
+
     it("performs zero writes when the head already carries paperclip/approved=success", async () => {
       const issueId = await insertIssue();
       await insertDecision(issueId);
