@@ -4242,6 +4242,13 @@ export function issueRoutes(
     });
     if (!resolutionNote) return activeRecoveryAction;
 
+    // SUP-14906: a terminal source (cancelled/done) can never be resurrected
+    // by the sweep — it is skipped outright. Passing boardResolution here is
+    // safe and necessary so that ceiling-exhausted (escalated+exhausted) rows
+    // are also cleared when the source reaches a terminal state.
+    const terminalSource =
+      input.issue.status === "cancelled" || input.issue.status === "done";
+
     const resolved = await recoveryActionsSvc.resolveActiveForIssue({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
@@ -4249,8 +4256,20 @@ export function issueRoutes(
       status: "cancelled",
       outcome: "cancelled",
       resolutionNote,
+      boardResolution: terminalSource,
     });
-    if (!resolved) return activeRecoveryAction;
+    if (!resolved) {
+      logger.warn(
+        {
+          issueId: input.issue.id,
+          issueStatus: input.issue.status,
+          actionId: activeRecoveryAction.id,
+          trigger: input.trigger,
+        },
+        "source revalidation recovery resolve matched zero rows (action may have been concurrently resolved)",
+      );
+      return activeRecoveryAction;
+    }
 
     const actor = input.actor;
     await logActivity(db, {

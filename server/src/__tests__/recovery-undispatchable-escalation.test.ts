@@ -392,11 +392,18 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue.status).toBe("done");
 
-    // The terminal row is protected: ordinary resolution must not erase it,
-    // but the card itself is fully writable.
+    // SUP-14906 supersedes the row half of this assertion. SUP-14565 pinned the
+    // ceiling-exhausted row as protected against ordinary resolution, which left
+    // it permanently active on a terminal source: the classifier's terminal
+    // branch decided to cancel it on every read and the predicate matched zero
+    // rows every time. SUP-14906 AC1 makes a terminal source clear the action,
+    // so the row is now resolved rather than preserved. The board-writability
+    // guarantee this test exists for — the PATCH above returning 200 with the
+    // card at `done` — is unchanged, and AC2 (the clear must not write the
+    // issue's own status) is asserted above.
     const [row] = await recoveryActionRows(issueId);
-    expect(row.status).toBe("escalated");
-    expect(row.outcome).toBe("exhausted");
+    expect(row.status).toBe("cancelled");
+    expect(row.outcome).toBe("cancelled");
   });
 
   async function resolveBoardRuling(actionId: string, outcome: "false_positive" | "restored") {

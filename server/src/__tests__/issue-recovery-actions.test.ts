@@ -3887,4 +3887,118 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(after.status).toBe("in_progress");
     });
   });
+
+  describe("SUP-14906: terminal source clears ceiling-exhausted action on read", () => {
+    it("clears an escalated+exhausted recovery action when the source issue is cancelled (acceptance 1+2)", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const fingerprint = "recovery:terminal-source:fingerprint";
+      const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+      const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+      expect(sweep.maxAttemptsReached).toBe(1);
+
+      await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, sourceIssueId));
+
+      const app = createApp();
+      const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+
+      // Acceptance 1: the action is cleared.
+      expect(detail.body.activeRecoveryAction).toBeNull();
+
+      // Acceptance 2: the issue's own status is not written by the clear.
+      expect(detail.body.status).toBe("cancelled");
+
+      const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(row).toMatchObject({ status: "cancelled", outcome: "cancelled", resolvedAt: expect.any(Date) });
+      expect(row.resolutionNote).toContain("source issue reached cancelled");
+    });
+
+    it("clears an escalated+exhausted recovery action when the source issue is done (acceptance 1)", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const fingerprint = "recovery:terminal-source:done";
+      const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+      const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+      expect(sweep.maxAttemptsReached).toBe(1);
+
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
+
+      const app = createApp();
+      const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+      expect(detail.body.activeRecoveryAction).toBeNull();
+
+      const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(row).toMatchObject({ status: "cancelled", outcome: "cancelled" });
+    });
+
+    it("still protects an escalated+exhausted action when the source is NON-terminal (acceptance 3)", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const fingerprint = "recovery:non-terminal:fingerprint";
+      const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+      const svc = issueRecoveryActionService(db);
+
+      const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+      expect(sweep.maxAttemptsReached).toBe(1);
+
+      // Source issue stays in_progress (non-terminal). Ordinary resolution must not clear it.
+      const cleared = await svc.resolveActiveForIssue({
+        companyId,
+        sourceIssueId,
+        actionId,
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Non-terminal source revalidation.",
+      });
+      expect(cleared).toBeNull();
+
+      const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(row).toMatchObject({ status: "escalated", outcome: "exhausted" });
+    });
+
+    it("logs a warning when the zero-row miss still occurs (acceptance 4)", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const fingerprint = "recovery:zero-row:fingerprint";
+      const { actionId } = await seedExhaustedSweepCandidate({ companyId, managerId, sourceIssueId, fingerprint });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+      const sweep = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60 * 1000 });
+      expect(sweep.maxAttemptsReached).toBe(1);
+
+      // Cancel the source issue (terminal).
+      await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, sourceIssueId));
+
+      // Deterministically exercise the zero-row path: the action is still
+      // escalated+exhausted in the DB (so getActiveForIssue finds it), but we
+      // make resolveActiveForIssue return null — simulating the concurrent
+      // resolution race where another writer resolves the row between the
+      // read and the update inside revalidateActiveSourceRecovery.
+      const recoveryModule = await import("../services/issue-recovery-actions.js");
+      const originalFactory = recoveryModule.issueRecoveryActionService;
+      const resolveSpy = vi.fn(async () => null);
+      vi.spyOn(recoveryModule, "issueRecoveryActionService").mockImplementation((dbArg: any) => {
+        const realSvc = originalFactory(dbArg);
+        return { ...realSvc, resolveActiveForIssue: resolveSpy };
+      });
+
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+      const app = createApp();
+      await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+
+      // AC4: the zero-row miss emitted a log line with the action's identity.
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ issueId: sourceIssueId, actionId, trigger: "read_projection" }),
+        "source revalidation recovery resolve matched zero rows (action may have been concurrently resolved)",
+      );
+
+      // The action was NOT cleared — the zero-row path returns the stale action.
+      const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(row.status).toBe("escalated");
+      expect(row.resolvedAt).toBeNull();
+
+      vi.restoreAllMocks();
+    });
+  });
 });
