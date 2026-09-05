@@ -11,6 +11,7 @@ import {
   issues,
   plugins,
 } from "@paperclipai/db";
+import type { Db } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -21,7 +22,7 @@ import {
   externalObjectService,
   type ExternalObjectResolver,
 } from "../services/external-objects.js";
-import { canonicalizeExternalObjectUrl } from "@paperclipai/shared/external-objects-server";
+import { canonicalizeExternalObjectUrl, extractExternalObjectCanonicalUrls } from "@paperclipai/shared/external-objects-server";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { createGitHubExternalObjectProvider } from "../services/github-external-object-provider.js";
@@ -99,6 +100,39 @@ describe("external object registries", () => {
       objectType: "link",
       externalId: canonical.canonicalIdentityHash,
       displayTitle: "https://example.com/path",
+    });
+  });
+
+  it("classifies a bold-wrapped github PR url as a pull_request, not a generic link", async () => {
+    // A url wrapped in markdown emphasis (`**…**`) must extract to a clean
+    // canonical url that the GitHub detector still recognises as a PR; before
+    // the fix the trailing `**` leaked into the path and it degraded to
+    // `url`/`link`, which merge-arming then reports as "no linked PR".
+    const urls = extractExternalObjectCanonicalUrls(
+      "Delivered as **https://github.com/acme/app/pull/375** this morning.",
+    );
+    expect(urls).toHaveLength(1);
+
+    const { detector: githubDetector } = createGitHubExternalObjectProvider({} as Db, {});
+    const registry = createExternalObjectDetectorRegistry([githubDetector]);
+    const detections = await registry.detect({
+      companyId: "company-1",
+      urls,
+      sourceContext: {
+        companyId: "company-1",
+        sourceIssueId: "issue-1",
+        sourceKind: "comment",
+        sourceRecordId: null,
+        documentKey: null,
+        propertyKey: null,
+      },
+    });
+
+    expect(detections).toHaveLength(1);
+    expect(detections[0]).toMatchObject({
+      providerKey: "github",
+      objectType: "pull_request",
+      externalId: "acme/app#pull/375",
     });
   });
 

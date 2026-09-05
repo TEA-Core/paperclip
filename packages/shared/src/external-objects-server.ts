@@ -73,11 +73,11 @@ function stripMarkdownCode(markdown: string): string {
   return output;
 }
 
-function trimTrailingPunctuation(token: string): string {
+function trimTrailingPunctuation(token: string, preceding?: string): string {
   let trimmed = token;
   while (trimmed.length > 0) {
     const last = trimmed[trimmed.length - 1]!;
-    if (!".,!?;:".includes(last) && last !== ")" && last !== "]") break;
+    if (!".,!?;:*_".includes(last) && last !== ")" && last !== "]") break;
 
     if (
       (last === ")" && (trimmed.match(/\(/g)?.length ?? 0) >= (trimmed.match(/\)/g)?.length ?? 0))
@@ -85,6 +85,13 @@ function trimTrailingPunctuation(token: string): string {
     ) {
       break;
     }
+
+    // A trailing `*` or `_` is a markdown emphasis close only when the source
+    // shows a matching opener abutting the start of the URL (e.g. `**url**`).
+    // Otherwise it is preserved when it is genuinely part of the path that the
+    // token regex cut off, e.g. `…/wiki/Foo_` immediately before `(bar)`.
+    if ((last === "*" || last === "_") && preceding !== last) break;
+
     trimmed = trimmed.slice(0, -1);
   }
   return trimmed;
@@ -121,7 +128,8 @@ export function findExternalObjectUrlMatches(markdown: string): ExternalObjectUr
   const re = new RegExp(EXTERNAL_URL_TOKEN_RE);
 
   while ((match = re.exec(scrubbed)) !== null) {
-    const matchedText = trimTrailingPunctuation(match[0]);
+    const preceding = match.index > 0 ? scrubbed[match.index - 1] : undefined;
+    const matchedText = trimTrailingPunctuation(match[0], preceding);
     if (!matchedText || parseIssueReferenceHref(matchedText)) continue;
 
     matches.push({
