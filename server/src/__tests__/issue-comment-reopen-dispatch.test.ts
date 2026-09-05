@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
-import { and, desc, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
+import request from "supertest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentRuntimeState,
@@ -8,21 +8,27 @@ import {
   agents,
   companies,
   companySkills,
-  createDb,
+  companyMemberships,
   environmentLeases,
   environments,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
+  principalPermissionGrants,
 } from "@paperclipai/db";
 import {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.ts";
+  describeEmbeddedPostgres,
+  routeApp,
+  seedCompanyWithBoardAccess,
+  useEmbeddedPostgres,
+} from "./helpers/route-test-harness.js";
+import { issueRoutes } from "../routes/issues.js";
 import { runningProcesses } from "../adapters/index.ts";
 
+// The run created for the reopen would otherwise spawn a real adapter process.
+// Stub the adapter so execution resolves immediately; the assertion only needs the
+// heartbeat_runs row that enqueueWakeup inserts before it hands off to execution.
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
     exitCode: 0,
@@ -46,29 +52,15 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+// SUP-15065 — the route-level regression the card asks for. Drives a comment-triggered
+// reopen through the REAL route (issues.ts fire-and-forget flush) with a REAL heartbeat
+// against embedded Postgres, and asserts a heartbeat_runs row appears — not just a wake
+// object. A unit test on the wake object alone is precisely the gap this card closes.
+const pg = useEmbeddedPostgres("paperclip-issue-comment-reopen-route-");
 
-type ScenarioOpts = {
-  label: string;
-  initialStatus: "todo" | "done";
-  flipToTodo: boolean;
-  reviewPolicy?: boolean;
-  lingeringRunStatus?: "queued" | "scheduled_retry" | "running" | "succeeded";
-};
-
-describeEmbeddedPostgres("issue comment reopen dispatch (SUP-15065) — scenario matrix", () => {
-  let db!: ReturnType<typeof createDb>;
-  let heartbeat!: ReturnType<typeof heartbeatService>;
-  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-
-  beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-comment-reopen-dispatch-");
-    db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db);
-  }, 30_000);
-
+describeEmbeddedPostgres("issue comment reopen route dispatch (SUP-15065)", () => {
   afterEach(async () => {
+    const db = pg.db;
     runningProcesses.clear();
     for (let attempt = 0; ; attempt += 1) {
       try {
@@ -83,6 +75,8 @@ describeEmbeddedPostgres("issue comment reopen dispatch (SUP-15065) — scenario
         await db.delete(environments);
         await db.delete(executionWorkspaces);
         await db.delete(companySkills);
+        await db.delete(companyMemberships);
+        await db.delete(principalPermissionGrants);
         await db.delete(companies);
         break;
       } catch (error) {
@@ -92,164 +86,127 @@ describeEmbeddedPostgres("issue comment reopen dispatch (SUP-15065) — scenario
     }
   });
 
-  afterAll(async () => {
-    await tempDb?.cleanup();
-  });
-
-  async function seedScenario(opts: ScenarioOpts) {
-    const companyId = randomUUID();
-    const agentId = randomUUID();
-    const issueId = randomUUID();
-    const priorRunId = randomUUID();
-
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-      defaultResponsibleUserId: "responsible-user",
-    });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
+  async function seedDoneCard(opts: { wakeOnDemand?: boolean } = {}) {
+    const db = pg.db;
+    const company = await seedCompanyWithBoardAccess(db, "Reopen Dispatch");
+    const wakeOnDemand = opts.wakeOnDemand ?? true;
+    const [agent] = await db.insert(agents).values({
+      companyId: company.companyId,
       name: "support-QAE",
       role: "support",
       status: "idle",
       adapterType: "opencode_local",
       adapterConfig: {},
-      runtimeConfig: {
-        heartbeat: {
-          wakeOnDemand: true,
-          maxConcurrentRuns: 1,
-        },
-      },
+      runtimeConfig: { heartbeat: { wakeOnDemand, maxConcurrentRuns: 1 } },
       permissions: {},
-    });
-
-    const executionPolicy = opts.reviewPolicy
-      ? {
-          mode: "normal",
-          commentRequired: true,
-          stages: [
-            {
-              id: randomUUID(),
-              type: "review",
-              participants: [{ id: agentId, type: "agent", userId: null, agentId }],
-              approvalsNeeded: 1,
-            },
-          ],
-        }
-      : undefined;
-
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: `Repro ${opts.label}`,
-      status: opts.initialStatus,
+    }).returning();
+    const [issue] = await db.insert(issues).values({
+      companyId: company.companyId,
+      title: "Reopen dispatch repro",
+      status: "done",
       priority: "medium",
-      assigneeAgentId: agentId,
-      responsibleUserId: "responsible-user",
-      ...(executionPolicy ? { executionPolicy } : {}),
-    });
-
-    // Prior terminal run that completed the (done) card.
-    await db.insert(heartbeatRuns).values({
-      id: priorRunId,
-      companyId,
-      agentId,
-      invocationSource: "assignment",
-      status: "succeeded",
-      responsibleUserId: "responsible-user",
-      createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
-      startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
-      finishedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
-      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
-    });
-
-    // A lingering non-terminal run (if requested) — models a run still holding the execution lock.
-    if (opts.lingeringRunStatus) {
-      await db.insert(heartbeatRuns).values({
-        id: randomUUID(),
-        companyId,
-        agentId,
-        invocationSource: "assignment",
-        status: opts.lingeringRunStatus,
-        responsibleUserId: "responsible-user",
-        createdAt: new Date(Date.now() - 30 * 60 * 1000),
-        startedAt: opts.lingeringRunStatus === "succeeded" ? new Date(Date.now() - 30 * 60 * 1000) : null,
-        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
-      });
-    }
-
-    // Mirror the route reopen mutation: done -> todo, executionState nulled.
-    if (opts.flipToTodo) {
-      await db
-        .update(issues)
-        .set({ status: "todo", executionState: null, updatedAt: new Date() })
-        .where(eq(issues.id, issueId));
-    }
-
-    return { companyId, agentId, issueId };
+      assigneeAgentId: agent!.id,
+      responsibleUserId: company.userId,
+    }).returning();
+    return { company, agent: agent!, issue: issue! };
   }
 
-  function reopenWake(agentId: string, issueId: string, reason: "issue_reopened_via_comment" | "issue_commented") {
-    const commentId = randomUUID();
-    const isReopen = reason === "issue_reopened_via_comment";
-    return heartbeat.wakeup(agentId, {
-      source: "automation",
-      triggerDetail: "system",
-      reason,
-      payload: {
-        issueId,
-        commentId,
-        ...(isReopen ? { reopenedFrom: "done" } : {}),
-        mutation: "comment",
-      },
-      requestedByActorType: "user",
-      requestedByActorId: "board-user",
-      contextSnapshot: {
-        issueId,
-        taskId: issueId,
-        commentId,
-        wakeCommentId: commentId,
-        source: isReopen ? "issue.comment.reopen" : "issue.comment",
-        wakeReason: reason,
-        ...(isReopen ? { reopenedFrom: "done" } : {}),
-      },
-    });
+  async function waitForReopenRun(agentId: string, ms = 8000) {
+    const db = pg.db;
+    const start = Date.now();
+    for (;;) {
+      const rows = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      const match = rows.find(
+        (row) =>
+          row.contextSnapshot?.wakeReason === "issue_reopened_via_comment" ||
+          row.contextSnapshot?.source === "issue.comment.reopen",
+      );
+      if (match) return match;
+      if (Date.now() - start > ms) {
+        // Surface every skip the wake produced so the shape is diagnosable.
+        const skips = await db
+          .select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.agentId, agentId));
+        throw new Error(
+          `no heartbeat_runs row for the reopen within ${ms}ms. agent_wakeup_requests: ${JSON.stringify(skips)}`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   }
 
-  it("a comment-triggered reopen on a done card enqueues a heartbeat_runs row for the assignee", async () => {
-    const { companyId, agentId, issueId } = await seedScenario({
-      label: "done_to_todo_reopen",
-      initialStatus: "done",
-      flipToTodo: true,
+  async function waitForActivityRow(action: string, ms = 8000) {
+    const db = pg.db;
+    const start = Date.now();
+    for (;;) {
+      const rows = await db
+        .select({ action: activityLog.action, details: activityLog.details })
+        .from(activityLog)
+        .where(eq(activityLog.action, action));
+      if (rows.length > 0) return rows;
+      if (Date.now() - start > ms) return null;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  it("records an issue.wake_not_dispatched row when the reopen wake is not dispatched", async () => {
+    const db = pg.db;
+    const { company, agent, issue } = await seedDoneCard({ wakeOnDemand: false });
+    const app = routeApp(db, company.actor, issueRoutes);
+
+    const res = await request(app)
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: "Please reopen and pick this up.", reopen: true });
+    expect(res.status).toBe(201);
+
+    // The reopen still flipped the card back to todo.
+    const refetched = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issue.id));
+    expect(refetched[0]?.status).toBe("todo");
+
+    // The silent loss is now observable: a not_dispatched activity row was recorded.
+    const notDispatched = await waitForActivityRow("issue.wake_not_dispatched");
+    expect(notDispatched, "an issue.wake_not_dispatched row must exist").toHaveLength(1);
+    expect(notDispatched![0].details).toMatchObject({
+      agentId: agent.id,
+      wakeupReason: "issue_reopened_via_comment",
+      outcome: "not_dispatched",
     });
 
-    // A clean done->todo reopen (idle assignee, resolvable responsible user) must
-    // dispatch a run — the exact dispatch guarantee the SUP-14989 card was missing.
-    const wake = await reopenWake(agentId, issueId, "issue_reopened_via_comment");
-    expect(
-      wake,
-      "a clean done->todo reopen must dispatch a run, not be skipped/deferred (null)",
-    ).toBeTruthy();
-
+    // ...and no run was enqueued for the assignee (the wake was skipped, not dropped silently).
     const runs = await db
-      .select({
-        id: heartbeatRuns.id,
-        status: heartbeatRuns.status,
-        agentId: heartbeatRuns.agentId,
-      })
+      .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)))
-      .orderBy(desc(heartbeatRuns.createdAt));
+      .where(eq(heartbeatRuns.agentId, agent.id));
+    expect(runs).toHaveLength(0);
+  });
 
-    // A fresh non-terminal run must exist for the reopened card (the seeded prior
-    // run was `succeeded`).
-    const dispatched = runs.filter((run) =>
-      ["queued", "running", "scheduled_retry"].includes(run.status),
-    );
-    expect(dispatched.length, "a non-terminal heartbeat_runs row must exist for the reopen").toBeGreaterThanOrEqual(1);
-    expect(wake && "id" in wake ? wake.id : null).toBe(dispatched[0]?.id);
+  it("POST /comments reopen on a done card enqueues a heartbeat_runs row for the assignee", async () => {
+    const db = pg.db;
+    const { company, agent, issue } = await seedDoneCard();
+    const app = routeApp(db, company.actor, issueRoutes);
+
+    const res = await request(app)
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: "Please reopen and pick this up.", reopen: true });
+
+    expect(res.status).toBe(201);
+    // POST /comments returns the created comment (its own id), not the issue.
+    expect(res.body?.body).toBe("Please reopen and pick this up.");
+
+    // The reopen flipped the card back to todo.
+    const refetched = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issue.id));
+    expect(refetched[0]?.status).toBe("todo");
+
+    const run = await waitForReopenRun(agent.id);
+    expect(run, "a heartbeat_runs row must exist for the reopen").toBeTruthy();
+    expect(run.status).toBeTruthy();
   });
 });
