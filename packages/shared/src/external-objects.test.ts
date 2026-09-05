@@ -123,4 +123,48 @@ describe("external object references", () => {
     expect(externalObjectProviderKeySchema.safeParse("GitHub").success).toBe(false);
     expect(externalObjectTypeSchema.safeParse("pull-request").success).toBe(false);
   });
+
+  it("strips a trailing ** from a bold-wrapped url so a PR link stays a PR link", () => {
+    const markdown = "Delivered as **https://github.com/acme/app/pull/375** this morning.";
+    expect(findExternalObjectUrlMatches(markdown).map((m) => m.matchedText)).toEqual([
+      "https://github.com/acme/app/pull/375",
+    ]);
+
+    const [canonical] = extractExternalObjectCanonicalUrls(markdown);
+    expect(canonical).toMatchObject({
+      sanitizedCanonicalUrl: "https://github.com/acme/app/pull/375",
+      canonicalIdentity: { scheme: "https", host: "github.com", path: "/acme/app/pull/375" },
+    });
+  });
+
+  it("strips abutting markdown emphasis and sentence punctuation from urls", () => {
+    const cases: Array<[string, string]> = [
+      ["See *https://github.com/acme/app/pull/8* now", "https://github.com/acme/app/pull/8"],
+      ["See _https://github.com/acme/app/pull/9_ now", "https://github.com/acme/app/pull/9"],
+      ["[PR](https://github.com/acme/app/pull/10) here", "https://github.com/acme/app/pull/10"],
+      ["Bare: https://github.com/acme/app/pull/11.", "https://github.com/acme/app/pull/11"],
+      ["Bare: https://github.com/acme/app/pull/12,", "https://github.com/acme/app/pull/12"],
+      ["Bare: https://github.com/acme/app/pull/13;", "https://github.com/acme/app/pull/13"],
+      ["Bare: https://github.com/acme/app/pull/14:", "https://github.com/acme/app/pull/14"],
+    ];
+    for (const [input, expected] of cases) {
+      expect(findExternalObjectUrlMatches(input).map((m) => m.matchedText)).toEqual([expected]);
+    }
+  });
+
+  it("preserves a genuine underscore the token cut off before a paren group (no over-strip)", () => {
+    // The token regex stops at `(`, so `Foo_` is captured; the trailing `_` must
+    // survive because it is not an abutting markdown emphasis marker.
+    const markdown = "Reference: https://en.wikipedia.org/wiki/Foo_(bar)";
+    expect(findExternalObjectUrlMatches(markdown).map((m) => m.matchedText)).toEqual([
+      "https://en.wikipedia.org/wiki/Foo_",
+    ]);
+  });
+
+  it("does not strip a url that genuinely ends in an underscore", () => {
+    const markdown = "Artifact: https://example.com/exports/2026_daily.";
+    expect(findExternalObjectUrlMatches(markdown).map((m) => m.matchedText)).toEqual([
+      "https://example.com/exports/2026_daily",
+    ]);
+  });
 });
