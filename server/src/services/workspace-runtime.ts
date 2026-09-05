@@ -35,7 +35,7 @@ import {
   type WorkspaceRuntimeServiceStateMap,
 } from "@paperclipai/shared";
 import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
-import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
+import { asNumber, asString, defaultPathForPlatform, parseObject, renderTemplate, resolveCommandForLogs } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
 import {
@@ -864,6 +864,19 @@ function createProcessOutputCapture(maxBytes: number): ProcessOutputAccumulator 
   };
 }
 
+// Resolves the `git` binary to an absolute path so that spawning it never
+// depends on `git` happening to be on the ambient PATH. Terminal-workspace
+// cleanup (reaper + `git worktree remove`) must not strand worktrees on disk
+// just because a reduced ambient PATH is missing the directory that holds git.
+// Returns the bare command when git cannot be located, preserving the original
+// spawn behavior (and its error) rather than hiding a real missing binary.
+export async function resolveGitExecutable(cwd: string, env: NodeJS.ProcessEnv): Promise<string> {
+  const ambient = await resolveCommandForLogs("git", cwd, env);
+  if (ambient !== "git") return ambient;
+  const widenedPath = [env.PATH ?? env.Path ?? "", defaultPathForPlatform()].filter(Boolean).join(path.delimiter);
+  return await resolveCommandForLogs("git", cwd, { ...env, PATH: widenedPath });
+}
+
 async function executeProcess(input: {
   command: string;
   args: string[];
@@ -880,15 +893,18 @@ async function executeProcess(input: {
   stdoutBytes: number;
   stderrBytes: number;
 }> {
+  const spawnEnv = input.env ?? process.env;
+  const spawnCommand =
+    input.command === "git" ? await resolveGitExecutable(input.cwd, spawnEnv) : input.command;
   const proc = await new Promise<{
     stdout: ProcessOutputAccumulator;
     stderr: ProcessOutputAccumulator;
     code: number | null;
   }>((resolve, reject) => {
-    const child = spawn(input.command, input.args, {
+    const child = spawn(spawnCommand, input.args, {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: input.env ?? process.env,
+      env: spawnEnv,
     });
     const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
@@ -6293,6 +6309,70 @@ async function deleteGitBranchAtVerifiedTip(input: {
   }
 }
 
+// Removes a git worktree artifact and returns a warning string when the removal
+// did not fully succeed via git (or null on clean success). When the base-repo
+// root no longer exists on disk, `git worktree remove` (which runs with
+// `cwd: repoRoot`) would fail the spawn with `spawn git ENOENT` and the worktree
+// would be stranded; in that case the worktree directory is removed directly
+// instead. Delivery state is verified by the caller just before removal.
+export async function removeGitWorktreeArtifact(input: {
+  repoRoot: string;
+  worktreePath: string;
+  forceWorktreeRemoval?: boolean;
+  recorder?: WorkspaceOperationRecorder | null;
+  assertSafeToCleanup?: (() => Promise<void>) | null;
+  metadata: {
+    workspaceId: string;
+    branchName: string | null;
+  };
+}): Promise<string | null> {
+  const { repoRoot, worktreePath } = input;
+  const force = input.forceWorktreeRemoval !== false;
+  const metadata = {
+    ...input.metadata,
+    workspacePath: worktreePath,
+    cleanupAction: "worktree_remove",
+  };
+
+  if (!(await directoryExists(repoRoot))) {
+    try {
+      await input.assertSafeToCleanup?.();
+      await fs.rm(worktreePath, { recursive: true, force: true });
+      if (input.recorder) {
+        await input.recorder.recordOperation({
+          phase: "worktree_cleanup",
+          command: `git worktree remove ${worktreePath} (base repo root missing)`,
+          cwd: worktreePath,
+          metadata: { ...metadata, removedDirectly: true },
+          run: async () => ({
+            status: "succeeded",
+            exitCode: 0,
+            system: `Base repo root "${repoRoot}" no longer exists; removed git worktree "${worktreePath}" directly.\n`,
+          }),
+        });
+      }
+      return `Base repo root "${repoRoot}" no longer exists; removed git worktree "${worktreePath}" directly.`;
+    } catch (err) {
+      return `Could not remove worktree "${worktreePath}" directly: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  try {
+    await input.assertSafeToCleanup?.();
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_cleanup",
+      args: ["worktree", "remove", ...(force ? ["--force"] : []), worktreePath],
+      cwd: repoRoot,
+      metadata,
+      successMessage: `Removed git worktree ${worktreePath}\n`,
+      failureLabel: `git worktree remove ${worktreePath}`,
+    });
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
 export async function cleanupExecutionWorkspaceArtifacts(input: {
   workspace: {
     id: string;
@@ -6424,29 +6504,18 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       if (!repoRoot) {
         warnings.push(`Could not resolve git repo root for "${workspacePath}".`);
       } else {
-        try {
-          await input.assertSafeToCleanup?.();
-          await recordGitOperation(input.recorder, {
-            phase: "worktree_cleanup",
-            args: [
-              "worktree",
-              "remove",
-              ...(input.forceWorktreeRemoval === false ? [] : ["--force"]),
-              workspacePath,
-            ],
-            cwd: repoRoot,
-            metadata: {
-              workspaceId: input.workspace.id,
-              workspacePath,
-              branchName: input.workspace.branchName,
-              cleanupAction: "worktree_remove",
-            },
-            successMessage: `Removed git worktree ${workspacePath}\n`,
-            failureLabel: `git worktree remove ${workspacePath}`,
-          });
-        } catch (err) {
-          warnings.push(err instanceof Error ? err.message : String(err));
-        }
+        const worktreeRemoveWarning = await removeGitWorktreeArtifact({
+          repoRoot,
+          worktreePath: workspacePath,
+          forceWorktreeRemoval: input.forceWorktreeRemoval,
+          recorder: input.recorder,
+          assertSafeToCleanup: input.assertSafeToCleanup,
+          metadata: {
+            workspaceId: input.workspace.id,
+            branchName: input.workspace.branchName,
+          },
+        });
+        if (worktreeRemoveWarning) warnings.push(worktreeRemoveWarning);
       }
     }
     if (branchCreatedByRuntime && input.workspace.branchName) {

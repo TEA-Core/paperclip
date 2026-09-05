@@ -39,6 +39,8 @@ import {
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   preserveUnpushedWorktreeCommits,
+  removeGitWorktreeArtifact,
+  resolveGitExecutable,
   prepareBaseRepoForWorkspace,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
@@ -12071,6 +12073,68 @@ describe("preserveUnpushedWorktreeCommits", () => {
       "refs/preserved/SUP-14982/feature-branch",
     ]);
     expect(refExists).toBe("");
+  });
+});
+
+describe("terminal workspace cleanup git resolution (SUP-15059)", () => {
+  it("resolves git from the ambient PATH when present", async () => {
+    const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gitbin-"));
+    const fakeGit = path.join(binDir, "git");
+    await fs.writeFile(fakeGit, "#!/bin/sh\necho ambient-git\n", "utf8");
+    await fs.chmod(fakeGit, 0o755);
+
+    const resolved = await resolveGitExecutable(binDir, { PATH: binDir });
+    expect(resolved).toBe(fakeGit);
+    await fs.rm(binDir, { recursive: true, force: true });
+  });
+
+  it("falls back to the platform default PATH when git is not on the ambient PATH", async () => {
+    const emptyDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-no-git-"));
+    // The ambient PATH has no git; the resolver must recover a working git binary
+    // from the platform default PATH instead of leaving it bare (spawn git ENOENT).
+    const resolved = await resolveGitExecutable(emptyDir, { PATH: emptyDir });
+    expect(resolved).not.toBe("git");
+    expect(path.isAbsolute(resolved)).toBe(true);
+    await expect(fs.access(resolved, fs.constants.X_OK)).resolves.toBeUndefined();
+    await fs.rm(emptyDir, { recursive: true, force: true });
+  });
+
+  it("removes a git worktree via `git worktree remove` when the base repo root exists", async () => {
+    const repoRoot = await createTempRepo("main");
+    const worktreePath = path.join(os.tmpdir(), `paperclip-wt-${randomUUID()}`);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "-b", "sup-15059-wt"]);
+
+    const warning = await removeGitWorktreeArtifact({
+      repoRoot,
+      worktreePath,
+      forceWorktreeRemoval: true,
+      metadata: { workspaceId: "ws-1", branchName: "sup-15059-wt" },
+    });
+
+    expect(warning).toBeNull();
+    await expect(fs.stat(worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readGit(repoRoot, ["worktree", "list", "--porcelain"])).not.toContain(worktreePath);
+    await fs.rm(repoRoot, { recursive: true, force: true });
+  });
+
+  it("removes the worktree directory directly when the base repo root no longer exists", async () => {
+    const repoRoot = await createTempRepo("main");
+    const worktreePath = path.join(os.tmpdir(), `paperclip-wt-${randomUUID()}`);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "-b", "sup-15059-wt"]);
+    // Simulate the base repo being cleaned from disk while the worktree checkout remains.
+    await fs.rm(repoRoot, { recursive: true, force: true });
+
+    const warning = await removeGitWorktreeArtifact({
+      repoRoot,
+      worktreePath,
+      forceWorktreeRemoval: true,
+      metadata: { workspaceId: "ws-1", branchName: "sup-15059-wt" },
+    });
+
+    expect(warning).toContain("no longer exists");
+    expect(warning).toContain("removed git worktree");
+    expect(warning).not.toContain("spawn git ENOENT");
+    await expect(fs.stat(worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
