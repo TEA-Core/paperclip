@@ -16,6 +16,11 @@ export const agentPermissionsSchema = z.object({
   canCreateSkills: z.boolean().optional().default(true),
   trustPreset: trustPresetSchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
+  // Per-agent allowlist of plugin keys whose tools are visible to this agent.
+  // Absent (undefined) means every ready plugin's tools are visible; an empty
+  // array means no plugin tools are visible. Enforced by the tool gateway when
+  // it resolves an agent's plugin-tool descriptors.
+  pluginTools: z.array(z.string()).optional(),
 }).catchall(z.unknown());
 
 export const agentInstructionsBundleModeSchema = z.enum(["managed", "external"]);
