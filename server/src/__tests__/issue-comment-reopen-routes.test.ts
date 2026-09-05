@@ -615,6 +615,88 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  // SUP-15065: a comment-triggered reopen that reaches the assignee but is not
+  // dispatched (skipped/deferred, or the enqueue throws) must not leave the card in
+  // `todo` with no run AND no trace. The route records the non-dispatch so the
+  // operator can see why the reopen did not start a run.
+  function findUndispatchedWakeActivity() {
+    return mockLogActivity.mock.calls.find(
+      (call) => (call[1] as { action?: string }).action === "issue.wake_not_dispatched",
+    );
+  }
+
+  it("records an activity row when a reopen wake is not dispatched", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+      makeIssueUpdateReceipt(issue, patch));
+    mockHeartbeatService.wakeup.mockResolvedValue(null);
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "please continue" });
+
+    expect(res.status).toBe(201);
+    await waitForWakeup(() => {
+      const call = findUndispatchedWakeActivity();
+      expect(call).toBeDefined();
+    });
+    expect(findUndispatchedWakeActivity()?.[1]?.details).toEqual(
+      expect.objectContaining({
+        agentId: "22222222-2222-4222-8222-222222222222",
+        wakeupReason: "issue_reopened_via_comment",
+        outcome: "not_dispatched",
+      }),
+    );
+  });
+
+  it("records an activity row when a reopen wake throws", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+      makeIssueUpdateReceipt(issue, patch));
+    mockHeartbeatService.wakeup.mockRejectedValue(new Error("responsible_user_unresolved"));
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "please continue" });
+
+    expect(res.status).toBe(201);
+    await waitForWakeup(() => {
+      const call = findUndispatchedWakeActivity();
+      expect(call).toBeDefined();
+    });
+    expect(findUndispatchedWakeActivity()?.[1]?.details).toEqual(
+      expect.objectContaining({
+        agentId: "22222222-2222-4222-8222-222222222222",
+        wakeupReason: "issue_reopened_via_comment",
+        outcome: "error",
+        error: "responsible_user_unresolved",
+      }),
+    );
+  });
+
+  it("does not record an undispatched-wake row when the reopen wake dispatches a run", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+      makeIssueUpdateReceipt(issue, patch));
+    mockHeartbeatService.wakeup.mockResolvedValue({ id: "run-xyz", status: "queued" });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "please continue" });
+
+    expect(res.status).toBe(201);
+    await waitForWakeup(() => {
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+      );
+    });
+    expect(findUndispatchedWakeActivity()).toBeUndefined();
+  });
+
   describe("SUP-14756: comment-reopen routes the status write through the execution-policy transition", () => {
     // The exact recorded SUP-14590 shape: a `done`/`cancelled` card that still
     // carries a `completed` executionState plus an executionPolicy whose live
