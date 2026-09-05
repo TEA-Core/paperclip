@@ -169,7 +169,12 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
       assignedIssueRows.map((row) => row.projectId).filter((id): id is string => typeof id === "string"),
     );
     if (assignedProjectIds.size === 0) {
-      throw notFound(`No project workspace for ${owner}/${repo}`);
+      // This is an assignment gate, not a missing-workspace one: the agent holds no
+      // assigned issue anywhere in this company, so it can reach no project. Do NOT
+      // claim a workspace is missing — the requested repo may well be registered.
+      throw notFound(
+        `Agent holds no assigned issues in this company, so it can reach no project (requested ${owner}/${repo})`,
+      );
     }
 
     const workspaceRows = await db
@@ -184,7 +189,18 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
         normalizeRepoUrl(row.repoUrl) === normalizedRepo,
     );
     if (!reachable) {
-      throw notFound(`No project workspace for ${owner}/${repo}`);
+      // Two structurally different misses previously shared one message. Distinguish
+      // them by matching the repo against ALL company workspace rows (not just the
+      // assigned subset): a row for this repo owned by no assigned project means the
+      // repo is registered but gated off; no such row means it is unregistered.
+      const registeredForRepo = workspaceRows.some(
+        (row) => typeof row.repoUrl === "string" && normalizeRepoUrl(row.repoUrl) === normalizedRepo,
+      );
+      throw notFound(
+        registeredForRepo
+          ? `Project workspace for ${owner}/${repo} is registered, but belongs to a project the agent holds no assigned issue in`
+          : `No project workspace is registered for ${owner}/${repo} in this company`,
+      );
     }
   }
 
