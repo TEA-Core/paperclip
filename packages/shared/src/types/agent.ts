@@ -21,6 +21,12 @@ export interface AgentPermissions extends Record<string, unknown> {
   canCreateSkills?: boolean;
   trustPreset?: TrustPreset;
   authorizationPolicy?: TrustAuthorizationPolicy;
+  /**
+   * Allowlist of plugin keys (e.g. `["acme.linear"]`) whose tools are visible
+   * to this agent. Absent means all ready plugin tools are visible; `[]` means
+   * none are visible.
+   */
+  pluginTools?: string[];
 }
 
 export interface AgentModelProfileConfig {
