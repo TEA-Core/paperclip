@@ -7548,10 +7548,23 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     await heartbeat.reconcileStrandedAssignedIssues();
 
+    // The recovery run executes asynchronously (startNextQueuedRunForAgent →
+    // executeRun) and settles with a plan_only classification; the
+    // run_liveness_continuation wake is minted during that settle path, after
+    // the plan_only classification lands. A plain wall-clock poll raced the
+    // settle chain and timed out under CI's serialized-runner load, so wait on
+    // the deterministic completion signal first, then give the wake a grace
+    // window.
+    const planOnlyRecoveryRun = await waitForValue(async () => {
+      const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      return rows.find((row) => row.id !== runId && row.livenessState === "plan_only") ?? null;
+    }, 15_000);
+    expect(planOnlyRecoveryRun).toBeTruthy();
+
     const livenessWake = await waitForValue(async () => {
       const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
       return rows.find((row) => row.reason === "run_liveness_continuation") ?? null;
-    });
+    }, 10_000);
     expect(livenessWake).toBeTruthy();
     expect(livenessWake?.payload).toMatchObject({
       issueId,
