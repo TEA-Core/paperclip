@@ -58,6 +58,7 @@ vi.mock("../services/environment-runtime.js", () => ({
 const mockWorkspaceRuntimeTeardown = vi.hoisted(() => ({
   stopRuntimeServicesForExecutionWorkspace: vi.fn(async () => undefined),
   cleanupExecutionWorkspaceArtifacts: vi.fn(async () => ({ cleaned: true, warnings: [] as string[] })),
+  preserveUnpushedWorktreeCommits: vi.fn(),
 }));
 
 vi.mock("../services/workspace-runtime.js", async (importActual) => {
@@ -67,25 +68,59 @@ vi.mock("../services/workspace-runtime.js", async (importActual) => {
     stopRuntimeServicesForExecutionWorkspace:
       mockWorkspaceRuntimeTeardown.stopRuntimeServicesForExecutionWorkspace,
     cleanupExecutionWorkspaceArtifacts: mockWorkspaceRuntimeTeardown.cleanupExecutionWorkspaceArtifacts,
+    preserveUnpushedWorktreeCommits: mockWorkspaceRuntimeTeardown.preserveUnpushedWorktreeCommits,
   };
 });
 
-function createApp(actor: Record<string, unknown> = {
-  type: "board",
-  userId: "local-board",
-  companyIds: ["company-1"],
-  source: "session",
-  isInstanceAdmin: false,
-}) {
+function createApp(
+  actor: Record<string, unknown> = {
+    type: "board",
+    userId: "local-board",
+    companyIds: ["company-1"],
+    source: "session",
+    isInstanceAdmin: false,
+  },
+  db: Record<string, unknown> = {} as Record<string, unknown>,
+) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", executionWorkspaceRoutes({} as any));
+  app.use("/api", executionWorkspaceRoutes(db as any));
   app.use(errorHandler);
   return app;
+}
+
+/**
+ * Minimal fake `db` covering the drizzle calls the archive route makes while deciding
+ * whether to preserve unpushed commits: the source-issue identifier lookup, the system
+ * comment insert, and the issue `updatedAt` touch. `inserts` records every comment value
+ * so tests can assert what (if anything) was posted.
+ */
+function makeArchiveDb(opts: { identifier?: string | null } = {}) {
+  const inserts: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+  const db: Record<string, unknown> = {
+    select: () => ({
+      from: () => ({
+        where: () =>
+          Promise.resolve(opts.identifier ? [{ identifier: opts.identifier }] : []),
+      }),
+    }),
+    insert: (table: unknown) => ({
+      values: (vals: Record<string, unknown>) => {
+        inserts.push({ table, values: vals });
+        return Promise.resolve();
+      },
+    }),
+    update: () => ({
+      set: () => ({
+        where: () => Promise.resolve([]),
+      }),
+    }),
+  };
+  return { db, inserts };
 }
 
 describe.sequential("execution workspace routes", () => {
@@ -452,6 +487,158 @@ describe.sequential("execution workspace routes", () => {
     expect(mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock).toHaveBeenCalledTimes(1);
     // The destruction fence never runs, so no worktree is removed.
     expect(mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction).not.toHaveBeenCalled();
+  });
+
+  it("archives when aheadCount > 0 but there are no unpushed commits to preserve (nothing to preserve)", async () => {
+    // `aheadCount` is measured vs baseRef, so a squash-merged branch reads ahead-forever even
+    // though `rev-list HEAD --not --remotes` is empty. The archive must proceed, and no
+    // system comment may be posted.
+    const archivedWorkspace = {
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+      status: "archived",
+      mode: "isolated_workspace",
+      projectWorkspaceId: null,
+      projectId: null,
+      cwd: "/tmp/worktree",
+    };
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      ...archivedWorkspace,
+      status: "active",
+      providerType: "git_worktree",
+      branchName: "feature-branch",
+    });
+    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue({
+      state: "ready",
+      blockingReasons: [],
+      git: { aheadCount: 3, repoRoot: "/repo", workspacePath: "/ws" },
+    });
+    // rev-list HEAD --not --remotes is empty: nothing to preserve, warning is null.
+    mockWorkspaceRuntimeTeardown.preserveUnpushedWorktreeCommits.mockResolvedValue({
+      preserved: false,
+      preservedRef: null,
+      commitSha: null,
+      warning: null,
+    });
+    mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock.mockResolvedValue({
+      outcome: "archived",
+      workspace: archivedWorkspace,
+      capturedGeneration: 3,
+    });
+    mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction.mockResolvedValue({
+      skippedReopened: false,
+      result: { cleaned: true, warnings: [] },
+    });
+
+    const { db, inserts } = makeArchiveDb({ identifier: "SUP-14979" });
+    const res = await request(createApp(undefined, db))
+      .patch("/api/execution-workspaces/workspace-1")
+      .send({ status: "archived" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("archived");
+    expect(mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock).toHaveBeenCalledTimes(1);
+    // No system comment is posted on the nothing-to-preserve path.
+    expect(inserts).toHaveLength(0);
+  });
+
+  it("archives and posts a preserved-commits comment when unpushed commits are preserved", async () => {
+    const archivedWorkspace = {
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+      status: "archived",
+      mode: "isolated_workspace",
+      projectWorkspaceId: null,
+      projectId: null,
+      cwd: "/tmp/worktree",
+    };
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      ...archivedWorkspace,
+      status: "active",
+      providerType: "git_worktree",
+      branchName: "feature-branch",
+    });
+    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue({
+      state: "ready",
+      blockingReasons: [],
+      git: { aheadCount: 3, repoRoot: "/repo", workspacePath: "/ws" },
+    });
+    mockWorkspaceRuntimeTeardown.preserveUnpushedWorktreeCommits.mockResolvedValue({
+      preserved: true,
+      preservedRef: "refs/preserved/SUP-14979/feature-branch",
+      commitSha: "abc123",
+      warning: null,
+    });
+    mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock.mockResolvedValue({
+      outcome: "archived",
+      workspace: archivedWorkspace,
+      capturedGeneration: 3,
+    });
+    mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction.mockResolvedValue({
+      skippedReopened: false,
+      result: { cleaned: true, warnings: [] },
+    });
+
+    const { db, inserts } = makeArchiveDb({ identifier: "SUP-14979" });
+    const res = await request(createApp(undefined, db))
+      .patch("/api/execution-workspaces/workspace-1")
+      .send({ status: "archived" });
+
+    expect(res.status).toBe(200);
+    expect(inserts).toHaveLength(1);
+    expect(String(inserts[0].values.body)).toContain("Preserved unpushed commits");
+  });
+
+  it("refuses with 409 and posts the real push error when preservation genuinely fails", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+      status: "active",
+      mode: "isolated_workspace",
+      providerType: "git_worktree",
+      branchName: "feature-branch",
+      projectWorkspaceId: null,
+      projectId: null,
+      cwd: "/tmp/worktree",
+    });
+    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue({
+      state: "ready",
+      blockingReasons: [],
+      git: { aheadCount: 3, repoRoot: "/repo", workspacePath: "/ws" },
+    });
+    const realPushError =
+      "Could not push unpushed commits to preservation ref refs/preserved/SUP-14979/feature-branch: remote rejected";
+    mockWorkspaceRuntimeTeardown.preserveUnpushedWorktreeCommits.mockResolvedValue({
+      preserved: false,
+      preservedRef: null,
+      commitSha: "abc123",
+      warning: realPushError,
+    });
+
+    const { db, inserts } = makeArchiveDb({ identifier: "SUP-14979" });
+    const res = await request(createApp(undefined, db))
+      .patch("/api/execution-workspaces/workspace-1")
+      .send({ status: "archived" });
+
+    expect(res.status).toBe(409);
+    // A genuine failure must never reach the archive.
+    expect(mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock).not.toHaveBeenCalled();
+    // The system comment carries the REAL push error, not "Unknown preservation failure".
+    expect(inserts).toHaveLength(1);
+    expect(String(inserts[0].values.body)).toContain(realPushError);
+    expect(String(inserts[0].values.body)).not.toContain("Unknown preservation failure");
+    // 409 body keeps closeReadiness and preservation unchanged in shape.
+    expect(res.body).toHaveProperty("closeReadiness");
+    expect(res.body).toHaveProperty("preservation");
+    expect(res.body.preservation).toEqual({
+      preserved: false,
+      preservedRef: null,
+      commitSha: "abc123",
+      warning: realPushError,
+    });
   });
 
   it("destroys the reusable sandbox leases inside the destruction fence when the archive wins", async () => {

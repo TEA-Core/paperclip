@@ -1214,7 +1214,11 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           repoRoot: readiness.git.repoRoot,
         });
 
-        if (!preservation.preserved) {
+        // `preserveUnpushedWorktreeCommits` returns `preserved: false` with `warning: null`
+        // when there is simply nothing to preserve (`rev-list HEAD --not --remotes` is empty) —
+        // that is not a failure, so the archive proceeds. Only a genuine preservation failure
+        // sets a non-null `warning` (the real push error) and refuses the archive.
+        if (!preservation.preserved && preservation.warning !== null) {
           if (existing.sourceIssueId) {
             await db
               .insert(issueComments)
@@ -1227,7 +1231,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
                 body:
                   `Archiving execution workspace \`${existing.name}\` was refused: ` +
                   `unpushed commits could not be preserved.\n\n` +
-                  `${preservation.warning ?? "Unknown preservation failure."}\n`,
+                  `${preservation.warning}\n`,
               })
               .catch(() => null);
             await db
@@ -1245,7 +1249,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           return;
         }
 
-        if (existing.sourceIssueId) {
+        if (preservation.preserved && existing.sourceIssueId) {
           await db
             .insert(issueComments)
             .values({
