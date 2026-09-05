@@ -3697,6 +3697,8 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       agentId: input.agent.id,
       runId: input.runId,
       permittedNotInstalledConnections,
+      permittedConnectionCount: permittedConnectionIds.size,
+      installedConnectionCount: installedConnectionIds.size,
     });
     return [];
   }
@@ -3777,6 +3779,8 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       agentId: input.agent.id,
       runId: input.runId,
       permittedNotInstalledConnections,
+      permittedConnectionCount: permittedConnectionIds.size,
+      installedConnectionCount: installedConnectionIds.size,
     });
   }
   return servers;

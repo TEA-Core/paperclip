@@ -228,7 +228,10 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       runId,
       details: expect.objectContaining({
         reasonCode: "permitted_connections_not_installed",
+        scope: "mcp_connections",
         deliveredServerCount: 0,
+        permittedConnectionCount: 1,
+        installedConnectionCount: 0,
         permittedNotInstalledCount: 1,
         permittedNotInstalledConnections: [{ id: connection!.id, name: "Zapier" }],
       }),
@@ -240,6 +243,50 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       actorId: agent!.id,
       reasonCode: "permitted_connections_not_installed",
       details: expect.objectContaining({ runId, deliveredServerCount: 0 }),
+    });
+  });
+
+  it("writes no_permitted_mcp_connections diagnostic when nothing is permitted", async () => {
+    const [company] = await db.insert(companies).values({
+      name: `Runtime MCP no-perm ${randomUUID()}`,
+      issuePrefix: `NP${randomUUID().slice(0, 5).toUpperCase()}`,
+    }).returning();
+    const [agent] = await db.insert(agents).values({
+      companyId: company!.id,
+      name: "No Perm Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+    }).returning();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: company!.id,
+      agentId: agent!.id,
+      status: "running",
+      contextSnapshot: {},
+    });
+
+    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId });
+
+    expect(servers).toEqual([]);
+    const [activity] = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "tool_gateway.runtime_mcp_delivery"));
+    expect(activity).toMatchObject({
+      companyId: company!.id,
+      agentId: agent!.id,
+      runId,
+      details: expect.objectContaining({
+        reasonCode: "no_permitted_mcp_connections",
+        scope: "mcp_connections",
+        deliveredServerCount: 0,
+        permittedConnectionCount: 0,
+        installedConnectionCount: 0,
+        permittedNotInstalledCount: 0,
+        permittedNotInstalledConnections: [],
+      }),
     });
   });
 });
