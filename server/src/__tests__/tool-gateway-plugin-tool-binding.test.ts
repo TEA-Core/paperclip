@@ -230,4 +230,14 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     expect(names).not.toContain("a.b:alpha");
     expect(names).not.toContain("c.d:beta");
   });
+
+  it("returns no plugin tools when the allowlist names a key with no ready plugin", async () => {
+    const { company, agent } = await createAgentFixture(db, { pluginTools: ["z.z"] });
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+
+    const names = (await gateway.listPluginToolsForAgent({ companyId: company.id, agentId: agent.id })).map((tool) => tool.name);
+
+    expect(names).toEqual([]);
+  });
 });
