@@ -42,6 +42,15 @@ import type {
 const DEFAULT_GRACE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+// A PR re-enqueued into the merge queue can be EJECTED by the queue (failing
+// checks, conflicts, behind the base branch) and left `open` again — in which
+// case the confirm/failed/escalated branches are all unreachable for it. So the
+// "already re-enqueued, skip" behavior is bounded to this many total re-enqueue
+// attempts per (issue, PR): beyond it, a still-open PR is re-examined on the
+// next sweep and escalates instead of being re-enqueued (or skipped) forever.
+// The hourly sweep interval spaces the attempts out; the cap bounds the total,
+// so the sweep cannot re-enqueue in a tight loop.
+export const MAX_REENQUEUE_ATTEMPTS = 3;
 
 export const DONE_CLOSE_LANDING_ACTOR_ID = "system:done-close-landing-backstop";
 export const DONE_CLOSE_LANDING_CONFIRMED_ACTION = "issue.done_close_landing_confirmed";
@@ -381,12 +390,17 @@ export function createDoneCloseLandingBackstopService(
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
     );
-    const alreadyReenqueued = new Set(
-      existing
-        .filter((r) => r.action === DONE_CLOSE_LANDING_REENQUEUED_ACTION)
-        .map((r) => readString(readRecord(r.details)?.pr))
-        .filter((value): value is string => value !== null),
-    );
+    // SUP-15073: count prior re-enqueues per PR instead of treating the FIRST
+    // one as terminal. A re-enqueued PR that the queue ejects is `open` again, so
+    // the idempotency set must not suppress re-examination (or escalation)
+    // indefinitely — it only caps how many times we attempt a re-enqueue.
+    const reenqueueCounts = new Map<string, number>();
+    for (const r of existing) {
+      if (r.action !== DONE_CLOSE_LANDING_REENQUEUED_ACTION) continue;
+      const prKey = readString(readRecord(r.details)?.pr);
+      if (prKey === null) continue;
+      reenqueueCounts.set(prKey, (reenqueueCounts.get(prKey) ?? 0) + 1);
+    }
     const alreadyEscalated = new Set(
       existing
         .filter((r) => r.action === DONE_CLOSE_LANDING_ESCALATED_ACTION)
@@ -498,14 +512,18 @@ export function createDoneCloseLandingBackstopService(
         continue;
       }
 
-      // state === "open" past the grace window: re-enqueue or escalate.
-      // If a prior sweep already re-enqueued this PR, it is in the merge queue
-      // waiting for CI — skip; the confirm path will fire when it merges.
-      if (alreadyReenqueued.has(prKey)) continue;
+      // state === "open" past the grace window: re-enqueue (bounded) or escalate.
+      // A prior re-enqueue does NOT mean the PR will land: the merge queue ejects
+      // PRs (failing checks, conflicts, behind the base branch) and an ejected PR
+      // is `open` again — at which point the confirm/failed branches can't fire.
+      // So "already re-enqueued → skip forever" is replaced with a bounded attempt
+      // count: re-examine on every sweep, re-enqueue only while under the cap, and
+      // once exhausted let a still-open PR fall through to the _escalated path.
+      const priorReenqueues = reenqueueCounts.get(prKey) ?? 0;
+      const reenqueueExhausted = priorReenqueues >= MAX_REENQUEUE_ATTEMPTS;
 
-      let reenqueueSucceeded = false;
-      if (mergeArmingEnabled) {
-        reenqueueSucceeded = await attemptReenqueue(
+      if (!reenqueueExhausted && mergeArmingEnabled) {
+        const reenqueueSucceeded = await attemptReenqueue(
           issue.companyId,
           pr,
         );
@@ -534,11 +552,14 @@ export function createDoneCloseLandingBackstopService(
         }
       }
 
-      // Escalate: lane closed, re-enqueue not attempted, or re-enqueue failed.
+      // Escalate: re-enqueue cap exhausted (still open), lane closed, or the
+      // re-enqueue attempt failed this tick.
       if (!alreadyEscalated.has(prKey)) {
-        const reason = mergeArmingEnabled
-          ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
-          : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
+        const reason = reenqueueExhausted
+          ? `the PR has been re-enqueued ${priorReenqueues} times and is still open past the done-close grace window — the merge queue is not landing it (e.g. failing checks, conflicts, or it is behind the base branch)`
+          : mergeArmingEnabled
+            ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
+            : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: "system",
@@ -561,7 +582,9 @@ export function createDoneCloseLandingBackstopService(
         });
         await deps.svc.addComment(
           issue.id,
-          `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window and cannot be re-enqueued by an agent — ${reason}. Board/operator must manually enable merge arming or merge the PR.`,
+          reenqueueExhausted
+            ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window after ${MAX_REENQUEUE_ATTEMPTS} re-enqueue attempts — the merge queue is not landing it (${reason}). Board/operator must fix the PR (checks/conflicts/rebase) and merge it, or re-open the card.`
+            : `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window and cannot be re-enqueued by an agent — ${reason}. Board/operator must manually enable merge arming or merge the PR.`,
           {},
           { authorType: "system" },
         );
@@ -569,7 +592,9 @@ export function createDoneCloseLandingBackstopService(
           status: "blocked",
           unblockDescriptor: {
             owner: "board",
-            action: `Manually merge or re-enqueue PR ${prKey} into the merge queue (merge arming lane is ${mergeArmingEnabled ? "open but re-enqueue failed" : "closed for this company"})`,
+            action: reenqueueExhausted
+              ? `Fix and merge PR ${prKey} (re-enqueued ${MAX_REENQUEUE_ATTEMPTS}x, still not landing — check CI checks, conflicts, or rebase onto the base branch) or re-open the card`
+              : `Manually merge or re-enqueue PR ${prKey} into the merge queue (merge arming lane is ${mergeArmingEnabled ? "open but re-enqueue failed" : "closed for this company"})`,
           },
         });
         if (opts.wakeup && issue.assigneeAgentId) {
