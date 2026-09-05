@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { and, eq, inArray } from "drizzle-orm";
-import { agents, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
+import { agents, issueExecutionDecisions, issueRelations, issues, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -874,9 +874,18 @@ function evaluateReviewLadderSatisfaction(
 }
 
 /**
- * SUP-14561 (mechanism A): count this issue's child issues that each ran a
- * review ladder — the child carries a non-null execution policy and its
- * execution state has a non-empty completedStageIds or skippedStageIds.
+ * SUP-14561 (mechanism A) + SUP-15031: count this issue's child issues that
+ * each ran a review ladder — the child carries a non-null execution policy and
+ * its execution state has a non-empty completedStageIds or skippedStageIds.
+ *
+ * Children are reached through the UNION of two linkage edges, de-duplicated
+ * by issue id:
+ *   1. `issues.parent_id` (a child row whose parent is this issue), and
+ *   2. an `issue_relations` row of type `blocks` whose `related_issue_id` is
+ *      this issue. The convention is `issue_id` = the blocker/child and
+ *      `related_issue_id` = the blocked/parent, so the children of `parentId`
+ *      are the `issue_id` values of every `blocks` relation pointing at
+ *      `parentId`. A child linked by both edges is counted once.
  *
  * A ladder-less parent (executionPolicy null, or `stages: []` — either way
  * `evaluateReviewLadderSatisfaction` reports no ladder) sitting over two or
@@ -886,24 +895,71 @@ function evaluateReviewLadderSatisfaction(
  * (SUP-14306 / SUP-14309 / SUP-14023 / SUP-13777). One-off ops/reflection
  * cards whose children carry no policy of their own count 0 and stay legal.
  *
- * This is a local indexed read (issues_company_parent_idx). Like mechanism C
- * it runs before any GitHub path, and it fails closed on a throw: the
- * transition write targets the same store, so a Postgres error must not be
- * waved through.
+ * Both edges are local indexed reads (issues_company_parent_idx and
+ * issue_relations_company_related_issue_idx). Like mechanism C this runs
+ * before any GitHub path, and it fails closed on a throw: the transition
+ * write targets the same store, so a Postgres error must not be waved
+ * through.
  */
 async function countLadderedChildren(
   db: Db,
   companyId: string,
   parentId: string,
 ): Promise<{ count: number; identifiers: string[] }> {
-  const rows = await db
+  // Edge 1 (parent_id): children that link up via `issues.parent_id`.
+  const parentRows = await db
     .select({
+      id: issues.id,
       identifier: issues.identifier,
       executionPolicy: issues.executionPolicy,
       executionState: issues.executionState,
     })
     .from(issues)
     .where(and(eq(issues.companyId, companyId), eq(issues.parentId, parentId)));
+
+  // Edge 2 (blockedBy): children that link up via an issue_relations row of
+  // type `blocks`. `issue_id` is the blocker (child); `related_issue_id` is
+  // the blocked (parent). So a child of `parentId` is any `blocks` relation
+  // whose `related_issue_id` is `parentId`, and the child id is its `issue_id`.
+  const relationRows = await db
+    .select({ issueId: issueRelations.issueId })
+    .from(issueRelations)
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.type, "blocks"),
+        eq(issueRelations.relatedIssueId, parentId),
+      ),
+    );
+
+  // Union of the two linkage edges, de-duplicated by issue id. A child linked
+  // by both `parent_id` and a `blocks` relation is kept once.
+  const parentIds = new Set(
+    parentRows.map((row) => row.id).filter((id): id is string => id != null),
+  );
+  const extraIds = relationRows
+    .map((row) => row.issueId)
+    .filter((id): id is string => id != null && !parentIds.has(id));
+
+  // Re-read the full child rows for any id only reachable via edge 2, so those
+  // children carry their own execution policy/state for the laddered predicate.
+  const blockedByRows =
+    extraIds.length > 0
+      ? await db
+          .select({
+            id: issues.id,
+            identifier: issues.identifier,
+            executionPolicy: issues.executionPolicy,
+            executionState: issues.executionState,
+          })
+          .from(issues)
+          .where(
+            and(eq(issues.companyId, companyId), inArray(issues.id, extraIds)),
+          )
+      : [];
+
+  const rows = [...parentRows, ...blockedByRows];
+  const seen = new Set<string>();
   let count = 0;
   const identifiers: string[] = [];
   for (const row of rows) {
@@ -912,6 +968,11 @@ async function countLadderedChildren(
     const completed = state?.completedStageIds?.length ?? 0;
     const skipped = state?.skippedStageIds?.length ?? 0;
     if (completed > 0 || skipped > 0) {
+      const key = row.id ?? row.identifier;
+      if (key != null) {
+        if (seen.has(key)) continue;
+        seen.add(key);
+      }
       count += 1;
       identifiers.push(row.identifier ?? "<unnamed>");
     }

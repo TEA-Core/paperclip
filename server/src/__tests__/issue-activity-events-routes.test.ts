@@ -562,9 +562,10 @@ describe("issue activity event routes", () => {
         from: (table: unknown) => ({
           where: () => {
             const tableName = getTableName(table as Parameters<typeof getTableName>[0]);
-            if (tableName === "issues") {
-              // SUP-14561 mechanism A: the guard counts this issue's laddered
-              // children on a plain issues-table select. This issue has none.
+            if (tableName === "issues" || tableName === "issue_relations") {
+              // SUP-14561 mechanism A + SUP-15031: the guard counts this issue's
+              // laddered children on a plain issues-table select (parent_id edge)
+              // and a blockedBy issue_relations select. This issue has none.
               return Promise.resolve([]);
             }
             return {
