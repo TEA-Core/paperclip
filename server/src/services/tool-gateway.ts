@@ -1897,8 +1897,8 @@ export function createToolGatewayService(
     return 403;
   }
 
-  function findStaticTool(toolName: string): ToolGatewayDescriptor {
-    const tool = allTools().find((candidate) => candidate.name === toolName);
+  function findStaticTool(toolName: string, allowlist?: Set<string> | null): ToolGatewayDescriptor {
+    const tool = allTools(allowlist).find((candidate) => candidate.name === toolName);
     if (!tool) {
       throw new ToolGatewayHttpError(404, `Tool "${toolName}" not found`, "tool_not_found", { tool: toolName });
     }
@@ -1906,10 +1906,13 @@ export function createToolGatewayService(
   }
 
   async function findToolForSession(session: ToolGatewaySession, toolName: string): Promise<ToolGatewayDescriptor> {
+    const pluginToolAllowlist = session.agentId
+      ? await pluginToolAllowlistForAgent(session.companyId, session.agentId)
+      : null;
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
-    const tool = [...allTools(), ...connectedTools, ...virtualTools]
+    const tool = [...allTools(pluginToolAllowlist), ...connectedTools, ...virtualTools]
       .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"))
       .find((candidate) => candidate.name === toolName);
     if (!tool) {
@@ -6097,7 +6100,10 @@ export function createToolGatewayService(
         expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
       };
 
-      const tool = findStaticTool(input.tool);
+      const pluginToolAllowlist = input.runContext.agentId
+        ? await pluginToolAllowlistForAgent(input.runContext.companyId, input.runContext.agentId)
+        : null;
+      const tool = findStaticTool(input.tool, pluginToolAllowlist);
 
       if (tool.providerType !== "paperclip_plugin") {
         throw new ToolGatewayHttpError(404, `Tool "${input.tool}" is not a plugin tool`, "tool_not_found");
