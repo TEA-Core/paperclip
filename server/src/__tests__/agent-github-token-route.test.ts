@@ -147,6 +147,9 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
     const app = createApp(agentActor(), deps, { workspaces: [] });
     const res = await request(app).post("/api/agents/me/github/installation-tokens").send({ owner: "owner", repo: "repo" });
     expect(res.status).toBe(404);
+    // Genuinely unregistered: no company workspace row maps to this repo. The message
+    // must name that, not claim a workspace merely "is not for" the agent.
+    expect(res.body.error).toBe("No project workspace is registered for owner/repo in this company");
     expect(resolveToken).not.toHaveBeenCalled();
   });
 
@@ -158,6 +161,29 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
     });
     const res = await request(app).post("/api/agents/me/github/installation-tokens").send({ owner: "owner", repo: "repo" });
     expect(res.status).toBe(404);
+    // The gate is issue-assignment, not registration: the requested workspace IS
+    // registered, but the agent holds no assigned issue anywhere, so it names the
+    // assignment condition and does not claim the workspace is missing.
+    expect(res.body.error).toBe(
+      "Agent holds no assigned issues in this company, so it can reach no project (requested owner/repo)",
+    );
+    expect(resolveToken).not.toHaveBeenCalled();
+  });
+
+  it("denies a registered repo owned by a project the agent holds no issue in (404), naming the assignment gate, without minting", async () => {
+    const { deps, resolveToken } = fakeDeps();
+    const app = createApp(agentActor(), deps, {
+      issues: [{ projectId: "project-x" }],
+      workspaces: [{ projectId: "project-y", repoUrl: "https://github.com/owner/repo" }],
+    });
+    const res = await request(app).post("/api/agents/me/github/installation-tokens").send({ owner: "owner", repo: "repo" });
+    expect(res.status).toBe(404);
+    // Registered-but-unreachable: the repo has a company workspace, but it belongs to
+    // project-y, which the agent holds no issue in. Distinct from both the no-assignment
+    // and the unregistered outcomes.
+    expect(res.body.error).toBe(
+      "Project workspace for owner/repo is registered, but belongs to a project the agent holds no assigned issue in",
+    );
     expect(resolveToken).not.toHaveBeenCalled();
   });
 
