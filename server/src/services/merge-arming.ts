@@ -82,6 +82,29 @@ export interface ApprovalCandidateAnchor {
   headShaAtApproval: string | null;
 }
 
+/**
+ * SUP-15016: the `no-pr` certification anchor. When an approval's PR resolution
+ * is `no-pr` (no open linked PR resolvable at decision time) but the card has an
+ * OWN, readable delivery branch, the delivery-branch head is certified at
+ * approval time and persisted under executionState.approvalStatus.pendingCandidates
+ * exactly like the ambiguous class — giving the approval-status reconciler a
+ * concrete anchor to verify against instead of falling back to the
+ * always-unsatisfiable temporal sha-existence proof (SUP-14844). `headSha` is
+ * null when the branch ref cannot be read; the consumer must fail closed on
+ * null, never guess.
+ */
+export interface NoPrBranchAnchor {
+  owner: string;
+  repo: string;
+  branch: string;
+  /** The delivery-branch head SHA captured at approval time, or null when the ref could not be read. */
+  headSha: string | null;
+  /** ISO-8601 timestamp of the approval-time certification. */
+  certifiedAt: string;
+  /** Discriminator: this anchor was produced by the no-pr delivery-branch certification. */
+  source: "no-pr-branch";
+}
+
 export interface LinkedPullRequest {
   id: string;
   owner: string;
@@ -1545,15 +1568,26 @@ export type DecisionHeadResolution =
       kind: "unresolvable";
       reason: string;
       /**
-       * SUP-14602: present only for the AMBIGUOUS unresolvable outcomes. When the
-       * decision cannot resolve a single head because several candidate PRs are
-       * all still open, the resolver certifies each candidate head at approval
-       * time so the caller can persist them (executionState.approvalStatus
-       * .pendingCandidates) and the approval-status reconciler can re-run Guard A
-       * against a certified head once the ambiguity resolves. Absent for every
-       * other unresolvable reason (no-pr / not-delivered / delivery_identity).
+       * Present when the unresolvable outcome still carries certifiable head
+       * evidence the caller should persist (executionState.approvalStatus
+       * .pendingCandidates). Two producers:
+       *
+       * - The AMBIGUOUS class (SUP-14602): several candidate PRs are all still
+       *   open, so the resolver certifies each candidate PR head at approval
+       *   time (`ApprovalCandidateAnchor[]`) so the approval-status reconciler
+       *   can re-run Guard A against a certified head once the ambiguity
+       *   resolves.
+       *
+       * - The no-pr class (SUP-15016): no open linked PR is resolvable at
+       *   decision time, but the card has an OWN delivery branch. The
+       *   delivery-branch head is certified (`NoPrBranchAnchor`,
+       *   `source: "no-pr-branch"`) so the reconciler has a concrete anchor to
+       *   verify against instead of the temporal sha-existence proof.
+       *
+       * Absent for the `not-delivered` and `delivery_identity` unresolvable
+       * reasons, which have no branch to certify.
        */
-      pendingCandidates?: ApprovalCandidateAnchor[];
+      pendingCandidates?: Array<ApprovalCandidateAnchor | NoPrBranchAnchor>;
     };
 
 /**
@@ -1707,7 +1741,24 @@ export async function resolveApprovalDecisionHead(
       ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName }
       : { kind: "unresolvable", reason: head.reason };
   }
-  return { kind: "unresolvable", reason: "no-pr: no open linked PR resolvable at decision time" };
+  // SUP-15016: no-pr is unresolvable at decision time, but on a CLOSING transition
+  // the certification the producer had in hand must not be discarded. The card's OWN
+  // delivery branch is resolvable even with no PR (resolveDeliveryIdentity), so
+  // certify its live head now — the same fail-open-to-null convention as the
+  // ambiguous class. Gated on closingTransition exactly like the live discovery
+  // above (discoverCardPullRequestByWorkspace): a stage approval that redirects a
+  // requested `done` to a later stage (in_review) is not a delivery transition and
+  // must make no delivery probe — certifying here would wedge every multi-stage
+  // review. A card with no own branch certifies nothing (acceptance #3) and behaves
+  // exactly as today.
+  const noPrAnchor = closingTransition
+    ? await certifyNoPrDeliveryBranchHead(db, companyId, issueId)
+    : null;
+  return {
+    kind: "unresolvable",
+    reason: "no-pr: no open linked PR resolvable at decision time",
+    pendingCandidates: noPrAnchor ? [noPrAnchor] : undefined,
+  };
 }
 
 /**
@@ -1733,6 +1784,98 @@ async function certifyCandidateHeads(
     });
   }
   return anchors;
+}
+
+/**
+ * SUP-15016: certifies the card's OWN delivery-branch head at approval time for a
+ * `no-pr` unresolvable decision. Returns a single `NoPrBranchAnchor`, or null when
+ * there is nothing to certify: no recorded branch, no resolvable delivery repo, or
+ * the recorded branch belongs to another issue (`branchIsOwn: false`). A readable
+ * branch ref yields its live head sha; an unreadable ref yields `headSha: null`
+ * (the consumer fails closed on null) rather than dropping the certification.
+ */
+async function certifyNoPrDeliveryBranchHead(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<NoPrBranchAnchor | null> {
+  const identity = await resolveDeliveryIdentity(db, companyId, issueId);
+  if (identity.branch === null || identity.repo === null) return null;
+  if (!identity.branchIsOwn) return null;
+  const headSha = await fetchBranchHeadShaAcrossCandidates(
+    db,
+    companyId,
+    identity.repo.owner,
+    identity.repo.repo,
+    identity.branch,
+  );
+  return {
+    owner: identity.repo.owner,
+    repo: identity.repo.repo,
+    branch: identity.branch,
+    headSha,
+    certifiedAt: new Date().toISOString(),
+    source: "no-pr-branch",
+  };
+}
+
+/**
+ * SUP-15016: resolve a delivery-branch ref's live head SHA across a list of token
+ * candidates (401/403 advances to the next candidate), or null when none could
+ * fetch it. Fail-open-to-null, matching the ambiguous-class convention: an
+ * unreadable ref is anchored to null (the reconciler fails closed on it) rather
+ * than dropped.
+ */
+async function fetchBranchHeadShaAcrossCandidates(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<string | null> {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
+  if (candidates.length === 0) return null;
+  for (let i = 0; i < candidates.length; i++) {
+    const result = await fetchBranchHeadSha(candidates[i]!.token, owner, repo, branch);
+    if (result.ok) return result.headSha;
+    if ((result.status === 401 || result.status === 403) && i < candidates.length - 1) continue;
+    return null;
+  }
+  return null;
+}
+
+/** Reads one delivery-branch ref's live head SHA from the GitHub refs API. */
+async function fetchBranchHeadSha(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<{ ok: true; headSha: string } | { ok: false; status: number }> {
+  const refPath = branch.split("/").map(encodeURIComponent).join("/");
+  const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
+    repo,
+  )}/git/refs/heads/${refPath}`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-merge-arming",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+
+  let response: Response;
+  try {
+    response = await ghFetch(url, { headers });
+  } catch {
+    return { ok: false, status: 0 };
+  }
+
+  if (!response.ok) return { ok: false, status: response.status };
+
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  const object = body?.object as Record<string, unknown> | undefined | null;
+  const sha = object?.sha as string | undefined;
+  if (typeof sha === "string" && sha.length > 0) return { ok: true, headSha: sha };
+  return { ok: false, status: response.status };
 }
 
 async function fetchHeadViaTokenCandidates(

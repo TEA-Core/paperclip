@@ -20,6 +20,7 @@ import {
   publishApprovalStatus,
   resolveApprovalDecisionHead,
   resolveCardPullRequest,
+  type NoPrBranchAnchor,
 } from "./merge-arming.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
@@ -61,6 +62,9 @@ const POST_STATUS_URL = (sha: string) =>
   `https://api.github.com/repos/${OWNER}/${REPO}/statuses/${sha}`;
 // The shared live workspace re-resolve lists open PRs by identifier substring.
 const OPEN_PRS_LIST_URL = `https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100`;
+// SUP-15016: the no-pr delivery-branch ref read (GET .../git/refs/heads/SUP-42-branch).
+const BRANCH_REF_URL = `https://api.github.com/repos/${OWNER}/${REPO}/git/refs/heads/SUP-42-branch`;
+const BRANCH_HEAD = "branch000000000000000000000000000000000001";
 function openPrsListItem(overrides: Record<string, unknown> = {}) {
   return {
     number: 455,
@@ -292,6 +296,82 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(result.kind).toBe("unresolvable");
       if (result.kind === "unresolvable") {
         expect(result.reason).toMatch(/^no-pr:/);
+      }
+    });
+
+    // SUP-15016: a no-pr decision certifies the card's OWN delivery-branch head so a
+    // later reconciler tick has an anchor to verify against. The no-pr refusal reason
+    // is unchanged (acceptance #5); only the certification evidence is now attached.
+    it("certifies the card's own delivery-branch head on a no-pr decision (acceptance 1)", async () => {
+      const issueId = await insertIssue();
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [] },
+        {
+          url: BRANCH_REF_URL,
+          body: { ref: "refs/heads/SUP-42-branch", object: { type: "commit", sha: BRANCH_HEAD } },
+        },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^no-pr:/);
+        expect(result.pendingCandidates).toHaveLength(1);
+        const anchor = result.pendingCandidates![0] as NoPrBranchAnchor;
+        expect(anchor.owner).toBe(OWNER);
+        expect(anchor.repo).toBe(REPO);
+        expect(anchor.branch).toBe("SUP-42-branch");
+        expect(anchor.headSha).toBe(BRANCH_HEAD);
+        expect(anchor.source).toBe("no-pr-branch");
+        expect(typeof anchor.certifiedAt).toBe("string");
+      }
+    });
+
+    it("anchors the no-pr delivery-branch head to null when the ref cannot be read (acceptance 2)", async () => {
+      const issueId = await insertIssue();
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [] },
+        { url: BRANCH_REF_URL, ok: false, status: 404, body: { message: "Not Found" } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^no-pr:/);
+        expect(result.pendingCandidates).toHaveLength(1);
+        const anchor = result.pendingCandidates![0] as NoPrBranchAnchor;
+        expect(anchor.branch).toBe("SUP-42-branch");
+        expect(anchor.headSha).toBeNull();
+        expect(anchor.source).toBe("no-pr-branch");
+      }
+    });
+
+    it("certifies nothing on a no-pr card with no delivery branch (acceptance 3)", async () => {
+      const issueId = await insertIssue({ deliveryIdentity: false });
+      installRoutes([{ url: OPEN_PRS_LIST_URL, body: [] }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^no-pr:/);
+        expect(result.pendingCandidates).toBeUndefined();
+      }
+    });
+
+    it("certifies nothing on a no-pr card whose delivery branch belongs to another issue (acceptance 3)", async () => {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-99" });
+      const issueId = await insertIssue({ sharedWorkspaceOwnerIssueId: ownerIssueId });
+      installRoutes([{ url: OPEN_PRS_LIST_URL, body: [] }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^no-pr:/);
+        expect(result.pendingCandidates).toBeUndefined();
       }
     });
 
