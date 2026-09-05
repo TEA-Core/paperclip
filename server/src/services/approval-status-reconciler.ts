@@ -295,6 +295,59 @@ function readPendingCandidates(state: Record<string, unknown> | null | undefined
   return out;
 }
 
+/**
+ * SUP-15017: a certified `no-pr` branch anchor persisted by the producer child
+ * (SUP-15016) on `executionState.approvalStatus.pendingCandidates` when an
+ * approval resolved to `no-pr` (no open linked PR). The producer reuses the
+ * `pendingCandidates` array but records a BRANCH (not a PR), so the entry has
+ * `source: "no-pr-branch"`, a `branch`, and `headSha` (the branch head sha
+ * read at approval time) instead of a PR `number` + `headShaAtApproval`. It
+ * therefore does NOT satisfy `readPendingCandidates` (which requires an integer
+ * `number`) and is read here, independently, by its `source` marker.
+ *
+ * `headSha` is null when the branch ref could not be read at approval time;
+ * the consumer fails closed on null and never attempts the content-identity
+ * proof without a certified anchor sha.
+ */
+interface NoPrBranchAnchor {
+  owner: string;
+  repo: string;
+  branch: string | null;
+  headSha: string | null;
+}
+
+/**
+ * SUP-15017: duck-type the `no-pr` branch anchor out of the card's
+ * `executionState.approvalStatus.pendingCandidates` without depending on the
+ * producer child's type changes (the two land in separate branches and the
+ * `source` / `headSha` / `branch` fields are not yet on the shared
+ * `ApprovalCandidateAnchor` type). An entry that is not a well-formed
+ * `no-pr-branch` record (missing owner/repo) is ignored; only one such anchor
+ * is ever written per card, so the first valid one wins. Returns null when no
+ * well-formed no-pr anchor is present.
+ */
+function findNoPrBranchAnchor(state: Record<string, unknown> | null | undefined): NoPrBranchAnchor | null {
+  const approvalStatus = state?.approvalStatus as Record<string, unknown> | null | undefined;
+  if (!approvalStatus || typeof approvalStatus !== "object") return null;
+  const raw = approvalStatus.pendingCandidates;
+  if (!Array.isArray(raw)) return null;
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (record.source !== "no-pr-branch") continue;
+    if (typeof record.owner !== "string" || record.owner.length === 0) continue;
+    if (typeof record.repo !== "string" || record.repo.length === 0) continue;
+    return {
+      owner: record.owner,
+      repo: record.repo,
+      branch: typeof record.branch === "string" ? record.branch : null,
+      headSha:
+        typeof record.headSha === "string" && record.headSha.length > 0 ? record.headSha : null,
+    };
+  }
+  return null;
+}
+
 /** Stable, case-insensitive identity key for a candidate PR (used to compare candidate sets). */
 function candidateKey(pr: { owner: string; repo: string; number: number }): string {
   return `${pr.owner.toLowerCase()}/${pr.repo.toLowerCase()}#${pr.number}`;
@@ -1187,6 +1240,171 @@ async function readShaServerTimestamp(
   return { ok: true, minTimestampMs };
 }
 
+/**
+ * SUP-15017: GitHub's `GET /repos/{owner}/{repo}/commits/{sha}` caps the
+ * returned `files` array at 300 entries. A commit that changed that many files
+ * cannot have its full changed-file set positively verified through this
+ * endpoint, so the content-identity proof refuses rather than risk comparing
+ * two identically-truncated prefixes (a false-positive match on content that
+ * was never reviewed).
+ */
+const MAX_COMMIT_CHANGED_FILES = 300;
+
+type CommitFilesRead =
+  | { ok: true; files: Map<string, string>; fileCount: number; parentCount: number }
+  | { ok: false; status: number; detail: string };
+
+/**
+ * SUP-15017: read a commit's changed-file set over its own parent from
+ * `GET /commits/{sha}`. The commit detail's `files` array is exactly the change
+ * the commit introduces over its parent: each entry's `sha` is the RESULTING
+ * blob sha, `status` is added/removed/modified/renamed/copied, and `filename`
+ * is unique within a commit. The result is a `Map<filename, status + "\0" +
+ * blobSha>` so two sets are equal iff they introduce the same byte-identical
+ * changes. The parent count is returned so the caller can fail closed on a
+ * merge commit (>1 parent) or a root commit (0 parents).
+ *
+ * A non-2xx read returns `{ ok: false, status }` with the HTTP status so the
+ * caller can classify 404 (a lost anchor) as deterministic and every other
+ * failure as transient. A 200 whose body is not an object, has no `files`
+ * array, or carries a file with no filename is treated as an unreadable payload
+ * (status 200, transient) — the same bytes may be readable on the next tick.
+ */
+async function readCommitChangedFiles(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  sha: string,
+): Promise<CommitFilesRead> {
+  const read = await ghReadJson(db, companyId, owner, repo, `/commits/${encodeURIComponent(sha)}`);
+  if (!read.ok) {
+    return {
+      ok: false,
+      status: read.status,
+      detail: `commit-read-failed: HTTP ${read.status} ${read.message ?? ""}`.trim(),
+    };
+  }
+  const body = read.body as Record<string, unknown> | null;
+  if (!body || typeof body !== "object") {
+    return { ok: false, status: 200, detail: "commit payload is not an object" };
+  }
+  const parents = Array.isArray(body.parents)
+    ? (body.parents as Array<Record<string, unknown>>)
+    : [];
+  if (!Array.isArray(body.files)) {
+    return { ok: false, status: 200, detail: "commit payload carries no files array" };
+  }
+  const files = new Map<string, string>();
+  for (const entry of body.files as Array<Record<string, unknown>>) {
+    const filename = typeof entry?.filename === "string" ? entry.filename : null;
+    if (!filename) {
+      return { ok: false, status: 200, detail: "commit file entry carries no filename" };
+    }
+    const status = typeof entry.status === "string" ? entry.status : "";
+    const blobSha = typeof entry.sha === "string" ? entry.sha : "";
+    files.set(filename, `${status}\0${blobSha}`);
+  }
+  return { ok: true, files, fileCount: files.size, parentCount: parents.length };
+}
+
+type NoPrContentIdentityOutcome =
+  | { kind: "match"; fileCount: number }
+  | { kind: "refused"; detail: string }
+  | { kind: "transient"; detail: string };
+
+/**
+ * SUP-15017: the second admissible backfill proof. Where the temporal proof
+ * asks "did this live head exist on this branch at/before the approval?" (which
+ * a PR opened after the approval can never answer), the content-identity proof
+ * asks "is the reviewed content byte-identical to the certified anchor's?" If
+ * the live head introduces the same set of byte-identical changed files as the
+ * certified `no-pr` anchor commit, the bytes that would merge are the bytes that
+ * were approved, and stamping is sound.
+ *
+ * Fail closed, refusing with `backfill:head-unverifiable` (the caller's
+ * `refused` case) whenever: the anchor sha is no longer reachable (404 — it can
+ * be gc'd; this proof is best-effort by nature); either commit has more than
+ * one parent (a merge) or zero (a root), so "over its own parent" is not
+ * decidable; a commit changed so many files the set is not positively
+ * verifiable (truncation); or the two changed-file sets differ in any way.
+ * Only an actual API read failure that is NOT an anchor 404 is transient
+ * (not persisted, retried next tick), mirroring `backfill:timeline-read-failed`.
+ */
+async function verifyNoPrContentIdentity(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  anchorSha: string,
+  liveHeadSha: string,
+): Promise<NoPrContentIdentityOutcome> {
+  const anchorRead = await readCommitChangedFiles(db, companyId, owner, repo, anchorSha);
+  if (!anchorRead.ok) {
+    // The anchor is the certified head. If GitHub no longer resolves it (404 —
+    // it can be gc'd), the proof is lost: a DETERMINISTIC refusal. Any other
+    // read failure (5xx / network / final auth) is TRANSIENT.
+    if (anchorRead.status === 404) {
+      return {
+        kind: "refused",
+        detail: `content-identity: certified no-pr anchor ${anchorSha.slice(0, 7)} is no longer reachable in ${owner}/${repo} (HTTP 404); cannot prove content identity`,
+      };
+    }
+    return {
+      kind: "transient",
+      detail: `content-identity: ${anchorRead.detail}; will retry on the next tick`,
+    };
+  }
+
+  const liveRead = await readCommitChangedFiles(db, companyId, owner, repo, liveHeadSha);
+  if (!liveRead.ok) {
+    // The live head was just read from the live PR payload, so it exists; a 404
+    // or other failure here is a blip, not a lost head. Every live-head read
+    // failure is TRANSIENT — never strand the card on one blip.
+    return {
+      kind: "transient",
+      detail: `content-identity: live-head ${liveHeadSha.slice(0, 7)} read failed (${liveRead.detail}); will retry on the next tick`,
+    };
+  }
+
+  if (anchorRead.parentCount !== 1 || liveRead.parentCount !== 1) {
+    return {
+      kind: "refused",
+      detail: `content-identity: anchor has ${anchorRead.parentCount} parent(s) and live head has ${liveRead.parentCount} parent(s); single-parent change-over-parent is not decidable; refusing to anchor an unverifiable head`,
+    };
+  }
+
+  if (
+    anchorRead.fileCount >= MAX_COMMIT_CHANGED_FILES ||
+    liveRead.fileCount >= MAX_COMMIT_CHANGED_FILES
+  ) {
+    return {
+      kind: "refused",
+      detail: `content-identity: a commit changed ${MAX_COMMIT_CHANGED_FILES}+ files; the full changed-file set is not positively verifiable; refusing to anchor an unverifiable head`,
+    };
+  }
+
+  if (!changedFileSetsEqual(anchorRead.files, liveRead.files)) {
+    return {
+      kind: "refused",
+      detail: `content-identity: live head ${liveHeadSha.slice(0, 7)} changed-file set differs from certified no-pr anchor ${anchorSha.slice(0, 7)}; refusing to anchor an unverifiable head`,
+    };
+  }
+
+  return { kind: "match", fileCount: anchorRead.fileCount };
+}
+
+function changedFileSetsEqual(
+  a: Map<string, string>,
+  b: Map<string, string>,
+): boolean {
+  if (a.size !== b.size) return false;
+  for (const [filename, entry] of a) {
+    if (b.get(filename) !== entry) return false;
+  }
+  return true;
+}
+
 type BackfillOutcome =
   | { kind: "backfilled"; anchorHeadSha: string; detail: string }
   | { kind: "skipped"; reason: string; detail: string };
@@ -1261,6 +1479,191 @@ async function persistBackfillRefusal(
   row.executionState = nextExecutionState;
 }
 
+type TemporalBackfillOutcome =
+  | { kind: "backfilled"; anchorHeadSha: string; detail: string }
+  | { kind: "refused"; reason: string; detail: string; transient: boolean };
+
+/**
+ * SUP-15017: the primary backfill proof — does the live head provably exist on
+ * this branch at/before the approval, per the PR timeline (+ the server-timed
+ * branch-bound sha-existence proof)? This performs every GitHub read and
+ * classifies the outcome, but performs NO writes: persistence (the stable
+ * refusal, or the stamped anchor) is owned by the caller,
+ * `backfillPreDBApprovalAnchor`, so the caller can escalate a deterministic
+ * temporal refusal to the content-identity proof before deciding what to
+ * persist. `transient` mirrors the old "report a skip but do NOT persist"
+ * branches (a failed / unreadable read that the next tick should retry).
+ */
+async function temporalBackfillOutcome(
+  db: Db,
+  companyId: string,
+  target: LinkedPullRequest,
+  currentHeadSha: string,
+  approvalTimeMs: number,
+  decisionCreatedAt: Date,
+): Promise<TemporalBackfillOutcome> {
+  const timeline = await readPrTimelineHeadEvents(
+    db,
+    companyId,
+    target.owner,
+    target.repo,
+    target.number,
+    approvalTimeMs,
+  );
+  if (timeline.kind === "failed") {
+    // A failed read is a TRANSIENT condition (HTTP / network error, or an
+    // unparseable head-mutating event). Reported as a skip; the caller does not
+    // persist it, so the next tick retries (backfill-refusal-caches-transient-failures).
+    return {
+      kind: "refused",
+      reason: "backfill:timeline-read-failed",
+      transient: true,
+      detail: `backfill: ${timeline.detail}`,
+    };
+  }
+  if (timeline.kind === "unparseable") {
+    // A structurally malformed but stable event (e.g. a head_ref_force_pushed
+    // with a null commit_id) is a DETERMINISTIC refusal: the same bytes are read
+    // on every tick, so the caller persists a named refusal keyed on (live head,
+    // approval time) and skips the re-read while neither changes.
+    return {
+      kind: "refused",
+      reason: "backfill:unparseable-force-push",
+      transient: false,
+      detail: `backfill: ${timeline.detail}`,
+    };
+  }
+  if (timeline.kind === "truncated") {
+    return {
+      kind: "refused",
+      reason: "backfill:timeline-truncated",
+      transient: false,
+      detail: `backfill: PR timeline for ${target.displayName} is incomplete and cannot be positively read up to the approval time; refusing to anchor an unverifiable head`,
+    };
+  }
+
+  if (timeline.headAtApproval === null) {
+    if (!timeline.sawCommittedHeadEvent) {
+      return {
+        kind: "refused",
+        reason: "backfill:no-head-mutating-event",
+        transient: false,
+        detail: `backfill: no committed / head_ref_force_pushed event at or before the approval time for ${target.displayName}; refusing to anchor an unverifiable head`,
+      };
+    }
+
+    if (timeline.sawPostApprovalForcePush) {
+      return {
+        kind: "refused",
+        reason: "backfill:head-unverifiable",
+        transient: false,
+        detail: `backfill: ${target.displayName} shows a post-approval force-push event; the head-at-approval cannot be verified via sha existence (the push-A/push-B/force-push-back-to-A hole); refusing to anchor an unverifiable head`,
+      };
+    }
+
+    // SUP-14844: the timeline carries only committed (client-timed) head events
+    // at/before the approval — no force-push. Attempt the server-timed,
+    // branch-bound sha existence proof: if the live head sha has a check run
+    // GitHub triggered on THIS PR's head branch (check_suite.head_branch === the
+    // card's PR head ref) whose server-assigned created_at is at/before the
+    // approval time, the sha provably existed on this branch at that time and no
+    // force-push moved it, so it was the head at approval.
+    const shaTimestamp = await readShaServerTimestamp(
+      db,
+      companyId,
+      target.owner,
+      target.repo,
+      currentHeadSha,
+      target.headRefName,
+    );
+    if (!shaTimestamp.ok) {
+      if (shaTimestamp.transient) {
+        // A failed read (or an unreadable head ref) is TRANSIENT — report a skip
+        // but do NOT persist, so the next tick retries (mirror the
+        // timeline-read-failed branch).
+        return {
+          kind: "refused",
+          reason: "backfill:sha-existence-read-failed",
+          transient: true,
+          detail: `backfill: ${shaTimestamp.detail}; will retry on the next tick`,
+        };
+      }
+      // No branch-bound server-timed evidence is a DETERMINISTIC refusal: the
+      // sha cannot be shown to have existed on this branch at/before the
+      // approval.
+      return {
+        kind: "refused",
+        reason: "backfill:head-unverifiable",
+        transient: false,
+        detail: `backfill: ${shaTimestamp.detail}; refusing to anchor an unverifiable head`,
+      };
+    }
+
+    if (shaTimestamp.minTimestampMs > approvalTimeMs) {
+      return {
+        kind: "refused",
+        reason: "backfill:head-unverifiable",
+        transient: false,
+        detail: `backfill: ${target.displayName} head ${currentHeadSha.slice(0, 7)} has no server-timestamped evidence at or before the approval ${decisionCreatedAt.toISOString()} (earliest: ${new Date(shaTimestamp.minTimestampMs).toISOString()}); refusing to anchor an unverifiable head`,
+      };
+    }
+
+    // The sha has server-attested existence at/before the approval time, and no
+    // post-approval force-push moved it.
+    return {
+      kind: "backfilled",
+      anchorHeadSha: currentHeadSha,
+      detail: `backfill: anchored ${currentHeadSha.slice(0, 7)} via server-timed sha existence (earliest ${new Date(shaTimestamp.minTimestampMs).toISOString()}) on the ${target.displayName} timeline (approved ${decisionCreatedAt.toISOString()})`,
+    };
+  }
+
+  if (timeline.headAtApproval !== currentHeadSha) {
+    return {
+      kind: "refused",
+      reason: "backfill:head-moved-since-approval",
+      transient: false,
+      detail: `backfill: verified head at approval time ${timeline.headAtApproval.slice(0, 7)} differs from the live head ${currentHeadSha.slice(0, 7)}; the reviewed code is no longer the head; refusing and leaving the card for re-review`,
+    };
+  }
+
+  return {
+    kind: "backfilled",
+    anchorHeadSha: timeline.headAtApproval,
+    detail: `backfill: anchored ${timeline.headAtApproval.slice(0, 7)} from the ${target.displayName} timeline (approved ${decisionCreatedAt.toISOString()})`,
+  };
+}
+
+/**
+ * SUP-14747: persist the D-B approval anchor for a verified backfill. Sets
+ * `approvalStatus.approvedHeadSha` + `approvedAt` (and clears any prior
+ * `backfillRefusal`) so the unmodified first-publish path certifies the head.
+ * Shared by the temporal-proof and SUP-15017 content-identity success paths.
+ */
+async function anchorBackfilledHead(
+  db: Db,
+  row: CandidateRow,
+  anchorHeadSha: string,
+  decisionCreatedAt: Date,
+): Promise<void> {
+  const existingApprovalStatus =
+    ((row.executionState?.approvalStatus as Record<string, unknown> | null | undefined) ?? {});
+  const nextApprovalStatus: Record<string, unknown> = {
+    ...existingApprovalStatus,
+    approvedHeadSha: anchorHeadSha,
+    approvedAt: decisionCreatedAt.toISOString(),
+  };
+  delete nextApprovalStatus.backfillRefusal;
+  const nextExecutionState: Record<string, unknown> = {
+    ...(row.executionState ?? {}),
+    approvalStatus: nextApprovalStatus,
+  };
+  await db
+    .update(issues)
+    .set({ executionState: nextExecutionState })
+    .where(eq(issues.id, row.id));
+  row.executionState = nextExecutionState;
+}
+
 /**
  * SUP-14747: recover the D-B approval anchor for a stranded pre-D-B first
  * publish. Reads the card's approval time (latest approved decision), derives
@@ -1268,14 +1671,20 @@ async function persistBackfillRefusal(
  * whose server-recorded `created_at` is at/before the approval), and — only when
  * that head still equals the live head — writes approvalStatus.approvedHeadSha +
  * approvedAt so the unmodified first-publish path certifies it. A head provable
-  * only through committed (client-timed) events, or any head we cannot verify to a
-  * server timestamp, is refused with a recorded reason and zero writes. A
-  * DETERMINISTIC refusal is persisted on the card, keyed on both the live head and
-  * the approval time, so the next tick skips the timeline re-read while neither
-  * changes (backfill-repeat-fanout). A transient timeline read failure is NOT
-  * persisted, so it retries on the next tick instead of stranding the card on one
-  * transient error (backfill-refusal-caches-transient-failures).
-  */
+ * only through committed (client-timed) events, or any head we cannot verify to a
+ * server timestamp, is refused with a recorded reason and zero writes. A
+ * DETERMINISTIC refusal is persisted on the card, keyed on both the live head and
+ * the approval time, so the next tick skips the timeline re-read while neither
+ * changes (backfill-repeat-fanout). A transient timeline read failure is NOT
+ * persisted, so it retries on the next tick instead of stranding the card on one
+ * transient error (backfill-refusal-caches-transient-failures).
+ *
+ * SUP-15017: when the card was approved via a certified `no-pr` branch anchor and
+ * the PR was opened AFTER the approval, the temporal proof can never certify the
+ * post-approval head. In that case the caller escalates a deterministic temporal
+ * refusal to the second admissible proof — the certified anchor's content
+ * identity — before persisting anything (see the escalation below).
+ */
 async function backfillPreDBApprovalAnchor(
   db: Db,
   row: CandidateRow,
@@ -1303,6 +1712,7 @@ async function backfillPreDBApprovalAnchor(
     };
   }
   const approvalTimeMs = decision.createdAt.getTime();
+  const decisionCreatedAt = decision.createdAt;
 
   // A stable refusal is a deterministic function of (timeline, live head,
   // approval time). It is cached against BOTH the live head and the approval
@@ -1323,199 +1733,98 @@ async function backfillPreDBApprovalAnchor(
     };
   }
 
-  const timeline = await readPrTimelineHeadEvents(
+  const temporal = await temporalBackfillOutcome(
     db,
     row.companyId,
-    target.owner,
-    target.repo,
-    target.number,
+    target,
+    currentHeadSha,
     approvalTimeMs,
+    decisionCreatedAt,
   );
-  if (timeline.kind === "failed") {
-    // A failed read is a TRANSIENT condition (HTTP / network error, or an
-    // unparseable head-mutating event) — NOT a deterministic refusal. It is
-    // reported as a skip but deliberately NOT persisted as a stable refusal, so
-    // the next tick retries the read instead of stranding a recoverable card on
-    // one transient error (backfill-refusal-caches-transient-failures).
-    return {
-      kind: "skipped",
-      reason: "backfill:timeline-read-failed",
-      detail: `backfill: ${timeline.detail}`,
-    };
-  }
-  if (timeline.kind === "unparseable") {
-    // A structurally malformed but stable event (e.g. a head_ref_force_pushed
-    // with a null commit_id) is a DETERMINISTIC refusal: the same bytes are read
-    // on every tick, so persist a named refusal keyed on (live head, approval
-    // time) and skip the timeline re-read while neither changes. This is the
-    // mirror image of the transient `failed` branch above, which stays
-    // non-cached so a recoverable card retries instead of stranding on one
-    // blip (backfill-unparseable-event-misclassified-transient).
-    await persistBackfillRefusal(db, row, {
-      reason: "backfill:unparseable-force-push",
-      observedHeadSha: currentHeadSha,
-      approvedAtMs: approvalTimeMs,
-      observedAt: new Date().toISOString(),
-    });
-    return {
-      kind: "skipped",
-      reason: "backfill:unparseable-force-push",
-      detail: `backfill: ${timeline.detail}`,
-    };
-  }
-  if (timeline.kind === "truncated") {
-    await persistBackfillRefusal(db, row, {
-      reason: "backfill:timeline-truncated",
-      observedHeadSha: currentHeadSha,
-      approvedAtMs: approvalTimeMs,
-      observedAt: new Date().toISOString(),
-    });
-    return {
-      kind: "skipped",
-      reason: "backfill:timeline-truncated",
-      detail: `backfill: PR timeline for ${target.displayName} is incomplete and cannot be positively read up to the approval time; refusing to anchor an unverifiable head`,
-    };
-  }
 
-  if (timeline.headAtApproval === null) {
-    if (!timeline.sawCommittedHeadEvent) {
-      const detail = `backfill: no committed / head_ref_force_pushed event at or before the approval time for ${target.displayName}; refusing to anchor an unverifiable head`;
-      await persistBackfillRefusal(db, row, {
-        reason: "backfill:no-head-mutating-event",
-        observedHeadSha: currentHeadSha,
-        approvedAtMs: approvalTimeMs,
-        observedAt: new Date().toISOString(),
-      });
-      return { kind: "skipped", reason: "backfill:no-head-mutating-event", detail };
-    }
-
-    if (timeline.sawPostApprovalForcePush) {
-      const detail = `backfill: ${target.displayName} shows a post-approval force-push event; the head-at-approval cannot be verified via sha existence (the push-A/push-B/force-push-back-to-A hole); refusing to anchor an unverifiable head`;
-      await persistBackfillRefusal(db, row, {
-        reason: "backfill:head-unverifiable",
-        observedHeadSha: currentHeadSha,
-        approvedAtMs: approvalTimeMs,
-        observedAt: new Date().toISOString(),
-      });
-      return { kind: "skipped", reason: "backfill:head-unverifiable", detail };
-    }
-
-    // SUP-14844: the timeline carries only committed (client-timed) head events
-    // at/before the approval — no force-push. Attempt the server-timed,
-    // branch-bound sha existence proof: if the live head sha has a check run
-    // GitHub triggered on THIS PR's head branch (check_suite.head_branch === the
-    // card's PR head ref) whose server-assigned created_at is at/before the
-    // approval time, the sha provably existed on this branch at that time and no
-    // force-push moved it, so it was the head at approval.
-    const shaTimestamp = await readShaServerTimestamp(
-      db,
-      row.companyId,
-      target.owner,
-      target.repo,
-      currentHeadSha,
-      target.headRefName,
-    );
-    if (!shaTimestamp.ok) {
-      if (shaTimestamp.transient) {
-        // A failed read (or an unreadable head ref) is TRANSIENT — report a
-        // skip but do NOT persist, so the next tick retries (mirror the
-        // timeline-read-failed branch).
-        return {
-          kind: "skipped",
-          reason: "backfill:sha-existence-read-failed",
-          detail: `backfill: ${shaTimestamp.detail}; will retry on the next tick`,
-        };
-      }
-      // No branch-bound server-timed evidence is a DETERMINISTIC refusal: the
-      // sha cannot be shown to have existed on this branch at/before the
-      // approval, so persist a stable refusal and leave the card for re-review.
-      const detail = `backfill: ${shaTimestamp.detail}; refusing to anchor an unverifiable head`;
-      await persistBackfillRefusal(db, row, {
-        reason: "backfill:head-unverifiable",
-        observedHeadSha: currentHeadSha,
-        approvedAtMs: approvalTimeMs,
-        observedAt: new Date().toISOString(),
-      });
-      return { kind: "skipped", reason: "backfill:head-unverifiable", detail };
-    }
-
-    if (shaTimestamp.minTimestampMs > approvalTimeMs) {
-      const detail = `backfill: ${target.displayName} head ${currentHeadSha.slice(0, 7)} has no server-timestamped evidence at or before the approval ${decision.createdAt.toISOString()} (earliest: ${new Date(shaTimestamp.minTimestampMs).toISOString()}); refusing to anchor an unverifiable head`;
-      await persistBackfillRefusal(db, row, {
-        reason: "backfill:head-unverifiable",
-        observedHeadSha: currentHeadSha,
-        approvedAtMs: approvalTimeMs,
-        observedAt: new Date().toISOString(),
-      });
-      return { kind: "skipped", reason: "backfill:head-unverifiable", detail };
-    }
-
-    // The sha has server-attested existence at/before the approval time, and no
-    // post-approval force-push moved it. Anchor and proceed to the first-publish
-    // path with enforceDeliveryIdentity (the same path a force-push-verified
-    // backfill uses).
-    const existingApprovalStatus =
-      ((row.executionState?.approvalStatus as Record<string, unknown> | null | undefined) ?? {});
-    const nextApprovalStatus: Record<string, unknown> = {
-      ...existingApprovalStatus,
-      approvedHeadSha: currentHeadSha,
-      approvedAt: decision.createdAt.toISOString(),
-    };
-    delete nextApprovalStatus.backfillRefusal;
-    const nextExecutionState: Record<string, unknown> = {
-      ...(row.executionState ?? {}),
-      approvalStatus: nextApprovalStatus,
-    };
-    await db
-      .update(issues)
-      .set({ executionState: nextExecutionState })
-      .where(eq(issues.id, row.id));
-    row.executionState = nextExecutionState;
-
+  if (temporal.kind === "backfilled") {
+    await anchorBackfilledHead(db, row, temporal.anchorHeadSha, decisionCreatedAt);
     return {
       kind: "backfilled",
-      anchorHeadSha: currentHeadSha,
-      detail: `backfill: anchored ${currentHeadSha.slice(0, 7)} via server-timed sha existence (earliest ${new Date(shaTimestamp.minTimestampMs).toISOString()}) on the ${target.displayName} timeline (approved ${decision.createdAt.toISOString()})`,
+      anchorHeadSha: temporal.anchorHeadSha,
+      detail: temporal.detail,
     };
   }
 
-  if (timeline.headAtApproval !== currentHeadSha) {
-    await persistBackfillRefusal(db, row, {
-      reason: "backfill:head-moved-since-approval",
-      observedHeadSha: currentHeadSha,
-      approvedAtMs: approvalTimeMs,
-      observedAt: new Date().toISOString(),
-    });
+  // The primary (temporal) proof did not certify the live head.
+  if (temporal.transient) {
+    // A transient read failure is reported as a skip but deliberately NOT
+    // persisted, so the next tick retries the read instead of stranding a
+    // recoverable card on one transient error
+    // (backfill-refusal-caches-transient-failures).
+    return { kind: "skipped", reason: temporal.reason, detail: temporal.detail };
+  }
+
+  // SUP-15017: a deterministic temporal refusal. When the card was approved via
+  // a certified `no-pr` branch anchor and the PR was opened AFTER the approval,
+  // the temporal proof can never certify the post-approval head (no head-mutating
+  // event at/before the approval, or the only server-timed evidence is
+  // post-approval). Fall back to the second admissible proof — the certified
+  // anchor's content identity. Reached ONLY when a well-formed no-pr anchor with
+  // a non-null certified head sha is present; a null headSha means the anchor
+  // was never certified, so the temporal refusal stands (fail closed).
+  const noPrAnchor = findNoPrBranchAnchor(row.executionState);
+  if (noPrAnchor && noPrAnchor.headSha !== null) {
+    const content = await verifyNoPrContentIdentity(
+      db,
+      row.companyId,
+      noPrAnchor.owner,
+      noPrAnchor.repo,
+      noPrAnchor.headSha,
+      currentHeadSha,
+    );
+    if (content.kind === "match") {
+      // The live head introduces the same byte-identical changed files as the
+      // certified anchor, so the bytes that would merge are the bytes that were
+      // approved. Stamp the live head; the caller proceeds to the first-publish
+      // path with enforceDeliveryIdentity (Guard A is a same-sha fast path).
+      await anchorBackfilledHead(db, row, currentHeadSha, decisionCreatedAt);
+      return {
+        kind: "backfilled",
+        anchorHeadSha: currentHeadSha,
+        detail: `backfill: anchored ${currentHeadSha.slice(0, 7)} via certified no-pr anchor content identity (${content.fileCount} changed files byte-identical to anchor ${noPrAnchor.headSha.slice(0, 7)}; approved ${decisionCreatedAt.toISOString()})`,
+      };
+    }
+    if (content.kind === "refused") {
+      // The content does not match (or the anchor is lost / not decidable). A
+      // DETERMINISTIC refusal with the existing `backfill:head-unverifiable`
+      // reason, persisted so the next tick skips the re-read.
+      await persistBackfillRefusal(db, row, {
+        reason: "backfill:head-unverifiable",
+        observedHeadSha: currentHeadSha,
+        approvedAtMs: approvalTimeMs,
+        observedAt: new Date().toISOString(),
+      });
+      return {
+        kind: "skipped",
+        reason: "backfill:head-unverifiable",
+        detail: content.detail,
+      };
+    }
+    // content.kind === "transient": an API read failed that is not a lost anchor
+    // (e.g. a live-head read 5xx). NOT persisted — the next tick retries.
     return {
       kind: "skipped",
-      reason: "backfill:head-moved-since-approval",
-      detail: `backfill: verified head at approval time ${timeline.headAtApproval.slice(0, 7)} differs from the live head ${currentHeadSha.slice(0, 7)}; the reviewed code is no longer the head; refusing and leaving the card for re-review`,
+      reason: "backfill:content-identity-read-failed",
+      detail: content.detail,
     };
   }
 
-  const existingApprovalStatus =
-    ((row.executionState?.approvalStatus as Record<string, unknown> | null | undefined) ?? {});
-  const nextApprovalStatus: Record<string, unknown> = {
-    ...existingApprovalStatus,
-    approvedHeadSha: timeline.headAtApproval,
-    approvedAt: decision.createdAt.toISOString(),
-  };
-  delete nextApprovalStatus.backfillRefusal;
-  const nextExecutionState: Record<string, unknown> = {
-    ...(row.executionState ?? {}),
-    approvalStatus: nextApprovalStatus,
-  };
-  await db
-    .update(issues)
-    .set({ executionState: nextExecutionState })
-    .where(eq(issues.id, row.id));
-  row.executionState = nextExecutionState;
-
-  return {
-    kind: "backfilled",
-    anchorHeadSha: timeline.headAtApproval,
-    detail: `backfill: anchored ${timeline.headAtApproval.slice(0, 7)} from the ${target.displayName} timeline (approved ${decision.createdAt.toISOString()})`,
-  };
+  // No no-pr anchor (or it carries no certified head sha): the deterministic
+  // temporal refusal stands and is persisted as a stable refusal keyed on the
+  // live head and approval time.
+  await persistBackfillRefusal(db, row, {
+    reason: temporal.reason,
+    observedHeadSha: currentHeadSha,
+    approvedAtMs: approvalTimeMs,
+    observedAt: new Date().toISOString(),
+  });
+  return { kind: "skipped", reason: temporal.reason, detail: temporal.detail };
 }
 
 /**

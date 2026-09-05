@@ -145,6 +145,46 @@ const TIMELINE_UNPARSEABLE_FORCE_PUSH_BODY = [
   { event: "head_ref_force_pushed", commit_id: null, created_at: "2026-08-19T10:00:00Z" },
 ];
 
+// SUP-15017: a certified `no-pr` branch anchor + the commit-detail reads the
+// content-identity proof makes. The certified anchor is the branch head sha
+// read at approval time (pre-DB approval); the live head is the post-approval
+// PR's head. Both commit-detail reads return the changed-file set each commit
+// introduces over its own parent; the proof compares them for byte-identical
+// equality (same filenames, same resulting blob shas).
+const NO_PR_ANCHOR_SHA = "anc00000000000000000000000000000000000000001";
+const ANCHOR_COMMIT_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NO_PR_ANCHOR_SHA}`;
+const LIVE_COMMIT_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}`;
+// The three changed files from the live SUP-14991 incident — the certified
+// anchor's changed-file set.
+const CONTENT_MATCH_FILES = [
+  { filename: "server/src/services/done-close-landing-backstop.test.ts", status: "modified", sha: "blob11111111111111111111111111111111111111" },
+  { filename: "server/src/services/done-close-landing-backstop.ts", status: "modified", sha: "blob22222222222222222222222222222222222222" },
+  { filename: "server/src/services/merge-arming.ts", status: "modified", sha: "blob33333333333333333333333333333333333333" },
+];
+// Same two files, one differing resulting blob sha: the live head's content is
+// NOT byte-identical to the certified anchor.
+const CONTENT_MISMATCH_FILES = [
+  { filename: "server/src/services/done-close-landing-backstop.test.ts", status: "modified", sha: "blob11111111111111111111111111111111111111" },
+  { filename: "server/src/services/done-close-landing-backstop.ts", status: "modified", sha: "blob99999999999999999999999999999999999999" },
+  { filename: "server/src/services/merge-arming.ts", status: "modified", sha: "blob33333333333333333333333333333333333333" },
+];
+// The live head adds a fourth file the certified anchor does not have.
+const CONTENT_ADDED_FILE_FILES = [
+  ...CONTENT_MATCH_FILES,
+  { filename: "server/src/services/brand-new-file.ts", status: "added", sha: "blob44444444444444444444444444444444444444" },
+];
+// A GitHub commit-detail payload with a single parent and the given changed
+// files (the proof requires exactly one parent on each side).
+function commitDetail(files: Array<Record<string, unknown>>) {
+  return {
+    sha: "commit000000000000000000000000000000000000000",
+    node_id: "commit_node",
+    commit: { message: "test commit" },
+    parents: [{ sha: "parent00000000000000000000000000000000000000000" }],
+    files,
+  };
+}
+
 function zeroSummary(): ApprovalStatusReconcilerTickSummary {
   return {
     scanned: 0,
@@ -225,6 +265,40 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       // the unrecoverable case override this.
       approvalStatus: { publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT },
       ...overrides,
+    };
+  }
+
+  /**
+   * SUP-15017: an approved card that resolved to `no-pr` at approval time — no
+   * publishedHeadSha, no approvedHeadSha, and a certified `no-pr` branch anchor
+   * on pendingCandidates (source: "no-pr-branch", no PR `number`). The anchor's
+   * `headSha` is null when the branch ref could not be read at approval time.
+   * Because the entry has no integer `number`, `readPendingCandidates` drops it
+   * and the reconciler enters the SUP-14747 backfill path, where the
+   * content-identity proof is applied.
+   */
+  function noPrCardState(headSha: string | null) {
+    return {
+      status: "completed",
+      completedStageIds: [APPROVAL_STAGE_ID],
+      lastDecisionOutcome: "approved",
+      currentStageId: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      approvalStatus: {
+        approvedHeadSha: null,
+        publishedHeadSha: null,
+        pendingCandidates: [
+          {
+            owner: "TEA-Core",
+            repo: "paperclip",
+            branch: "some-branch-name",
+            headSha,
+            certifiedAt: APPROVED_AT,
+            source: "no-pr-branch",
+          },
+        ],
+      },
     };
   }
 
@@ -2557,6 +2631,242 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
       expect(approvalStatus.approvedHeadSha).toBe(NEW_HEAD);
       expect(approvalStatus.publishedHeadSha).toBeNull();
+    });
+
+    it("stamps paperclip/approved when the post-approval head is byte-identical to the certified no-pr anchor's changed files (SUP-15017, content-identity match)", async () => {
+      const issueId = await insertIssue({ executionState: noPrCardState(NO_PR_ANCHOR_SHA) });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        // The temporal proof must deterministically fail FIRST (a post-approval
+        // PR: committed-only timeline + only a post-approval branch-bound check
+        // run), so the content-identity proof is reached as the fallback.
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        {
+          url: CHECK_RUNS_URL,
+          body: {
+            total_count: 1,
+            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+          },
+        },
+        // The two commit-detail reads: the certified anchor commit and the live
+        // head commit, introducing the SAME byte-identical changed files.
+        { url: ANCHOR_COMMIT_URL, body: commitDetail(CONTENT_MATCH_FILES) },
+        { url: LIVE_COMMIT_URL, body: commitDetail(CONTENT_MATCH_FILES) },
+        { url: POST_STATUS_URL, body: { id: 12349 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(summary.backfilled).toBe(1);
+      expect(Object.keys(summary.skipped)).toEqual([]);
+      expect(postStatusCalls()).toHaveLength(1);
+      expect(postStatusBodies()[0]).toMatchObject({ state: "success", context: PAPERCLIP_APPROVED });
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBe(NEW_HEAD);
+      expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
+      // The successful stamp must clear any transient backfillRefusal.
+      expect(approvalStatus.backfillRefusal).toBeUndefined();
+    });
+
+    it("refuses to stamp (persistent) when the live head's changed-file set differs from the certified no-pr anchor in one blob (SUP-15017, content-identity mismatch)", async () => {
+      const issueId = await insertIssue({ executionState: noPrCardState(NO_PR_ANCHOR_SHA) });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        {
+          url: CHECK_RUNS_URL,
+          body: {
+            total_count: 1,
+            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+          },
+        },
+        // The live head changes the same files but one differs in its resulting
+        // blob sha: the content is NOT byte-identical, so no stamp.
+        { url: ANCHOR_COMMIT_URL, body: commitDetail(CONTENT_MATCH_FILES) },
+        { url: LIVE_COMMIT_URL, body: commitDetail(CONTENT_MISMATCH_FILES) },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.backfilled).toBe(0);
+      expect(summary.skipped["backfill:head-unverifiable"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      expect(approvalStatus.publishedHeadSha).toBeNull();
+      expect(approvalStatus.backfillRefusal).toMatchObject({ reason: "backfill:head-unverifiable" });
+    });
+
+    it("refuses to stamp (persistent) when the live head adds a file the certified no-pr anchor does not have (SUP-15017, content-identity added-file)", async () => {
+      const issueId = await insertIssue({ executionState: noPrCardState(NO_PR_ANCHOR_SHA) });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        {
+          url: CHECK_RUNS_URL,
+          body: {
+            total_count: 1,
+            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+          },
+        },
+        // The live head's changed-file set is a strict superset of the certified
+        // anchor's (an added file): the content differs, so no stamp.
+        { url: ANCHOR_COMMIT_URL, body: commitDetail(CONTENT_MATCH_FILES) },
+        { url: LIVE_COMMIT_URL, body: commitDetail(CONTENT_ADDED_FILE_FILES) },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.backfilled).toBe(0);
+      expect(summary.skipped["backfill:head-unverifiable"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      expect(approvalStatus.publishedHeadSha).toBeNull();
+      expect(approvalStatus.backfillRefusal).toMatchObject({ reason: "backfill:head-unverifiable" });
+    });
+
+    it("refuses (persistent) when the certified no-pr anchor sha is no longer reachable (HTTP 404) (SUP-15017, content-identity anchor-lost)", async () => {
+      const issueId = await insertIssue({ executionState: noPrCardState(NO_PR_ANCHOR_SHA) });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        {
+          url: CHECK_RUNS_URL,
+          body: {
+            total_count: 1,
+            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+          },
+        },
+        // The certified anchor commit is gone (gc'd): a DETERMINISTIC refusal,
+        // not a transient read failure, because the lost anchor can never come
+        // back.
+        { url: ANCHOR_COMMIT_URL, ok: false, status: 404, body: { message: "Not Found" } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.backfilled).toBe(0);
+      expect(summary.skipped["backfill:head-unverifiable"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      expect(approvalStatus.publishedHeadSha).toBeNull();
+      expect(approvalStatus.backfillRefusal).toMatchObject({ reason: "backfill:head-unverifiable" });
+    });
+
+    it("never attempts the content-identity read when the no-pr anchor has no certified head sha (null) and persists the temporal refusal (SUP-15017, null headSha)", async () => {
+      const issueId = await insertIssue({ executionState: noPrCardState(null) });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        // No head-mutating event at/before the approval: a deterministic temporal
+        // refusal (no-head-mutating-event) with no check-runs read needed.
+        { url: TIMELINE_URL, body: TIMELINE_NO_HEAD_EVENT_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.backfilled).toBe(0);
+      expect(summary.skipped["backfill:no-head-mutating-event"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      // With a null certified head sha, the content-identity commit reads must
+      // never be attempted — the proof cannot run without an anchor to compare
+      // against, so the card is left on the deterministic temporal refusal.
+      const commitReads = mockGhFetch.mock.calls.filter((call) => {
+        const url = String(call[0]);
+        return url === ANCHOR_COMMIT_URL || url === LIVE_COMMIT_URL;
+      });
+      expect(commitReads).toHaveLength(0);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      expect(approvalStatus.publishedHeadSha).toBeNull();
+      expect(approvalStatus.backfillRefusal).toMatchObject({ reason: "backfill:no-head-mutating-event" });
+    });
+
+    it("skips transiently (no persistence) when the content-identity anchor commit read fails with an API error other than 404 (SUP-15017, content-identity read-failed)", async () => {
+      const issueId = await insertIssue({ executionState: noPrCardState(NO_PR_ANCHOR_SHA) });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await seedDeliveryIdentity(issueId, "some-branch-name", "https://github.com/TEA-Core/paperclip");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: TIMELINE_URL, body: TIMELINE_COMMITTED_ONLY_BODY },
+        {
+          url: CHECK_RUNS_URL,
+          body: {
+            total_count: 1,
+            check_runs: [{ check_suite: { head_branch: "some-branch-name" }, created_at: "2026-08-20T01:00:00Z" }],
+          },
+        },
+        // A transient 500 on the anchor commit read (NOT a lost-anchor 404): the
+        // proof cannot conclude, but the bytes may be readable next tick, so it
+        // must be a transient skip — NOT persisted as a stable refusal.
+        { url: ANCHOR_COMMIT_URL, ok: false, status: 500, body: { message: "server error" } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.backfilled).toBe(0);
+      expect(summary.skipped["backfill:content-identity-read-failed"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect(approvalStatus.approvedHeadSha).toBeNull();
+      expect(approvalStatus.publishedHeadSha).toBeNull();
+      // A transient content-identity read failure is NOT cached as a stable
+      // refusal: the next tick retries the read.
+      expect(approvalStatus.backfillRefusal).toBeUndefined();
     });
 
     it("still fires the stage-integrity (self-approval) refusal on a first-publish-anchored card", async () => {
