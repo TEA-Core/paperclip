@@ -5,6 +5,7 @@ import {
   createDoneCloseLandingBackstopService,
   buildDiscoveryQuery,
   selectLandingCandidates,
+  MAX_REENQUEUE_ATTEMPTS,
   type DoneCloseLandingSweepResult,
 } from "./done-close-landing-backstop.js";
 import type { ExternalObjectResolveResult } from "./external-objects.js";
@@ -969,7 +970,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_fetched", "PRNode_fetched");
     });
 
-    it("does not re-enqueue on subsequent sweeps after a successful re-enqueue (idempotency)", async () => {
+    it("re-examines and re-enqueues again on a later sweep while the cap is unexhausted (SUP-15073)", async () => {
       const state: DbState = {
         candidates: [candidateRow()],
         existingLandingRows: [],
@@ -987,18 +988,115 @@ describe("createDoneCloseLandingBackstopService", () => {
       });
       mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
 
-      await service.sweep();
+      // First sweep re-enqueues (attempt 1).
+      const first = await service.sweep();
+      expect(first.reenqueued).toBe(1);
+      expect(first.escalated).toBe(0);
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
 
-      // Simulate a second sweep with the re-enqueued row present.
+      // Second sweep: the PR was re-enqueued once but is still `open` (the queue
+      // ejected it). The old code skipped it forever (alreadyReenqueued); now the
+      // sweep re-examines and re-enqueues again, because the cap is unexhausted.
       state.existingLandingRows.push({
         action: "issue.done_close_landing_reenqueued",
         details: { pr: "paperclipai/paperclip#514" },
       });
-      await service.sweep();
-      // No second re-enqueue, no escalate (alreadyReenqueued is set so we skip both).
-      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+      const second = await service.sweep();
+      expect(second.reenqueued).toBe(1);
+      expect(second.escalated).toBe(0);
+      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(2);
+      // Still under the cap: no escalation, no block.
       expect(mockUpdate).not.toHaveBeenCalled();
+    });
+
+    it("escalates instead of re-enqueuing once the cap is exhausted and the PR is still open (SUP-15073)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      // Pre-seed the cap's worth of prior re-enqueue rows: the PR has already
+      // been re-enqueued MAX times and is back to `open` (ejected) each time.
+      const priorRows = Array.from({ length: MAX_REENQUEUE_ATTEMPTS }, () => ({
+        action: "issue.done_close_landing_reenqueued",
+        details: { pr: "paperclipai/paperclip#514" },
+      }));
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: priorRows,
+          companyMergeArmingEnabled: true,
+        },
+        { wakeup },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+
+      const result = await service.sweep();
+
+      // Cap exhausted: NO re-enqueue attempt, and the sweep reaches _escalated
+      // (the old skip returned deferred: 0 / escalated: 0 — permanently silent).
+      expect(result).toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 1,
+      });
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledTimes(1);
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_escalated",
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#514",
+          prState: "open",
+          reason: expect.stringContaining("re-enqueued"),
+        }),
+      }));
+      expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
+        status: "blocked",
+        unblockDescriptor: expect.objectContaining({
+          owner: "board",
+          action: expect.stringContaining("re-enqueued"),
+        }),
+      }));
+      expect(mockAddComment).toHaveBeenCalledTimes(1);
+      expect(wakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("still confirms when the PR merges after a prior re-enqueue (SUP-15073 AC4, no regression)", async () => {
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [
+            { action: "issue.done_close_landing_reenqueued", details: { pr: "paperclipai/paperclip#514" } },
+          ],
+          companyMergeArmingEnabled: true,
+        },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => mergedSnapshot);
+
+      const result = await service.sweep();
+
+      // Merged after a re-enqueue → confirm path fires normally; the re-enqueue
+      // count neither blocks it nor triggers a spurious escalate.
+      expect(result).toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 1,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 0,
+      });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_confirmed",
+      }));
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
     });
   });
 });
