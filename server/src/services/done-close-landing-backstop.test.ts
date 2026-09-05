@@ -1,19 +1,28 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createDb } from "@paperclipai/db";
 import {
   classifyPullRequestLanding,
   createDoneCloseLandingBackstopService,
+  buildDiscoveryQuery,
+  selectLandingCandidates,
   type DoneCloseLandingSweepResult,
 } from "./done-close-landing-backstop.js";
 import type { ExternalObjectResolveResult } from "./external-objects.js";
 
 const mockResolveLinkedPullRequestsWithState = vi.hoisted(() => vi.fn());
 const mockResolveCardPullRequest = vi.hoisted(() => vi.fn());
+const mockResolveGitHubTokenForRepo = vi.hoisted(() => vi.fn());
+const mockEnableAutoMerge = vi.hoisted(() => vi.fn());
+const mockFetchGitHubNodeId = vi.hoisted(() => vi.fn());
 vi.mock("./merge-arming.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("./merge-arming.js")>();
   return {
     ...orig,
     resolveLinkedPullRequestsWithState: mockResolveLinkedPullRequestsWithState,
     resolveCardPullRequest: mockResolveCardPullRequest,
+    resolveGitHubTokenForRepo: mockResolveGitHubTokenForRepo,
+    enableAutoMerge: mockEnableAutoMerge,
+    fetchGitHubNodeId: mockFetchGitHubNodeId,
   };
 });
 
@@ -26,8 +35,9 @@ const mockLogActivity = vi.hoisted(() => vi.fn().mockResolvedValue({ id: "activi
 vi.mock("./activity-log.js", () => ({ logActivity: mockLogActivity }));
 
 const mockAddComment = vi.hoisted(() => vi.fn().mockResolvedValue({ id: "comment-row" }));
+const mockUpdate = vi.hoisted(() => vi.fn().mockResolvedValue({ id: "issue-row" }));
 vi.mock("./issues.js", () => ({
-  issueService: () => ({ addComment: mockAddComment }),
+  issueService: () => ({ addComment: mockAddComment, update: mockUpdate }),
 }));
 
 vi.mock("../middleware/logger.js", () => ({
@@ -39,19 +49,36 @@ import { logActivity } from "./activity-log.js";
 type DbState = {
   candidates: Array<Record<string, unknown>>;
   existingLandingRows: Array<Record<string, unknown>>;
+  companyMergeArmingEnabled?: boolean;
 };
 
-/** Discovery selects an `issue` sub-object; idempotency selects flat columns. */
+/** Discovery selects an `issue` sub-object; company query selects mergeArmingEnabled; idempotency selects flat columns. */
 function makeDb(state: DbState) {
   return {
     select: vi.fn((cols: Record<string, unknown>) => {
-      const rows = "issue" in cols ? state.candidates : state.existingLandingRows;
+      if ("issue" in cols) {
+        return {
+          from: () => ({
+            innerJoin: () => ({
+              where: () => Promise.resolve(state.candidates),
+            }),
+          }),
+        };
+      }
+      if ("mergeArmingEnabled" in cols) {
+        return {
+          from: () => ({
+            where: () => Promise.resolve(
+              state.companyMergeArmingEnabled !== undefined
+                ? [{ mergeArmingEnabled: state.companyMergeArmingEnabled }]
+                : [],
+            ),
+          }),
+        };
+      }
       return {
         from: () => ({
-          innerJoin: () => ({
-            where: () => Promise.resolve(rows),
-          }),
-          where: () => Promise.resolve(rows),
+          where: () => Promise.resolve(state.existingLandingRows),
         }),
       };
     }),
@@ -215,8 +242,12 @@ function makeService(
 beforeEach(() => {
   mockLogActivity.mockClear();
   mockAddComment.mockClear();
+  mockUpdate.mockClear();
   mockResolveLinkedPullRequestsWithState.mockReset();
   mockResolveCardPullRequest.mockReset();
+  mockResolveGitHubTokenForRepo.mockReset();
+  mockEnableAutoMerge.mockReset();
+  mockFetchGitHubNodeId.mockReset();
   mockCreateGitHubExternalObjectProvider.mockReset();
 });
 
@@ -227,6 +258,145 @@ describe("classifyPullRequestLanding", () => {
     expect(classifyPullRequestLanding(openSnapshot)).toBe("open");
     expect(classifyPullRequestLanding(authUnavailable)).toBe("unknown");
     expect(classifyPullRequestLanding(notFoundSnapshot)).toBe("unknown");
+  });
+});
+
+describe("done-close-landing discovery predicate (AC1 — #514-class card)", () => {
+  // AC1 proof anchor: the VERBATIM live row recorded on SUP-14959 when it closed
+  // done with an open linked PR. This is the concrete row that proves the sweep's
+  // discovery predicate catches a "published-but-un-merged" card (#514-class).
+  //   action   = issue.done_transition_guard_skipped
+  //   reason   = open_linked_prs_decision_carried:1
+  //   prs      = tea-core/paperclip#514
+  //   createdAt= 2026-09-04T15:59:15.623Z
+  //   issue    = 794fc6b8-... status=done identifier=SUP-14959
+  const sup14959Row = {
+    details: {
+      prs: "tea-core/paperclip#514",
+      reason: "open_linked_prs_decision_carried:1",
+      identifier: "SUP-14959",
+      skipReason: "open_linked_prs_decision_carried:1",
+    },
+    createdAt: new Date("2026-09-04T15:59:15.623Z"),
+    issue: {
+      id: "794fc6b8-7e52-467a-b4d7-99b93ef30f19",
+      companyId: COMPANY,
+      status: "done",
+      identifier: "SUP-14959",
+      assigneeAgentId: "3ff8593a-4231-4c76-9b72-446f668bf8cc",
+    },
+  };
+  // A lookback/grace window that contains SUP-14959's real transition timestamp.
+  const windowStart = new Date("2026-08-28T00:00:00Z");
+  const graceCutoff = new Date("2026-09-05T00:00:00Z");
+
+  it("compiles the actual discovery WHERE to the #514-class predicate", () => {
+    const db = createDb("postgres://user:pass@127.0.0.1:59999/probe");
+    const compiled = buildDiscoveryQuery(db, windowStart, graceCutoff).toSQL();
+    // The decision-carried arm keys on the guard's skip reason via ->>'reason'.
+    expect(compiled.sql).toContain(
+      `"activity_log"."details"->>'reason' LIKE 'open_linked_prs_decision_carried:%'`,
+    );
+    // The arming-refusal arm keys on the explicit refusal action (SUP-14900).
+    expect(compiled.params).toContain("issue.merge_arming_refused_on_close");
+    // Only issue-scoped rows, joined to the card, and only cards still `done`.
+    expect(compiled.sql).toContain(`inner join "issues"`);
+    expect(compiled.sql).toContain(`"activity_log"."entity_id" = "issues"."id"`);
+    expect(compiled.params).toContain("issue");
+    expect(compiled.params).toContain("issue.done_transition_guard_skipped");
+    expect(compiled.params).toContain("done");
+    // The time window is bound, not omitted.
+    const asMs = (v: unknown) =>
+      v instanceof Date ? v.getTime() : typeof v === "string" ? Date.parse(v) : null;
+    expect(compiled.params.map(asMs)).toContain(windowStart.getTime());
+    expect(compiled.params.map(asMs)).toContain(graceCutoff.getTime());
+  });
+
+  it("selects the verbatim SUP-14959 row through selectLandingCandidates", () => {
+    const selected = selectLandingCandidates([sup14959Row], windowStart, graceCutoff);
+    expect(selected).toHaveLength(1);
+    expect(selected[0].issue.id).toBe("794fc6b8-7e52-467a-b4d7-99b93ef30f19");
+    expect(selected[0].details as Record<string, unknown>).toMatchObject({
+      reason: "open_linked_prs_decision_carried:1",
+      prs: "tea-core/paperclip#514",
+    });
+  });
+
+  it("selects an arming-refusal row (SUP-14900) with the same window logic", () => {
+    const refusalRow = {
+      details: {
+        refusalReason:
+          "status:skipped:head_unresolvable: no open PR carries the approved head for tea-core/paperclip pull/514",
+      },
+      createdAt: new Date("2026-09-04T09:00:00Z"),
+      issue: {
+        id: "88888888-8888-4888-8888-888888888888",
+        companyId: COMPANY,
+        status: "done",
+        identifier: "SUP-14900",
+        assigneeAgentId: AGENT,
+      },
+    };
+    const selected = selectLandingCandidates([refusalRow], windowStart, graceCutoff);
+    expect(selected).toHaveLength(1);
+  });
+
+  it("excludes the documented edge cases", () => {
+    // (a) never-linked/never-armed: a plain "ahead, N PRs open" close with no
+    // decision-carried reason and no refusalReason is NOT a candidate. This pins
+    // the known limitation honestly — such a card produces no qualifying row.
+    const plainCloseRow = candidateRow({
+      reason: "open_linked_prs:2",
+      skipReason: "open_linked_prs:2",
+    });
+    // (b) a card that is no longer `done`.
+    const notDoneRow = candidateRow({ status: "in_review" });
+    // (c) a transition outside the lookback window (too old).
+    const outOfWindowRow = candidateRow({ createdAt: "2026-08-01T00:00:00Z" });
+    // (d) a decision-carrying reason with a different prefix.
+    const otherPrefixRow = candidateRow({
+      reason: "ahead_by_no_merged_pr_decision_carried:2",
+      skipReason: "ahead_by_no_merged_pr_decision_carried:2",
+    });
+
+    for (const row of [plainCloseRow, notDoneRow, outOfWindowRow, otherPrefixRow]) {
+      expect(selectLandingCandidates([row], windowStart, graceCutoff)).toHaveLength(0);
+    }
+  });
+
+  it("discovers only the decision-carried raw row from a mixed raw activity_log set", async () => {
+    const qualifying = candidateRow(); // issue id = ISSUE, decision-carried, done, in-window
+    const plainClose = {
+      details: {
+        prs: "paperclipai/paperclip#999",
+        reason: "open_linked_prs:2",
+        skipReason: "open_linked_prs:2",
+        identifier: "SUP-9999",
+      },
+      createdAt: new Date(IN_WINDOW),
+      issue: {
+        id: "44444444-4444-4444-8444-444444444444",
+        companyId: COMPANY,
+        status: "done",
+        identifier: "SUP-9999",
+        assigneeAgentId: AGENT,
+      },
+    };
+    const { service } = makeService({
+      candidates: [qualifying, plainClose],
+      existingLandingRows: [],
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr()]);
+    mockResolver(async () => mergedSnapshot);
+
+    const result = await service.sweep();
+
+    // Only the decision-carried card is a candidate; the plain-close card is
+    // excluded by the discovery predicate + qualification, so its PR is never
+    // resolved.
+    expect(result.candidates).toBe(1);
+    expect(result.confirmed).toBe(1);
+    expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -245,6 +415,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       confirmed: 1,
       failed: 0,
       deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
     });
 
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -281,6 +453,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       confirmed: 0,
       failed: 1,
       deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
     });
 
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -308,10 +482,10 @@ describe("createDoneCloseLandingBackstopService", () => {
     });
   });
 
-  it("emits issue.done_close_landing_failed when the PR is still open past the grace window", async () => {
+  it("escalates when the PR is still open past the grace window and merge arming lane is closed", async () => {
     const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
     const { service } = makeService(
-      { candidates: [candidateRow()], existingLandingRows: [] },
+      { candidates: [candidateRow()], existingLandingRows: [], companyMergeArmingEnabled: false },
       { wakeup },
     );
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([
@@ -323,25 +497,34 @@ describe("createDoneCloseLandingBackstopService", () => {
       due: true,
       candidates: 1,
       confirmed: 0,
-      failed: 1,
+      failed: 0,
       deferred: 0,
+      reenqueued: 0,
+      escalated: 1,
     });
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "issue.done_close_landing_failed",
+      action: "issue.done_close_landing_escalated",
       details: expect.objectContaining({
         pr: "paperclipai/paperclip#3145",
         prState: "open",
-        closedAt: null,
+        reason: expect.stringContaining("mergeArmingEnabled=false"),
+      }),
+    }));
+    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
+      status: "blocked",
+      unblockDescriptor: expect.objectContaining({
+        owner: "board",
+        action: expect.stringContaining("PR paperclipai/paperclip#3145"),
       }),
     }));
     expect(mockAddComment).toHaveBeenCalledTimes(1);
     expect(wakeup).toHaveBeenCalledTimes(1);
   });
 
-  it("emits issue.done_close_landing_failed for an arming-refusal card whose linked PR is still open (SUP-14900)", async () => {
+  it("escalates an arming-refusal card whose linked PR is still open past grace (SUP-14900)", async () => {
     const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
     const { service } = makeService(
-      { candidates: [refusalCandidateRow()], existingLandingRows: [] },
+      { candidates: [refusalCandidateRow()], existingLandingRows: [], companyMergeArmingEnabled: false },
       { wakeup },
     );
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([
@@ -353,13 +536,15 @@ describe("createDoneCloseLandingBackstopService", () => {
       due: true,
       candidates: 1,
       confirmed: 0,
-      failed: 1,
+      failed: 0,
       deferred: 0,
+      reenqueued: 0,
+      escalated: 1,
     });
 
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "issue.done_close_landing_failed",
+      action: "issue.done_close_landing_escalated",
       details: expect.objectContaining({
         identifier: "SUP-14849",
         pr: "paperclipai/paperclip#364",
@@ -368,10 +553,11 @@ describe("createDoneCloseLandingBackstopService", () => {
         skipReason: expect.stringContaining("head_unresolvable"),
       }),
     }));
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
     expect(mockAddComment).toHaveBeenCalledTimes(1);
     const [commentIssueId, commentBody] = mockAddComment.mock.calls[0]!;
     expect(commentIssueId).toBe(ISSUE);
-    expect(commentBody).toContain("merge arming was REFUSED at close");
+    expect(commentBody).toContain("merge arming lane is closed");
     expect(wakeup).toHaveBeenCalledTimes(1);
   });
 
@@ -391,6 +577,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       confirmed: 1,
       failed: 0,
       deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
     });
 
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -416,10 +604,10 @@ describe("createDoneCloseLandingBackstopService", () => {
       source: "workspace" as const,
     };
 
-    it("reports a done card whose workspace-resolved PR is open past the grace window (AC2)", async () => {
+    it("escalates a done card whose workspace-resolved PR is open past the grace window when lane closed (AC2)", async () => {
       const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
       const { service } = makeService(
-        { candidates: [candidateRow()], existingLandingRows: [] },
+        { candidates: [candidateRow()], existingLandingRows: [], companyMergeArmingEnabled: false },
         { wakeup },
       );
       // Zero cached mentions; the shared resolution finds the delivered PR by workspace.
@@ -431,14 +619,16 @@ describe("createDoneCloseLandingBackstopService", () => {
         due: true,
         candidates: 1,
         confirmed: 0,
-        failed: 1,
+        failed: 0,
         deferred: 0,
+        reenqueued: 0,
+        escalated: 1,
       });
 
       expect(mockResolveCardPullRequest).toHaveBeenCalledTimes(1);
       expect(mockLogActivity).toHaveBeenCalledTimes(1);
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-        action: "issue.done_close_landing_failed",
+        action: "issue.done_close_landing_escalated",
         details: expect.objectContaining({
           pr: "paperclipai/paperclip#455",
           prState: "open",
@@ -462,6 +652,8 @@ describe("createDoneCloseLandingBackstopService", () => {
         confirmed: 0,
         failed: 0,
         deferred: 0,
+        reenqueued: 0,
+        escalated: 0,
       });
       expect(mockLogActivity).not.toHaveBeenCalled();
       expect(mockAddComment).not.toHaveBeenCalled();
@@ -486,6 +678,8 @@ describe("createDoneCloseLandingBackstopService", () => {
         confirmed: 0,
         failed: 0,
         deferred: 1,
+        reenqueued: 0,
+        escalated: 0,
       });
       expect(mockLogActivity).not.toHaveBeenCalled();
       expect(mockAddComment).not.toHaveBeenCalled();
@@ -495,7 +689,7 @@ describe("createDoneCloseLandingBackstopService", () => {
   it("never evaluates a done issue without the decision-carried skip row, and ignores other skip reasons", async () => {
     const { service } = makeService({ candidates: [], existingLandingRows: [] });
     const result = await service.sweep();
-    expect(result).toEqual({ due: true, candidates: 0, confirmed: 0, failed: 0, deferred: 0 });
+    expect(result).toEqual({ due: true, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 });
     expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
 
@@ -523,7 +717,7 @@ describe("createDoneCloseLandingBackstopService", () => {
     mockResolver(async () => mergedSnapshot);
 
     const first: DoneCloseLandingSweepResult = await service.sweep();
-    expect(first).toEqual({ due: true, candidates: 1, confirmed: 1, failed: 0, deferred: 0 });
+    expect(first).toEqual({ due: true, candidates: 1, confirmed: 1, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 });
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
 
     // The first sweep's row now exists; a later sweep must not re-emit.
@@ -532,7 +726,7 @@ describe("createDoneCloseLandingBackstopService", () => {
       details: { identifier: "SUP-13326", pr: "paperclipai/paperclip#3158" },
     });
     const second = await service.sweep();
-    expect(second).toEqual({ due: true, candidates: 1, confirmed: 0, failed: 0, deferred: 0 });
+    expect(second).toEqual({ due: true, candidates: 1, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 });
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
     expect(mockAddComment).not.toHaveBeenCalled();
   });
@@ -550,6 +744,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       confirmed: 0,
       failed: 0,
       deferred: 1,
+      reenqueued: 0,
+      escalated: 0,
     });
     expect(mockLogActivity).not.toHaveBeenCalled();
     expect(mockAddComment).not.toHaveBeenCalled();
@@ -561,6 +757,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       confirmed: 0,
       failed: 0,
       deferred: 1,
+      reenqueued: 0,
+      escalated: 0,
     });
     expect(mockLogActivity).not.toHaveBeenCalled();
     expect(mockAddComment).not.toHaveBeenCalled();
@@ -605,6 +803,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       confirmed: 0,
       failed: 1,
       deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
     });
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
@@ -629,6 +829,8 @@ describe("createDoneCloseLandingBackstopService", () => {
       confirmed: 0,
       failed: 1,
       deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
     });
     expect(mockAddComment).toHaveBeenCalledTimes(1);
     expect(wakeup).not.toHaveBeenCalled();
@@ -649,10 +851,154 @@ describe("createDoneCloseLandingBackstopService", () => {
     const selectCallsAfterFirst = db.select.mock.calls.length;
     clock += 30 * 1000;
     const second = await service.sweep();
-    expect(second).toEqual({ due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0 });
+    expect(second).toEqual({ due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0 });
     // Non-due tick performed no database work at all.
     expect(db.select.mock.calls.length).toBe(selectCallsAfterFirst);
     clock += 61 * 60 * 1000;
     await expect(service.sweep()).resolves.toMatchObject({ due: true });
+  });
+
+  describe("SUP-14991: re-enqueue and escalate branches for open-past-grace PRs", () => {
+    it("re-enqueues the PR when merge arming is enabled and the token resolves", async () => {
+      const { service } = makeService(
+        { candidates: [candidateRow()], existingLandingRows: [], companyMergeArmingEnabled: true },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123", displayName: "paperclipai/paperclip#514" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_test_token",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 1,
+        escalated: 0,
+      });
+
+      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
+      expect(mockLogActivity).toHaveBeenCalledTimes(1);
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_reenqueued",
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#514",
+          prState: "open",
+        }),
+      }));
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(mockAddComment).not.toHaveBeenCalled();
+    });
+
+    it("escalates when merge arming is enabled but no token is resolvable", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        { candidates: [candidateRow()], existingLandingRows: [], companyMergeArmingEnabled: true },
+        { wakeup },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123", displayName: "paperclipai/paperclip#514" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: null,
+        reason: "No GitHub token resolvable for paperclipai/paperclip",
+      });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 1,
+      });
+
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_escalated",
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#514",
+          prState: "open",
+          reason: expect.stringContaining("re-enqueue attempt failed"),
+        }),
+      }));
+      expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
+        status: "blocked",
+        unblockDescriptor: expect.objectContaining({ owner: "board" }),
+      }));
+      expect(wakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("fetches the node ID when the cached PR row has no nodeId", async () => {
+      const { service } = makeService(
+        { candidates: [candidateRow()], existingLandingRows: [], companyMergeArmingEnabled: true },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: null, displayName: "paperclipai/paperclip#514" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_fetched",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockFetchGitHubNodeId.mockResolvedValue({ ok: true, status: 200, message: null, nodeId: "PRNode_fetched" });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 1,
+        escalated: 0,
+      });
+
+      expect(mockFetchGitHubNodeId).toHaveBeenCalledWith("ghp_fetched", "paperclipai", "paperclip", 514);
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_fetched", "PRNode_fetched");
+    });
+
+    it("does not re-enqueue on subsequent sweeps after a successful re-enqueue (idempotency)", async () => {
+      const state: DbState = {
+        candidates: [candidateRow()],
+        existingLandingRows: [],
+        companyMergeArmingEnabled: true,
+      };
+      const { service } = makeService(state);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_tok",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      await service.sweep();
+      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+
+      // Simulate a second sweep with the re-enqueued row present.
+      state.existingLandingRows.push({
+        action: "issue.done_close_landing_reenqueued",
+        details: { pr: "paperclipai/paperclip#514" },
+      });
+      await service.sweep();
+      // No second re-enqueue, no escalate (alreadyReenqueued is set so we skip both).
+      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+      expect(mockUpdate).not.toHaveBeenCalled();
+    });
   });
 });
