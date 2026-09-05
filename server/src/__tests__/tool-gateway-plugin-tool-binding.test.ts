@@ -240,4 +240,68 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
 
     expect(names).toEqual([]);
   });
+
+  it("denies executing an allowlist-excluded plugin tool by name via tools/call", async () => {
+    const { company, agent, run } = await createAgentFixture(db, { pluginTools: ["a.b"] });
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "c.d:beta",
+      parameters: {},
+    })).rejects.toMatchObject({ status: 404, reasonCode: "tool_not_found" });
+  });
+
+  it("still executes an allowlisted plugin tool by name via tools/call", async () => {
+    const { company, agent, run } = await createAgentFixture(db, { pluginTools: ["a.b"] });
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "a.b:alpha",
+      parameters: {},
+    })).resolves.toMatchObject({ status: "completed", tool: "a.b:alpha" });
+  });
+
+  it("keeps executing plugin tools by name when the agent has no pluginTools key", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "c.d:beta",
+      parameters: {},
+    })).resolves.toMatchObject({ status: "completed", tool: "c.d:beta" });
+  });
+
+  it("denies executing an allowlist-excluded plugin tool by name via the plugin execute route", async () => {
+    const { company, agent, run } = await createAgentFixture(db, { pluginTools: ["a.b"] });
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+
+    await expect(gateway.executePluginTool({
+      actor: { type: "agent", agentId: agent.id, companyId: company.id, runId: run.id },
+      tool: "c.d:beta",
+      parameters: {},
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    })).rejects.toMatchObject({ status: 404, reasonCode: "tool_not_found" });
+  });
 });
