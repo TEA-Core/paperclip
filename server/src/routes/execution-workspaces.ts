@@ -36,6 +36,7 @@ import {
 } from "../services/index.js";
 import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
 import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
+import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
 import {
   buildWorkspaceRuntimeDesiredStatePatch,
@@ -1212,6 +1213,13 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           branchName: existing.branchName,
           issueIdentifier,
           repoRoot: readiness.git.repoRoot,
+          // SUP-14982: give the preservation push the same by-name GitHub credential the
+          // server resolves for its other git operations (App installation token scoped to the
+          // remote's owner/repo, else a company secret by name, else server env). Never pass a
+          // token here — the provider resolves and threads it into the git invocation.
+          resolveGitAuth: createGitRemoteAuthProvider(db, existing.companyId, {
+            issueId: existing.sourceIssueId ?? undefined,
+          }),
         });
 
         // `preserveUnpushedWorktreeCommits` returns `preserved: false` with `warning: null`

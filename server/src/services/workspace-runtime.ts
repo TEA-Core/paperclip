@@ -6027,6 +6027,7 @@ export async function preserveUnpushedWorktreeCommits(input: {
   issueIdentifier: string | null;
   repoRoot: string;
   recorder?: WorkspaceOperationRecorder | null;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<{
   preserved: boolean;
   preservedRef: string | null;
@@ -6043,11 +6044,35 @@ export async function preserveUnpushedWorktreeCommits(input: {
     const safeBranchName = input.branchName.replace(/[^a-zA-Z0-9._\-]/g, "_");
     const preservedRef = `${WORKTREE_PRESERVATION_REF_PREFIX}/${safeIdentifier}/${safeBranchName}`;
 
+    // Resolve a by-name server-side GitHub credential for the push exactly like provisioning
+    // clones and heartbeat base-ref refreshes do (`refreshRemoteTrackingBaseRef`): a GitHub App
+    // installation token scoped to the remote's owner/repo, else a `GITHUB_TOKEN`/`GH_TOKEN`/
+    // `PAPERCLIP_GITHUB_TOKEN` company secret by name, else the server env. Without it the
+    // preservation push was the one server git op that could not authenticate, so every
+    // genuinely-unpushed workspace failed to archive (SUP-14982). Ambient behavior is kept when
+    // no resolver is supplied or it resolves nothing.
+    const remoteUrl = input.resolveGitAuth
+      ? await runGit(["remote", "get-url", "origin"], input.repoRoot)
+          .then((value) => value.trim() || null)
+          .catch(() => null)
+      : null;
+    const auth =
+      input.resolveGitAuth && remoteUrl ? await input.resolveGitAuth(remoteUrl).catch(() => null) : null;
+
     try {
       // paperclip:allow-git-push: worktree cleanup would otherwise destroy unpushed commits; this
       // preserves them under refs/<preservation prefix>/, never a branch, and is the last step
       // before the worktree is removed.
-      await runGit(["push", "origin", `${commitSha}:${preservedRef}`], input.repoRoot);
+      await runGit(
+        [
+          ...(auth?.configArgs ?? []),
+          "push",
+          "origin",
+          `${commitSha}:${preservedRef}`,
+        ],
+        input.repoRoot,
+        auth ? { env: { ...process.env, ...auth.env } } : undefined,
+      );
     } catch (pushErr) {
       const pushMessage = pushErr instanceof Error ? pushErr.message : String(pushErr);
       return {
