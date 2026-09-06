@@ -112,6 +112,74 @@ export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIs
 }
 
 /**
+ * Does a recorded execution-workspace branch name a `sup-<n>` id that is not
+ * the issue's own?
+ *
+ * This is the server-side mirror of the one-branch-one-issue gate that
+ * scripts/deliver.sh applies at delivery time: extract every whole
+ * `sup-<n>` token the branch names (case-insensitive; `SUP-15104` does not
+ * count as naming `SUP-1510`), and the branch is foreign unless the
+ * delivering issue's number is among them. A branch that names no `sup-<n>`
+ * token at all (feature/foo, release branches) is outside the gate's scope
+ * and passes, exactly as it does in deliver.sh.
+ */
+export function executionWorkspaceBranchNamesDifferentIssue(input: {
+  issueIdentifier?: string | null;
+  workspaceBranchName?: string | null;
+}): boolean {
+  const branchName = input.workspaceBranchName?.trim();
+  if (!branchName) return false;
+  const issueIdentifier = input.issueIdentifier?.trim();
+  if (!issueIdentifier) return false;
+  const separator = issueIdentifier.lastIndexOf("-");
+  if (separator < 0) return false;
+  const issueNumber = issueIdentifier.slice(separator + 1);
+  if (!/^[0-9]+$/.test(issueNumber)) return false;
+  const branchIssueNumbers: string[] = [];
+  for (const match of branchName.matchAll(/sup-[0-9]+/gi)) {
+    const digits = match[0].match(/[0-9]+/);
+    if (digits) branchIssueNumbers.push(digits[0]);
+  }
+  if (branchIssueNumbers.length === 0) return false;
+  return !branchIssueNumbers.includes(issueNumber);
+}
+
+/**
+ * SUP-15205: should a `reuse_existing` binding be declined because it is an
+ * inherited binding onto another issue's delivery branch?
+ *
+ * Default inheritance copies the parent's workspace binding onto a child, and
+ * the restore arm then reads the parent's recorded branch verbatim, so the
+ * child's work lands on a branch that names a different SUP id — a branch no
+ * approval can lawfully stamp for the child. The child must realize its own
+ * workspace instead.
+ *
+ * "Inherited by default" is observable through the workspace row: every
+ * server-realized workspace stamps its source issue, and a binding to a
+ * workspace sourced by another (non-shared) issue can only have been written
+ * by the inheritance path — explicit API writes to cross-source non-shared
+ * workspaces are rejected at the write boundary (SUP-14139). A binding to a
+ * sourceless, shared, or self-sourced workspace is an operator choice (or a
+ * resumption of the issue's own workspace) and is left alone: restoring it is
+ * the counterpart of deliver.sh's explicit out-of-scope override.
+ */
+export function inheritedExecutionWorkspaceBranchDeclined(input: {
+  issueId: string | null;
+  issueIdentifier?: string | null;
+  workspaceSourceIssueId?: string | null;
+  workspaceMode?: string | null;
+  workspaceBranchName?: string | null;
+}): boolean {
+  const sourceIssueId = input.workspaceSourceIssueId?.trim();
+  if (!sourceIssueId || sourceIssueId === input.issueId) return false;
+  if (input.workspaceMode === "shared_workspace") return false;
+  return executionWorkspaceBranchNamesDifferentIssue({
+    issueIdentifier: input.issueIdentifier,
+    workspaceBranchName: input.workspaceBranchName,
+  });
+}
+
+/**
  * Does THIS write supply an issue-level execution-workspace override?
  *
  * The question is about the fields THIS write carries — NOT about the issue's

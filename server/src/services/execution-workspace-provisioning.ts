@@ -45,6 +45,7 @@ import {
   executionWorkspaceService,
 } from "./execution-workspaces.js";
 import {
+  inheritedExecutionWorkspaceBranchDeclined,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   resolveEffectiveWorkspaceStrategyType,
   type ParsedExecutionWorkspaceMode,
@@ -309,10 +310,45 @@ export async function provisionIssueExecutionWorkspace(
     return { kind: "deferred" };
   }
 
-  const requestedShouldReuseExisting =
+  let requestedShouldReuseExisting =
     workspaceOccupancyDecision.action === "provision_fresh"
       ? false
       : workspaceReuseRequest.requestedShouldReuseExisting;
+
+  // SUP-15205: mirror the one-branch-one-issue gate that scripts/deliver.sh
+  // applies at delivery time. The restore arm below passes the persisted
+  // branchName verbatim into ensurePersistedExecutionWorkspaceAvailable, so
+  // restoring here would put this issue on a branch that names a different
+  // SUP id — a branch deliver.sh refuses, and no approval can lawfully stamp
+  // for this issue. A binding to a workspace sourced by another (non-shared)
+  // issue can only have been written by the default inheritance path: the
+  // write boundary refuses explicit cross-source non-shared bindings
+  // (SUP-14139). Decline the binding so this issue realizes its own
+  // workspace and renders its own branch.
+  if (
+    requestedShouldReuseExisting &&
+    existingExecutionWorkspace !== null &&
+    inheritedExecutionWorkspaceBranchDeclined({
+      issueId,
+      issueIdentifier: issueRef?.identifier ?? null,
+      workspaceSourceIssueId: existingExecutionWorkspace.sourceIssueId,
+      workspaceMode: existingExecutionWorkspace.mode,
+      workspaceBranchName: existingExecutionWorkspace.branchName,
+    })
+  ) {
+    requestedShouldReuseExisting = false;
+    logger.warn(
+      {
+        runId: run.id,
+        issueId,
+        issueIdentifier: issueRef?.identifier ?? null,
+        executionWorkspaceId: existingExecutionWorkspace.id,
+        executionWorkspaceBranchName: existingExecutionWorkspace.branchName,
+        executionWorkspaceSourceIssueId: existingExecutionWorkspace.sourceIssueId,
+      },
+      "inherited execution workspace records a branch that names a different issue; declining reuse and provisioning a fresh workspace with this issue's own branch",
+    );
+  }
 
   if (workspaceOccupancyDecision.action === "provision_fresh") {
     logger.warn(
