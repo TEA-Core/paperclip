@@ -621,6 +621,160 @@ describeEmbeddedPostgres("stage-integrity audit route (ADR-073 D3, SUP-14923)", 
     expect(identifiers.has("SIA-ORPH-BOUNDARY")).toBe(false);
   });
 
+  it("surfaces a later guard hidden by a skipped stage, and leaves a skip-only card clean (SUP-15236)", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+
+    // Pre-table boundary: the earliest decision in the company pins the time-scoped
+    // exclusion so none of the cards below are treated as pre-decision-table.
+    const boundaryStage = randomUUID();
+    const boundary = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Boundary clean close",
+      identifier: "SIA-15236-BND",
+      status: "done",
+      executionPolicy: reviewPolicy(boundaryStage),
+      executionState: { completedStageIds: [boundaryStage], skippedStageIds: [] },
+      completedAt: new Date("2026-08-18T00:00:00Z"),
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: boundary.id,
+      stageId: boundaryStage,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "boundary-verdict",
+      createdAt: T0,
+    });
+
+    // AC1: a lawfully-skipped stage plus an orphaned approved decision on a
+    // DIFFERENT (in-policy, non-completed, non-skipped) stage. Pre-fix the skip
+    // short-circuited the cascade and this card emitted nothing; post-fix the
+    // orphaned-decision inverse guard is reached and reported.
+    const orpA = randomUUID();
+    const orpB = randomUUID();
+    const orpOrphan = randomUUID();
+    const skipOrphan = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Skip + orphaned decision",
+      identifier: "SIA-SKIP-ORPHAN",
+      status: "done",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          { id: orpA, type: "review", participants: [], approvalsNeeded: 1 },
+          { id: orpB, type: "approval", participants: [], approvalsNeeded: 1 },
+          { id: orpOrphan, type: "review", participants: [], approvalsNeeded: 1 },
+        ],
+      },
+      executionState: { completedStageIds: [orpA], skippedStageIds: [orpB] },
+      completedAt: new Date("2026-09-05T05:00:00Z"),
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: skipOrphan.id,
+      stageId: orpA,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "skip-orphan-A-verdict",
+      createdAt: new Date("2026-09-05T04:00:00Z"),
+    });
+    const skipOrphanB = await seedDecision(db, {
+      companyId: company.id,
+      issueId: skipOrphan.id,
+      stageId: orpOrphan,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "skip-orphan-orphan-verdict",
+      createdAt: new Date("2026-09-05T04:18:44Z"),
+    });
+
+    // AC2: a card whose ONLY integrity-relevant fact is a lawfully-skipped stage.
+    // Every policy stage is accounted for (completed or skipped) with decisions,
+    // so continuing past the skip must find nothing and drop the card.
+    const onlyA = randomUUID();
+    const onlyB = randomUUID();
+    const skipOnly = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Skip only (clean)",
+      identifier: "SIA-SKIP-ONLY",
+      status: "done",
+      executionPolicy: twoStagePolicy(onlyA, onlyB),
+      executionState: { completedStageIds: [onlyA], skippedStageIds: [onlyB] },
+      completedAt: new Date("2026-09-05T06:00:00Z"),
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: skipOnly.id,
+      stageId: onlyA,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "skip-only-A-verdict",
+      createdAt: new Date("2026-09-05T05:00:00Z"),
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: skipOnly.id,
+      stageId: onlyB,
+      stageType: "approval",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "skip-only-B-verdict",
+      createdAt: new Date("2026-09-05T05:01:00Z"),
+    });
+
+    // AC4: a pre-existing finding type (completed stage with no decision row) must
+    // still surface — the continue-past-skip change must not drop earlier guards.
+    const unmetStage = randomUUID();
+    await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Completed stage, no decision row",
+      identifier: "SIA-15236-UNMET",
+      status: "done",
+      executionPolicy: reviewPolicy(unmetStage),
+      executionState: { completedStageIds: [unmetStage], skippedStageIds: [] },
+      completedAt: new Date("2026-09-05T07:00:00Z"),
+      createdByAgentId: agent.id,
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/companies/${company.id}/audit/stage-integrity`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const rows = res.body as Array<{ identifier: string; reason: string; detail: string; id: string }>;
+    const byIdentifier = new Map(rows.map((row) => [row.identifier, row]));
+    const identifiers = new Set(rows.map((row) => row.identifier));
+
+    // AC1: the orphaned decision is no longer hidden by the skip.
+    const skipOrphanRow = byIdentifier.get("SIA-SKIP-ORPHAN");
+    expect(skipOrphanRow?.reason).toBe("guard-b:decision-without-completed-stage");
+    expect(skipOrphanRow?.detail).toContain(orpOrphan);
+    expect(skipOrphanRow?.detail).toContain(skipOrphanB.id);
+
+    // AC2: the skip-only card produces no row.
+    expect(identifiers.has("SIA-SKIP-ONLY")).toBe(false);
+
+    // AC4: the pre-existing unmet finding still appears.
+    const unmetRow = byIdentifier.get("SIA-15236-UNMET");
+    expect(unmetRow?.reason).toBe("guard-b:stage-without-decision");
+
+    // The boundary control is not flagged.
+    expect(identifiers.has("SIA-15236-BND")).toBe(false);
+  });
+
   it("admits in_review and blocked cards carrying a live ladder, and still excludes cancelled (SUP-15212 selector widening)", async () => {
     const company = await seedCompany(db);
     const agent = await seedAgent(db, company.id);

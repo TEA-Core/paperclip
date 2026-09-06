@@ -3254,6 +3254,170 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     });
    });
 
+  describe("SUP-15236: a skipped stage must not hide later guards (audit route)", () => {
+    const S_APPROVAL = "00000000-0000-0000-0000-0000000000e1";
+    const S_REVIEW = "00000000-0000-0000-0000-0000000000e2";
+    const S_ORPHAN = "00000000-0000-0000-0000-0000000000e3";
+    const POLICY = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        { id: S_APPROVAL, type: "approval", approvalsNeeded: 1 },
+        { id: S_REVIEW, type: "review", approvalsNeeded: 1 },
+        { id: S_ORPHAN, type: "review", approvalsNeeded: 1 },
+      ],
+    };
+
+    function buildRow(
+      issueId: string,
+      executionState: Record<string, unknown>,
+      status?: string,
+    ) {
+      const row: CandidateRow = {
+        id: issueId,
+        companyId,
+        identifier: "SUP-15236",
+        createdByAgentId: AGENT_CREATOR,
+        createdByUserId: null,
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        executionState,
+        executionPolicy: POLICY,
+      };
+      if (status !== undefined) row.status = status;
+      return row;
+    }
+
+    it("AC3: the default path (reconciler / merge-arming) keeps skipped-stage terminal — a skip + orphan still returns skipped-stage", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [S_APPROVAL], skippedStageIds: [S_REVIEW] },
+      });
+      await insertDecision(issueId, { stageId: S_APPROVAL, actorUserId: USER_REVIEWER });
+      await insertDecision(issueId, { stageId: S_ORPHAN, actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [S_APPROVAL], skippedStageIds: [S_REVIEW] },
+          "done",
+        ),
+      );
+
+      expect(verdict?.reason).toBe("guard-b:skipped-stage");
+    });
+
+    it("AC1: audit mode surfaces the orphaned decision that a skipped stage was hiding", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [S_APPROVAL], skippedStageIds: [S_REVIEW] },
+      });
+      await insertDecision(issueId, { stageId: S_APPROVAL, actorUserId: USER_REVIEWER });
+      await insertDecision(issueId, { stageId: S_ORPHAN, actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [S_APPROVAL], skippedStageIds: [S_REVIEW] },
+          "done",
+        ),
+        { continuePastSkippedStage: true },
+      );
+
+      expect(verdict?.reason).toBe("guard-b:decision-without-completed-stage");
+      expect(verdict?.detail).toContain(S_ORPHAN);
+    });
+
+    it("AC1 (empty-ladder variant): audit mode still surfaces the orphan when the card has no completed stage", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [], skippedStageIds: [S_REVIEW] },
+      });
+      await insertDecision(issueId, { stageId: S_ORPHAN, actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [], skippedStageIds: [S_REVIEW] },
+          "done",
+        ),
+        { continuePastSkippedStage: true },
+      );
+
+      expect(verdict?.reason).toBe("guard-b:decision-without-completed-stage");
+    });
+
+    it("AC2: audit mode with only a lawful skip and no other defect falls back to skipped-stage (the route drops it)", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [S_APPROVAL], skippedStageIds: [S_REVIEW] },
+      });
+      await insertDecision(issueId, { stageId: S_APPROVAL, actorUserId: USER_REVIEWER });
+      await insertDecision(issueId, { stageId: S_REVIEW, actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [S_APPROVAL], skippedStageIds: [S_REVIEW] },
+          "done",
+        ),
+        { continuePastSkippedStage: true },
+      );
+
+      expect(verdict?.reason).toBe("guard-b:skipped-stage");
+    });
+
+    it("AC4: audit mode is strictly additive — it only surfaces a guard a skip was hiding and never changes an existing finding", async () => {
+      // Skip + hidden orphan: the default path reports skipped-stage (the audit
+      // route drops it, so no row before); audit mode surfaces the orphan.
+      const skipOrphanId = await insertIssue({
+        identifier: "SUP-15236-ORPHAN",
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [S_APPROVAL], skippedStageIds: [S_REVIEW] },
+      });
+      await insertDecision(skipOrphanId, { stageId: S_APPROVAL, actorUserId: USER_REVIEWER });
+      await insertDecision(skipOrphanId, { stageId: S_ORPHAN, actorUserId: USER_REVIEWER });
+      const skipOrphanRow = buildRow(
+        skipOrphanId,
+        { completedStageIds: [S_APPROVAL], skippedStageIds: [S_REVIEW] },
+        "done",
+      );
+      const skipBefore = await evaluateStageIntegrity(db, skipOrphanRow);
+      const skipAfter = await evaluateStageIntegrity(db, skipOrphanRow, {
+        continuePastSkippedStage: true,
+      });
+      expect(skipBefore?.reason).toBe("guard-b:skipped-stage");
+      expect(skipAfter?.reason).toBe("guard-b:decision-without-completed-stage");
+
+      // No-skip finding: byte-identical across modes, so the continue-past-skip
+      // flag cannot alter or drop it. S_REVIEW is in policy with a decision but is
+      // in neither completed nor skipped, so both modes report the inverse guard.
+      const cleanId = await insertIssue({
+        identifier: "SUP-15236-CLEAN",
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [S_APPROVAL], skippedStageIds: [] },
+      });
+      await insertDecision(cleanId, { stageId: S_APPROVAL, actorUserId: USER_REVIEWER });
+      await insertDecision(cleanId, { stageId: S_REVIEW, actorUserId: USER_REVIEWER });
+      const cleanRow = buildRow(
+        cleanId,
+        { completedStageIds: [S_APPROVAL], skippedStageIds: [] },
+        "done",
+      );
+      const cleanBefore = await evaluateStageIntegrity(db, cleanRow);
+      const cleanAfter = await evaluateStageIntegrity(db, cleanRow, {
+        continuePastSkippedStage: true,
+      });
+      expect(cleanBefore?.reason).toBe("guard-b:decision-without-completed-stage");
+      expect(cleanAfter?.reason).toBe("guard-b:decision-without-completed-stage");
+      expect(cleanAfter?.detail).toBe(cleanBefore?.detail);
+    });
+  });
+
   describe("SUP-14911: terminal resolution error on unhydrated PR", () => {
     /**
      * Insert a phantom external object that mimics a typo'd GitHub URL:
