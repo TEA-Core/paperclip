@@ -44,6 +44,7 @@ import {
   executionWorkspaceBranchNamesAnyIssueIdentifier,
   executionWorkspaceBranchNamesDifferentIssue,
   inheritedExecutionWorkspaceBranchDeclined,
+  inheritedExecutionWorkspaceBranchExempt,
 } from "./execution-workspace-policy.js";
 
 type SessionConfigMetadata = Awaited<ReturnType<typeof buildEffectiveRunSessionConfigMetadata>>;
@@ -1587,6 +1588,85 @@ describe("inheritedExecutionWorkspaceBranchDeclined (SUP-15205)", () => {
   });
 });
 
+describe("inheritedExecutionWorkspaceBranchExempt (SUP-15231)", () => {
+  it("exempts an ancestor-sourced shared_workspace carrier", () => {
+    expect(
+      inheritedExecutionWorkspaceBranchExempt({
+        workspaceMode: "shared_workspace",
+        workspaceSourceIssueId: "parent",
+        sourceIssueIsAncestorOfBoundIssue: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not exempt a shared_workspace row whose source is not an ancestor", () => {
+    expect(
+      inheritedExecutionWorkspaceBranchExempt({
+        workspaceMode: "shared_workspace",
+        workspaceSourceIssueId: "sibling",
+        sourceIssueIsAncestorOfBoundIssue: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not exempt an isolated_workspace row even when the source is an ancestor", () => {
+    for (const mode of ["isolated_workspace", "operator_branch"] as const) {
+      expect(
+        inheritedExecutionWorkspaceBranchExempt({
+          workspaceMode: mode,
+          workspaceSourceIssueId: "parent",
+          sourceIssueIsAncestorOfBoundIssue: true,
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("does not exempt a sourceless or empty-source shared_workspace row", () => {
+    expect(
+      inheritedExecutionWorkspaceBranchExempt({
+        workspaceMode: "shared_workspace",
+        workspaceSourceIssueId: null,
+        sourceIssueIsAncestorOfBoundIssue: true,
+      }),
+    ).toBe(false);
+    expect(
+      inheritedExecutionWorkspaceBranchExempt({
+        workspaceMode: "shared_workspace",
+        workspaceSourceIssueId: "   ",
+        sourceIssueIsAncestorOfBoundIssue: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps the decline verdict for non-carrier inputs and threads mode + ancestor through the declined predicate", () => {
+    const base = {
+      issueId: "child",
+      issueIdentifier: "SUP-2",
+      workspaceBranchName: "SUP-1-plan-deep-tools",
+      workspaceSourceIssueId: "parent",
+    };
+    // isolated / operator_branch sourced by an ancestor still declines (the defect SUP-15205 fixes).
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceMode: "isolated_workspace", sourceIssueIsAncestorOfBoundIssue: true }),
+    ).toBe(true);
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceMode: "operator_branch", sourceIssueIsAncestorOfBoundIssue: true }),
+    ).toBe(true);
+    // shared_workspace sourced by a non-ancestor still declines.
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceMode: "shared_workspace", sourceIssueIsAncestorOfBoundIssue: false }),
+    ).toBe(true);
+    // shared_workspace sourced by an ancestor is exempt — restored, not declined.
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceMode: "shared_workspace", sourceIssueIsAncestorOfBoundIssue: true }),
+    ).toBe(false);
+    // no mode supplied (legacy shape) still declines a cross-source sup branch.
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined(base),
+    ).toBe(true);
+  });
+});
+
 describeEmbeddedPostgres("inherited execution workspace branch-identity decline (SUP-15205)", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: Db;
@@ -1631,6 +1711,13 @@ describeEmbeddedPostgres("inherited execution workspace branch-identity decline 
     childBound: boolean;
     /** The persisted workspace row's mode. Defaults to isolated_workspace. */
     workspaceMode?: "isolated_workspace" | "shared_workspace";
+    /**
+     * SUP-15231: link the child's parentId to the workspace's source issue so
+     * the source is a strict ancestor of the child. Off by default — the
+     * SUP-15205 tests seed the source WITHOUT a parent link, which is exactly
+     * the "not an ancestor" shape that must still decline.
+     */
+    childParentedToSource?: boolean;
   }) {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -1781,6 +1868,7 @@ describeEmbeddedPostgres("inherited execution workspace branch-identity decline 
       responsibleUserId: "responsible-user",
       issueNumber: 2,
       identifier: "SUP-2",
+      parentId: options.childParentedToSource ? parentId : null,
       executionWorkspaceId: options.childBound ? parentWorkspaceId : null,
       executionWorkspacePreference: options.childBound ? "reuse_existing" : null,
       executionWorkspaceSettings: { mode: "isolated_workspace" },
@@ -2048,5 +2136,56 @@ describeEmbeddedPostgres("inherited execution workspace branch-identity decline 
 
     expect(result.persistedExecutionWorkspace!.id).toBe(parentWorkspaceId);
     expect(result.persistedExecutionWorkspace!.branchName).toBe("SUP-2-resumed");
+  }, 60_000);
+
+  it("restores an ancestor-sourced shared_workspace plan carrier onto its carrier branch (SUP-15231 exemption)", async () => {
+    // The sanctioned carrier shape: a shared_workspace row sourced by the plan
+    // parent (SUP-1) on a deliverable per-card sup branch, with the child
+    // (SUP-2) as a real descendant of that source. The SUP-15205 branch-identity
+    // backstop must NOT decline: the child restores onto the carrier branch
+    // verbatim instead of realizing its own.
+    const { childId, parentWorkspaceId, provision } = await seed({
+      workspaceBranchName: "SUP-1-plan-deep-tools",
+      workspaceSource: "parent",
+      childBound: true,
+      workspaceMode: "shared_workspace",
+      childParentedToSource: true,
+    });
+
+    const result = await provision();
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+
+    expect(result.persistedExecutionWorkspace!.id).toBe(parentWorkspaceId);
+    expect(result.persistedExecutionWorkspace!.branchName).toBe("SUP-1-plan-deep-tools");
+
+    // The child stayed bound to the carrier workspace — no fresh SUP-2 workspace.
+    const childRows = await db
+      .select({ executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, childId));
+    expect(childRows[0]!.executionWorkspaceId).toBe(parentWorkspaceId);
+  }, 60_000);
+
+  it("still declines an ancestor-sourced isolated_workspace binding (SUP-15205 defect preserved, exemption not too broad)", async () => {
+    // An isolated_workspace row sourced by an ancestor is the exact defect
+    // SUP-15205 fixes. Even now that shared carriers are exempt, the backstop
+    // must decline it: the child realizes its own branch.
+    const { childId, parentWorkspaceId, provision } = await seed({
+      workspaceBranchName: "SUP-1-plan-deep-tools",
+      workspaceSource: "parent",
+      childBound: true,
+      workspaceMode: "isolated_workspace",
+      childParentedToSource: true,
+    });
+
+    const result = await provision();
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+
+    const persisted = result.persistedExecutionWorkspace!;
+    expect(persisted.id).not.toBe(parentWorkspaceId);
+    expect(persisted.branchName).toBe("SUP-2");
+    expect(persisted.sourceIssueId).toBe(childId);
   }, 60_000);
 });

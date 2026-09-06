@@ -50,7 +50,7 @@ import {
   resolveEffectiveWorkspaceStrategyType,
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
-import { issueService } from "./issues.js";
+import { issueService, isStrictAncestorIssueIdOf } from "./issues.js";
 import { environmentService } from "./environments.js";
 import type { TrustPresetResolution } from "./trust-preset-resolver.js";
 import {
@@ -315,19 +315,42 @@ export async function provisionIssueExecutionWorkspace(
       ? false
       : workspaceReuseRequest.requestedShouldReuseExisting;
 
-  // SUP-15205: mirror the one-branch-one-issue gate that scripts/deliver.sh
-  // applies at delivery time. The restore arm below passes the persisted
-  // branchName verbatim into ensurePersistedExecutionWorkspaceAvailable, so
-  // restoring here would put this issue on a branch that names a different
-  // SUP id — a branch deliver.sh refuses, and no approval can lawfully stamp
-  // for this issue. This is the backstop; the authoritative decline happens at
-  // the inheritance site, which knows the binding is implicit. The
-  // discriminator is the branch identity, not the workspace's mode, so a
-  // shared_workspace row sourced by its parent is declined too. Decline the
-  // binding so this issue realizes its own workspace and renders its own
-  // branch. A cross-source binding whose branch names the issue's own sup id
-  // (a resumption) is still restored, matching deliver.sh's explicit
-  // out-of-scope override.
+  // SUP-15205 (narrowed by SUP-15231): mirror the one-branch-one-issue gate.
+  // The restore arm below passes the persisted branchName verbatim into
+  // ensurePersistedExecutionWorkspaceAvailable, so a cross-issue inheritance
+  // would put this issue on a branch that names a different SUP id — a branch
+  // no approval can lawfully stamp for this issue. This is the backstop; the
+  // authoritative decline happens at the inheritance site, which knows the
+  // binding is implicit.
+  //
+  // The one sanctioned exception is the shared_workspace plan carrier: a
+  // shared_workspace row sourced by an ANCESTOR of this issue is the shared
+  // branch the plan's children build on, so it restores rather than declines.
+  // An isolated_workspace / operator_branch row sourced by a parent still
+  // declines, and so does a shared row sourced by a non-ancestor. A cross-source
+  // binding whose branch names this issue's own sup id (a resumption) is still
+  // restored, matching deliver.sh's explicit out-of-scope override.
+  const carrierWorkspace =
+    requestedShouldReuseExisting && existingExecutionWorkspace !== null
+      ? existingExecutionWorkspace
+      : null;
+  const carrierSourceIssueId = carrierWorkspace?.sourceIssueId?.trim() ?? null;
+  let sourceIssueIsAncestorOfBoundIssue = false;
+  if (
+    carrierWorkspace !== null &&
+    carrierWorkspace.mode === "shared_workspace" &&
+    carrierSourceIssueId !== null &&
+    issueId !== null &&
+    carrierSourceIssueId !== issueId
+  ) {
+    sourceIssueIsAncestorOfBoundIssue = await isStrictAncestorIssueIdOf(
+      db,
+      carrierWorkspace.companyId,
+      issueId,
+      carrierSourceIssueId,
+    );
+  }
+
   if (
     requestedShouldReuseExisting &&
     existingExecutionWorkspace !== null &&
@@ -336,6 +359,8 @@ export async function provisionIssueExecutionWorkspace(
       issueIdentifier: issueRef?.identifier ?? null,
       workspaceSourceIssueId: existingExecutionWorkspace.sourceIssueId,
       workspaceBranchName: existingExecutionWorkspace.branchName,
+      workspaceMode: existingExecutionWorkspace.mode,
+      sourceIssueIsAncestorOfBoundIssue,
     })
   ) {
     requestedShouldReuseExisting = false;

@@ -155,7 +155,10 @@ export function executionWorkspaceBranchNamesDifferentIssue(input: {
  * For that create path this is exactly equivalent to
  * `executionWorkspaceBranchNamesDifferentIssue`, without needing the new
  * issue's identifier, and it is the branch scripts/deliver.sh's
- * one-branch-one-issue gate would refuse for the new issue.
+ * one-branch-one-issue gate would refuse for the new issue. The create site in
+ * issues.ts applies the SUP-15231 `shared_workspace` plan-carrier exemption
+ * (`inheritedExecutionWorkspaceBranchExempt`) before declining on this
+ * predicate, so an ancestor-sourced shared carrier still inherits.
  */
 export function executionWorkspaceBranchNamesAnyIssueIdentifier(
   workspaceBranchName?: string | null,
@@ -166,24 +169,67 @@ export function executionWorkspaceBranchNamesAnyIssueIdentifier(
 }
 
 /**
- * SUP-15205: should a `reuse_existing` binding be declined because it would
- * restore this issue onto another issue's delivery branch?
+ * SUP-15231: is a parent-sourced workspace binding EXEMPT from the SUP-15205
+ * branch-identity inheritance decline?
+ *
+ * The sanctioned `shared_workspace` plan carrier is the one legitimate shape a
+ * parent-sourced row can have. TSP's project policy defaults every card to
+ * `shared_workspace`, and the plan parent sources the carrier row that its
+ * children deliver onto. `merge-arming.ts` keys `branchIsOwn` on
+ * `workspaceRow.sourceIssueId === issueId`, so the parent — and only the
+ * parent — can lawfully mint `paperclip/approved` on the carrier PR; the
+ * children close nested and the parent lands the branch once through its own
+ * ladder. Declining that binding pushes every open child onto a fresh
+ * `baseRef: origin/main` workspace that lacks the carrier content, deadlocking
+ * the parent's ladder. (The 7 commits on #3443 and 3 on #3446 were all pushed
+ * by children through deliver.sh — the carrier branch is real, shared content,
+ * not a strand.)
+ *
+ * The exemption fires iff BOTH hold:
+ *   1. the source row's mode is `shared_workspace`, and
+ *   2. its `sourceIssueId` is a strict ancestor of the issue being bound
+ *       (the caller walks the issues parent chain and supplies the verdict).
+ *
+ * An `isolated_workspace` / `operator_branch` row sourced by a parent — the
+ * defect SUP-15205 exists to fix — is NOT exempt. A `shared_workspace` row
+ * sourced by a sibling or an unrelated card (not an ancestor) is NOT exempt.
+ * Self-sourced and sourceless bindings never reach here: they restore as
+ * before and are outside the gate's scope.
+ */
+export function inheritedExecutionWorkspaceBranchExempt(input: {
+  workspaceMode?: string | null;
+  workspaceSourceIssueId?: string | null;
+  sourceIssueIsAncestorOfBoundIssue?: boolean;
+}): boolean {
+  if (input.workspaceMode !== "shared_workspace") return false;
+  const sourceIssueId = input.workspaceSourceIssueId?.trim();
+  if (!sourceIssueId) return false;
+  return input.sourceIssueIsAncestorOfBoundIssue === true;
+}
+
+/**
+ * SUP-15205 (narrowed by SUP-15231): should a `reuse_existing` binding be
+ * declined because it would restore this issue onto another issue's delivery
+ * branch?
  *
  * Default inheritance copies the parent's workspace binding onto a child, and
  * the restore arm then reads the parent's recorded branch verbatim, so the
- * child's work lands on a branch that names a different SUP id — a branch no
- * approval can lawfully stamp for the child. The child must realize its own
- * workspace instead.
+ * child's work lands on a branch that names a different SUP id. For an
+ * `isolated_workspace` / `operator_branch` row that is a defect: the child
+ * would sit on a branch the parent merges and deletes, and no approval can
+ * lawfully stamp it for the child. The child must realize its own workspace
+ * instead.
+ *
+ * The one sanctioned exception is the `shared_workspace` plan carrier (see
+ * `inheritedExecutionWorkspaceBranchExempt`): a `shared_workspace` row sourced
+ * by an ANCESTOR of this issue is the shared branch the plan's children are
+ * meant to build on, so it restores as before.
  *
  * This is the provisioning-side backstop; the authoritative decline happens at
- * the inheritance site (issues.ts) which knows the binding is implicit. Here we
- * can only read the persisted row, so the discriminator is the branch
- * identity, NOT the workspace's mode: `mode` was a proxy for explicitness and
- * the live strands that motivated this card (TSP #3443, #3446) are
- * `shared_workspace` rows sourced by their parent, so exempting that mode
- * leaves the entire defect reachable. A branch that does not name a foreign
- * per-card sup id — `feature/foo`, a release branch — is out of the gate's
- * scope and restores as before, so legitimate shared-branch reuse is
+ * the inheritance site (issues.ts) which knows the binding is implicit. The
+ * branch discriminator is the shared source of truth: a branch that does not
+ * name a foreign per-card sup id — `feature/foo`, a release branch — is out of
+ * the gate's scope and restores as before, so legitimate shared-branch reuse is
  * unaffected. A binding to a sourceless or self-sourced workspace is an
  * operator opt-in or a resumption of the issue's own workspace and is left
  * alone: restoring it is the counterpart of deliver.sh's explicit out-of-scope
@@ -194,7 +240,18 @@ export function inheritedExecutionWorkspaceBranchDeclined(input: {
   issueIdentifier?: string | null;
   workspaceSourceIssueId?: string | null;
   workspaceBranchName?: string | null;
+  workspaceMode?: string | null;
+  sourceIssueIsAncestorOfBoundIssue?: boolean;
 }): boolean {
+  if (
+    inheritedExecutionWorkspaceBranchExempt({
+      workspaceMode: input.workspaceMode,
+      workspaceSourceIssueId: input.workspaceSourceIssueId,
+      sourceIssueIsAncestorOfBoundIssue: input.sourceIssueIsAncestorOfBoundIssue,
+    })
+  ) {
+    return false;
+  }
   const sourceIssueId = input.workspaceSourceIssueId?.trim();
   if (!sourceIssueId || sourceIssueId === input.issueId) return false;
   return executionWorkspaceBranchNamesDifferentIssue({

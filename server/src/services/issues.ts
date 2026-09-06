@@ -77,6 +77,7 @@ import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   executionWorkspaceBranchNamesAnyIssueIdentifier,
   gateProjectExecutionWorkspacePolicy,
+  inheritedExecutionWorkspaceBranchExempt,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
   parseIssueExecutionWorkspaceSettings,
@@ -1711,6 +1712,49 @@ async function getWorkspaceInheritanceIssue(
     throw notFound("Workspace inheritance issue not found");
   }
   return issue;
+}
+
+/**
+ * SUP-15231: strict-ancestry test over the issues parent chain.
+ *
+ * Is `candidateId` a strict ancestor of `descendantId` — does it appear in the
+ * parent chain above `descendantId`? A single recursive-CTE walk over
+ * `issues.parent_id`, the same shape the delegation-cycle guard
+ * (`findOpenAncestorCreatedByAgent`) already uses, scoped to the company so a
+ * uuid collision across companies cannot match.
+ *
+ * Used to decide whether a parent-sourced `shared_workspace` carrier may be
+ * inherited by a descendant child instead of declined by the SUP-15205
+ * branch-identity gate. A self-reference (candidate === descendant) is not an
+ * ancestor and returns false, as does any empty input.
+ */
+export async function isStrictAncestorIssueIdOf(
+  db: Pick<Db, "execute">,
+  companyId: string,
+  descendantId: string,
+  candidateId: string,
+): Promise<boolean> {
+  if (!descendantId || !candidateId || descendantId === candidateId) return false;
+  const result = await db.execute(sql`
+    WITH RECURSIVE ancestors(id) AS (
+      SELECT parent_id
+      FROM issues
+      WHERE id = ${descendantId} AND company_id = ${companyId}
+      UNION
+      SELECT i.parent_id
+      FROM issues i
+      JOIN ancestors a ON i.id = a.id
+      WHERE i.parent_id IS NOT NULL AND i.company_id = ${companyId}
+    )
+    SELECT 1 AS hit
+    FROM ancestors
+    WHERE id = ${candidateId}
+    LIMIT 1
+  `);
+  const rows: unknown[] = Array.isArray(result)
+    ? result
+    : ((result as { rows?: unknown[] }).rows ?? []);
+  return rows.length > 0;
 }
 
 // Mine participation fails closed. Add new user-authored issue mutation actions
@@ -7745,40 +7789,76 @@ export function issueService(db: Db) {
               sourceWorkspace &&
               executionWorkspaceBranchNamesAnyIssueIdentifier(sourceWorkspace.branchName)
             ) {
-              // SUP-15205: the source branch carries a deliverable `sup-<n>`
-              // token. At create time the new issue's number is strictly greater
-              // than every existing issue's, so that token necessarily names a
-              // different issue's delivery branch — the branch scripts/deliver.sh's
-              // one-branch-one-issue gate refuses for the new issue. This arm
-              // catches the shapes the cross-source arm above leaves reachable:
-              // shared workspaces and sourceless rows. Decline it (and log it,
-              // mirroring the cross-source arm) so the child realizes its own
-              // workspace and renders its own branch. A genuinely shared branch
-              // that names no sup id falls through and is preserved.
-              declinedWorkspaceInheritance = true;
-              await logActivityInTransaction(tx as unknown as Db, {
-                companyId,
-                actorType: "system",
-                actorId: "workspace_binding_guard",
-                action: "execution_workspace.inheritance_declined_branch_identity",
-                entityType: "execution_workspace",
-                entityId: sourceWorkspace.id,
-                details: {
-                  requestedByIssueId: workspaceInheritanceIssueId,
-                  sourceIssueId: sourceWorkspace.sourceIssueId,
-                  branchName: sourceWorkspace.branchName,
-                  reason: "workspace branch names a different issue's delivery branch",
-                },
-              }, createActivityPublications);
-            }
-            else if (sourceWorkspace) {
-              executionWorkspaceId = sourceWorkspace.id;
-              executionWorkspacePreference = "reuse_existing";
-              executionWorkspaceSettings = {
-                ...((workspaceSource.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? {}),
-                mode: issueExecutionWorkspaceModeForPersistedWorkspace(sourceWorkspace.mode),
-              };
-            }
+              // SUP-15205 (narrowed by SUP-15231): the source branch carries a
+              // deliverable `sup-<n>` token. At create time the new issue's
+              // number is strictly greater than every existing issue's, so that
+              // token necessarily names a different issue's delivery branch —
+              // the branch scripts/deliver.sh's one-branch-one-issue gate would
+              // refuse for the new issue. This arm catches the shapes the
+              // cross-source arm above leaves reachable: shared workspaces and
+              // sourceless rows.
+              //
+              // The one exception is the shared_workspace plan carrier: when the
+              // source row is shared_workspace and its sourceIssueId is an
+              // ancestor of the new issue, inheritance is the sanctioned path
+              // (the children build on the parent's carrier branch), so it is
+              // NOT declined — it falls through to the inherit arm below and no
+              // inheritance_declined_branch_identity row is logged. The new row
+              // is not yet in the DB, so the new issue's parent chain is rooted
+              // at issueData.parentId: the source is an ancestor iff it equals
+              // the parent or sits in the parent's chain.
+              const carrierSourceIssueId = sourceWorkspace.sourceIssueId?.trim() || null;
+              const carrierSourceIsAncestorOfNewIssue =
+                sourceWorkspace.mode === "shared_workspace" &&
+                carrierSourceIssueId !== null &&
+                issueData.parentId != null
+                  ? carrierSourceIssueId === issueData.parentId ||
+                    (await isStrictAncestorIssueIdOf(
+                      tx as unknown as Pick<Db, "execute">,
+                      companyId,
+                      issueData.parentId,
+                      carrierSourceIssueId,
+                    ))
+                  : false;
+              if (
+                !inheritedExecutionWorkspaceBranchExempt({
+                  workspaceMode: sourceWorkspace.mode,
+                  workspaceSourceIssueId: carrierSourceIssueId,
+                  sourceIssueIsAncestorOfBoundIssue: carrierSourceIsAncestorOfNewIssue,
+                })
+              ) {
+                declinedWorkspaceInheritance = true;
+                await logActivityInTransaction(tx as unknown as Db, {
+                  companyId,
+                  actorType: "system",
+                  actorId: "workspace_binding_guard",
+                  action: "execution_workspace.inheritance_declined_branch_identity",
+                  entityType: "execution_workspace",
+                  entityId: sourceWorkspace.id,
+                  details: {
+                    requestedByIssueId: workspaceInheritanceIssueId,
+                    sourceIssueId: sourceWorkspace.sourceIssueId,
+                    branchName: sourceWorkspace.branchName,
+                    reason: "workspace branch names a different issue's delivery branch",
+                  },
+                }, createActivityPublications);
+              }
+             }
+             // Inherit a live, non-cross-source source workspace unless one of the
+             // guards above declined it. This includes the SUP-15231
+             // shared_workspace plan carrier: when the branch-identity arm finds
+             // the row exempt it leaves declinedWorkspaceInheritance unset, so
+             // the child inherits the carrier branch verbatim (the children build
+             // on the parent's carrier). A non-exempt cross-source branch or a
+             // terminal source still declines above.
+             if (!declinedWorkspaceInheritance && sourceWorkspace) {
+               executionWorkspaceId = sourceWorkspace.id;
+               executionWorkspacePreference = "reuse_existing";
+               executionWorkspaceSettings = {
+                 ...((workspaceSource.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? {}),
+                 mode: issueExecutionWorkspaceModeForPersistedWorkspace(sourceWorkspace.mode),
+               };
+             }
           }
         }
         // A bare `reuse_existing` is a request to inherit, so a declined
