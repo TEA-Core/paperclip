@@ -1149,6 +1149,34 @@ describe("evaluateDoneTransitionGuard", () => {
         }),
       );
     });
+
+    it("does not fire Mechanism D when edge-2 blockers carry a non-null parentId (SUP-15228 sibling shape)", async () => {
+      // Reproduces the live SUP-15110 shape: a leaf coding child with two
+      // blockedBy predecessors (siblings) that each ran ladders. Before the
+      // fix, those siblings were counted as "laddered children" and mechanism D
+      // fired with a 409. After the fix, siblings with parentId are excluded.
+      const siblingParentId = "99999999-9999-4999-8999-999999999999";
+      setupDbMock({
+        issues: [],
+        issueRelations: [
+          { id: "rel-1", companyId: "company-1", issueId: "sibling-1", relatedIssueId: "issue-1", type: "blocks" },
+          { id: "rel-2", companyId: "company-1", issueId: "sibling-2", relatedIssueId: "issue-1", type: "blocks" },
+        ],
+        blockedByIssues: [
+          { id: "sibling-1", identifier: "SUP-15106", parentId: siblingParentId, executionPolicy: { stages: [{ id: "40000000-0000-4000-8000-000000000001", type: "review" }] }, executionState: satisfiedState(["40000000-0000-4000-8000-000000000001"]) },
+          { id: "sibling-2", identifier: "SUP-15109", parentId: siblingParentId, executionPolicy: { stages: [{ id: "50000000-0000-4000-8000-000000000002", type: "review" }] }, executionState: satisfiedState(["50000000-0000-4000-8000-000000000002"]) },
+        ],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: siblingParentId, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.reason).not.toContain("Mechanism D");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
   });
 
   describe("ungated decomposed parent (SUP-14561 mechanism A)", () => {
@@ -1441,6 +1469,35 @@ describe("evaluateDoneTransitionGuard", () => {
             ladderedChildIdentifiers: ["SUP-B1", "SUP-B2"],
           }),
         }),
+      );
+    });
+
+    it("does not fire Mechanism A when edge-2 blockers carry a non-null parentId (SUP-15228 sibling shape, ladder-less variant)", async () => {
+      // Ladder-less variant of the SUP-15110 shape: the issue under evaluation
+      // has no execution policy, and its two blockedBy predecessors are siblings
+      // (they carry a non-null parentId). After the fix, they are excluded from
+      // edge 2 and mechanism A does not fire.
+      const siblingParentId = "99999999-9999-4999-8999-999999999999";
+      setupDbMock({
+        issues: [],
+        issueRelations: [
+          { id: "rel-1", companyId: "company-1", issueId: "sibling-1", relatedIssueId: "issue-1", type: "blocks" },
+          { id: "rel-2", companyId: "company-1", issueId: "sibling-2", relatedIssueId: "issue-1", type: "blocks" },
+        ],
+        blockedByIssues: [
+          { id: "sibling-1", identifier: "SUP-15106", parentId: siblingParentId, executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] }, executionState: childState([stageId]) },
+          { id: "sibling-2", identifier: "SUP-15109", parentId: siblingParentId, executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] }, executionState: childState([stageId]) },
+        ],
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: siblingParentId, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
       );
     });
 

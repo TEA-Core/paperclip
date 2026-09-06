@@ -943,12 +943,13 @@ async function countLadderedChildren(
 
   // Re-read the full child rows for any id only reachable via edge 2, so those
   // children carry their own execution policy/state for the laddered predicate.
-  const blockedByRows =
+  const blockedByRowsRaw =
     extraIds.length > 0
       ? await db
           .select({
             id: issues.id,
             identifier: issues.identifier,
+            parentId: issues.parentId,
             executionPolicy: issues.executionPolicy,
             executionState: issues.executionState,
           })
@@ -957,6 +958,12 @@ async function countLadderedChildren(
             and(eq(issues.companyId, companyId), inArray(issues.id, extraIds)),
           )
       : [];
+
+  // SUP-15228: a blocks-linked issue that carries a non-null parent_id is a
+  // dependency (sibling or unrelated card), not a decomposition child. Edge 1
+  // already counts children parented to this issue; edge 2 targets only
+  // unparented links.
+  const blockedByRows = blockedByRowsRaw.filter((row) => row.parentId == null);
 
   const rows = [...parentRows, ...blockedByRows];
   const seen = new Set<string>();
