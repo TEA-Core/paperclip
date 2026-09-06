@@ -395,6 +395,55 @@ function nativeRunnerErrorCode(error: unknown): string | null {
   return message.match(/^(paperclip_runner_[a-z0-9_]+)/)?.[1] ?? null;
 }
 
+/**
+ * Names + Postgres codes along the error `cause` chain (bounded depth). Drizzle/postgres.js
+ * wrap driver failures, so the real Postgres error class and SQLSTATE are reachable only by
+ * walking the chain (same walk as `isUniqueViolation` in db-errors.ts).
+ */
+export function contextSnapshotWriteErrorClasses(
+  error: unknown,
+): Array<{ name: string; code: string | null }> {
+  const classes: Array<{ name: string; code: string | null }> = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth += 1) {
+    const candidate = current as { name?: unknown; code?: unknown; cause?: unknown };
+    const name =
+      typeof candidate.name === "string" && candidate.name.length > 0
+        ? candidate.name
+        : current instanceof Error
+          ? "Error"
+          : String(current);
+    const code = typeof candidate.code === "string" && candidate.code.length > 0 ? candidate.code : null;
+    classes.push({ name, code });
+    current = candidate.cause;
+  }
+  return classes;
+}
+
+/**
+ * Guard a single `heartbeat_runs.context_snapshot` write (SUP-15284): a driver-level failure is
+ * recorded via `record` and the run continues instead of dying. The snapshot write is
+ * diagnostic — losing it must never end the run. Never throws.
+ */
+export async function runContextSnapshotWriteGuarded<T>(input: {
+  writeSite: string;
+  runId: string;
+  write: () => Promise<T>;
+  fallback: T;
+  record: (failure: { error: unknown; writeSite: string; runId: string }) => void | Promise<void>;
+}): Promise<T> {
+  try {
+    return await input.write();
+  } catch (error) {
+    try {
+      await input.record({ error, writeSite: input.writeSite, runId: input.runId });
+    } catch {
+      // Recording must never re-throw into the guarded write path.
+    }
+    return input.fallback;
+  }
+}
+
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
   currentUserRedactionOptions?: CurrentUserRedactionOptions,
@@ -10542,6 +10591,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(row?.maxSeq ?? 0) + 1;
   }
 
+  // Guard wrapper shared by every heartbeat_runs.context_snapshot write site. The snapshot is
+  // diagnostic persistence: a driver-level failure must be recorded (with its error class chain,
+  // since drizzle/postgres.js keep the real Postgres error and SQLSTATE on `.cause`) and the run
+  // must continue (SUP-15284). The guard never throws.
+  async function guardHeartbeatRunContextSnapshotWrite<T>(input: {
+    writeSite: string;
+    runId: string;
+    agentId?: string | null;
+    companyId?: string | null;
+    write: () => Promise<T>;
+    fallback: T;
+  }): Promise<T> {
+    return runContextSnapshotWriteGuarded({
+      writeSite: input.writeSite,
+      runId: input.runId,
+      write: input.write,
+      fallback: input.fallback,
+      record: (failure) => {
+        logger.error(
+          {
+            err: failure.error,
+            runId: failure.runId,
+            agentId: input.agentId ?? null,
+            companyId: input.companyId ?? null,
+            writeSite: failure.writeSite,
+            errorClasses: contextSnapshotWriteErrorClasses(failure.error),
+          },
+          `heartbeat_runs.context_snapshot write failed at ${failure.writeSite}; continuing run without persisting this snapshot`,
+        );
+      },
+    });
+  }
+
   async function persistRunProcessMetadata(
     runId: string,
     meta: { pid: number; processGroupId: number | null; startedAt: string },
@@ -16892,13 +16974,22 @@ function pendingCleanupAttemptsSql() {
           }
         : {}),
     };
-    await db
-      .update(heartbeatRuns)
-      .set({
-        contextSnapshot: boundContextSnapshot(context),
-        updatedAt: new Date(),
-      })
-      .where(eq(heartbeatRuns.id, run.id));
+    await guardHeartbeatRunContextSnapshotWrite({
+      writeSite: "executeRun:dispatch-start",
+      runId: run.id,
+      agentId: agent.id,
+      companyId: agent.companyId,
+      write: async () => {
+        await db
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: boundContextSnapshot(context),
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, run.id));
+      },
+      fallback: undefined,
+    });
     const runtimeSessionResolution = resolveRuntimeSessionParamsForWorkspace({
       agentId: agent.id,
       previousSessionParams,
@@ -17121,17 +17212,25 @@ function pendingCleanupAttemptsSql() {
     };
     try {
       const startedAt = run.startedAt ?? new Date();
-      const runningWithSession = await db
-        .update(heartbeatRuns)
-        .set({
-          startedAt,
-          sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-          contextSnapshot: boundContextSnapshot(context),
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, run.id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const runningWithSession = await guardHeartbeatRunContextSnapshotWrite({
+        writeSite: "executeRun:running-with-session",
+        runId: run.id,
+        agentId: agent.id,
+        companyId: agent.companyId,
+        write: () =>
+          db
+            .update(heartbeatRuns)
+            .set({
+              startedAt,
+              sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
+              contextSnapshot: boundContextSnapshot(context),
+              updatedAt: new Date(),
+            })
+            .where(eq(heartbeatRuns.id, run.id))
+            .returning()
+            .then((rows) => rows[0] ?? null),
+        fallback: null,
+      });
       if (runningWithSession) run = runningWithSession;
 
       // Pause Durability: flip to "running" ONLY if the agent is still invokable.
@@ -17341,13 +17440,22 @@ function pendingCleanupAttemptsSql() {
         context.paperclipRuntimeServices = runtimeServices;
         context.paperclipRuntimePrimaryUrl =
           runtimeServices.find((service) => readNonEmptyString(service.url))?.url ?? null;
-        await db
-          .update(heartbeatRuns)
-          .set({
-            contextSnapshot: boundContextSnapshot(context),
-            updatedAt: new Date(),
-          })
-          .where(eq(heartbeatRuns.id, run.id));
+        await guardHeartbeatRunContextSnapshotWrite({
+          writeSite: "executeRun:runtime-services-refresh",
+          runId: run.id,
+          agentId: agent.id,
+          companyId: agent.companyId,
+          write: async () => {
+            await db
+              .update(heartbeatRuns)
+              .set({
+                contextSnapshot: boundContextSnapshot(context),
+                updatedAt: new Date(),
+              })
+              .where(eq(heartbeatRuns.id, run.id));
+          },
+          fallback: undefined,
+        });
       }
       if (issueId && (executionWorkspace.created || runtimeServices.some((service) => !service.reused))) {
         try {
@@ -17842,13 +17950,22 @@ function pendingCleanupAttemptsSql() {
         context.paperclipRuntimeServices = combinedRuntimeServices;
         context.paperclipRuntimePrimaryUrl =
           combinedRuntimeServices.find((service) => readNonEmptyString(service.url))?.url ?? null;
-        await db
-          .update(heartbeatRuns)
-          .set({
-            contextSnapshot: boundContextSnapshot(context),
-            updatedAt: new Date(),
-          })
-          .where(eq(heartbeatRuns.id, run.id));
+        await guardHeartbeatRunContextSnapshotWrite({
+          writeSite: "executeRun:adapter-managed-runtime-services-refresh",
+          runId: run.id,
+          agentId: agent.id,
+          companyId: agent.companyId,
+          write: async () => {
+            await db
+              .update(heartbeatRuns)
+              .set({
+                contextSnapshot: boundContextSnapshot(context),
+                updatedAt: new Date(),
+              })
+              .where(eq(heartbeatRuns.id, run.id));
+          },
+          fallback: undefined,
+        });
         if (issueId) {
           try {
             await postWorkspaceReadyComment({
@@ -20522,15 +20639,23 @@ function pendingCleanupAttemptsSql() {
               availableActiveExecutionRun.contextSnapshot,
               enrichedContextSnapshot,
             );
-            const mergedRun = await tx
-              .update(heartbeatRuns)
-              .set({
-                contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
-                updatedAt: new Date(),
-              })
-              .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
-              .returning()
-              .then((rows) => rows[0] ?? availableActiveExecutionRun);
+            const mergedRun = await guardHeartbeatRunContextSnapshotWrite({
+              writeSite: "enqueueWakeup:issue-bound-coalesce",
+              runId: availableActiveExecutionRun.id,
+              agentId,
+              companyId: agent.companyId,
+              write: () =>
+                tx
+                  .update(heartbeatRuns)
+                  .set({
+                    contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
+                    updatedAt: new Date(),
+                  })
+                  .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
+                  .returning()
+                  .then((rows) => rows[0] ?? availableActiveExecutionRun),
+              fallback: availableActiveExecutionRun,
+            });
 
             await tx.insert(agentWakeupRequests).values({
               companyId: agent.companyId,
@@ -20872,15 +20997,23 @@ function pendingCleanupAttemptsSql() {
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
       );
-      const mergedRun = await db
-        .update(heartbeatRuns)
-        .set({
-          contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
-        .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
+      const mergedRun = await guardHeartbeatRunContextSnapshotWrite({
+        writeSite: "enqueueWakeup:same-scope-coalesce",
+        runId: coalescedTargetRun.id,
+        agentId,
+        companyId: agent.companyId,
+        write: () =>
+          db
+            .update(heartbeatRuns)
+            .set({
+              contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
+              updatedAt: new Date(),
+            })
+            .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+            .returning()
+            .then((rows) => rows[0] ?? coalescedTargetRun),
+        fallback: coalescedTargetRun,
+      });
 
       await db.insert(agentWakeupRequests).values({
         companyId: agent.companyId,

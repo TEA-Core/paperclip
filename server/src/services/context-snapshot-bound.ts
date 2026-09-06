@@ -47,14 +47,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function deepClone<T>(value: T): T {
-  try {
-    return JSON.parse(JSON.stringify(value)) as T;
-  } catch {
-    return value;
-  }
-}
-
 function headBytes(input: string, maxBytes: number): string {
   // Byte-safe prefix that never splits a multi-byte UTF-8 codepoint.
   if (Buffer.byteLength(input, "utf8") <= maxBytes) return input;
@@ -67,14 +59,18 @@ function headBytes(input: string, maxBytes: number): string {
   return out;
 }
 
+/** Cap a single oversized string leaf (byte-accurate prefix + explicit omitted-byte count). */
+function capStringLeaf(value: string): string {
+  const byteLength = Buffer.byteLength(value, "utf8");
+  if (byteLength <= STRING_LEAF_CAP_BYTES) return value;
+  const head = headBytes(value, STRING_LEAF_CAP_BYTES);
+  const omittedBytes = byteLength - Buffer.byteLength(head, "utf8");
+  return `${head}...[${CONTEXT_SNAPSHOT_TRUNCATION_MARKER} omitted ${omittedBytes} bytes]`;
+}
+
 /** Replace every string longer than {@link STRING_LEAF_CAP_BYTES} with a capped + marked form. */
 function capStringLeaves(value: unknown): unknown {
-  if (typeof value === "string") {
-    const byteLength = Buffer.byteLength(value, "utf8");
-    if (byteLength <= STRING_LEAF_CAP_BYTES) return value;
-    const head = headBytes(value, STRING_LEAF_CAP_BYTES);
-    return `${head}...[${CONTEXT_SNAPSHOT_TRUNCATION_MARKER} omitted ${byteLength - head.length} bytes]`;
-  }
+  if (typeof value === "string") return capStringLeaf(value);
   if (Array.isArray(value)) {
     const items = value.length > ARRAY_LEAF_CAP_ITEMS ? value.slice(0, ARRAY_LEAF_CAP_ITEMS) : value;
     const cappedItems = items.map(capStringLeaves);
@@ -96,7 +92,12 @@ function capStringLeaves(value: unknown): unknown {
 function pickPreservedKeys(source: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const key of CONTEXT_SNAPSHOT_PRESERVED_KEYS) {
-    if (key in source) out[key] = source[key];
+    if (!(key in source)) continue;
+    const child = source[key];
+    // Cap oversized preserved string leaves (e.g. a huge wakeReason) so a single preserved value
+    // cannot push the degraded form back over the cap; identity is retained via the byte-accurate
+    // head. Non-string preserved values are copied verbatim (pass 1 already caps their leaves).
+    out[key] = typeof child === "string" ? capStringLeaf(child) : child;
   }
   return out;
 }
