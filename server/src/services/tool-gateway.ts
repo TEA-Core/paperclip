@@ -36,6 +36,7 @@ import type {
   DeploymentExposure,
   DeploymentMode,
   McpConnectionCredentialRef,
+  PluginRecord,
   SecretVersionSelector,
   ToolAccessDecision,
   ToolAccessDecisionInput,
@@ -51,6 +52,7 @@ import type {
   UpdateToolMcpGateway,
 } from "@paperclipai/shared";
 import type { AgentToolDescriptor, PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
+import { pluginRegistryService } from "./plugin-registry.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
@@ -4984,6 +4986,79 @@ export function createToolGatewayService(
           const { providerType: _providerType, risk: _risk, ...descriptor } = tool;
           return descriptor;
         });
+    },
+
+    async pluginToolHealth(input: { companyId: string; agentId: string }) {
+      await assertAgentInCompany(input.companyId, input.agentId);
+
+      const pluginRegistry = pluginRegistryService(db);
+      const installedPlugins = (await pluginRegistry.listInstalled()) as PluginRecord[];
+
+      const allPluginTools = pluginTools();
+
+      const registeredByPlugin = new Map<string, number>();
+      for (const tool of allPluginTools) {
+        registeredByPlugin.set(tool.pluginId, (registeredByPlugin.get(tool.pluginId) ?? 0) + 1);
+      }
+
+      const decisions = await Promise.all(allPluginTools.map(async (tool) => {
+        const decision = await policyService.decide(policyInputForAgentTool({
+          companyId: input.companyId,
+          agentId: input.agentId,
+          tool,
+        }));
+        return { tool, allowed: decision.allowed || decision.decision === "require_approval" };
+      }));
+
+      const visibleByPlugin = new Map<string, number>();
+      for (const { tool, allowed } of decisions) {
+        if (allowed) {
+          visibleByPlugin.set(tool.pluginId, (visibleByPlugin.get(tool.pluginId) ?? 0) + 1);
+        }
+      }
+
+      // The "not bound" determination is keyed off the agent's declared
+      // `permissions.pluginTools` allowlist — the per-agent binding — not the
+      // tool-profile visibility, which is a different (profile) binding. An
+      // absent allowlist means the agent is bound to every ready plugin's
+      // tools, so only a present allowlist that excludes the plugin key reports
+      // it as not bound (SUP-15090, criterion 4 + consume contract).
+      const allowlist = await pluginToolAllowlistForAgent(input.companyId, input.agentId);
+
+      const plugins = installedPlugins
+        .filter((plugin) => (plugin.manifestJson?.tools?.length ?? 0) > 0)
+        .map((plugin) => {
+          const declaredToolCount = plugin.manifestJson!.tools!.length;
+          const registeredToolCount = registeredByPlugin.get(plugin.id) ?? 0;
+          const visibleToolCount = visibleByPlugin.get(plugin.id) ?? 0;
+          const isReady = plugin.status === "ready";
+          const notBound = allowlist !== null && !allowlist.has(plugin.pluginKey);
+
+          let deliverable = false;
+          let reason: string | null = null;
+
+          if (!isReady) {
+            reason = `Plugin "${plugin.pluginKey}" is in "${plugin.status}" status`;
+          } else if (notBound) {
+            reason = `Plugin "${plugin.pluginKey}" is not bound to this agent (excluded by permissions.pluginTools)`;
+          } else if (visibleToolCount === 0) {
+            reason = `Plugin "${plugin.pluginKey}" has no tools visible to this agent under its tool profile`;
+          } else {
+            deliverable = true;
+          }
+
+          return {
+            pluginKey: plugin.pluginKey,
+            pluginStatus: plugin.status,
+            declaredToolCount,
+            registeredToolCount,
+            visibleToolCount,
+            deliverable,
+            reason,
+          };
+        });
+
+      return { plugins };
     },
 
     async summarizeConnectionAccessForAgent(input: { companyId: string; connectionId: string; agentId: string }) {
