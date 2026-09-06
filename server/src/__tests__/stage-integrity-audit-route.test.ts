@@ -168,6 +168,17 @@ function reviewPolicy(stageId: string) {
   };
 }
 
+function twoStagePolicy(stageA: string, stageB: string) {
+  return {
+    mode: "normal",
+    stages: [
+      { id: stageA, type: "review", participants: [], approvalsNeeded: 1 },
+      { id: stageB, type: "approval", participants: [], approvalsNeeded: 1 },
+    ],
+    commentRequired: true,
+  };
+}
+
 describeEmbeddedPostgres("stage-integrity audit route (ADR-073 D3, SUP-14923)", () => {
   let db!: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -489,6 +500,385 @@ describeEmbeddedPostgres("stage-integrity audit route (ADR-073 D3, SUP-14923)", 
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toEqual([]);
+  });
+
+  it("flags an approved decision whose stage is in policy but in neither completedStageIds nor skippedStageIds (SUP-15212 inverse guard)", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+
+    // Pre-table boundary: the earliest decision in the company sits at T0 so the
+    // time-scoped exclusion has a reference and does not swallow the findings.
+    const boundaryStage = randomUUID();
+    const boundary = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Boundary clean close",
+      identifier: "SIA-ORPH-BOUNDARY",
+      status: "done",
+      executionPolicy: reviewPolicy(boundaryStage),
+      executionState: { completedStageIds: [boundaryStage], skippedStageIds: [] },
+      completedAt: new Date("2026-08-18T00:00:00Z"),
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: boundary.id,
+      stageId: boundaryStage,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "orphan-boundary-verdict",
+      createdAt: T0,
+    });
+
+    // Orphaned verdict: stage A completed + decided (clean); stage B has a durable
+    // `approved` decision but is in NEITHER completedStageIds NOR skippedStageIds.
+    const stageA = randomUUID();
+    const stageB = randomUUID();
+    const orphan = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Orphaned decision",
+      identifier: "SIA-ORPHAN",
+      status: "done",
+      executionPolicy: twoStagePolicy(stageA, stageB),
+      executionState: { completedStageIds: [stageA], skippedStageIds: [] },
+      completedAt: new Date("2026-09-05T05:00:00Z"),
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: orphan.id,
+      stageId: stageA,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "orphan-A-verdict",
+      createdAt: new Date("2026-09-05T04:00:00Z"),
+    });
+    const orphanB = await seedDecision(db, {
+      companyId: company.id,
+      issueId: orphan.id,
+      stageId: stageB,
+      stageType: "approval",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "orphan-B-verdict",
+      createdAt: new Date("2026-09-05T04:18:44Z"),
+    });
+
+    // Same ladder, but stage B lawfully sits in skippedStageIds -> not a finding.
+    const skipA = randomUUID();
+    const skipB = randomUUID();
+    const skippedOrphan = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Orphaned decision (stage lawfully skipped)",
+      identifier: "SIA-ORPHAN-SKIP",
+      status: "done",
+      executionPolicy: twoStagePolicy(skipA, skipB),
+      executionState: { completedStageIds: [skipA], skippedStageIds: [skipB] },
+      completedAt: new Date("2026-09-05T06:00:00Z"),
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: skippedOrphan.id,
+      stageId: skipA,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "orphan-skip-A-verdict",
+      createdAt: new Date("2026-09-05T05:30:00Z"),
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: skippedOrphan.id,
+      stageId: skipB,
+      stageType: "approval",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "orphan-skip-B-verdict",
+      createdAt: new Date("2026-09-05T05:31:00Z"),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/companies/${company.id}/audit/stage-integrity`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const identifiers = new Set(res.body.map((row: { identifier: string }) => row.identifier));
+
+    // The orphaned verdict is flagged with the inverse reason...
+    const orphanRow = res.body.find((row: { identifier: string }) => row.identifier === "SIA-ORPHAN");
+    expect(orphanRow?.reason).toBe("guard-b:decision-without-completed-stage");
+    // ...naming the orphaned decision id, its stage, and its decision timestamp.
+    expect(orphanRow?.detail).toContain(orphanB.id);
+    expect(orphanRow?.detail).toContain(stageB);
+    expect(orphanRow?.detail).toContain("2026-09-05T04:18:44");
+    // The clean control and the lawfully-skipped variant are NOT flagged.
+    expect(identifiers.has("SIA-ORPHAN-SKIP")).toBe(false);
+    expect(identifiers.has("SIA-ORPH-BOUNDARY")).toBe(false);
+  });
+
+  it("admits in_review and blocked cards carrying a live ladder, and still excludes cancelled (SUP-15212 selector widening)", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+
+    // in_review card with a live ladder and an orphaned verdict -> admitted + flagged.
+    const inA = randomUUID();
+    const inB = randomUUID();
+    const inReview = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Live ladder (in_review)",
+      identifier: "SIA-LIVE-REVIEW",
+      status: "in_review",
+      executionPolicy: twoStagePolicy(inA, inB),
+      executionState: { completedStageIds: [inA], skippedStageIds: [] },
+      completedAt: null,
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: inReview.id,
+      stageId: inA,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "live-review-A-verdict",
+      createdAt: new Date("2026-09-05T04:00:00Z"),
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: inReview.id,
+      stageId: inB,
+      stageType: "approval",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "live-review-B-verdict",
+      createdAt: new Date("2026-09-05T04:18:44Z"),
+    });
+
+    // blocked card with a live ladder + an orphaned approved verdict ->
+    // admitted and flagged decision-without-completed-stage (the close-presupposing
+    // no-completed-stage must NOT fire on a live card with an empty completedStageIds).
+    const blockedStage = randomUUID();
+    const blocked = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Live ladder (blocked)",
+      identifier: "SIA-LIVE-BLOCKED",
+      status: "blocked",
+      executionPolicy: reviewPolicy(blockedStage),
+      executionState: { completedStageIds: [], skippedStageIds: [] },
+      completedAt: null,
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: blocked.id,
+      stageId: blockedStage,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "live-blocked-verdict",
+      createdAt: new Date("2026-09-05T03:00:00Z"),
+    });
+
+    // blocked card whose only verdict is changes_requested (not a durable approval)
+    // and whose ladder has completed no stage -> admitted but NOT flagged. This is
+    // the regression the round-1 review required: pre-fix, `no-completed-stage`
+    // fired on the empty completedStageIds and shadowed every later guard; post-fix
+    // the close-presupposing guard is suppressed for a live card and the inverse
+    // (orphaned-decision) guard only fires on a durable approved verdict, so a
+    // changes_requested verdict is not a defect.
+    const parkedStage = randomUUID();
+    const parked = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Live ladder (blocked, changes requested)",
+      identifier: "SIA-LIVE-PARKED",
+      status: "blocked",
+      executionPolicy: reviewPolicy(parkedStage),
+      executionState: { completedStageIds: [], skippedStageIds: [] },
+      completedAt: null,
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: parked.id,
+      stageId: parkedStage,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "changes_requested",
+      body: "live-parked-changes-requested",
+      createdAt: new Date("2026-09-05T03:30:00Z"),
+    });
+
+    // cancelled card that would otherwise be a live-ladder finding -> excluded.
+    const cxA = randomUUID();
+    const cxB = randomUUID();
+    const cancelled = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Cancelled ladder",
+      identifier: "SIA-CANCELLED",
+      status: "cancelled",
+      executionPolicy: twoStagePolicy(cxA, cxB),
+      executionState: { completedStageIds: [cxA], skippedStageIds: [] },
+      completedAt: null,
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: cancelled.id,
+      stageId: cxA,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "cancelled-A-verdict",
+      createdAt: new Date("2026-09-05T02:00:00Z"),
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: cancelled.id,
+      stageId: cxB,
+      stageType: "approval",
+      actorUserId: "board-user",
+      outcome: "approved",
+      body: "cancelled-B-verdict",
+      createdAt: new Date("2026-09-05T02:18:44Z"),
+    });
+
+    // A live card with no decision has no ladder to audit -> not admitted.
+    const noDecisionStage = randomUUID();
+    await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Live card, never decided",
+      identifier: "SIA-LIVE-NODEC",
+      status: "in_review",
+      executionPolicy: reviewPolicy(noDecisionStage),
+      executionState: { completedStageIds: [], skippedStageIds: [] },
+      completedAt: null,
+      createdByAgentId: agent.id,
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/companies/${company.id}/audit/stage-integrity`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const identifiers = new Set(res.body.map((row: { identifier: string }) => row.identifier));
+    // in_review and blocked ladders are now admitted...
+    expect(identifiers.has("SIA-LIVE-REVIEW")).toBe(true);
+    expect(identifiers.has("SIA-LIVE-BLOCKED")).toBe(true);
+    // ...a cancelled card is still excluded...
+    expect(identifiers.has("SIA-CANCELLED")).toBe(false);
+    // ...and a live card that never decided anything is not admitted.
+    expect(identifiers.has("SIA-LIVE-NODEC")).toBe(false);
+    // ...and a live card with a non-approving verdict and an empty ladder is
+    // admitted but produces no finding (no close-presupposing false positive).
+    expect(identifiers.has("SIA-LIVE-PARKED")).toBe(false);
+
+    const reviewRow = res.body.find((row: { identifier: string }) => row.identifier === "SIA-LIVE-REVIEW");
+    expect(reviewRow?.reason).toBe("guard-b:decision-without-completed-stage");
+    const blockedRow = res.body.find((row: { identifier: string }) => row.identifier === "SIA-LIVE-BLOCKED");
+    // Round-1 fix: a live (blocked) card with an orphaned approved verdict is
+    // flagged by the inverse guard, not the terminal-only no-completed-stage.
+    expect(blockedRow?.reason).toBe("guard-b:decision-without-completed-stage");
+  });
+
+  it("replays the live SUP-15120 orphan (decision f643c6e6 / stage 17763832) and flags it with the inverse reason", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+
+    // The exact live ids from the defect (TEA-Core/paperclip, SUP-15120 / 838433b7).
+    // At the moment the ticket observed it, stage 17763832 held a durable approved
+    // verdict (decision f643c6e6) but the completion projection had NOT advanced
+    // completedStageIds past 5d2dc845 — an orphaned decision. The card was live
+    // (in_review), which the widened selector now admits.
+    const STAGE_5D2D = "5d2dc845-fa9d-4bf9-9e47-c4a3d4300c30";
+    const STAGE_1776 = "17763832-ec0f-415b-9e01-99ed991e9487";
+    const STAGE_A85E = "a85e93d4-5a36-4a08-b4e9-9c84d5e1d9cd";
+    const STAGE_1FDC = "1fdc01b8-c9b0-456f-a57c-c1396367a4da";
+    const ISSUE_15120 = "838433b7-b66f-46f2-8d57-28591ef397e1";
+    const DECISION_F643 = "f643c6e6-c4de-4a6e-bc37-efdc6e5bf156";
+
+    const policy = {
+      mode: "normal",
+      commentRequired: true,
+      returnAssigneeAgentId: "14293690-7ce0-456d-88c7-86b35a08c059",
+      stages: [STAGE_5D2D, STAGE_1776, STAGE_A85E, STAGE_1FDC].map((id) => ({
+        id,
+        type: "approval",
+        participants: [],
+        approvalsNeeded: 1,
+      })),
+    };
+
+    await db.insert(issues).values({
+      id: ISSUE_15120,
+      companyId: company.id,
+      projectId: project.id,
+      parentId: null,
+      title: "Repro: SUP-15120 orphan replay",
+      identifier: "SUP-15120",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: null,
+      responsibleUserId: "board-user",
+      executionPolicy: policy,
+      executionState: { completedStageIds: [STAGE_5D2D], skippedStageIds: [] },
+      completedAt: null,
+      createdByAgentId: agent.id,
+    });
+
+    // 5d2dc845 is completed AND decided (clean) — its verdict is by an agent that
+    // is NOT the return assignee (14293690...), so the return-assignee guard does
+    // not fire. The scratch company's own agent is used for the FK.
+    await db.insert(issueExecutionDecisions).values({
+      id: "8dd2e5c6-6567-40f8-bdfd-5cd57a997eee",
+      companyId: company.id,
+      issueId: ISSUE_15120,
+      stageId: STAGE_5D2D,
+      stageType: "approval",
+      actorAgentId: agent.id,
+      actorUserId: null,
+      outcome: "approved",
+      body: "repro-5d2d-verdict",
+      createdByRunId: null,
+      createdAt: new Date("2026-09-06T04:15:06.268Z"),
+    });
+    // 17763832: the durable approved verdict the projection dropped (the orphan).
+    await db.insert(issueExecutionDecisions).values({
+      id: DECISION_F643,
+      companyId: company.id,
+      issueId: ISSUE_15120,
+      stageId: STAGE_1776,
+      stageType: "approval",
+      actorAgentId: agent.id,
+      actorUserId: null,
+      outcome: "approved",
+      body: "repro-1776-verdict",
+      createdByRunId: null,
+      createdAt: new Date("2026-09-06T04:18:44.968Z"),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/companies/${company.id}/audit/stage-integrity`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const row = res.body.find((r: { identifier: string }) => r.identifier === "SUP-15120");
+    expect(row, JSON.stringify(res.body)).toBeDefined();
+    expect(row?.reason).toBe("guard-b:decision-without-completed-stage");
+    // Cite the live decision id, its stage, and its decision timestamp.
+    expect(row?.id).toBe(ISSUE_15120);
+    expect(row?.detail).toContain(DECISION_F643);
+    expect(row?.detail).toContain(STAGE_1776);
+    expect(row?.detail).toContain("2026-09-06T04:18:44.968Z");
   });
 
   it("refuses an agent key from another company with 403", async () => {

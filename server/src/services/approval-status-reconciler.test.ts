@@ -24,6 +24,7 @@ import {
   persistBackfillRefusal,
   runApprovalStatusReconcilerTick,
   startApprovalStatusReconciler,
+  evaluateStageIntegrity,
   type ApprovalStatusReconcilerTickSummary,
   type CandidateRow,
 } from "./approval-status-reconciler.js";
@@ -3085,6 +3086,173 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(mockGhFetch).not.toHaveBeenCalled();
     });
   });
+
+  describe("SUP-15212: inverse stage-integrity guard (orphaned decision)", () => {
+    const POLICY = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        { id: APPROVAL_STAGE_ID, type: "approval", approvalsNeeded: 1 },
+        { id: REVIEW_STAGE_ID, type: "review", approvalsNeeded: 1 },
+      ],
+    };
+
+    function buildRow(
+      issueId: string,
+      executionState: Record<string, unknown>,
+      executionPolicy: Record<string, unknown>,
+      status?: string,
+    ) {
+      const row: CandidateRow = {
+        id: issueId,
+        companyId,
+        identifier: "SUP-INV",
+        createdByAgentId: AGENT_CREATOR,
+        createdByUserId: null,
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        executionState,
+        executionPolicy,
+      };
+      if (status !== undefined) row.status = status;
+      return row;
+    }
+
+    it("flags a durable approved decision whose stage is in policy but in neither completedStageIds nor skippedStageIds", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [APPROVAL_STAGE_ID], skippedStageIds: [] },
+      });
+      // APPROVAL_STAGE_ID is completed + decided (clean); REVIEW_STAGE_ID carries
+      // a durable approved verdict but is recorded in neither completed nor skipped.
+      await insertDecision(issueId, { stageId: APPROVAL_STAGE_ID, actorUserId: USER_REVIEWER });
+      await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [APPROVAL_STAGE_ID], skippedStageIds: [] },
+          POLICY,
+        ),
+      );
+
+      expect(verdict?.reason).toBe("guard-b:decision-without-completed-stage");
+      expect(verdict?.detail).toContain(REVIEW_STAGE_ID);
+    });
+
+    it("treats a stage in skippedStageIds as a legitimate exclusion, not an orphaned decision", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: {
+          completedStageIds: [APPROVAL_STAGE_ID],
+          skippedStageIds: [REVIEW_STAGE_ID],
+        },
+      });
+      await insertDecision(issueId, { stageId: APPROVAL_STAGE_ID, actorUserId: USER_REVIEWER });
+      await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [APPROVAL_STAGE_ID], skippedStageIds: [REVIEW_STAGE_ID] },
+          POLICY,
+        ),
+      );
+
+      expect(verdict?.reason).not.toBe("guard-b:decision-without-completed-stage");
+    });
+
+    it("does not flag a decision for a stage that is not in executionPolicy.stages", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [APPROVAL_STAGE_ID], skippedStageIds: [] },
+      });
+      await insertDecision(issueId, { stageId: APPROVAL_STAGE_ID, actorUserId: USER_REVIEWER });
+      await insertDecision(issueId, { stageId: randomUUID(), actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [APPROVAL_STAGE_ID], skippedStageIds: [] },
+          POLICY,
+        ),
+      );
+
+      expect(verdict?.reason).not.toBe("guard-b:decision-without-completed-stage");
+    });
+
+    it("still flags a live card with an orphaned approved verdict via the inverse guard, not no-completed-stage", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [], skippedStageIds: [] },
+      });
+      // REVIEW_STAGE_ID holds a durable approved verdict but the live ladder has
+      // completed no stage. Pre-fix this card reported no-completed-stage (and the
+      // first-match return shadowed the inverse guard); post-fix the
+      // close-presupposing guard is suppressed for a live card and the inverse
+      // guard reports the orphan.
+      await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [], skippedStageIds: [] },
+          POLICY,
+          "blocked",
+        ),
+      );
+
+      expect(verdict?.reason).toBe("guard-b:decision-without-completed-stage");
+    });
+
+    it("does not flag a live card whose only verdict is not a durable approval (no close-presupposing false positive)", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [], skippedStageIds: [] },
+      });
+      // A changes_requested verdict on a live card with an empty ladder is not an
+      // integrity defect: no-completed-stage is suppressed for live cards and the
+      // inverse guard only fires on an approved verdict.
+      await insertDecision(issueId, {
+        stageId: REVIEW_STAGE_ID,
+        actorUserId: USER_REVIEWER,
+        outcome: "changes_requested",
+      });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [], skippedStageIds: [] },
+          POLICY,
+          "in_review",
+        ),
+      );
+
+      expect(verdict?.reason).not.toBe("guard-b:no-completed-stage");
+      expect(verdict).toBeNull();
+    });
+
+    it("keeps flagging a terminal (done) card with an empty ladder via no-completed-stage (status absent or non-live)", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [], skippedStageIds: [] },
+      });
+      // No decision rows: nothing to audit beyond the empty ladder. On a terminal
+      // close the close-presupposing guard still fires (row.status absent here —
+      // the reconciler / decision-time candidates never project it).
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(issueId, { completedStageIds: [], skippedStageIds: [] }, POLICY),
+      );
+
+      expect(verdict?.reason).toBe("guard-b:no-completed-stage");
+    });
+   });
 
   describe("SUP-14911: terminal resolution error on unhydrated PR", () => {
     /**

@@ -183,6 +183,15 @@ export interface CandidateRow {
   assigneeUserId: string | null;
   executionState: Record<string, unknown> | null;
   executionPolicy: Record<string, unknown> | null;
+  /**
+   * SUP-15212: the issue's status, projected only by the audit selector
+   * (findStageIntegrityAuditCandidates). Absent on the reconciler's
+   * re-publish candidates and the decision-time arming candidate, both of
+   * which operate on closed/approved cards — there the terminal-only guards
+   * keep their existing behavior. Only the audit route distinguishes a live
+   * ladder (`in_review` / `blocked`) from a terminal close.
+   */
+  status?: string;
 }
 
 type CandidateResult =
@@ -808,10 +817,15 @@ async function findApprovalCandidates(
  * Both complementary, non-overlapping controls of {@link findApprovalCandidates}
  * therefore leave the class this audit must see entirely unexamined. This
  * selector takes every terminal (`done`) issue in the company that carries a
- * non-empty `executionPolicy.stages`, returning the same row shape
- * {@link evaluateStageIntegrity} consumes (plus `completedAt`, which the caller
- * uses to exclude pre-decision-table closes as indeterminate). It never
- * re-implements the check: the caller feeds each row to
+ * non-empty `executionPolicy.stages`, PLUS — since SUP-15212 — every live
+ * ladder (`in_review` / `blocked`) that also carries a non-empty
+ * `executionPolicy.stages` and at least one execution decision. `done` cards
+ * are admitted unconditionally (the original behavior); live cards are admitted
+ * only when they have a decision, so a card that never decided anything is not
+ * audited. It returns the same row shape {@link evaluateStageIntegrity} consumes
+ * (plus `completedAt`, which the caller uses to exclude pre-decision-table
+ * closes as indeterminate — a live card's null `completedAt` never trips that
+ * boundary). It never re-implements the check: the caller feeds each row to
  * {@link evaluateStageIntegrity} verbatim.
  */
 export type StageIntegrityAuditCandidate = CandidateRow & {
@@ -835,19 +849,50 @@ export async function findStageIntegrityAuditCandidates(
       executionState: issues.executionState,
       executionPolicy: issues.executionPolicy,
       completedAt: issues.completedAt,
+      // SUP-15212: projected so evaluateStageIntegrity can tell a live ladder
+      // (in_review / blocked) from a terminal close and suppress the
+      // close-presupposing guards on live cards (see isLiveLadder there).
+      status: issues.status,
     })
     .from(issues)
     .where(
       and(
         eq(issues.companyId, companyId),
-        eq(issues.status, "done"),
+        // SUP-15212: admit terminal (`done`) closes AND the live ladders that jam
+        // before closing (`in_review` / `blocked`). The jam-in-progress case is
+        // the one still cheap to repair, so it must be visible — the old
+        // `done`-only selector could only find integrity defects after the card
+        // had already closed (the damage unrecoverable). `cancelled` and the
+        // other non-ladder states stay out. This widening is additive: it cannot
+        // suppress a finding the `done`-only selector reported.
+        sql`${issues.status} in ('done', 'in_review', 'blocked')`,
         sql`${issues.identifier} is not null`,
         sql`jsonb_typeof(${issues.executionPolicy} -> 'stages') = 'array'
              and jsonb_array_length(${issues.executionPolicy} -> 'stages') > 0`,
+        // `done` keeps its prior behavior (admitted unconditionally); a live
+        // card is admitted only when it carries at least one execution decision
+        // — a card that never decided anything has no ladder integrity to audit.
+        sql`(
+          ${issues.status} = 'done'
+          or exists (
+            select 1
+            from ${issueExecutionDecisions}
+            where ${issueExecutionDecisions.companyId} = ${issues.companyId}
+              and ${issueExecutionDecisions.issueId} = ${issues.id}
+          )
+        )`,
       ),
     )
     .orderBy(issues.identifier);
 
+  // SUP-15212 (F3): the default call is unbounded, so the widened selector is a
+  // strict superset of the old done-only one and cannot suppress a finding it
+  // reported before. A bounded call (?limit=N) is different: it truncates after
+  // the lexical identifier ordering, so newly admitted live cards compete for
+  // the same N slots and can crowd out done rows that would have fit in an
+  // unbounded scan. The audit route defaults to no limit, so the invariant the
+  // caller relies on holds; note it here rather than re-order done-first, which
+  // would change the identifier ordering existing consumers see.
   if (limit !== undefined && limit > 0) {
     return query.limit(limit);
   }
@@ -869,6 +914,21 @@ export async function evaluateStageIntegrity(
 ): Promise<{ reason: string; detail: string } | null> {
   const state: Record<string, unknown> = row.executionState ?? {};
   const policy: Record<string, unknown> = row.executionPolicy ?? {};
+
+  // SUP-15212: the widened audit selector now admits live ladders
+  // (in_review / blocked), not just terminal closes. Two guards in this
+  // cascade presuppose a close, so they must NOT fire on a live card or they
+  // (a) report a false positive and (b) — because the cascade returns on the
+  // first match — shadow the inverse (orphaned-decision) guard that is the
+  // reason the selector was widened to reach these rows:
+  //   - `no-completed-stage`: on a done card it means "closed without ever
+  //     completing a stage" (a defect); on a live ladder it just means the
+  //     ladder has not completed a stage yet (the normal pre-completion state).
+  //   - `return-assignee-unresolved`: on a live card the gated principal is not
+  //     expected to be set up yet, so an unresolvable one is not a defect.
+  // row.status is projected only by the audit selector; the reconciler and
+  // decision-time candidates leave it unset, so their behavior is unchanged.
+  const isLiveLadder = row.status === "in_review" || row.status === "blocked";
 
   const skippedStageIds = Array.isArray(state.skippedStageIds)
     ? (state.skippedStageIds as unknown[]).filter((s): s is string => typeof s === "string")
@@ -892,7 +952,11 @@ export async function evaluateStageIntegrity(
   const completedStageIds = Array.isArray(state.completedStageIds)
     ? (state.completedStageIds as unknown[]).filter((s): s is string => typeof s === "string")
     : [];
-  if (completedStageIds.length === 0) {
+  // SUP-15212: `no-completed-stage` presupposes a close. On a live ladder an
+  // empty completedStageIds is the normal pre-completion state, not a defect —
+  // so suppress it there and fall through to the inverse guard, which is the
+  // check this card exists to add. A done card keeps its existing finding.
+  if (completedStageIds.length === 0 && !isLiveLadder) {
     return {
       reason: "guard-b:no-completed-stage",
       detail: "no completed stages recorded in executionState",
@@ -909,7 +973,9 @@ export async function evaluateStageIntegrity(
 
   const decisions = await db
     .select({
+      id: issueExecutionDecisions.id,
       stageId: issueExecutionDecisions.stageId,
+      outcome: issueExecutionDecisions.outcome,
       actorAgentId: issueExecutionDecisions.actorAgentId,
       actorUserId: issueExecutionDecisions.actorUserId,
       createdAt: issueExecutionDecisions.createdAt,
@@ -975,10 +1041,18 @@ export async function evaluateStageIntegrity(
       if (row.createdByAgentId) forbiddenAgents.add(row.createdByAgentId);
     }
     if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
-      return {
-        reason: "guard-b:return-assignee-unresolved",
-        detail: "no return assignee, delivery author, or creator agent recorded",
-      };
+      // SUP-15212: a live ladder is not expected to have its gated principal
+      // resolved yet, so an unresolvable one is not a finding there. On a done
+      // card it still refuses (the terminal card's approval cannot be
+      // attributed to a non-gated actor). Suppressed on live cards this also
+      // stops it from shadowing the inverse guard (the cascade returns on the
+      // first match).
+      if (!isLiveLadder) {
+        return {
+          reason: "guard-b:return-assignee-unresolved",
+          detail: "no return assignee, delivery author, or creator agent recorded",
+        };
+      }
     }
   }
 
@@ -991,6 +1065,40 @@ export async function evaluateStageIntegrity(
         detail: `stage ${stageId} decided by the resolved return assignee`,
       };
     }
+  }
+
+  // SUP-15212: the INVERSE of the forward `stage-without-decision` check above.
+  // Walk the decision rows and ask the opposite question: is there a durable
+  // `approved` verdict whose stage is declared in executionPolicy.stages yet
+  // landed in NEITHER completedStageIds NOR skippedStageIds? That is an
+  // orphaned decision the completion projection dropped — an approval the card's
+  // recorded completion does not reflect (the SUP-15120 shape). It is a
+  // ladder-integrity finding even on a card that is still live (in_review /
+  // blocked), which the widened audit selector now admits. A lawfully
+  // auto-skipped stage sits in skippedStageIds and is a legitimate exclusion, so
+  // it is never reported here.
+  //
+  // This check runs LAST in the cascade so it is strictly additive: any card
+  // already reported by an earlier guard (skipped-stage, no-completed-stage,
+  // stage-not-in-policy, stage-without-decision, decision-by-return-assignee,
+  // return-assignee-unresolved) keeps that reason unchanged, and the new
+  // `guard-b:decision-without-completed-stage` only surfaces for cards that pass
+  // every prior guard yet still hold an orphaned decision. That preserves the
+  // existing reason counts (no regression in existing detection).
+  const completedStageIdSet = new Set(completedStageIds);
+  const skippedStageIdSet = new Set(skippedStageIds);
+  for (const decision of decisions) {
+    if (decision.outcome !== "approved") continue;
+    if (!policyStageIds.has(decision.stageId)) continue;
+    if (completedStageIdSet.has(decision.stageId)) continue;
+    if (skippedStageIdSet.has(decision.stageId)) continue;
+    return {
+      reason: "guard-b:decision-without-completed-stage",
+      detail:
+        `decision ${decision.id} (stage ${decision.stageId}, approved at ` +
+        `${decision.createdAt.toISOString()}) is a durable approval, but stage ${decision.stageId} ` +
+        `is in executionPolicy.stages yet in neither completedStageIds nor skippedStageIds`,
+    };
   }
 
   return null;
