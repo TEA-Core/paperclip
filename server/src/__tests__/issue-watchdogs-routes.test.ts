@@ -664,4 +664,142 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       expect(res.body.error).toBe("Cannot assign watchdog to an agent that is not invokable");
     },
   );
+
+  it("lets a watchdog run post a comment then transition the watched issue in one run", async () => {
+    const companyId = await seedCompany();
+    const watchdogAgentId = await seedAgent(companyId, { name: "Fingerprint Watchdog" });
+    const watchedRootId = await seedIssue(companyId, {
+      title: "Watched root",
+      identifier: "WDOG-ADV-ROOT",
+      status: "blocked",
+      assigneeAgentId: watchdogAgentId,
+    });
+    const watchdogIssueId = await seedIssue(companyId, {
+      title: "Reusable watchdog issue",
+      identifier: "WDOG-ADV-WD",
+      parentId: watchedRootId,
+      assigneeAgentId: watchdogAgentId,
+      originKind: "task_watchdog",
+      originId: watchedRootId,
+    });
+    const runId = await seedWatchdogRun({
+      companyId,
+      watchdogAgentId,
+      watchedIssueId: watchedRootId,
+      watchdogIssueId,
+    });
+    const app = createApp(companyId, {
+      type: "agent",
+      agentId: watchdogAgentId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    const comment = await request(app)
+      .post(`/api/issues/${watchedRootId}/comments`)
+      .send({ body: "Watchdog verified the source; moving it forward." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+
+    const transition = await request(app)
+      .patch(`/api/issues/${watchedRootId}`)
+      .send({ status: "in_progress" });
+    expect(transition.status, JSON.stringify(transition.body)).toBe(200);
+    expect(transition.body.status).toBe("in_progress");
+  });
+
+  it("lets a watchdog run replace a pending interaction in the same run without a stale rejection", async () => {
+    const companyId = await seedCompany();
+    const watchdogAgentId = await seedAgent(companyId, { name: "Incident Watchdog" });
+    const watchedRootId = await seedIssue(companyId, {
+      title: "Watched root",
+      identifier: "WDOG-INC-ROOT",
+      status: "blocked",
+    });
+    const watchdogIssueId = await seedIssue(companyId, {
+      title: "Reusable watchdog issue",
+      identifier: "WDOG-INC-WD",
+      parentId: watchedRootId,
+      assigneeAgentId: watchdogAgentId,
+      originKind: "task_watchdog",
+      originId: watchedRootId,
+    });
+    const runId = await seedWatchdogRun({
+      companyId,
+      watchdogAgentId,
+      watchedIssueId: watchedRootId,
+      watchdogIssueId,
+    });
+    const app = createApp(companyId, {
+      type: "agent",
+      agentId: watchdogAgentId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    const created = await request(app)
+      .post(`/api/issues/${watchedRootId}/interactions`)
+      .send({
+        kind: "suggest_tasks",
+        payload: { version: 1, tasks: [{ clientKey: "a", title: "First follow-up" }] },
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+    const withdrawn = await request(app)
+      .post(`/api/issues/${watchedRootId}/interactions/${created.body.id}/withdraw`)
+      .send({ reason: "Watchdog replacing the ask with a corrected follow-up" });
+    expect(withdrawn.status, JSON.stringify(withdrawn.body)).toBe(200);
+
+    const replaced = await request(app)
+      .post(`/api/issues/${watchedRootId}/interactions`)
+      .send({
+        kind: "suggest_tasks",
+        payload: { version: 1, tasks: [{ clientKey: "b", title: "Corrected follow-up" }] },
+      });
+    expect(replaced.status, JSON.stringify(replaced.body)).toBe(201);
+  });
+
+  it("still rejects a watchdog write when a different actor moved the watched subtree", async () => {
+    const companyId = await seedCompany();
+    const watchdogAgentId = await seedAgent(companyId, { name: "Guard Watchdog" });
+    const watchedRootId = await seedIssue(companyId, {
+      title: "Watched root",
+      identifier: "WDOG-GUARD-ROOT",
+      status: "blocked",
+    });
+    const watchdogIssueId = await seedIssue(companyId, {
+      title: "Reusable watchdog issue",
+      identifier: "WDOG-GUARD-WD",
+      parentId: watchedRootId,
+      assigneeAgentId: watchdogAgentId,
+      originKind: "task_watchdog",
+      originId: watchedRootId,
+    });
+    const runId = await seedWatchdogRun({
+      companyId,
+      watchdogAgentId,
+      watchedIssueId: watchedRootId,
+      watchdogIssueId,
+    });
+    const app = createApp(companyId, {
+      type: "agent",
+      agentId: watchdogAgentId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    // A different actor moves the watched subtree after the run observed it,
+    // changing the stop fingerprint without touching the run's stored copy.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, watchedRootId));
+
+    const denied = await request(app)
+      .patch(`/api/issues/${watchedRootId}`)
+      .send({ status: "done" });
+    expect(denied.status, JSON.stringify(denied.body)).toBe(409);
+    expect(denied.body.error).toContain("changed by an actor other than this run");
+    expect(denied.body.error).toContain("scheduler will open a fresh review");
+    expect(denied.body.error).not.toContain("refresh the source state");
+  });
 });
