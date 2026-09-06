@@ -20,6 +20,7 @@ import {
 import {
   runApprovalStatusReconcilerTick,
   startApprovalStatusReconciler,
+  evaluateStageIntegrity,
   type ApprovalStatusReconcilerTickSummary,
 } from "./approval-status-reconciler.js";
 
@@ -2887,6 +2888,101 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
       // Guard B refuses before any GitHub read.
       expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("SUP-15212: inverse stage-integrity guard (orphaned decision)", () => {
+    const POLICY = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        { id: APPROVAL_STAGE_ID, type: "approval", approvalsNeeded: 1 },
+        { id: REVIEW_STAGE_ID, type: "review", approvalsNeeded: 1 },
+      ],
+    };
+
+    function buildRow(
+      issueId: string,
+      executionState: Record<string, unknown>,
+      executionPolicy: Record<string, unknown>,
+    ) {
+      return {
+        id: issueId,
+        companyId,
+        identifier: "SUP-INV",
+        createdByAgentId: AGENT_CREATOR,
+        createdByUserId: null,
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        executionState,
+        executionPolicy,
+      };
+    }
+
+    it("flags a durable approved decision whose stage is in policy but in neither completedStageIds nor skippedStageIds", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [APPROVAL_STAGE_ID], skippedStageIds: [] },
+      });
+      // APPROVAL_STAGE_ID is completed + decided (clean); REVIEW_STAGE_ID carries
+      // a durable approved verdict but is recorded in neither completed nor skipped.
+      await insertDecision(issueId, { stageId: APPROVAL_STAGE_ID, actorUserId: USER_REVIEWER });
+      await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [APPROVAL_STAGE_ID], skippedStageIds: [] },
+          POLICY,
+        ),
+      );
+
+      expect(verdict?.reason).toBe("guard-b:decision-without-completed-stage");
+      expect(verdict?.detail).toContain(REVIEW_STAGE_ID);
+    });
+
+    it("treats a stage in skippedStageIds as a legitimate exclusion, not an orphaned decision", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: {
+          completedStageIds: [APPROVAL_STAGE_ID],
+          skippedStageIds: [REVIEW_STAGE_ID],
+        },
+      });
+      await insertDecision(issueId, { stageId: APPROVAL_STAGE_ID, actorUserId: USER_REVIEWER });
+      await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [APPROVAL_STAGE_ID], skippedStageIds: [REVIEW_STAGE_ID] },
+          POLICY,
+        ),
+      );
+
+      expect(verdict?.reason).not.toBe("guard-b:decision-without-completed-stage");
+    });
+
+    it("does not flag a decision for a stage that is not in executionPolicy.stages", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [APPROVAL_STAGE_ID], skippedStageIds: [] },
+      });
+      await insertDecision(issueId, { stageId: APPROVAL_STAGE_ID, actorUserId: USER_REVIEWER });
+      await insertDecision(issueId, { stageId: randomUUID(), actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [APPROVAL_STAGE_ID], skippedStageIds: [] },
+          POLICY,
+        ),
+      );
+
+      expect(verdict?.reason).not.toBe("guard-b:decision-without-completed-stage");
     });
   });
 
