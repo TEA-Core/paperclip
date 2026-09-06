@@ -5835,6 +5835,91 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(escalationComment?.body).not.toContain("live reviewer run");
   });
 
+  it.each([
+    "wake_assignee",
+    "wake_assignee_on_accept",
+  ] as const)("releases a review participant held on a pending %s interaction instead of parking it blocked", async (continuationPolicy) => {
+    // SUP-15237: a review child correctly holding for a recorded board answer (a pending
+    // interaction whose continuationPolicy wakes the assignee) has a durable wake path. The
+    // execution-review-participant producer must use the same liveness predicate as the
+    // zero-blocker heal and release the card, never park it `blocked` with an empty blocker
+    // set. This is the exact inverse of "blocks a review participant that keeps deferring
+    // past the deferral retry limit" above: the identical card, but with a pending wake
+    // interaction present.
+    const { companyId, agentId, issueId, runId } = await seedInReviewParticipantRunFixture({
+      wakeReason: "execution_review_participant_recovery",
+      retryReason: "execution_review_participant_recovery",
+    });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      createdByRunId: runId,
+      body: "Still deferring the review decision.",
+    });
+    // Two earlier terminal deferral retries already burned the budget; without the pending
+    // interaction below this run would be the third and would park the card blocked.
+    for (const index of [0, 1]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "succeeded",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "execution_review_participant_recovery",
+          retryReason: "execution_review_participant_recovery",
+        },
+        startedAt: new Date(`2026-03-18T0${index}:00:00.000Z`),
+        finishedAt: new Date(`2026-03-18T0${index}:05:00.000Z`),
+        updatedAt: new Date(`2026-03-18T0${index}:05:00.000Z`),
+      });
+    }
+    // The held board gate: answering it wakes the assignee, who corrects the status.
+    await db.insert(issueThreadInteractions).values({
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy,
+      createdByAgentId: agentId,
+      payload: { version: 1, prompt: "Approve before I decide the review?" },
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+    expect(settledRun?.status).toBe("succeeded");
+
+    // The card stays held in review: released, not parked.
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_review");
+
+    // No recovery action was minted and no zero-blocker park was written.
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(recoveryActions).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body.includes("deferral limit"))).toBe(false);
+
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(activity.some((event) =>
+      (event.details as Record<string, unknown> | null)?.source ===
+        "recovery.reconcile_execution_review_participant",
+    )).toBe(false);
+  });
+
   // SUP-11306: a reviewer whose run keeps succeeding is not a dead execution path, so the
   // stage is re-armed under it up to the deferral limit before the issue is escalated.
   it("retries a pending execution-review participant up to the deferral limit before blocking with a recovery action", { timeout: 10_000 }, async () => {
