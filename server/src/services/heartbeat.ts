@@ -288,7 +288,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES, recoveryService } from "./recovery/service.js";
+import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES, hasPendingWakeInteraction, recoveryService } from "./recovery/service.js";
 import { collectDispositionRepairSourceState } from "./recovery/disposition-repair.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
@@ -19381,6 +19381,12 @@ function pendingCleanupAttemptsSql() {
           options.suppressImmediateRecovery ||
           existingReviewParticipantExecutionPath ||
           issueHasPersistedMonitor ||
+          // A held review child gated on a pending board interaction whose continuationPolicy
+          // wakes the assignee has a durable, self-resolving wake path. Parking it `blocked`
+          // with an empty blocker set is exactly the state the zero-blocker heal
+          // (reconcileBlockedWithoutBlockers) is forbidden to touch, so both sweeps must use
+          // the same liveness predicate and release rather than block (SUP-15237).
+          (await hasPendingWakeInteraction(db, issue.companyId, issue.id)) ||
           await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
         ) {
           return { kind: "released" as const };
