@@ -1177,6 +1177,88 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.reason).not.toContain("Mechanism D");
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
+
+    it("counts exactly one parentless blocker (count 1, below threshold): SUP-15228 live shape after its blockedBy edge was attached", async () => {
+      // Live shape of SUP-15110 once SUP-15228 itself was attached as a
+      // blockedBy edge: two parented siblings (SUP-15106 / SUP-15109, both
+      // parent_id = SUP-15099) are excluded from edge 2, and the one parentless
+      // blocker (SUP-15228) is the sole countable row. Count = 1 < 2, so the
+      // leaf child closes cleanly. Pairs with the boundary case below: this
+      // documents the count-1 resolution; that one proves the parentless row is
+      // actually counted rather than over-filtered to 0.
+      const siblingParentId = "99999999-9999-4999-8999-999999999999";
+      setupDbMock({
+        issues: [],
+        issueRelations: [
+          { id: "rel-1", companyId: "company-1", issueId: "sibling-1", relatedIssueId: "issue-1", type: "blocks" },
+          { id: "rel-2", companyId: "company-1", issueId: "sibling-2", relatedIssueId: "issue-1", type: "blocks" },
+          { id: "rel-3", companyId: "company-1", issueId: "blocker-3", relatedIssueId: "issue-1", type: "blocks" },
+        ],
+        blockedByIssues: [
+          { id: "sibling-1", identifier: "SUP-15106", parentId: siblingParentId, executionPolicy: { stages: [{ id: "40000000-0000-4000-8000-000000000001", type: "review" }] }, executionState: satisfiedState(["40000000-0000-4000-8000-000000000001"]) },
+          { id: "sibling-2", identifier: "SUP-15109", parentId: siblingParentId, executionPolicy: { stages: [{ id: "50000000-0000-4000-8000-000000000002", type: "review" }] }, executionState: satisfiedState(["50000000-0000-4000-8000-000000000002"]) },
+          { id: "blocker-3", identifier: "SUP-15228", parentId: null, executionPolicy: { stages: [{ id: "60000000-0000-4000-8000-000000000003", type: "review" }] }, executionState: satisfiedState(["60000000-0000-4000-8000-000000000003"]) },
+        ],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: siblingParentId, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.reason).not.toContain("Mechanism D");
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("still counts parentless blockers and ignores parented ones (SUP-15228 boundary: 2 parentless fire, 2 parented excluded)", async () => {
+      // Load-bearing boundary case proving the SUP-15228 filter is not
+      // over-tuned to the 0-vs-2 boundary: two parentless blockedBy predecessors
+      // are counted (count reaches 2, so mechanism D fires), while two parented
+      // siblings are ignored (they are dependencies, not children). If the
+      // filter had dropped the parentless rows too, the count would be 0 and
+      // mechanism D would not fire. If it had kept the parented rows, the
+      // identifiers would include them.
+      const siblingParentId = "99999999-9999-4999-8999-999999999999";
+      setupDbMock({
+        issues: [],
+        issueRelations: [
+          { id: "rel-1", companyId: "company-1", issueId: "parentless-1", relatedIssueId: "issue-1", type: "blocks" },
+          { id: "rel-2", companyId: "company-1", issueId: "parentless-2", relatedIssueId: "issue-1", type: "blocks" },
+          { id: "rel-3", companyId: "company-1", issueId: "sibling-1", relatedIssueId: "issue-1", type: "blocks" },
+          { id: "rel-4", companyId: "company-1", issueId: "sibling-2", relatedIssueId: "issue-1", type: "blocks" },
+        ],
+        blockedByIssues: [
+          { id: "parentless-1", identifier: "SUP-P1", parentId: null, executionPolicy: { stages: [{ id: "70000000-0000-4000-8000-000000000001", type: "review" }] }, executionState: satisfiedState(["70000000-0000-4000-8000-000000000001"]) },
+          { id: "parentless-2", identifier: "SUP-P2", parentId: null, executionPolicy: { stages: [{ id: "71000000-0000-4000-8000-000000000002", type: "review" }] }, executionState: satisfiedState(["71000000-0000-4000-8000-000000000002"]) },
+          { id: "sibling-1", identifier: "SUP-15106", parentId: siblingParentId, executionPolicy: { stages: [{ id: "72000000-0000-4000-8000-000000000003", type: "review" }] }, executionState: satisfiedState(["72000000-0000-4000-8000-000000000003"]) },
+          { id: "sibling-2", identifier: "SUP-15109", parentId: siblingParentId, executionPolicy: { stages: [{ id: "73000000-0000-4000-8000-000000000004", type: "review" }] }, executionState: satisfiedState(["73000000-0000-4000-8000-000000000004"]) },
+        ],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: siblingParentId, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism D");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-P1", "SUP-P2"],
+          }),
+        }),
+      );
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
   });
 
   describe("ungated decomposed parent (SUP-14561 mechanism A)", () => {
