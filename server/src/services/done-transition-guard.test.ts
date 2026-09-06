@@ -91,30 +91,24 @@ function mockProjectRow(row: Partial<Record<string, unknown>> = {}) {
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[] }) {
   // SUP-14561: the guard now also reads the issues table (child ladder scan).
-  // Dispatch by table identity when `rows.issues`/`rows.blockedByIssues` is
-  // seeded; otherwise every select().from().where() resolves to the
-  // executionWorkspaces rows exactly as the legacy chain did, so pre-existing
-  // tests are untouched. SUP-15031: countLadderedChildren issues up to TWO
-  // issues-table queries — the first (parent_id edge) resolves to
-  // `rows.issues`, the second (blockedBy/inArray edge) to
-  // `rows.blockedByIssues`. A separate per-call counter keeps them apart.
+  // Dispatch by table identity when `rows.issues` is seeded; otherwise every
+  // select().from().where() resolves to the executionWorkspaces rows exactly
+  // as the legacy chain did, so pre-existing tests are untouched.
+  // SUP-15233: countLadderedChildren issues exactly ONE issues-table read
+  // (the parent_id edge); the SUP-15031 blockedBy re-read — and its
+  // `rows.blockedByIssues` seed and second-read dispatch — are gone.
   const issuesChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.issues ?? []),
     then: vi.fn().mockResolvedValue(rows.issues ?? []),
   };
-  // SUP-15031: the second issues-table read (blockedBy children by id).
-  const blockedByIssuesChain = {
-    from: vi.fn().mockReturnThis(),
-    where: vi.fn().mockResolvedValue(rows.blockedByIssues ?? []),
-    then: vi.fn().mockResolvedValue(rows.blockedByIssues ?? []),
-  };
-  // SUP-15031: the guard now also reads issue_relations (blockedBy edge of the
-  // child ladder scan). Dispatched by table identity; the guard fetches the
-  // `issue_id` values of every `blocks` relation whose `related_issue_id` is
-  // the parent, so the mock returns the seeded rows unfiltered.
+  // SUP-15031: the guard once read issue_relations (blockedBy edge of the
+  // child ladder scan). SUP-15233 dropped that edge, so the guard no longer
+  // dispatches here — the table-identity dispatch is kept so tests can still
+  // seed live blockedBy shapes in `rows.issueRelations` as documentation
+  // without the guard consuming them.
   const relationsChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.issueRelations ?? []),
@@ -158,21 +152,13 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockReturnThis(),
     then: vi.fn().mockResolvedValue(rows.projectWorkspaces ?? []),
   };
-  // SUP-15031: countLadderedChildren issues up to two issues-table reads in a
-  // single guard call. The counter must outlive individual `db.select()` calls
-  // (the per-call `mockImplementation` below re-runs on every select), so it is
-  // scoped to `setupDbMock` — fresh per test, shared across that test's selects.
-  let issuesCallCount = 0;
   (mockDb.select as any).mockImplementation((_cols?: any) => {
     let callCount = 0;
     const chains = [selectChain, selectChain2, selectChain3, selectChain4];
     return {
       from: function (table: unknown) {
         if (table === issueRelationsTable) return relationsChain;
-        if (table === issuesTable && (rows.issues !== undefined || rows.blockedByIssues !== undefined)) {
-          issuesCallCount++;
-          return issuesCallCount === 1 ? issuesChain : blockedByIssuesChain;
-        }
+        if (table === issuesTable && rows.issues !== undefined) return issuesChain;
         if (table === agentsTable && rows.agents !== undefined) return agentsChain;
         if (table === issueExecutionDecisionsTable) return decisionsChain;
         const chain = chains[callCount] ?? selectChain;
@@ -1112,16 +1098,23 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
-    it("refuses the ADR-072 close-ladder shape when children are reachable only via blockedBy (SUP-15031)", async () => {
+    it("does not fire Mechanism D when laddered predecessors are reachable only via blockedBy (SUP-15233 supersedes SUP-15031)", async () => {
+      // SUP-15233 supersedes SUP-15031: a `blocks` row is a dependency edge,
+      // not a decomposition edge, and a predecessor is not a child at any tree
+      // depth. The live shape this originally refused (a parent whose
+      // "children" were linked only by `blocks` rows with zero parent_id
+      // children — the live SUP-14904 shape) is knowingly excluded: that
+      // instance was contained before its blockers cleared (SUP-15032
+      // installed the close ladder) and is closed, and the SUP-15031 corpus
+      // scan found no other instance (0 of 130 recently completed issues
+      // closed with >=2 blockedBy relations). The issue_relations seed below
+      // documents the live shape; the guard no longer reads it in the child
+      // ladder scan.
       setupDbMock({
         issues: [],
         issueRelations: [
           { id: "rel-1", companyId: "company-1", issueId: "child-1", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-2", companyId: "company-1", issueId: "child-2", relatedIssueId: "issue-1", type: "blocks" },
-        ],
-        blockedByIssues: [
-          { id: "child-1", identifier: "SUP-D1", executionPolicy: { stages: [{ id: "40000000-0000-4000-8000-000000000001", type: "review" }] }, executionState: satisfiedState(["40000000-0000-4000-8000-000000000001"]) },
-          { id: "child-2", identifier: "SUP-D2", executionPolicy: { stages: [{ id: "50000000-0000-4000-8000-000000000002", type: "review" }] }, executionState: satisfiedState(["50000000-0000-4000-8000-000000000002"]) },
         ],
         agents,
       });
@@ -1130,41 +1123,31 @@ describe("evaluateDoneTransitionGuard", () => {
         { ...issue, parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
         null,
       );
-      expect(result.allowed).toBe(false);
-      expect(result.skipped).toBe(false);
-      expect(result.reason).toContain("Mechanism D");
-      expect(result.reason).toContain("ADR-072 close-ladder shape");
-      // Fail closed before any external probe: no GitHub call, no PR resolution.
-      expect(ghFetchMock).not.toHaveBeenCalled();
-      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
-      expect(logActivity).toHaveBeenCalledWith(
+      expect(result.allowed).toBe(true);
+      expect(result.reason).not.toContain("Mechanism D");
+      expect(logActivity).not.toHaveBeenCalledWith(
         expect.anything(),
-        expect.objectContaining({
-          action: "issue.done_transition_ladder_shape_refused",
-          details: expect.objectContaining({
-            reason: "adr072_close_ladder_shape_incomplete",
-            ladderedChildCount: 2,
-            ladderedChildIdentifiers: ["SUP-D1", "SUP-D2"],
-          }),
-        }),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
       );
+      // The head zone is unreachable with no resolvable repo context, so no
+      // branch-compare fetch is issued.
+      expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
     it("does not fire Mechanism D when edge-2 blockers carry a non-null parentId (SUP-15228 sibling shape)", async () => {
       // Reproduces the live SUP-15110 shape: a leaf coding child with two
       // blockedBy predecessors (siblings) that each ran ladders. Before the
       // fix, those siblings were counted as "laddered children" and mechanism D
-      // fired with a 409. After the fix, siblings with parentId are excluded.
+      // fired with a 409. SUP-15228 excluded siblings carrying a parentId;
+      // SUP-15233 supersedes that filter entirely — no blockedBy row
+      // contributes to the child count, parented or not, so the sibling shape
+      // stays exempt. The issue_relations seed documents the live shape.
       const siblingParentId = "99999999-9999-4999-8999-999999999999";
       setupDbMock({
         issues: [],
         issueRelations: [
           { id: "rel-1", companyId: "company-1", issueId: "sibling-1", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-2", companyId: "company-1", issueId: "sibling-2", relatedIssueId: "issue-1", type: "blocks" },
-        ],
-        blockedByIssues: [
-          { id: "sibling-1", identifier: "SUP-15106", parentId: siblingParentId, executionPolicy: { stages: [{ id: "40000000-0000-4000-8000-000000000001", type: "review" }] }, executionState: satisfiedState(["40000000-0000-4000-8000-000000000001"]) },
-          { id: "sibling-2", identifier: "SUP-15109", parentId: siblingParentId, executionPolicy: { stages: [{ id: "50000000-0000-4000-8000-000000000002", type: "review" }] }, executionState: satisfiedState(["50000000-0000-4000-8000-000000000002"]) },
         ],
         agents,
       });
@@ -1178,14 +1161,14 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
-    it("counts exactly one parentless blocker (count 1, below threshold): SUP-15228 live shape after its blockedBy edge was attached", async () => {
-      // Live shape of SUP-15110 once SUP-15228 itself was attached as a
-      // blockedBy edge: two parented siblings (SUP-15106 / SUP-15109, both
-      // parent_id = SUP-15099) are excluded from edge 2, and the one parentless
-      // blocker (SUP-15228) is the sole countable row. Count = 1 < 2, so the
-      // leaf child closes cleanly. Pairs with the boundary case below: this
-      // documents the count-1 resolution; that one proves the parentless row is
-      // actually counted rather than over-filtered to 0.
+    it("counts zero for the SUP-15228 live shape: the parentless blocker is a predecessor, not a child (SUP-15233 supersedes the count-1 resolution)", async () => {
+      // Superseded by SUP-15233: this test previously documented the count-1
+      // resolution of the SUP-15228 filter — the two parented siblings
+      // (SUP-15106 / SUP-15109, parent_id = SUP-15099) excluded from edge 2
+      // and the one parentless blocker (SUP-15228) counted. After SUP-15233
+      // the blockedBy edge is dropped entirely, so this live shape counts 0:
+      // a predecessor is not a child at any tree depth. The outcome (close
+      // allowed) is unchanged; the documented count is 0, not 1.
       const siblingParentId = "99999999-9999-4999-8999-999999999999";
       setupDbMock({
         issues: [],
@@ -1193,11 +1176,6 @@ describe("evaluateDoneTransitionGuard", () => {
           { id: "rel-1", companyId: "company-1", issueId: "sibling-1", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-2", companyId: "company-1", issueId: "sibling-2", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-3", companyId: "company-1", issueId: "blocker-3", relatedIssueId: "issue-1", type: "blocks" },
-        ],
-        blockedByIssues: [
-          { id: "sibling-1", identifier: "SUP-15106", parentId: siblingParentId, executionPolicy: { stages: [{ id: "40000000-0000-4000-8000-000000000001", type: "review" }] }, executionState: satisfiedState(["40000000-0000-4000-8000-000000000001"]) },
-          { id: "sibling-2", identifier: "SUP-15109", parentId: siblingParentId, executionPolicy: { stages: [{ id: "50000000-0000-4000-8000-000000000002", type: "review" }] }, executionState: satisfiedState(["50000000-0000-4000-8000-000000000002"]) },
-          { id: "blocker-3", identifier: "SUP-15228", parentId: null, executionPolicy: { stages: [{ id: "60000000-0000-4000-8000-000000000003", type: "review" }] }, executionState: satisfiedState(["60000000-0000-4000-8000-000000000003"]) },
         ],
         agents,
       });
@@ -1215,14 +1193,18 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
-    it("still counts parentless blockers and ignores parented ones (SUP-15228 boundary: 2 parentless fire, 2 parented excluded)", async () => {
-      // Load-bearing boundary case proving the SUP-15228 filter is not
-      // over-tuned to the 0-vs-2 boundary: two parentless blockedBy predecessors
-      // are counted (count reaches 2, so mechanism D fires), while two parented
-      // siblings are ignored (they are dependencies, not children). If the
-      // filter had dropped the parentless rows too, the count would be 0 and
-      // mechanism D would not fire. If it had kept the parented rows, the
-      // identifiers would include them.
+    it("closes the SUP-15110 live shape with any number of parentless blockedBy predecessors (>= 2) (SUP-15233 regression)", async () => {
+      // Superseded by SUP-15233: this test previously asserted the SUP-15228
+      // boundary — two parentless blockedBy predecessors fire mechanism D.
+      // A predecessor is not a child at any tree depth: a `blocks` row answers
+      // "what had to land first?", not "was the work gated at the children?".
+      // Counting predecessors as children is what trapped SUP-15110 at count 1
+      // of the >= 2 threshold, so attaching one more parentless blocker (a
+      // platform card, an ops card, whatever filed top-level) silently
+      // re-fired the identical 409 and re-stranded the card. After SUP-15233
+      // any number of parentless blockedBy predecessors contributes 0 to the
+      // child count and the leaf closes. The issue_relations seed documents
+      // the live shape (2 parentless + 2 parented, all laddered).
       const siblingParentId = "99999999-9999-4999-8999-999999999999";
       setupDbMock({
         issues: [],
@@ -1232,12 +1214,6 @@ describe("evaluateDoneTransitionGuard", () => {
           { id: "rel-3", companyId: "company-1", issueId: "sibling-1", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-4", companyId: "company-1", issueId: "sibling-2", relatedIssueId: "issue-1", type: "blocks" },
         ],
-        blockedByIssues: [
-          { id: "parentless-1", identifier: "SUP-P1", parentId: null, executionPolicy: { stages: [{ id: "70000000-0000-4000-8000-000000000001", type: "review" }] }, executionState: satisfiedState(["70000000-0000-4000-8000-000000000001"]) },
-          { id: "parentless-2", identifier: "SUP-P2", parentId: null, executionPolicy: { stages: [{ id: "71000000-0000-4000-8000-000000000002", type: "review" }] }, executionState: satisfiedState(["71000000-0000-4000-8000-000000000002"]) },
-          { id: "sibling-1", identifier: "SUP-15106", parentId: siblingParentId, executionPolicy: { stages: [{ id: "72000000-0000-4000-8000-000000000003", type: "review" }] }, executionState: satisfiedState(["72000000-0000-4000-8000-000000000003"]) },
-          { id: "sibling-2", identifier: "SUP-15109", parentId: siblingParentId, executionPolicy: { stages: [{ id: "73000000-0000-4000-8000-000000000004", type: "review" }] }, executionState: satisfiedState(["73000000-0000-4000-8000-000000000004"]) },
-        ],
         agents,
       });
       const result = await evaluateDoneTransitionGuard(
@@ -1245,17 +1221,11 @@ describe("evaluateDoneTransitionGuard", () => {
         { ...issue, parentId: siblingParentId, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
         null,
       );
-      expect(result.allowed).toBe(false);
-      expect(result.reason).toContain("Mechanism D");
-      expect(logActivity).toHaveBeenCalledWith(
+      expect(result.allowed).toBe(true);
+      expect(result.reason).not.toContain("Mechanism D");
+      expect(logActivity).not.toHaveBeenCalledWith(
         expect.anything(),
-        expect.objectContaining({
-          action: "issue.done_transition_ladder_shape_refused",
-          details: expect.objectContaining({
-            ladderedChildCount: 2,
-            ladderedChildIdentifiers: ["SUP-P1", "SUP-P2"],
-          }),
-        }),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
       );
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
@@ -1512,8 +1482,8 @@ describe("evaluateDoneTransitionGuard", () => {
       await expect(evaluateDoneTransitionGuard(mockDb, fixtureIssue(f!), null)).rejects.toThrow("postgres down");
     });
 
-    // SUP-15031: a laddered child reached only through a `blocks` relation.
-    // `issue_id` is the blocker/child; `related_issue_id` is the blocked/parent.
+    // A laddered child row for the issues-table seed (the parent_id edge, the
+    // sole child linkage after SUP-15233).
     const blockedByLadderedChild = (id: string, identifier: string) => ({
       id,
       identifier,
@@ -1521,16 +1491,23 @@ describe("evaluateDoneTransitionGuard", () => {
       executionState: childState([stageId]),
     });
 
-    it("refuses when laddered children are reachable only via blockedBy relations (SUP-15031)", async () => {
+    it("does not refuse when laddered predecessors are reachable only via blockedBy relations (SUP-15233 supersedes SUP-15031)", async () => {
+      // Knowingly excluded per SUP-15233 AC3: a `blocks` row is a dependency
+      // edge, not a decomposition edge, and a predecessor is not a child at any
+      // tree depth. The live shape this originally refused — a ladder-less
+      // parent whose "children" were linked only by `blocks` rows with zero
+      // parent_id children (the live SUP-14904 shape) — is no longer caught.
+      // That instance was contained before its blockers cleared (SUP-15032
+      // installed the close ladder) and is closed; the SUP-15031 corpus scan
+      // found no other instance (0 of 130 recently completed issues closed
+      // with >=2 blockedBy relations), and parent_id is the dominant
+      // decomposition edge. The issue_relations seed documents the live shape;
+      // the guard no longer reads it in the child ladder scan.
       setupDbMock({
         issues: [],
         issueRelations: [
           { id: "rel-1", companyId: "company-1", issueId: "child-1", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-2", companyId: "company-1", issueId: "child-2", relatedIssueId: "issue-1", type: "blocks" },
-        ],
-        blockedByIssues: [
-          blockedByLadderedChild("child-1", "SUP-B1"),
-          blockedByLadderedChild("child-2", "SUP-B2"),
         ],
       });
       const result = await evaluateDoneTransitionGuard(
@@ -1538,37 +1515,26 @@ describe("evaluateDoneTransitionGuard", () => {
         { ...issue, executionPolicy: null, executionState: null },
         null,
       );
-      expect(result.allowed).toBe(false);
-      expect(result.skipped).toBe(false);
-      expect(result.reason).toContain("Mechanism A");
-      expect(logActivity).toHaveBeenCalledWith(
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
         expect.anything(),
-        expect.objectContaining({
-          action: "issue.done_transition_null_policy_refused",
-          details: expect.objectContaining({
-            reason: "ungated_decomposed_parent",
-            ladderedChildCount: 2,
-            ladderedChildIdentifiers: ["SUP-B1", "SUP-B2"],
-          }),
-        }),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
       );
     });
 
     it("does not fire Mechanism A when edge-2 blockers carry a non-null parentId (SUP-15228 sibling shape, ladder-less variant)", async () => {
       // Ladder-less variant of the SUP-15110 shape: the issue under evaluation
       // has no execution policy, and its two blockedBy predecessors are siblings
-      // (they carry a non-null parentId). After the fix, they are excluded from
-      // edge 2 and mechanism A does not fire.
+      // (they carry a non-null parentId). SUP-15228 excluded them from edge 2;
+      // SUP-15233 supersedes that filter entirely — no blockedBy row
+      // contributes to the child count, so mechanism A does not fire. The
+      // issue_relations seed documents the live shape.
       const siblingParentId = "99999999-9999-4999-8999-999999999999";
       setupDbMock({
         issues: [],
         issueRelations: [
           { id: "rel-1", companyId: "company-1", issueId: "sibling-1", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-2", companyId: "company-1", issueId: "sibling-2", relatedIssueId: "issue-1", type: "blocks" },
-        ],
-        blockedByIssues: [
-          { id: "sibling-1", identifier: "SUP-15106", parentId: siblingParentId, executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] }, executionState: childState([stageId]) },
-          { id: "sibling-2", identifier: "SUP-15109", parentId: siblingParentId, executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] }, executionState: childState([stageId]) },
         ],
       });
       const result = await evaluateDoneTransitionGuard(
@@ -1583,18 +1549,18 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
-    it("counts a child linked by both parent_id and blockedBy once (SUP-15031 de-dup)", async () => {
-      // childA is reachable by both edges; childB only via blockedBy. The union
-      // is two distinct laddered children; a non-deduping count would report 3.
+    it("closes the SUP-15110 live shape under mechanism A with any number of parentless blockedBy predecessors (>= 2) (SUP-15233 regression)", async () => {
+      // Mechanism A consumes the same corrected count as mechanism D
+      // (countLadderedChildren is the shared helper). Ladder-less variant of
+      // the SUP-15110 trap: two parentless blockedBy predecessors that each
+      // ran ladders must NOT fire mechanism A, because a predecessor is not a
+      // child at any tree depth. The issue_relations seed documents the live
+      // shape; the guard no longer reads it in the child ladder scan.
       setupDbMock({
-        issues: [blockedByLadderedChild("childA", "SUP-A")],
+        issues: [],
         issueRelations: [
-          { id: "rel-1", companyId: "company-1", issueId: "childA", relatedIssueId: "issue-1", type: "blocks" },
-          { id: "rel-2", companyId: "company-1", issueId: "childB", relatedIssueId: "issue-1", type: "blocks" },
-        ],
-        blockedByIssues: [
-          blockedByLadderedChild("childA", "SUP-A"),
-          blockedByLadderedChild("childB", "SUP-B"),
+          { id: "rel-1", companyId: "company-1", issueId: "parentless-1", relatedIssueId: "issue-1", type: "blocks" },
+          { id: "rel-2", companyId: "company-1", issueId: "parentless-2", relatedIssueId: "issue-1", type: "blocks" },
         ],
       });
       const result = await evaluateDoneTransitionGuard(
@@ -1602,29 +1568,49 @@ describe("evaluateDoneTransitionGuard", () => {
         { ...issue, executionPolicy: null, executionState: null },
         null,
       );
-      expect(result.allowed).toBe(false);
-      expect(logActivity).toHaveBeenCalledWith(
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
         expect.anything(),
-        expect.objectContaining({
-          action: "issue.done_transition_null_policy_refused",
-          details: expect.objectContaining({
-            reason: "ungated_decomposed_parent",
-            ladderedChildCount: 2,
-          }),
-        }),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
       );
     });
 
-    it("does not count blockedBy children that never ran a ladder (SUP-15031 predicate applies to edge 2)", async () => {
+    it("counts a child linked by both parent_id and blockedBy once (SUP-15233: parent_id is the sole linkage edge)", async () => {
+      // Superseded by SUP-15233: this test previously proved the two-edge
+      // de-dup (childA reachable via both edges, childB only via blockedBy,
+      // union counted as 2). With the blockedBy edge dropped, childA is
+      // reached once via parent_id and childB — reachable only through a
+      // dependency edge — is not a child at all. Count stays 1, below the
+      // >= 2 threshold, so the ladder-less parent closes.
+      setupDbMock({
+        issues: [blockedByLadderedChild("childA", "SUP-A")],
+        issueRelations: [
+          { id: "rel-1", companyId: "company-1", issueId: "childA", relatedIssueId: "issue-1", type: "blocks" },
+          { id: "rel-2", companyId: "company-1", issueId: "childB", relatedIssueId: "issue-1", type: "blocks" },
+        ],
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+    });
+
+    it("does not count blockedBy predecessors that never ran a ladder (SUP-15233: no blockedBy row contributes)", async () => {
+      // SUP-15233 supersedes the SUP-15031 "predicate applies to edge 2"
+      // assertion: no blockedBy row contributes to the child count at all,
+      // laddered or not. The seed documents the live shape; the guard no
+      // longer reads it in the child ladder scan.
       setupDbMock({
         issues: [],
         issueRelations: [
           { id: "rel-1", companyId: "company-1", issueId: "child-1", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-2", companyId: "company-1", issueId: "child-2", relatedIssueId: "issue-1", type: "blocks" },
-        ],
-        blockedByIssues: [
-          { id: "child-1", identifier: "SUP-N1", executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] }, executionState: childState() },
-          { id: "child-2", identifier: "SUP-N2", executionPolicy: null, executionState: null },
         ],
       });
       const result = await evaluateDoneTransitionGuard(
