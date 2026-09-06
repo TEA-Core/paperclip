@@ -91,24 +91,24 @@ function mockProjectRow(row: Partial<Record<string, unknown>> = {}) {
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[] }) {
-  // SUP-14561: the guard now also reads the issues table (child ladder scan).
-  // Dispatch by table identity when `rows.issues` is seeded; otherwise every
-  // select().from().where() resolves to the executionWorkspaces rows exactly
-  // as the legacy chain did, so pre-existing tests are untouched.
-  // SUP-15233: countLadderedChildren issues exactly ONE issues-table read
-  // (the parent_id edge); the SUP-15031 blockedBy re-read — and its
-  // `rows.blockedByIssues` seed and second-read dispatch — are gone.
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[] }) {
+  // SUP-15233: the guard reads the issues table twice inside
+  // countLadderedChildren: read 1 is the parent_id edge (decomposition
+  // children), read 2 is the inArray re-read (blockedBy edge, only present in
+  // the buggy 3ed1372d shape). The two-chain dispatch returns rows.issues for
+  // read 1 and rows.blockedByIssues for read 2, so the buggy guard's inArray
+  // re-read gets the seeded parentless laddered rows and count ≥ 2 → the
+  // mechanism fires → the suite discriminates.
   const issuesChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.issues ?? []),
     then: vi.fn().mockResolvedValue(rows.issues ?? []),
   };
-  // SUP-15031: the guard once read issue_relations (blockedBy edge of the
-  // child ladder scan). SUP-15233 dropped that edge, so the guard no longer
-  // dispatches here — the table-identity dispatch is kept so tests can still
-  // seed live blockedBy shapes in `rows.issueRelations` as documentation
-  // without the guard consuming them.
+  const blockedByIssuesChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.blockedByIssues ?? []),
+    then: vi.fn().mockResolvedValue(rows.blockedByIssues ?? []),
+  };
   const relationsChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.issueRelations ?? []),
@@ -152,13 +152,17 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockReturnThis(),
     then: vi.fn().mockResolvedValue(rows.projectWorkspaces ?? []),
   };
+  let issuesCallCount = 0;
   (mockDb.select as any).mockImplementation((_cols?: any) => {
     let callCount = 0;
     const chains = [selectChain, selectChain2, selectChain3, selectChain4];
     return {
       from: function (table: unknown) {
         if (table === issueRelationsTable) return relationsChain;
-        if (table === issuesTable && rows.issues !== undefined) return issuesChain;
+        if (table === issuesTable && (rows.issues !== undefined || rows.blockedByIssues !== undefined)) {
+          issuesCallCount++;
+          return issuesCallCount === 1 ? issuesChain : blockedByIssuesChain;
+        }
         if (table === agentsTable && rows.agents !== undefined) return agentsChain;
         if (table === issueExecutionDecisionsTable) return decisionsChain;
         const chain = chains[callCount] ?? selectChain;
@@ -1172,6 +1176,10 @@ describe("evaluateDoneTransitionGuard", () => {
       const siblingParentId = "99999999-9999-4999-8999-999999999999";
       setupDbMock({
         issues: [],
+        blockedByIssues: [
+          { id: "blocker-1", companyId: "company-1", parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+          { id: "blocker-2", companyId: "company-1", parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        ],
         issueRelations: [
           { id: "rel-1", companyId: "company-1", issueId: "sibling-1", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-2", companyId: "company-1", issueId: "sibling-2", relatedIssueId: "issue-1", type: "blocks" },
@@ -1208,6 +1216,12 @@ describe("evaluateDoneTransitionGuard", () => {
       const siblingParentId = "99999999-9999-4999-8999-999999999999";
       setupDbMock({
         issues: [],
+        blockedByIssues: [
+          { id: "parentless-1", companyId: "company-1", parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+          { id: "parentless-2", companyId: "company-1", parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+          { id: "sibling-1", companyId: "company-1", parentId: siblingParentId, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+          { id: "sibling-2", companyId: "company-1", parentId: siblingParentId, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        ],
         issueRelations: [
           { id: "rel-1", companyId: "company-1", issueId: "parentless-1", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-2", companyId: "company-1", issueId: "parentless-2", relatedIssueId: "issue-1", type: "blocks" },
@@ -1558,6 +1572,10 @@ describe("evaluateDoneTransitionGuard", () => {
       // shape; the guard no longer reads it in the child ladder scan.
       setupDbMock({
         issues: [],
+        blockedByIssues: [
+          { id: "parentless-1", companyId: "company-1", parentId: null, executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] }, executionState: childState([stageId]) },
+          { id: "parentless-2", companyId: "company-1", parentId: null, executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review" }] }, executionState: childState([stageId]) },
+        ],
         issueRelations: [
           { id: "rel-1", companyId: "company-1", issueId: "parentless-1", relatedIssueId: "issue-1", type: "blocks" },
           { id: "rel-2", companyId: "company-1", issueId: "parentless-2", relatedIssueId: "issue-1", type: "blocks" },
