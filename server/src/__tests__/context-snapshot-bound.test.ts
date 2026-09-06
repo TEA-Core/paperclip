@@ -83,6 +83,19 @@ describe("boundContextSnapshot (pure)", () => {
     expect(result[CONTEXT_SNAPSHOT_TRUNCATION_MARKER]).toBeTruthy();
     expect(result.issueId).toBe("issue-circular");
   });
+
+  it("stays at or under the cap even when a single oversized preserved key (e.g. wakeReason) is present", () => {
+    const oversizedPreserved = boundedSnapshot(2 * 1024 * 1024, "issue-wake");
+    oversizedPreserved.wakeReason = "w".repeat(2 * 1024 * 1024);
+    expect(jsonByteLength(oversizedPreserved)).toBeGreaterThan(CONTEXT_SNAPSHOT_MAX_BYTES);
+
+    const result = boundContextSnapshot(oversizedPreserved);
+
+    expect(jsonByteLength(result)).toBeLessThanOrEqual(CONTEXT_SNAPSHOT_MAX_BYTES);
+    expect(result[CONTEXT_SNAPSHOT_TRUNCATION_MARKER]).toBeTruthy();
+    expect(typeof result.wakeReason).toBe("string");
+    expect(String(result.wakeReason)).toContain(CONTEXT_SNAPSHOT_TRUNCATION_MARKER);
+  });
 });
 
 describe("boundContextSnapshot (jsonb write round-trip)", () => {
