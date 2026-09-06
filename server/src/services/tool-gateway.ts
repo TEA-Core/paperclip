@@ -5017,6 +5017,14 @@ export function createToolGatewayService(
         }
       }
 
+      // The "not bound" determination is keyed off the agent's declared
+      // `permissions.pluginTools` allowlist — the per-agent binding — not the
+      // tool-profile visibility, which is a different (profile) binding. An
+      // absent allowlist means the agent is bound to every ready plugin's
+      // tools, so only a present allowlist that excludes the plugin key reports
+      // it as not bound (SUP-15090, criterion 4 + consume contract).
+      const allowlist = await pluginToolAllowlistForAgent(input.companyId, input.agentId);
+
       const plugins = installedPlugins
         .filter((plugin) => (plugin.manifestJson?.tools?.length ?? 0) > 0)
         .map((plugin) => {
@@ -5024,14 +5032,17 @@ export function createToolGatewayService(
           const registeredToolCount = registeredByPlugin.get(plugin.id) ?? 0;
           const visibleToolCount = visibleByPlugin.get(plugin.id) ?? 0;
           const isReady = plugin.status === "ready";
+          const notBound = allowlist !== null && !allowlist.has(plugin.pluginKey);
 
           let deliverable = false;
           let reason: string | null = null;
 
           if (!isReady) {
             reason = `Plugin "${plugin.pluginKey}" is in "${plugin.status}" status`;
+          } else if (notBound) {
+            reason = `Plugin "${plugin.pluginKey}" is not bound to this agent (excluded by permissions.pluginTools)`;
           } else if (visibleToolCount === 0) {
-            reason = `Plugin "${plugin.pluginKey}" tools are not bound to this agent`;
+            reason = `Plugin "${plugin.pluginKey}" has no tools visible to this agent under its tool profile`;
           } else {
             deliverable = true;
           }

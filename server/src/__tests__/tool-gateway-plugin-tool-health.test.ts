@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import express from "express";
 import { and, eq } from "drizzle-orm";
+import request from "supertest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
   companies,
@@ -15,6 +17,7 @@ import {
 import type { Db } from "@paperclipai/db";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
+import { toolGatewayRoutes } from "../routes/tool-gateway.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -34,7 +37,7 @@ async function createCompany(db: Db) {
     .then((rows) => rows[0]!);
 }
 
-async function createAgent(db: Db, companyId: string) {
+async function createAgent(db: Db, companyId: string, permissions: Record<string, unknown> = {}) {
   return db
     .insert(agents)
     .values({
@@ -44,7 +47,7 @@ async function createAgent(db: Db, companyId: string) {
       adapterType: "process",
       adapterConfig: {},
       runtimeConfig: {},
-      permissions: {},
+      permissions,
     })
     .returning()
     .then((rows) => rows[0]!);
@@ -238,7 +241,7 @@ describe("pluginToolHealth (embedded postgres)", () => {
     expect(notReadyEntry.reason).toBe('Plugin "acme.broken-plugin" is in "installed" status');
   });
 
-  it("reports not-bound reason when a ready plugin has no tools in the agent profile", async () => {
+  it("reports the tool-profile reason when a ready, allowlist-unbounded plugin has no profile-visible tools", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run: _run } = await createIssueAndRun(db, company.id, agent.id);
@@ -246,6 +249,177 @@ describe("pluginToolHealth (embedded postgres)", () => {
     const pluginId = randomUUID();
     await db.insert(plugins).values({
       id: pluginId,
+      pluginKey: "acme.profile-scoped-plugin",
+      packageName: "@acme/plugin-profile-scoped",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.profile-scoped-plugin",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Profile Scoped Plugin",
+        description: "Profile scoped plugin",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: [],
+        entrypoints: { worker: "./dist/worker.js" },
+        tools: [
+          { name: "do_z", displayName: "Do Z", description: "Does z", parametersSchema: { type: "object" } },
+        ],
+      },
+      status: "ready",
+      installOrder: 1,
+    });
+
+    const dispatcher = makeDispatcher(pluginId, ["acme.profile-scoped-plugin:do_z"]);
+    const gateway = createToolGatewayService(db, {
+      pluginToolDispatcher: dispatcher,
+      toolActionSigningSecret: "test-secret",
+    });
+
+    // No permissions.pluginTools allowlist (agent is bound to every ready
+    // plugin), but the tool profile denies the tool — so this is the
+    // profile-deny case and must NOT be reported as "not bound".
+    const result = await gateway.pluginToolHealth({ companyId: company.id, agentId: agent.id });
+    expect(result.plugins).toHaveLength(1);
+
+    const entry = result.plugins[0]!;
+    expect(entry).toMatchObject({
+      pluginKey: "acme.profile-scoped-plugin",
+      pluginStatus: "ready",
+      declaredToolCount: 1,
+      registeredToolCount: 1,
+      visibleToolCount: 0,
+      deliverable: false,
+    });
+    expect(entry.reason).toBe('Plugin "acme.profile-scoped-plugin" has no tools visible to this agent under its tool profile');
+  });
+
+  it("reports the permissions.pluginTools reason when a ready plugin is allowlist-excluded even though profile-visible", async () => {
+    const company = await createCompany(db);
+    // The allowlist names a DIFFERENT plugin, so acme.allowlisted-plugin is
+    // excluded by permissions.pluginTools even though its tool is profile-visible.
+    const agent = await createAgent(db, company.id, {
+      pluginTools: ["acme.other-bound-plugin"],
+    });
+    const { run: _run } = await createIssueAndRun(db, company.id, agent.id);
+
+    const pluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.allowlisted-plugin",
+      packageName: "@acme/plugin-allowlisted",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.allowlisted-plugin",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Allowlisted Plugin",
+        description: "Allowlisted plugin",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: [],
+        entrypoints: { worker: "./dist/worker.js" },
+        tools: [
+          { name: "do_a", displayName: "Do A", description: "Does a", parametersSchema: { type: "object" } },
+        ],
+      },
+      status: "ready",
+      installOrder: 1,
+    });
+
+    const dispatcher = makeDispatcher(pluginId, ["acme.allowlisted-plugin:do_a"]);
+    const gateway = createToolGatewayService(db, {
+      pluginToolDispatcher: dispatcher,
+      toolActionSigningSecret: "test-secret",
+    });
+
+    // The tool profile explicitly allows the tool so visibleToolCount > 0 —
+    // proving the "not bound" answer comes from the allowlist, not the profile.
+    await allowToolsForAgent(db, company.id, agent.id, ["acme.allowlisted-plugin:do_a"]);
+
+    const result = await gateway.pluginToolHealth({ companyId: company.id, agentId: agent.id });
+    expect(result.plugins).toHaveLength(1);
+
+    const entry = result.plugins[0]!;
+    expect(entry).toMatchObject({
+      pluginKey: "acme.allowlisted-plugin",
+      pluginStatus: "ready",
+      declaredToolCount: 1,
+      registeredToolCount: 1,
+      visibleToolCount: 1,
+      deliverable: false,
+    });
+    expect(entry.reason).toBe('Plugin "acme.allowlisted-plugin" is not bound to this agent (excluded by permissions.pluginTools)');
+  });
+
+  it("returns 200 for an agent-actor route call and distinguishes not-ready from not-bound", async () => {
+    const company = await createCompany(db);
+    // Allowlist includes acme.ready-plugin only: acme.excluded-plugin is ready
+    // but allowlist-excluded (not-bound); acme.broken-plugin is not-ready.
+    const agent = await createAgent(db, company.id, {
+      pluginTools: ["acme.ready-plugin"],
+    });
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+
+    const readyPluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: readyPluginId,
+      pluginKey: "acme.ready-plugin",
+      packageName: "@acme/plugin-ready",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.ready-plugin",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Ready Plugin",
+        description: "A ready plugin",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: [],
+        entrypoints: { worker: "./dist/worker.js" },
+        tools: [
+          { name: "do_thing", displayName: "Do Thing", description: "Does a thing", parametersSchema: { type: "object" } },
+        ],
+      },
+      status: "ready",
+      installOrder: 1,
+    });
+
+    const brokenPluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: brokenPluginId,
+      pluginKey: "acme.broken-plugin",
+      packageName: "@acme/plugin-broken",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.broken-plugin",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Broken Plugin",
+        description: "A broken plugin",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: [],
+        entrypoints: { worker: "./dist/worker.js" },
+        tools: [
+          { name: "do_x", displayName: "Do X", description: "Does x", parametersSchema: { type: "object" } },
+        ],
+      },
+      status: "installed",
+      installOrder: 2,
+    });
+
+    const excludedPluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: excludedPluginId,
       pluginKey: "acme.excluded-plugin",
       packageName: "@acme/plugin-excluded",
       version: "1.0.0",
@@ -262,32 +436,63 @@ describe("pluginToolHealth (embedded postgres)", () => {
         capabilities: [],
         entrypoints: { worker: "./dist/worker.js" },
         tools: [
-          { name: "do_z", displayName: "Do Z", description: "Does z", parametersSchema: { type: "object" } },
+          { name: "do_c", displayName: "Do C", description: "Does c", parametersSchema: { type: "object" } },
         ],
       },
       status: "ready",
-      installOrder: 1,
+      installOrder: 3,
     });
 
-    const dispatcher = makeDispatcher(pluginId, ["acme.excluded-plugin:do_z"]);
+    const dispatcher: PluginToolDispatcher = {
+      initialize: async () => {},
+      teardown: () => {},
+      listToolsForAgent: () => [
+        { name: "acme.ready-plugin:do_thing", displayName: "Do Thing", description: "test", parametersSchema: { type: "object" }, pluginId: readyPluginId },
+        { name: "acme.excluded-plugin:do_c", displayName: "Do C", description: "test", parametersSchema: { type: "object" }, pluginId: excludedPluginId },
+      ],
+      getTool: () => null,
+      executeTool: async () => { throw new Error("not used"); },
+      registerPluginTools: () => {},
+      unregisterPluginTools: () => {},
+      toolCount: () => 2,
+      getRegistry: () => { throw new Error("not used"); },
+    };
     const gateway = createToolGatewayService(db, {
       pluginToolDispatcher: dispatcher,
       toolActionSigningSecret: "test-secret",
     });
 
-    const result = await gateway.pluginToolHealth({ companyId: company.id, agentId: agent.id });
-    expect(result.plugins).toHaveLength(1);
+    await allowToolsForAgent(db, company.id, agent.id, ["acme.ready-plugin:do_thing", "acme.excluded-plugin:do_c"]);
 
-    const entry = result.plugins[0]!;
-    expect(entry).toMatchObject({
-      pluginKey: "acme.excluded-plugin",
-      pluginStatus: "ready",
-      declaredToolCount: 1,
-      registeredToolCount: 1,
-      visibleToolCount: 0,
-      deliverable: false,
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "agent",
+        companyId: company.id,
+        agentId: agent.id,
+        runId: run.id,
+        source: "agent_jwt",
+      };
+      next();
     });
-    expect(entry.reason).toBe('Plugin "acme.excluded-plugin" tools are not bound to this agent');
+    app.use("/api", toolGatewayRoutes(db, gateway));
+
+    const res = await request(app).get("/api/tool-gateway/plugin-tools/health");
+    expect(res.status).toBe(200);
+    const bodyPlugins = res.body.plugins as Array<{ pluginKey: string; pluginStatus: string; deliverable: boolean; reason: string | null; visibleToolCount: number }>;
+    expect(bodyPlugins).toHaveLength(3);
+
+    const ready = bodyPlugins.find((p) => p.pluginKey === "acme.ready-plugin")!;
+    expect(ready).toMatchObject({ deliverable: true, reason: null });
+
+    const broken = bodyPlugins.find((p) => p.pluginKey === "acme.broken-plugin")!;
+    expect(broken).toMatchObject({ pluginStatus: "installed", deliverable: false });
+    expect(broken.reason).toBe('Plugin "acme.broken-plugin" is in "installed" status');
+
+    const excluded = bodyPlugins.find((p) => p.pluginKey === "acme.excluded-plugin")!;
+    expect(excluded).toMatchObject({ pluginStatus: "ready", visibleToolCount: 1, deliverable: false });
+    expect(excluded.reason).toBe('Plugin "acme.excluded-plugin" is not bound to this agent (excluded by permissions.pluginTools)');
   });
 
   it("returns empty plugins array when no plugins declare tools", async () => {
