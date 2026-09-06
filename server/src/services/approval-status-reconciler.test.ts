@@ -22,6 +22,7 @@ import {
   startApprovalStatusReconciler,
   evaluateStageIntegrity,
   type ApprovalStatusReconcilerTickSummary,
+  type CandidateRow,
 } from "./approval-status-reconciler.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
@@ -2905,8 +2906,9 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       issueId: string,
       executionState: Record<string, unknown>,
       executionPolicy: Record<string, unknown>,
+      status?: string,
     ) {
-      return {
+      const row: CandidateRow = {
         id: issueId,
         companyId,
         identifier: "SUP-INV",
@@ -2917,6 +2919,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
         executionState,
         executionPolicy,
       };
+      if (status !== undefined) row.status = status;
+      return row;
     }
 
     it("flags a durable approved decision whose stage is in policy but in neither completedStageIds nor skippedStageIds", async () => {
@@ -2984,7 +2988,76 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
 
       expect(verdict?.reason).not.toBe("guard-b:decision-without-completed-stage");
     });
-  });
+
+    it("still flags a live card with an orphaned approved verdict via the inverse guard, not no-completed-stage", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [], skippedStageIds: [] },
+      });
+      // REVIEW_STAGE_ID holds a durable approved verdict but the live ladder has
+      // completed no stage. Pre-fix this card reported no-completed-stage (and the
+      // first-match return shadowed the inverse guard); post-fix the
+      // close-presupposing guard is suppressed for a live card and the inverse
+      // guard reports the orphan.
+      await insertDecision(issueId, { stageId: REVIEW_STAGE_ID, actorUserId: USER_REVIEWER });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [], skippedStageIds: [] },
+          POLICY,
+          "blocked",
+        ),
+      );
+
+      expect(verdict?.reason).toBe("guard-b:decision-without-completed-stage");
+    });
+
+    it("does not flag a live card whose only verdict is not a durable approval (no close-presupposing false positive)", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [], skippedStageIds: [] },
+      });
+      // A changes_requested verdict on a live card with an empty ladder is not an
+      // integrity defect: no-completed-stage is suppressed for live cards and the
+      // inverse guard only fires on an approved verdict.
+      await insertDecision(issueId, {
+        stageId: REVIEW_STAGE_ID,
+        actorUserId: USER_REVIEWER,
+        outcome: "changes_requested",
+      });
+
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(
+          issueId,
+          { completedStageIds: [], skippedStageIds: [] },
+          POLICY,
+          "in_review",
+        ),
+      );
+
+      expect(verdict?.reason).not.toBe("guard-b:no-completed-stage");
+      expect(verdict).toBeNull();
+    });
+
+    it("keeps flagging a terminal (done) card with an empty ladder via no-completed-stage (status absent or non-live)", async () => {
+      const issueId = await insertIssue({
+        executionPolicy: POLICY,
+        executionState: { completedStageIds: [], skippedStageIds: [] },
+      });
+      // No decision rows: nothing to audit beyond the empty ladder. On a terminal
+      // close the close-presupposing guard still fires (row.status absent here —
+      // the reconciler / decision-time candidates never project it).
+      const verdict = await evaluateStageIntegrity(
+        db,
+        buildRow(issueId, { completedStageIds: [], skippedStageIds: [] }, POLICY),
+      );
+
+      expect(verdict?.reason).toBe("guard-b:no-completed-stage");
+    });
+   });
 
   describe("SUP-14911: terminal resolution error on unhydrated PR", () => {
     /**

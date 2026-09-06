@@ -661,7 +661,9 @@ describeEmbeddedPostgres("stage-integrity audit route (ADR-073 D3, SUP-14923)", 
       createdAt: new Date("2026-09-05T04:18:44Z"),
     });
 
-    // blocked card with a live ladder -> admitted (flagged no-completed-stage).
+    // blocked card with a live ladder + an orphaned approved verdict ->
+    // admitted and flagged decision-without-completed-stage (the close-presupposing
+    // no-completed-stage must NOT fire on a live card with an empty completedStageIds).
     const blockedStage = randomUUID();
     const blocked = await seedIssue(db, {
       companyId: company.id,
@@ -683,6 +685,36 @@ describeEmbeddedPostgres("stage-integrity audit route (ADR-073 D3, SUP-14923)", 
       outcome: "approved",
       body: "live-blocked-verdict",
       createdAt: new Date("2026-09-05T03:00:00Z"),
+    });
+
+    // blocked card whose only verdict is changes_requested (not a durable approval)
+    // and whose ladder has completed no stage -> admitted but NOT flagged. This is
+    // the regression the round-1 review required: pre-fix, `no-completed-stage`
+    // fired on the empty completedStageIds and shadowed every later guard; post-fix
+    // the close-presupposing guard is suppressed for a live card and the inverse
+    // (orphaned-decision) guard only fires on a durable approved verdict, so a
+    // changes_requested verdict is not a defect.
+    const parkedStage = randomUUID();
+    const parked = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Live ladder (blocked, changes requested)",
+      identifier: "SIA-LIVE-PARKED",
+      status: "blocked",
+      executionPolicy: reviewPolicy(parkedStage),
+      executionState: { completedStageIds: [], skippedStageIds: [] },
+      completedAt: null,
+      createdByAgentId: agent.id,
+    });
+    await seedDecision(db, {
+      companyId: company.id,
+      issueId: parked.id,
+      stageId: parkedStage,
+      stageType: "review",
+      actorUserId: "board-user",
+      outcome: "changes_requested",
+      body: "live-parked-changes-requested",
+      createdAt: new Date("2026-09-05T03:30:00Z"),
     });
 
     // cancelled card that would otherwise be a live-ladder finding -> excluded.
@@ -746,11 +778,16 @@ describeEmbeddedPostgres("stage-integrity audit route (ADR-073 D3, SUP-14923)", 
     expect(identifiers.has("SIA-CANCELLED")).toBe(false);
     // ...and a live card that never decided anything is not admitted.
     expect(identifiers.has("SIA-LIVE-NODEC")).toBe(false);
+    // ...and a live card with a non-approving verdict and an empty ladder is
+    // admitted but produces no finding (no close-presupposing false positive).
+    expect(identifiers.has("SIA-LIVE-PARKED")).toBe(false);
 
     const reviewRow = res.body.find((row: { identifier: string }) => row.identifier === "SIA-LIVE-REVIEW");
     expect(reviewRow?.reason).toBe("guard-b:decision-without-completed-stage");
     const blockedRow = res.body.find((row: { identifier: string }) => row.identifier === "SIA-LIVE-BLOCKED");
-    expect(blockedRow?.reason).toBe("guard-b:no-completed-stage");
+    // Round-1 fix: a live (blocked) card with an orphaned approved verdict is
+    // flagged by the inverse guard, not the terminal-only no-completed-stage.
+    expect(blockedRow?.reason).toBe("guard-b:decision-without-completed-stage");
   });
 
   it("replays the live SUP-15120 orphan (decision f643c6e6 / stage 17763832) and flags it with the inverse reason", async () => {

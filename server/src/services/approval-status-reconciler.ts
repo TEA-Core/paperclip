@@ -182,6 +182,15 @@ export interface CandidateRow {
   assigneeUserId: string | null;
   executionState: Record<string, unknown> | null;
   executionPolicy: Record<string, unknown> | null;
+  /**
+   * SUP-15212: the issue's status, projected only by the audit selector
+   * (findStageIntegrityAuditCandidates). Absent on the reconciler's
+   * re-publish candidates and the decision-time arming candidate, both of
+   * which operate on closed/approved cards — there the terminal-only guards
+   * keep their existing behavior. Only the audit route distinguishes a live
+   * ladder (`in_review` / `blocked`) from a terminal close.
+   */
+  status?: string;
 }
 
 type CandidateResult =
@@ -839,6 +848,10 @@ export async function findStageIntegrityAuditCandidates(
       executionState: issues.executionState,
       executionPolicy: issues.executionPolicy,
       completedAt: issues.completedAt,
+      // SUP-15212: projected so evaluateStageIntegrity can tell a live ladder
+      // (in_review / blocked) from a terminal close and suppress the
+      // close-presupposing guards on live cards (see isLiveLadder there).
+      status: issues.status,
     })
     .from(issues)
     .where(
@@ -871,6 +884,14 @@ export async function findStageIntegrityAuditCandidates(
     )
     .orderBy(issues.identifier);
 
+  // SUP-15212 (F3): the default call is unbounded, so the widened selector is a
+  // strict superset of the old done-only one and cannot suppress a finding it
+  // reported before. A bounded call (?limit=N) is different: it truncates after
+  // the lexical identifier ordering, so newly admitted live cards compete for
+  // the same N slots and can crowd out done rows that would have fit in an
+  // unbounded scan. The audit route defaults to no limit, so the invariant the
+  // caller relies on holds; note it here rather than re-order done-first, which
+  // would change the identifier ordering existing consumers see.
   if (limit !== undefined && limit > 0) {
     return query.limit(limit);
   }
@@ -892,6 +913,21 @@ export async function evaluateStageIntegrity(
 ): Promise<{ reason: string; detail: string } | null> {
   const state: Record<string, unknown> = row.executionState ?? {};
   const policy: Record<string, unknown> = row.executionPolicy ?? {};
+
+  // SUP-15212: the widened audit selector now admits live ladders
+  // (in_review / blocked), not just terminal closes. Two guards in this
+  // cascade presuppose a close, so they must NOT fire on a live card or they
+  // (a) report a false positive and (b) — because the cascade returns on the
+  // first match — shadow the inverse (orphaned-decision) guard that is the
+  // reason the selector was widened to reach these rows:
+  //   - `no-completed-stage`: on a done card it means "closed without ever
+  //     completing a stage" (a defect); on a live ladder it just means the
+  //     ladder has not completed a stage yet (the normal pre-completion state).
+  //   - `return-assignee-unresolved`: on a live card the gated principal is not
+  //     expected to be set up yet, so an unresolvable one is not a defect.
+  // row.status is projected only by the audit selector; the reconciler and
+  // decision-time candidates leave it unset, so their behavior is unchanged.
+  const isLiveLadder = row.status === "in_review" || row.status === "blocked";
 
   const skippedStageIds = Array.isArray(state.skippedStageIds)
     ? (state.skippedStageIds as unknown[]).filter((s): s is string => typeof s === "string")
@@ -915,7 +951,11 @@ export async function evaluateStageIntegrity(
   const completedStageIds = Array.isArray(state.completedStageIds)
     ? (state.completedStageIds as unknown[]).filter((s): s is string => typeof s === "string")
     : [];
-  if (completedStageIds.length === 0) {
+  // SUP-15212: `no-completed-stage` presupposes a close. On a live ladder an
+  // empty completedStageIds is the normal pre-completion state, not a defect —
+  // so suppress it there and fall through to the inverse guard, which is the
+  // check this card exists to add. A done card keeps its existing finding.
+  if (completedStageIds.length === 0 && !isLiveLadder) {
     return {
       reason: "guard-b:no-completed-stage",
       detail: "no completed stages recorded in executionState",
@@ -1000,10 +1040,18 @@ export async function evaluateStageIntegrity(
       if (row.createdByAgentId) forbiddenAgents.add(row.createdByAgentId);
     }
     if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
-      return {
-        reason: "guard-b:return-assignee-unresolved",
-        detail: "no return assignee, delivery author, or creator agent recorded",
-      };
+      // SUP-15212: a live ladder is not expected to have its gated principal
+      // resolved yet, so an unresolvable one is not a finding there. On a done
+      // card it still refuses (the terminal card's approval cannot be
+      // attributed to a non-gated actor). Suppressed on live cards this also
+      // stops it from shadowing the inverse guard (the cascade returns on the
+      // first match).
+      if (!isLiveLadder) {
+        return {
+          reason: "guard-b:return-assignee-unresolved",
+          detail: "no return assignee, delivery author, or creator agent recorded",
+        };
+      }
     }
   }
 
