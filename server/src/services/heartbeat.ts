@@ -151,6 +151,7 @@ import {
   resolveAdapterRunOutcome,
   type RunTruncationVerdict,
 } from "./run-truncation.js";
+import { boundContextSnapshot } from "./context-snapshot-bound.js";
 import {
   buildStillbornRunMessage,
   canDetectStillbornRun,
@@ -16916,7 +16917,7 @@ function pendingCleanupAttemptsSql() {
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: context,
+        contextSnapshot: boundContextSnapshot(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));
@@ -17147,7 +17148,7 @@ function pendingCleanupAttemptsSql() {
         .set({
           startedAt,
           sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-          contextSnapshot: context,
+          contextSnapshot: boundContextSnapshot(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id))
@@ -17365,7 +17366,7 @@ function pendingCleanupAttemptsSql() {
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: context,
+            contextSnapshot: boundContextSnapshot(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -17866,7 +17867,7 @@ function pendingCleanupAttemptsSql() {
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: context,
+            contextSnapshot: boundContextSnapshot(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -20562,7 +20563,7 @@ function pendingCleanupAttemptsSql() {
             const mergedRun = await tx
               .update(heartbeatRuns)
               .set({
-                contextSnapshot: mergedContextSnapshot,
+                contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
                 updatedAt: new Date(),
               })
               .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
@@ -20912,7 +20913,7 @@ function pendingCleanupAttemptsSql() {
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: mergedContextSnapshot,
+          contextSnapshot: boundContextSnapshot(mergedContextSnapshot),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
