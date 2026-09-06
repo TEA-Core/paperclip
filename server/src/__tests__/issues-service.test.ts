@@ -7704,3 +7704,168 @@ describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance
     });
   });
 });
+
+describeEmbeddedPostgres("issueService.create company defaultExecutionPolicy inheritance", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-create-company-default-policy-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  const companyPolicyAgentId = randomUUID();
+
+  const companyPolicy: IssueExecutionPolicy = {
+    mode: "normal",
+    commentRequired: true,
+    stages: [
+      {
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId: companyPolicyAgentId, userId: null }],
+      },
+    ],
+  };
+
+  it("inherits the company defaultExecutionPolicy when the issue has no project", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultExecutionPolicy: companyPolicy as unknown as Record<string, unknown>,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId: null,
+      title: "Project-less issue inherits company default",
+    });
+
+    expect(issue.executionPolicy).toMatchObject({
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        {
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [expect.objectContaining({ type: "agent", agentId: companyPolicyAgentId })],
+        },
+      ],
+    });
+  });
+
+  it("leaves executionPolicy null when neither project nor company has a default", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId: null,
+      title: "No defaults anywhere",
+    });
+
+    expect(issue.executionPolicy).toBeNull();
+  });
+
+  it("project default takes precedence over company default when both are set", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectPolicyAgentId = randomUUID();
+
+    const projectPolicy: IssueExecutionPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        {
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId: projectPolicyAgentId, userId: null }],
+        },
+      ],
+    };
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultExecutionPolicy: companyPolicy as unknown as Record<string, unknown>,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Policy project",
+      status: "in_progress",
+      defaultExecutionPolicy: projectPolicy as unknown as Record<string, unknown>,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId,
+      title: "Issue with both project and company defaults",
+    });
+
+    expect(issue.executionPolicy).toMatchObject({
+      stages: [
+        {
+          participants: [expect.objectContaining({ agentId: projectPolicyAgentId })],
+        },
+      ],
+    });
+    expect(issue.executionPolicy).not.toMatchObject({
+      stages: [
+        {
+          participants: [expect.objectContaining({ agentId: companyPolicyAgentId })],
+        },
+      ],
+    });
+  });
+
+  it("a malformed company default yields a null policy rather than throwing", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultExecutionPolicy: "this-is-not-valid-json" as unknown as Record<string, unknown>,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId: null,
+      title: "Issue with malformed company default",
+    });
+
+    expect(issue.executionPolicy).toBeNull();
+  });
+});
