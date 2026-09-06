@@ -1695,6 +1695,13 @@
       "when": 1788040970632,
       "tag": "0243_prune_execution_state_stale_stage_ids",
       "breakpoints": true
+    },
+    {
+      "idx": 242,
+      "version": "7",
+      "when": 1788040971632,
+      "tag": "0244_company_default_execution_policy",
+      "breakpoints": true
     }
   ]
 }
