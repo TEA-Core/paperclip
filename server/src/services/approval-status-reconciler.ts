@@ -5,8 +5,9 @@ import {
   issueExecutionDecisions,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, ne, sql } from "drizzle-orm";
+import { and, desc, eq, ne, sql, type SQL } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
+import { logActivity } from "./activity-log.js";
 import {
   resolveGitHubTokenCandidatesForRepo,
   type GitHubTokenResolution,
@@ -1461,22 +1462,76 @@ function readBackfillRefusal(row: CandidateRow): BackfillRefusal | null {
   };
 }
 
-async function persistBackfillRefusal(
+/**
+ * SUP-15211. Every reconciler write of `executionState.approvalStatus` goes through this
+ * helper so no write ever rebuilds the whole `executionState` column from the batch-load
+ * snapshot. The snapshot is stale by the time the write lands — the candidate was loaded
+ * by `findApprovalCandidates`, and a concurrent writer (a ladder advance,
+ * `currentStageIndex`, `lastDecisionId`, …) may have committed a sibling key since. The
+ * old sites rebuilt `{ ...snapshot, approvalStatus: … }` and wrote the whole column, so the
+ * sibling advance was silently reverted with no audit event (the SUP-15120 lost update).
+ *
+ * Instead this merges the patch into the LIVE column on the server: `jsonb_set` on the root,
+ * a jsonb `||` on the live `approvalStatus` subtree, and an optional `- 'key'` for removals.
+ * No sibling key is ever read into the write. `row.executionState` is hydrated from the
+ * statement's RETURNING value (never a locally-built object), and — because these writes
+ * previously skipped the audit trail entirely — every call emits an `issue.updated` entry
+ * naming the issue and the changed subtree.
+ */
+export async function mergeApprovalStatus(
+  db: Db,
+  row: CandidateRow,
+  patch: Record<string, unknown>,
+  options: { source: string; removeKeys?: string[] },
+): Promise<void> {
+  const removeKeys = options.removeKeys ?? [];
+  let approvalStatusExpr: SQL = sql`(
+    coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb)
+    || ${JSON.stringify(patch)}::jsonb
+  )`;
+  for (const key of removeKeys) {
+    approvalStatusExpr = sql`${approvalStatusExpr} - ${key}`;
+  }
+  const executionStateExpr: SQL = sql`(
+    jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{approvalStatus}', ${approvalStatusExpr})
+  )`;
+  const setValues: { executionState: SQL } = { executionState: executionStateExpr };
+  const updated = await db
+    .update(issues)
+    .set(setValues)
+    .where(eq(issues.id, row.id))
+    .returning({ executionState: issues.executionState });
+  row.executionState =
+    (updated[0]?.executionState as Record<string, unknown> | null) ?? null;
+
+  await logActivity(db, {
+    companyId: row.companyId,
+    actorType: "system",
+    actorId: "system",
+    agentId: null,
+    runId: null,
+    action: "issue.updated",
+    entityType: "issue",
+    entityId: row.id,
+    issueId: row.id,
+    details: {
+      identifier: row.identifier,
+      source: options.source,
+      changedSubtree: "executionState.approvalStatus",
+      setKeys: Object.keys(patch),
+      ...(removeKeys.length > 0 ? { removedKeys: removeKeys } : {}),
+    },
+  });
+}
+
+export async function persistBackfillRefusal(
   db: Db,
   row: CandidateRow,
   refusal: BackfillRefusal,
 ): Promise<void> {
-  const currentState = row.executionState ?? {};
-  const existing = (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
-  const nextExecutionState: Record<string, unknown> = {
-    ...currentState,
-    approvalStatus: { ...existing, backfillRefusal: refusal },
-  };
-  await db
-    .update(issues)
-    .set({ executionState: nextExecutionState })
-    .where(eq(issues.id, row.id));
-  row.executionState = nextExecutionState;
+  await mergeApprovalStatus(db, row, { backfillRefusal: refusal }, {
+    source: "approval-status-reconciler.persist_backfill_refusal",
+  });
 }
 
 type TemporalBackfillOutcome =
@@ -1639,29 +1694,26 @@ async function temporalBackfillOutcome(
  * `backfillRefusal`) so the unmodified first-publish path certifies the head.
  * Shared by the temporal-proof and SUP-15017 content-identity success paths.
  */
-async function anchorBackfilledHead(
+export async function anchorBackfilledHead(
   db: Db,
   row: CandidateRow,
   anchorHeadSha: string,
   decisionCreatedAt: Date,
 ): Promise<void> {
-  const existingApprovalStatus =
-    ((row.executionState?.approvalStatus as Record<string, unknown> | null | undefined) ?? {});
-  const nextApprovalStatus: Record<string, unknown> = {
-    ...existingApprovalStatus,
-    approvedHeadSha: anchorHeadSha,
-    approvedAt: decisionCreatedAt.toISOString(),
-  };
-  delete nextApprovalStatus.backfillRefusal;
-  const nextExecutionState: Record<string, unknown> = {
-    ...(row.executionState ?? {}),
-    approvalStatus: nextApprovalStatus,
-  };
-  await db
-    .update(issues)
-    .set({ executionState: nextExecutionState })
-    .where(eq(issues.id, row.id));
-  row.executionState = nextExecutionState;
+  await mergeApprovalStatus(
+    db,
+    row,
+    {
+      approvedHeadSha: anchorHeadSha,
+      approvedAt: decisionCreatedAt.toISOString(),
+    },
+    {
+      source: "approval-status-reconciler.anchor_backfilled_head",
+      // A backfilled anchor supersedes any earlier stable refusal; drop it so the
+      // subtree stops reporting the card as unbackfillable.
+      removeKeys: ["backfillRefusal"],
+    },
+  );
 }
 
 /**
@@ -1838,27 +1890,21 @@ async function backfillPreDBApprovalAnchor(
  * auth/HTTP) and `ambiguous` (operator attention) must keep retrying and are
  * never silenced.
  */
-async function persistWorkspaceDiscoveryVerdict(
+export async function persistWorkspaceDiscoveryVerdict(
   db: Db,
   row: CandidateRow,
 ): Promise<void> {
+  // Read the anchor from the snapshot before the merge; it is only needed to
+  // record which head the "none" verdict was reached against.
   const anchorHeadSha = readApprovedHead(row.executionState)?.anchorHeadSha ?? null;
-  const currentState = row.executionState ?? {};
-  const existing = (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
   const marker = {
     verdict: "none",
     at: new Date().toISOString(),
     headSha: anchorHeadSha,
   };
-  const nextExecutionState: Record<string, unknown> = {
-    ...currentState,
-    approvalStatus: { ...existing, workspaceDiscovery: marker },
-  };
-  await db
-    .update(issues)
-    .set({ executionState: nextExecutionState })
-    .where(eq(issues.id, row.id));
-  row.executionState = nextExecutionState;
+  await mergeApprovalStatus(db, row, { workspaceDiscovery: marker }, {
+    source: "approval-status-reconciler.persist_workspace_discovery_verdict",
+  });
 }
 
 async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateResult> {
@@ -2156,22 +2202,17 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
       // unmodified Guard A comparison, so the normal publishedHeadSha path
       // takes over from here. pendingCandidates stays as the historical
       // record; the idempotency pre-check keeps re-runs at zero writes.
-      const currentState = row.executionState ?? {};
-      const existingApprovalStatus =
-        (currentState.approvalStatus as Record<string, unknown> | null | undefined) ?? {};
-      await db
-        .update(issues)
-        .set({
-          executionState: {
-            ...currentState,
-            approvalStatus: {
-              ...existingApprovalStatus,
-              publishedHeadSha: headSha,
-              publishedAt: new Date().toISOString(),
-            },
-          },
-        })
-        .where(eq(issues.id, row.id));
+      await mergeApprovalStatus(
+        db,
+        row,
+        {
+          publishedHeadSha: headSha,
+          publishedAt: new Date().toISOString(),
+        },
+        {
+          source: "approval-status-reconciler.republish",
+        },
+      );
     }
     return { kind: "republished", detail: `republished ${target.displayName}: ${outcome.message}`, backfilledDetail };
   }

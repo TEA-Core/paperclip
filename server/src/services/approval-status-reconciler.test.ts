@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -18,9 +19,13 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import {
+  anchorBackfilledHead,
+  mergeApprovalStatus,
+  persistBackfillRefusal,
   runApprovalStatusReconcilerTick,
   startApprovalStatusReconciler,
   type ApprovalStatusReconcilerTickSummary,
+  type CandidateRow,
 } from "./approval-status-reconciler.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
@@ -324,6 +329,9 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
     mockGhFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({}) } as unknown as Response);
 
+    // SUP-15211: the reconciler's approvalStatus writes now emit an activity_log
+    // row; clear it first so the company delete isn't blocked by the FK.
+    await db.delete(activityLog);
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issueExecutionDecisions);
@@ -346,6 +354,8 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
   });
 
   afterEach(async () => {
+    // SUP-15211: clear audit rows first (they FK-reference the company).
+    await db.delete(activityLog);
     await db.delete(externalObjectMentions);
     await db.delete(externalObjects);
     await db.delete(issueExecutionDecisions);
@@ -682,6 +692,192 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const summary3 = await runApprovalStatusReconcilerTick(db);
       expect(summary3.scanned).toBe(1);
       expect(summary3.skipped["no-open-pr"]).toBe(1);
+    });
+
+    describe("executionState.approvalStatus merge (SUP-15211)", () => {
+      async function readIssueState(issueId: string) {
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        return row!.executionState as Record<string, unknown>;
+      }
+
+      function staleRow(issueId: string, executionState: Record<string, unknown>): CandidateRow {
+        return {
+          id: issueId,
+          companyId,
+          identifier: "SUP-42",
+          createdByAgentId: AGENT_CREATOR,
+          createdByUserId: null,
+          assigneeAgentId: null,
+          assigneeUserId: null,
+          executionState,
+          executionPolicy: EXECUTION_POLICY,
+        };
+      }
+
+      // The lost-update race in one line: the candidate was loaded with a stale
+      // snapshot, then a concurrent writer advanced a sibling key (`ladder` here).
+      async function advanceLadderConcurrently(issueId: string) {
+        await db
+          .update(issues)
+          .set({
+            executionState: sql`jsonb_set(${issues.executionState}, '{currentStageIndex}', '2'::jsonb)`,
+          })
+          .where(eq(issues.id, issueId));
+      }
+
+      async function lastAuditFor(issueId: string) {
+        const [audit] = await db
+          .select()
+          .from(activityLog)
+          .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated")));
+        return audit ?? null;
+      }
+
+      it("preserves a concurrent sibling-key advance when the tick persists the `none` verdict", async () => {
+        const issueId = await insertIssue();
+        await insertDecision(issueId);
+        await seedDeliveryIdentity(issueId, "SUP-42-branch", "https://github.com/TEA-Core/paperclip");
+
+        // The candidate batch load captured the column before the ladder advanced.
+        // While the reconciler reads the live open-PR list, a concurrent writer
+        // commits currentStageIndex -> 2; the old whole-column write reverted it.
+        mockGhFetch.mockImplementation(async (url: string) => {
+          if (url === OPEN_PRS_LIST_URL) {
+            await advanceLadderConcurrently(issueId);
+            return { ok: true, status: 200, json: async () => [] } as unknown as Response;
+          }
+          throw new Error(`unmocked ghFetch URL: ${url}`);
+        });
+
+        const summary = await runApprovalStatusReconcilerTick(db);
+        expect(summary.scanned).toBe(1);
+        expect(summary.skipped["no-open-pr"]).toBe(1);
+
+        const state = await readIssueState(issueId);
+        expect(state.currentStageIndex).toBe(2);
+        const approvalStatus = state.approvalStatus as Record<string, unknown>;
+        expect(approvalStatus.workspaceDiscovery).toEqual(
+          expect.objectContaining({ verdict: "none", headSha: NEW_HEAD }),
+        );
+
+        const audit = await lastAuditFor(issueId);
+        expect(audit).toBeTruthy();
+        expect(audit!.details).toEqual(
+          expect.objectContaining({
+            identifier: "SUP-42",
+            source: "approval-status-reconciler.persist_workspace_discovery_verdict",
+            changedSubtree: "executionState.approvalStatus",
+          }),
+        );
+      });
+
+      it("mergeApprovalStatus merges into the live subtree and emits an audit event", async () => {
+        const initial = {
+          status: "completed",
+          completedStageIds: [APPROVAL_STAGE_ID],
+          lastDecisionOutcome: "approved",
+          currentStageIndex: 0,
+          approvalStatus: { publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT },
+        };
+        const issueId = await insertIssue({ executionState: initial });
+        const row = staleRow(issueId, initial);
+        await advanceLadderConcurrently(issueId);
+
+        await mergeApprovalStatus(
+          db,
+          row,
+          { publishedHeadSha: MOVED_HEAD, publishedAt: APPROVED_AT },
+          { source: "approval-status-reconciler.republish" },
+        );
+
+        const state = await readIssueState(issueId);
+        // The sibling advance survived even though the snapshot (row.executionState)
+        // still carried currentStageIndex: 0.
+        expect(state.currentStageIndex).toBe(2);
+        const approvalStatus = state.approvalStatus as Record<string, unknown>;
+        expect(approvalStatus.publishedHeadSha).toBe(MOVED_HEAD);
+        // The pre-existing approvalStatus key is preserved (jsonb || merge).
+        expect(approvalStatus.publishedAt).toBe(APPROVED_AT);
+
+        const audit = await lastAuditFor(issueId);
+        expect(audit).toBeTruthy();
+        expect(audit!.details).toEqual(
+          expect.objectContaining({
+            source: "approval-status-reconciler.republish",
+            setKeys: ["publishedHeadSha", "publishedAt"],
+          }),
+        );
+      });
+
+      it("persistBackfillRefusal preserves sibling keys and records the refusal", async () => {
+        const initial = {
+          status: "completed",
+          completedStageIds: [APPROVAL_STAGE_ID],
+          lastDecisionOutcome: "approved",
+          currentStageIndex: 0,
+          approvalStatus: { publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT },
+        };
+        const issueId = await insertIssue({ executionState: initial });
+        const row = staleRow(issueId, initial);
+        await advanceLadderConcurrently(issueId);
+
+        const refusal = {
+          reason: "backfill:head-unverifiable",
+          observedHeadSha: APPROVED_HEAD,
+          approvedAtMs: 1_755_628_800_000,
+          observedAt: APPROVED_AT,
+        };
+        await persistBackfillRefusal(db, row, refusal);
+
+        const state = await readIssueState(issueId);
+        expect(state.currentStageIndex).toBe(2);
+        const approvalStatus = state.approvalStatus as Record<string, unknown>;
+        expect(approvalStatus.backfillRefusal).toEqual(refusal);
+        expect(approvalStatus.publishedHeadSha).toBe(NEW_HEAD);
+
+        const audit = await lastAuditFor(issueId);
+        expect(audit!.details).toEqual(
+          expect.objectContaining({ source: "approval-status-reconciler.persist_backfill_refusal" }),
+        );
+      });
+
+      it("anchorBackfilledHead preserves sibling keys, stamps the anchor, and removes the refusal", async () => {
+        const initial = {
+          status: "completed",
+          completedStageIds: [APPROVAL_STAGE_ID],
+          lastDecisionOutcome: "approved",
+          currentStageIndex: 0,
+          approvalStatus: {
+            backfillRefusal: {
+              reason: "backfill:head-unverifiable",
+              observedHeadSha: APPROVED_HEAD,
+              approvedAtMs: 1_755_628_800_000,
+              observedAt: APPROVED_AT,
+            },
+          },
+        };
+        const issueId = await insertIssue({ executionState: initial });
+        const row = staleRow(issueId, initial);
+        await advanceLadderConcurrently(issueId);
+
+        await anchorBackfilledHead(db, row, NEW_HEAD, new Date(APPROVED_AT));
+
+        const state = await readIssueState(issueId);
+        expect(state.currentStageIndex).toBe(2);
+        const approvalStatus = state.approvalStatus as Record<string, unknown>;
+        expect(approvalStatus.approvedHeadSha).toBe(NEW_HEAD);
+        expect(approvalStatus.approvedAt).toBe(new Date(APPROVED_AT).toISOString());
+        // The superseded stable refusal is gone from the live subtree.
+        expect(approvalStatus.backfillRefusal).toBeUndefined();
+
+        const audit = await lastAuditFor(issueId);
+        expect(audit!.details).toEqual(
+          expect.objectContaining({
+            source: "approval-status-reconciler.anchor_backfilled_head",
+            removedKeys: ["backfillRefusal"],
+          }),
+        );
+      });
     });
 
     it("does not persist a verdict when live workspace discovery is undetermined (SUP-14926 AC3)", async () => {
