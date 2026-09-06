@@ -189,9 +189,29 @@ export interface CandidateRow {
    * re-publish candidates and the decision-time arming candidate, both of
    * which operate on closed/approved cards — there the terminal-only guards
    * keep their existing behavior. Only the audit route distinguishes a live
-   * ladder (`in_review` / `blocked`) from a terminal close.
+    * ladder (`in_review` / `blocked`) from a terminal close.
+    */
+   status?: string;
+}
+
+/**
+ * SUP-15236: options for {@link evaluateStageIntegrity}.
+ */
+export interface EvaluateStageIntegrityOptions {
+  /**
+   * SUP-15236: when true (the audit route only), a lawfully-skipped stage does
+   * NOT terminate the cascade. Evaluation continues past `skipped-stage` so every
+   * later guard — including the SUP-15212 orphaned-decision inverse — is still
+   * evaluated on a card that also carries a skip. The done-card
+   * `no-completed-stage` guard is suppressed while a skip is present, since a
+   * lawfully-skipped stage can account for an otherwise-empty completedStageIds
+   * (so "no completed stage" is not a defect there, the same rationale as the
+   * live-ladder suppression). If no later guard fires, the verdict falls back to
+   * `skipped-stage` so the audit route's existing drop filter keeps a skip-only
+   * card out of the report. Default (false) keeps `skipped-stage` terminal for the
+   * reconciler re-publish loop and the two decision-time merge-arming gates.
    */
-  status?: string;
+  continuePastSkippedStage?: boolean;
 }
 
 type CandidateResult =
@@ -911,7 +931,9 @@ export async function findStageIntegrityAuditCandidates(
 export async function evaluateStageIntegrity(
   db: Db,
   row: CandidateRow,
+  options: EvaluateStageIntegrityOptions = {},
 ): Promise<{ reason: string; detail: string } | null> {
+  const { continuePastSkippedStage = false } = options;
   const state: Record<string, unknown> = row.executionState ?? {};
   const policy: Record<string, unknown> = row.executionPolicy ?? {};
 
@@ -933,11 +955,21 @@ export async function evaluateStageIntegrity(
   const skippedStageIds = Array.isArray(state.skippedStageIds)
     ? (state.skippedStageIds as unknown[]).filter((s): s is string => typeof s === "string")
     : [];
-  if (skippedStageIds.length > 0) {
-    return {
-      reason: "guard-b:skipped-stage",
-      detail: `skipped stages present: ${skippedStageIds.join(", ")}`,
-    };
+  // SUP-15236: a skipped stage used to short-circuit the whole cascade, hiding
+  // every later guard (including the SUP-15212 orphaned-decision inverse) for
+  // any card that carries a skip. In audit mode (continuePastSkippedStage) we
+  // record the verdict but keep evaluating so cross-stage defects still surface;
+  // in the default path (reconciler + merge-arming) the skip stays terminal and
+  // is returned immediately, exactly as before.
+  const skippedStageVerdict: { reason: string; detail: string } | null =
+    skippedStageIds.length > 0
+      ? {
+          reason: "guard-b:skipped-stage",
+          detail: `skipped stages present: ${skippedStageIds.join(", ")}`,
+        }
+      : null;
+  if (skippedStageVerdict && !continuePastSkippedStage) {
+    return skippedStageVerdict;
   }
 
   const policyStageIds = new Set(
@@ -956,7 +988,14 @@ export async function evaluateStageIntegrity(
   // empty completedStageIds is the normal pre-completion state, not a defect —
   // so suppress it there and fall through to the inverse guard, which is the
   // check this card exists to add. A done card keeps its existing finding.
-  if (completedStageIds.length === 0 && !isLiveLadder) {
+  //
+  // SUP-15236: suppress it likewise on a card that carries a lawfully-skipped
+  // stage when the audit is continuing past the skip. The skip can account for
+  // an otherwise-empty completedStageIds (the card completed by skipping), so
+  // "no completed stage" is not a defect here either — letting it fire would
+  // both be a false positive and shadow the inverse guard on exactly the
+  // skip+orphan shape this card exists to surface.
+  if (completedStageIds.length === 0 && !isLiveLadder && !skippedStageVerdict) {
     return {
       reason: "guard-b:no-completed-stage",
       detail: "no completed stages recorded in executionState",
@@ -1099,6 +1138,14 @@ export async function evaluateStageIntegrity(
         `${decision.createdAt.toISOString()}) is a durable approval, but stage ${decision.stageId} ` +
         `is in executionPolicy.stages yet in neither completedStageIds nor skippedStageIds`,
     };
+  }
+
+  // SUP-15236: audit mode continued past a skipped stage but found no later
+  // guard. Report the captured skipped-stage verdict (which the audit route's
+  // existing drop filter discards) so a skip-only card is never surfaced, while
+  // any genuine cross-stage defect found above has already returned.
+  if (continuePastSkippedStage && skippedStageVerdict) {
+    return skippedStageVerdict;
   }
 
   return null;

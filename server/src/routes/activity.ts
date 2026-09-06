@@ -407,7 +407,12 @@ export function activityRoutes(db: Db) {
       ) {
         continue;
       }
-      const verdict = await evaluateStageIntegrity(db, row);
+      // SUP-15236: continue past a skipped stage so the skip does not hide every
+      // later guard (including the SUP-15212 orphaned-decision inverse). The
+      // reconciler / merge-arming gates keep the skip terminal (default).
+      const verdict = await evaluateStageIntegrity(db, row, {
+        continuePastSkippedStage: true,
+      });
       if (!verdict) continue;
       // A lawfully auto-skipped stage writes no decision row on purpose
       // (skippedStageIds); that is not a stage-integrity finding.
