@@ -28,6 +28,9 @@ export type TaskWatchdogMutationScope =
       watchedIssueId: string;
       watchdogIssueId: string | null;
       stopFingerprint: string | null;
+      /** The agent heartbeat run carrying this watchdog context, so its stop
+       *  fingerprint can be advanced after the run's own source mutations. */
+      runId: string;
     };
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -118,6 +121,7 @@ export async function resolveTaskWatchdogMutationScope(
     watchedIssueId: watchdog.issueId,
     watchdogIssueId: watchdog.watchdogIssueId ?? null,
     stopFingerprint: taskWatchdog.stopFingerprint,
+    runId: runId as string,
   };
 }
 
