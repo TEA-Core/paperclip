@@ -145,8 +145,29 @@ export function executionWorkspaceBranchNamesDifferentIssue(input: {
 }
 
 /**
- * SUP-15205: should a `reuse_existing` binding be declined because it is an
- * inherited binding onto another issue's delivery branch?
+ * Does a branch carry at least one deliverable `sup-<n>` token?
+ *
+ * Used only at issue-create time, where the new issue's own identifier is not
+ * yet assigned but its number is, by construction, strictly greater than every
+ * existing issue's number. A source workspace's branch was rendered by an
+ * already-existing issue, so every `sup-<n>` token it carries names a card that
+ * already exists — and therefore names an id different from the new issue's.
+ * For that create path this is exactly equivalent to
+ * `executionWorkspaceBranchNamesDifferentIssue`, without needing the new
+ * issue's identifier, and it is the branch scripts/deliver.sh's
+ * one-branch-one-issue gate would refuse for the new issue.
+ */
+export function executionWorkspaceBranchNamesAnyIssueIdentifier(
+  workspaceBranchName?: string | null,
+): boolean {
+  const branchName = workspaceBranchName?.trim();
+  if (!branchName) return false;
+  return /sup-[0-9]+/i.test(branchName);
+}
+
+/**
+ * SUP-15205: should a `reuse_existing` binding be declined because it would
+ * restore this issue onto another issue's delivery branch?
  *
  * Default inheritance copies the parent's workspace binding onto a child, and
  * the restore arm then reads the parent's recorded branch verbatim, so the
@@ -154,25 +175,28 @@ export function executionWorkspaceBranchNamesDifferentIssue(input: {
  * approval can lawfully stamp for the child. The child must realize its own
  * workspace instead.
  *
- * "Inherited by default" is observable through the workspace row: every
- * server-realized workspace stamps its source issue, and a binding to a
- * workspace sourced by another (non-shared) issue can only have been written
- * by the inheritance path — explicit API writes to cross-source non-shared
- * workspaces are rejected at the write boundary (SUP-14139). A binding to a
- * sourceless, shared, or self-sourced workspace is an operator choice (or a
- * resumption of the issue's own workspace) and is left alone: restoring it is
- * the counterpart of deliver.sh's explicit out-of-scope override.
+ * This is the provisioning-side backstop; the authoritative decline happens at
+ * the inheritance site (issues.ts) which knows the binding is implicit. Here we
+ * can only read the persisted row, so the discriminator is the branch
+ * identity, NOT the workspace's mode: `mode` was a proxy for explicitness and
+ * the live strands that motivated this card (TSP #3443, #3446) are
+ * `shared_workspace` rows sourced by their parent, so exempting that mode
+ * leaves the entire defect reachable. A branch that does not name a foreign
+ * per-card sup id — `feature/foo`, a release branch — is out of the gate's
+ * scope and restores as before, so legitimate shared-branch reuse is
+ * unaffected. A binding to a sourceless or self-sourced workspace is an
+ * operator opt-in or a resumption of the issue's own workspace and is left
+ * alone: restoring it is the counterpart of deliver.sh's explicit out-of-scope
+ * override.
  */
 export function inheritedExecutionWorkspaceBranchDeclined(input: {
   issueId: string | null;
   issueIdentifier?: string | null;
   workspaceSourceIssueId?: string | null;
-  workspaceMode?: string | null;
   workspaceBranchName?: string | null;
 }): boolean {
   const sourceIssueId = input.workspaceSourceIssueId?.trim();
   if (!sourceIssueId || sourceIssueId === input.issueId) return false;
-  if (input.workspaceMode === "shared_workspace") return false;
   return executionWorkspaceBranchNamesDifferentIssue({
     issueIdentifier: input.issueIdentifier,
     workspaceBranchName: input.workspaceBranchName,

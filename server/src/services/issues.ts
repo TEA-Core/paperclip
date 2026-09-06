@@ -75,6 +75,7 @@ import {
 } from "./successful-run-handoff-state.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
+  executionWorkspaceBranchNamesAnyIssueIdentifier,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
@@ -7696,6 +7697,7 @@ export function issueService(db: Db) {
                 id: executionWorkspaces.id,
                 mode: executionWorkspaces.mode,
                 sourceIssueId: executionWorkspaces.sourceIssueId,
+                branchName: executionWorkspaces.branchName,
               })
               .from(executionWorkspaces)
               .where(eq(executionWorkspaces.id, workspaceSource.executionWorkspaceId))
@@ -7736,6 +7738,36 @@ export function issueService(db: Db) {
                   requestedByIssueId: workspaceInheritanceIssueId,
                   sourceIssueId: sourceWorkspace.sourceIssueId,
                   reason: "workspace is sourced by a different issue",
+                },
+              }, createActivityPublications);
+            }
+            else if (
+              sourceWorkspace &&
+              executionWorkspaceBranchNamesAnyIssueIdentifier(sourceWorkspace.branchName)
+            ) {
+              // SUP-15205: the source branch carries a deliverable `sup-<n>`
+              // token. At create time the new issue's number is strictly greater
+              // than every existing issue's, so that token necessarily names a
+              // different issue's delivery branch — the branch scripts/deliver.sh's
+              // one-branch-one-issue gate refuses for the new issue. This arm
+              // catches the shapes the cross-source arm above leaves reachable:
+              // shared workspaces and sourceless rows. Decline it (and log it,
+              // mirroring the cross-source arm) so the child realizes its own
+              // workspace and renders its own branch. A genuinely shared branch
+              // that names no sup id falls through and is preserved.
+              declinedWorkspaceInheritance = true;
+              await logActivityInTransaction(tx as unknown as Db, {
+                companyId,
+                actorType: "system",
+                actorId: "workspace_binding_guard",
+                action: "execution_workspace.inheritance_declined_branch_identity",
+                entityType: "execution_workspace",
+                entityId: sourceWorkspace.id,
+                details: {
+                  requestedByIssueId: workspaceInheritanceIssueId,
+                  sourceIssueId: sourceWorkspace.sourceIssueId,
+                  branchName: sourceWorkspace.branchName,
+                  reason: "workspace branch names a different issue's delivery branch",
                 },
               }, createActivityPublications);
             }

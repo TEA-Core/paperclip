@@ -320,11 +320,14 @@ export async function provisionIssueExecutionWorkspace(
   // branchName verbatim into ensurePersistedExecutionWorkspaceAvailable, so
   // restoring here would put this issue on a branch that names a different
   // SUP id — a branch deliver.sh refuses, and no approval can lawfully stamp
-  // for this issue. A binding to a workspace sourced by another (non-shared)
-  // issue can only have been written by the default inheritance path: the
-  // write boundary refuses explicit cross-source non-shared bindings
-  // (SUP-14139). Decline the binding so this issue realizes its own
-  // workspace and renders its own branch.
+  // for this issue. This is the backstop; the authoritative decline happens at
+  // the inheritance site, which knows the binding is implicit. The
+  // discriminator is the branch identity, not the workspace's mode, so a
+  // shared_workspace row sourced by its parent is declined too. Decline the
+  // binding so this issue realizes its own workspace and renders its own
+  // branch. A cross-source binding whose branch names the issue's own sup id
+  // (a resumption) is still restored, matching deliver.sh's explicit
+  // out-of-scope override.
   if (
     requestedShouldReuseExisting &&
     existingExecutionWorkspace !== null &&
@@ -332,7 +335,6 @@ export async function provisionIssueExecutionWorkspace(
       issueId,
       issueIdentifier: issueRef?.identifier ?? null,
       workspaceSourceIssueId: existingExecutionWorkspace.sourceIssueId,
-      workspaceMode: existingExecutionWorkspace.mode,
       workspaceBranchName: existingExecutionWorkspace.branchName,
     })
   ) {
