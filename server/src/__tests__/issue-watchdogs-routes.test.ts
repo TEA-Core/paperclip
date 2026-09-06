@@ -711,10 +711,19 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
   it("lets a watchdog run replace a pending interaction in the same run without a stale rejection", async () => {
     const companyId = await seedCompany();
     const watchdogAgentId = await seedAgent(companyId, { name: "Incident Watchdog" });
+    // Incident shape: the watched root is assigned to the reviewing watchdog
+    // agent (the incident's watched issue was assigned to the same agent that
+    // ran the review). When actor.agentId === issue.assigneeAgentId the withdraw
+    // route does NOT enqueue a continuation wake, so the subtree stays "stopped"
+    // and only the stop fingerprint moves -- exactly the incident, whose
+    // post-withdraw state was reported "stopped". An unassigned root would make
+    // the withdraw enqueue a self-wake on the subtree and flip the classifier to
+    // "live" (a different, non-incident shape the guard correctly refuses).
     const watchedRootId = await seedIssue(companyId, {
       title: "Watched root",
       identifier: "WDOG-INC-ROOT",
       status: "blocked",
+      assigneeAgentId: watchdogAgentId,
     });
     const watchdogIssueId = await seedIssue(companyId, {
       title: "Reusable watchdog issue",
