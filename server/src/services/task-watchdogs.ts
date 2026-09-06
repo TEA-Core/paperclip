@@ -1651,10 +1651,78 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     return {
       allowed: false as const,
       reason: classification.state === "stopped"
-        ? "Task-watchdog review is stale because the watched subtree stop fingerprint changed; refresh the source state before mutating it."
-        : "Task-watchdog review is stale because the watched subtree now has a live, waiting, already-reviewed, or not-applicable path; refresh the source state before mutating it.",
+        ? "Task-watchdog review is stale: the watched subtree is still stopped but its stop fingerprint was changed by an actor other than this run, so this run's review no longer matches the source state. Do not retry this mutation; the task-watchdog scheduler will open a fresh review that re-observes the subtree."
+        : "Task-watchdog review is stale: the watched subtree now has a live, waiting, already-reviewed, or not-applicable path, so this run's stopped-subtree review no longer applies. The run should stop mutating this subtree rather than retrying.",
       classification,
     };
+  }
+
+  /**
+   * SUP-15257: a task-watchdog run may make several mutations to its watched
+   * subtree within a single review. The stop fingerprint recomputes on each of
+   * those mutations, so freezing the run's fingerprint at wake time guarantees
+   * the guard trips on the run's own second write. After a successful
+   * watchdog-attributed source mutation, re-derive the current stop fingerprint
+   * and advance the run's stored copy so the next write in the same run sees a
+   * matching fingerprint. External actors do not route through here, so their
+   * changes leave the run's stored fingerprint untouched and are still rejected
+   * by {@link revalidateMutationScope}.
+   *
+   * Returns the advanced stop fingerprint, or null when the subtree is no longer
+   * in a stopped state (nothing to advance; the next preflight will reject).
+   */
+  async function advanceWatchdogRunStopFingerprint(input: {
+    runId: string;
+    companyId: string;
+    watchdogId: string;
+  }): Promise<string | null> {
+    const watchdog = await db
+      .select()
+      .from(issueWatchdogs)
+      .where(and(
+        eq(issueWatchdogs.id, input.watchdogId),
+        eq(issueWatchdogs.companyId, input.companyId),
+        eq(issueWatchdogs.status, "active"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!watchdog) return null;
+
+    const classifierInput = await collectClassifierInput(input.companyId, watchdog);
+    const classification = classifyTaskWatchdogSubtree(classifierInput);
+    if (classification.state !== "stopped") return null;
+    const stopFingerprint = classification.stopFingerprint;
+
+    const [run] = await db
+      .select({
+        id: heartbeatRuns.id,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+      ));
+    if (!run || typeof run.contextSnapshot !== "object" || run.contextSnapshot === null) {
+      return stopFingerprint;
+    }
+
+    const context = run.contextSnapshot as Record<string, unknown>;
+    const taskWatchdog = (typeof context.taskWatchdog === "object" && context.taskWatchdog !== null
+      ? context.taskWatchdog
+      : {}) as Record<string, unknown>;
+    // Only advance when this run's fingerprint has actually moved; a no-op keeps
+    // the row untouched so unrelated context_snapshot fields are never rewritten.
+    if (taskWatchdog.stopFingerprint === stopFingerprint && context.stopFingerprint === stopFingerprint) {
+      return stopFingerprint;
+    }
+    taskWatchdog.stopFingerprint = stopFingerprint;
+    context.taskWatchdog = taskWatchdog;
+    context.stopFingerprint = stopFingerprint;
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: context, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, input.runId));
+    return stopFingerprint;
   }
 
   return {
@@ -1811,5 +1879,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     },
 
     revalidateMutationScope,
+
+    advanceWatchdogRunStopFingerprint,
   };
 }

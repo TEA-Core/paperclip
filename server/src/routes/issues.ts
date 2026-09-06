@@ -488,6 +488,7 @@ function noopTaskWatchdogService(): TaskWatchdogService {
         pendingInteractionsByIssueId: {},
       },
     }),
+    advanceWatchdogRunStopFingerprint: async () => null,
   };
 }
 
@@ -5318,6 +5319,28 @@ export function issueRoutes(
       },
     });
     return false;
+  }
+
+  /**
+   * SUP-15257: after a successful watchdog-attributed source mutation, re-derive
+   * and advance the run's stop fingerprint so the next write in the same run is
+   * not rejected as stale. Fire-and-forget: a failure here degrades to the
+   * pre-fix behavior (subsequent writes may 409) and must never break the write
+   * that just committed.
+   */
+  async function advanceTaskWatchdogSourceMutationFingerprint(
+    scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
+  ) {
+    if (scope.kind !== "watchdog" || !scope.runId) return;
+    try {
+      await taskWatchdogsSvc.advanceWatchdogRunStopFingerprint({
+        runId: scope.runId,
+        companyId: scope.companyId,
+        watchdogId: scope.watchdogId,
+      });
+    } catch (err) {
+      logger.warn({ err, runId: scope.runId, watchdogId: scope.watchdogId }, "failed to advance task-watchdog run stop fingerprint");
+    }
   }
 
   async function rejectTaskWatchdogConfigMutation(req: Request, res: Response) {
@@ -10786,6 +10809,13 @@ export function issueRoutes(
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
 
+    // SUP-15257: creating a follow-up child mutates the watched subtree; advance
+    // this run's stop fingerprint so its next in-run write is not rejected.
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      await advanceTaskWatchdogSourceMutationFingerprint(
+        await resolveTaskWatchdogMutationScope(db, req.actor),
+      );
+    }
     res.status(201).json(issue);
   });
 
@@ -12205,6 +12235,14 @@ export function issueRoutes(
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
+    }
+    // SUP-15257: this issue mutation just committed; if it came from a
+    // task-watchdog run, re-derive and advance that run's stop fingerprint so
+    // its next in-run write is not rejected as stale.
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      await advanceTaskWatchdogSourceMutationFingerprint(
+        await resolveTaskWatchdogMutationScope(db, req.actor),
+      );
     }
     if (transition.reviewEscalation && transition.decision) {
       try {
@@ -13628,6 +13666,14 @@ export function issueRoutes(
       }, "failed to wake addressee on issue interaction creation"));
     }
 
+    // SUP-15257: creating an interaction mutates the watched subtree's pending
+    // interaction set; advance this run's stop fingerprint so its next in-run
+    // write is not rejected as stale.
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      await advanceTaskWatchdogSourceMutationFingerprint(
+        await resolveTaskWatchdogMutationScope(db, req.actor),
+      );
+    }
     res.status(201).json(interaction);
   });
 
@@ -14221,6 +14267,14 @@ export function issueRoutes(
           actor,
           source: "issue.interaction.withdraw",
         });
+      }
+      // SUP-15257: withdrawing an interaction clears a pending interaction from
+      // the watched subtree; advance this run's stop fingerprint so its next
+      // in-run write is not rejected as stale.
+      if (req.actor.type === "agent" && req.actor.agentId) {
+        await advanceTaskWatchdogSourceMutationFingerprint(
+          await resolveTaskWatchdogMutationScope(db, req.actor),
+        );
       }
       res.json(interaction);
     },
