@@ -3,6 +3,7 @@ import {
   COMPANY_STATUSES,
   ISSUE_THREAD_INTERACTION_RESOLVER_POLICIES,
 } from "../constants.js";
+import { issueExecutionPolicySchema } from "./issue.js";
 import { objectWithoutDefaults } from "./partial.js";
 
 const logoAssetIdSchema = z.string().guid().nullable().optional();
@@ -44,6 +45,7 @@ export const updateCompanySchema = objectWithoutDefaults(
       feedbackDataSharingConsentByUserId: z.string().min(1).nullable().optional(),
       feedbackDataSharingTermsVersion: feedbackDataSharingTermsVersionSchema,
       logoAssetId: logoAssetIdSchema,
+      defaultExecutionPolicy: issueExecutionPolicySchema.optional().nullable(),
     }),
 );
 
