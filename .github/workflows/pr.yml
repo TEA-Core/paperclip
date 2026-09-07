@@ -26,7 +26,70 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A queue entry that is not approved is going to be ejected -- but today the
+  # ejection costs a full merge_group run of pr.yml. Measured on PR #517's
+  # entries: the `Paperclip Approval Enforcer` workflow reaches its verdict in
+  # ~13 seconds and the queue removes the entry ~48 seconds after admission,
+  # while this workflow's 23 jobs keep running to completion and burn 98.1
+  # runner-minutes. #517 has been enqueued 13 times -- 10 by `fleet-only[bot]`
+  # (agents re-arming merge) and 3 by `tea-core[bot]` (the done-close landing
+  # backstop, correctly bounded at MAX_REENQUEUE_ATTEMPTS = 3) -- for ~1,275
+  # runner-minutes spent re-learning a 13-second answer, and each entry cancels
+  # the entries behind it.
+  #
+  # So: make the cheap verdict a precondition of the expensive work. `policy` is
+  # the single root of this workflow's job graph; every other job reaches it
+  # through `needs`, so gating `policy` gates all 23. `verify` and `e2e` are
+  # `always()` aggregators that assert their dependencies succeeded, so they
+  # still land a conclusion on the required contexts and the queue still ejects
+  # promptly -- it just ejects for ~2 runner-minutes instead of ~98.
+  #
+  # This bounds the cost of an ejection; it does not reduce the ejection COUNT.
+  # That belongs at the enqueue sites, and 10 of 13 of those are outside this
+  # repository, which is exactly why the guard is placed here: it covers every
+  # actor that can reach the queue, including the ones this repo cannot change.
+  #
+  # NO job-level `if`. A skipped job makes its dependents skip too (SUP-13500),
+  # which would silently disable the entire pipeline on `pull_request`. The job
+  # always runs; only its steps are scoped to the merge_group event, so a
+  # pull_request pays a runner start and nothing else.
+  approval_precondition:
+    name: Approval precondition
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: read
+      pull-requests: read
+    env:
+      # `gh api` needs a token in the workflow environment; without it every
+      # call fails and this job would fail-closed on its own plumbing.
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Note the event
+        run: |
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            echo "merge_group — checking the approval gate before the expensive jobs start"
+          else
+            echo "${{ github.event_name }} — no precondition; the approval status is published after CI first runs on a PR"
+          fi
+
+      - name: Checkout repository
+        if: github.event_name == 'merge_group'
+        uses: actions/checkout@v7
+
+      - name: Refuse an unapproved queue entry before the expensive jobs start
+        if: github.event_name == 'merge_group'
+        # Deliberately the SAME script the required `paperclip-approved-enforcer`
+        # context runs, on the same inputs, so the two can never disagree about
+        # whether an entry is admissible. The difference is only when it runs:
+        # there, in parallel with 98 runner-minutes of work; here, before any of
+        # it starts.
+        run: bash scripts/ci/check-paperclip-approved.sh merge_group
+
   policy:
+    needs: [approval_precondition]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -190,6 +253,9 @@ jobs:
 
       - name: Test merge queue workflow wiring
         run: node --test ./scripts/__tests__/pr-workflow-merge-group.test.mjs
+
+      - name: Test approval precondition wiring
+        run: node --test ./scripts/__tests__/pr-approval-precondition.test.mjs
 
       - name: Test overrides lockfile guard wiring
         run: node --test ./scripts/__tests__/pr-overrides-guard.test.mjs
