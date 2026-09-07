@@ -54,28 +54,32 @@
 #   1. PR body contains a line:  Paperclip-Approved-Waiver: <reason>
 #   2. PR carries the label:     no-paperclip-card
 #
-# COUNTERSIGNATURE on fold-sync heads. A PR whose head ref starts with
-# `fold-sync/` cannot earn `paperclip/approved` at all — the head must stay
-# `fold-sync/*` for pr.yml's lockfile exemption, which is mutually exclusive
-# with the execution-workspace branch match `isDeliveredByCard()` requires — so
-# on that branch class the waiver is not an escape hatch, it is the default
-# route on the riskiest change in the repository, and the fleet's own
-# `pull_requests:write` grant lets the identity that opens the PR author either
-# waiver form. On a `fold-sync/` head, EITHER waiver stands only if the PR also
-# carries an approving review from a human GitHub account (`user.type == "User"`)
-# on the CURRENT head SHA, from someone other than the PR author, not later
-# superseded by that same account, AND whose `author_association` is one of
-# OWNER / MEMBER / COLLABORATOR. That last condition is not optional: this
-# repository is PUBLIC, so any GitHub account can submit an approving review on
-# any PR, and without it a drive-by APPROVED from an unaffiliated account would
-# countersign a fold waiver. Note the honest limit — `author_association`
-# establishes org or collaborator standing, NOT write access; a read-only
-# collaborator still satisfies it. Checking the actual permission level needs
-# `GET /repos/{o}/{r}/collaborators/{u}/permission`, which requires push access
-# the workflow token deliberately does not have. This makes one read-only call:
+# COUNTERSIGNATURE on fold-sync heads -- ADVISORY SINCE 2026-09-07, NOT ENFORCED.
+# A PR whose head ref starts with `fold-sync/` cannot earn `paperclip/approved`
+# at all -- the head must stay `fold-sync/*` for pr.yml's lockfile exemption,
+# which is mutually exclusive with the execution-workspace branch match
+# `isDeliveredByCard()` requires -- so on that branch class the waiver is not an
+# escape hatch, it is the only route.
+#
+# From 2026-09-07 the waiver STANDS ALONE on a fold-sync head. The operator
+# ruling and its reasoning are in the fork design doc, D3; the short version is
+# that TEA-Core/paperclip has two collaborators and the fold PR is opened by the
+# operator, so the rule required a second account that in practice was the same
+# person -- a formality this gate cannot detect, which is worse than no gate
+# because it reads as a safety property in write-ups.
+#
+# The countersignature is still COMPUTED and REPORTED on every fold waiver, as
+# telemetry only. It gates nothing. Do not cite the note as an approval control;
+# it answers "did a human look at this fold", which the design doc lists as a
+# metric, and nothing more. Re-enabling is a one-line change: make
+# `require_countersignature` return the advisory result instead of 0.
+#
+# The resolution logic behind the note is deliberately kept intact and tested --
+# APPROVED and still approved (a later CHANGES_REQUESTED or DISMISSED from the
+# same login supersedes), `user.type == "User"`, on the current head SHA, not the
+# PR author, and `author_association` in OWNER / MEMBER / COLLABORATOR. It costs
+# one read-only call:
 #   GET repos/{owner}/{repo}/pulls/{n}/reviews
-# An uncountersigned waiver is not an immediate failure: it falls through to the
-# ordinary `paperclip/approved` status check, which can still pass on its own.
 # Every other head ref keeps the unmodified waiver behaviour.
 #
 # Usage:
@@ -339,31 +343,28 @@ human_countersigner() {
   return 1
 }
 
-# Set by the waiver blocks below when a waiver is present but uncountersigned,
-# so the final failure message can say which of the two things is missing.
-WAIVER_UNCOUNTERSIGNED=""
-
 # require_countersignature <waiver-description>
 #   0 -> the waiver stands (not a fold head, or a human countersigned it)
 #   1 -> the waiver is present but uncountersigned; fall through to the status
 #        check, which is the ordinary gate and can still pass on its own
+# ALWAYS RETURNS 0. The countersignature is telemetry as of 2026-09-07, not a
+# gate; see the header. It is still resolved so the log records whether a human
+# looked at the fold, and so the resolution logic does not rot before anyone
+# decides to re-enable it. A failure reading the reviews is reported and then
+# ignored, because an advisory signal must not be able to fail a build.
 require_countersignature() {
   local what="$1" approver rc
   [ "$FOLD_HEAD" = "1" ] || return 0
 
   approver="$(human_countersigner)" && rc=0 || rc=$?
   if [ "${rc:-1}" = "0" ] && [ -n "$approver" ]; then
-    note "countersigned: ${what}, approved on head ${HEAD_SHA} by @${approver} (human account)"
-    return 0
+    note "countersigned (advisory): ${what}, approved on head ${HEAD_SHA} by @${approver} (human account)"
+  elif [ "${rc:-1}" = "2" ]; then
+    note "countersignature UNKNOWN (advisory): could not read the reviews for ${what} — not enforced, so the waiver stands"
+  else
+    note "NOT countersigned (advisory): ${what} on fold head '${PR_HEAD_REF}' carries no approving review from a human account on head ${HEAD_SHA} — not enforced, so the waiver stands"
   fi
-  if [ "${rc:-1}" = "2" ]; then
-    # An API failure must never read as countersigned.
-    WAIVER_UNCOUNTERSIGNED="${what} (could not read the PR's reviews)"
-    return 1
-  fi
-  WAIVER_UNCOUNTERSIGNED="$what"
-  note "NOT countersigned: ${what} on fold head '${PR_HEAD_REF}' carries no approving review from a human account on head ${HEAD_SHA}"
-  return 1
+  return 0
 }
 
 # Waiver 1: body line "Paperclip-Approved-Waiver: <reason>" with a non-empty
@@ -447,15 +448,4 @@ err "FAIL: ${CONTEXT} is ${APPROVAL_STATE}, expected ${STATE} — PR #${PR_NUMBE
 err "  an approval is produced by the control plane when the card's review stage records 'approved'"
 err "  (a hand PATCH of the card status skips publishApprovalStatus — no status is ever published)"
 err "  or waive a cardless PR: body line 'Paperclip-Approved-Waiver: <reason>' or the 'no-paperclip-card' label"
-if [ -n "$WAIVER_UNCOUNTERSIGNED" ]; then
-  err "  this PR DOES carry a waiver — ${WAIVER_UNCOUNTERSIGNED} — but its head ref '${PR_HEAD_REF}' is a fold-sync branch,"
-  err "  and on a fold-sync head a waiver stands only when the PR also carries an approving review"
-  err "  from a human GitHub account on the current head SHA ${HEAD_SHA}, whose author_association"
-  err "  is OWNER, MEMBER or COLLABORATOR (this repository is public — an unaffiliated account's"
-  err "  approval does not count)."
-  err "  A fold PR cannot earn paperclip/approved (the head must stay fold-sync/* for pr.yml's lockfile"
-  err "  exemption, which is mutually exclusive with the card branch match isDeliveredByCard() requires),"
-  err "  so the countersignature is the human on the path — not an obstacle to route around."
-  err "  Push the FINAL head SHA first, then approve: an approval made against an earlier commit does not count."
-fi
 exit 1

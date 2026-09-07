@@ -157,187 +157,150 @@ function withFixture(options, assertions, runOptions) {
 // A `fold-sync/*` PR cannot earn `paperclip/approved`: the head must stay
 // `fold-sync/*` for pr.yml's lockfile exemption, and that is mutually exclusive
 // with the execution-workspace branch match `isDeliveredByCard()` requires. So
-// on this branch class the waiver is the default route on the riskiest change
-// in the repository -- and the `fleet-only` grant carries
-// `pull_requests:write`, so the identity that opens the PR can author either
-// waiver form for itself. These tests pin the countersignature that puts a
-// person on that path.
+// on this branch class the waiver is the only route.
+//
+// 2026-09-07: the countersignature that used to gate that route is now ADVISORY.
+// TEA-Core/paperclip has two collaborators and the operator opens the fold PR, so
+// the rule demanded a second account that in practice was the same person — a
+// formality the gate cannot detect, and one that read as a safety property in
+// write-ups. Operator ruling; see the fork design doc, D3.
+//
+// These tests pin BOTH halves of that decision:
+//   1. the waiver now stands on a fold head with no review at all, and
+//   2. the advisory resolution is still correct, so the log keeps answering
+//      "did a human look at this fold" and the logic does not rot before anyone
+//      decides to re-enable it.
+// Deleting the second half would leave a note nobody can trust.
 
-test("an uncountersigned body waiver on a fold-sync head does not merge", () => {
-  withFixture({}, ({ code, err }) => {
-    assert.equal(code, 1);
-    assert.match(err, /fold-sync branch/);
-    assert.match(err, /approving review\n?.*human GitHub account|human GitHub account/s);
+// --- 1. the gate is gone ------------------------------------------------------
+
+test("an uncountersigned body waiver on a fold-sync head now merges", () => {
+  withFixture({ reviews: [] }, ({ code, out, err }) => {
+    assert.equal(code, 0, `expected the waiver to stand alone\n${out}${err}`);
+    assert.match(`${out}${err}`, /NOT countersigned \(advisory\)/);
+    assert.match(`${out}${err}`, /not enforced, so the waiver stands/);
   });
 });
 
-test("a human approval on the current head SHA countersigns the waiver", () => {
-  withFixture({ reviews: [review()] }, ({ code, out }) => {
-    assert.equal(code, 0);
-    assert.match(out, /countersigned: body waiver/);
-    assert.match(out, /@kronik187/);
-  });
-});
-
-test("a Bot approval does not countersign", () => {
+test("an uncountersigned no-paperclip-card label on a fold-sync head now merges", () => {
   withFixture(
-    { reviews: [review({ user: { login: "fleet-only[bot]", type: "Bot" } })] },
-    ({ code, err }) => {
-      // The whole point is an identity the fleet's own installation token
-      // cannot produce. An App review reports user.type "Bot".
-      assert.equal(code, 1);
-      assert.match(err, /fold-sync branch/);
+    { body: "no waiver line here", labels: ["no-paperclip-card"], reviews: [] },
+    ({ code, out, err }) => {
+      assert.equal(code, 0, `expected the label waiver to stand alone\n${out}${err}`);
+      assert.match(`${out}${err}`, /NOT countersigned \(advisory\)/);
     },
   );
 });
 
-test("an approval carried over from an earlier commit does not countersign", () => {
-  withFixture({ reviews: [review({ commit_id: OLD_SHA })] }, ({ code, err }) => {
-    // pr.yml's stale-merge-base check hard-fails past 20 commits behind or 24h,
-    // so a fold PR is pushed to its FINAL SHA and only then approved. An
-    // approval against an earlier commit reviewed a different tree.
-    assert.equal(code, 1);
-    assert.match(err, /FINAL head SHA/);
+test("a failure reading the reviews cannot fail the build", () => {
+  // An advisory signal that can break CI is worse than no signal: it would make
+  // every fold hostage to a transient 502 on a call whose answer is not used.
+  withFixture({ reviews: [], reviewsFail: true }, ({ code, out, err }) => {
+    assert.equal(code, 0, `a reviews API failure must not gate\n${out}${err}`);
+    assert.match(`${out}${err}`, /countersignature UNKNOWN \(advisory\)/);
   });
 });
 
-test("a later CHANGES_REQUESTED from the same account supersedes its approval", () => {
+test("a non-fold head still keeps the unmodified waiver", () => {
+  withFixture({ headRef: "docs/sync", reviews: [] }, ({ code, out, err }) => {
+    assert.equal(code, 0, `${out}${err}`);
+    assert.doesNotMatch(`${out}${err}`, /advisory/, "no countersignature note belongs on a non-fold head");
+  });
+});
+
+// --- 2. the gate that REMAINS -------------------------------------------------
+
+test("a fold head with no waiver and no approval still fails", () => {
+  // The waiver is what stands alone now — not the absence of one. If this ever
+  // passes, the change went further than the ruling.
+  withFixture({ body: "no waiver line here", labels: [], reviews: [] }, ({ code }) => {
+    assert.equal(code, 1, "a fold PR with neither a waiver nor an approval must not merge");
+  });
+});
+
+// --- 3. the advisory resolution is still correct ------------------------------
+
+const advisoryCases = [
+  ["a human approval on the current head SHA", [review()], /countersigned \(advisory\)/],
+  ["a Bot approval", [review({ user: { login: "tea-core[bot]", type: "Bot" } })], /NOT countersigned/],
+  ["an approval carried over from an earlier commit", [review({ commit_id: OLD_SHA })], /NOT countersigned/],
+  [
+    "a later CHANGES_REQUESTED from the same account",
+    [review(), review({ state: "CHANGES_REQUESTED" })],
+    /NOT countersigned/,
+  ],
+  [
+    "a retraction targeting an older commit",
+    [review(), review({ state: "CHANGES_REQUESTED", commit_id: OLD_SHA })],
+    /NOT countersigned/,
+  ],
+  [
+    "an approval superseded on an old commit and re-approved on head",
+    [review(), review({ state: "CHANGES_REQUESTED", commit_id: OLD_SHA }), review()],
+    /countersigned \(advisory\)/,
+  ],
+  [
+    "a COMMENTED review after an approval",
+    [review(), review({ state: "COMMENTED" })],
+    /countersigned \(advisory\)/,
+  ],
+  [
+    "an unaffiliated account's approval",
+    [review({ user: { login: "passer-by", type: "User" }, author_association: "CONTRIBUTOR" })],
+    /NOT countersigned/,
+  ],
+  ["an OWNER's approval", [review({ author_association: "OWNER" })], /countersigned \(advisory\)/],
+  [
+    "a COLLABORATOR's approval",
+    [review({ author_association: "COLLABORATOR" })],
+    /countersigned \(advisory\)/,
+  ],
+];
+
+for (const [label, reviews, expected] of advisoryCases) {
+  test(`advisory note: ${label}`, () => {
+    withFixture({ reviews }, ({ code, out, err }) => {
+      // Every one of these merges now. Only the NOTE differs.
+      assert.equal(code, 0, `the waiver stands regardless of the review\n${out}${err}`);
+      assert.match(`${out}${err}`, expected);
+    });
+  });
+}
+
+test("advisory note: the PR author's own approval does not count", () => {
+  // GitHub already refuses author self-approval. Asserted because the note would
+  // otherwise claim a human reviewed a fold the author waived for themselves —
+  // which is exactly the shape the ruling accepted knowingly, and the log must
+  // not overstate it.
   withFixture(
-    { reviews: [review(), review({ state: "CHANGES_REQUESTED" })] },
-    ({ code }) => assert.equal(code, 1),
+    { author: "kronik187", reviews: [review({ user: { login: "kronik187", type: "User" } })] },
+    ({ code, out, err }) => {
+      assert.equal(code, 0, `${out}${err}`);
+      assert.match(`${out}${err}`, /NOT countersigned/);
+    },
   );
 });
 
-test("a retraction targeting an older commit still supersedes the approval", () => {
-  // A review may target any commit associated with the PR. Filtering by
-  // commit_id while accumulating each reviewer's state would discard this
-  // CHANGES_REQUESTED as "not on the head SHA" and leave the superseded
-  // approval standing -- the countersignature would survive its own retraction.
-  withFixture(
-    { reviews: [review(), review({ state: "CHANGES_REQUESTED", commit_id: OLD_SHA })] },
-    ({ code }) => assert.equal(code, 1),
-  );
-});
-
-test("an approval superseded on an old commit and re-approved on head counts", () => {
-  // The mirror case: the final state is what matters, and it is an approval of
-  // the current head.
+test("advisory note: a retraction whose association has since downgraded still supersedes", () => {
+  // `author_association` is computed per review at submission time, so someone
+  // who leaves the org submits their next review as CONTRIBUTOR. Filtering on it
+  // while accumulating would drop the retraction and leave the approval standing.
   withFixture(
     {
       reviews: [
-        review({ state: "CHANGES_REQUESTED", commit_id: OLD_SHA }),
         review(),
-      ],
-    },
-    ({ code }) => assert.equal(code, 0),
-  );
-});
-
-test("a COMMENTED review after an approval leaves the approval standing", () => {
-  withFixture(
-    { reviews: [review(), review({ state: "COMMENTED" })] },
-    ({ code }) => assert.equal(code, 0),
-  );
-});
-
-test("an unaffiliated account's approval does not countersign", () => {
-  // TEA-Core/paperclip is a PUBLIC repository, so any GitHub account can submit
-  // an approving review on any PR. `user.type == "User"` proves the reviewer is
-  // a person, not that they have any standing here -- without the association
-  // check a drive-by APPROVED would countersign a fold waiver on the branch
-  // that auto-deploys to production.
-  for (const assoc of ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE", ""]) {
-    withFixture(
-      {
-        reviews: [
-          review({ user: { login: "passer-by", type: "User" }, author_association: assoc }),
-        ],
-      },
-      ({ code }) => assert.equal(code, 1, `author_association ${assoc || "<empty>"} must not count`),
-    );
-  }
-});
-
-test("a retraction whose association has since downgraded still supersedes", () => {
-  // `author_association` is computed per review at submission time, so it can
-  // differ between two reviews by the same account -- someone who leaves the
-  // org submits their next review as CONTRIBUTOR. Filtering on it while
-  // accumulating would skip this CHANGES_REQUESTED as "untrusted" rather than
-  // letting it supersede, and the earlier approval would still countersign.
-  withFixture(
-    {
-      reviews: [
-        review({ author_association: "MEMBER" }),
         review({ state: "CHANGES_REQUESTED", author_association: "CONTRIBUTOR" }),
       ],
     },
-    ({ code }) => assert.equal(code, 1),
-  );
-});
-
-test("owners and collaborators countersign as well as members", () => {
-  for (const assoc of ["OWNER", "MEMBER", "COLLABORATOR"]) {
-    withFixture(
-      { reviews: [review({ author_association: assoc })] },
-      ({ code }) => assert.equal(code, 0, `author_association ${assoc} must count`),
-    );
-  }
-});
-
-test("the PR author's own approval does not countersign", () => {
-  withFixture(
-    {
-      author: "kronik187",
-      reviews: [review({ user: { login: "kronik187", type: "User" } })],
-    },
-    ({ code }) => assert.equal(code, 1),
-  );
-});
-
-test("the no-paperclip-card label is countersigned on a fold-sync head too", () => {
-  // Leaving one of the two waiver forms uncountersigned would leave the gate
-  // exactly as open as before: `pull_requests:write` covers labels.
-  withFixture({ body: "no waiver line here", labels: ["no-paperclip-card"] }, ({ code, err }) => {
-    assert.equal(code, 1);
-    assert.match(err, /no-paperclip-card/);
-  });
-  withFixture(
-    { body: "no waiver line here", labels: ["no-paperclip-card"], reviews: [review()] },
-    ({ code, out }) => {
-      assert.equal(code, 0);
-      assert.match(out, /countersigned: the 'no-paperclip-card' label/);
+    ({ code, out, err }) => {
+      assert.equal(code, 0, `${out}${err}`);
+      assert.match(`${out}${err}`, /NOT countersigned/);
     },
   );
 });
 
-test("a non-fold head keeps the unmodified waiver", () => {
-  // Scoped deliberately: cardless doctrine-sync, rescue and router-only PRs are
-  // ~26/day and must not acquire a review requirement.
-  withFixture({ headRef: "SUP-15270-context-snapshot-size-bound" }, ({ code, out }) => {
+test("pull_request stays advisory for a fold waiver", () => {
+  withFixture({ reviews: [] }, ({ code }) => {
     assert.equal(code, 0);
-    assert.match(out, /waived: PR body declares/);
-  });
-});
-
-test("an uncountersigned waiver still falls through to the status check", () => {
-  // The countersignature gates the waiver, not the ordinary gate. A fold PR
-  // that somehow does carry paperclip/approved must still pass.
-  withFixture({ approvedState: "success" }, ({ code, out }) => {
-    assert.equal(code, 0);
-    assert.match(out, /pass: paperclip\/approved = success/);
-  });
-});
-
-test("a failure reading the reviews never reads as countersigned", () => {
-  withFixture({ reviewsFail: true }, ({ code, err }) => {
-    assert.equal(code, 1);
-    assert.match(err, /could not read the PR's reviews/);
-  });
-});
-
-test("pull_request stays advisory for an uncountersigned fold waiver", () => {
-  // The merge queue is the enforcement point. A fail-closed pull_request arm
-  // would make every fold PR red for its whole working life, and GitHub does
-  // not re-run a pull_request workflow when a review lands later.
-  withFixture({}, ({ code }) => assert.equal(code, 0), { event: "pull_request" });
+  }, { event: "pull_request" });
 });

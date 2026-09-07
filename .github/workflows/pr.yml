@@ -262,12 +262,17 @@ jobs:
       - name: Test PR security gate wiring
         run: node --test ./scripts/__tests__/pr-security-gate.test.mjs
 
-      - name: Test paperclip-approved enforcer countersignature
-        # The enforcer had no test of any kind before this. It is the last gate
-        # before a commit lands on the branch that auto-deploys to production,
-        # and on a fold-sync head its waiver path is the ONLY route -- so the
-        # countersignature is the single thing standing between the fleet's own
-        # `pull_requests:write` grant and a self-waived fold merge.
+      - name: Test paperclip-approved enforcer fold-waiver contract
+        # On a fold-sync head the waiver path is the ONLY route, so this file is
+        # what pins its contract. As of 2026-09-07 the countersignature that used
+        # to gate that route is ADVISORY -- an operator ruling, recorded in the
+        # fork design doc under D3, taken because this repository has two
+        # collaborators and the operator opens the fold PR, so the rule demanded a
+        # second account that in practice was the same person.
+        #
+        # The tests therefore pin two things at once: that a fold waiver now
+        # stands alone, AND that a fold PR with no waiver at all still fails. The
+        # second is the invariant the ruling did NOT relax.
         run: node --test ./scripts/__tests__/paperclip-approved-countersign.test.mjs
 
       - name: Test paperclip-approved status attribution
