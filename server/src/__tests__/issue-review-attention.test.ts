@@ -334,26 +334,57 @@ describeEmbeddedPostgres("issue review attention", () => {
       executionState: deadParticipantState,
     });
 
-    // Nine queued review wakes, all older than the participant re-arm deferral
-    // window (30 min) and never delivered — the exact SUP-15248 shape.
+    // The exact SUP-15248 shape: nine undelivered review re-arm wakes, all older
+    // than the participant re-arm deferral window (30 min) and never delivered.
+    // Production re-arms use reason `execution_review_requested` with
+    // payload.rearm=true (recovery/service.ts PENDING_REVIEW_REARM_REASON), so the
+    // fixture mirrors that instead of the pre-fix test-only reason.
     const staleAgeMs = 24 * 60 * 60 * 1000;
     for (let i = 0; i < 9; i += 1) {
       await db.insert(agentWakeupRequests).values({
         companyId,
         agentId: deadAgentId,
         source: "automation",
-        reason: "pending_review_rearm",
+        reason: "execution_review_requested",
         status: "queued",
-        payload: { issueId: staleIssueId, rearm: true },
+        payload: { issueId: staleIssueId, mutation: "update", rearm: true },
         requestedAt: new Date(Date.now() - staleAgeMs - i * 60_000),
       });
     }
+
+    // The 3/3 exhausted re-arm budget: the three re-arm attempts the platform
+    // already made reached a terminal status (completed/failed/timed_out).
+    // Terminal wakes are not `queued_wake` maintained paths — the attention fetch
+    // only reads queued/deferred/claimed rows — so their presence proves the
+    // exhausted-budget state is still not counted as covered.
+    const consumedRearmStatuses: string[] = ["completed", "failed", "timed_out"];
+    for (let i = 0; i < consumedRearmStatuses.length; i += 1) {
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId: deadAgentId,
+        source: "automation",
+        reason: "execution_review_requested",
+        status: consumedRearmStatuses[i],
+        payload: { issueId: staleIssueId, mutation: "update", rearm: true },
+        requestedAt: new Date(Date.now() - (i + 1) * 5 * 60 * 1000),
+        finishedAt: new Date(Date.now() - i * 5 * 60 * 1000),
+      });
+    }
+
+    // NB: a `pending_review_rearm_cap_exhausted` recovery action (ownerType: board)
+    // is deliberately NOT seeded here. classifyIssueReviewPaths turns any open
+    // recovery action into a maintained `recovery` path (issues.ts), which would
+    // flip the card to `covered` and contradict the acceptance criterion that an
+    // exhausted re-arm budget is not covered. That recovery-path classification is
+    // a separate concern (the issue's "Out of scope" recovery/blocker analogue),
+    // not part of this scoring fix.
 
     let row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === staleIssueId);
     expect(row?.reviewAttention?.state).not.toBe("covered");
     expect(row?.reviewAttention).toMatchObject({ state: "stalled", paths: [] });
 
-    // Control: a fresh queued wake is still a maintained path -> covered.
+    // Control: a fresh queued re-arm wake (within the deferral window) is still a
+    // maintained path -> covered.
     const freshIssueId = await insertReview({
       companyId,
       agentId,
@@ -364,9 +395,9 @@ describeEmbeddedPostgres("issue review attention", () => {
       companyId,
       agentId: deadAgentId,
       source: "automation",
-      reason: "pending_review_rearm",
+      reason: "execution_review_requested",
       status: "queued",
-      payload: { issueId: freshIssueId, rearm: true },
+      payload: { issueId: freshIssueId, mutation: "update", rearm: true },
       requestedAt: new Date(),
     });
     row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === freshIssueId);
