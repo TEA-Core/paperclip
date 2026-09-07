@@ -64,7 +64,15 @@
 # waiver form. On a `fold-sync/` head, EITHER waiver stands only if the PR also
 # carries an approving review from a human GitHub account (`user.type == "User"`)
 # on the CURRENT head SHA, from someone other than the PR author, not later
-# superseded by that same account. This makes one read-only call:
+# superseded by that same account, AND whose `author_association` is one of
+# OWNER / MEMBER / COLLABORATOR. That last condition is not optional: this
+# repository is PUBLIC, so any GitHub account can submit an approving review on
+# any PR, and without it a drive-by APPROVED from an unaffiliated account would
+# countersign a fold waiver. Note the honest limit — `author_association`
+# establishes org or collaborator standing, NOT write access; a read-only
+# collaborator still satisfies it. Checking the actual permission level needs
+# `GET /repos/{o}/{r}/collaborators/{u}/permission`, which requires push access
+# the workflow token deliberately does not have. This makes one read-only call:
 #   GET repos/{owner}/{repo}/pulls/{n}/reviews
 # An uncountersigned waiver is not an immediate failure: it falls through to the
 # ordinary `paperclip/approved` status check, which can still pass on its own.
@@ -273,10 +281,10 @@ esac
 #   not the author -- GitHub already refuses author self-approval; asserted here
 #                     because this gate is what a compromised token would aim at.
 human_countersigner() {
-  local reviews state commit login utype approver
+  local reviews state commit login utype assoc approver
   reviews="$(gh api --paginate \
     "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" \
-    --jq '.[] | [(.state // ""), (.commit_id // ""), (.user.login // ""), (.user.type // "")] | @tsv' 2>&1)" \
+    --jq '.[] | [(.state // ""), (.commit_id // ""), (.user.login // ""), (.user.type // ""), (.author_association // "")] | @tsv' 2>&1)" \
     || { err "API failure: GET repos/${REPO}/pulls/${PR_NUMBER}/reviews — ${reviews}"; return 2; }
 
   # Reviews come back in submission order, so a later state for a login
@@ -292,11 +300,20 @@ human_countersigner() {
   # the end.
   declare -A final_state=()
   declare -A final_commit=()
-  while IFS=$'\t' read -r state commit login utype; do
+  while IFS=$'\t' read -r state commit login utype assoc; do
     [ -n "$state" ] || continue
     [ "$utype" = "User" ] || continue
     [ -n "$login" ] || continue
     [ "$login" != "$PR_AUTHOR" ] || continue
+    # TEA-Core/paperclip is a PUBLIC repository, so any GitHub account can
+    # submit an approving review on any PR. `user.type == "User"` proves the
+    # reviewer is a person rather than an App; it proves nothing about their
+    # standing here, and a drive-by APPROVED from an unaffiliated account would
+    # otherwise countersign a fold waiver.
+    case "$assoc" in
+      OWNER|MEMBER|COLLABORATOR) ;;
+      *) continue ;;
+    esac
     # COMMENTED reviews do not change an approval either way.
     [ "$state" != "COMMENTED" ] || continue
     final_state["$login"]="$state"
@@ -424,7 +441,9 @@ err "  or waive a cardless PR: body line 'Paperclip-Approved-Waiver: <reason>' o
 if [ -n "$WAIVER_UNCOUNTERSIGNED" ]; then
   err "  this PR DOES carry a waiver — ${WAIVER_UNCOUNTERSIGNED} — but its head ref '${PR_HEAD_REF}' is a fold-sync branch,"
   err "  and on a fold-sync head a waiver stands only when the PR also carries an approving review"
-  err "  from a human GitHub account on the current head SHA ${HEAD_SHA}."
+  err "  from a human GitHub account on the current head SHA ${HEAD_SHA}, whose author_association"
+  err "  is OWNER, MEMBER or COLLABORATOR (this repository is public — an unaffiliated account's"
+  err "  approval does not count)."
   err "  A fold PR cannot earn paperclip/approved (the head must stay fold-sync/* for pr.yml's lockfile"
   err "  exemption, which is mutually exclusive with the card branch match isDeliveredByCard() requires),"
   err "  so the countersignature is the human on the path — not an obstacle to route around."

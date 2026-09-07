@@ -128,6 +128,7 @@ function review(overrides = {}) {
     state: "APPROVED",
     commit_id: HEAD_SHA,
     user: { login: "kronik187", type: "User" },
+    author_association: "MEMBER",
     ...overrides,
   };
 }
@@ -225,6 +226,33 @@ test("a COMMENTED review after an approval leaves the approval standing", () => 
     { reviews: [review(), review({ state: "COMMENTED" })] },
     ({ code }) => assert.equal(code, 0),
   );
+});
+
+test("an unaffiliated account's approval does not countersign", () => {
+  // TEA-Core/paperclip is a PUBLIC repository, so any GitHub account can submit
+  // an approving review on any PR. `user.type == "User"` proves the reviewer is
+  // a person, not that they have any standing here -- without the association
+  // check a drive-by APPROVED would countersign a fold waiver on the branch
+  // that auto-deploys to production.
+  for (const assoc of ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE", ""]) {
+    withFixture(
+      {
+        reviews: [
+          review({ user: { login: "passer-by", type: "User" }, author_association: assoc }),
+        ],
+      },
+      ({ code }) => assert.equal(code, 1, `author_association ${assoc || "<empty>"} must not count`),
+    );
+  }
+});
+
+test("owners and collaborators countersign as well as members", () => {
+  for (const assoc of ["OWNER", "MEMBER", "COLLABORATOR"]) {
+    withFixture(
+      { reviews: [review({ author_association: assoc })] },
+      ({ code }) => assert.equal(code, 0, `author_association ${assoc} must count`),
+    );
+  }
 });
 
 test("the PR author's own approval does not countersign", () => {
