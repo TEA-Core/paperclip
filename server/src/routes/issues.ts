@@ -96,6 +96,7 @@ import {
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
   type IssueReviewPolicy,
+  type IssueUnblockDescriptor,
   type IssueThreadInteractionCanonicalResolverPolicy,
   type IssueCommentPresentation,
   type IssueWatchdogDiscoveryKind,
@@ -6353,7 +6354,12 @@ export function issueRoutes(
 
   async function requireRecoveryActionAuthority(
     req: Request,
-    issue: { id: string; companyId: string; assigneeAgentId: string | null },
+    issue: {
+      id: string;
+      companyId: string;
+      assigneeAgentId: string | null;
+      unblockDescriptor?: IssueUnblockDescriptor | null;
+    },
     activeRecoveryAction: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>,
     input: { source: "issue_update" | "recovery_action_resolution" },
   ) {
@@ -6373,6 +6379,21 @@ export function issueRoutes(
     }
     if (!issue.assigneeAgentId && !activeRecoveryAction.ownerAgentId) return true;
     if (activeRecoveryAction.ownerAgentId === actorAgentId) return true;
+    // The issue's declared unblock owner is the one agent the card's own
+    // nextAction asks to "unblock it to resume work". When the liveness sweeper
+    // routes the recovery action to an escalation-ladder owner, that declared
+    // owner would otherwise be locked out of the very action it was named for.
+    // Grant authority to the agent named in the stored (already-parsed)
+    // descriptor; every other rejection path is unchanged.
+    const unblockDescriptor = issue.unblockDescriptor;
+    if (
+      unblockDescriptor &&
+      unblockDescriptor.owner !== "board" &&
+      "agentId" in unblockDescriptor.owner &&
+      unblockDescriptor.owner.agentId === actorAgentId
+    ) {
+      return true;
+    }
     if (
       activeRecoveryAction.ownerAgentId &&
       await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, activeRecoveryAction.ownerAgentId)

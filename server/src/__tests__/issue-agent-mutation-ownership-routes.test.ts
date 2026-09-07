@@ -2283,6 +2283,82 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
   });
 
+  it("lets the issue's declared unblock owner move its own blocked issue past another agent's recovery action", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        status: "blocked",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        unblockDescriptor: { owner: { agentId: peerAgentId }, action: "Unblock to resume work" },
+      }),
+    );
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" }),
+      ...patch,
+    }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId,
+    });
+
+    const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send({ status: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("todo");
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("still rejects a peer that is neither the unblock owner nor the recovery owner when a descriptor names someone else", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        status: "blocked",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        unblockDescriptor: { owner: { agentId: ownerAgentId }, action: "Unblock to resume work" },
+      }),
+    );
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId,
+    });
+
+    const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send({ status: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent cannot resolve another owner's recovery action");
+    expect(res.body.details).toEqual(
+      expect.objectContaining({
+        issueId,
+        recoveryActionId,
+        actorAgentId: peerAgentId,
+        assigneeAgentId: null,
+        recoveryOwnerAgentId: ownerAgentId,
+      }),
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("does not grant a peer authority from a board-owned unblock descriptor", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        status: "blocked",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        unblockDescriptor: { owner: "board", action: "Decide the next step" },
+      }),
+    );
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId,
+    });
+
+    const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send({ status: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent cannot resolve another owner's recovery action");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("allows any same-company agent to mutate an unassigned issue when the active recovery action has no owner", async () => {
     mockIssueService.getById.mockResolvedValue(
       makeIssue({ status: "blocked", assigneeAgentId: null }),
