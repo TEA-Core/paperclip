@@ -212,7 +212,7 @@ test("mergesToCheck falls back to the head alone with no base", () => {
   }
 });
 
-test("generated lockfiles are excluded even though YAML is in scope", () => {
+test("workflow YAML is in scope, both extensions, and generated lockfiles are not", () => {
   // `.yml` is in scope because a workflow file is a real place for a merge to
   // keep both copies -- fold 1446a58c0 duplicated a whole `release.yml` step.
   // `pnpm-lock.yaml` is the entire cost of that: its dependency entries are
@@ -223,33 +223,37 @@ test("generated lockfiles are excluded even though YAML is in scope", () => {
   // refuses the edit and a fold takes upstream's resolved file wholesale.
   const { dir, git, gitAllowingConflict } = makeRepo();
   try {
+    // `deploy.yaml` is the positive case for the `.yaml` extension itself:
+    // without it, `ci.yml` alone would keep this test green even if `yaml` were
+    // dropped from the extension set, because the only other `.yaml` here is
+    // the one expected to be absent.
+    const tracked = ["pnpm-lock.yaml", "ci.yml", "deploy.yaml"];
     const write = (name, body) => writeFileSync(path.join(dir, name), body);
-    write("pnpm-lock.yaml", `${GUARD}\n`);
-    write("ci.yml", `${GUARD}\n`);
+    for (const name of tracked) write(name, `${GUARD}\n`);
     git("add", "-A");
     git("commit", "-qm", "base");
 
     git("checkout", "-q", "-b", "fork");
-    write("pnpm-lock.yaml", `${GUARD}\n\nfork: true\n`);
-    write("ci.yml", `${GUARD}\n\nfork: true\n`);
+    for (const name of tracked) write(name, `${GUARD}\n\nfork: true\n`);
     git("commit", "-qam", "fork side");
 
     git("checkout", "-q", "base");
-    write("pnpm-lock.yaml", `${GUARD}\n\nupstream: true\n`);
-    write("ci.yml", `${GUARD}\n\nupstream: true\n`);
+    for (const name of tracked) write(name, `${GUARD}\n\nupstream: true\n`);
     git("commit", "-qam", "upstream side");
 
     gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
-    for (const name of ["pnpm-lock.yaml", "ci.yml"]) {
+    for (const name of tracked) {
       write(name, `${GUARD}\n${GUARD}\n\nupstream: true\nfork: true\n`);
     }
     git("add", "-A");
-    git("commit", "-qm", "merge keeping both sides in both files");
+    git("commit", "-qm", "merge keeping both sides in every file");
 
     const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
-    const flagged = result.findings.map((f) => f.path);
-    assert.deepEqual(flagged, ["ci.yml"]);
-    assert.equal(result.redeclarations.every((r) => r.path === "ci.yml"), true);
+    assert.deepEqual(result.findings.map((f) => f.path).sort(), ["ci.yml", "deploy.yaml"]);
+    assert.deepEqual(
+      [...new Set(result.redeclarations.map((r) => r.path))].sort(),
+      ["ci.yml", "deploy.yaml"],
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
