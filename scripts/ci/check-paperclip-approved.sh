@@ -17,7 +17,16 @@
 # or write that context — a local write is a contract violation that
 # manufactures a fake signal. This script makes two read-only API calls:
 #   GET repos/{owner}/{repo}/pulls/{n}
-#   GET repos/{owner}/{repo}/commits/{head-sha}/status
+#   GET repos/{owner}/{repo}/commits/{head-sha}/statuses
+#
+# ATTRIBUTION. `paperclip/approved` is a plain commit status and the
+# `fleet-only` installation grants `statuses:write` to every Paperclip-assigned
+# agent, so possession of the signal proves nothing on its own — any agent could
+# publish a success on its own head SHA. A `success` is therefore accepted only
+# when its `creator` is the control-plane App's bot user (id
+# $APPROVED_STATUS_CREATOR_ID). The LIST endpoint is used rather than the
+# combined `/status` one because the combined endpoint omits `creator`
+# entirely, which is why this hole stood open.
 #
 # Behaviour, by event:
 #   pull_request -> advisory: log the observed state, exit 0 (green). The
@@ -68,6 +77,14 @@ set -euo pipefail
 
 CONTEXT="paperclip/approved"
 STATE="success"
+
+# The ONLY identity whose `paperclip/approved` status counts: the control-plane
+# GitHub App's bot user. A bot user's numeric id is stable for the life of the
+# App and cannot be re-registered, which a login can. Overridable so the same
+# script can run against a differently-installed control plane; the default is
+# this repository's.
+APPROVED_STATUS_CREATOR_ID="${PAPERCLIP_APPROVED_STATUS_CREATOR_ID:-317012809}"
+APPROVED_STATUS_CREATOR_LOGIN="${PAPERCLIP_APPROVED_STATUS_CREATOR_LOGIN:-tea-core[bot]}"
 
 err() { echo "[paperclip-approved][error] $*" >&2; }
 note() { echo "[paperclip-approved] $*"; }
@@ -215,17 +232,47 @@ if [ -n "$PR_LABELS" ] && printf '%s' "$PR_LABELS" | jq -e --arg l 'no-paperclip
 fi
 
 # --- the consume-contract itself ----------------------------------------------
-STATUSES_JSON="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/status" 2>&1)" \
-  || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/status — ${STATUSES_JSON}"
+# Read the LIST endpoint, not the combined one. `GET /commits/{sha}/status`
+# omits `creator` from every entry it returns — verified against a real
+# published status — so on that endpoint the enforcer structurally cannot see
+# who wrote the signal it is enforcing. `GET /commits/{sha}/statuses` carries
+# `creator`, and returns entries newest-first, so the first entry matching the
+# context is the same value the combined endpoint would have reported.
+STATUSES_JSON="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" 2>&1)" \
+  || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_JSON}"
 jq -e . >/dev/null 2>&1 <<<"$STATUSES_JSON" \
   || fail "malformed commit-status payload for ${HEAD_SHA}"
 
-APPROVAL_STATE="$(jq -r --arg c "$CONTEXT" \
-  '[(.statuses // [])[] | select(.context == $c) | .state] | if length == 0 then "missing" else .[0] end' \
+LATEST_STATUS="$(jq -c --arg c "$CONTEXT" \
+  '[(. // [])[] | select(.context == $c)] | if length == 0 then null else .[0] end' \
   <<<"$STATUSES_JSON")"
 
+if [ "$LATEST_STATUS" = "null" ] || [ -z "$LATEST_STATUS" ]; then
+  APPROVAL_STATE="missing"
+  APPROVAL_CREATOR_ID=""
+  APPROVAL_CREATOR_LOGIN=""
+else
+  APPROVAL_STATE="$(jq -r '.state // "missing"' <<<"$LATEST_STATUS")"
+  APPROVAL_CREATOR_ID="$(jq -r '.creator.id // "" | tostring' <<<"$LATEST_STATUS")"
+  APPROVAL_CREATOR_LOGIN="$(jq -r '.creator.login // ""' <<<"$LATEST_STATUS")"
+fi
+
 if [ "$APPROVAL_STATE" = "$STATE" ]; then
-  note "pass: ${CONTEXT} = ${STATE} on PR #${PR_NUMBER} head ${HEAD_SHA}"
+  # `paperclip/approved` is a plain commit status, and the `fleet-only`
+  # installation grants `statuses:write` to any Paperclip-assigned agent. So
+  # until this check existed the gate was forgeable by capability, whatever the
+  # header above asserts: any agent in the fleet could publish a success on its
+  # own head SHA and merge. The producer is the control plane, which acts as the
+  # `tea-core` App — a different installation, whose bot identity the fleet
+  # token cannot assume.
+  if [ "$APPROVAL_CREATOR_ID" != "$APPROVED_STATUS_CREATOR_ID" ]; then
+    err "FORGED: ${CONTEXT} on ${HEAD_SHA} was written by ${APPROVAL_CREATOR_LOGIN:-<unknown>} (id ${APPROVAL_CREATOR_ID:-<none>})"
+    err "  the only accepted producer is the control-plane App ${APPROVED_STATUS_CREATOR_LOGIN} (id ${APPROVED_STATUS_CREATOR_ID})"
+    err "  the fleet installation grants statuses:write to every Paperclip-assigned agent, so a"
+    err "  ${CONTEXT} status from any other identity is a self-published approval, not an approval"
+    fail "${CONTEXT} on ${HEAD_SHA} was not published by the control plane"
+  fi
+  note "pass: ${CONTEXT} = ${STATE} on PR #${PR_NUMBER} head ${HEAD_SHA} (published by ${APPROVAL_CREATOR_LOGIN})"
   exit 0
 fi
 
