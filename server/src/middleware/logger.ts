@@ -12,12 +12,39 @@ const sharedOpts = {
 };
 
 const isProduction = process.env.NODE_ENV === "production";
+
+// One pretty-print transport per process, even when this module is evaluated
+// more than once.
+//
+// `pino.transport` spawns a worker thread (thread-stream) and hands back no
+// handle this module could close, so every extra evaluation leaks one worker
+// thread, one MessagePort and that worker's whole V8 isolate for the life of
+// the process. A server process evaluates this module once, so the cache is
+// inert in production. The route and authz suites do not: they call
+// `vi.resetModules()` in `beforeEach` and re-import the middleware barrel per
+// test, so a 50-test suite would otherwise end holding 50 live worker threads.
+// Measured cost of the leak: ~400 transports in one process reach 407 threads
+// and 1.68 GB RSS, so a 50-test route suite carries roughly 280 MB of dead
+// workers — on the serialized shard, where files run one at a time under
+// `maxWorkers=1` and a single runner carries every suite in turn.
+//
+// The cache lives on `globalThis` on purpose: a module-scoped variable is
+// discarded by the very module-registry reset this guards against.
+const PRETTY_TRANSPORT_KEY = "__paperclipPinoPrettyTransport";
+type PrettyTransportCache = { [PRETTY_TRANSPORT_KEY]?: ReturnType<typeof pino.transport> };
+
+function prettyTransport() {
+  const cache = globalThis as typeof globalThis & PrettyTransportCache;
+  cache[PRETTY_TRANSPORT_KEY] ??= pino.transport({
+    target: "pino-pretty",
+    options: { ...sharedOpts, ignore: "pid,hostname,req,res,responseTime", colorize: true, destination: 1 },
+  });
+  return cache[PRETTY_TRANSPORT_KEY];
+}
+
 export const logger = isProduction
   ? pino({ level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "info", redact: [...HTTP_LOG_REDACT_PATHS] })
-  : pino({ level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "debug", redact: [...HTTP_LOG_REDACT_PATHS] }, pino.transport({
-      target: "pino-pretty",
-      options: { ...sharedOpts, ignore: "pid,hostname,req,res,responseTime", colorize: true, destination: 1 },
-    }));
+  : pino({ level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "debug", redact: [...HTTP_LOG_REDACT_PATHS] }, prettyTransport());
 
 export const httpLogger = pinoHttp({
   logger,
