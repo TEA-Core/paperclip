@@ -92,8 +92,15 @@ jobs:
       # when the gate step already failed — it cannot turn a green entry red,
       # and it is best-effort, so a post failure never changes the check
       # conclusion that blocks the merge.
+      #
+      # The `if` MUST name an explicit status-check function: without one GitHub
+      # implicitly prepends `success()`, which is false exactly when the gate
+      # step fails — the step would be skipped on the very path it exists for.
+      # `failure()` disables that implicit success(), and the `steps.gate.outcome
+      # == 'failure'` term keeps it specific to the gate (not a checkout/event
+      # step failing earlier).
       - name: Surface the merge-queue ejection reason on the PR
-        if: github.event_name == 'merge_group' && steps.gate.outcome == 'failure'
+        if: ${{ failure() && github.event_name == 'merge_group' && steps.gate.outcome == 'failure' }}
         env:
           GH_REPO: ${{ github.repository }}
         run: |

@@ -20,8 +20,12 @@
 # blocked.
 #
 # Consume/write contract:
-#   READ:  GET repos/{o}/{r}/pulls/{n}/comments   (find an existing artefact)
+#   READ:  GET repos/{o}/{r}/issues/{n}/comments   (find an existing artefact)
 #   WRITE: POST/PATCH repos/{o}/{r}/issues/{n}/comments[/{id}]
+#   Both use the issue-comment family (the PR's conversation thread), never the
+#   pull-request *review*-comment family (`pulls/{n}/comments`): the marker the
+#   write posts must be found again by the read, or re-queueing stacks a comment
+#   per attempt instead of updating the one in place.
 #   The artefact is a plain PR comment carrying a stable HTML marker
 #   (`<!-- paperclip:merge-queue-ejection -->`), so re-queueing updates the one
 #   comment in place rather than stacking one per attempt.
@@ -165,7 +169,7 @@ BODY="${BODY//__REASON__/$REASON}"
 # One artefact per PR: if a comment already carries the marker, update it in
 # place; otherwise create it. Re-queueing a PR therefore refreshes the existing
 # note instead of stacking a new one per attempt.
-comments_json="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/comments?per_page=100" 2>&1)" \
+comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>&1)" \
   || { log "could not list the PR's comments — skipping (best-effort); enforcement is unaffected"; exit 0; }
 existing_id="$(jq -r '.[] | select((.body // "") | contains("paperclip:merge-queue-ejection")) | .id' <<<"$comments_json" 2>/dev/null | head -1 || true)"
 
