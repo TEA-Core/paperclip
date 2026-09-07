@@ -300,32 +300,41 @@ human_countersigner() {
   # the end.
   declare -A final_state=()
   declare -A final_commit=()
+  declare -A final_assoc=()
   while IFS=$'\t' read -r state commit login utype assoc; do
     [ -n "$state" ] || continue
     [ "$utype" = "User" ] || continue
     [ -n "$login" ] || continue
     [ "$login" != "$PR_AUTHOR" ] || continue
+    # COMMENTED reviews do not change an approval either way.
+    [ "$state" != "COMMENTED" ] || continue
+    final_state["$login"]="$state"
+    final_commit["$login"]="$commit"
+    final_assoc["$login"]="$assoc"
+  done <<<"$reviews"
+
+  # Every condition is applied HERE, to each login's final review, and none of
+  # them inside the loop above. `author_association` is computed per review at
+  # submission time, so it can differ between two reviews by the same account —
+  # someone who leaves the org submits their next review as CONTRIBUTOR. Filter
+  # on it while accumulating and a later CHANGES_REQUESTED gets skipped as
+  # "untrusted" instead of superseding, leaving the earlier approval standing.
+  # That is the same shape as the commit_id bug fixed just above; the rule for
+  # this loop is accumulate first, judge last.
+  for approver in "${!final_state[@]}"; do
+    [ "${final_state[$approver]}" = "APPROVED" ] || continue
+    [ "${final_commit[$approver]}" = "$HEAD_SHA" ] || continue
     # TEA-Core/paperclip is a PUBLIC repository, so any GitHub account can
     # submit an approving review on any PR. `user.type == "User"` proves the
     # reviewer is a person rather than an App; it proves nothing about their
     # standing here, and a drive-by APPROVED from an unaffiliated account would
     # otherwise countersign a fold waiver.
-    case "$assoc" in
+    case "${final_assoc[$approver]}" in
       OWNER|MEMBER|COLLABORATOR) ;;
       *) continue ;;
     esac
-    # COMMENTED reviews do not change an approval either way.
-    [ "$state" != "COMMENTED" ] || continue
-    final_state["$login"]="$state"
-    final_commit["$login"]="$commit"
-  done <<<"$reviews"
-
-  for approver in "${!final_state[@]}"; do
-    if [ "${final_state[$approver]}" = "APPROVED" ] \
-      && [ "${final_commit[$approver]}" = "$HEAD_SHA" ]; then
-      printf '%s' "$approver"
-      return 0
-    fi
+    printf '%s' "$approver"
+    return 0
   done
   return 1
 }

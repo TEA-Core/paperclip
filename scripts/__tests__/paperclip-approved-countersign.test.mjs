@@ -116,6 +116,12 @@ function run(fixture, { event = "merge_group" } = {}) {
       GH_SHIM_DIR: fixture.dir,
       GH_SHIM_REVIEWS_FAIL: fixture.reviewsFail ? "1" : "0",
       GH_REPO: REPO,
+      // Pin the producer identity the fixtures emit. Inheriting a
+      // PAPERCLIP_APPROVED_STATUS_CREATOR_ID from the surrounding environment
+      // would fail every approval case for a reason that has nothing to do
+      // with the code under test.
+      PAPERCLIP_APPROVED_STATUS_CREATOR_ID: String(TEA_CORE.id),
+      PAPERCLIP_APPROVED_STATUS_CREATOR_LOGIN: TEA_CORE.login,
       GITHUB_REF: event === "merge_group" ? QUEUE_REF : "",
       GITHUB_REF_NAME: event === "merge_group" ? QUEUE_REF.replace("refs/heads/", "") : "",
     },
@@ -244,6 +250,23 @@ test("an unaffiliated account's approval does not countersign", () => {
       ({ code }) => assert.equal(code, 1, `author_association ${assoc || "<empty>"} must not count`),
     );
   }
+});
+
+test("a retraction whose association has since downgraded still supersedes", () => {
+  // `author_association` is computed per review at submission time, so it can
+  // differ between two reviews by the same account -- someone who leaves the
+  // org submits their next review as CONTRIBUTOR. Filtering on it while
+  // accumulating would skip this CHANGES_REQUESTED as "untrusted" rather than
+  // letting it supersede, and the earlier approval would still countersign.
+  withFixture(
+    {
+      reviews: [
+        review({ author_association: "MEMBER" }),
+        review({ state: "CHANGES_REQUESTED", author_association: "CONTRIBUTOR" }),
+      ],
+    },
+    ({ code }) => assert.equal(code, 1),
+  );
 });
 
 test("owners and collaborators countersign as well as members", () => {

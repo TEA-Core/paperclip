@@ -92,6 +92,12 @@ function run(statuses, { event = "merge_group" } = {}) {
         PATH: `${fixture.bin}:${process.env.PATH}`,
         GH_SHIM_DIR: fixture.dir,
         GH_REPO: REPO,
+        // Pin the producer identity the fixtures emit. Inheriting a
+        // PAPERCLIP_APPROVED_STATUS_CREATOR_ID from the surrounding
+        // environment would fail every approval case for a reason that has
+        // nothing to do with the code under test.
+        PAPERCLIP_APPROVED_STATUS_CREATOR_ID: String(TEA_CORE.id),
+        PAPERCLIP_APPROVED_STATUS_CREATOR_LOGIN: TEA_CORE.login,
         GITHUB_REF: event === "merge_group" ? QUEUE_REF : "",
         GITHUB_REF_NAME: event === "merge_group" ? QUEUE_REF.replace("refs/heads/", "") : "",
       },
