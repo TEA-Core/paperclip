@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, executionPolicyStagesCleared, normalizeIssueExecutionPolicy, parseIssueExecutionState, preserveExecutionPolicyStagesOnOmission, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -317,6 +317,81 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
     expect(() => assertWrite({ raw: "nope", currentPolicy: twoStagePolicy() })).not.toThrow();
   });
 });
+
+describe("preserveExecutionPolicyStagesOnOmission (SUP-15374)", () => {
+  it("preserves the stored ladder when the body omits the stages key", () => {
+    const current = twoStagePolicy();
+    const monitorBody = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } });
+    expect(monitorBody?.stages).toEqual([]);
+    const merged = preserveExecutionPolicyStagesOnOmission(monitorBody, current, false);
+    expect(merged?.stages).toEqual(current.stages);
+    // other supplied keys still win from the body
+    expect(merged?.monitor?.nextCheckAt).toBe("2026-04-11T12:30:00.000Z");
+  });
+
+  it("keeps an explicitly supplied stages array authoritative (non-empty replace)", () => {
+    const current = twoStagePolicy();
+    const replacement = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+    });
+    const merged = preserveExecutionPolicyStagesOnOmission(replacement, current, true);
+    expect(merged?.stages).toEqual(replacement!.stages);
+    expect(merged?.stages).toHaveLength(1);
+  });
+
+  it("respects an explicit empty stages array when the key is present", () => {
+    const current = twoStagePolicy();
+    const explicitEmpty = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" }, stages: [] });
+    const merged = preserveExecutionPolicyStagesOnOmission(explicitEmpty, current, true);
+    // key present → authoritative; the guard governs whether this write is
+    // permitted, not this merge.
+    expect(merged?.stages).toEqual([]);
+  });
+
+  it("is a no-op over a stage-less stored policy (monitor re-arm round trip)", () => {
+    const current = normalizeIssueExecutionPolicy({ stages: [], monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } });
+    const partial = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-08-26T08:00:00.000Z" } });
+    const merged = preserveExecutionPolicyStagesOnOmission(partial, current, false);
+    expect(merged?.stages).toEqual([]);
+    expect(merged?.monitor?.nextCheckAt).toBe("2026-08-26T08:00:00.000Z");
+  });
+
+  it("returns null unchanged when the normalized policy is null", () => {
+    expect(preserveExecutionPolicyStagesOnOmission(null, twoStagePolicy(), false)).toBeNull();
+  });
+
+  it("does not preserve stages over a null stored policy", () => {
+    const monitorOnly = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } });
+    const merged = preserveExecutionPolicyStagesOnOmission(monitorOnly, null, false);
+    expect(merged?.stages).toEqual([]);
+  });
+});
+
+describe("executionPolicyStagesCleared (SUP-15374)", () => {
+  it("detects a staged-to-empty transition on an in_review card", () => {
+    expect(
+      executionPolicyStagesCleared(twoStagePolicy(), normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } })!, "in_review"),
+    ).toBe(true);
+  });
+
+  it("does not fire when the next policy still has stages", () => {
+    const monitor = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } })!;
+    const merged = preserveExecutionPolicyStagesOnOmission(monitor, twoStagePolicy(), false)!;
+    expect(executionPolicyStagesCleared(twoStagePolicy(), merged, "in_review")).toBe(false);
+  });
+
+  it("does not fire when the card is not in_review", () => {
+    const empty = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } })!;
+    expect(executionPolicyStagesCleared(twoStagePolicy(), empty, "in_progress")).toBe(false);
+  });
+
+  it("does not fire when the previous policy had no stages", () => {
+    const empty = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } })!;
+    expect(executionPolicyStagesCleared(empty, empty, "in_review")).toBe(false);
+    expect(executionPolicyStagesCleared(null, empty, "in_review")).toBe(false);
+  });
+});
+
 
 describe("parseIssueExecutionState", () => {
   it("returns null for null/undefined", () => {

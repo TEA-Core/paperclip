@@ -527,6 +527,55 @@ export function assertPatchableExecutionPolicyWrite(input: {
 }
 
 /**
+ * SUP-15374: `PATCH /issues/:id` writes `executionPolicy` with replace
+ * semantics, so a body that omits the `stages` key but carries other policy
+ * content (a `monitor`, an `authorizationPolicy`, …) normalizes to a non-null
+ * policy whose `stages` is the schema default `[]` and silently wipes a live
+ * review ladder. The card then reads as `in_review` on every board and API
+ * surface while no reviewer is assigned and no approval can ever be recorded.
+ *
+ * This restores the guard's stated intent ("a body that omits the `stages`
+ * field" must not strip the ladder) by deep-merging the stored stages back
+ * into the normalized policy when the client OMITTED the `stages` key.
+ *
+ * - `stagesKeyPresent` true: the body explicitly set `stages` (any length),
+ *   so the body is authoritative and we return it untouched. An explicit
+ *   `stages: []` over a staged policy is still governed by
+ *   `assertPatchableExecutionPolicyWrite` (ADR-029/ADR-072), not here.
+ * - normalized null / no stored stages: nothing to preserve.
+ * - Otherwise: keep the stored ladder; only the omitted keys are preserved,
+ *   every other supplied key (monitor, mode, …) still wins from the body.
+ */
+export function preserveExecutionPolicyStagesOnOmission(
+  normalized: IssueExecutionPolicy | null,
+  currentPolicy: IssueExecutionPolicy | null,
+  stagesKeyPresent: boolean,
+): IssueExecutionPolicy | null {
+  if (stagesKeyPresent) return normalized;
+  if (normalized === null) return normalized;
+  if (!currentPolicy || currentPolicy.stages.length === 0) return normalized;
+  return { ...normalized, stages: currentPolicy.stages };
+}
+
+/**
+ * SUP-15374: true when a write takes a review ladder that had one or more
+ * stages down to zero on a card that is (or just became) `in_review`. The
+ * route records an activity entry for this transition so a disarmed gate can
+ * no longer disappear from every surface without a log line.
+ */
+export function executionPolicyStagesCleared(
+  previous: IssueExecutionPolicy | null,
+  next: IssueExecutionPolicy | null,
+  status: string,
+): boolean {
+  return (
+    status === "in_review" &&
+    (previous?.stages.length ?? 0) > 0 &&
+    (next?.stages.length ?? 0) === 0
+  );
+}
+
+/**
  * Normalizes a project-level default execution policy for issue creation.
  *
  * Unlike `normalizeIssueExecutionPolicy`, a malformed stored default returns

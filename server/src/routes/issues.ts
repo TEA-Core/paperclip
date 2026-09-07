@@ -268,8 +268,10 @@ import {
 import {
   applyIssueExecutionPolicyTransition,
   assertPatchableExecutionPolicyWrite,
+  executionPolicyStagesCleared,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
+  preserveExecutionPolicyStagesOnOmission,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
   type ReviewEscalationSignal,
@@ -11305,6 +11307,15 @@ export function issueRoutes(
         !Array.isArray(policy) &&
         Array.isArray((policy as { stages?: unknown }).stages) &&
         (policy as { stages: unknown[] }).stages.length === 0;
+      // SUP-15374: whether the client supplied the `stages` key at all, so the
+      // route can deep-merge the stored ladder back when it was omitted. A
+      // non-null object that merely lacks the key is the omission case; an
+      // explicit `stages` (any length, including `[]`) marks it present.
+      (req as unknown as Record<string, unknown>).executionPolicyStagesKeyPresent =
+        policy !== null &&
+        typeof policy === "object" &&
+        !Array.isArray(policy) &&
+        "stages" in (policy as object);
       next();
     },
     validateIssueMutationBody(updateIssueRouteSchema),
@@ -11661,7 +11672,18 @@ export function issueRoutes(
           (req as unknown as Record<string, unknown>).executionPolicyStagesExplicitlyEmpty,
         ),
       });
-      const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+      const normalizedExecutionPolicyRaw = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+      // SUP-15374: when the body omits the `stages` key, a blind replace would
+      // collapse a live review ladder to the schema default `[]`. Deep-merge the
+      // stored stages back so the gate survives a monitor/preset/authorization
+      // PATCH; an explicit `stages` write remains authoritative.
+      const normalizedExecutionPolicy = preserveExecutionPolicyStagesOnOmission(
+        normalizedExecutionPolicyRaw,
+        previousExecutionPolicy,
+        Boolean(
+          (req as unknown as Record<string, unknown>).executionPolicyStagesKeyPresent,
+        ),
+      );
       // requestedAssigneeAgentId is the assignee AFTER this PATCH, so a PATCH that
       // moves the assignee off the collision in the same body is accepted.
       assertIssueExecutionPolicySatisfiable({
@@ -12734,6 +12756,30 @@ export function issueRoutes(
     }
 
     const nextStoredExecutionPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+    // SUP-15374: a review ladder going to zero on an in_review card is a
+    // disarmed gate. Even though the PATCH now deep-merges an omitted
+    // `stages` key (so the common footgun can no longer do this silently),
+    // record the transition whenever it does land, so the removal is audited
+    // on the issue's activity log instead of surfacing only as a phantom
+    // "in review" state on every board and API surface.
+    if (executionPolicyStagesCleared(previousExecutionPolicy, nextStoredExecutionPolicy, issue.status)) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.execution_stages_cleared",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          status: issue.status,
+          previousStageCount: previousExecutionPolicy?.stages.length ?? 0,
+        },
+      });
+    }
     const previousMonitor = summarizeIssueMonitor(existing, previousExecutionPolicy);
     const nextMonitor = summarizeIssueMonitor(issue, nextStoredExecutionPolicy);
     const monitorScheduledChanged = previousMonitor.nextCheckAt !== nextMonitor.nextCheckAt;

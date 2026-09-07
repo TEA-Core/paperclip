@@ -1999,6 +1999,123 @@ describe("issue execution policy routes", () => {
       expect(written.executionPolicy?.monitor?.maxAttempts).toBe(100);
     });
 
+    // SUP-15374: the replace-semantics footgun. A board PATCH that supplies only
+    // `executionPolicy.monitor` (omitting the `stages` key) used to normalize to
+    // `stages: []`, pass the empty-array guard, and silently disarm an armed
+    // review ladder. The write now deep-merges the stored stages back.
+    function armedLadderInReviewIssue(issueId: string) {
+      return {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_review",
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-15374",
+        title: "Armed ladder in review",
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [
+            {
+              type: "review",
+              participants: [{ type: "agent", agentId: "55555555-5555-4555-8555-555555555555" }],
+            },
+          ],
+        }),
+        executionState: null,
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: null,
+      };
+    }
+
+    it("preserves an armed review stage when a monitor-only PATCH omits the stages key", async () => {
+      const issueId = randomUUID();
+      const issue = armedLadderInReviewIssue(issueId);
+      const storedStages = (issue.executionPolicy as { stages: unknown[] }).stages;
+      expect(storedStages).toHaveLength(1);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: {
+              nextCheckAt: "2026-12-01T12:00:00.000Z",
+              scheduledBy: "assignee",
+              notes: "Wait for external QA report.",
+            },
+          },
+        });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+      const written = mockIssueService.update.mock.calls.at(-1)?.[1] as {
+        executionPolicy?: { stages?: unknown[]; monitor?: { nextCheckAt?: string } };
+      };
+      // The armed ladder survives the monitor re-arm.
+      expect(written.executionPolicy?.stages).toEqual(storedStages);
+      // ...while the new monitor arm lands.
+      expect(written.executionPolicy?.monitor?.nextCheckAt).toBe("2026-12-01T12:00:00.000Z");
+      // No disarmed-gate audit, since nothing was cleared.
+      for (const call of mockLogActivity.mock.calls) {
+        expect((call[1] as { action?: string }).action).not.toBe("issue.execution_stages_cleared");
+      }
+    });
+
+    it("records an issue.execution_stages_cleared audit when a live ladder lands empty on an in_review card", async () => {
+      const issueId = randomUUID();
+      const issue = armedLadderInReviewIssue(issueId);
+      const storedStages = (issue.executionPolicy as { stages: unknown[] }).stages;
+      expect(storedStages).toHaveLength(1);
+      mockIssueService.getById.mockResolvedValue(issue);
+      // Simulate a write that lands with an emptied ladder while the card is
+      // still in_review (the out-of-band / explicit-clear path the route's
+      // guard no longer produces). The backstop must surface it in the
+      // activity log instead of leaving a phantom "in review" state.
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        executionPolicy: normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z" } }),
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: {
+              nextCheckAt: "2026-12-01T12:00:00.000Z",
+              scheduledBy: "assignee",
+              notes: "Wait for external QA report.",
+            },
+          },
+        });
+
+      expect(res.status).toBe(200);
+      const clearCalls = mockLogActivity.mock.calls.filter(
+        (call) => (call[1] as { action?: string }).action === "issue.execution_stages_cleared",
+      );
+      expect(clearCalls).toHaveLength(1);
+      const audit = clearCalls[0][1] as {
+        action: string;
+        entityType: string;
+        entityId: string;
+        details: { identifier: string; status: string; previousStageCount: number };
+      };
+      expect(audit.entityType).toBe("issue");
+      expect(audit.entityId).toBe(issueId);
+      expect(audit.details.identifier).toBe("PAP-15374");
+      expect(audit.details.status).toBe("in_review");
+      expect(audit.details.previousStageCount).toBe(1);
+    });
+
     it("rejects a PATCH that sets executionPolicy to null over a non-null stored policy and leaves it untouched", async () => {
       const issueId = randomUUID();
       const issue = ladderIssue(issueId);
