@@ -139,6 +139,8 @@ export {
   toolApplications,
   toolConnections,
   connectionGrants,
+  connectionGrantMembers,
+  connectionGrantDelegations,
   toolConnectionInstalls,
   toolOauthStates,
   toolCatalogEntries,

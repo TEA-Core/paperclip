@@ -26,4 +26,5 @@ export const TARGET_BOUND_INTERACTION_KINDS = [
 export const USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS = [
   ...TARGET_BOUND_INTERACTION_KINDS,
   "ask_user_questions",
+  "connection_intent",
 ] as const;
