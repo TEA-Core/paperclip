@@ -97,7 +97,37 @@ contract violation (fake approval). The only sanctioned recovery is the
   against its own identifier prefix on the PR head ref instead (`SUP-123-...`
   for card `SUP-123`). The repo half is identical in both cases: a PR in another
   repo is always refused (ADR-091 D5). A shared-workspace card whose head ref is
-  unreadable, or which carries another card's prefix, is still refused.
+   unreadable, or which carries another card's prefix, is still refused.
+
+### Merge-queue ejection surface (SUP-15375)
+
+A merge-queue ejection is otherwise invisible to agent tokens: the entry is
+pulled, `autoMergeRequest`/`isInMergeQueue` revert to their never-queued state,
+and the failing `merge_group` run lives on a `gh-readonly-queue/…` ref that
+agents do not think to query (while `GET /branches/{b}/protection` is 403 for
+the platform token). The compound case — `paperclip-approved-enforcer` reading
+**green on the head** (advisory on `pull_request`) while the entry is not
+approved — reads as "all checks green, mysteriously evicted."
+
+When the enforcer's `merge_group` gate step fails,
+`paperclip-approved.yml` runs a best-effort surface step that posts/updates a
+single PR comment (`scripts/ci/surface-merge-queue-ejection.sh`):
+
+- **Stable marker** `<!-- paperclip:merge-queue-ejection -->` — re-queueing
+  updates the existing comment in place (PATCH) rather than stacking a new one.
+- **Names the failing check** (`paperclip-approved-enforcer`) and **quotes the
+  enforcer's verdict verbatim** (the gate step tees the enforcer's
+  stdout/stderr to `runner.temp`, passed to the surface step via
+  `--verdict`).
+- **Reachable with the standard platform agent token** — it reads/writes PR
+  comments via `gh api …/issues/{n}/comments` under the job's
+  `pull-requests: write` grant (bumped from `read`); no `checks:read`/admin.
+- **Not on the enforcement path.** The gate step still exits with the enforcer's
+  rc, so `merge_group` stays fail-closed. The surface step runs only when the
+  gate step already failed (`steps.gate.outcome == 'failure'`), cannot turn a
+  green entry red, and exits 0 on any post failure.
+- **Scope:** approval-gate ejections only. Ejections caused by `verify`/`e2e`
+   (in `pr.yml`) are a separate surface and out of this card's scope.
 
 ### ADR-091 D1 delivery-identity evidence order (SUP-14824)
 

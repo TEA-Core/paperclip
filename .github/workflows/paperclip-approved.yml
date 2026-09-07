@@ -44,12 +44,19 @@ jobs:
     permissions:
       contents: read
       statuses: read
-      pull-requests: read
+      # `write` (not `read`) so the ejection-surface step can post/update the
+      # merge-queue ejection comment on a merge_group failure. It grants comment
+      # rights on this job's own PR only — no `checks:read`, no admin escalation.
+      pull-requests: write
     env:
       # `gh api` needs a token in the workflow environment — GITHUB_TOKEN is
       # not guaranteed on every runner class; without it every API call fails
       # and the merge_group leg would fail-closed on its own plumbing.
       GH_TOKEN: ${{ github.token }}
+      # The gate step tees the enforcer's verdict here so the ejection-surface
+      # step can quote its reason verbatim. `runner.temp` is shared across the
+      # job's steps.
+      MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-approved-verdict
     steps:
       - name: Event note
         run: |
@@ -60,11 +67,34 @@ jobs:
           esac
       - uses: actions/checkout@v7
       - name: Check the paperclip/approved status
+        id: gate
         env:
           GH_REPO: ${{ github.repository }}
         run: |
+          # Capture the enforcer's verdict so the ejection step can quote its
+          # reason verbatim; the job still exits with the enforcer's rc, so the
+          # fail-closed merge_group semantics are unchanged.
+          set +e
           case "${{ github.event_name }}" in
-            pull_request) bash scripts/ci/check-paperclip-approved.sh pull_request "${{ github.event.pull_request.number }}" ;;
-            merge_group)  bash scripts/ci/check-paperclip-approved.sh merge_group ;;
-            *)            bash scripts/ci/check-paperclip-approved.sh push ;;
+            pull_request) bash scripts/ci/check-paperclip-approved.sh pull_request "${{ github.event.pull_request.number }}" >"$MERGE_EJECTION_VERDICT" 2>&1 ;;
+            merge_group)  bash scripts/ci/check-paperclip-approved.sh merge_group >"$MERGE_EJECTION_VERDICT" 2>&1 ;;
+            *)            bash scripts/ci/check-paperclip-approved.sh push >"$MERGE_EJECTION_VERDICT" 2>&1 ;;
           esac
+          rc=$?
+          set -e
+          cat "$MERGE_EJECTION_VERDICT"
+          [ "$rc" -eq 0 ] || exit "$rc"
+      # SUP-15375: when the gate above fails, the merge queue ejects this entry
+      # and the PR head reads identical to a never-queued PR (no comment, no
+      # failing check on the head; the merge_group run is on the
+      # gh-readonly-queue/… ref agents do not think to query). Surface the
+      # reason on the PR so a standard agent token can see it. This runs only
+      # when the gate step already failed — it cannot turn a green entry red,
+      # and it is best-effort, so a post failure never changes the check
+      # conclusion that blocks the merge.
+      - name: Surface the merge-queue ejection reason on the PR
+        if: github.event_name == 'merge_group' && steps.gate.outcome == 'failure'
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          bash scripts/ci/surface-merge-queue-ejection.sh --verdict "$MERGE_EJECTION_VERDICT"
