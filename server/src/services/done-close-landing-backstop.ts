@@ -296,11 +296,14 @@ async function resolveOwningPlanParent(
 const BLOCKED_BY_BFS_CAP = 200;
 
 /**
- * SUP-15383: BFS from `startId` following "blocks" edges outward (parent →
- * children it blocks → grandchildren they block, …) to determine whether
- * `targetId` is reachable. Pure reachability — no status filtering.
- * Returns true when `targetId` is in the closure; capped at `BLOCKED_BY_BFS_CAP`
- * visited nodes to bound the traversal.
+ * SUP-15383: BFS from `startId` following each node's `blockedBy` edges outward
+ * (a node → the issues that block it → their blockers, …) to determine whether
+ * `targetId` is reachable. A `blocks` row is stored as
+ * `{issueId: blocker, relatedIssueId: blockee}`, so a node's blockers are the
+ * rows where `relatedIssueId == node` and the hop target is that row's `issueId`.
+ * Pure reachability — no status filtering. Returns true when `targetId` is in
+ * the closure; capped at `BLOCKED_BY_BFS_CAP` visited nodes to bound the
+ * traversal.
  */
 async function isReachableViaBlockedBy(
   db: Db,
@@ -312,21 +315,21 @@ async function isReachableViaBlockedBy(
   let frontier: string[] = [startId];
   while (frontier.length > 0 && visited.size <= BLOCKED_BY_BFS_CAP) {
     const rows = await db
-      .select({ relatedIssueId: issueRelations.relatedIssueId })
+      .select({ issueId: issueRelations.issueId })
       .from(issueRelations)
       .where(
         and(
           eq(issueRelations.companyId, companyId),
           eq(issueRelations.type, "blocks"),
-          inArray(issueRelations.issueId, frontier),
+          inArray(issueRelations.relatedIssueId, frontier),
         ),
       );
     frontier = [];
     for (const row of rows) {
-      if (visited.has(row.relatedIssueId)) continue;
-      if (row.relatedIssueId === targetId) return true;
-      visited.add(row.relatedIssueId);
-      frontier.push(row.relatedIssueId);
+      if (visited.has(row.issueId)) continue;
+      if (row.issueId === targetId) return true;
+      visited.add(row.issueId);
+      frontier.push(row.issueId);
     }
   }
   return false;
@@ -641,8 +644,19 @@ export function createDoneCloseLandingBackstopService(
         }
       }
     } catch {
-      // Fail open: if the shared-carrier check errors, proceed with normal
-      // disposition so the sweep is not blocked by a transient DB failure.
+      // SUP-15383: fail CLOSED. When the shared-carrier question cannot be
+      // answered we do not know whether this card sits on a shared carrier, so we
+      // cannot safely dispose it: waking a shared carrier that is inside its own
+      // parent's closure deadlocks the parent, and a fail-open dispose drops the
+      // card out of `done` discovery so no later sweep re-examines it. Defer
+      // instead — the card stays `done` (stays in discovery) and the next sweep
+      // retries once the transient DB failure clears.
+      counts.deferred += 1;
+      logger.warn(
+        { issueId: issue.id, identifier: issue.identifier ?? null },
+        "done-close landing backstop: shared-carrier question failed; deferring candidate to next sweep",
+      );
+      return;
     }
 
     for (const { pr, prKey, state, closedAt } of measured) {

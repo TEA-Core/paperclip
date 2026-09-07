@@ -72,9 +72,44 @@ type DbState = {
   issueExecutionState?: Record<string, unknown> | null;
   /** SUP-15383: the execution workspace's sourceIssueId (the owning plan parent). */
   executionWorkspaceSourceIssueId?: string | null;
-  /** SUP-15383: blockedBy edges for the BFS closure check. */
-  blockedByEdges?: Array<{ relatedIssueId: string }>;
+  /**
+   * SUP-15383: `blocks` edges for the BFS closure check, modeled in the real
+   * storage direction — a row `{issueId: blocker, relatedIssueId: blockee}`.
+   * A node's `blockedBy` closure is the set of blockers reachable from it, so an
+   * edge whose `relatedIssueId` is in the BFS frontier contributes its `issueId`
+   * (the blocker) to the next frontier.
+   */
+  blockedByEdges?: Array<{ issueId: string; relatedIssueId: string }>;
 };
+
+/**
+ * Extract the values passed to `inArray(<col>, …)` inside a drizzle `SQL` where
+ * clause, matched by the column's DB name. The BFS's `where` is
+ * `and(eq(companyId, …), eq(type, "blocks"), inArray(<col>, frontier))`; this
+ * lets the mock db honor the frontier filter (the inArray array lives at
+ * `queryChunks[3]` of the `inArray` SQL node, next to the column at
+ * `queryChunks[1]`). Without honoring the filter the closure check could pass on
+ * an inverted traversal, so the test would not catch F1.
+ */
+function extractInArrayValues(cond: unknown, columnName: string): string[] {
+  const found: string[][] = [];
+  function walk(node: unknown): void {
+    if (!node || typeof node !== "object") return;
+    const n = node as { constructor?: { name?: string }; queryChunks?: unknown[] };
+    if (n.constructor?.name === "SQL" && Array.isArray(n.queryChunks)) {
+      const col = n.queryChunks[1] as { name?: string } | undefined;
+      const arr = n.queryChunks[3];
+      if (col?.name === columnName && Array.isArray(arr)) {
+        found.push(arr.map((p) => (p as { value?: unknown }).value as string));
+      }
+      for (const child of n.queryChunks) walk(child);
+    } else if (Array.isArray(n)) {
+      for (const child of n) walk(child);
+    }
+  }
+  walk(cond);
+  return found.flat();
+}
 
 /**
  * Discovery selects an `issue` sub-object; company query selects mergeArmingEnabled;
@@ -126,12 +161,34 @@ function makeDb(state: DbState) {
           }),
         };
       }
-      // SUP-15383: blockedBy BFS edges.
-      if ("relatedIssueId" in cols) {
+      // SUP-15383: blockedBy BFS edges. Model the real `issue_relations` table in
+      // BOTH directions and honor the WHERE (frontier) filter, keyed by the column
+      // the BFS projects: the corrected BFS projects `issueId` and filters
+      // `relatedIssueId IN frontier` (hops on blockers); a reverted BFS projects
+      // `relatedIssueId` and filters `issueId IN frontier` (hops on blockees).
+      // Keying on the projected column + frontier is what makes the test fail on
+      // an inverted traversal (F1/F2).
+      if ("issueId" in cols || "relatedIssueId" in cols) {
+        const projectIssueId = "issueId" in cols;
+        const filterColumn = projectIssueId ? "related_issue_id" : "issue_id";
         return {
           from: () => ({
-            where: () =>
-              Promise.resolve(state.blockedByEdges ?? []),
+            where: (cond: unknown) => {
+              const frontier = extractInArrayValues(cond, filterColumn);
+              const edges = state.blockedByEdges ?? [];
+              const rows = edges
+                .filter((edge) =>
+                  projectIssueId
+                    ? frontier.includes(edge.relatedIssueId)
+                    : frontier.includes(edge.issueId),
+                )
+                .map((edge) =>
+                  projectIssueId
+                    ? { issueId: edge.issueId }
+                    : { relatedIssueId: edge.relatedIssueId },
+                );
+              return Promise.resolve(rows);
+            },
           }),
         };
       }
@@ -324,6 +381,18 @@ beforeEach(() => {
   mockFetchHeadViaTokenCandidates.mockReset();
   mockFetchHeadApprovedStatusViaTokenCandidates.mockReset();
   mockResolveDeliveryIdentity.mockReset();
+  // The real resolveDeliveryIdentity always returns a well-formed identity
+  // (branchIsOwn defaults to true when ownership is unknown; it only throws on a
+  // genuine DB failure). Default the mock to an own-branch card so the
+  // shared-carrier exemption is NOT taken unless a test explicitly opts in; a
+  // bare reset would leave it returning undefined, make the shared-carrier
+  // question throw, and defer every candidate (the fail-closed path under test).
+  mockResolveDeliveryIdentity.mockResolvedValue({
+    branch: "SUP-branch",
+    repo: { owner: "paperclipai", repo: "paperclip" },
+    branchIsOwn: true,
+    identifier: "SUP-13326",
+  });
   mockCreateGitHubExternalObjectProvider.mockReset();
 });
 
@@ -1744,19 +1813,23 @@ describe("createDoneCloseLandingBackstopService", () => {
 
     it("IN-closure: emits deadlock_skip audit only, no comment, no wake, no block (AC5b)", async () => {
       const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const INTERMEDIATE = "77777777-7777-4777-8777-777777777777";
       const state: DbState = {
         candidates: [sharedCarrierCandidateRow()],
         existingLandingRows: [],
         executionWorkspaceSourceIssueId: PARENT,
-        // The card IS in the parent's blockedBy closure: parent → ... → card.
+        // The card IS in the parent's blockedBy closure, modeled in the real
+        // storage direction as a 2-hop chain: the parent is blocked by
+        // INTERMEDIATE (`{issueId: INTERMEDIATE, relatedIssueId: PARENT}`) and
+        // INTERMEDIATE is blocked by the card (`{issueId: card, relatedIssueId:
+        // INTERMEDIATE}`). The corrected BFS hops from the parent (frontier) to
+        // its blockers and only reaches the card on the second hop, so the test
+        // genuinely exercises frontier-driven traversal.
         blockedByEdges: [
-          { relatedIssueId: "77777777-7777-4777-8777-777777777777" },
+          { issueId: INTERMEDIATE, relatedIssueId: PARENT },
+          { issueId: ISSUE, relatedIssueId: INTERMEDIATE },
         ],
       };
-      // Override to make the BFS reach the target: the single edge points to
-      // a different node, so we need the target to be directly reachable.
-      // Actually, let's set it up so the parent directly blocks the card:
-      state.blockedByEdges = [{ relatedIssueId: ISSUE }];
       const { service } = makeService(state, { wakeup });
       mockResolveDeliveryIdentity.mockResolvedValue({
         branch: "SUP-parent-branch",
@@ -1794,6 +1867,116 @@ describe("createDoneCloseLandingBackstopService", () => {
         action: "issue.done_close_landing_shared_carrier",
       }));
       // No comment, no wake, no block.
+      expect(mockAddComment).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    });
+
+    it("UNRELATED-card: blocks an unrelated issue, NOT in parent closure, so NOT skipped (AC5d)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const UNRELATED = "88888888-8888-4888-8888-888888888888";
+      const state: DbState = {
+        candidates: [sharedCarrierCandidateRow()],
+        existingLandingRows: [],
+        executionWorkspaceSourceIssueId: PARENT,
+        // A real edge exists, but it connects the card to an UNRELATED issue,
+        // not the parent. The card is NOT in the parent's blockedBy closure.
+        // Guards against a stub/BFS that ignores the frontier filter and treats
+        // every blocker edge as "in closure" (would wrongly skip this card).
+        blockedByEdges: [
+          { issueId: ISSUE, relatedIssueId: UNRELATED },
+        ],
+      };
+      const { service } = makeService(state, { wakeup });
+      mockResolveDeliveryIdentity.mockResolvedValue({
+        branch: "SUP-parent-branch",
+        repo: { owner: "paperclipai", repo: "paperclip" },
+        branchIsOwn: false,
+        identifier: "SUP-15383-child",
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 3443 }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_tok", scope: "company", secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      const result = await service.sweep();
+
+      // Not in closure → AC2 informational disposition (like AC5a), not skipped.
+      expect(result).toEqual({
+        due: true, candidates: 1, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0,
+      });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_shared_carrier",
+        entityId: ISSUE,
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#3443",
+          parentId: PARENT,
+        }),
+      }));
+      // NOT the deadlock skip — that only fires when the card is in the closure.
+      expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_shared_carrier_deadlock_skip",
+      }));
+      // Safe-to-notify path: comment + wake fire.
+      expect(mockAddComment).toHaveBeenCalledWith(
+        ISSUE,
+        expect.stringContaining("shared carrier"),
+        {},
+        { authorType: "system" },
+      );
+      expect(wakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("shared-carrier question throws: fails closed, defers candidate, no disposition (AC5e)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const state: DbState = {
+        candidates: [sharedCarrierCandidateRow()],
+        existingLandingRows: [],
+        executionWorkspaceSourceIssueId: PARENT,
+        blockedByEdges: [],
+      };
+      const { service } = makeService(state, { wakeup });
+      // The shared-carrier question fails (transient DB error).
+      mockResolveDeliveryIdentity.mockRejectedValue(new Error("transient db failure"));
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 3443 }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_tok", scope: "company", secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      const result = await service.sweep();
+
+      // Fails closed: the candidate is deferred (stays `done`, retried on the
+      // next sweep) and no disposition is emitted.
+      expect(result).toEqual({
+        due: true, candidates: 1, confirmed: 0, failed: 0, deferred: 1, reenqueued: 0, escalated: 0,
+      });
+      // No shared-carrier or normal disposition.
+      expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_shared_carrier",
+      }));
+      expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_shared_carrier_deadlock_skip",
+      }));
+      expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_escalated",
+      }));
+      expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_failed",
+      }));
+      // No side effects: no comment, no wake, no block, no merge-arming.
       expect(mockAddComment).not.toHaveBeenCalled();
       expect(wakeup).not.toHaveBeenCalled();
       expect(mockUpdate).not.toHaveBeenCalled();
