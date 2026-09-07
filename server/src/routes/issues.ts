@@ -271,6 +271,7 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
+  resolvePatchExecutionPolicy,
   setIssueExecutionPolicyMonitorScheduledBy,
   type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
@@ -11344,13 +11345,18 @@ export function issueRoutes(
       // SUP-13634: capture whether the client explicitly sent an empty
       // `executionPolicy.stages` array before validate() applies the schema's
       // `.default([])` and loses the distinction.
+      // SUP-15377: also capture whether the `stages` key was omitted entirely —
+      // the schema default would erase that, but omission means "keep the
+      // stored stages", not "clear them".
       const policy = (req.body as { executionPolicy?: unknown } | undefined)?.executionPolicy;
+      const policyIsObject =
+        policy !== null && typeof policy === "object" && !Array.isArray(policy);
       (req as unknown as Record<string, unknown>).executionPolicyStagesExplicitlyEmpty =
-        policy !== null &&
-        typeof policy === "object" &&
-        !Array.isArray(policy) &&
+        policyIsObject &&
         Array.isArray((policy as { stages?: unknown }).stages) &&
         (policy as { stages: unknown[] }).stages.length === 0;
+      (req as unknown as Record<string, unknown>).executionPolicyStagesKeyAbsent =
+        policyIsObject && !("stages" in (policy as Record<string, unknown>));
       next();
     },
     validateIssueMutationBody(updateIssueRouteSchema),
@@ -11700,14 +11706,26 @@ export function issueRoutes(
       // empty stages array, or an explicit null over a non-null stored
       // policy, is rejected before any write or reviewer/approver detach
       // side-effect can run.
+      // SUP-15377: an omitted `stages` key is a preserve signal; the resolver
+      // below carries the stored stages forward so a routine partial write
+      // (e.g. a monitor re-arm) keeps the ladder.
+      const stagesExplicitlyEmpty = Boolean(
+        (req as unknown as Record<string, unknown>).executionPolicyStagesExplicitlyEmpty,
+      );
+      const stagesKeyAbsent = Boolean(
+        (req as unknown as Record<string, unknown>).executionPolicyStagesKeyAbsent,
+      );
       assertPatchableExecutionPolicyWrite({
         raw: req.body.executionPolicy,
         currentPolicy: previousExecutionPolicy,
-        stagesExplicitlyEmpty: Boolean(
-          (req as unknown as Record<string, unknown>).executionPolicyStagesExplicitlyEmpty,
-        ),
+        stagesExplicitlyEmpty,
+        stagesKeyAbsent,
       });
-      const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+      const normalizedExecutionPolicy = resolvePatchExecutionPolicy({
+        raw: req.body.executionPolicy,
+        currentPolicy: previousExecutionPolicy,
+        stagesKeyAbsent,
+      });
       // requestedAssigneeAgentId is the assignee AFTER this PATCH, so a PATCH that
       // moves the assignee off the collision in the same body is accepted.
       assertIssueExecutionPolicySatisfiable({

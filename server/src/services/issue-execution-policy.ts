@@ -490,6 +490,16 @@ export function normalizeIssueExecutionPolicy(
  * reachable today by omitting the `stages` key entirely, so the rejection was
  * blocking an idiom rather than defending the ladder. Over a policy that *has*
  * stages the rejection is unchanged — that is the case ADR-029/ADR-072 guard.
+ *
+ * SUP-15377: an omitted `stages` key is a preserve signal, not a clear. The
+ * schema's `.default([])` silently turned every stage-less partial write —
+ * most routinely a monitor re-arm sending `{mode, commentRequired, monitor}`
+ * with no `stages` — into a ladder destruction. The pre-validate middleware
+ * now captures `stagesKeyAbsent` before parsing, and `resolvePatchExecutionPolicy`
+ * carries the stored stages forward onto the normalized result so those
+ * partial writes keep the ladder. This guard scopes its null-clear backstop to
+ * bodies where `stagesKeyAbsent` is false, so an omission is no longer rejected
+ * here; `resolvePatchExecutionPolicy` performs the preserve.
  */
 export function assertPatchableExecutionPolicyWrite(input: {
   raw: unknown;
@@ -497,8 +507,13 @@ export function assertPatchableExecutionPolicyWrite(input: {
   /** True when the client expressly included `stages: []` in the PATCH body,
    *  before the schema default `[]` is applied. */
   stagesExplicitlyEmpty: boolean;
+  /** True when the PATCH body omitted the `stages` key entirely (a non-array
+   *  object with no `stages` property), captured in pre-validate middleware
+   *  before the schema's `.default([])` erases the distinction. Omitting the
+   *  key preserves the stored stages rather than clearing them (SUP-15377). */
+  stagesKeyAbsent: boolean;
 }): void {
-  const { raw, currentPolicy, stagesExplicitlyEmpty } = input;
+  const { raw, currentPolicy, stagesExplicitlyEmpty, stagesKeyAbsent } = input;
 
   // SUP-13925: only reject when there is a close ladder to strip. `stages: []`
   // over a stored policy that is already stage-less is a faithful round-trip,
@@ -515,8 +530,14 @@ export function assertPatchableExecutionPolicyWrite(input: {
     );
   }
 
+  // SUP-13634 fail-closed backstop: a body that normalizes back to null over a
+  // stored ladder would silently clear it. SUP-15377: a body that OMITS the
+  // `stages` key is no longer a clear — the stored stages are carried forward
+  // by `resolvePatchExecutionPolicy` — so this backstop is scoped to bodies
+  // where the key was not omitted. It is a backstop, not the primary guard:
+  // the explicit-`[]` branch above already refuses every reachable clear.
   if (raw !== null && typeof raw === "object" && !Array.isArray(raw) &&
-      currentPolicy !== null && currentPolicy.stages.length > 0) {
+      currentPolicy !== null && currentPolicy.stages.length > 0 && !stagesKeyAbsent) {
     const normalized = normalizeIssueExecutionPolicy(raw);
     if (normalized === null) {
       throw unprocessable(
@@ -524,6 +545,45 @@ export function assertPatchableExecutionPolicyWrite(input: {
       );
     }
   }
+}
+
+/**
+ * SUP-15377: the normalized execution policy a PATCH should store, with
+ * preserve-on-omit semantics for the `stages` key.
+ *
+ * Omitting `stages` in a PATCH body is a partial-update signal for that one
+ * key — "leave my stages alone" — not a clear. The schema's `.default([])`
+ * would otherwise turn every stage-less partial write (most commonly a monitor
+ * re-arm) into a silent ladder destruction. When the client omitted the
+ * `stages` key and the stored policy holds a close ladder, the stored stages
+ * are carried forward onto the normalized result so the partial write keeps
+ * the ladder.
+ *
+ * A caller that genuinely wants a stage-less policy must send `stages: []`
+ * explicitly; `assertPatchableExecutionPolicyWrite` still refuses that over a
+ * stored ladder. Over an already stage-less policy, omission is a no-op (there
+ * is nothing to preserve), matching the SUP-13925 monitor-only round-trip.
+ *
+ * A malformed non-object body is returned as `null` rather than thrown: the
+ * route has already validated the body against the schema before calling this,
+ * so a non-object body is defense-in-depth, not a reachable state.
+ */
+export function resolvePatchExecutionPolicy(input: {
+  raw: unknown;
+  currentPolicy: IssueExecutionPolicy | null;
+  stagesKeyAbsent: boolean;
+}): IssueExecutionPolicy | null {
+  const { raw, currentPolicy, stagesKeyAbsent } = input;
+  if (raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) return null;
+
+  const storedStages =
+    currentPolicy !== null && currentPolicy.stages.length > 0 ? currentPolicy.stages : null;
+  const effectiveRaw =
+    stagesKeyAbsent && storedStages !== null
+      ? { ...(raw as Record<string, unknown>), stages: storedStages }
+      : raw;
+  return normalizeIssueExecutionPolicy(effectiveRaw);
 }
 
 /**

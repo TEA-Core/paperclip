@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -142,12 +142,17 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
   };
 
   function assertWrite(
-    input: Omit<Parameters<typeof assertPatchableExecutionPolicyWrite>[0], "stagesExplicitlyEmpty"> & {
+    input: Omit<
+      Parameters<typeof assertPatchableExecutionPolicyWrite>[0],
+      "stagesExplicitlyEmpty" | "stagesKeyAbsent"
+    > & {
       stagesExplicitlyEmpty?: boolean;
+      stagesKeyAbsent?: boolean;
     },
   ) {
     return assertPatchableExecutionPolicyWrite({
       stagesExplicitlyEmpty: false,
+      stagesKeyAbsent: false,
       ...input,
     });
   }
@@ -242,16 +247,53 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
     ).not.toThrow();
   });
 
-  it("grants no capability the partial-body path did not already have", () => {
-    // The permissive branch is safe precisely because omitting `stages`
-    // entirely reaches the identical stored result today. If that ever stops
-    // being true, this test fails and the relaxation must be re-argued.
+  // SUP-15377 re-argues the SUP-13925 relaxation. SUP-13925 justified
+  // permitting an explicit `stages: []` over a stage-less policy by arguing the
+  // same stored result was already reachable by omitting `stages` entirely.
+  // That argument is now invalid: omitting `stages` no longer reaches an
+  // empty-stages result — it PRESERVES the stored ladder (see
+  // `resolvePatchExecutionPolicy`). The relaxation remains safe, but for a
+  // stricter reason: an explicit `stages: []` is only ever written when the
+  // stored policy has no ladder to strip.
+  it("re-argues the SUP-13925 relaxation under SUP-15377 preserve-on-omit", () => {
+    // (a) Monitor-only round-trip preserved: an explicit `stages: []` over an
+    // already stage-less policy still round-trips to `stages: []`.
     const stored = monitorOnlyPolicy();
-    const whole = { mode: "normal" as const, commentRequired: true, stages: [], monitor };
-    expect(normalizeIssueExecutionPolicy(whole)).toEqual(
-      normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, monitor }),
-    );
-    expect(normalizeIssueExecutionPolicy(whole)!.stages).toEqual(stored.stages);
+    expect(stored.stages).toEqual([]);
+    const roundTrip = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [], monitor },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+    });
+    expect(roundTrip!.stages).toEqual([]);
+    expect(roundTrip!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
+
+    // (b) Omitting `stages` over a stored ladder now PRESERVES it — the
+    // baseline that made SUP-13925 look safe was itself the bug. A monitor
+    // re-arm no longer reaches an empty-stages result.
+    const ladder = reviewOnlyPolicy();
+    const monitorRearm = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, monitor },
+      currentPolicy: ladder,
+      stagesKeyAbsent: true,
+    });
+    expect(monitorRearm!.stages).toEqual(ladder.stages);
+    expect(monitorRearm!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
+    expect(monitorRearm!.stages.length).toBeGreaterThan(0);
+  });
+
+  it("does not reject a body that omits `stages` over a stored ladder (preserve, not clear)", () => {
+    // SUP-15377: the guard now scopes its null-clear backstop to bodies where
+    // the key was not omitted. An omitted key is handled by the resolver, so
+    // the guard must not 422 here.
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { mode: "normal", commentRequired: true, monitor },
+        currentPolicy: twoStagePolicy(),
+        stagesExplicitlyEmpty: false,
+        stagesKeyAbsent: true,
+      }),
+    ).not.toThrow();
   });
 
   it("still rejects an explicit empty stages array over a policy that HAS stages", () => {
@@ -315,6 +357,78 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
 
   it("leaves malformed non-object shapes to the schema", () => {
     expect(() => assertWrite({ raw: "nope", currentPolicy: twoStagePolicy() })).not.toThrow();
+  });
+});
+
+describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
+  const monitor = { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: "Check deployment" } as const;
+  const reviewOnlyPolicy = () =>
+    normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+    })!;
+
+  it("preserves the stored ladder when the client omits `stages` (monitor re-arm)", () => {
+    const stored = reviewOnlyPolicy();
+    const originalStageId = stored.stages[0]!.id;
+    const originalParticipantId = stored.stages[0]!.participants[0]!.id;
+
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, monitor },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+    });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages.length).toBe(1);
+    // ids are carried forward verbatim — the ladder is the same one, not a
+    // reconstructed copy.
+    expect(resolved!.stages[0]!.id).toBe(originalStageId);
+    expect(resolved!.stages[0]!.participants[0]!.id).toBe(originalParticipantId);
+    expect(resolved!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
+  });
+
+  it("does not invent stages when the stored policy is already stage-less", () => {
+    const stored = normalizeIssueExecutionPolicy({ monitor, stages: [] })!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, monitor },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+    });
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
+  });
+
+  it("preserves nothing over a null stored policy", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, monitor },
+      currentPolicy: null,
+      stagesKeyAbsent: true,
+    });
+    // A monitor-only policy still normalizes to a non-null monitor-only shape.
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
+  });
+
+  it("respects an explicit `stages` array when the key is present", () => {
+    const stored = reviewOnlyPolicy();
+    const replacement = [
+      { type: "review" as const, participants: [{ type: "agent" as const, agentId: ctoAgentId }] },
+    ];
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", stages: replacement },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+    });
+    expect(resolved!.stages.length).toBe(1);
+    // The replacement participant is respected, not the stored qa agent.
+    expect(resolved!.stages[0]!.participants[0]!.agentId).toBe(ctoAgentId);
+    // A fresh id is minted for the new stage — the stored ladder is not reused.
+    expect(resolved!.stages[0]!.id).not.toBe(stored.stages[0]!.id);
+  });
+
+  it("returns null for a malformed non-object body (defense-in-depth)", () => {
+    expect(resolvePatchExecutionPolicy({ raw: "nope", currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
+    expect(resolvePatchExecutionPolicy({ raw: null, currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
+    expect(resolvePatchExecutionPolicy({ raw: [1, 2], currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
   });
 });
 
