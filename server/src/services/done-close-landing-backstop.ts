@@ -115,6 +115,14 @@ interface SweepCounts {
   escalated: number;
 }
 
+/** A live-measured PR, captured in the first pass before any disposition. */
+interface MeasuredLanding {
+  pr: LinkedPullRequest;
+  prKey: string;
+  state: MeasuredPullRequestState;
+  closedAt: string | null;
+}
+
 function readMsEnv(name: string, fallbackMs: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallbackMs;
@@ -408,6 +416,14 @@ export function createDoneCloseLandingBackstopService(
         .filter((value): value is string => value !== null),
     );
 
+    // Two-pass reconciliation (SUP-14971): measure EVERY linked PR on the card
+    // before dispositioning any of them. The card-level question is "did this
+    // card's work land ANYWHERE?" — a `merged` sibling means a closed-unmerged
+    // sibling is a superseded carrier (its work was re-delivered and merged as
+    // the sibling), not a landing failure. The old single loop dispositioned each
+    // PR in isolation and reported the carrier as failed, telling the assignee to
+    // re-merge work that had already landed.
+    const measured: MeasuredLanding[] = [];
     for (const pr of prs) {
       const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
       if (alreadyConfirmed.has(prKey) || alreadyFailed.has(prKey)) continue;
@@ -444,6 +460,21 @@ export function createDoneCloseLandingBackstopService(
             ? readString(data?.closed_at)
             : null;
 
+      measured.push({ pr, prKey, state, closedAt });
+    }
+
+    // Did ANY linked PR on this card merge? If so, a closed-unmerged sibling is a
+    // superseded carrier. The still-open-past-grace arm is intentionally left
+    // unchanged (out of scope for this fix): it still takes the re-enqueue/escalate
+    // path.
+    const mergedSiblingKeys = measured
+      .filter((m) => m.state === "merged")
+      .map((m) => m.prKey);
+    const hasMergedSibling = mergedSiblingKeys.length > 0;
+
+    for (const { pr, prKey, state, closedAt } of measured) {
+      const isSupersededCarrier = state === "closed" && hasMergedSibling;
+
       if (state === "merged") {
         await logActivity(db, {
           companyId: issue.companyId,
@@ -470,10 +501,6 @@ export function createDoneCloseLandingBackstopService(
       }
 
       if (state === "closed") {
-        // Closed-unmerged: surface attention (existing behavior).
-        const cause = isArmingRefusal
-          ? `merge arming was REFUSED at close (${refusalReason}) and the approved head was never certified`
-          : "the decision-carried merge never landed";
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: "system",
@@ -492,8 +519,21 @@ export function createDoneCloseLandingBackstopService(
             closedAt,
             skipReason: skipReason ?? null,
             refusal: isArmingRefusal,
+            ...(isSupersededCarrier
+              ? { supersededBy: mergedSiblingKeys.join(", ") }
+              : {}),
           },
         });
+        if (isSupersededCarrier) {
+          // The card's work provably landed via the merged sibling. The audit row
+          // above (with `supersededBy`) is the only record: neither the comment
+          // nor the assignee wake fires, and it does not count as failed.
+          continue;
+        }
+        // Closed-unmerged, no merged sibling: surface attention (existing behavior).
+        const cause = isArmingRefusal
+          ? `merge arming was REFUSED at close (${refusalReason}) and the approved head was never certified`
+          : "the decision-carried merge never landed";
         await deps.svc.addComment(
           issue.id,
           `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is closed-unmerged past the done-close grace window — ${cause}. Re-open/merge the PR and verify the deliverable.`,
