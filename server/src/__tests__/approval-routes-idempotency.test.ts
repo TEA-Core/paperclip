@@ -23,6 +23,10 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   linkManyForApproval: vi.fn(),
 }));
 
+const mockIssueService = vi.hoisted(() => ({
+  listReviewAttention: vi.fn(),
+}));
+
 const mockSecretService = vi.hoisted(() => ({
   normalizeHireApprovalPayloadForPersistence: vi.fn(),
 }));
@@ -40,6 +44,9 @@ function registerModuleMocks() {
     issueApprovalService: () => mockIssueApprovalService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
+  }));
+  vi.doMock("../services/issues.js", () => ({
+    issueService: () => mockIssueService,
   }));
 }
 
@@ -128,6 +135,8 @@ describe("approval routes idempotent retries", () => {
     mockApprovalService.listComments.mockReset();
     mockApprovalService.addComment.mockReset();
     mockHeartbeatService.wakeup.mockReset();
+    mockIssueService.listReviewAttention.mockReset();
+    mockIssueService.listReviewAttention.mockResolvedValue(new Map());
     mockIssueApprovalService.listIssuesForApproval.mockReset();
     mockIssueApprovalService.linkManyForApproval.mockReset();
     mockSecretService.normalizeHireApprovalPayloadForPersistence.mockReset();
@@ -728,5 +737,43 @@ describe("approval routes idempotent retries", () => {
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
     expect(mockApprovalService.create).toHaveBeenCalled();
     expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+  // Regression: fold 1446a58c0 resolved this region by keeping both sides, so the
+  // reject route called queueAdditionalApprovalReviewPathWakes twice with identical
+  // arguments. The `approval-review-path:` idempotency prefix has no partial unique
+  // index behind it, so the second call queued a second wake request and a second
+  // `approval.review_path_wakeup_queued` activity row per lost-review issue.
+  it("queues exactly one review-path wake per lost-review issue on reject", async () => {
+    const approval = {
+      id: "approval-review-path",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "rejected",
+      payload: {},
+      requestedByAgentId: null,
+    };
+    mockApprovalService.getById.mockResolvedValue({ ...approval, status: "pending" });
+    mockApprovalService.reject.mockResolvedValue({ approval, applied: true });
+    mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([
+      { id: "issue-1", assigneeAgentId: "agent-2" },
+    ]);
+    mockIssueService.listReviewAttention.mockResolvedValue(
+      new Map([["issue-1", { state: "stalled" }]]),
+    );
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-review-path/reject")
+      .send({ decisionNote: "not now" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const reviewPathWakes = mockHeartbeatService.wakeup.mock.calls.filter(
+      ([, opts]) => typeof opts?.idempotencyKey === "string"
+        && opts.idempotencyKey.startsWith("approval-review-path:"),
+    );
+    expect(reviewPathWakes).toHaveLength(1);
+    const reviewPathActivity = mockLogActivity.mock.calls.filter(
+      ([, entry]) => entry?.action === "approval.review_path_wakeup_queued",
+    );
+    expect(reviewPathActivity).toHaveLength(1);
   });
 });

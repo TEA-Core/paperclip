@@ -15166,30 +15166,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return claimed.length > 0;
   }
 
-// Read the stored retry attempt count as a safe value, directly in SQL. A
-// provider can write a malformed value under the attempts key. The type guard
-// makes any non-number value read as zero. The reader computes as numeric and
-// never casts to int, so a finite number outside the 32-bit range (for example
-// 1e300) never throws. The reader clamps a negative value to zero and a positive
-// value to the attempt cap. One malformed lease therefore never aborts the page
-// sweep. This matches the TypeScript reader `readPendingCleanupRetryAttempts`,
-// which clamps to the same range. The claim predicate compares the two readers,
-// so both must yield the same value for every input.
-function pendingCleanupAttemptsSql() {
-  return sql`
-    case
-      when jsonb_typeof(${environmentLeases.metadata} -> ${PENDING_CLEANUP_ATTEMPTS_METADATA_KEY}) = 'number'
-        then least(
-          greatest(
-            floor((${environmentLeases.metadata} ->> ${PENDING_CLEANUP_ATTEMPTS_METADATA_KEY})::numeric),
-            0
-          ),
-          ${PENDING_CLEANUP_SWEEP_ATTEMPT_CAP}
-        )
-      else 0
-    end`;
-}
-
   // Retry the leases stranded in "pending_cleanup". A failed destroy leaves a
   // lease in that state forever without this sweep. The reaper tick runs the
   // sweep. The backoff equals the reaper staleness threshold, so a lease waits
