@@ -2095,6 +2095,39 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it("restores a human-assigned blocked issue to todo on agent follow-up (SUP-15299)", async () => {
+    const issue = { ...makeIssue("blocked"), assigneeAgentId: null, assigneeUserId: "human-op" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+  });
+
+  it("still refuses agent follow-up on a fully-unassigned blocked issue with 409 (SUP-15299)", async () => {
+    const issue = { ...makeIssue("blocked"), assigneeAgentId: null, assigneeUserId: null };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("Issue follow-up requires an assigned agent");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("keeps the existing backlog to todo assignee wake", async () => {
     const issue = makeIssue("backlog");
     mockIssueService.getById.mockResolvedValue(issue);

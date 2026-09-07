@@ -6310,6 +6310,13 @@ export function issueRoutes(
       return false;
     }
     if (!issue.assigneeAgentId) {
+      // A human-assigned card (assigneeUserId set, no agent) has a valid
+      // follow-up owner. Refusing it here created a pincer: an agent could
+      // push such a card to `blocked` but could never restore it, because
+      // restoring to `todo` demanded an agent assignee that the assignee
+      // guard ("Issue can only have one assignee") would refuse to add. A
+      // human assignee is a legitimate follow-up owner; allow the reversal.
+      if (issue.assigneeUserId) return true;
       // An unassigned issue whose active recovery action is also ownerless is
       // adoptable by any same-company agent -- the same rule
       // assertRecoveryActionAuthority applies. Without this, upstream's
