@@ -6337,22 +6337,68 @@ export function issueRoutes(
       return false;
     }
     if (!issue.assigneeAgentId) {
-      // An unassigned issue whose active recovery action is also ownerless is
-      // adoptable by any same-company agent -- the same rule
-      // assertRecoveryActionAuthority applies. Without this, upstream's
-      // resume-authority gate refuses exactly the adoption the recovery path
-      // exists to enable.
+      // SUP-15387 -- TWO independent doors open below, and they are not
+      // alternatives: each reaches a population the other misses. Read both
+      // before changing either.
+      //
+      // The invariant this branch enforces is NOT the one the 409 below states
+      // ("follow-up requires an assigned agent"). It is:
+      //
+      //   an agent may drive the resume transition unless some *other* agent
+      //   holds the card -- held meaning `issue.assigneeAgentId`, or ownership
+      //   of the active recovery action. With neither an agent assignee nor an
+      //   agent recovery owner, there is no agent authority to violate, so any
+      //   same-company agent may act. Every remedy the residual owner (a human)
+      //   still has -- cancel, re-park, re-assign -- survives the transition,
+      //   because it reassigns nothing and dispatches no run.
+      //
+      // The 409 string is left verbatim as a wire contract; it describes the
+      // common case, not the rule.
+      //
+      // (1) Recovery adoption. Deliberately mirrors the identical test in
+      // `requireRecoveryActionAuthority` and `requireRecoverySourceMutationAuthority`
+      // (`!assigneeAgentId && !action.ownerAgentId`). All three must agree, or
+      // an agent may resolve a card's recovery action while being refused the
+      // very transition that resolution exists to perform. Note that here
+      // `ownerAgentId === null` does not mean "nobody owns it": every ownerless
+      // mint site writes `ownerType: "board"` (or `"system"`), so an agent
+      // passing this door pre-empts a human. That is accepted -- the
+      // `blocked_without_blockers` escalation's own nextAction reads "(b)
+      // unblock it to resume work", and refusing instead wedges the card in
+      // `blocked` with no agent able to move it, which is the failure this
+      // carve-out was added to fix.
       const ownerlessRecoveryAction =
         await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id).catch(() => null);
       if (ownerlessRecoveryAction && !ownerlessRecoveryAction.ownerAgentId) return true;
-      // SUP-15298: a human-assigned issue has no agent whose resume authority a
-      // follow-up could violate -- the card's owner is a person, not an agent.
-      // Requiring an agent assignee here turns a `blocked` card into a one-way
-      // door: an agent can push it into `blocked` (Guard B, the single-assignee
-      // invariant, then forbids it from claiming the slot). When there are no
-      // unresolved blockers (the readiness gate above already passed), let any
-      // same-company agent pull the card back to a state the human can act on.
-      // This reassigns nothing and triggers no agent run.
+      // (2) SUP-15298: a human-assigned issue has no agent whose resume
+      // authority a follow-up could violate -- the card's owner is a person,
+      // not an agent. Requiring an agent assignee here turns a `blocked` card
+      // into a one-way door: an agent can push it into `blocked` (Guard B, the
+      // single-assignee invariant, then forbids it from claiming the slot).
+      // When there are no unresolved blockers (the readiness gate above already
+      // passed), let any same-company agent pull the card back to a state the
+      // human can act on. This reassigns nothing and triggers no agent run.
+      //
+      // Why (2) is NOT redundant with (1): (1) requires an active recovery
+      // action to exist, and the `blocked_without_blockers` sweep that mints
+      // one (services/recovery/service.ts) skips a card that is younger than
+      // BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS, has a live execution path,
+      // has a queued wake, has a pending wake interaction, is under a pause
+      // hold, or falls past the 100-candidate limit -- and it only runs on a
+      // cadence. Under any of those (1) is shut and (2) is the only door.
+      // Conversely (1) reaches cards (2) cannot: no human assignee needed, and
+      // any status `isExplicitResumeCapableStatus` admits, not just `blocked`.
+      // On an aged, swept, blockerless `blocked` card the two overlap and (1)
+      // fires first -- which is why (2) cannot be exercised through a live
+      // fixture older than the grace window (SUP-15311 burned several runs
+      // measuring exactly that non-discriminating pair).
+      //
+      // (1)'s reach into `done`/`cancelled` is bounded on the mint side, not
+      // here: the sweeps skip terminal sources outright, and
+      // `classifySourceRecoveryRevalidation` stales any surviving action the
+      // first time the card is touched or read-projected. Narrowing (1) to
+      // `blocked` would buy only that already-closing race, at the cost of
+      // splitting it from the two authority guards it must match.
       if (issue.assigneeUserId && issue.status === "blocked") return true;
       res.status(409).json({
         error: "Issue follow-up requires an assigned agent",
