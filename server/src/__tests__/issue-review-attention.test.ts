@@ -301,4 +301,78 @@ describeEmbeddedPostgres("issue review attention", () => {
       status: "queued",
     })).resolves.toBeDefined();
   });
+
+  it("does not score a dead review stage covered on stale undelivered wakes (SUP-15369)", async () => {
+    const { companyId, agentId } = await seed();
+    // The review participant is a dead (paused) agent, so it is not a live
+    // execution_participant path — mirroring SUP-15248's stuck review stage.
+    const deadAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: deadAgentId,
+      companyId,
+      name: "Dead Reviewer",
+      role: "engineer",
+      status: "paused",
+    });
+
+    const deadParticipantState = {
+      status: "pending",
+      currentStageType: "review",
+      currentStageIndex: 0,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      reviewRequest: null,
+      changesRequestedCount: 0,
+      currentParticipant: { type: "agent", agentId: deadAgentId },
+    };
+
+    const staleIssueId = await insertReview({
+      companyId,
+      agentId,
+      identifier: "RVA-STALE-1",
+      executionState: deadParticipantState,
+    });
+
+    // Nine queued review wakes, all older than the participant re-arm deferral
+    // window (30 min) and never delivered — the exact SUP-15248 shape.
+    const staleAgeMs = 24 * 60 * 60 * 1000;
+    for (let i = 0; i < 9; i += 1) {
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId: deadAgentId,
+        source: "automation",
+        reason: "pending_review_rearm",
+        status: "queued",
+        payload: { issueId: staleIssueId, rearm: true },
+        requestedAt: new Date(Date.now() - staleAgeMs - i * 60_000),
+      });
+    }
+
+    let row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === staleIssueId);
+    expect(row?.reviewAttention?.state).not.toBe("covered");
+    expect(row?.reviewAttention).toMatchObject({ state: "stalled", paths: [] });
+
+    // Control: a fresh queued wake is still a maintained path -> covered.
+    const freshIssueId = await insertReview({
+      companyId,
+      agentId,
+      identifier: "RVA-STALE-2",
+      executionState: deadParticipantState,
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: deadAgentId,
+      source: "automation",
+      reason: "pending_review_rearm",
+      status: "queued",
+      payload: { issueId: freshIssueId, rearm: true },
+      requestedAt: new Date(),
+    });
+    row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === freshIssueId);
+    expect(row?.reviewAttention).toMatchObject({
+      state: "covered",
+      paths: [expect.objectContaining({ kind: "queued_wake" })],
+    });
+  });
 });

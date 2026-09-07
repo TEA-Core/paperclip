@@ -127,6 +127,12 @@ function detectTailnetBindHost(): string | undefined {
   }
 }
 
+// Cheap re-arm window accessor for hot paths that must not pay loadConfig's tailnet
+// probe on every call. Env-only, mirrors the loadConfig derivation (SUP-15369).
+export function pendingReviewRearmWindowMsFromEnv(): number {
+  return Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_REARM_WINDOW_MS) || 30 * 60 * 1000);
+}
+
 export function loadConfig(): Config {
   const fileConfig = readConfigFile();
   const fileDatabaseMode =
@@ -454,7 +460,7 @@ export function loadConfig(): Config {
     recoveryActionWakeIntervalMs: Math.max(60000, Number(process.env.RECOVERY_ACTION_WAKE_INTERVAL_MS) || 300000),
     resolvedDependencyWakeRearmWindowMs: Math.max(30 * 60 * 1000, Number(process.env.RESOLVED_DEPENDENCY_WAKE_REARM_WINDOW_MS) || 6 * 60 * 60 * 1000),
     resolvedDependencyWakeRearmMaxCount: Math.max(1, Number(process.env.RESOLVED_DEPENDENCY_WAKE_REARM_MAX_COUNT) || 3),
-    pendingReviewRearmWindowMs: Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_REARM_WINDOW_MS) || 30 * 60 * 1000),
+    pendingReviewRearmWindowMs: pendingReviewRearmWindowMsFromEnv(),
     pendingReviewRearmMaxCount: Math.max(1, Number(process.env.PENDING_REVIEW_REARM_MAX_COUNT) || 3),
     companyDeletionEnabled,
     externalObjectRefreshIntervalMs: Math.max(60000, Number(process.env.EXTERNAL_OBJECT_REFRESH_INTERVAL_MS) || 60_000),

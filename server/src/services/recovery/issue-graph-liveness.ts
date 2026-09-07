@@ -126,6 +126,7 @@ export interface IssueGraphLivenessInput {
   pendingInteractions?: IssueLivenessWaitingPathInput[];
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
+  queuedWakeStaleAfterMs?: number;
   now?: Date | string;
 }
 
@@ -183,6 +184,10 @@ function readDateMs(value: unknown): number | null {
   const date = value instanceof Date ? value : new Date(value);
   const time = date.getTime();
   return Number.isNaN(time) ? null : time;
+}
+
+function readNonNegativeMs(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function monitorFromIssue(issue: IssueLivenessIssueInput) {
@@ -273,7 +278,25 @@ export function classifyIssueReviewPaths(
     }
   };
   appendExecutionPaths(input.activeRuns ?? [], "active_run");
-  appendExecutionPaths(input.queuedWakeRequests ?? [], "queued_wake");
+
+  // A queued wake that has not been delivered within the participant re-arm deferral
+  // window is not a maintained action path — it is evidence the review stage stopped
+  // advancing (SUP-15369). A wake with no readable age is kept, matching prior behavior.
+  const queuedWakeStaleAfterMs = readNonNegativeMs(input.queuedWakeStaleAfterMs);
+  for (const entry of input.queuedWakeRequests ?? []) {
+    if (entry.companyId !== issue.companyId || entry.issueId !== issue.id) continue;
+    if (queuedWakeStaleAfterMs !== null) {
+      const createdAtMs = readDateMs(entry.createdAt);
+      if (createdAtMs !== null && nowMs - createdAtMs > queuedWakeStaleAfterMs) continue;
+    }
+    paths.push({
+      kind: "queued_wake",
+      ref: entry.id ?? null,
+      agentId: entry.agentId ?? null,
+      userId: null,
+      since: entry.createdAt ?? null,
+    });
+  }
 
   const appendWaitingPaths = (
     entries: IssueLivenessWaitingPathInput[],
