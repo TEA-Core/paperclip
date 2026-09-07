@@ -13,9 +13,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * test pins the transport to one per process so those suites stop paying for
  * it, and fails loudly if the cache is ever removed.
  */
+/**
+ * Count the live `pino.transport` workers, one MessagePort each. Reading active
+ * resources is portable; reading /proc/self/task would pin this test to Linux.
+ */
 function messagePortCount() {
-  // Each `pino.transport` worker keeps one MessagePort alive. Counting active
-  // resources is portable; counting /proc/self/task is not.
   return process.getActiveResourcesInfo().filter((resource) => resource === "MessagePort").length;
 }
 

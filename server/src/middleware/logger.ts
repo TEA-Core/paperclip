@@ -33,6 +33,10 @@ const isProduction = process.env.NODE_ENV === "production";
 const PRETTY_TRANSPORT_KEY = "__paperclipPinoPrettyTransport";
 type PrettyTransportCache = { [PRETTY_TRANSPORT_KEY]?: ReturnType<typeof pino.transport> };
 
+/**
+ * The process's one pretty-print transport, created on first use. See the note
+ * above for why it is cached rather than built per module evaluation.
+ */
 function prettyTransport() {
   const cache = globalThis as typeof globalThis & PrettyTransportCache;
   cache[PRETTY_TRANSPORT_KEY] ??= pino.transport({

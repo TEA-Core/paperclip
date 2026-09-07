@@ -56,6 +56,12 @@ const mockDb = {
   transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(TX_SENTINEL)),
 };
 
+/**
+ * Build a fresh express app around the real instance-settings router and the
+ * mocked services, with `actor` already attached to every request. Imported
+ * per test because `beforeEach` resets the module registry, so each app gets
+ * the module instances the current test's mocks were registered against.
+ */
 async function createApp(actor: any) {
   const [{ errorHandler }, { instanceSettingsRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
