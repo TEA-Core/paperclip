@@ -17,8 +17,14 @@ function readWorkflow(name) {
 // this directory: the policy job runs these before `pnpm install`, so they may
 // not import a workspace dependency.
 
+// A job id line may legally carry trailing whitespace or a YAML comment, and
+// both of these patterns have to tolerate that. A stricter read does not fail
+// loudly -- it silently drops the job from the scan, which is precisely how a
+// job would slip past the reachability check below.
+const JOB_ID_TAIL = ":[ \\t]*(?:#[^\\n]*)?\\n";
+
 function jobBlock(workflow, name) {
-  const match = workflow.match(new RegExp(`\\n {2}${name}:\\n((?: {4}.*\\n|\\n)*)`));
+  const match = workflow.match(new RegExp(`\\n {2}${name}${JOB_ID_TAIL}((?: {4}.*\\n|\\n)*)`));
   assert.ok(match, `expected a \`${name}\` job`);
   return match[1];
 }
@@ -30,7 +36,9 @@ function jobNames(workflow) {
   // `security-scan` -- and skipping a job is exactly how one escapes the
   // reachability check below, so the narrow read makes this test pass for the
   // one case it exists to catch.
-  return [...jobs.matchAll(/\n {2}([A-Za-z_][A-Za-z0-9_-]*):\n/g)].map((m) => m[1]);
+  return [...jobs.matchAll(new RegExp(`\\n {2}([A-Za-z_][A-Za-z0-9_-]*)${JOB_ID_TAIL}`, "g"))].map(
+    (m) => m[1],
+  );
 }
 
 function needsOf(block) {
@@ -92,6 +100,38 @@ test("the precondition job exists and every other job reaches it through needs",
     [],
     "every job must reach approval_precondition through needs",
   );
+});
+
+test("the job scan sees ids declared with a trailing comment or whitespace", () => {
+  // Both are legal YAML for a job id line, and a stricter pattern does not fail
+  // loudly -- it silently drops the job, which is exactly how one would slip
+  // past the reachability check above. `security-Scan` also exercises the
+  // uppercase and hyphen characters Actions permits.
+  const synthetic = [
+    "name: PR",
+    "",
+    "jobs:",
+    "  approval_precondition:",
+    "    runs-on: ubuntu-latest",
+    "  security-Scan: # a valid YAML comment",
+    "    runs-on: ubuntu-latest",
+    "  trailing_space_job:   ",
+    "    runs-on: ubuntu-latest",
+    "",
+  ].join("\n");
+
+  const names = jobNames(synthetic);
+  for (const expected of ["approval_precondition", "security-Scan", "trailing_space_job"]) {
+    assert.ok(names.includes(expected), `jobNames must see ${expected}, got ${names.join(", ")}`);
+  }
+
+  // jobBlock has to tolerate the same tail, or a job the scan finds becomes an
+  // assertion failure rather than a reachability finding.
+  assert.match(jobBlock(synthetic, "security-Scan"), /runs-on: ubuntu-latest/);
+  assert.match(jobBlock(synthetic, "trailing_space_job"), /runs-on: ubuntu-latest/);
+
+  // And such a job, with no needs chain, must read as ungated.
+  assert.deepEqual(needsOf(jobBlock(synthetic, "security-Scan")), []);
 });
 
 test("the precondition job is never skipped", () => {
