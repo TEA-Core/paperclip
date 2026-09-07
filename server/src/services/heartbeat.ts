@@ -2875,6 +2875,71 @@ export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, 
   return parseObject(bounded) ?? { _truncated: true };
 }
 
+// First-class driver/Postgres error text for the `error` column on
+// heartbeat_run_events (SUP-15309). Prefers the full stack because, for a
+// driver error, the stack carries the underlying query + error detail rather
+// than just the top-line "Failed query: ..." message. This value is stored in
+// the dedicated `error` column verbatim and is intentionally NOT passed through
+// the payload bounder (boundHeartbeatRunEventPayloadForStorage), whose 16KB
+// string bound is exactly what truncated the SUP-15254 error away.
+function runEventErrorText(err: unknown): string | undefined {
+  if (err instanceof Error) {
+    if (typeof err.stack === "string" && err.stack.length > 0) return err.stack;
+    return err.message ? err.message : undefined;
+  }
+  if (err === null || err === undefined) return undefined;
+  return String(err);
+}
+
+export interface HeartbeatRunEventInput {
+  eventType: string;
+  stream?: "system" | "stdout" | "stderr";
+  level?: "info" | "warn" | "error";
+  color?: string;
+  message?: string;
+  payload?: Record<string, unknown>;
+  error?: string;
+}
+
+// Builds the exact heartbeat_run_events insert values for a run event. Extracted
+// (and exported) so the retention contract is unit-testable: the `error` field is
+// written verbatim (only current-user identity is redacted) and is NOT passed
+// through the payload bounder, while `payload` is bounded as before.
+export function buildRunEventInsertValues(params: {
+  run: Pick<typeof heartbeatRuns.$inferSelect, "companyId" | "id" | "agentId">;
+  seq: number;
+  event: HeartbeatRunEventInput;
+  currentUserRedactionOptions?: CurrentUserRedactionOptions;
+}) {
+  const { run, seq, event, currentUserRedactionOptions } = params;
+  const sanitizedMessage = event.message
+    ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+    : event.message;
+  const sanitizedError = event.error
+    ? redactCurrentUserText(event.error, currentUserRedactionOptions)
+    : event.error;
+  const boundedPayload = event.payload
+    ? boundHeartbeatRunEventPayloadForStorage(event.payload)
+    : event.payload;
+  const secretSanitizedPayload = boundedPayload ? redactEventPayload(boundedPayload) : boundedPayload;
+  const sanitizedPayload = secretSanitizedPayload
+    ? redactCurrentUserValue(secretSanitizedPayload, currentUserRedactionOptions)
+    : secretSanitizedPayload;
+  return {
+    companyId: run.companyId,
+    runId: run.id,
+    agentId: run.agentId,
+    seq,
+    eventType: event.eventType,
+    stream: event.stream,
+    level: event.level,
+    color: event.color,
+    message: sanitizedMessage,
+    error: sanitizedError,
+    payload: sanitizedPayload,
+  };
+}
+
 function redactInlineBase64ImageData(chunk: string) {
   return chunk.replace(INLINE_BASE64_IMAGE_DATA_RE, (_match, prefix: string, data: string, suffix: string) =>
     `${prefix}[omitted base64 image data: ${data.length} chars]${suffix}`,
@@ -10477,27 +10542,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function appendRunEvent(
     run: typeof heartbeatRuns.$inferSelect,
     seq: number,
-    event: {
-      eventType: string;
-      stream?: "system" | "stdout" | "stderr";
-      level?: "info" | "warn" | "error";
-      color?: string;
-      message?: string;
-      payload?: Record<string, unknown>;
-    },
+    event: HeartbeatRunEventInput,
   ) {
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const sanitizedMessage = event.message
-      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
-      : event.message;
-    const boundedPayload = event.payload
-      ? boundHeartbeatRunEventPayloadForStorage(event.payload)
-      : event.payload;
-    const secretSanitizedPayload = boundedPayload ? redactEventPayload(boundedPayload) : boundedPayload;
-    const sanitizedPayload = secretSanitizedPayload
-      ? redactCurrentUserValue(secretSanitizedPayload, currentUserRedactionOptions)
-      : secretSanitizedPayload;
+    const insertValues = buildRunEventInsertValues({
+      run,
+      seq,
+      event,
+      currentUserRedactionOptions,
+    });
+    const sanitizedMessage = insertValues.message;
+    const sanitizedError = insertValues.error;
+    const sanitizedPayload = insertValues.payload;
     const issueId = readRuntimeStatusIssueIdCandidate(run) ?? null;
     const progress = buildRunEventRuntimeProgress({
       eventType: event.eventType,
@@ -10506,18 +10563,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       at: eventAt,
     });
 
-    await db.insert(heartbeatRunEvents).values({
-      companyId: run.companyId,
-      runId: run.id,
-      agentId: run.agentId,
-      seq,
-      eventType: event.eventType,
-      stream: event.stream,
-      level: event.level,
-      color: event.color,
-      message: sanitizedMessage,
-      payload: sanitizedPayload,
-    });
+    await db.insert(heartbeatRunEvents).values(insertValues);
 
     publishLiveEvent({
       companyId: run.companyId,
@@ -10532,6 +10578,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         level: event.level ?? null,
         color: event.color ?? null,
         message: sanitizedMessage ?? null,
+        error: sanitizedError ?? null,
         currentToolName: progress?.currentToolName ?? null,
         lastAssistantSnippet: progress?.lastAssistantSnippet ?? null,
         lastEventAt: (progress?.lastEventAt ?? eventAt).toISOString(),
@@ -18286,6 +18333,7 @@ function pendingCleanupAttemptsSql() {
         stream: "system",
         level: "error",
         message,
+        error: runEventErrorText(err),
       });
 
       const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
@@ -18458,6 +18506,7 @@ function pendingCleanupAttemptsSql() {
               stream: "system",
               level: "error",
               message,
+              error: runEventErrorText(outerErr),
             }).catch(() => undefined);
           }
           const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
@@ -18602,6 +18651,7 @@ function pendingCleanupAttemptsSql() {
                 stream: "system",
                 level: "warn",
                 message: "run scratch cleanup failed",
+                error: runEventErrorText(scratchCleanupError),
                 payload: {
                   dir: scratchForCleanup.dir,
                   error: scratchCleanupError instanceof Error
