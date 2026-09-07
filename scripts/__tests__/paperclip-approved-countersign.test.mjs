@@ -172,6 +172,31 @@ test("a later CHANGES_REQUESTED from the same account supersedes its approval", 
   );
 });
 
+test("a retraction targeting an older commit still supersedes the approval", () => {
+  // A review may target any commit associated with the PR. Filtering by
+  // commit_id while accumulating each reviewer's state would discard this
+  // CHANGES_REQUESTED as "not on the head SHA" and leave the superseded
+  // approval standing -- the countersignature would survive its own retraction.
+  withFixture(
+    { reviews: [review(), review({ state: "CHANGES_REQUESTED", commit_id: OLD_SHA })] },
+    ({ code }) => assert.equal(code, 1),
+  );
+});
+
+test("an approval superseded on an old commit and re-approved on head counts", () => {
+  // The mirror case: the final state is what matters, and it is an approval of
+  // the current head.
+  withFixture(
+    {
+      reviews: [
+        review({ state: "CHANGES_REQUESTED", commit_id: OLD_SHA }),
+        review(),
+      ],
+    },
+    ({ code }) => assert.equal(code, 0),
+  );
+});
+
 test("a COMMENTED review after an approval leaves the approval standing", () => {
   withFixture(
     { reviews: [review(), review({ state: "COMMENTED" })] },

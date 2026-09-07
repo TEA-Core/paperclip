@@ -263,21 +263,32 @@ human_countersigner() {
     || { err "API failure: GET repos/${REPO}/pulls/${PR_NUMBER}/reviews — ${reviews}"; return 2; }
 
   # Reviews come back in submission order, so a later state for a login
-  # overwrites an earlier one. Only logins whose final state is APPROVED count.
+  # supersedes an earlier one. Resolve each login's FINAL state across every
+  # eligible review FIRST, and only then ask whether that final state is an
+  # approval of the current head.
+  #
+  # The head-SHA test cannot live in this loop. A review may target any commit
+  # associated with the PR, so a reviewer can approve on HEAD_SHA and then
+  # submit CHANGES_REQUESTED against an older commit: filtering by commit while
+  # accumulating would discard the retraction and leave the superseded approval
+  # standing. Record the state and the commit it was made on, and judge both at
+  # the end.
   declare -A final_state=()
+  declare -A final_commit=()
   while IFS=$'\t' read -r state commit login utype; do
     [ -n "$state" ] || continue
     [ "$utype" = "User" ] || continue
-    [ "$commit" = "$HEAD_SHA" ] || continue
     [ -n "$login" ] || continue
     [ "$login" != "$PR_AUTHOR" ] || continue
     # COMMENTED reviews do not change an approval either way.
     [ "$state" != "COMMENTED" ] || continue
     final_state["$login"]="$state"
+    final_commit["$login"]="$commit"
   done <<<"$reviews"
 
   for approver in "${!final_state[@]}"; do
-    if [ "${final_state[$approver]}" = "APPROVED" ]; then
+    if [ "${final_state[$approver]}" = "APPROVED" ] \
+      && [ "${final_commit[$approver]}" = "$HEAD_SHA" ]; then
       printf '%s' "$approver"
       return 0
     fi
