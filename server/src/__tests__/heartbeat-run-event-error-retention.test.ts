@@ -9,6 +9,7 @@ import {
 import {
   boundHeartbeatRunEventPayloadForStorage,
   buildRunEventInsertValues,
+  runEventErrorText,
 } from "../services/heartbeat.ts";
 
 // SUP-15309: the underlying Postgres/driver error must survive intact on
@@ -102,6 +103,76 @@ describe("heartbeat_run_events error retention (appendRunEvent insert values)", 
     expect(values.error!.includes("paperclip-test-user")).toBe(false);
     // Redaction swaps the username for a mask; length stays > the 16KB bound.
     expect(values.error!.length).toBeGreaterThan(PAYLOAD_STRING_BOUND);
+  });
+});
+
+describe("runEventErrorText cause-chain extraction (drizzle wrapper -> driver error)", () => {
+  // Mirrors drizzle-orm 0.45.x DrizzleQueryError: the top error's `.message` is
+  // the "Failed query: ..." top line and its own `.stack` never includes the
+  // cause; the real Postgres/driver error rides only on `.cause` (the same
+  // chain server/src/db-errors.ts walks). SUP-15309 finding 2 asserts the
+  // underlying message lands in `error`, not the wrapper's redundant top line.
+  it("retains the underlying driver error from a cause-wrapped failure", () => {
+    const driverError = Object.assign(
+      new Error(
+        'duplicate key value violates unique constraint "heartbeat_run_events_run_source_event_uq"',
+      ),
+      {
+        code: "23505",
+        detail: "Key (source_event_id)=(deadbeefdeadbeefdeadbeef) already exists.",
+        constraint: "heartbeat_run_events_run_source_event_uq",
+      },
+    );
+    const wrapper = Object.assign(
+      new Error('Failed query: update "heartbeat_runs" set "context_snapshot" = $1'),
+      { cause: driverError },
+    );
+
+    const text = runEventErrorText(wrapper);
+    expect(text).toBeDefined();
+    expect(text).toContain('duplicate key value violates unique constraint');
+    expect(text).toContain("heartbeat_run_events_run_source_event_uq");
+    expect(text).toContain("code: 23505");
+    expect(text).toContain("detail: Key (source_event_id)=(deadbeefdeadbeefdeadbeef) already exists.");
+  });
+
+  it("walks a multi-level cause chain to the deepest driver error", () => {
+    const driverError = Object.assign(new Error('relation "heartbeat_runs" does not exist'), {
+      code: "42P01",
+    });
+    const mid = Object.assign(new Error("query aborted: 57014"), { cause: driverError });
+    const wrapper = Object.assign(
+      new Error('Failed query: select * from "heartbeat_runs"'),
+      { cause: mid },
+    );
+
+    const text = runEventErrorText(wrapper);
+    expect(text).toContain('relation "heartbeat_runs" does not exist');
+    expect(text).toContain("code: 42P01");
+  });
+
+  it("retains a large underlying driver error past the 16KB payload bound", () => {
+    const driverError = Object.assign(
+      new Error('relation "heartbeat_runs" does not exist'),
+      { code: "42P01", detail: "d".repeat(PAYLOAD_STRING_BOUND + 2048) },
+    );
+    const wrapper = Object.assign(
+      new Error('Failed query: update "heartbeat_runs" set "context_snapshot" = $1'),
+      { cause: driverError },
+    );
+
+    const text = runEventErrorText(wrapper);
+    expect(text!.length).toBeGreaterThan(PAYLOAD_STRING_BOUND);
+    expect(text!.includes("[truncated")).toBe(false);
+    expect(text).toContain("code: 42P01");
+  });
+
+  it("keeps a plain (unwrapped) driver error and yields nothing for null/undefined", () => {
+    expect(runEventErrorText(new Error("ECONNREFUSED 127.0.0.1:5432"))).toContain(
+      "ECONNREFUSED 127.0.0.1:5432",
+    );
+    expect(runEventErrorText(undefined)).toBeUndefined();
+    expect(runEventErrorText(null)).toBeUndefined();
   });
 });
 

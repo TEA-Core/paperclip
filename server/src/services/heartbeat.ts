@@ -2876,19 +2876,75 @@ export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, 
 }
 
 // First-class driver/Postgres error text for the `error` column on
-// heartbeat_run_events (SUP-15309). Prefers the full stack because, for a
-// driver error, the stack carries the underlying query + error detail rather
-// than just the top-line "Failed query: ..." message. This value is stored in
-// the dedicated `error` column verbatim and is intentionally NOT passed through
-// the payload bounder (boundHeartbeatRunEventPayloadForStorage), whose 16KB
-// string bound is exactly what truncated the SUP-15254 error away.
-function runEventErrorText(err: unknown): string | undefined {
-  if (err instanceof Error) {
-    if (typeof err.stack === "string" && err.stack.length > 0) return err.stack;
-    return err.message ? err.message : undefined;
+// heartbeat_run_events (SUP-15309). The value is stored in the dedicated
+// `error` column verbatim and is intentionally NOT passed through the payload
+// bounder (boundHeartbeatRunEventPayloadForStorage), whose 16KB string bound is
+// exactly what truncated the SUP-15254 error away.
+//
+// Drizzle wraps driver failures in a `DrizzleQueryError` whose `.message` is the
+// top-line "Failed query: ..." and whose own `.stack` is a fresh
+// captureStackTrace that never includes the cause; the real Postgres/driver
+// error (message, SQLSTATE code, detail, constraint) is reachable ONLY on
+// `.cause` (the repo's server/src/db-errors.ts walks this same chain). To retain
+// the *underlying* driver error — the whole point of this column — we walk the
+// cause chain to the deepest node and format from it, so a large driver error is
+// captured intact rather than shadowed by the wrapper's redundant top line.
+const RUN_EVENT_ERROR_MAX_CAUSE_DEPTH = 4;
+
+// Walks `.cause` links to the deepest error. Bounded to a small depth and
+// cycle-guarded so a malformed chain can never loop.
+function runEventErrorDeepestCause(err: unknown): unknown {
+  let current: unknown = err;
+  let depth = 0;
+  while (
+    typeof current === "object" &&
+    current !== null &&
+    depth <= RUN_EVENT_ERROR_MAX_CAUSE_DEPTH
+  ) {
+    const next = (current as { cause?: unknown }).cause;
+    if (typeof next !== "object" || next === null || next === current) break;
+    current = next;
+    depth += 1;
   }
-  if (err === null || err === undefined) return undefined;
-  return String(err);
+  return current;
+}
+
+// Renders the deepest error node as a single retained string: its stack (which
+// carries the driver message + frames) or, lacking that, its message; the
+// SQLSTATE code / detail / constraint are appended where the driver surfaces
+// them so the exact Postgres failure is reproducible from the row alone.
+function runEventErrorNodeText(node: unknown): string | undefined {
+  if (node === null || node === undefined) return undefined;
+  const record = typeof node === "object" ? (node as Record<string, unknown>) : undefined;
+  const stack =
+    typeof record?.stack === "string" && record.stack.length > 0 ? record.stack : undefined;
+  const message =
+    typeof record?.message === "string" && record.message.length > 0
+      ? record.message
+      : node instanceof Error && node.message.length > 0
+        ? node.message
+        : undefined;
+  const base = stack ?? message ?? String(node);
+  const code =
+    typeof record?.code === "string" && record.code.length > 0 ? `code: ${record.code}` : undefined;
+  const detail =
+    typeof record?.detail === "string" && record.detail.length > 0
+      ? `detail: ${record.detail}`
+      : undefined;
+  const constraint =
+    typeof record?.constraint === "string" && record.constraint.length > 0
+      ? `constraint: ${record.constraint}`
+      : typeof record?.constraint_name === "string" && record.constraint_name.length > 0
+        ? `constraint: ${record.constraint_name}`
+        : undefined;
+  const parts = [base, code, detail, constraint].filter(
+    (part): part is string => part !== undefined && part.length > 0,
+  );
+  return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
+export function runEventErrorText(err: unknown): string | undefined {
+  return runEventErrorNodeText(runEventErrorDeepestCause(err));
 }
 
 export interface HeartbeatRunEventInput {
