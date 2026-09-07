@@ -141,6 +141,32 @@ jobs:
         if: github.event_name == 'pull_request'
         run: node ./scripts/check-overrides-lockfile.mjs
 
+      - name: Validate migration ordering against target branch
+        # `.github/scripts/check-pr-migration-order.mjs` had exactly one caller:
+        # `pr-trusted.yml`, which is `workflow_call:` only and which nothing
+        # calls. So cross-branch migration-order validation has never run on
+        # this pipeline — and it is precisely the check that catches a fold's
+        # migration collision, where upstream and the fork both claim the same
+        # 4-digit number and the later one silently loses.
+        #
+        # Deliberately NOT gated on `github.event_name == 'pull_request'` like
+        # the lockfile guards above. Those bind on facts a queue entry cannot
+        # change. This one binds on the numbering of the target branch, and the
+        # collision it exists to catch is created by the BASE advancing:
+        # ruleset 20756420 sets `strict_required_status_checks_policy: false`,
+        # so base can move between the PR-time check and the merge, and the
+        # merge_group entry is the only place the real post-merge numbering is
+        # ever visible. BASE_SHA/HEAD_SHA resolve both payload shapes at the
+        # job level, and the checkout above uses fetch-depth: 0, so both
+        # commits are present in either event.
+        run: node .github/scripts/check-pr-migration-order.mjs "$BASE_SHA" "$HEAD_SHA"
+
+      - name: Test migration ordering check
+        run: node --test .github/scripts/tests/check-pr-migration-order.test.mjs
+
+      - name: Test migration ordering check wiring
+        run: node --test ./scripts/__tests__/pr-migration-order-wiring.test.mjs
+
       - name: Validate Dockerfile deps stage
         run: node ./scripts/check-docker-deps-stage.mjs
 
