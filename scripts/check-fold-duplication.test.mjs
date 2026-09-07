@@ -10,6 +10,7 @@ import {
   countOccurrences,
   findAdjacentRepeats,
   findMergeDuplication,
+  mergesToCheck,
   normalize,
 } from "./check-fold-duplication.mjs";
 
@@ -157,6 +158,55 @@ test("findMergeDuplication skips a non-merge commit", () => {
     const result = findMergeDuplication("HEAD", { cwd: dir });
     assert.equal(result.skipped, true);
     assert.deepEqual(result.findings, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("mergesToCheck lists a symbolic head that is itself a merge exactly once", () => {
+  // `git rev-list` emits full SHAs. Before `head` was canonicalized, a symbolic
+  // or abbreviated head that the range already listed did not match, got
+  // appended again, and every finding on it was reported twice.
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "mod.ts"), `${GUARD}\n`);
+    git("add", "-A");
+    git("commit", "-qm", "base");
+
+    git("checkout", "-q", "-b", "fork");
+    writeFileSync(path.join(dir, "mod.ts"), `${GUARD}\n\nexport const FORK_FLAG = true;\n`);
+    git("commit", "-qam", "fork side");
+
+    git("checkout", "-q", "base");
+    writeFileSync(path.join(dir, "mod.ts"), `${GUARD}\n\nexport const UPSTREAM_FLAG = true;\n`);
+    git("commit", "-qam", "upstream side");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    writeFileSync(
+      path.join(dir, "mod.ts"),
+      `${GUARD}\n${GUARD}\n\nexport const UPSTREAM_FLAG = true;\nexport const FORK_FLAG = true;\n`,
+    );
+    git("add", "-A");
+    git("commit", "-qm", "merge keeping both sides");
+
+    const mergeSha = git("rev-parse", "HEAD").trim();
+    const symbolic = mergesToCheck("HEAD", "HEAD^1", { cwd: dir });
+    assert.deepEqual(symbolic, [mergeSha]);
+
+    const abbreviated = mergesToCheck(mergeSha.slice(0, 9), "HEAD^1", { cwd: dir });
+    assert.deepEqual(abbreviated, [mergeSha]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("mergesToCheck falls back to the head alone with no base", () => {
+  const { dir, git } = makeRepo();
+  try {
+    writeFileSync(path.join(dir, "mod.ts"), `${GUARD}\n`);
+    git("add", "-A");
+    git("commit", "-qm", "base");
+    assert.deepEqual(mergesToCheck("HEAD", "", { cwd: dir }), [git("rev-parse", "HEAD").trim()]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

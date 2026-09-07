@@ -254,14 +254,24 @@ export function findMergeDuplication(commit, options = {}) {
   return { skipped: false, parents, resolvedFiles: resolved.length, findings, redeclarations };
 }
 
-/** Every two-parent merge to inspect for a head, optionally bounded by a base. */
-export function mergesToCheck(head, base) {
+/**
+ * Every two-parent merge to inspect for a head, optionally bounded by a base.
+ *
+ * `head` is canonicalized first. `git rev-list` emits full 40-char SHAs, so a
+ * symbolic or abbreviated `head` that is itself a merge inside the range would
+ * not match the listed entry, get appended a second time, and have every
+ * finding on it reported twice. CI passes a full SHA and never hit this; the
+ * documented CLI form (`check-fold-duplication.mjs HEAD <base>`) does.
+ */
+export function mergesToCheck(head, base, options = {}) {
+  repoCwd = options.cwd;
+  const resolved = git(["rev-parse", head], { allowFailure: true })?.trim() || head;
   const commits = [];
   if (base) {
-    const listed = git(["rev-list", "--merges", `${base}..${head}`], { allowFailure: true });
+    const listed = git(["rev-list", "--merges", `${base}..${resolved}`], { allowFailure: true });
     if (listed) commits.push(...listed.split("\n").filter(Boolean));
   }
-  if (!commits.includes(head)) commits.push(head);
+  if (!commits.includes(resolved)) commits.push(resolved);
   return commits;
 }
 
