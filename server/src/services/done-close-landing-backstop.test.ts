@@ -442,6 +442,35 @@ describe("done-close-landing discovery predicate (AC1 — #514-class card)", () 
     expect(selected).toHaveLength(1);
   });
 
+  // SUP-15394: the arming-refusal row the post-approval close hook now records
+  // when the ACTUATOR refuses a PR the publisher already stamped. Its
+  // refusalReason carries the actuator's exact skip message; the backstop must
+  // still pick the card up so it is not left unqueued and quiet.
+  it("selects a SUP-15394 arming-refusal row whose actuator refused no-pr (AC#3)", () => {
+    const row = {
+      details: {
+        identifier: "SUP-15394",
+        refusalReason: "skipped:no-pr: No linked pull request found",
+        headSha: null,
+        decisionOutcome: "approved",
+      },
+      createdAt: new Date("2026-09-04T09:00:00Z"),
+      issue: {
+        id: "99999999-9999-4999-8999-999999999999",
+        companyId: COMPANY,
+        status: "done",
+        identifier: "SUP-15394",
+        assigneeAgentId: AGENT,
+      },
+    };
+    const selected = selectLandingCandidates([row], windowStart, graceCutoff);
+    expect(selected).toHaveLength(1);
+    expect(selected[0]!.issue.id).toBe("99999999-9999-4999-8999-999999999999");
+    expect((selected[0]!.details as Record<string, unknown>).refusalReason).toBe(
+      "skipped:no-pr: No linked pull request found",
+    );
+  });
+
   it("excludes the documented edge cases", () => {
     // (a) never-linked/never-armed: a plain "ahead, N PRs open" close with no
     // decision-carried reason and no refusalReason is NOT a candidate. This pins

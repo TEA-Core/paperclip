@@ -66,6 +66,21 @@ export interface ArmingOutcome {
    * instead of failing closed forever on guard-a:no-approved-head.
    */
   skipCandidates?: ApprovalCandidateAnchor[];
+  /**
+   * SUP-15394: the PR this `armed` outcome CERTIFIED — the exact
+   * owner/repo/number (plus the fields the arming actuator needs) that
+   * publishApprovalStatus resolved, delivery-identity-gated, and stamped
+   * paperclip/approved on. The post-approval close hook hands it to
+   * armMergeOnApproval so the actuator arms EXACTLY the PR the publisher
+   * certified. A second, independent resolveLinkedPullRequests call was the
+   * SUP-15393 root cause: on the zero-mention card the two resolvers disagreed
+   * and the arming refused a PR the publisher had already stamped.
+   *
+   * Optional: callers that do not arm (the reconciler's Guard A re-publish)
+   * ignore it, and armMergeOnApproval falls back to its own cached resolve when
+   * no certified subject is supplied.
+   */
+  certifiedPr?: LinkedPullRequest | null;
 }
 
 /**
@@ -418,6 +433,8 @@ export interface WorkspacePullRequestMatch {
   number: number;
   displayName: string;
   headRefName: string | null;
+  /** The PR title as GitHub reported it in the open-PR list, or null. Carried so a certified subject can reproduce the SUP-13361 title-OR-branch ownership check (SUP-15394). */
+  title: string | null;
   candidate: GitHubTokenResolution;
 }
 
@@ -583,6 +600,7 @@ async function discoverCardPullRequestByWorkspace(
           number: item.number,
           displayName: `${pair.owner}/${pair.repo}#${item.number}`,
           headRefName: item.headRef ?? null,
+          title: item.title ?? null,
           candidate,
         });
       }
@@ -1443,6 +1461,23 @@ export async function publishApprovalStatus(
           kind: "armed",
           message: `status:published (live re-resolve): paperclip/approved status written to ${pr.displayName} head ${headSha.slice(0, 7)}`,
           headSha,
+          // SUP-15394: hand the certified PR to the actuator. The discovery match
+          // has no cached external object, so id is empty and nodeId/head-ref are
+          // what the live read reported; the actuator re-fetches the node id when
+          // absent. cachedState is "open" — discovery only ever returns open PRs.
+          certifiedPr: {
+            id: "",
+            owner: pr.owner,
+            repo: pr.repo,
+            number: pr.number,
+            nodeId: null,
+            headRefName: pr.headRefName,
+            displayName: pr.displayName,
+            title: pr.title,
+            cachedState: "open",
+            lastErrorCode: null,
+            reviewDecision: null,
+          },
         };
       }
 
@@ -1551,6 +1586,9 @@ export async function publishApprovalStatus(
         kind: "armed",
         message: `status:published: paperclip/approved status written to ${pr.displayName} head ${headSha.slice(0, 7)}`,
         headSha,
+        // SUP-15394: the cached-mention path already resolved a LinkedPullRequest,
+        // so hand it over verbatim as the certified subject.
+        certifiedPr: pr,
       };
     }
 
@@ -2263,12 +2301,23 @@ export async function armMergeOnApproval(
   companyId: string,
   issueId: string,
   decision: MergeArmingDecision,
+  certifiedPr?: LinkedPullRequest | null,
 ): Promise<ArmingOutcome> {
   if (decision.outcome !== "approved") {
     return { kind: "skipped", message: `skipped:not-approved: Decision outcome is "${decision.outcome}", not "approved"` };
   }
 
-  const linkedPRs = await resolveLinkedPullRequests(db, companyId, issueId);
+  // SUP-15394: when the close hook hands over the PR that publishApprovalStatus
+  // already resolved, delivery-identity-gated, and stamped, arm THAT PR as the
+  // authoritative subject instead of re-resolving it. A second, independent
+  // resolveLinkedPullRequests is what let the two resolvers disagree on the
+  // zero-mention card (SUP-15393) and refuse a PR the publisher had already
+  // stamped. No new authorization surface: the certified PR was already gated
+  // by the publisher, and every gate below (owner-approved, SUP-13361
+  // title-OR-branch, stage-completion) still runs against this subject. When no
+  // certified subject is supplied (the reconciler / any other caller), fall back
+  // to the historical cached resolve — unchanged.
+  const linkedPRs = certifiedPr ? [certifiedPr] : await resolveLinkedPullRequests(db, companyId, issueId);
 
   if (linkedPRs.length === 0) {
     return { kind: "skipped", message: "skipped:no-pr: No linked pull request found" };
