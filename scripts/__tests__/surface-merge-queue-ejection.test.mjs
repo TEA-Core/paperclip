@@ -9,12 +9,22 @@ import test from "node:test";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const script = path.join(repoRoot, "scripts/ci/surface-merge-queue-ejection.sh");
 const workflow = path.join(repoRoot, ".github/workflows/paperclip-approved.yml");
+const prWorkflow = path.join(repoRoot, ".github/workflows/pr.yml");
 
 const REPO = "TEA-Core/paperclip";
 const PR = 4242;
 // A fold merge-queue ref whose base branch itself contains slashes — the exact
 // shape that broke the single-component regex on the agent-tools repo.
 const QUEUE_REF_NAME = `gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-${PR}-0123456789abcdef`;
+
+// Every required merge_group check has its own surface marker, so a comment for
+// one failing check is never mistaken for another's and each updates in place
+// on re-queue.
+const ENFORCER_CHECK = "paperclip-approved-enforcer";
+const markerFor = (checkName) => `<!-- paperclip:merge-queue-ejection:${checkName} -->`;
+const ENFORCER_MARKER = markerFor(ENFORCER_CHECK);
+const VERIFY_MARKER = markerFor("verify");
+const E2E_MARKER = markerFor("e2e");
 
 // The enforcer's trailing failure block — what the gate step tees into the
 // verdict file and the surface script is expected to quote verbatim.
@@ -108,9 +118,11 @@ function readCalls(dir) {
     });
 }
 
-function run(fixture, { refName = "", prNumber = String(PR), withVerdict = true } = {}) {
+function run(fixture, { refName = "", prNumber = String(PR), withVerdict = true, checkName = ENFORCER_CHECK, extraArgs = [] } = {}) {
   const args = [script];
+  if (checkName) args.push("--check-name", checkName);
   if (withVerdict && existsSync(fixture.verdictPath)) args.push("--verdict", fixture.verdictPath);
+  args.push(...extraArgs);
   const result = spawnSync("bash", args, {
     cwd: repoRoot,
     encoding: "utf8",
@@ -159,18 +171,74 @@ test("posts an ejection comment naming the check and quoting the reason", () => 
       assert.equal(create.verb, "POST");
       assert.match(create.url, new RegExp(`issues/${PR}/comments$`));
       assert.doesNotMatch(create.url, /\/pulls\//);
-      // The body is a JSON payload {body}; it carries the stable marker, the
+      // The body is a JSON payload {body}; it carries the per-check marker, the
       // failing check name, and the enforcer's reason verbatim.
-      assert.match(create.body, /paperclip:merge-queue-ejection/);
+      assert.match(create.body, new RegExp(ENFORCER_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
       assert.match(create.body, /paperclip-approved-enforcer/);
       assert.match(create.body, /paperclip\/approved is missing/);
     },
   );
 });
 
+test("posts a verify-check comment naming verify, not the enforcer", () => {
+  const verifyVerdict = "general_tests: failure\nbuild: success";
+  withFixture(
+    { comments: [], verdict: verifyVerdict },
+    (calls, { code }) => {
+      assert.equal(code, 0);
+      const create = calls[1];
+      assert.equal(create.verb, "POST");
+      assert.match(create.body, /paperclip:merge-queue-ejection:verify/);
+      assert.doesNotMatch(create.body, /paperclip:merge-queue-ejection:paperclip-approved-enforcer/);
+      assert.match(create.body, /\*\*`verify`\*\* check failed on this entry's merge-group commit/);
+      assert.match(create.body, /general_tests: failure/, "the lane-summary verdict file is quoted verbatim");
+    },
+    { checkName: "verify" },
+  );
+});
+
+test("posts an e2e-check comment naming e2e", () => {
+  const e2eVerdict = "e2e_shards: failure";
+  withFixture(
+    { comments: [], verdict: e2eVerdict },
+    (calls, { code }) => {
+      assert.equal(code, 0);
+      const create = calls[1];
+      assert.equal(create.verb, "POST");
+      assert.match(create.body, /paperclip:merge-queue-ejection:e2e/);
+      assert.match(create.body, /\*\*`e2e`\*\* check failed on this entry's merge-group commit/);
+      assert.match(create.body, /e2e_shards: failure/, "the lane-summary verdict file is quoted verbatim");
+    },
+    { checkName: "e2e" },
+  );
+});
+
+test("upserts only the same check's comment — verify never clobbers the enforcer's", () => {
+  // The PR already carries an enforcer marker AND a verify marker; a verify run
+  // must find and PATCH only its own comment, leaving the enforcer's alone.
+  withFixture(
+    {
+      comments: [
+        { id: 111, body: `enforcer …${ENFORCER_MARKER}…` },
+        { id: 222, body: `verify …${VERIFY_MARKER}… old verify reason` },
+      ],
+    },
+    (calls, { code, out }) => {
+      assert.equal(code, 0);
+      assert.match(out, /updated merge-queue ejection comment 222/);
+      assert.equal(calls.length, 2);
+      const update = calls[1];
+      assert.equal(update.verb, "PATCH");
+      assert.match(update.url, /issues\/4242\/comments\/222$/);
+      assert.doesNotMatch(calls.map((c) => c.verb).join(","), /POST/, "the verify marker was found; no stack");
+    },
+    { checkName: "verify" },
+  );
+});
+
 test("updates the existing comment in place instead of stacking a new one", () => {
   withFixture(
-    { comments: [{ id: 555, body: "…<!-- paperclip:merge-queue-ejection -->… old reason" }] },
+    { comments: [{ id: 555, body: `…${ENFORCER_MARKER}… old reason` }] },
     (calls, { code, out }) => {
       assert.equal(code, 0);
       assert.match(out, /updated merge-queue ejection comment 555/);
@@ -193,7 +261,7 @@ test("finds a marker previously posted as an issue comment (round-trip after a r
   // id a subsequent list on the SAME endpoint returns. Feed that back and assert
   // the script PATCHes id 424242 rather than creating a second comment.
   withFixture(
-    { comments: [{ id: 424242, body: "hello <!-- paperclip:merge-queue-ejection --> world" }] },
+    { comments: [{ id: 424242, body: `hello ${ENFORCER_MARKER} world` }] },
     (calls, { code, out }) => {
       assert.equal(code, 0);
       assert.match(out, /updated merge-queue ejection comment 424242/);
@@ -302,7 +370,10 @@ test("the surface step runs only on merge_group gate failure and calls the scrip
   // A naive condition without a status function must never come back: GitHub
   // would silently add `success()` and the artefact would never be posted.
   assert.doesNotMatch(ifExpr, /^if: github\.event_name/, "a bare (implicit-success) condition is the round-1 defect");
-  assert.match(text, /bash scripts\/ci\/surface-merge-queue-ejection\.sh --verdict "\$MERGE_EJECTION_VERDICT"/);
+  assert.match(
+    text,
+    /bash scripts\/ci\/surface-merge-queue-ejection\.sh --check-name paperclip-approved-enforcer --verdict "\$MERGE_EJECTION_VERDICT"/,
+  );
   // It is gated on the gate step's failure, not `always()` — so it can never run
   // on a green entry and turn one red, and it is not required for a conclusion.
   assert.match(text, /- name: Check the paperclip\/approved status/);
@@ -314,4 +385,59 @@ test("the surface step is not on the enforcement path (best-effort)", () => {
   // that would mask the gate; it simply runs after the gate has already failed.
   const text = readFileSync(workflow, "utf8");
   assert.doesNotMatch(text, /needs:.*surface/i, "nothing depends on the surface step");
+});
+
+// ---------------------------------------------------------------------------
+// Wiring: pr.yml's verify/e2e aggregates (the other required merge_group checks)
+// ---------------------------------------------------------------------------
+
+test("pr.yml verify aggregate gates a surface step on merge_group gate failure", () => {
+  const text = readFileSync(prWorkflow, "utf8");
+  // The `verify` job is an always() aggregator whose gate keeps its fail-closed
+  // assertions unchanged and tees the lane results before they run.
+  const job = text.match(/\n {2}verify:\n((?: {4}.*\n|\n)*?)(?=\n {2}build:)/)[1];
+  assert.match(job, /if: \$\{\{ always\(\) \}\}/, "verify stays an always() aggregator");
+  assert.match(job, /id: verify_gate/);
+  assert.match(job, /> "\$MERGE_EJECTION_VERDICT"/, "lane results are teed for the surface step");
+  assert.match(job, /test "\$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"/, "fail-closed assertion unchanged");
+  // The surface step carries an explicit status function + the event/gate scope,
+  // and calls the shared script with its own --check-name.
+  assert.match(
+    job,
+    /- name: Surface the merge-queue ejection reason on the PR \(verify\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.verify_gate\.outcome == 'failure' \}\}/,
+  );
+  assert.match(job, /bash scripts\/ci\/surface-merge-queue-ejection\.sh --check-name verify --verdict "\$MERGE_EJECTION_VERDICT"/);
+});
+
+test("pr.yml e2e aggregate gates a surface step on merge_group gate failure", () => {
+  const text = readFileSync(prWorkflow, "utf8");
+  const job = text.match(/\n {2}e2e:\n((?: {4}.*\n|\n)*)/)[1];
+  assert.match(job, /if: \$\{\{ always\(\) \}\}/, "e2e stays an always() aggregator");
+  assert.match(job, /id: e2e_gate/);
+  assert.match(job, /> "\$MERGE_EJECTION_VERDICT"/, "the e2e_shards result is teed for the surface step");
+  assert.match(job, /test "\$E2E_SHARDS_RESULT" = "success"/, "fail-closed assertion unchanged");
+  assert.match(
+    job,
+    /- name: Surface the merge-queue ejection reason on the PR \(e2e\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.e2e_gate\.outcome == 'failure' \}\}/,
+  );
+  assert.match(job, /bash scripts\/ci\/surface-merge-queue-ejection\.sh --check-name e2e --verdict "\$MERGE_EJECTION_VERDICT"/);
+});
+
+test("pr.yml surface steps only post on a genuine failure, not skipped/cancelled lanes", () => {
+  const text = readFileSync(prWorkflow, "utf8");
+  // Both surface run blocks gate on a `: failure` verdict line, so an approval
+  // collapse (lanes skipped/cancelled → the paperclip-approved surface owns the
+  // story) does not stack verify/e2e comments.
+  assert.match(
+    text,
+    /- name: Surface the merge-queue ejection reason on the PR \(verify\)\n((?: {6,}.*\n|\n)*?)(?=\n {4}- |\n {2}build:)/,
+  );
+  assert.match(
+    text,
+    /Surface the merge-queue ejection reason on the PR \(verify\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.verify_gate\.outcome == 'failure' \}\}\n {8}run: \|\n(?: {10}.*\n)*? {10}if grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
+  );
+  assert.match(
+    text,
+    /Surface the merge-queue ejection reason on the PR \(e2e\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.e2e_gate\.outcome == 'failure' \}\}\n {8}run: \|\n(?: {10}.*\n)*? {10}if grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
+  );
 });

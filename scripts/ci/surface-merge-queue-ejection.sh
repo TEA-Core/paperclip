@@ -7,16 +7,23 @@
 # `gh-readonly-queue/…` ref, which agent tokens do not think to query, and
 # `GET /branches/{b}/protection` is 403 for the platform token. This script
 # makes the reason reachable from the PR itself: it posts — or updates in
-# place — a single PR comment naming the failing check and quoting the
-# enforcer's verdict, using only `pull-requests: read|write`. No `checks:read`,
-# no admin escalation.
+# place — a PR comment naming the failing check and quoting the reason it was
+# ejected, using only `pull-requests: read|write`. No `checks:read`, no admin
+# escalation.
+#
+# One call site per *required* merge_group check, each passing its own
+# `--check-name`, so every failure source that can eject an entry is surfaced:
+#   - `paperclip-approved-enforcer`  (`.github/workflows/paperclip-approved.yml`)
+#   - `verify` and `e2e`             (`.github/workflows/pr.yml` aggregate jobs)
+# Each check owns a per-check marker, so a comment for one check is never
+# mistaken for another's, and each updates in place on re-queue.
 #
 # BEST-EFFORT BY DESIGN. This is a diagnostic surface, not enforcement. The
-# merge decision is made by the `paperclip-approved-enforcer` check-run
-# (fail-closed on `merge_group`, unchanged by this script). This step runs only
-# AFTER that check has already failed, so it cannot turn a green entry red; and
-# if the comment cannot be posted (unresolvable identity, API error) it logs and
-# exits 0 — the absence of the artefact must never change whether the merge is
+# merge decision is made by the failing check itself (fail-closed on
+# `merge_group`, unchanged by this script). This step runs only AFTER that
+# check has already failed, so it cannot turn a green entry red; and if the
+# comment cannot be posted (unresolvable identity, API error) it logs and exits
+# 0 — the absence of the artefact must never change whether the merge is
 # blocked.
 #
 # Consume/write contract:
@@ -26,16 +33,19 @@
 #   pull-request *review*-comment family (`pulls/{n}/comments`): the marker the
 #   write posts must be found again by the read, or re-queueing stacks a comment
 #   per attempt instead of updating the one in place.
-#   The artefact is a plain PR comment carrying a stable HTML marker
-#   (`<!-- paperclip:merge-queue-ejection -->`), so re-queueing updates the one
-#   comment in place rather than stacking one per attempt.
+#   The artefact is a plain PR comment carrying a stable per-check HTML marker
+#   (`<!-- paperclip:merge-queue-ejection:<check-name> -->`), so re-queueing
+#   updates the one comment in place rather than stacking one per attempt.
 #
 # Usage:
-#   surface-merge-queue-ejection.sh [--verdict <path>]
+#   surface-merge-queue-ejection.sh [--check-name <name>] [--verdict <path>]
 #
-#   --verdict <path>   File with the enforcer's captured stdout+stderr. The
-#                      trailing lines (the reason) are quoted verbatim. Optional:
-#                      without it a generic reason is posted.
+#   --check-name <name>  The required merge_group check that failed, naming the
+#                        failing job in the artefact and scoping the marker.
+#                        Default: paperclip-approved-enforcer.
+#   --verdict <path>     File with the failing check's captured stdout+stderr.
+#                        The trailing lines (the reason) are quoted verbatim.
+#                        Optional: without it a generic reason is posted.
 #
 # Environment:
 #   GH_REPO                   owner/repo (default: parsed from `git remote get-url origin`)
@@ -50,16 +60,30 @@
 #   2  usage / missing-dependency error
 set -euo pipefail
 
-MARKER="<!-- paperclip:merge-queue-ejection -->"
-CHECK_NAME="paperclip-approved-enforcer"
+usage() {
+  echo "usage: $(basename "$0") [--check-name <name>] [--verdict <path>]" >&2
+}
 
+CHECK_NAME="paperclip-approved-enforcer"
 VERDICT_FILE=""
-if [ "${1:-}" = "--verdict" ] && [ -n "${2:-}" ]; then
-  VERDICT_FILE="$2"
-elif [ -n "${1:-}" ]; then
-  echo "usage: $(basename "$0") [--verdict <path>]" >&2
-  exit 2
-fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check-name)
+      [ -n "${2:-}" ] || { usage; exit 2; }
+      CHECK_NAME="$2"
+      shift 2
+      ;;
+    --verdict)
+      [ -n "${2:-}" ] || { usage; exit 2; }
+      VERDICT_FILE="$2"
+      shift 2
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
 
 command -v jq >/dev/null 2>&1 || { echo "[merge-queue-ejection] jq is required but not on PATH" >&2; exit 2; }
 command -v gh >/dev/null 2>&1 || { echo "[merge-queue-ejection] gh is required but not on PATH" >&2; exit 2; }
@@ -126,23 +150,28 @@ if ! REPO="$(resolve_repo)"; then
   log "could not determine the repository (owner/repo) for PR #${PR_NUMBER} — skipping (best-effort); enforcement is unaffected"
   exit 0
 fi
-log "surfacing merge-queue ejection on ${REPO} PR #${PR_NUMBER}"
+log "surfacing merge-queue ejection (${CHECK_NAME}) on ${REPO} PR #${PR_NUMBER}"
 
 # --- verdict (the reason) ----------------------------------------------------
-# Quote the enforcer's trailing lines verbatim. On a failure these are the
+# Quote the failing check's trailing lines verbatim. On a failure these are the
 # `FAIL: …` / remediation err block — the reason the entry was ejected.
 REASON=""
 if [ -n "$VERDICT_FILE" ] && [ -f "$VERDICT_FILE" ] && [ -s "$VERDICT_FILE" ]; then
   REASON="$(tr -d '\r' <"$VERDICT_FILE" | tail -c 4096 | sed -e '/^[[:space:]]*$/d')"
 fi
 if [ -z "$REASON" ]; then
-  REASON="(the paperclip-approved-enforcer check failed on the merge-group commit; see its merge_group run for the full log)"
+  REASON="(the ${CHECK_NAME} check failed on the merge-group commit; see its merge_group run for the full log)"
 fi
 
 # --- comment body ------------------------------------------------------------
-# A quoted heredoc keeps every backtick literal; the three placeholders are
-# substituted afterwards with bash parameter expansion.
-body_template="$(cat <<'EOF'
+# The paperclip-approved-enforcer body keeps the approval-gate explanation
+# (advisory on pull_request / fail-closed on merge_group); the other required
+# checks get a generic merge-group re-test note. A quoted heredoc keeps every
+# backtick literal; the placeholders are substituted afterwards with bash
+# parameter expansion.
+MARKER="<!-- paperclip:merge-queue-ejection:${CHECK_NAME} -->"
+if [ "$CHECK_NAME" = "paperclip-approved-enforcer" ]; then
+  body_template="$(cat <<'EOF'
 __MARKER__
 ## Ejected from the merge queue
 
@@ -161,17 +190,39 @@ __REASON__
 **To land this PR:** get the card's review stage to `approved` (the control plane then publishes `paperclip/approved` on the head SHA), or — for a cardless PR — add a `Paperclip-Approved-Waiver: <reason>` body line / the `no-paperclip-card` label. Then re-arm the merge.
 EOF
 )"
+else
+  body_template="$(cat <<'EOF'
+__MARKER__
+## Ejected from the merge queue
+
+The required **`__CHECK_NAME__`** check failed on this entry's merge-group commit, so the merge queue removed it.
+
+The queue tests each entry against a **merge-group commit** (the post-merge state) — not the PR head — so this check can fail there even when the PR head reads clean. The failing run lives on the `gh-readonly-queue/…` ref, which is not surfaced on the PR head; this comment is the agent-reachable artefact.
+
+**Failing check:** `__CHECK_NAME__`
+
+**Reason (verbatim from the failing check's merge_group run):**
+
+```
+__REASON__
+```
+
+**To land this PR:** fix the reported failure, then re-arm the merge; the next queue entry is re-tested on a fresh merge-group commit.
+EOF
+)"
+fi
 BODY="${body_template//__MARKER__/$MARKER}"
 BODY="${BODY//__CHECK_NAME__/$CHECK_NAME}"
 BODY="${BODY//__REASON__/$REASON}"
 
 # --- find-or-upsert the comment ----------------------------------------------
-# One artefact per PR: if a comment already carries the marker, update it in
-# place; otherwise create it. Re-queueing a PR therefore refreshes the existing
-# note instead of stacking a new one per attempt.
+# One artefact per check per PR: if a comment already carries THIS check's
+# marker, update it in place; otherwise create it. Re-queueing a PR therefore
+# refreshes the existing note instead of stacking a new one per attempt, and a
+# comment for another failing check is never clobbered.
 comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>&1)" \
   || { log "could not list the PR's comments — skipping (best-effort); enforcement is unaffected"; exit 0; }
-existing_id="$(jq -r '.[] | select((.body // "") | contains("paperclip:merge-queue-ejection")) | .id' <<<"$comments_json" 2>/dev/null | head -1 || true)"
+existing_id="$(jq -r --arg m "paperclip:merge-queue-ejection:${CHECK_NAME}" '.[] | select((.body // "") | contains($m)) | .id' <<<"$comments_json" 2>/dev/null | head -1 || true)"
 
 payload() { jq -n --arg b "$BODY" '{body: $b}'; }
 

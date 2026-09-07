@@ -109,25 +109,33 @@ the platform token). The compound case — `paperclip-approved-enforcer` reading
 **green on the head** (advisory on `pull_request`) while the entry is not
 approved — reads as "all checks green, mysteriously evicted."
 
-When the enforcer's `merge_group` gate step fails,
-`paperclip-approved.yml` runs a best-effort surface step that posts/updates a
-single PR comment (`scripts/ci/surface-merge-queue-ejection.sh`):
+When a required `merge_group` check fails a queue entry, the workflow that owns
+that check runs a best-effort surface step that posts/updates a PR comment
+(`scripts/ci/surface-merge-queue-ejection.sh`). One call site per required
+check, each passing its own `--check-name`:
 
-- **Stable marker** `<!-- paperclip:merge-queue-ejection -->` — re-queueing
-  updates the existing comment in place (PATCH) rather than stacking a new one.
-- **Names the failing check** (`paperclip-approved-enforcer`) and **quotes the
-  enforcer's verdict verbatim** (the gate step tees the enforcer's
-  stdout/stderr to `runner.temp`, passed to the surface step via
-  `--verdict`).
+- `paperclip-approved-enforcer` — in `paperclip-approved.yml`, when the gate
+  step fails.
+- `verify` and `e2e` — in `pr.yml`'s aggregate jobs, when a lane genuinely
+  ends `failure` (skipped/cancelled lanes mean an earlier gate collapsed the
+  run — the approval surface owns that story, so no comment is posted).
+
+Each artefact:
+
+- **Per-check marker** `<!-- paperclip:merge-queue-ejection:<check-name> -->` —
+  re-queueing updates the right check's existing comment in place (PATCH)
+  rather than stacking a new one, and a comment for one failing check is never
+  clobbered by another's.
+- **Names the failing check** (the `--check-name`) and **quotes the reason
+  verbatim** (the failing step tees its captured output / lane results to
+  `runner.temp`, passed via `--verdict`).
 - **Reachable with the standard platform agent token** — it reads/writes PR
   comments via `gh api …/issues/{n}/comments` under the job's
   `pull-requests: write` grant (bumped from `read`); no `checks:read`/admin.
-- **Not on the enforcement path.** The gate step still exits with the enforcer's
-  rc, so `merge_group` stays fail-closed. The surface step runs only when the
-  gate step already failed (`steps.gate.outcome == 'failure'`), cannot turn a
-  green entry red, and exits 0 on any post failure.
-- **Scope:** approval-gate ejections only. Ejections caused by `verify`/`e2e`
-   (in `pr.yml`) are a separate surface and out of this card's scope.
+- **Not on the enforcement path.** Each gate step still fails closed
+  (`merge_group` conclusions are unchanged); the surface step runs only when
+  that gate step already failed (explicit `failure()`, event == `merge_group`),
+  cannot turn a green entry red, and exits 0 on any post failure.
 
 ### ADR-091 D1 delivery-identity evidence order (SUP-14824)
 

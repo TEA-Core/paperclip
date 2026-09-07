@@ -104,4 +104,4 @@ jobs:
         env:
           GH_REPO: ${{ github.repository }}
         run: |
-          bash scripts/ci/surface-merge-queue-ejection.sh --verdict "$MERGE_EJECTION_VERDICT"
+          bash scripts/ci/surface-merge-queue-ejection.sh --check-name paperclip-approved-enforcer --verdict "$MERGE_EJECTION_VERDICT"

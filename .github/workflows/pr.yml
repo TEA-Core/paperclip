@@ -574,9 +574,29 @@ jobs:
     needs: [typecheck_release_registry, general_tests, build, verify_serialized_server, canary_dry_run]
     runs-on: ubuntu-latest
     timeout-minutes: 5
-
+    permissions:
+      contents: read
+      # `write` so the SUP-15375 ejection surface can post/update a PR comment
+      # when this required check fails a queue entry. Comment rights on the
+      # job's own PR only — no `checks:read`, no admin escalation.
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # The gate step tees each lane's result here so the surface step can
+      # quote the failing lane(s) verbatim as the ejection reason.
+      MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-verify-verdict
     steps:
+      # SUP-15375: the surface step needs the repo script. The gh-readonly-queue
+      # ref is deleted the moment the entry is ejected, so checkout at the TOP of
+      # the job — while the entry is still queued — not after the gate fails.
+      # merge_group-only (pull_request keeps the aggregate checkout-free) and
+      # continue-on-error, so a ref race can never redden a green run.
+      - uses: actions/checkout@v7
+        if: github.event_name == 'merge_group'
+        continue-on-error: true
       - name: Fail if any split verify lane failed
+        id: verify_gate
         env:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
@@ -584,11 +604,44 @@ jobs:
           VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
           CANARY_DRY_RUN_RESULT: ${{ needs.canary_dry_run.result }}
         run: |
+          # SUP-15375: capture which lanes ended how BEFORE the assertions below
+          # fail the step, so a merge-group ejection has a quoteable reason.
+          # This is a tee only — the fail-closed semantics are the same `test`
+          # assertions that follow, unchanged.
+          {
+            echo "typecheck_release_registry: $TYPECHECK_RELEASE_REGISTRY_RESULT"
+            echo "general_tests: $GENERAL_TESTS_RESULT"
+            echo "build: $BUILD_RESULT"
+            echo "verify_serialized_server: $VERIFY_SERIALIZED_SERVER_RESULT"
+            echo "canary_dry_run: $CANARY_DRY_RUN_RESULT"
+          } > "$MERGE_EJECTION_VERDICT"
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
           test "$VERIFY_SERIALIZED_SERVER_RESULT" = "success"
           test "$CANARY_DRY_RUN_RESULT" = "success"
+      # SUP-15375: a queue entry is ejected when a *required* merge_group check
+      # goes red — `verify` is one of them. Surface the ejection on the PR so an
+      # agent token can see which required check failed and why, instead of a
+      # PR that silently leaves the queue. This runs only AFTER the gate step
+      # above already failed (explicit `failure()`, so the implicit success()
+      # GitHub would otherwise prepend cannot skip it), only on merge_group, and
+      # only when at least one lane genuinely ended `failure` (not when lanes
+      # were skipped/cancelled because the approval precondition collapsed the
+      # run first — the paperclip-approved surface owns that story). Best-effort:
+      # a post failure never changes the red `verify` conclusion that ejected.
+      - name: Surface the merge-queue ejection reason on the PR (verify)
+        if: ${{ failure() && github.event_name == 'merge_group' && steps.verify_gate.outcome == 'failure' }}
+        run: |
+          if [ ! -f scripts/ci/surface-merge-queue-ejection.sh ]; then
+            echo "[merge-queue-ejection] checkout unavailable (queue ref already removed?) — skipping; enforcement unaffected"
+            exit 0
+          fi
+          if grep -q ': failure$' "$MERGE_EJECTION_VERDICT"; then
+            bash scripts/ci/surface-merge-queue-ejection.sh --check-name verify --verdict "$MERGE_EJECTION_VERDICT"
+          else
+            echo "[merge-queue-ejection] verify lanes skipped/cancelled (not failed) — no genuine failure to surface; enforcement unaffected"
+          fi
 
   build:
     name: Build
@@ -911,9 +964,49 @@ jobs:
     needs: [e2e_shards]
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      # `write` so the SUP-15375 ejection surface can post/update a PR comment
+      # when this required check fails a queue entry. Comment rights on the
+      # job's own PR only — no `checks:read`, no admin escalation.
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-e2e-verdict
 
     steps:
+      # SUP-15375: the surface step needs the repo script. The gh-readonly-queue
+      # ref is deleted the moment the entry is ejected, so checkout at the TOP of
+      # the job — while the entry is still queued — not after the gate fails.
+      # merge_group-only (pull_request keeps the aggregate checkout-free) and
+      # continue-on-error, so a ref race can never redden a green run.
+      - uses: actions/checkout@v7
+        if: github.event_name == 'merge_group'
+        continue-on-error: true
       - name: Fail if any e2e shard failed
+        id: e2e_gate
         env:
           E2E_SHARDS_RESULT: ${{ needs.e2e_shards.result }}
-        run: test "$E2E_SHARDS_RESULT" = "success"
+        run: |
+          # SUP-15375: capture the aggregate result BEFORE the assertion fails
+          # the step, so a merge-group ejection has a quoteable reason. The
+          # fail-closed assertion below is unchanged.
+          echo "e2e_shards: $E2E_SHARDS_RESULT" > "$MERGE_EJECTION_VERDICT"
+          test "$E2E_SHARDS_RESULT" = "success"
+      # SUP-15375: surface a merge-group ejection caused by the required `e2e`
+      # context. See the verify job's surface step for the full rationale —
+      # same conditions: explicit `failure()`, merge_group only, genuine
+      # failure only, best-effort post.
+      - name: Surface the merge-queue ejection reason on the PR (e2e)
+        if: ${{ failure() && github.event_name == 'merge_group' && steps.e2e_gate.outcome == 'failure' }}
+        run: |
+          if [ ! -f scripts/ci/surface-merge-queue-ejection.sh ]; then
+            echo "[merge-queue-ejection] checkout unavailable (queue ref already removed?) — skipping; enforcement unaffected"
+            exit 0
+          fi
+          if grep -q ': failure$' "$MERGE_EJECTION_VERDICT"; then
+            bash scripts/ci/surface-merge-queue-ejection.sh --check-name e2e --verdict "$MERGE_EJECTION_VERDICT"
+          else
+            echo "[merge-queue-ejection] e2e_shards skipped/cancelled (not failed) — no genuine failure to surface; enforcement unaffected"
+          fi
