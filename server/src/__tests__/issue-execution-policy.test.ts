@@ -999,6 +999,101 @@ describe("issue execution policy transitions", () => {
       expect(result.workflowControlledAssignment).toBeUndefined();
     });
 
+    describe("board override on a completed workflow (SUP-15305)", () => {
+      const approvalStageId = policy.stages[1].id;
+      const completedState: Record<string, unknown> = {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [reviewStageId, approvalStageId],
+        lastDecisionId: null,
+        lastDecisionOutcome: "approved",
+      };
+
+      it("clears executionState for a non-in_review status (done/cancelled/blocked/in_progress)", () => {
+        for (const status of ["done", "cancelled", "blocked", "in_progress"] as const) {
+          const result = applyIssueExecutionPolicyTransition({
+            issue: {
+              status: "blocked",
+              assigneeAgentId: coderAgentId,
+              assigneeUserId: null,
+              executionPolicy: policy,
+              executionState: completedState,
+            },
+            policy,
+            requestedStatus: status,
+            requestedAssigneePatch: {},
+            actor: { userId: boardUserId },
+            allowBoardOverride: true,
+            commentBody: "Overriding the stuck review",
+          });
+          expect(result.patch.executionState).toBeNull();
+          expect(result.decision).toBeUndefined();
+        }
+      });
+
+      it("clears executionState on a board unassign", () => {
+        const result = applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "blocked",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: completedState,
+          },
+          policy,
+          requestedAssigneePatch: { assigneeAgentId: null, assigneeUserId: null },
+          actor: { userId: boardUserId },
+          allowBoardOverride: true,
+          commentBody: "Unassigning the reviewer",
+        });
+        expect(result.patch.executionState).toBeNull();
+        expect(result.decision).toBeUndefined();
+      });
+
+      it("fails loud (422) instead of returning an empty patch when board overrides to in_review", () => {
+        expect(() =>
+          applyIssueExecutionPolicyTransition({
+            issue: {
+              status: "blocked",
+              assigneeAgentId: coderAgentId,
+              assigneeUserId: null,
+              executionPolicy: policy,
+              executionState: completedState,
+            },
+            policy,
+            requestedStatus: "in_review",
+            requestedAssigneePatch: {},
+            actor: { userId: boardUserId },
+            allowBoardOverride: true,
+            commentBody: "Trying to re-arm review",
+          }),
+        ).toThrow("cannot move this issue to in_review");
+      });
+
+      it("leaves a non-board done on a completed workflow a no-op (#7893)", () => {
+        const result = applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: completedState,
+          },
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          allowBoardOverride: false,
+          commentBody: "Done",
+        });
+        expect(result.patch).toEqual({});
+      });
+    });
+
     it("non-participant can still post non-advancing updates", () => {
       const result = applyIssueExecutionPolicyTransition({
         issue: {

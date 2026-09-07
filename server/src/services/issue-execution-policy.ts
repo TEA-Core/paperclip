@@ -887,6 +887,31 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     return { patch };
   }
 
+  // Board override on a workflow that has no active (pending) stage — the
+  // completed shape (status "completed", currentStageId null). Both override
+  // branches below live inside `if (activeStage)`, so a completed workflow
+  // fell through to the tail and returned an empty patch: the board's
+  // documented escape hatch was unreachable exactly where an operator needs it
+  // (SUP-15305). There is no stage to advance or re-pend, so a requested
+  // non-in_review status or an assignee/unassign change dissolves the stuck
+  // executionState. A requested in_review cannot be honoured — it would strand
+  // the issue in_review with no active participant — so it fails loud instead
+  // of the silent empty patch.
+  if (!activeStage && input.allowBoardOverride && existingState?.status === COMPLETED_STATUS) {
+    const attemptedBoardAdvance =
+      requestedAssigneePatchProvided ||
+      (requestedStatus !== undefined && requestedStatus !== "in_review");
+    if (requestedStatus === "in_review" || attemptedBoardAdvance) {
+      if (requestedStatus === "in_review") {
+        throw unprocessable(
+          "Board override cannot move this issue to in_review: the execution workflow is completed and has no active stage to re-arm",
+        );
+      }
+      patch.executionState = null;
+      return { patch };
+    }
+  }
+
   if (activeStage) {
     const currentParticipant =
       existingState?.currentParticipant ??
