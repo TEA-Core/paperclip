@@ -46,6 +46,11 @@ const loadConfigMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../config.js", () => ({
   loadConfig: loadConfigMock,
+  // SUP-15369: issues.ts imports this env-only re-arm-window accessor; mirror the
+  // production formula (config.ts) so the mock stays faithful without loadConfig's
+  // tailnet-probe side effects.
+  pendingReviewRearmWindowMsFromEnv: () =>
+    Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_REARM_WINDOW_MS) || 30 * 60 * 1000),
 }));
 
 vi.mock("../telemetry.ts", () => ({
