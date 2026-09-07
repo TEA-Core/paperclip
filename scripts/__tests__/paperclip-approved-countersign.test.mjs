@@ -15,6 +15,10 @@ const HEAD_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OLD_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const QUEUE_REF = `refs/heads/gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-${PR}-0123456789abcdef`;
 
+// The control-plane App's bot user — the only identity whose
+// `paperclip/approved` the enforcer accepts.
+const TEA_CORE = { id: 317012809, login: "tea-core[bot]", type: "Bot" };
+
 // A `gh` stand-in. The enforcer makes three read-only calls and nothing else,
 // so the shim can be exact: an unrecognised call is a hard failure rather than
 // a silently empty payload, which is what would let a test pass for the wrong
@@ -24,9 +28,11 @@ const GH_SHIM = [
   "set -euo pipefail",
   "url=\"\"",
   "jqfilter=\"\"",
+  "paginate=0",
   "while [ \"$#\" -gt 0 ]; do",
   "  case \"$1\" in",
-  "    api|--paginate|--slurp) ;;",
+  "    api|--slurp) ;;",
+  "    --paginate) paginate=1 ;;",
   "    -H) shift ;;",
   "    --jq|-q) shift; jqfilter=\"$1\" ;;",
   "    *) [ -n \"$url\" ] || url=\"$1\" ;;",
@@ -41,7 +47,19 @@ const GH_SHIM = [
   "    fi",
   "    jq -r \"$jqfilter\" \"$GH_SHIM_DIR/reviews.json\" ;;",
   "  */pulls/*)   cat \"$GH_SHIM_DIR/pull.json\" ;;",
-  "  */status*)   cat \"$GH_SHIM_DIR/status.json\" ;;",
+  "  */statuses*)",
+  "    # Emulate what `gh --paginate` does rather than guarding on the flag: an",
+  "    # unpaginated read sees only the first page. That way the 100-noise case",
+  "    # fails because the approval is genuinely out of reach, which is the real",
+  "    # failure mode, instead of failing on an artificial refusal.",
+  "    per_page=\"$(printf '%s' \"$url\" | sed -n 's/.*[?&]per_page=\\([0-9]*\\).*/\\1/p')\"",
+  "    [ -n \"$per_page\" ] || per_page=30",
+  "    if [ \"$paginate\" = \"1\" ]; then",
+  "      jq -r \"$jqfilter\" \"$GH_SHIM_DIR/statuses.json\"",
+  "    else",
+  "      jq -r \".[0:$per_page] | ($jqfilter)\" \"$GH_SHIM_DIR/statuses.json\"",
+  "    fi ;;",
+  "  */status*)   echo \"gh shim: the combined /status endpoint omits creator and must not be used\" >&2; exit 1 ;;",
   "  *) echo \"gh shim: unexpected call: $url\" >&2; exit 1 ;;",
   "esac",
   "",
@@ -66,11 +84,22 @@ function makeFixture({
       user: { login: author },
     }),
   );
+  // List-shaped, and carrying the control-plane App's creator: the enforcer
+  // reads `/commits/{sha}/statuses` (the combined `/status` endpoint omits
+  // `creator`) and refuses a `success` published by anyone else.
   writeFileSync(
-    path.join(dir, "status.json"),
-    JSON.stringify({
-      statuses: approvedState ? [{ context: "paperclip/approved", state: approvedState }] : [],
-    }),
+    path.join(dir, "statuses.json"),
+    JSON.stringify(
+      approvedState
+        ? [
+            {
+              context: "paperclip/approved",
+              state: approvedState,
+              creator: TEA_CORE,
+            },
+          ]
+        : [],
+    ),
   );
   writeFileSync(path.join(dir, "reviews.json"), JSON.stringify(reviews));
 
@@ -93,6 +122,12 @@ function run(fixture, { event = "merge_group" } = {}) {
       GH_SHIM_DIR: fixture.dir,
       GH_SHIM_REVIEWS_FAIL: fixture.reviewsFail ? "1" : "0",
       GH_REPO: REPO,
+      // Pin the producer identity the fixtures emit. Inheriting a
+      // PAPERCLIP_APPROVED_STATUS_CREATOR_ID from the surrounding environment
+      // would fail every approval case for a reason that has nothing to do
+      // with the code under test.
+      PAPERCLIP_APPROVED_STATUS_CREATOR_ID: String(TEA_CORE.id),
+      PAPERCLIP_APPROVED_STATUS_CREATOR_LOGIN: TEA_CORE.login,
       GITHUB_REF: event === "merge_group" ? QUEUE_REF : "",
       GITHUB_REF_NAME: event === "merge_group" ? QUEUE_REF.replace("refs/heads/", "") : "",
     },
@@ -105,6 +140,7 @@ function review(overrides = {}) {
     state: "APPROVED",
     commit_id: HEAD_SHA,
     user: { login: "kronik187", type: "User" },
+    author_association: "MEMBER",
     ...overrides,
   };
 }
@@ -202,6 +238,50 @@ test("a COMMENTED review after an approval leaves the approval standing", () => 
     { reviews: [review(), review({ state: "COMMENTED" })] },
     ({ code }) => assert.equal(code, 0),
   );
+});
+
+test("an unaffiliated account's approval does not countersign", () => {
+  // TEA-Core/paperclip is a PUBLIC repository, so any GitHub account can submit
+  // an approving review on any PR. `user.type == "User"` proves the reviewer is
+  // a person, not that they have any standing here -- without the association
+  // check a drive-by APPROVED would countersign a fold waiver on the branch
+  // that auto-deploys to production.
+  for (const assoc of ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE", ""]) {
+    withFixture(
+      {
+        reviews: [
+          review({ user: { login: "passer-by", type: "User" }, author_association: assoc }),
+        ],
+      },
+      ({ code }) => assert.equal(code, 1, `author_association ${assoc || "<empty>"} must not count`),
+    );
+  }
+});
+
+test("a retraction whose association has since downgraded still supersedes", () => {
+  // `author_association` is computed per review at submission time, so it can
+  // differ between two reviews by the same account -- someone who leaves the
+  // org submits their next review as CONTRIBUTOR. Filtering on it while
+  // accumulating would skip this CHANGES_REQUESTED as "untrusted" rather than
+  // letting it supersede, and the earlier approval would still countersign.
+  withFixture(
+    {
+      reviews: [
+        review({ author_association: "MEMBER" }),
+        review({ state: "CHANGES_REQUESTED", author_association: "CONTRIBUTOR" }),
+      ],
+    },
+    ({ code }) => assert.equal(code, 1),
+  );
+});
+
+test("owners and collaborators countersign as well as members", () => {
+  for (const assoc of ["OWNER", "MEMBER", "COLLABORATOR"]) {
+    withFixture(
+      { reviews: [review({ author_association: assoc })] },
+      ({ code }) => assert.equal(code, 0, `author_association ${assoc} must count`),
+    );
+  }
 });
 
 test("the PR author's own approval does not countersign", () => {

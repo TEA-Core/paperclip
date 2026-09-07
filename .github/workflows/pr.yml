@@ -181,6 +181,15 @@ jobs:
         # `pull_requests:write` grant and a self-waived fold merge.
         run: node --test ./scripts/__tests__/paperclip-approved-countersign.test.mjs
 
+      - name: Test paperclip-approved status attribution
+        # `paperclip/approved` is a plain commit status and the `fleet-only`
+        # installation grants `statuses:write` to every Paperclip-assigned
+        # agent, so the gate was forgeable by capability until the enforcer
+        # started checking who published it. These tests pin the producer
+        # identity and, in particular, refuse the combined `/status` endpoint —
+        # which omits `creator` and is how the hole stood open.
+        run: node --test ./scripts/__tests__/paperclip-approved-status-attribution.test.mjs
+
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 
