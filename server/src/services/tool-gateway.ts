@@ -4598,8 +4598,12 @@ export function createToolGatewayService(
       agentId: string;
       runId: string;
       permittedNotInstalledConnections: Array<{ id: string; name: string }>;
+      permittedConnectionCount: number;
+      installedConnectionCount: number;
     }) {
-      if (input.permittedNotInstalledConnections.length === 0) return;
+      const reasonCode = input.permittedConnectionCount === 0
+        ? "no_permitted_mcp_connections"
+        : "permitted_connections_not_installed";
       const [run] = await db
         .select({ issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'` })
         .from(heartbeatRuns)
@@ -4617,8 +4621,11 @@ export function createToolGatewayService(
         action: "tool_gateway.runtime_mcp_delivery",
         details: {
           decision: "diagnostic",
-          reasonCode: "permitted_connections_not_installed",
+          reasonCode,
+          scope: "mcp_connections",
           deliveredServerCount: 0,
+          permittedConnectionCount: input.permittedConnectionCount,
+          installedConnectionCount: input.installedConnectionCount,
           permittedNotInstalledCount: input.permittedNotInstalledConnections.length,
           permittedNotInstalledConnections: input.permittedNotInstalledConnections,
         },
