@@ -13,6 +13,7 @@ import {
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { hasNoPlatformDispatchPath } from "./agent-work-delivery.js";
 import { budgetService } from "./budgets.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -460,6 +461,16 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     thresholds: ProductivityReviewThresholds,
     now: Date,
   ): Promise<ProductivityReviewEvidence | null> {
+    // A seat with no platform dispatch path (external_pull, or heartbeat fully
+    // off) can never start a run, so every run-derived trigger — run counts,
+    // cost, run-linked comments, and even the active-episode duration — is
+    // structurally zero or unmeasurable. Evaluating those triggers against such
+    // a seat fires deterministically and only produces a review card that
+    // hard-blocks the source issue with no way to resolve it. Skip them; there
+    // is no run evidence to review.
+    if (hasNoPlatformDispatchPath(sourceAgent)) {
+      return null;
+    }
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
     const sixHoursAgo = new Date(now.getTime() - 6 * 60 * 60 * 1000);
 

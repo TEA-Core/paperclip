@@ -109,6 +109,7 @@ const mockTaskWatchdogService = vi.hoisted(() => ({
   })),
   upsertForIssue: vi.fn(),
   disableForIssue: vi.fn(async () => null),
+  advanceWatchdogRunStopFingerprint: vi.fn(async () => null),
 }));
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
@@ -2820,7 +2821,7 @@ describe("agent issue mutation checkout ownership", () => {
       mockTaskWatchdogService.revalidateMutationScope.mockResolvedValueOnce({
         allowed: false,
         reason:
-          "Task-watchdog review is stale because the watched subtree now has a live, waiting, already-reviewed, or not-applicable path; refresh the source state before mutating it.",
+          "Task-watchdog review is stale: the watched subtree now has a live, waiting, already-reviewed, or not-applicable path, so this run's stopped-subtree review no longer applies. The run should stop mutating this subtree rather than retrying.",
         classification: { state: "live", liveIssueIds: [issueId] },
       });
 
@@ -2829,6 +2830,8 @@ describe("agent issue mutation checkout ownership", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(409);
       expect(res.body.error).toContain("Task-watchdog review is stale");
+      expect(res.body.error).toContain("stop mutating this subtree rather than retrying");
+      expect(res.body.error).not.toContain("refresh the source state");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
@@ -2838,7 +2841,7 @@ describe("agent issue mutation checkout ownership", () => {
       mockTaskWatchdogService.revalidateMutationScope.mockResolvedValueOnce({
         allowed: false,
         reason:
-          "Task-watchdog review is stale because the watched subtree now has a live, waiting, already-reviewed, or not-applicable path; refresh the source state before mutating it.",
+          "Task-watchdog review is stale: the watched subtree now has a live, waiting, already-reviewed, or not-applicable path, so this run's stopped-subtree review no longer applies. The run should stop mutating this subtree rather than retrying.",
         classification: { state: "live", liveIssueIds: [issueId] },
       });
 
@@ -2849,6 +2852,8 @@ describe("agent issue mutation checkout ownership", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(409);
       expect(res.body.error).toContain("Task-watchdog review is stale");
+      expect(res.body.error).toContain("stop mutating this subtree rather than retrying");
+      expect(res.body.error).not.toContain("refresh the source state");
       expect(mockIssueService.createChild).not.toHaveBeenCalled();
     });
 

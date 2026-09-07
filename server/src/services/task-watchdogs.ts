@@ -329,6 +329,48 @@ function materialLeaf(leaf: TaskWatchdogStoppedLeaf): TaskWatchdogMaterialLeaf {
   };
 }
 
+// SUP-15297: a watchdog run is "woken with" the stop fingerprint it observed
+// when the scheduler fired. Between wake and the run's first write an external
+// actor can touch the watched card (e.g. an unrelated comment or a pending
+// interaction), which moves the stop fingerprint while the watched card is
+// still stuck in the same stopped state. To tell a benign fingerprint move
+// apart from a genuine material change (the card left the stopped state), we
+// compare the run's woken stopped leaves against the current stopped leaves on
+// the CORE material only: status, assignee, and blocker set per leaf. Pending
+// wait paths (interactions / approvals) are the exact "unrelated" churn that
+// produces the born-stale fingerprint move, so they are deliberately excluded.
+function taskWatchdogStoppedLeavesCoreKey(leaves: Array<Partial<TaskWatchdogStoppedLeaf> | null | undefined>): string {
+  return [...leaves]
+    .filter((leaf): leaf is TaskWatchdogStoppedLeaf => Boolean(leaf && typeof leaf === "object" && leaf.issueId))
+    .map((leaf): [string, string, string | null, string | null, string[]] => [
+      leaf.issueId,
+      leaf.status ?? "",
+      leaf.assigneeAgentId ?? null,
+      leaf.assigneeUserId ?? null,
+      Array.isArray(leaf.blockerIssueIds) ? [...leaf.blockerIssueIds].sort() : [],
+    ])
+    .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
+    .map((row) => JSON.stringify(row))
+    .join("|");
+}
+
+export function taskWatchdogCoreMaterialUnchanged(
+  woken: Array<Partial<TaskWatchdogStoppedLeaf>> | null | undefined,
+  current: TaskWatchdogStoppedLeaf[] | null | undefined,
+): boolean {
+  if (!Array.isArray(woken) || !Array.isArray(current)) return false;
+  return taskWatchdogStoppedLeavesCoreKey(woken) === taskWatchdogStoppedLeavesCoreKey(current);
+}
+
+function readTaskWatchdogWokenStoppedLeaves(
+  contextSnapshot: unknown,
+): Array<Partial<TaskWatchdogStoppedLeaf>> | null {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
+  const leaves = (contextSnapshot as Record<string, unknown>).stoppedLeaves;
+  if (!Array.isArray(leaves)) return null;
+  return leaves as Array<Partial<TaskWatchdogStoppedLeaf>>;
+}
+
 function parseStopSnapshot(value: unknown): TaskWatchdogStopSnapshot | null {
   if (!value || typeof value !== "object") return null;
   const candidate = value as Partial<TaskWatchdogStopSnapshot>;
@@ -1617,6 +1659,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     companyId: string;
     watchedIssueId: string;
     stopFingerprint: string | null;
+    runId?: string;
   }) {
     if (!scope.stopFingerprint) {
       return {
@@ -1648,13 +1691,124 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       return { allowed: true as const, classification };
     }
 
+    // SUP-15297: born-stale case. An external actor touched the watched card
+    // between this run's wake and its first write, so the run's woken stop
+    // fingerprint no longer matches the current one even though the watched
+    // card is still stuck in the same stopped state. That alone must not block
+    // the run: when the stopped subtree's CORE material (status / assignee /
+    // blocker set per leaf) is unchanged, the run's review still applies. Rebind
+    // the run's stored fingerprint to the current one so the run can proceed
+    // with its mandate. A genuine material change — the card moved to
+    // in_progress/done, a leaf appeared/disappeared, or its assignee/blockers
+    // changed — leaves the fingerprint legitimately stale and is still refused
+    // below.
+    if (classification.state === "stopped" && scope.runId) {
+      const [run] = await db
+        .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, scope.runId),
+          eq(heartbeatRuns.companyId, scope.companyId),
+        ));
+      const wokenStoppedLeaves = readTaskWatchdogWokenStoppedLeaves(run?.contextSnapshot);
+      if (
+        wokenStoppedLeaves !== null &&
+        taskWatchdogCoreMaterialUnchanged(wokenStoppedLeaves, classification.stoppedLeaves)
+      ) {
+        const context: Record<string, unknown> =
+          run && typeof run.contextSnapshot === "object" && run.contextSnapshot !== null
+            ? { ...(run.contextSnapshot as Record<string, unknown>) }
+            : {};
+        const taskWatchdog: Record<string, unknown> =
+          typeof context.taskWatchdog === "object" && context.taskWatchdog !== null
+            ? { ...(context.taskWatchdog as Record<string, unknown>) }
+            : {};
+        taskWatchdog.stopFingerprint = classification.stopFingerprint;
+        context.taskWatchdog = taskWatchdog;
+        context.stopFingerprint = classification.stopFingerprint;
+        await db
+          .update(heartbeatRuns)
+          .set({ contextSnapshot: context, updatedAt: new Date() })
+          .where(eq(heartbeatRuns.id, scope.runId));
+        return { allowed: true as const, classification };
+      }
+    }
+
     return {
       allowed: false as const,
       reason: classification.state === "stopped"
-        ? "Task-watchdog review is stale because the watched subtree stop fingerprint changed; refresh the source state before mutating it."
-        : "Task-watchdog review is stale because the watched subtree now has a live, waiting, already-reviewed, or not-applicable path; refresh the source state before mutating it.",
+        ? "Task-watchdog review is stale: the watched subtree is still stopped but its material composition (the status, assignee, or blocker set of a stopped leaf) changed by an actor other than this run, so this run's review no longer matches the source state. Do not retry this mutation; the task-watchdog scheduler will open a fresh review that re-observes the subtree."
+        : "Task-watchdog review is stale: the watched subtree now has a live, waiting, already-reviewed, or not-applicable path, so this run's stopped-subtree review no longer applies. The run should stop mutating this subtree rather than retrying.",
       classification,
     };
+  }
+
+  /**
+   * SUP-15257: a task-watchdog run may make several mutations to its watched
+   * subtree within a single review. The stop fingerprint recomputes on each of
+   * those mutations, so freezing the run's fingerprint at wake time guarantees
+   * the guard trips on the run's own second write. After a successful
+   * watchdog-attributed source mutation, re-derive the current stop fingerprint
+   * and advance the run's stored copy so the next write in the same run sees a
+   * matching fingerprint. External actors do not route through here, so their
+   * changes leave the run's stored fingerprint untouched and are still rejected
+   * by {@link revalidateMutationScope}.
+   *
+   * Returns the advanced stop fingerprint, or null when the subtree is no longer
+   * in a stopped state (nothing to advance; the next preflight will reject).
+   */
+  async function advanceWatchdogRunStopFingerprint(input: {
+    runId: string;
+    companyId: string;
+    watchdogId: string;
+  }): Promise<string | null> {
+    const watchdog = await db
+      .select()
+      .from(issueWatchdogs)
+      .where(and(
+        eq(issueWatchdogs.id, input.watchdogId),
+        eq(issueWatchdogs.companyId, input.companyId),
+        eq(issueWatchdogs.status, "active"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!watchdog) return null;
+
+    const classifierInput = await collectClassifierInput(input.companyId, watchdog);
+    const classification = classifyTaskWatchdogSubtree(classifierInput);
+    if (classification.state !== "stopped") return null;
+    const stopFingerprint = classification.stopFingerprint;
+
+    const [run] = await db
+      .select({
+        id: heartbeatRuns.id,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+      ));
+    if (!run || typeof run.contextSnapshot !== "object" || run.contextSnapshot === null) {
+      return stopFingerprint;
+    }
+
+    const context = run.contextSnapshot as Record<string, unknown>;
+    const taskWatchdog = (typeof context.taskWatchdog === "object" && context.taskWatchdog !== null
+      ? context.taskWatchdog
+      : {}) as Record<string, unknown>;
+    // Only advance when this run's fingerprint has actually moved; a no-op keeps
+    // the row untouched so unrelated context_snapshot fields are never rewritten.
+    if (taskWatchdog.stopFingerprint === stopFingerprint && context.stopFingerprint === stopFingerprint) {
+      return stopFingerprint;
+    }
+    taskWatchdog.stopFingerprint = stopFingerprint;
+    context.taskWatchdog = taskWatchdog;
+    context.stopFingerprint = stopFingerprint;
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: context, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, input.runId));
+    return stopFingerprint;
   }
 
   return {
@@ -1811,5 +1965,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     },
 
     revalidateMutationScope,
+
+    advanceWatchdogRunStopFingerprint,
   };
 }
