@@ -1106,6 +1106,11 @@ describe.sequential("issue thread interaction routes", () => {
       "interaction-withdraw",
       { reason: "No longer needed" },
       expect.objectContaining({ agentId: CREATED_AGENT_ID }),
+      // Upstream's withdraw route now passes a 5th `mutationOptions` argument so
+      // it can cancel a native question run inside the same transaction.
+      // `toHaveBeenCalledWith` matches arity exactly, so the fork's assertion has
+      // to name it or it fails on shape rather than on behaviour.
+      expect.objectContaining({ afterResolveInTransaction: expect.any(Function) }),
     );
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
       ASSIGNEE_AGENT_ID,
