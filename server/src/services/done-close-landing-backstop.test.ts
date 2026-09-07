@@ -51,6 +51,22 @@ vi.mock("../middleware/logger.js", () => ({
   logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+// SUP-15381: the shared-carrier interception. Keep the pure predicate
+// `isSharedCarrierRefusal` REAL (importOriginal) so the tests exercise the exact
+// ADR-091 D1 marker; stub only the three db-hitting helpers.
+const mockResolveCarrierOwner = vi.hoisted(() => vi.fn());
+const mockIssueInBlockerClosure = vi.hoisted(() => vi.fn());
+const mockListNonTerminalRootCauseBlockers = vi.hoisted(() => vi.fn());
+vi.mock("./blocker-closure.js", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("./blocker-closure.js")>();
+  return {
+    ...orig,
+    resolveCarrierOwner: mockResolveCarrierOwner,
+    issueInBlockerClosure: mockIssueInBlockerClosure,
+    listNonTerminalRootCauseBlockers: mockListNonTerminalRootCauseBlockers,
+  };
+});
+
 import { logActivity } from "./activity-log.js";
 
 type DbState = {
@@ -224,6 +240,37 @@ function candidateRow(overrides: {
     };
   }
 
+  // SUP-15381 (ADR-091 D1): a shared-carrier child whose close was refused by the
+  // prefix predicate. The refusalReason carries the EXACT marker the monitor keys
+  // on — `does not carry this card's identifier prefix` — which ONLY the D1
+  // shared-workspace narrowing emits (a single-card head_unresolvable refusal does
+  // not). This is the SUP-15098 / SUP-15126 / SUP-15203 shape.
+  function sharedCarrierRefusalCandidateRow(overrides: {
+    identifier?: string | null;
+    assigneeAgentId?: string | null;
+    refusalReason?: string;
+  } = {}) {
+    const refusalReason =
+      overrides.refusalReason ??
+      "status:skipped:not_delivered: PR #455 head paperclipai/paperclip:SUP-15098-branch does not carry this card's identifier prefix SUP-15098-; this card shares execution workspace branch SUP-15098-branch with another issue, so that branch is not its delivery branch (ADR-091 D1)";
+    return {
+      details: {
+        identifier: "SUP-15098",
+        refusalReason,
+        headSha: null,
+        decisionOutcome: "approved",
+      },
+      createdAt: new Date(IN_WINDOW),
+      issue: {
+        id: ISSUE,
+        companyId: COMPANY,
+        status: "done",
+        identifier: overrides.identifier ?? "SUP-15098",
+        assigneeAgentId: overrides.assigneeAgentId === undefined ? AGENT : overrides.assigneeAgentId,
+      },
+    };
+  }
+
 
 const mergedSnapshot = {
   ok: true,
@@ -297,6 +344,12 @@ beforeEach(() => {
   mockFetchHeadViaTokenCandidates.mockReset();
   mockFetchHeadApprovedStatusViaTokenCandidates.mockReset();
   mockCreateGitHubExternalObjectProvider.mockReset();
+  mockResolveCarrierOwner.mockReset();
+  mockResolveCarrierOwner.mockResolvedValue(null);
+  mockIssueInBlockerClosure.mockReset();
+  mockIssueInBlockerClosure.mockResolvedValue(false);
+  mockListNonTerminalRootCauseBlockers.mockReset();
+  mockListNonTerminalRootCauseBlockers.mockResolvedValue([]);
 });
 
 describe("classifyPullRequestLanding", () => {
@@ -1628,3 +1681,161 @@ describe("createDoneCloseLandingBackstopService", () => {
     });
   });
 });
+
+describe("SUP-15381: shared-carrier (ADR-091 D1) attribution", () => {
+  const CARRIER = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+  it("attributes a shared-carrier child whose PR is open past grace, reporting the deadlock — no re-open, no park (regression)", async () => {
+    mockResolveCarrierOwner.mockResolvedValue({ ownerId: CARRIER, identifier: "SUP-15000" });
+    mockIssueInBlockerClosure.mockResolvedValue(true);
+    mockListNonTerminalRootCauseBlockers.mockResolvedValue([
+      { id: "rrrrrrrr-0000-4000-8000-000000000000", identifier: "SUP-15001", status: "in_progress" },
+    ]);
+    const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+    const { service } = makeService(
+      {
+        candidates: [sharedCarrierRefusalCandidateRow()],
+        existingLandingRows: [],
+        companyMergeArmingEnabled: true,
+      },
+      { wakeup },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 455, displayName: "paperclipai/paperclip#455", headRefName: "SUP-15098-branch" }),
+    ]);
+    mockResolver(async () => openSnapshot);
+
+    const result = await service.sweep();
+
+    // AC1/AC2/AC5: the child is left done — no re-open, no board park, no re-enqueue.
+    expect(result.escalated).toBe(0);
+    expect(result.reenqueued).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(wakeup).not.toHaveBeenCalled();
+
+    // The attribution ledger row + the deadlock report naming the owning card.
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      actorType: "system",
+      action: "issue.done_close_landing_attributed",
+      entityType: "issue",
+      entityId: ISSUE,
+      details: expect.objectContaining({
+        pr: "paperclipai/paperclip#455",
+        prState: "open",
+        sharedCarrier: true,
+        refusal: true,
+        carrierOwnerId: CARRIER,
+        carrierIdentifier: "SUP-15000",
+        deadlocked: true,
+        rootCauseBlockers: ["SUP-15001"],
+      }),
+    }));
+    expect(mockAddComment).toHaveBeenCalledTimes(1);
+    const [commentIssueId, commentBody] = mockAddComment.mock.calls[0]!;
+    expect(commentIssueId).toBe(ISSUE);
+    expect(commentBody).toContain("owned by SUP-15000");
+    expect(commentBody).toContain("blocker closure");
+    expect(commentBody).toContain("SUP-15001");
+  });
+
+  it("attributes a non-deadlocked shared-carrier child without fetching root causes", async () => {
+    mockResolveCarrierOwner.mockResolvedValue({ ownerId: CARRIER, identifier: "SUP-15000" });
+    mockIssueInBlockerClosure.mockResolvedValue(false);
+    const { service } = makeService(
+      { candidates: [sharedCarrierRefusalCandidateRow()], existingLandingRows: [] },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 455, displayName: "paperclipai/paperclip#455", headRefName: "SUP-15098-branch" }),
+    ]);
+    mockResolver(async () => openSnapshot);
+
+    const result = await service.sweep();
+
+    expect(result.escalated).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_attributed",
+      details: expect.objectContaining({
+        carrierOwnerId: CARRIER,
+        deadlocked: false,
+        rootCauseBlockers: [],
+      }),
+    }));
+    // Root-cause walk only runs when deadlocked.
+    expect(mockListNonTerminalRootCauseBlockers).not.toHaveBeenCalled();
+  });
+
+  it("falls back to escalation when a shared-carrier child's owner cannot be resolved (safe default)", async () => {
+    mockResolveCarrierOwner.mockResolvedValue(null);
+    const { service } = makeService(
+      { candidates: [sharedCarrierRefusalCandidateRow()], existingLandingRows: [], companyMergeArmingEnabled: false },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 455, displayName: "paperclipai/paperclip#455", headRefName: "SUP-15098-branch" }),
+    ]);
+    mockResolver(async () => openSnapshot);
+
+    const result = await service.sweep();
+
+    // Unresolvable owner → no attribution, the pre-existing open-past-grace escalation fires.
+    expect(result.escalated).toBe(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.done_close_landing_escalated",
+    }));
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("still re-opens (escalates) a single-card arming-refusal child whose PR is open past grace (AC6)", async () => {
+    // The default head_unresolvable refusalReason carries NO ADR-091 D1 marker, so
+    // the shared-carrier interception is a no-op and the pre-existing escalation
+    // path still fires. AC6: single-card behavior is unchanged.
+    const { service } = makeService(
+      { candidates: [refusalCandidateRow()], existingLandingRows: [], companyMergeArmingEnabled: false },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 364, displayName: "paperclipai/paperclip#364" }),
+    ]);
+    mockResolver(async () => openSnapshot);
+
+    const result = await service.sweep();
+
+    expect(result.escalated).toBe(1);
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({ status: "blocked" }));
+    // No shared-carrier handling at all.
+    expect(mockResolveCarrierOwner).not.toHaveBeenCalled();
+  });
+
+  it("does not re-attribute (nor re-open) a shared-carrier child already attributed on a prior sweep", async () => {
+    mockResolveCarrierOwner.mockResolvedValue({ ownerId: CARRIER, identifier: "SUP-15000" });
+    const { service } = makeService(
+      {
+        candidates: [sharedCarrierRefusalCandidateRow()],
+        existingLandingRows: [
+          {
+            action: "issue.done_close_landing_attributed",
+            entityId: ISSUE,
+            details: { pr: "paperclipai/paperclip#455" },
+          },
+        ],
+      },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 455, displayName: "paperclipai/paperclip#455", headRefName: "SUP-15098-branch" }),
+    ]);
+    mockResolver(async () => openSnapshot);
+
+    const result = await service.sweep();
+
+    // Already attributed → no-op: no second audit row, no re-open/park.
+    expect(result.escalated).toBe(0);
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockResolveCarrierOwner).not.toHaveBeenCalled();
+  });
+});
+
