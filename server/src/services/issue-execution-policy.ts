@@ -457,39 +457,29 @@ export function normalizeIssueExecutionPolicy(
 }
 
 /**
- * SUP-13634: rejects PATCH executionPolicy shapes that would strip the close
- * ladder before the write (and any reviewer/approver detach side-effect) can
- * run.
+ * SUP-13634 / SUP-15374: guards PATCH executionPolicy writes against the
+ * *accidental* stripping of the close ladder while leaving the ladder to the
+ * client's explicit, intentional writes.
  *
- * The close ladder is a ratified control (ADR-029/ADR-072); it must not be
- * removable with a two-character value or a bare null. Three destructive
- * shapes are rejected at the write boundary:
+ * Two shapes are still destructive enough to reject at the write boundary:
  *
- * - an explicitly empty `stages` array (`executionPolicy.stages: []`), unless
- *   the stored policy is *already* stage-less, in which case the array removes
- *   nothing (SUP-13925);
- * - an explicit `executionPolicy: null` on an issue whose stored policy is
- *   non-null;
- * - any other body over an issue that currently has stages, where the body
- *   normalizes back to null (e.g. `{}` or `{mode: "normal"}`) so it cannot
- *   silently clear the ladder.
+ * - a bare `executionPolicy: null` over a non-null stored policy — a bare null
+ *   is never the intentional-clear form;
+ * - any non-null object body over an issue that currently has stages that
+ *   normalizes back to null (e.g. `{}` or `{mode: "normal"}`), i.e. a body that
+ *   carries no policy content. These must not silently clear the ladder.
  *
- * `null` over a `null` stored policy stays a no-op and is allowed. A
- * monitor-only policy (or a policy with authorization/review-preset content
- * but no stages) can still be cleared or replaced with a body that is not
- * null-as-is and that omits the `stages` field.
+ * The deliberate clear is an explicit `executionPolicy.stages: []`
+ * (`stagesExplicitlyEmpty`). That is the sanctioned opt-in the deep-merge in
+ * `preserveExecutionPolicyStagesOnOmission` requires: omitting the `stages` key
+ * preserves the stored ladder, while an explicit empty array clears it and the
+ * route audits the transition. `null` over a `null` stored policy stays a no-op.
  *
- * SUP-13925: the empty-`stages` rejection is scoped to writes that actually
- * remove something. A monitor-only watcher's stored policy is
- * `{mode, stages: [], monitor}` by design, and the natural re-arm idiom is to
- * read that policy, edit `monitor.nextCheckAt`, and write the whole object
- * back. That round-trip carries an explicit `stages: []` and used to 422, which
- * left the only working re-arm path a partial `{monitor: {...}}` body that
- * relies on merge semantics. Permitting the round-trip grants no new
- * capability: over an already stage-less policy the identical stored result is
- * reachable today by omitting the `stages` key entirely, so the rejection was
- * blocking an idiom rather than defending the ladder. Over a policy that *has*
- * stages the rejection is unchanged — that is the case ADR-029/ADR-072 guard.
+ * SUP-13925 (subsumed): the monitor re-arm round-trip — reading a monitor-only
+ * `{mode, stages: [], monitor}` policy and writing it whole back — carries an
+ * explicit `stages: []` over an already stage-less policy. That path is now
+ * allowed by the same rule that permits the intentional clear, so the round-trip
+ * no longer needs the partial `{monitor}` workaround.
  */
 export function assertPatchableExecutionPolicyWrite(input: {
   raw: unknown;
@@ -500,25 +490,21 @@ export function assertPatchableExecutionPolicyWrite(input: {
 }): void {
   const { raw, currentPolicy, stagesExplicitlyEmpty } = input;
 
-  // SUP-13925: only reject when there is a close ladder to strip. `stages: []`
-  // over a stored policy that is already stage-less is a faithful round-trip,
-  // not a removal. `currentPolicy === null` still rejects: there is no stored
-  // shape being round-tripped, so an explicit empty array there is the
-  // ladder-free policy the guard was written to keep off the board.
-  if (stagesExplicitlyEmpty && (currentPolicy === null || currentPolicy.stages.length > 0)) {
-    throw unprocessable("executionPolicy.stages must not be empty");
-  }
-
   if (raw === null && currentPolicy !== null) {
     throw unprocessable(
       "executionPolicy must not be set to null on an issue that currently has a policy; send the full replacement policy instead",
     );
   }
 
+  // SUP-15374: a body that would normalize to null over a staged policy would
+  // strip the ladder. Reject it UNLESS the client expressly sent `stages: []`,
+  // which is the intentional clear (the route audits that transition). An
+  // omitted `stages` key never reaches this branch: the route deep-merges the
+  // stored ladder back in `preserveExecutionPolicyStagesOnOmission`.
   if (raw !== null && typeof raw === "object" && !Array.isArray(raw) &&
       currentPolicy !== null && currentPolicy.stages.length > 0) {
     const normalized = normalizeIssueExecutionPolicy(raw);
-    if (normalized === null) {
+    if (normalized === null && !stagesExplicitlyEmpty) {
       throw unprocessable(
         "executionPolicy must not clear the issue's existing close stages; send the full replacement policy instead",
       );

@@ -1921,25 +1921,27 @@ describe("issue execution policy routes", () => {
       };
     }
 
-    it("rejects a PATCH whose executionPolicy.stages is an empty array and leaves the stored policy untouched", async () => {
+    it("clears the close ladder on an explicit executionPolicy.stages: [] write", async () => {
       const issueId = randomUUID();
       const issue = ladderIssue(issueId);
-      const storedPolicy = issue.executionPolicy;
       mockIssueService.getById.mockResolvedValue(issue);
-      mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: null } as any);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
 
       const res = await request(await createApp())
         .patch(`/api/issues/${issueId}`)
         .send({ executionPolicy: { stages: [] } });
 
-      expect(res.status).toBe(422);
-      expect(res.body).toMatchObject({ error: "executionPolicy.stages must not be empty" });
-      expect(mockIssueService.update).not.toHaveBeenCalled();
-      for (const call of mockLogActivity.mock.calls) {
-        expect((call[1] as { action?: string }).action).not.toBe("issue.reviewers_updated");
-        expect((call[1] as { action?: string }).action).not.toBe("issue.approvers_updated");
-      }
-      expect(storedPolicy).not.toBeNull();
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+      const written = mockIssueService.update.mock.calls.at(-1)?.[1] as {
+        executionPolicy?: unknown;
+      };
+      // The explicit empty array is the sanctioned clear: no stages survive.
+      expect(written.executionPolicy ?? null).toBeNull();
     });
 
     // SUP-13925: the monitor re-arm round-trip. A monitor-only watcher stores
@@ -2069,36 +2071,32 @@ describe("issue execution policy routes", () => {
       }
     });
 
-    it("records an issue.execution_stages_cleared audit when a live ladder lands empty on an in_review card", async () => {
+    it("records an issue.execution_stages_cleared audit when an explicit stages: [] clears a live ladder on an in_review card", async () => {
       const issueId = randomUUID();
       const issue = armedLadderInReviewIssue(issueId);
       const storedStages = (issue.executionPolicy as { stages: unknown[] }).stages;
       expect(storedStages).toHaveLength(1);
       mockIssueService.getById.mockResolvedValue(issue);
-      // Simulate a write that lands with an emptied ladder while the card is
-      // still in_review (the out-of-band / explicit-clear path the route's
-      // guard no longer produces). The backstop must surface it in the
-      // activity log instead of leaving a phantom "in review" state.
+      // The explicit `stages: []` is the intentional clear. The guard now allows
+      // it, the normalize collapses the ladder to null, and the write lands the
+      // emptied ladder while the card is still in_review — so the route's audit
+      // surfaces the disarmed gate in the activity log.
       mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
         ...issue,
         ...patch,
-        executionPolicy: normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z" } }),
         updatedAt: new Date(),
       }));
 
       const res = await request(await createApp())
         .patch(`/api/issues/${issueId}`)
-        .send({
-          executionPolicy: {
-            monitor: {
-              nextCheckAt: "2026-12-01T12:00:00.000Z",
-              scheduledBy: "assignee",
-              notes: "Wait for external QA report.",
-            },
-          },
-        });
+        .send({ executionPolicy: { stages: [] } });
 
       expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+      const written = mockIssueService.update.mock.calls.at(-1)?.[1] as {
+        executionPolicy?: unknown;
+      };
+      expect(written.executionPolicy ?? null).toBeNull();
       const clearCalls = mockLogActivity.mock.calls.filter(
         (call) => (call[1] as { action?: string }).action === "issue.execution_stages_cleared",
       );

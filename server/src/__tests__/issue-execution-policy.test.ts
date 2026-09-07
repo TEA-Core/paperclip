@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorTriggeredPatch, executionPolicyStagesCleared, normalizeIssueExecutionPolicy, parseIssueExecutionState, preserveExecutionPolicyStagesOnOmission, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
-import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
 const coderAgentId = "11111111-1111-4111-8111-111111111111";
@@ -152,60 +151,52 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
     });
   }
 
-  it("rejects an explicit empty stages array", () => {
+  it("allows an explicit empty stages array as the intentional ladder clear", () => {
+    // SUP-15374: `stages: []` is the explicit opt-in that clears a live ladder;
+    // it is the sanctioned clear, not a rejected strip.
     expect(() =>
       assertPatchableExecutionPolicyWrite({
         raw: { stages: [] },
         currentPolicy: twoStagePolicy(),
         stagesExplicitlyEmpty: true,
       }),
-    ).toThrowError(HttpError);
-    try {
-      assertPatchableExecutionPolicyWrite({
-        raw: { stages: [] },
-        currentPolicy: twoStagePolicy(),
-        stagesExplicitlyEmpty: true,
-      });
-      throw new Error("expected assert to throw");
-    } catch (error) {
-      expect(error).toBeInstanceOf(HttpError);
-      expect((error as HttpError).status).toBe(422);
-      expect((error as Error).message).toBe("executionPolicy.stages must not be empty");
-    }
+    ).not.toThrow();
   });
 
-  it("rejects an explicit empty stages array even when no policy is stored yet", () => {
+  it("allows an explicit empty stages array when no policy is stored yet", () => {
     expect(() =>
       assertPatchableExecutionPolicyWrite({
         raw: { stages: [] },
         currentPolicy: null,
         stagesExplicitlyEmpty: true,
       }),
-    ).toThrowError("executionPolicy.stages must not be empty");
+    ).not.toThrow();
   });
 
-  it("rejects an explicit empty stages array even when other policy fields are present", () => {
+  it("allows an explicit empty stages array to clear the ladder while keeping other fields", () => {
     expect(() =>
       assertPatchableExecutionPolicyWrite({
         raw: { stages: [], monitor },
         currentPolicy: twoStagePolicy(),
         stagesExplicitlyEmpty: true,
       }),
-    ).toThrowError("executionPolicy.stages must not be empty");
+    ).not.toThrow();
   });
 
-  it("flags explicit-emptiness via the captured pre-default flag, not the parsed body", () => {
-    const raw = { mode: "normal", commentRequired: true, stages: [], monitor };
+  it("honors the explicit-clear flag only when the body would otherwise normalize to null", () => {
+    // A `{stages: []}` body with no other content normalizes to null; only the
+    // captured pre-default flag makes that a sanctioned clear rather than a
+    // silent ladder-strip.
     expect(() =>
-      assertWrite({ raw, currentPolicy: twoStagePolicy() }),
-    ).not.toThrow();
+      assertWrite({ raw: { stages: [] }, currentPolicy: twoStagePolicy() }),
+    ).toThrowError("executionPolicy must not clear the issue's existing close stages");
     expect(() =>
       assertPatchableExecutionPolicyWrite({
-        raw,
+        raw: { stages: [] },
         currentPolicy: twoStagePolicy(),
         stagesExplicitlyEmpty: true,
       }),
-    ).toThrowError("executionPolicy.stages must not be empty");
+    ).not.toThrow();
   });
 
   // SUP-13925: a monitor-only watcher's stored policy is `{mode, stages: [],
@@ -254,15 +245,17 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
     expect(normalizeIssueExecutionPolicy(whole)!.stages).toEqual(stored.stages);
   });
 
-  it("still rejects an explicit empty stages array over a policy that HAS stages", () => {
-    // The ADR-029/ADR-072 case. Unchanged by SUP-13925.
+  it("clears a live ladder on an explicit empty stages array over a policy that HAS stages", () => {
+    // The ADR-029/ADR-072 case, superseded by SUP-15374: an explicit `stages: []`
+    // is the intentional clear, so it is allowed (the route audits the
+    // transition). Omission is what still strips nothing — it deep-merges.
     expect(() =>
       assertPatchableExecutionPolicyWrite({
         raw: { mode: "normal", commentRequired: true, stages: [], monitor },
         currentPolicy: reviewOnlyPolicy(),
         stagesExplicitlyEmpty: true,
       }),
-    ).toThrowError("executionPolicy.stages must not be empty");
+    ).not.toThrow();
   });
 
   it("rejects an explicit null over a non-null stored policy", () => {
