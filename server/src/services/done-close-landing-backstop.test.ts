@@ -51,9 +51,22 @@ type DbState = {
   candidates: Array<Record<string, unknown>>;
   existingLandingRows: Array<Record<string, unknown>>;
   companyMergeArmingEnabled?: boolean;
+  /**
+   * The issue id the sweep is currently measuring. The real landing query is
+   * company-wide (SUP-15316), so the mock returns every sibling's landing row;
+   * but if the fix is reverted to the old per-issue query (which selects no
+   * `entityId`), the mock falls back to this card's own rows only — so the
+   * PR-scoped cap tests genuinely fail on a revert.
+   */
+  sweptIssueId?: string;
 };
 
-/** Discovery selects an `issue` sub-object; company query selects mergeArmingEnabled; idempotency selects flat columns. */
+/**
+ * Discovery selects an `issue` sub-object; company query selects mergeArmingEnabled;
+ * the landing query selects flat columns. The landing branch distinguishes the
+ * new company-wide PR-scoped query (selects `entityId`) from the old per-issue
+ * one by that column, mirroring the SQL scope the service must get right.
+ */
 function makeDb(state: DbState) {
   return {
     select: vi.fn((cols: Record<string, unknown>) => {
@@ -77,9 +90,17 @@ function makeDb(state: DbState) {
           }),
         };
       }
+      // Company-wide PR-scoped read (new) returns every sibling's landing row for
+      // the PR; a reverted per-issue read is narrowed to this card's own rows.
+      const landingRows =
+        "entityId" in cols
+          ? state.existingLandingRows
+          : state.existingLandingRows.filter(
+              (row) => state.sweptIssueId === undefined || row.entityId === state.sweptIssueId,
+            );
       return {
         from: () => ({
-          where: () => Promise.resolve(state.existingLandingRows),
+          where: () => Promise.resolve(landingRows),
         }),
       };
     }),
@@ -122,6 +143,7 @@ function linkedPr(overrides: Record<string, unknown> = {}) {
 
 function candidateRow(overrides: {
   status?: string;
+  id?: string;
   identifier?: string | null;
   assigneeAgentId?: string | null;
   createdAt?: string;
@@ -137,16 +159,16 @@ function candidateRow(overrides: {
       skipReason: overrides.skipReason ?? reason,
       prs: "paperclipai/paperclip#3158",
     },
-      createdAt: new Date(createdAt),
-      issue: {
-        id: ISSUE,
-        companyId: COMPANY,
-        status: overrides.status ?? "done",
-        identifier: overrides.identifier ?? "SUP-13326",
-        assigneeAgentId: overrides.assigneeAgentId === undefined ? AGENT : overrides.assigneeAgentId,
-      },
-    };
-  }
+    createdAt: new Date(createdAt),
+    issue: {
+      id: overrides.id ?? ISSUE,
+      companyId: COMPANY,
+      status: overrides.status ?? "done",
+      identifier: overrides.identifier ?? "SUP-13326",
+      assigneeAgentId: overrides.assigneeAgentId === undefined ? AGENT : overrides.assigneeAgentId,
+    },
+  };
+}
 
   // SUP-14900: an arming-refusal candidate — the closing transition's arming was
   // refused (head_unresolvable, …), so the guard recorded no decision-carried skip
@@ -241,7 +263,8 @@ function makeService(
 }
 
 beforeEach(() => {
-  mockLogActivity.mockClear();
+  mockLogActivity.mockReset();
+  mockLogActivity.mockResolvedValue({ id: "activity-row" });
   mockAddComment.mockClear();
   mockUpdate.mockClear();
   mockResolveLinkedPullRequestsWithState.mockReset();
@@ -724,6 +747,7 @@ describe("createDoneCloseLandingBackstopService", () => {
     // The first sweep's row now exists; a later sweep must not re-emit.
     state.existingLandingRows.push({
       action: "issue.done_close_landing_confirmed",
+      entityId: ISSUE,
       details: { identifier: "SUP-13326", pr: "paperclipai/paperclip#3158" },
     });
     const second = await service.sweep();
@@ -1095,6 +1119,117 @@ describe("createDoneCloseLandingBackstopService", () => {
       expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
         action: "issue.done_close_landing_confirmed",
       }));
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("SUP-15316: re-enqueue cap + escalation are PR-scoped, not per-issue", () => {
+    const ISSUE_A = "aaaa0000-0000-4000-8000-000000000001";
+    const ISSUE_B = "bbbb0000-0000-4000-8000-000000000002";
+    const ISSUE_C = "cccc0000-0000-4000-8000-000000000003";
+
+    // Mirror production faithfully: each sweepCandidate writes its landing rows via
+    // logActivity, and the NEXT sibling's fresh company-wide query sees them.
+    // Without this live append the PR-scoped shared bound across siblings within a
+    // single tick would be invisible to the test.
+    function trackLandingWrites(state: DbState) {
+      mockLogActivity.mockImplementation(
+        (
+          _db: unknown,
+          entry: { action: string; entityId: string; companyId: string; details: Record<string, unknown> },
+        ) => {
+          state.existingLandingRows.push({
+            action: entry.action,
+            entityId: entry.entityId,
+            companyId: entry.companyId,
+            details: entry.details,
+          });
+          return Promise.resolve({ id: "activity-row" });
+        },
+      );
+    }
+
+    it("3 distinct done cards sharing one open PR cap at 3 re-enqueues total, then exactly 1 escalation (AC5, #3443 shape)", async () => {
+      const state: DbState = {
+        candidates: [
+          candidateRow({ id: ISSUE_A, identifier: "SUP-15104" }),
+          candidateRow({ id: ISSUE_B, identifier: "SUP-15105" }),
+          candidateRow({ id: ISSUE_C, identifier: "SUP-15107" }),
+        ],
+        existingLandingRows: [],
+        companyMergeArmingEnabled: true,
+      };
+      const { service } = makeService(state);
+      mockResolveLinkedPullRequestsWithState.mockImplementation(async (_db, _companyId, issueId) => {
+        state.sweptIssueId = issueId;
+        return [linkedPr({ number: 3443, nodeId: "PRNode_3443", displayName: "paperclipai/paperclip#3443" })];
+      });
+      mockResolver(async () => openSnapshot);
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_tok",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+      trackLandingWrites(state);
+
+      // Sweep 1: cap unexhausted (0 prior) — all 3 siblings re-enqueue the shared
+      // PR once. That is the ENTIRE allowed budget for the PR (not 3x3).
+      const first = await service.sweep();
+      expect(first).toEqual({
+        due: true, candidates: 3, confirmed: 0, failed: 0, deferred: 0, reenqueued: 3, escalated: 0,
+      });
+      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(3);
+
+      // Sweep 2: the shared PR now has 3 re-enqueue rows -> cap exhausted. Exactly
+      // ONE card escalates and is set blocked; the other two see the PR-scoped
+      // escalated row and do NOT re-escalate (no 2nd/3rd board action on one PR).
+      const second = await service.sweep();
+      expect(second).toEqual({
+        due: true, candidates: 3, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 1,
+      });
+      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(3); // no 4th attempt ever
+      expect(mockUpdate).toHaveBeenCalledTimes(1); // one blocked card, not three
+
+      const calls = mockLogActivity.mock.calls as unknown as Array<
+        [unknown, { action: string; entityId: string; details: Record<string, unknown> }]
+      >;
+      const escalatedRows = calls.filter((c) => c[1].action === "issue.done_close_landing_escalated");
+      expect(escalatedRows).toHaveLength(1);
+      expect(escalatedRows[0][1].details.pr).toBe("paperclipai/paperclip#3443");
+    });
+
+    it("2 distinct done cards sharing one MERGED PR each record their own confirmed row (AC6 — AC3 not over-widened)", async () => {
+      const state: DbState = {
+        candidates: [
+          candidateRow({ id: ISSUE_A, identifier: "SUP-15142" }),
+          candidateRow({ id: ISSUE_B, identifier: "SUP-15149" }),
+        ],
+        existingLandingRows: [],
+      };
+      const { service } = makeService(state);
+      mockResolveLinkedPullRequestsWithState.mockImplementation(async (_db, _companyId, issueId) => {
+        state.sweptIssueId = issueId;
+        return [linkedPr({ number: 3447, displayName: "paperclipai/paperclip#3447" })];
+      });
+      mockResolver(async () => mergedSnapshot);
+      trackLandingWrites(state);
+
+      const result = await service.sweep();
+      expect(result).toEqual({
+        due: true, candidates: 2, confirmed: 2, failed: 0, deferred: 0, reenqueued: 0, escalated: 0,
+      });
+
+      // Both cards confirmed even though card B's fresh query sees card A's
+      // confirmed row (live append): the per-card ledger is keyed on entityId, so
+      // a sibling's landing of the same PR never suppresses this card's row.
+      const calls = mockLogActivity.mock.calls as unknown as Array<
+        [unknown, { action: string; entityId: string; details: Record<string, unknown> }]
+      >;
+      const confirmedRows = calls.filter((c) => c[1].action === "issue.done_close_landing_confirmed");
+      expect(confirmedRows).toHaveLength(2);
+      expect(confirmedRows.map((c) => c[1].entityId).sort()).toEqual([ISSUE_A, ISSUE_B]);
       expect(mockUpdate).not.toHaveBeenCalled();
       expect(mockEnableAutoMerge).not.toHaveBeenCalled();
     });
