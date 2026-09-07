@@ -46,10 +46,18 @@ const DEFAULT_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 // checks, conflicts, behind the base branch) and left `open` again — in which
 // case the confirm/failed/escalated branches are all unreachable for it. So the
 // "already re-enqueued, skip" behavior is bounded to this many total re-enqueue
-// attempts per (issue, PR): beyond it, a still-open PR is re-examined on the
-// next sweep and escalates instead of being re-enqueued (or skipped) forever.
-// The hourly sweep interval spaces the attempts out; the cap bounds the total,
-// so the sweep cannot re-enqueue in a tight loop.
+// attempts PER PULL REQUEST (company-wide): beyond it, a still-open PR is
+// re-examined on the next sweep and escalates instead of being re-enqueued
+// (or skipped) forever.
+//
+// The bound is on the PR, NOT on (issue, PR). A shared carrier PR can be linked
+// from N `done` sibling cards, and scoping the counter to the issue would give
+// each sibling its own quota of 3 — an effective bound of 3xN that grows with
+// every sibling that closes `done` (measured 2026-09-07: 3 cards / 5 adds on
+// #3443). So the cap and the single escalation are counted across the whole
+// company on the PR key (see sweepCandidate). The hourly sweep interval spaces
+// the attempts out; the cap bounds the total PER PR, so the sweep cannot
+// re-enqueue in a tight loop.
 export const MAX_REENQUEUE_ATTEMPTS = 3;
 
 export const DONE_CLOSE_LANDING_ACTOR_ID = "system:done-close-landing-backstop";
@@ -363,18 +371,35 @@ export function createDoneCloseLandingBackstopService(
       });
     }
 
-    // Idempotency with no new column/table: any prior landing row for this
-    // (issue, PR) means the pair was already dispositioned by an earlier sweep.
+    // Idempotency with no new column/table, split by the scope each disposition
+    // actually owns (SUP-15316):
+    //   • CONFIRMED / FAILED are the PER-CARD landing ledger. A merged/closed PR
+    //     linked from N `done` cards must record one audit row PER card, so they
+    //     stay scoped to this card (entityId = issue.id). Do NOT widen these —
+    //     widening them would suppress the per-card ledger row whenever a sibling
+    //     card lands the same PR first.
+    //   • REENQUEUED / ESCALATED are the PR-SCOPED shared bound. The resource the
+    //     cap protects is the PR, not the card: a shared carrier PR linked from N
+    //     `done` siblings would otherwise get N × MAX_REENQUEUE_ATTEMPTS adds and
+    //     N independent board escalations (measured 2026-09-07: 3 cards / 5 adds
+    //     on #3443, two duplicate board unblockDescriptors on one PR). So the
+    //     re-enqueue count and the single escalation are read company-wide,
+    //     matched on the PR key, never on entityId = issue.id.
+    //   • A refused attempt (SUP-15315,
+    //     issue.done_close_landing_reenqueue_refused) is a DIFFERENT action and is
+    //     deliberately never counted here, so it cannot consume cap quota.
+    const prKeys = prs.map((pr) => `${pr.owner}/${pr.repo}#${pr.number}`);
+    const prText = sql<string>`${activityLog.details}->>'pr'`;
     const existing = await db
       .select({
         details: activityLog.details,
         action: activityLog.action,
+        entityId: activityLog.entityId,
       })
       .from(activityLog)
       .where(
         and(
           eq(activityLog.entityType, "issue"),
-          eq(activityLog.entityId, issue.id),
           inArray(
             activityLog.action,
             [
@@ -384,24 +409,40 @@ export function createDoneCloseLandingBackstopService(
               DONE_CLOSE_LANDING_ESCALATED_ACTION,
             ],
           ),
+          // This card's own rows (per-card ledger) OR any company row that
+          // dispositions one of this card's PRs (PR-scoped shared bound).
+          or(
+            eq(activityLog.entityId, issue.id),
+            and(
+              eq(activityLog.companyId, issue.companyId),
+              inArray(prText, prKeys),
+            ),
+          ),
         ),
       );
+    // Per-card ledger: only THIS card's confirmed/failed rows count, so a sibling
+    // card landing the same PR does not suppress this card's audit row (AC3).
     const alreadyConfirmed = new Set(
       existing
-        .filter((r) => r.action === DONE_CLOSE_LANDING_CONFIRMED_ACTION)
+        .filter(
+          (r) =>
+            r.action === DONE_CLOSE_LANDING_CONFIRMED_ACTION && r.entityId === issue.id,
+        )
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
     );
     const alreadyFailed = new Set(
       existing
-        .filter((r) => r.action === DONE_CLOSE_LANDING_FAILED_ACTION)
+        .filter(
+          (r) =>
+            r.action === DONE_CLOSE_LANDING_FAILED_ACTION && r.entityId === issue.id,
+        )
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
     );
-    // SUP-15073: count prior re-enqueues per PR instead of treating the FIRST
-    // one as terminal. A re-enqueued PR that the queue ejects is `open` again, so
-    // the idempotency set must not suppress re-examination (or escalation)
-    // indefinitely — it only caps how many times we attempt a re-enqueue.
+    // PR-scoped bound: count prior re-enqueues across the whole company for each
+    // of this card's PRs, so MAX_REENQUEUE_ATTEMPTS caps TOTAL re-enqueues per PR
+    // regardless of how many `done` cards link it.
     const reenqueueCounts = new Map<string, number>();
     for (const r of existing) {
       if (r.action !== DONE_CLOSE_LANDING_REENQUEUED_ACTION) continue;
@@ -409,6 +450,8 @@ export function createDoneCloseLandingBackstopService(
       if (prKey === null) continue;
       reenqueueCounts.set(prKey, (reenqueueCounts.get(prKey) ?? 0) + 1);
     }
+    // PR-scoped: at most one card is set `blocked` per PR per exhaustion; later
+    // sibling cards see the escalated row and do not re-escalate the same PR.
     const alreadyEscalated = new Set(
       existing
         .filter((r) => r.action === DONE_CLOSE_LANDING_ESCALATED_ACTION)
