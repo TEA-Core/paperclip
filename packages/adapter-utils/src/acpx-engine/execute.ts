@@ -802,6 +802,21 @@ const ACPX_INHERITED_PROVIDER_ENV_KEYS: Readonly<Record<string, ReadonlySet<stri
     "KIMI_CODE_HOME",
   ]),
   grok: new Set(["XAI_API_KEY"]),
+  // FORK ADDITION. Upstream ships no `custom` entry, so an ACP agent configured
+  // as `agent: "custom"` (an arbitrary ACP command, which this fork supports)
+  // inherits PATH/HOME/locale/proxy/CA and nothing else — losing any ambient
+  // provider config. No adapter in this tree sets `acpxAgent: "custom"` today,
+  // so this is defensive rather than a live gap; it mirrors the `claude` set
+  // because the fork's router lanes are addressed through ANTHROPIC_BASE_URL.
+  custom: new Set([
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CONFIG_DIR",
+  ]),
 };
 
 /**

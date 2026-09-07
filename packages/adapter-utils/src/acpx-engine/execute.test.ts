@@ -3019,35 +3019,26 @@ describe("summarizeAcpxTurnUsage no-report turns", () => {
   });
 });
 
-describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
-  it("passes process.env through the shared sanitizer before spawning", async () => {
-    process.env.DATABASE_URL = "postgres://example.test/paperclip";
-    process.env.ZZZ_SENTINEL = "sentinel-value";
-    try {
-      await runExecutor({
-        agent: "custom",
-        agentCommand: "node ./fake-acp.js",
-      });
-    } finally {
-      delete process.env.DATABASE_URL;
-      delete process.env.ZZZ_SENTINEL;
-    }
-
-    expect(sanitizeCalls.length).toBeGreaterThan(0);
-    expect(sanitizeCalls.at(-1)).toBe(process.env);
-    const sanitizedEnv = sanitizeResults.at(-1);
-    // `.at()` is `T | undefined`. Asserting it is defined keeps the sentinel
-    // assertions below meaningful — optional chaining would let a missing
-    // result pass `toBeUndefined()` and silently stop testing the strip.
-    expect(sanitizedEnv).toBeDefined();
-    expect(sanitizedEnv!.DATABASE_URL).toBeUndefined();
-    expect(sanitizedEnv!.ZZZ_SENTINEL).toBe("sentinel-value");
-  });
-
-  it("strips secrets from session options env while preserving non-secret inherited keys", async () => {
+// FORK DIVERGENCE (2026-09-07 fold, cutoff f0fbfb939). These tests used to
+// assert the MECHANISM — that `sanitizeInheritedPaperclipEnv` was called at the
+// ACPX spawn point, and that an arbitrary non-secret host var survived into the
+// agent env. Upstream replaced that denylist with
+// `projectAcpxInheritedHostEnvironment`, a CLOSED ALLOWLIST, and set
+// `inheritProcessEnv: false` so acpx builds the child env from `{}`. The
+// allowlist is strictly tighter: it drops a secret the denylist was never
+// taught about. So these now assert the PROPERTY the fork actually cares about
+// — no server secret reaches the agent — plus the allowlist's own contract.
+// `sanitizeInheritedPaperclipEnv` remains the choke point at every NON-ACPX
+// spawn boundary (codex/kimi/pi/cursor/hermes/opencode-local); see
+// server-utils.test.ts for the behavioural guard there.
+describe("ACPX spawn env admits no server secret", () => {
+  it("keeps every server secret out of the spawned session env", async () => {
     process.env.DATABASE_URL = "postgres://example.test/paperclip";
     process.env.BETTER_AUTH_SECRET = "secret-auth-value";
-    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "secret-tool-action";
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = "secret-master-key";
+    // Positive control on the allowlist. Without a key that MUST survive, the
+    // absence assertions below would pass for free against an empty object.
+    process.env.NO_PROXY = "localhost,127.0.0.1";
     process.env.ZZZ_SENTINEL = "sentinel-value";
     try {
       const { sessionInputs } = await runExecutor({
@@ -3055,15 +3046,43 @@ describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
         agentCommand: "node ./fake-acp.js",
       });
       const sessionEnv = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+
+      expect(sessionEnv.NO_PROXY).toBe("localhost,127.0.0.1");
       expect(sessionEnv.DATABASE_URL).toBeUndefined();
       expect(sessionEnv.BETTER_AUTH_SECRET).toBeUndefined();
-      expect(sessionEnv.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
-      expect(sessionEnv.ZZZ_SENTINEL).toBe("sentinel-value");
-      expect(sessionEnv.PAPERCLIP_AGENT_ID).toBe("agent-1");
+      expect(sessionEnv.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
     } finally {
       delete process.env.DATABASE_URL;
       delete process.env.BETTER_AUTH_SECRET;
-      delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      delete process.env.NO_PROXY;
+      delete process.env.ZZZ_SENTINEL;
+    }
+  });
+
+  it("admits only allowlisted host env, and the run's explicit env still wins", async () => {
+    process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    process.env.NO_PROXY = "localhost,127.0.0.1";
+    // Not on the allowlist and not a known secret. Under the fork's old
+    // denylist this reached the agent; under upstream's allowlist it does not.
+    // Asserted rather than deleted so the divergence cannot drift back
+    // unnoticed in either direction.
+    process.env.ZZZ_SENTINEL = "sentinel-value";
+    try {
+      const { sessionInputs } = await runExecutor({
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+      });
+      const sessionEnv = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+
+      expect(sessionEnv.NO_PROXY).toBe("localhost,127.0.0.1");
+      expect(sessionEnv.ZZZ_SENTINEL).toBeUndefined();
+      expect(sessionEnv.DATABASE_URL).toBeUndefined();
+      // Explicit run env is overlaid after the projection and is unaffected.
+      expect(sessionEnv.PAPERCLIP_AGENT_ID).toBe("agent-1");
+    } finally {
+      delete process.env.DATABASE_URL;
+      delete process.env.NO_PROXY;
       delete process.env.ZZZ_SENTINEL;
     }
   });
