@@ -15,6 +15,10 @@ const mockResolveCardPullRequest = vi.hoisted(() => vi.fn());
 const mockResolveGitHubTokenForRepo = vi.hoisted(() => vi.fn());
 const mockEnableAutoMerge = vi.hoisted(() => vi.fn());
 const mockFetchGitHubNodeId = vi.hoisted(() => vi.fn());
+// SUP-15315: head-authorization gate readers. Without these the gate would hit
+// the real token-credential + GitHub paths (or, worse, real network).
+const mockFetchHeadViaTokenCandidates = vi.hoisted(() => vi.fn());
+const mockFetchHeadApprovedStatusViaTokenCandidates = vi.hoisted(() => vi.fn());
 vi.mock("./merge-arming.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("./merge-arming.js")>();
   return {
@@ -24,6 +28,8 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
     resolveGitHubTokenForRepo: mockResolveGitHubTokenForRepo,
     enableAutoMerge: mockEnableAutoMerge,
     fetchGitHubNodeId: mockFetchGitHubNodeId,
+    fetchHeadViaTokenCandidates: mockFetchHeadViaTokenCandidates,
+    fetchHeadApprovedStatusViaTokenCandidates: mockFetchHeadApprovedStatusViaTokenCandidates,
   };
 });
 
@@ -59,6 +65,8 @@ type DbState = {
    * PR-scoped cap tests genuinely fail on a revert.
    */
   sweptIssueId?: string;
+  /** SUP-15315: the card's executionState (drives the approval-stamp read). */
+  issueExecutionState?: Record<string, unknown> | null;
 };
 
 /**
@@ -87,6 +95,16 @@ function makeDb(state: DbState) {
                 ? [{ mergeArmingEnabled: state.companyMergeArmingEnabled }]
                 : [],
             ),
+          }),
+        };
+      }
+      if ("executionState" in cols) {
+        return {
+          from: () => ({
+            where: () =>
+              Promise.resolve([
+                { executionState: state.issueExecutionState ?? null },
+              ]),
           }),
         };
       }
@@ -125,6 +143,10 @@ const NOW = "2026-08-19T00:00:00Z";
 const fixedNow = () => new Date(NOW);
 // 3 days old: past the 24h grace, inside the 7d lookback.
 const IN_WINDOW = "2026-08-16T00:00:00Z";
+// SUP-15315: live head + a stranded approval-stamp SHA (mirrors TSP #3447's
+// executed-migration head vs. its pinned e7e741b… stamp).
+const LIVE_SHA = "57726532dcd765819df8f76f102d15db68afd99a";
+const STAMPED_SHA = "e7e741b79a7da0b7eedb227b5091aad71c2ee843";
 
 function linkedPr(overrides: Record<string, unknown> = {}) {
   return {
@@ -272,6 +294,8 @@ beforeEach(() => {
   mockResolveGitHubTokenForRepo.mockReset();
   mockEnableAutoMerge.mockReset();
   mockFetchGitHubNodeId.mockReset();
+  mockFetchHeadViaTokenCandidates.mockReset();
+  mockFetchHeadApprovedStatusViaTokenCandidates.mockReset();
   mockCreateGitHubExternalObjectProvider.mockReset();
 });
 
@@ -971,12 +995,19 @@ describe("createDoneCloseLandingBackstopService", () => {
   describe("SUP-14991: re-enqueue and escalate branches for open-past-grace PRs", () => {
     it("re-enqueues the PR when merge arming is enabled and the token resolves", async () => {
       const { service } = makeService(
-        { candidates: [candidateRow()], existingLandingRows: [], companyMergeArmingEnabled: true },
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+        },
       );
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
         linkedPr({ number: 514, nodeId: "PRNode_abc123", displayName: "paperclipai/paperclip#514" }),
       ]);
       mockResolver(async () => openSnapshot);
+      // SUP-15315 gate: live head is covered by the card's pinned stamp → authorized.
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: "ghp_test_token",
         scope: "company",
@@ -1011,13 +1042,21 @@ describe("createDoneCloseLandingBackstopService", () => {
     it("escalates when merge arming is enabled but no token is resolvable", async () => {
       const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
       const { service } = makeService(
-        { candidates: [candidateRow()], existingLandingRows: [], companyMergeArmingEnabled: true },
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+        },
         { wakeup },
       );
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
         linkedPr({ number: 514, nodeId: "PRNode_abc123", displayName: "paperclipai/paperclip#514" }),
       ]);
       mockResolver(async () => openSnapshot);
+      // SUP-15315 gate: head is authorized (stamp match), so the sweep reaches
+      // the re-enqueue attempt — which then fails because no token resolves.
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: null,
         reason: "No GitHub token resolvable for paperclipai/paperclip",
@@ -1051,12 +1090,18 @@ describe("createDoneCloseLandingBackstopService", () => {
 
     it("fetches the node ID when the cached PR row has no nodeId", async () => {
       const { service } = makeService(
-        { candidates: [candidateRow()], existingLandingRows: [], companyMergeArmingEnabled: true },
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+        },
       );
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
         linkedPr({ number: 514, nodeId: null, displayName: "paperclipai/paperclip#514" }),
       ]);
       mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: "ghp_fetched",
         scope: "company",
@@ -1084,12 +1129,14 @@ describe("createDoneCloseLandingBackstopService", () => {
         candidates: [candidateRow()],
         existingLandingRows: [],
         companyMergeArmingEnabled: true,
+        issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
       };
       const { service } = makeService(state);
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
         linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
       ]);
       mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: "ghp_tok",
         scope: "company",
@@ -1209,6 +1256,7 @@ describe("createDoneCloseLandingBackstopService", () => {
     });
   });
 
+
   describe("SUP-15316: re-enqueue cap + escalation are PR-scoped, not per-issue", () => {
     const ISSUE_A = "aaaa0000-0000-4000-8000-000000000001";
     const ISSUE_B = "bbbb0000-0000-4000-8000-000000000002";
@@ -1251,6 +1299,11 @@ describe("createDoneCloseLandingBackstopService", () => {
         return [linkedPr({ number: 3443, nodeId: "PRNode_3443", displayName: "paperclipai/paperclip#3443" })];
       });
       mockResolver(async () => openSnapshot);
+
+      // SUP-15315 gate (landed in #567): authorize the open PR's live head so the sweep
+      // reaches the re-enqueue path; the PR-scoped cap is what this test exercises.
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
       mockResolveGitHubTokenForRepo.mockResolvedValue({
         token: "ghp_tok",
         scope: "company",
@@ -1317,6 +1370,261 @@ describe("createDoneCloseLandingBackstopService", () => {
       expect(confirmedRows.map((c) => c[1].entityId).sort()).toEqual([ISSUE_A, ISSUE_B]);
       expect(mockUpdate).not.toHaveBeenCalled();
       expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("SUP-15315: head-authorization gate for the re-enqueue path", () => {
+    it("authorizes and re-enqueues when the live head carries a paperclip/approved success status (stamp absent)", async () => {
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          // No pinned stamp — authorization must come from the live commit status.
+        },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_test_token",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 1,
+        escalated: 0,
+      });
+      expect(mockEnableAutoMerge).toHaveBeenCalledWith("ghp_test_token", "PRNode_abc123");
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_reenqueued",
+      }));
+      // The status reader WAS consulted because the stamp did not cover the live head.
+      expect(mockFetchHeadApprovedStatusViaTokenCandidates).toHaveBeenCalledWith(
+        expect.anything(), COMPANY, "paperclipai", "paperclip", LIVE_SHA,
+      );
+    });
+
+    it("REFUSES (does not re-enqueue) a stranded approval stamp — the live head is not the approved head (#3447 shape)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: STAMPED_SHA } },
+        },
+        { wakeup },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      // Live head moved past the stamped head (the migration ran after approval).
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // The new head has only a `migration/success` status — no paperclip/approved.
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: false });
+
+      const result = await service.sweep();
+
+      expect(result).toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 1,
+      });
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      // AC2: durable refusal row with head + stamp + reason.
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_reenqueue_refused",
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#514",
+          headSha: LIVE_SHA,
+          approvedHeadSha: STAMPED_SHA,
+          reason: expect.stringContaining("stamp stranded"),
+        }),
+      }));
+      // AC3: reaches the existing escalate path exactly once.
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_escalated",
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#514",
+          reason: expect.stringContaining("stamp stranded"),
+        }),
+      }));
+      // The unblock action names re-approval (not rebase / CI).
+      expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
+        status: "blocked",
+        unblockDescriptor: expect.objectContaining({
+          owner: "board",
+          action: expect.stringContaining("Re-approve PR paperclipai/paperclip#514"),
+        }),
+      }));
+      expect(wakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("REFUSES when there is no approval stamp at all and the live head has no paperclip/approved status (#3446 shape)", async () => {
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          // No executionState.approvalStatus.approvedHeadSha pinned on the card.
+        },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // #3446: the status API returns an empty list — no paperclip/approved.
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: false });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 1,
+      });
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_reenqueue_refused",
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#514",
+          headSha: LIVE_SHA,
+          approvedHeadSha: null,
+          reason: expect.stringContaining("no valid approval on head"),
+        }),
+      }));
+      expect(mockUpdate).toHaveBeenCalledWith(ISSUE, expect.objectContaining({
+        status: "blocked",
+        unblockDescriptor: expect.objectContaining({
+          owner: "board",
+          action: expect.stringContaining("Re-approve PR paperclipai/paperclip#514"),
+        }),
+      }));
+    });
+
+    it("DEFERS (never re-enqueues, never reports) when the live head SHA is unresolvable (auth/network)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+        },
+        { wakeup },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      // Head unreadable this tick (auth) → fail closed.
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({
+        ok: false,
+        reason: "pr_auth: HTTP 401 invalid token (scope=repo, secretName=github-token)",
+      });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 1,
+        reenqueued: 0,
+        escalated: 0,
+      });
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+      expect(mockAddComment).not.toHaveBeenCalled();
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
+    });
+
+    it("DEFERS when the head resolves but its approval status is unresolvable", async () => {
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: STAMPED_SHA } },
+        },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      // Stamp mismatch → status read needed; the status read is unresolvable → defer.
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({
+        ok: false,
+        reason: "pr_network: network_error",
+      });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 1,
+        reenqueued: 0,
+        escalated: 0,
+      });
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+      expect(mockUpdate).not.toHaveBeenCalled();
+    });
+
+    it("does not call the status reader when the pinned stamp covers the live head (AC5)", async () => {
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          companyMergeArmingEnabled: true,
+          issueExecutionState: { approvalStatus: { approvedHeadSha: LIVE_SHA } },
+        },
+      );
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 514, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_test_token",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 1,
+        escalated: 0,
+      });
+      // Stamp match short-circuits the status read (AC5).
+      expect(mockFetchHeadApprovedStatusViaTokenCandidates).not.toHaveBeenCalled();
+      expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
     });
   });
 });
