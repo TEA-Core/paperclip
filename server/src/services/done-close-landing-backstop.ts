@@ -11,6 +11,8 @@ import {
   resolveCardPullRequest,
   resolveGitHubTokenForRepo,
   resolveLinkedPullRequestsWithState,
+  fetchHeadViaTokenCandidates,
+  fetchHeadApprovedStatusViaTokenCandidates,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
 } from "./merge-arming.js";
@@ -56,6 +58,7 @@ export const DONE_CLOSE_LANDING_ACTOR_ID = "system:done-close-landing-backstop";
 export const DONE_CLOSE_LANDING_CONFIRMED_ACTION = "issue.done_close_landing_confirmed";
 export const DONE_CLOSE_LANDING_FAILED_ACTION = "issue.done_close_landing_failed";
 export const DONE_CLOSE_LANDING_REENQUEUED_ACTION = "issue.done_close_landing_reenqueued";
+export const DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION = "issue.done_close_landing_reenqueue_refused";
 export const DONE_CLOSE_LANDING_ESCALATED_ACTION = "issue.done_close_landing_escalated";
 const DECISION_CARRIED_SKIP_REASON_PREFIX = "open_linked_prs_decision_carried:";
 const SKIPPED_ACTION = "issue.done_transition_guard_skipped";
@@ -92,6 +95,20 @@ export interface DoneCloseLandingSweepResult {
 }
 
 export type MeasuredPullRequestState = "merged" | "closed" | "open";
+
+/**
+ * SUP-15315: outcome of the re-enqueue head-authorization gate.
+ *  - `authorized`: the live head is covered by the card's pinned approval stamp
+ *    OR carries its own `paperclip/approved` success status — safe to re-enqueue.
+ *  - `refused`: the head is positively UNSTAMPED (stamp stranded or absent and no
+ *    live status) — never re-enqueue; write the refusal and escalate.
+ *  - `deferred`: the live head or its approval status could not be read this tick
+ *    (network/auth/404) — fail closed, defer to a later sweep, never report.
+ */
+export type RequeueAuthorization =
+  | { kind: "authorized" }
+  | { kind: "refused"; headSha: string; approvedHeadSha: string | null; reason: string }
+  | { kind: "deferred"; reason: string };
 
 interface CandidateIssue {
   id: string;
@@ -408,6 +425,14 @@ export function createDoneCloseLandingBackstopService(
         .filter((value): value is string => value !== null),
     );
 
+    // SUP-15315: head-authorization gate. The re-enqueue path must not arm a
+    // merge on a head the merge boundary has not authorized. Fetch the card's
+    // pinned approval stamp once per candidate so the per-PR gate can compare
+    // the live head against it. Only needed when the re-enqueue lane is open.
+    const approvedHeadSha = mergeArmingEnabled
+      ? await readApprovedHeadSha(db, issue.id)
+      : null;
+
     for (const pr of prs) {
       const prKey = `${pr.owner}/${pr.repo}#${pr.number}`;
       if (alreadyConfirmed.has(prKey) || alreadyFailed.has(prKey)) continue;
@@ -522,12 +547,68 @@ export function createDoneCloseLandingBackstopService(
       const priorReenqueues = reenqueueCounts.get(prKey) ?? 0;
       const reenqueueExhausted = priorReenqueues >= MAX_REENQUEUE_ATTEMPTS;
 
+      // SUP-15315: head-authorization gate. Set when the live head is positively
+      // UNSTAMPED (refused); the pair then falls through to the escalation path
+      // below with the head-moved cause instead of being armed.
+      let refusedHead: { headSha: string; approvedHeadSha: string | null; reason: string } | null = null;
+
       if (!reenqueueExhausted && mergeArmingEnabled) {
-        const reenqueueSucceeded = await attemptReenqueue(
-          issue.companyId,
-          pr,
-        );
-        if (reenqueueSucceeded) {
+        const gate = await authorizeReenqueueHead(issue.companyId, pr, approvedHeadSha);
+        if (gate.kind === "deferred") {
+          // AC4: unresolvable head or approval status — fail closed, never
+          // re-enqueue and never report; retry on a later sweep.
+          counts.deferred += 1;
+          continue;
+        }
+        if (gate.kind === "refused") {
+          // AC2/AC3: head positively unstamped — record the refusal and fall
+          // through to the escalation path below with the head-moved cause.
+          refusedHead = gate;
+        } else {
+          const reenqueueSucceeded = await attemptReenqueue(
+            issue.companyId,
+            pr,
+          );
+          if (reenqueueSucceeded) {
+            await logActivity(db, {
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+              agentId: null,
+              runId: null,
+              agentApiKeyId: null,
+              action: DONE_CLOSE_LANDING_REENQUEUED_ACTION,
+              entityType: "issue",
+              entityId: issue.id,
+              issueId: issue.id,
+              details: {
+                identifier: issue.identifier ?? null,
+                pr: prKey,
+                prState: "open",
+                skipReason: skipReason ?? null,
+                refusal: isArmingRefusal,
+              },
+            });
+            counts.reenqueued += 1;
+            continue;
+          }
+        }
+      }
+
+      // Escalate: re-enqueue cap exhausted (still open), lane closed, the
+      // re-enqueue attempt failed this tick, or the live head was positively
+      // UNSTAMPED (head-authorization refusal).
+      if (!alreadyEscalated.has(prKey)) {
+        const reason = reenqueueExhausted
+          ? `the PR has been re-enqueued ${priorReenqueues} times and is still open past the done-close grace window — the merge queue is not landing it (e.g. failing checks, conflicts, or it is behind the base branch)`
+          : refusedHead
+            ? refusedHead.reason
+            : mergeArmingEnabled
+              ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
+              : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
+        if (refusedHead) {
+          // SUP-15315 (AC2): durable refusal row — the live head is not covered
+          // by an authorized head, so no re-enqueue row is written for it.
           await logActivity(db, {
             companyId: issue.companyId,
             actorType: "system",
@@ -535,31 +616,19 @@ export function createDoneCloseLandingBackstopService(
             agentId: null,
             runId: null,
             agentApiKeyId: null,
-            action: DONE_CLOSE_LANDING_REENQUEUED_ACTION,
+            action: DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION,
             entityType: "issue",
             entityId: issue.id,
             issueId: issue.id,
             details: {
               identifier: issue.identifier ?? null,
               pr: prKey,
-              prState: "open",
-              skipReason: skipReason ?? null,
-              refusal: isArmingRefusal,
+              headSha: refusedHead.headSha,
+              approvedHeadSha: refusedHead.approvedHeadSha,
+              reason: refusedHead.reason,
             },
           });
-          counts.reenqueued += 1;
-          continue;
         }
-      }
-
-      // Escalate: re-enqueue cap exhausted (still open), lane closed, or the
-      // re-enqueue attempt failed this tick.
-      if (!alreadyEscalated.has(prKey)) {
-        const reason = reenqueueExhausted
-          ? `the PR has been re-enqueued ${priorReenqueues} times and is still open past the done-close grace window — the merge queue is not landing it (e.g. failing checks, conflicts, or it is behind the base branch)`
-          : mergeArmingEnabled
-            ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
-            : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
         await logActivity(db, {
           companyId: issue.companyId,
           actorType: "system",
@@ -584,7 +653,9 @@ export function createDoneCloseLandingBackstopService(
           issue.id,
           reenqueueExhausted
             ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window after ${MAX_REENQUEUE_ATTEMPTS} re-enqueue attempts — the merge queue is not landing it (${reason}). Board/operator must fix the PR (checks/conflicts/rebase) and merge it, or re-open the card.`
-            : `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window and cannot be re-enqueued by an agent — ${reason}. Board/operator must manually enable merge arming or merge the PR.`,
+            : refusedHead
+              ? `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} cannot be re-enqueued — ${refusedHead.reason}. Re-review and re-approve the PR at its current head to re-stamp paperclip/approved (or land it through the review lane); the merge queue will not arm an unauthorized head.`
+              : `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is still open past the done-close grace window and cannot be re-enqueued by an agent — ${reason}. Board/operator must manually enable merge arming or merge the PR.`,
           {},
           { authorType: "system" },
         );
@@ -594,7 +665,9 @@ export function createDoneCloseLandingBackstopService(
             owner: "board",
             action: reenqueueExhausted
               ? `Fix and merge PR ${prKey} (re-enqueued ${MAX_REENQUEUE_ATTEMPTS}x, still not landing — check CI checks, conflicts, or rebase onto the base branch) or re-open the card`
-              : `Manually merge or re-enqueue PR ${prKey} into the merge queue (merge arming lane is ${mergeArmingEnabled ? "open but re-enqueue failed" : "closed for this company"})`,
+              : refusedHead
+                ? `Re-approve PR ${prKey} at its current head ${refusedHead.headSha.slice(0, 7)} to re-stamp paperclip/approved (approval stamp is ${refusedHead.approvedHeadSha ? `stranded on ${refusedHead.approvedHeadSha.slice(0, 7)}` : "missing"}) — re-review, not rebase/CI, is the unblock; the merge queue will not arm an unauthorized head`
+                : `Manually merge or re-enqueue PR ${prKey} into the merge queue (merge arming lane is ${mergeArmingEnabled ? "open but re-enqueue failed" : "closed for this company"})`,
           },
         });
         if (opts.wakeup && issue.assigneeAgentId) {
@@ -608,6 +681,73 @@ export function createDoneCloseLandingBackstopService(
         counts.escalated += 1;
       }
     }
+  }
+
+  /**
+   * Reads the card's pinned approval-stamp head
+   * (`executionState.approvalStatus.approvedHeadSha`), or null when the card has
+   * no stamped head (e.g. an arming-refusal candidate).
+   */
+  async function readApprovedHeadSha(
+    db: Db,
+    issueId: string,
+  ): Promise<string | null> {
+    const row = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const state = row[0]?.executionState as Record<string, unknown> | null | undefined;
+    const approvalStatus = state?.approvalStatus as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const sha = approvalStatus?.approvedHeadSha;
+    return typeof sha === "string" && sha.length > 0 ? sha : null;
+  }
+
+  /**
+   * SUP-15315: authorizes a PR's live head for the re-enqueue path. Resolves the
+   * live head SHA; if it is covered by the card's pinned approval stamp it is
+   * `authorized` without a second read (AC5). Otherwise the live head must carry
+   * its own `paperclip/approved` success status, else the head is positively
+   * UNSTAMPED → `refused`. Any unreadable head or status → `deferred` (fail
+   * closed, AC4).
+   */
+  async function authorizeReenqueueHead(
+    companyId: string,
+    pr: LinkedPullRequest,
+    approvedHeadSha: string | null,
+  ): Promise<RequeueAuthorization> {
+    const head = await fetchHeadViaTokenCandidates(
+      db,
+      companyId,
+      pr.owner,
+      pr.repo,
+      pr.number,
+    );
+    if (!head.ok) return { kind: "deferred", reason: head.reason };
+    const liveHeadSha = head.headSha;
+    if (approvedHeadSha !== null && liveHeadSha === approvedHeadSha) {
+      return { kind: "authorized" };
+    }
+    const status = await fetchHeadApprovedStatusViaTokenCandidates(
+      db,
+      companyId,
+      pr.owner,
+      pr.repo,
+      liveHeadSha,
+    );
+    if (!status.ok) return { kind: "deferred", reason: status.reason };
+    if (status.approved) return { kind: "authorized" };
+    return {
+      kind: "refused",
+      headSha: liveHeadSha,
+      approvedHeadSha,
+      reason:
+        approvedHeadSha !== null
+          ? `approval stamp stranded: the card approved head ${approvedHeadSha.slice(0, 7)} but the live head is ${liveHeadSha.slice(0, 7)}, and that head carries no paperclip/approved success status`
+          : `no valid approval on head: the live head ${liveHeadSha.slice(0, 7)} carries no paperclip/approved success status and the card has no pinned approvedHeadSha`,
+    };
   }
 
   async function attemptReenqueue(

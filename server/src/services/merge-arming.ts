@@ -1878,7 +1878,14 @@ async function fetchBranchHeadSha(
   return { ok: false, status: response.status };
 }
 
-async function fetchHeadViaTokenCandidates(
+/**
+ * SUP-15315: resolves one PR's live head SHA across the resolvable token
+ * candidates (401/403 advances to the next candidate). Exposed so the
+ * done-close-landing backstop's head-authorization gate can read a head without
+ * re-deriving the token path: a positive SHA on success, a named `reason`
+ * (never a guessed head) when it cannot be read.
+ */
+export async function fetchHeadViaTokenCandidates(
   db: Db,
   companyId: string,
   owner: string,
@@ -1911,6 +1918,104 @@ async function fetchHeadViaTokenCandidates(
     return { ok: false, reason: `pr_error: HTTP ${status} ${message ?? ""}` };
   }
   return { ok: false, reason: "internal: exhausted GitHub token candidates" };
+}
+
+/**
+ * SUP-15315: reads whether a PR's live head carries a `paperclip/approved`
+ * commit status with state `success`, across the resolvable token candidates
+ * (401/403 advances to the next candidate). A 2xx with zero or non-matching
+ * statuses resolves to `{ ok: true, approved: false }` — the head is positively
+ * UNSTAMPED, which the caller treats as a refusal. A terminal transport, auth,
+ * rate-limit, or 4xx/5xx error resolves to `{ ok: false, reason }` —
+ * unresolvable, which the caller defers (fail closed). Reuses the shared
+ * ghFetch transport and writes nothing.
+ */
+export async function fetchHeadApprovedStatusViaTokenCandidates(
+  db: Db,
+  companyId: string,
+  owner: string,
+  repo: string,
+  headSha: string,
+): Promise<{ ok: true; approved: boolean } | { ok: false; reason: string }> {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, owner, repo);
+  if (candidates.length === 0) {
+    const tokenResult = await resolveGitHubTokenForRepo(db, companyId, owner, repo);
+    const reason = isGitHubTokenResolution(tokenResult)
+      ? `auth_required: no GitHub token resolvable for ${owner}/${repo}`
+      : `auth_required: ${tokenResult.reason}`;
+    return { ok: false, reason };
+  }
+  let lastStatus = 0;
+  let lastMessage: string | null = null;
+  for (const candidate of candidates) {
+    const result = await fetchHeadCommitStatuses(candidate.token, owner, repo, headSha);
+    if (result.ok) return { ok: true, approved: result.approved };
+    lastStatus = result.status;
+    lastMessage = result.message;
+    if ((result.status === 401 || result.status === 403) && candidate !== candidates[candidates.length - 1]) {
+      continue;
+    }
+    break;
+  }
+  if (lastStatus === 404) return { ok: false, reason: "pr_not_found: HTTP 404" };
+  if (lastStatus === 429) return { ok: false, reason: "pr_rate_limited: HTTP 429" };
+  if (lastStatus === 0) return { ok: false, reason: `pr_network: ${lastMessage ?? "network_error"}` };
+  if (lastStatus === 401 || lastStatus === 403) {
+    const scopeDetail =
+      candidates.length === 1
+        ? `(scope=${candidates[0]!.scope}, secretName=${candidates[0]!.secretName})`
+        : `(tried: ${candidates.map((c) => `${c.scope}/${c.secretName}`).join(", ")})`;
+    return { ok: false, reason: `pr_auth: HTTP ${lastStatus} ${lastMessage ?? ""} ${scopeDetail}` };
+  }
+  return { ok: false, reason: `pr_error: HTTP ${lastStatus} ${lastMessage ?? ""}` };
+}
+
+/**
+ * SUP-15315: reads one head SHA's commit statuses from the GitHub statuses API
+ * (GET, read-only) and reports whether a `paperclip/approved` status with state
+ * `success` is present. Uses the shared ghFetch transport — no new HTTP layer.
+ */
+async function fetchHeadCommitStatuses(
+  token: string,
+  owner: string,
+  repo: string,
+  headSha: string,
+): Promise<{ ok: boolean; approved: boolean; status: number; message: string | null }> {
+  const url =
+    `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
+    `/statuses/${encodeURIComponent(headSha)}?per_page=100`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-merge-arming",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+
+  let response: Response;
+  try {
+    response = await ghFetch(url, { headers });
+  } catch {
+    return { ok: false, approved: false, status: 0, message: "network_error" };
+  }
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const message = body?.message as string | undefined;
+    return { ok: false, approved: false, status: response.status, message: message ?? null };
+  }
+
+  const body = await response.json().catch(() => null);
+  const list = Array.isArray(body) ? body : [];
+  let approved = false;
+  for (const raw of list) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const status = raw as Record<string, unknown>;
+    if (status.context === "paperclip/approved" && status.state === "success") {
+      approved = true;
+      break;
+    }
+  }
+  return { ok: true, approved, status: response.status, message: null };
 }
 
 export interface HeadShaSuccess extends GitHubFetchResult {
