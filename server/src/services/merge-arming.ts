@@ -976,7 +976,7 @@ export interface PublishApprovalStatusOptions {
  * project repo, or a repo that differs from the project repo (F1) — fails
  * closed with a named reason and never falls back to the workspace row.
  */
-async function resolveDeliveryIdentity(
+export async function resolveDeliveryIdentity(
   db: Db,
   companyId: string,
   issueId: string,

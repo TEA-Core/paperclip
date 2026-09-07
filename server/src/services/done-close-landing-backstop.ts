@@ -1,6 +1,6 @@
 import { and, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, companies, issues } from "@paperclipai/db";
+import { activityLog, companies, executionWorkspaces, issueRelations, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
@@ -9,6 +9,7 @@ import {
   fetchGitHubNodeId,
   isGitHubTokenResolution,
   resolveCardPullRequest,
+  resolveDeliveryIdentity,
   resolveGitHubTokenForRepo,
   resolveLinkedPullRequestsWithState,
   fetchHeadViaTokenCandidates,
@@ -68,6 +69,8 @@ export const DONE_CLOSE_LANDING_FAILED_ACTION = "issue.done_close_landing_failed
 export const DONE_CLOSE_LANDING_REENQUEUED_ACTION = "issue.done_close_landing_reenqueued";
 export const DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION = "issue.done_close_landing_reenqueue_refused";
 export const DONE_CLOSE_LANDING_ESCALATED_ACTION = "issue.done_close_landing_escalated";
+export const DONE_CLOSE_LANDING_SHARED_CARRIER_ACTION = "issue.done_close_landing_shared_carrier";
+export const DONE_CLOSE_LANDING_SHARED_CARRIER_DEADLOCK_SKIP_ACTION = "issue.done_close_landing_shared_carrier_deadlock_skip";
 const DECISION_CARRIED_SKIP_REASON_PREFIX = "open_linked_prs_decision_carried:";
 const SKIPPED_ACTION = "issue.done_transition_guard_skipped";
 
@@ -124,6 +127,7 @@ interface CandidateIssue {
   status: string;
   identifier: string | null;
   assigneeAgentId: string | null;
+  executionWorkspaceId?: string | null;
 }
 
 interface CandidateRow {
@@ -190,6 +194,7 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, graceCutoff: Date
         status: issues.status,
         identifier: issues.identifier,
         assigneeAgentId: issues.assigneeAgentId,
+        executionWorkspaceId: issues.executionWorkspaceId,
       },
     })
     .from(activityLog)
@@ -268,6 +273,63 @@ export function classifyPullRequestLanding(
   if (data?.state === "closed") return "closed";
   if (data?.state === "open") return "open";
   return "unknown";
+}
+
+/**
+ * SUP-15383: resolve the owning plan parent for a card's execution workspace.
+ * Returns the `sourceIssueId` of the card's execution workspace (the plan card
+ * that created the shared workspace), or null when the card has no workspace or
+ * the workspace has no source issue.
+ */
+async function resolveOwningPlanParent(
+  db: Db,
+  issue: CandidateIssue,
+): Promise<string | null> {
+  if (!issue.executionWorkspaceId) return null;
+  const rows = await db
+    .select({ sourceIssueId: executionWorkspaces.sourceIssueId })
+    .from(executionWorkspaces)
+    .where(eq(executionWorkspaces.id, issue.executionWorkspaceId));
+  return rows[0]?.sourceIssueId ?? null;
+}
+
+const BLOCKED_BY_BFS_CAP = 200;
+
+/**
+ * SUP-15383: BFS from `startId` following "blocks" edges outward (parent →
+ * children it blocks → grandchildren they block, …) to determine whether
+ * `targetId` is reachable. Pure reachability — no status filtering.
+ * Returns true when `targetId` is in the closure; capped at `BLOCKED_BY_BFS_CAP`
+ * visited nodes to bound the traversal.
+ */
+async function isReachableViaBlockedBy(
+  db: Db,
+  companyId: string,
+  startId: string,
+  targetId: string,
+): Promise<boolean> {
+  const visited = new Set<string>([startId]);
+  let frontier: string[] = [startId];
+  while (frontier.length > 0 && visited.size <= BLOCKED_BY_BFS_CAP) {
+    const rows = await db
+      .select({ relatedIssueId: issueRelations.relatedIssueId })
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.type, "blocks"),
+          inArray(issueRelations.issueId, frontier),
+        ),
+      );
+    frontier = [];
+    for (const row of rows) {
+      if (visited.has(row.relatedIssueId)) continue;
+      if (row.relatedIssueId === targetId) return true;
+      visited.add(row.relatedIssueId);
+      frontier.push(row.relatedIssueId);
+    }
+  }
+  return false;
 }
 
 export function createDoneCloseLandingBackstopService(
@@ -424,6 +486,8 @@ export function createDoneCloseLandingBackstopService(
               DONE_CLOSE_LANDING_FAILED_ACTION,
               DONE_CLOSE_LANDING_REENQUEUED_ACTION,
               DONE_CLOSE_LANDING_ESCALATED_ACTION,
+              DONE_CLOSE_LANDING_SHARED_CARRIER_ACTION,
+              DONE_CLOSE_LANDING_SHARED_CARRIER_DEADLOCK_SKIP_ACTION,
             ],
           ),
           // This card's own rows (per-card ledger) OR any company row that
@@ -472,6 +536,19 @@ export function createDoneCloseLandingBackstopService(
     const alreadyEscalated = new Set(
       existing
         .filter((r) => r.action === DONE_CLOSE_LANDING_ESCALATED_ACTION)
+        .map((r) => readString(readRecord(r.details)?.pr))
+        .filter((value): value is string => value !== null),
+    );
+    // SUP-15383: per-card shared-carrier idempotency — skip re-emission when a
+    // shared_carrier or deadlock_skip row already exists for this (card, prKey).
+    const alreadySharedCarrier = new Set(
+      existing
+        .filter(
+          (r) =>
+            (r.action === DONE_CLOSE_LANDING_SHARED_CARRIER_ACTION
+              || r.action === DONE_CLOSE_LANDING_SHARED_CARRIER_DEADLOCK_SKIP_ACTION)
+            && r.entityId === issue.id,
+        )
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
     );
@@ -541,6 +618,33 @@ export function createDoneCloseLandingBackstopService(
       .map((m) => m.prKey);
     const hasMergedSibling = mergedSiblingKeys.length > 0;
 
+    // SUP-15383: shared-carrier exemption. When the card's delivery branch is
+    // inherited from a parent (shared workspace), the PR landing is the parent's
+    // concern, not this card's. The sweep must NOT park this card blocked on its
+    // own carrier parent's blocker closure (deadlock: the parent can never
+    // complete because its child is blocked on the parent's own landing).
+    let isSharedCarrier = false;
+    let sharedCarrierParentId: string | null = null;
+    let inParentBlockerClosure = false;
+    try {
+      const delivery = await resolveDeliveryIdentity(db, issue.companyId, issue.id);
+      isSharedCarrier = delivery.branchIsOwn === false;
+      if (isSharedCarrier) {
+        sharedCarrierParentId = await resolveOwningPlanParent(db, issue);
+        if (sharedCarrierParentId) {
+          inParentBlockerClosure = await isReachableViaBlockedBy(
+            db,
+            issue.companyId,
+            sharedCarrierParentId,
+            issue.id,
+          );
+        }
+      }
+    } catch {
+      // Fail open: if the shared-carrier check errors, proceed with normal
+      // disposition so the sweep is not blocked by a transient DB failure.
+    }
+
     for (const { pr, prKey, state, closedAt } of measured) {
       const isSupersededCarrier = state === "closed" && hasMergedSibling;
 
@@ -566,6 +670,75 @@ export function createDoneCloseLandingBackstopService(
           },
         });
         counts.confirmed += 1;
+        continue;
+      }
+
+      // SUP-15383: shared-carrier exemption. When the card sits on a shared
+      // carrier, its unlanded PRs are the parent's landing concern. Do NOT
+      // park blocked or re-enqueue on the card's own behalf.
+      if (isSharedCarrier) {
+        if (alreadySharedCarrier.has(prKey)) continue;
+        if (inParentBlockerClosure) {
+          // AC3: the card is inside the parent's own blockedBy closure —
+          // waking it would create the deadlock the exec-CTO ruling prohibits.
+          // Emit the audit row only: no comment, no wake, no block.
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: DONE_CLOSE_LANDING_SHARED_CARRIER_DEADLOCK_SKIP_ACTION,
+            entityType: "issue",
+            entityId: issue.id,
+            issueId: issue.id,
+            details: {
+              identifier: issue.identifier ?? null,
+              pr: prKey,
+              prState: state,
+              parentId: sharedCarrierParentId,
+              reason: "card is inside the owning plan parent's blockedBy closure; landing is the parent's ladder; parking blocked would deadlock the parent",
+            },
+          });
+        } else {
+          // AC2: safe to notify — the card is NOT in the parent's closure, so
+          // informing the assignee cannot create a deadlock.
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: DONE_CLOSE_LANDING_SHARED_CARRIER_ACTION,
+            entityType: "issue",
+            entityId: issue.id,
+            issueId: issue.id,
+            details: {
+              identifier: issue.identifier ?? null,
+              pr: prKey,
+              prState: state,
+              parentId: sharedCarrierParentId,
+              reason: "shared carrier: landing is the owning plan parent's ladder; remain done, do NOT park blocked",
+            },
+          });
+          await deps.svc.addComment(
+            issue.id,
+            `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is on a shared carrier (parent ${sharedCarrierParentId ?? "unknown"}). Landing is the parent's ladder — remain done, do NOT park blocked on your own carrier.`,
+            {},
+            { authorType: "system" },
+          );
+          if (opts.wakeup && issue.assigneeAgentId) {
+            await opts.wakeup(issue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: { issueId: issue.id, mutation: "comment" },
+            });
+          }
+        }
+        alreadySharedCarrier.add(prKey);
         continue;
       }
 

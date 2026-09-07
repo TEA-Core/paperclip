@@ -19,6 +19,8 @@ const mockFetchGitHubNodeId = vi.hoisted(() => vi.fn());
 // the real token-credential + GitHub paths (or, worse, real network).
 const mockFetchHeadViaTokenCandidates = vi.hoisted(() => vi.fn());
 const mockFetchHeadApprovedStatusViaTokenCandidates = vi.hoisted(() => vi.fn());
+// SUP-15383: shared-carrier detection.
+const mockResolveDeliveryIdentity = vi.hoisted(() => vi.fn());
 vi.mock("./merge-arming.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("./merge-arming.js")>();
   return {
@@ -30,6 +32,7 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
     fetchGitHubNodeId: mockFetchGitHubNodeId,
     fetchHeadViaTokenCandidates: mockFetchHeadViaTokenCandidates,
     fetchHeadApprovedStatusViaTokenCandidates: mockFetchHeadApprovedStatusViaTokenCandidates,
+    resolveDeliveryIdentity: mockResolveDeliveryIdentity,
   };
 });
 
@@ -67,6 +70,10 @@ type DbState = {
   sweptIssueId?: string;
   /** SUP-15315: the card's executionState (drives the approval-stamp read). */
   issueExecutionState?: Record<string, unknown> | null;
+  /** SUP-15383: the execution workspace's sourceIssueId (the owning plan parent). */
+  executionWorkspaceSourceIssueId?: string | null;
+  /** SUP-15383: blockedBy edges for the BFS closure check. */
+  blockedByEdges?: Array<{ relatedIssueId: string }>;
 };
 
 /**
@@ -105,6 +112,26 @@ function makeDb(state: DbState) {
               Promise.resolve([
                 { executionState: state.issueExecutionState ?? null },
               ]),
+          }),
+        };
+      }
+      // SUP-15383: execution workspace source issue (the owning plan parent).
+      if ("sourceIssueId" in cols) {
+        return {
+          from: () => ({
+            where: () =>
+              Promise.resolve([
+                { sourceIssueId: state.executionWorkspaceSourceIssueId ?? null },
+              ]),
+          }),
+        };
+      }
+      // SUP-15383: blockedBy BFS edges.
+      if ("relatedIssueId" in cols) {
+        return {
+          from: () => ({
+            where: () =>
+              Promise.resolve(state.blockedByEdges ?? []),
           }),
         };
       }
@@ -296,6 +323,7 @@ beforeEach(() => {
   mockFetchGitHubNodeId.mockReset();
   mockFetchHeadViaTokenCandidates.mockReset();
   mockFetchHeadApprovedStatusViaTokenCandidates.mockReset();
+  mockResolveDeliveryIdentity.mockReset();
   mockCreateGitHubExternalObjectProvider.mockReset();
 });
 
@@ -1625,6 +1653,197 @@ describe("createDoneCloseLandingBackstopService", () => {
       // Stamp match short-circuits the status read (AC5).
       expect(mockFetchHeadApprovedStatusViaTokenCandidates).not.toHaveBeenCalled();
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("SUP-15383: shared-carrier exemption", () => {
+    const PARENT = "55555555-5555-4555-8555-555555555555";
+    const WORKSPACE = "66666666-6666-4666-8666-666666666666";
+
+    function sharedCarrierCandidateRow() {
+      return {
+        details: {
+          identifier: "SUP-15383-child",
+          reason: "open_linked_prs_decision_carried:1",
+          skipReason: "open_linked_prs_decision_carried:1",
+        },
+        createdAt: new Date(IN_WINDOW),
+        issue: {
+          id: ISSUE,
+          companyId: COMPANY,
+          status: "done",
+          identifier: "SUP-15383-child",
+          assigneeAgentId: AGENT,
+          executionWorkspaceId: WORKSPACE,
+        },
+      };
+    }
+
+    it("NOT-in-closure: emits shared_carrier audit + comment + wake, no blocked update (AC5a)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const state: DbState = {
+        candidates: [sharedCarrierCandidateRow()],
+        existingLandingRows: [],
+        executionWorkspaceSourceIssueId: PARENT,
+        blockedByEdges: [],
+      };
+      const { service } = makeService(state, { wakeup });
+      // Shared carrier: branch belongs to a different issue.
+      mockResolveDeliveryIdentity.mockResolvedValue({
+        branch: "SUP-parent-branch",
+        repo: { owner: "paperclipai", repo: "paperclip" },
+        branchIsOwn: false,
+        identifier: "SUP-15383-child",
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 3443 }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      // SUP-15315 gate: needed because mergeArmingEnabled is true.
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_tok", scope: "company", secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      const result = await service.sweep();
+
+      // No count fields increment for shared-carrier disposition.
+      expect(result).toEqual({
+        due: true, candidates: 1, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0,
+      });
+      // AC2: audit row emitted.
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_shared_carrier",
+        entityId: ISSUE,
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#3443",
+          parentId: PARENT,
+        }),
+      }));
+      // Comment + wake fire.
+      expect(mockAddComment).toHaveBeenCalledWith(
+        ISSUE,
+        expect.stringContaining("shared carrier"),
+        {},
+        { authorType: "system" },
+      );
+      expect(wakeup).toHaveBeenCalledTimes(1);
+      // No blocked update, no re-enqueue.
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+      // No normal escalation/fail audit.
+      expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_escalated",
+      }));
+      expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_failed",
+      }));
+    });
+
+    it("IN-closure: emits deadlock_skip audit only, no comment, no wake, no block (AC5b)", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const state: DbState = {
+        candidates: [sharedCarrierCandidateRow()],
+        existingLandingRows: [],
+        executionWorkspaceSourceIssueId: PARENT,
+        // The card IS in the parent's blockedBy closure: parent → ... → card.
+        blockedByEdges: [
+          { relatedIssueId: "77777777-7777-4777-8777-777777777777" },
+        ],
+      };
+      // Override to make the BFS reach the target: the single edge points to
+      // a different node, so we need the target to be directly reachable.
+      // Actually, let's set it up so the parent directly blocks the card:
+      state.blockedByEdges = [{ relatedIssueId: ISSUE }];
+      const { service } = makeService(state, { wakeup });
+      mockResolveDeliveryIdentity.mockResolvedValue({
+        branch: "SUP-parent-branch",
+        repo: { owner: "paperclipai", repo: "paperclip" },
+        branchIsOwn: false,
+        identifier: "SUP-15383-child",
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 3443 }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_tok", scope: "company", secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      const result = await service.sweep();
+
+      expect(result).toEqual({
+        due: true, candidates: 1, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0,
+      });
+      // AC3: deadlock_skip audit emitted.
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_shared_carrier_deadlock_skip",
+        entityId: ISSUE,
+        details: expect.objectContaining({
+          pr: "paperclipai/paperclip#3443",
+          parentId: PARENT,
+        }),
+      }));
+      // No normal shared_carrier action (that's the not-in-closure path).
+      expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_shared_carrier",
+      }));
+      // No comment, no wake, no block.
+      expect(mockAddComment).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    });
+
+    it("ordinary single-card (branchIsOwn=true): shared-carrier path not taken, normal disposition proceeds (AC5c)", async () => {
+      const state: DbState = {
+        candidates: [sharedCarrierCandidateRow()],
+        existingLandingRows: [],
+      };
+      const { service } = makeService(state);
+      // branchIsOwn = true: the card owns its branch, so the shared-carrier
+      // exemption does NOT apply. Normal disposition proceeds.
+      mockResolveDeliveryIdentity.mockResolvedValue({
+        branch: "SUP-own-branch",
+        repo: { owner: "paperclipai", repo: "paperclip" },
+        branchIsOwn: true,
+        identifier: "SUP-15383-child",
+      });
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr({ number: 3443, nodeId: "PRNode_abc123" }),
+      ]);
+      mockResolver(async () => openSnapshot);
+      mockFetchHeadViaTokenCandidates.mockResolvedValue({ ok: true, headSha: LIVE_SHA });
+      mockFetchHeadApprovedStatusViaTokenCandidates.mockResolvedValue({ ok: true, approved: true });
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_tok", scope: "company", secretName: "github-token",
+      });
+      mockEnableAutoMerge.mockResolvedValue({ success: true, alreadyQueued: false, error: null, status: 200 });
+
+      const result = await service.sweep();
+
+      // Normal re-enqueue path taken (mergeArmingEnabled is undefined → false,
+      // so it actually escalates). Wait: companyMergeArmingEnabled is undefined
+      // → mergeArmingEnabled = false. So the re-enqueue lane is closed → escalate.
+      expect(result).toEqual({
+        due: true, candidates: 1, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 1,
+      });
+      // No shared-carrier audit rows.
+      expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_shared_carrier",
+      }));
+      expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_shared_carrier_deadlock_skip",
+      }));
+      // Normal escalation fired.
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_escalated",
+      }));
     });
   });
 });
