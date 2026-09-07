@@ -173,6 +173,14 @@ jobs:
       - name: Test PR security gate wiring
         run: node --test ./scripts/__tests__/pr-security-gate.test.mjs
 
+      - name: Test paperclip-approved enforcer countersignature
+        # The enforcer had no test of any kind before this. It is the last gate
+        # before a commit lands on the branch that auto-deploys to production,
+        # and on a fold-sync head its waiver path is the ONLY route -- so the
+        # countersignature is the single thing standing between the fleet's own
+        # `pull_requests:write` grant and a self-waived fold merge.
+        run: node --test ./scripts/__tests__/paperclip-approved-countersign.test.mjs
+
       - name: Test paperclip-approved status attribution
         # `paperclip/approved` is a plain commit status and the `fleet-only`
         # installation grants `statuses:write` to every Paperclip-assigned

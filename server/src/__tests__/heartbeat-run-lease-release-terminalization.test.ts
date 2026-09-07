@@ -51,10 +51,15 @@ describeEmbeddedPostgres("heartbeat terminalizeRunOnLeaseRelease", () => {
     await tempDb?.cleanup();
   });
 
-  async function seed(input: { issueStatus: string; runStatus: string }) {
+  async function seed(input: {
+    issueStatus?: string;
+    runStatus: string;
+    issueIdentifier?: string | null;
+    withIssue?: boolean;
+  }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
-    const issueId = randomUUID();
+    const issueId = input.withIssue === false ? null : randomUUID();
     const runId = randomUUID();
 
     await db.insert(companies).values({
@@ -74,14 +79,17 @@ describeEmbeddedPostgres("heartbeat terminalizeRunOnLeaseRelease", () => {
       runtimeConfig: {},
       permissions: {},
     });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Terminalize on lease release",
-      status: input.issueStatus,
-      priority: "high",
-      assigneeAgentId: agentId,
-    });
+    if (issueId) {
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Terminalize on lease release",
+        status: input.issueStatus ?? "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        ...(input.issueIdentifier ? { identifier: input.issueIdentifier } : {}),
+      });
+    }
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId,
@@ -89,7 +97,7 @@ describeEmbeddedPostgres("heartbeat terminalizeRunOnLeaseRelease", () => {
       status: input.runStatus,
       invocationSource: "manual",
       startedAt: new Date(),
-      contextSnapshot: { issueId },
+      contextSnapshot: issueId ? { issueId } : {},
     });
 
     const run = await db
@@ -208,5 +216,59 @@ describeEmbeddedPostgres("heartbeat terminalizeRunOnLeaseRelease", () => {
       .where(eq(heartbeatRunEvents.runId, runId))
       .then((rows) => rows.length);
     expect(eventCount).toBe(0);
+  });
+
+  it("attributes the terminalized error and run event to the owning issue", async () => {
+    const { issueId, runId, run } = await seed({
+      issueStatus: "in_progress",
+      runStatus: "running",
+      issueIdentifier: "SUP-4242",
+    });
+    expect(issueId).toBeTruthy();
+
+    const heartbeat = heartbeatService(db);
+    const terminal = await heartbeat.terminalizeRunOnLeaseRelease(run);
+
+    expect(terminal.status).toBe("interrupted");
+
+    const row = await db
+      .select({ error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(row?.errorCode).toBe("lease_released_before_terminal");
+    expect(row?.error).toContain("(issue: SUP-4242");
+    expect(row?.error).toContain(issueId!);
+
+    const event = await db
+      .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId))
+      .then((rows) => rows[0]);
+    expect(event?.message).toContain("SUP-4242");
+    const payload = (event?.payload ?? null) as
+      | { issueId?: string; issueIdentifier?: string }
+      | null;
+    expect(payload?.issueId).toBe(issueId);
+    expect(payload?.issueIdentifier).toBe("SUP-4242");
+  });
+
+  it("emits no issue attribution when the run has no owning issue", async () => {
+    const { runId, run } = await seed({ runStatus: "running", withIssue: false });
+
+    const heartbeat = heartbeatService(db);
+    const terminal = await heartbeat.terminalizeRunOnLeaseRelease(run);
+
+    expect(terminal.status).toBe("interrupted");
+
+    const row = await db
+      .select({ error: heartbeatRuns.error })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(row?.error).toBe(
+      "run terminalized on environment lease release: heartbeat_runs.status was still running at teardown",
+    );
+    expect(row?.error).not.toContain("(issue:");
   });
 });

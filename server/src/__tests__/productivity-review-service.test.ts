@@ -589,6 +589,74 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
+  it("does not raise a review for an external_pull seat even when its active episode exceeds the threshold (SUP-15296)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // The pull-only seat's `/bin/echo` adapter and external_pull declaration mean
+    // it has never run and never will via the platform, so every run-derived
+    // metric is structurally zero. The 6h active episode must NOT produce a card.
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { workDelivery: "external_pull" } })
+      .where(eq(agents.id, seeded.coderId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not raise a review for a seat whose heartbeat is fully off even on a long active episode (SUP-15296)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } })
+      .where(eq(agents.id, seeded.coderId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still raises a review for an invoked seat with a live dispatch path even when it has never run", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // A normal invoked seat with heartbeat enabled CAN dispatch runs; the
+    // no-dispatch gate must not suppress it.
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: true } } })
+      .where(eq(agents.id, seeded.coderId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
   it("skips a long-active candidate while its assignee is paused and reviews it once unpaused", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
