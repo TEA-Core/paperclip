@@ -288,7 +288,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES, recoveryService } from "./recovery/service.js";
+import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES, hasPendingWakeInteraction, recoveryService } from "./recovery/service.js";
 import { collectDispositionRepairSourceState } from "./recovery/disposition-repair.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
@@ -3605,6 +3605,24 @@ export function buildReferencedProjectRunObservability(input: {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+// Append the owning issue's attribution to a human-readable heartbeat-failure
+// message so downstream consumers (e.g. the stack-admin gate 3 per-issue rule)
+// can attribute the failure to its issue. Stable, greppable shape:
+// " (issue: SUP-1234 <uuid>)" when the identifier is known, " (issue: <uuid>)"
+// otherwise. Empty string when the run has no owning issue (no fabricated
+// attribution).
+function issueAttributionSuffix(issueId: string | null, issueIdentifier: string | null): string {
+  if (!issueId) return "";
+  return issueIdentifier ? ` (issue: ${issueIdentifier} ${issueId})` : ` (issue: ${issueId})`;
+}
+
+// Structured log-record fields carrying the owning issue's attribution. Empty
+// object when the run has no owning issue.
+function issueAttributionLogFields(issueId: string | null, issueIdentifier: string | null): Record<string, string> {
+  if (!issueId) return {};
+  return { issueId, ...(issueIdentifier ? { issueIdentifier } : {}) };
 }
 
 function sanitizeAgentSessionMessageText(value: unknown): string | null {
@@ -9735,19 +9753,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // matching terminal run status. Otherwise the teardown cut the run short,
     // so use "interrupted".
     const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    let issueIdentifier: string | null = null;
     let terminalStatus: "succeeded" | "cancelled" | "interrupted" = "interrupted";
     if (issueId) {
-      const issueStatus = await db
-        .select({ status: issues.status })
+      const issueRow = await db
+        .select({ status: issues.status, identifier: issues.identifier })
         .from(issues)
         .where(eq(issues.id, issueId))
-        .then((rows) => rows[0]?.status ?? null);
-      if (issueStatus === "done") terminalStatus = "succeeded";
-      else if (issueStatus === "cancelled") terminalStatus = "cancelled";
+        .then((rows) => rows[0] ?? null);
+      issueIdentifier = readNonEmptyString(issueRow?.identifier);
+      if (issueRow?.status === "done") terminalStatus = "succeeded";
+      else if (issueRow?.status === "cancelled") terminalStatus = "cancelled";
     }
 
     const message =
-      `run terminalized on environment lease release: heartbeat_runs.status was still ${run.status} at teardown`;
+      `run terminalized on environment lease release: heartbeat_runs.status was still ${run.status} at teardown` +
+      issueAttributionSuffix(issueId, issueIdentifier);
     // Match both "running" and "queued". A queued run has released its lease but
     // never reached "running", so a running-only update would miss it and leave
     // a phantom live run behind.
@@ -9773,10 +9794,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           terminalStatus,
           reason: "environment_lease_release",
           ...(issueId ? { issueId } : {}),
+          ...(issueIdentifier ? { issueIdentifier } : {}),
         },
       }).catch((eventErr) => {
         logger.warn(
-          { err: eventErr, runId: run.id },
+          { err: eventErr, runId: run.id, ...issueAttributionLogFields(issueId, issueIdentifier) },
           "failed to append run event for lease-release terminalization",
         );
       });
@@ -18386,10 +18408,24 @@ function pendingCleanupAttemptsSql() {
           } else {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
-          const message = redactCurrentUserText(
-            outerErr instanceof Error ? outerErr.message : "Unknown setup failure",
-            await getCurrentUserRedactionOptions(),
-          );
+          // Attribute the failure to the owning issue (id + SUP-NNN identifier) so
+          // downstream consumers (e.g. the stack-admin gate 3 per-issue rule) can
+          // key on it instead of falling through to a raw count.
+          const setupFailureIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+          const setupFailureIssueIdentifier = setupFailureIssueId
+            ? await db
+                .select({ identifier: issues.identifier })
+                .from(issues)
+                .where(eq(issues.id, setupFailureIssueId))
+                .then((rows) => readNonEmptyString(rows[0]?.identifier))
+                .catch(() => null)
+            : null;
+          const message =
+            redactCurrentUserText(
+              outerErr instanceof Error ? outerErr.message : "Unknown setup failure",
+              await getCurrentUserRedactionOptions(),
+            ) +
+            issueAttributionSuffix(setupFailureIssueId, setupFailureIssueIdentifier);
           // A missing secret/env binding is a known pre-dispatch configuration gap,
           // not an opaque setup crash. Surface it with its own errorCode so the
           // recovery path routes it to a human owner instead of looping retries.
@@ -18409,7 +18445,10 @@ function pendingCleanupAttemptsSql() {
             nativeRunnerErrorCode(outerErr) ??
             recordedResponsibleUserDenialCode ??
             "setup_failed";
-          logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
+          logger.error(
+            { err: outerErr, runId, ...issueAttributionLogFields(setupFailureIssueId, setupFailureIssueIdentifier) },
+            "heartbeat execution setup failed",
+          );
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
           // Emit the run-log event before the status flip so the event stream is
           // complete by the time terminal status is observable. Only do so while
@@ -18460,7 +18499,6 @@ function pendingCleanupAttemptsSql() {
           const failedRun = await getRun(runId).catch(() => null);
           if (setupFailureWrite.updated && failedRun) {
             const livenessRun = await classifyAndPersistRunLiveness(failedRun).catch(() => failedRun);
-            const setupFailureIssueId = readNonEmptyString(parseObject(livenessRun.contextSnapshot).issueId);
             if (setupFailureIssueId) {
               await completeSkillTestRunForHeartbeatOutcome({
                 run: livenessRun,
@@ -19385,6 +19423,12 @@ function pendingCleanupAttemptsSql() {
           options.suppressImmediateRecovery ||
           existingReviewParticipantExecutionPath ||
           issueHasPersistedMonitor ||
+          // A held review child gated on a pending board interaction whose continuationPolicy
+          // wakes the assignee has a durable, self-resolving wake path. Parking it `blocked`
+          // with an empty blocker set is exactly the state the zero-blocker heal
+          // (reconcileBlockedWithoutBlockers) is forbidden to touch, so both sweeps must use
+          // the same liveness predicate and release rather than block (SUP-15237).
+          (await hasPendingWakeInteraction(db, issue.companyId, issue.id)) ||
           await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
         ) {
           return { kind: "released" as const };

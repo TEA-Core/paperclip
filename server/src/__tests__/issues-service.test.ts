@@ -3937,6 +3937,150 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  async function seedCarrierForCreateSite(options: {
+    workspaceMode: "shared_workspace" | "isolated_workspace";
+    /**
+     * true = the carrier's sourceIssueId is the child's own parent (the
+     * sanctioned carrier → exempt). false = the source is a separate card that
+     * is not in the child's parent chain (the SUP-15205 gate still declines).
+     */
+    carrierSourceIsAncestor: boolean;
+  }) {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const parentIssueId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+    });
+
+    // The child is created under this parent; its parent chain is just this row.
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Plan parent",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    // The issue the carrier row is sourced by. Carrier = the parent itself;
+    // non-carrier = a separate top-level card not in the child's parent chain.
+    // It must exist before the execution_workspaces insert (source_issue_id FK).
+    let carrierSourceIssueId = parentIssueId;
+    if (!options.carrierSourceIsAncestor) {
+      carrierSourceIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: carrierSourceIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Sister card",
+        status: "in_progress",
+        priority: "medium",
+      });
+    }
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: options.workspaceMode,
+      strategyType: "project_primary",
+      sourceIssueId: carrierSourceIssueId,
+      branchName: "SUP-1-plan-deep-tools",
+      name: "Plan carrier",
+      status: "active",
+      providerType: "local_fs",
+    });
+
+    // Bind the parent to the carrier now that the row exists.
+    await db.update(issues).set({
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: options.workspaceMode },
+    }).where(eq(issues.id, parentIssueId));
+
+    return { companyId, projectId, parentIssueId, executionWorkspaceId };
+  }
+
+  it("restores an ancestor-sourced shared_workspace plan carrier at the create site (SUP-15231 exemption)", async () => {
+    const { companyId, projectId, parentIssueId, executionWorkspaceId } = await seedCarrierForCreateSite({
+      workspaceMode: "shared_workspace",
+      carrierSourceIsAncestor: true,
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId,
+      title: "Plan child",
+    });
+
+    // The carrier is the child's parent and a shared row, so it is exempt: the
+    // child inherits the carrier branch verbatim instead of realizing its own.
+    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
+    expect(child.executionWorkspacePreference).toBe("reuse_existing");
+    expect(child.executionWorkspaceSettings).toMatchObject({ mode: "shared_workspace" });
+  });
+
+  it("still declines a shared_workspace source whose source is not an ancestor at the create site (SUP-15205 gate preserved)", async () => {
+    const { companyId, projectId, parentIssueId, executionWorkspaceId } = await seedCarrierForCreateSite({
+      workspaceMode: "shared_workspace",
+      carrierSourceIsAncestor: false,
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId,
+      title: "Plan child",
+    });
+
+    // Not an ancestor, so the exemption does not fire: the child realizes its
+    // own workspace and is not bound to the foreign carrier.
+    expect(child.executionWorkspaceId).toBeNull();
+    expect(child.executionWorkspaceId).not.toBe(executionWorkspaceId);
+  });
+
+  it("still declines an ancestor-sourced isolated_workspace source at the create site (cross-source gate preserved)", async () => {
+    const { companyId, projectId, parentIssueId, executionWorkspaceId } = await seedCarrierForCreateSite({
+      workspaceMode: "isolated_workspace",
+      carrierSourceIsAncestor: true,
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId,
+      title: "Plan child",
+    });
+
+    // An isolated_workspace row sourced by another issue is cross-source and
+    // declines regardless of ancestry: the child realizes its own workspace.
+    expect(child.executionWorkspaceId).toBeNull();
+    expect(child.executionWorkspaceId).not.toBe(executionWorkspaceId);
+  });
+
   it("createChild applies parent defaults, acceptance criteria, workspace inheritance, and optional parent blocker chaining", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -7558,5 +7702,170 @@ describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance
         }),
       ],
     });
+  });
+});
+
+describeEmbeddedPostgres("issueService.create company defaultExecutionPolicy inheritance", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-create-company-default-policy-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  const companyPolicyAgentId = randomUUID();
+
+  const companyPolicy: IssueExecutionPolicy = {
+    mode: "normal",
+    commentRequired: true,
+    stages: [
+      {
+        type: "review",
+        approvalsNeeded: 1,
+        participants: [{ type: "agent", agentId: companyPolicyAgentId, userId: null }],
+      },
+    ],
+  };
+
+  it("inherits the company defaultExecutionPolicy when the issue has no project", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultExecutionPolicy: companyPolicy as unknown as Record<string, unknown>,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId: null,
+      title: "Project-less issue inherits company default",
+    });
+
+    expect(issue.executionPolicy).toMatchObject({
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        {
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [expect.objectContaining({ type: "agent", agentId: companyPolicyAgentId })],
+        },
+      ],
+    });
+  });
+
+  it("leaves executionPolicy null when neither project nor company has a default", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId: null,
+      title: "No defaults anywhere",
+    });
+
+    expect(issue.executionPolicy).toBeNull();
+  });
+
+  it("project default takes precedence over company default when both are set", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectPolicyAgentId = randomUUID();
+
+    const projectPolicy: IssueExecutionPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        {
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId: projectPolicyAgentId, userId: null }],
+        },
+      ],
+    };
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultExecutionPolicy: companyPolicy as unknown as Record<string, unknown>,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Policy project",
+      status: "in_progress",
+      defaultExecutionPolicy: projectPolicy as unknown as Record<string, unknown>,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId,
+      title: "Issue with both project and company defaults",
+    });
+
+    expect(issue.executionPolicy).toMatchObject({
+      stages: [
+        {
+          participants: [expect.objectContaining({ agentId: projectPolicyAgentId })],
+        },
+      ],
+    });
+    expect(issue.executionPolicy).not.toMatchObject({
+      stages: [
+        {
+          participants: [expect.objectContaining({ agentId: companyPolicyAgentId })],
+        },
+      ],
+    });
+  });
+
+  it("a malformed company default yields a null policy rather than throwing", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultExecutionPolicy: "this-is-not-valid-json" as unknown as Record<string, unknown>,
+    });
+
+    const issue = await svc.create(companyId, {
+      projectId: null,
+      title: "Issue with malformed company default",
+    });
+
+    expect(issue.executionPolicy).toBeNull();
   });
 });

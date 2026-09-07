@@ -8061,6 +8061,18 @@ registerCurrentRoute({
 
 registerCurrentRoute({
   method: "get",
+  path: "/api/tool-gateway/plugin-tools/health",
+  tags: ["tool-gateway"],
+  summary: "Report whether the agent's bound plugin tools can deliver",
+  query: z.object({
+    companyId: z.string().optional(),
+    agentId: z.string().optional(),
+  }),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
+  method: "get",
   path: "/api/tool-gateway/tools",
   tags: ["tool-gateway"],
   summary: "List tools available to a gateway session",

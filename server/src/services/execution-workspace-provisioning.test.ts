@@ -40,6 +40,12 @@ import {
   buildSessionWorkspaceConfigCategoryValue,
   projectExecutionWorkspaceForSessionCategory,
 } from "./heartbeat.js";
+import {
+  executionWorkspaceBranchNamesAnyIssueIdentifier,
+  executionWorkspaceBranchNamesDifferentIssue,
+  inheritedExecutionWorkspaceBranchDeclined,
+  inheritedExecutionWorkspaceBranchExempt,
+} from "./execution-workspace-policy.js";
 
 type SessionConfigMetadata = Awaited<ReturnType<typeof buildEffectiveRunSessionConfigMetadata>>;
 
@@ -1456,5 +1462,730 @@ describeEmbeddedPostgres("allowIssueOverride enforcement (SUP-13058)", () => {
     // Run 2 must NOT be rejected. This is the arm the first implementation failed.
     const second = await provisionOnce(randomUUID());
     expect(second.kind).toBe("provisioned");
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// SUP-15205: implicit execution-workspace inheritance must not restore a
+// persisted workspace whose recorded branch names a different issue's
+// delivery branch — the one-branch-one-issue invariant that
+// scripts/deliver.sh enforces at delivery time.
+// ---------------------------------------------------------------------------
+
+describe("inheritedExecutionWorkspaceBranchDeclined (SUP-15205)", () => {
+  it("stays out of scope for branches that name no deliverable sup id", () => {
+    expect(
+      executionWorkspaceBranchNamesDifferentIssue({
+        issueIdentifier: "SUP-2",
+        workspaceBranchName: "feature/awesome-things",
+      }),
+    ).toBe(false);
+    expect(
+      executionWorkspaceBranchNamesDifferentIssue({
+        issueIdentifier: "SUP-2",
+        workspaceBranchName: "main",
+      }),
+    ).toBe(false);
+  });
+
+  it("treats a branch naming the issue's own sup id as its own branch", () => {
+    expect(
+      executionWorkspaceBranchNamesDifferentIssue({
+        issueIdentifier: "SUP-2",
+        workspaceBranchName: "SUP-2-resumed",
+      }),
+    ).toBe(false);
+    expect(
+      executionWorkspaceBranchNamesDifferentIssue({
+        issueIdentifier: "SUP-2",
+        workspaceBranchName: "sup-2",
+      }),
+    ).toBe(false);
+  });
+
+  it("declines a branch that names a different issue's sup id", () => {
+    expect(
+      executionWorkspaceBranchNamesDifferentIssue({
+        issueIdentifier: "SUP-2",
+        workspaceBranchName: "SUP-1-plan-deep-tools",
+      }),
+    ).toBe(true);
+    // A branch naming BOTH ids is the issue's own as far as the gate is
+    // concerned — deliver.sh's `sort -u` membership test passes.
+    expect(
+      executionWorkspaceBranchNamesDifferentIssue({
+        issueIdentifier: "SUP-2",
+        workspaceBranchName: "SUP-1-SUP-2-combined",
+      }),
+    ).toBe(false);
+  });
+
+  it("matches whole sup ids, not digit prefixes of longer ids", () => {
+    expect(
+      executionWorkspaceBranchNamesDifferentIssue({
+        issueIdentifier: "SUP-1510",
+        workspaceBranchName: "SUP-15104",
+      }),
+    ).toBe(true);
+    expect(
+      executionWorkspaceBranchNamesDifferentIssue({
+        issueIdentifier: "SUP-15104",
+        workspaceBranchName: "SUP-15104",
+      }),
+    ).toBe(false);
+  });
+
+  it("flags any branch carrying a deliverable sup id (create-time helper)", () => {
+    // The create-path arm in issues.ts declines inheritance when the source
+    // branch carries any `sup-<n>` token; at create time the new issue's number
+    // is strictly greater than every existing one, so any such token names a
+    // different issue's delivery branch.
+    expect(executionWorkspaceBranchNamesAnyIssueIdentifier("SUP-1-plan-deep-tools")).toBe(true);
+    expect(executionWorkspaceBranchNamesAnyIssueIdentifier("sup-15099")).toBe(true);
+    expect(executionWorkspaceBranchNamesAnyIssueIdentifier("SUP-1-SUP-2-combined")).toBe(true);
+    // A branch naming no deliverable sup id is out of the gate's scope (AC2).
+    expect(executionWorkspaceBranchNamesAnyIssueIdentifier("feature/awesome-things")).toBe(false);
+    expect(executionWorkspaceBranchNamesAnyIssueIdentifier("release/2026.08")).toBe(false);
+    expect(executionWorkspaceBranchNamesAnyIssueIdentifier("main")).toBe(false);
+    expect(executionWorkspaceBranchNamesAnyIssueIdentifier(null)).toBe(false);
+    expect(executionWorkspaceBranchNamesAnyIssueIdentifier("")).toBe(false);
+    expect(executionWorkspaceBranchNamesAnyIssueIdentifier("   ")).toBe(false);
+  });
+
+  it("declines a cross-source binding onto a foreign sup branch regardless of workspace mode", () => {
+    // workspaceMode is deliberately NOT a parameter: the discriminator is the
+    // branch identity, and the live strands this card closes are shared
+    // workspace rows sourced by their parent. The embedded acceptance-delta
+    // test below proves the mode-specific end-to-end behavior.
+    const base = {
+      issueId: "child",
+      issueIdentifier: "SUP-2",
+      workspaceBranchName: "SUP-1-plan-deep-tools",
+    };
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceSourceIssueId: "parent" }),
+    ).toBe(true);
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceSourceIssueId: null }),
+    ).toBe(false);
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceSourceIssueId: "" }),
+    ).toBe(false);
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceSourceIssueId: "child" }),
+    ).toBe(false);
+  });
+
+  it("returns false when the issue identifier is missing", () => {
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({
+        issueId: "child",
+        issueIdentifier: null,
+        workspaceSourceIssueId: "parent",
+        workspaceBranchName: "SUP-1-plan-deep-tools",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("inheritedExecutionWorkspaceBranchExempt (SUP-15231)", () => {
+  it("exempts an ancestor-sourced shared_workspace carrier", () => {
+    expect(
+      inheritedExecutionWorkspaceBranchExempt({
+        workspaceMode: "shared_workspace",
+        workspaceSourceIssueId: "parent",
+        sourceIssueIsAncestorOfBoundIssue: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not exempt a shared_workspace row whose source is not an ancestor", () => {
+    expect(
+      inheritedExecutionWorkspaceBranchExempt({
+        workspaceMode: "shared_workspace",
+        workspaceSourceIssueId: "sibling",
+        sourceIssueIsAncestorOfBoundIssue: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not exempt an isolated_workspace row even when the source is an ancestor", () => {
+    for (const mode of ["isolated_workspace", "operator_branch"] as const) {
+      expect(
+        inheritedExecutionWorkspaceBranchExempt({
+          workspaceMode: mode,
+          workspaceSourceIssueId: "parent",
+          sourceIssueIsAncestorOfBoundIssue: true,
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("does not exempt a sourceless or empty-source shared_workspace row", () => {
+    expect(
+      inheritedExecutionWorkspaceBranchExempt({
+        workspaceMode: "shared_workspace",
+        workspaceSourceIssueId: null,
+        sourceIssueIsAncestorOfBoundIssue: true,
+      }),
+    ).toBe(false);
+    expect(
+      inheritedExecutionWorkspaceBranchExempt({
+        workspaceMode: "shared_workspace",
+        workspaceSourceIssueId: "   ",
+        sourceIssueIsAncestorOfBoundIssue: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps the decline verdict for non-carrier inputs and threads mode + ancestor through the declined predicate", () => {
+    const base = {
+      issueId: "child",
+      issueIdentifier: "SUP-2",
+      workspaceBranchName: "SUP-1-plan-deep-tools",
+      workspaceSourceIssueId: "parent",
+    };
+    // isolated / operator_branch sourced by an ancestor still declines (the defect SUP-15205 fixes).
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceMode: "isolated_workspace", sourceIssueIsAncestorOfBoundIssue: true }),
+    ).toBe(true);
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceMode: "operator_branch", sourceIssueIsAncestorOfBoundIssue: true }),
+    ).toBe(true);
+    // shared_workspace sourced by a non-ancestor still declines.
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceMode: "shared_workspace", sourceIssueIsAncestorOfBoundIssue: false }),
+    ).toBe(true);
+    // shared_workspace sourced by an ancestor is exempt — restored, not declined.
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined({ ...base, workspaceMode: "shared_workspace", sourceIssueIsAncestorOfBoundIssue: true }),
+    ).toBe(false);
+    // no mode supplied (legacy shape) still declines a cross-source sup branch.
+    expect(
+      inheritedExecutionWorkspaceBranchDeclined(base),
+    ).toBe(true);
+  });
+});
+
+describeEmbeddedPostgres("inherited execution workspace branch-identity decline (SUP-15205)", () => {
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let db: Db;
+  let tempRoots: string[] = [];
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-branch-identity-decline-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    for (const root of tempRoots.splice(0)) {
+      await rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
+    await db.delete(heartbeatRuns);
+    await db.delete(issues);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(executionWorkspaces);
+    await db.delete(environments);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await db.$client.end();
+    await tempDb?.cleanup();
+  }, 60_000);
+
+  /**
+   * Seeds the default-inheritance shape: a PARENT issue whose server-realized
+   * workspace recorded a branch, and a CHILD issue bound to that workspace the
+   * way default inheritance binds it (reuse_existing). The project renders
+   * the issue identifier as the fresh branch name, and the parent's worktree
+   * is a REAL git worktree checked out on the recorded branch so the restore
+   * arm can actually restore onto it (the pre-fix behaviour under test).
+   */
+  async function seed(options: {
+    workspaceBranchName: string;
+    /** Which issue (if any) the persisted workspace row records as its source. */
+    workspaceSource: "parent" | "none";
+    childBound: boolean;
+    /** The persisted workspace row's mode. Defaults to isolated_workspace. */
+    workspaceMode?: "isolated_workspace" | "shared_workspace";
+    /**
+     * SUP-15231: link the child's parentId to the workspace's source issue so
+     * the source is a strict ancestor of the child. Off by default — the
+     * SUP-15205 tests seed the source WITHOUT a parent link, which is exactly
+     * the "not an ancestor" shape that must still decline.
+     */
+    childParentedToSource?: boolean;
+  }) {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    const parentWorkspaceId = randomUUID();
+    const now = new Date("2026-09-01T00:00:00.000Z");
+
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-branch-decline-"));
+    tempRoots.push(tempRoot);
+    initTempGitRepo(tempRoot);
+    const parentWorktreeDir = path.join(tempRoot, "parent-worktree");
+    execSync(`git worktree add -b "${options.workspaceBranchName}" "${parentWorktreeDir}"`, {
+      cwd: tempRoot,
+      stdio: "pipe",
+    });
+
+    await instanceSettingsService(db).updateExperimental({
+      enableIsolatedWorkspaces: true,
+      enableWorkspaceBranchReconcileForward: false,
+      enableWorkspaceDirtyQuarantineRepair: false,
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Acme",
+      issuePrefix: "SUP",
+      status: "active",
+      defaultResponsibleUserId: "responsible-user",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Branch identity test",
+      status: "active",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        workspaceStrategy: {
+          type: "git_worktree",
+          baseRef: "HEAD",
+          branchTemplate: "{{issue.identifier}}",
+        },
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: tempRoot,
+      isPrimary: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "BranchIdentityAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: { issueId: childId, taskId: childId, wakeReason: "issue_assigned" },
+      responsibleUserId: "responsible-user",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: parentId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Plan parent",
+      status: "in_progress",
+      workMode: "standard",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: "SUP-1",
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+      startedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: parentWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId: options.workspaceSource === "parent" ? parentId : null,
+      mode: options.workspaceMode ?? "isolated_workspace",
+      strategyType: "git_worktree",
+      name: options.workspaceBranchName,
+      status: "active",
+      cwd: parentWorktreeDir,
+      baseRef: "HEAD",
+      branchName: options.workspaceBranchName,
+      providerType: "git_worktree",
+      providerRef: parentWorktreeDir,
+      metadata: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Child card",
+      status: "in_progress",
+      workMode: "standard",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+      executionRunId: runId,
+      executionAgentNameKey: "branchidentityagent",
+      executionLockedAt: now,
+      responsibleUserId: "responsible-user",
+      issueNumber: 2,
+      identifier: "SUP-2",
+      parentId: options.childParentedToSource ? parentId : null,
+      executionWorkspaceId: options.childBound ? parentWorkspaceId : null,
+      executionWorkspacePreference: options.childBound ? "reuse_existing" : null,
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+      startedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const issueRef: ExecutionWorkspaceProvisioningIssueRef = {
+      id: childId,
+      identifier: "SUP-2",
+      title: "Child card",
+      status: "in_progress",
+      priority: "high",
+      workMode: "standard",
+      description: null,
+      projectId,
+      projectWorkspaceId,
+      executionWorkspaceId: options.childBound ? parentWorkspaceId : null,
+      executionWorkspacePreference: options.childBound ? "reuse_existing" : null,
+    };
+
+    const run = await db.query.heartbeatRuns.findFirst({ where: eq(heartbeatRuns.id, runId) });
+    const agent = await db.query.agents.findFirst({ where: eq(agents.id, agentId) });
+
+    const localEnvironment: Environment = {
+      id: "local-env",
+      name: "Local",
+      description: null,
+      driver: "local",
+      status: "active",
+      config: {},
+      envVars: {},
+      metadata: null,
+      createdAt: now,
+      updatedAt: now,
+    } as unknown as Environment;
+
+    async function provision() {
+      return provisionIssueExecutionWorkspace({
+        db,
+        run: run!,
+        agent: agent!,
+        issueId: childId,
+        issueRef,
+        runId,
+        previousSessionParams: null,
+        effectiveExecutionWorkspaceMode: "isolated_workspace",
+        trustPreset: standardTrustResolution(),
+        isolatedWorkspacesEnabled: true,
+        selectedEnvironmentId: null,
+        selectedEnvironmentForConfig: null,
+        localEnvironment,
+        environmentSelectionSource: "local",
+        configSnapshot: null,
+        secretManifest: [],
+        projectExecutionWorkspacePolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: true,
+          workspaceStrategy: {
+            type: "git_worktree",
+            baseRef: "HEAD",
+            branchTemplate: "{{issue.identifier}}",
+            provisionCommand: "echo provision",
+          },
+        },
+        issueExecutionWorkspaceSettings: { mode: "isolated_workspace" },
+        executionProjectId: projectId,
+        resolvedInstanceSettings: {
+          experimental: {
+            enableWorkspaceBranchReconcileForward: false,
+            enableWorkspaceDirtyQuarantineRepair: false,
+          },
+        },
+        mergedConfig: {},
+        executionPolicy: { executionMode: "standard" },
+        context: { issueId: childId, taskId: childId, wakeReason: "issue_assigned" },
+        resolveWorkspace: async () =>
+          buildResolvedWorkspace({
+            cwd: tempRoot,
+            source: "project_primary",
+            projectId,
+            workspaceId: projectWorkspaceId,
+            repoUrl: null,
+            repoRef: null,
+          }),
+        resolveSessionConfig: async (_input: {
+          persistedExecutionWorkspace: unknown;
+          postAttachIssuePatch: unknown;
+        }) => ({
+          previousSessionParams: null,
+          resetTaskSession: true,
+          sessionResetReason: null,
+          sessionConfigFreshness: {
+            reset: true,
+            reasons: ["initial"],
+            changedCategories: [],
+            nextFingerprint: null,
+            storedFingerprint: null,
+          },
+          sessionConfigMetadata: buildTestSessionConfigMetadata(),
+        }),
+        runLifecycle: {
+          onExecutionWorkspaceOccupied: async () => {
+            throw new Error("should not defer");
+          },
+        },
+      } as unknown as Parameters<typeof provisionIssueExecutionWorkspace>[0]);
+    }
+
+    return {
+      companyId,
+      projectId,
+      childId,
+      parentWorkspaceId,
+      provision,
+    };
+  }
+
+  it("realizes the child's own workspace instead of restoring the parent's delivery branch", async () => {
+    const { childId, parentWorkspaceId, provision } = await seed({
+      workspaceBranchName: "SUP-1-plan-deep-tools",
+      workspaceSource: "parent",
+      childBound: true,
+    });
+
+    const result = await provision();
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+
+    const persisted = result.persistedExecutionWorkspace!;
+    expect(persisted.id).not.toBe(parentWorkspaceId);
+    expect(persisted.branchName).toBe("SUP-2");
+    expect(persisted.sourceIssueId).toBe(childId);
+    expect(
+      executionWorkspaceBranchNamesDifferentIssue({
+        issueIdentifier: "SUP-2",
+        workspaceBranchName: persisted.branchName,
+      }),
+    ).toBe(false);
+
+    // The child's binding is re-pointed at its own workspace.
+    const childRows = await db
+      .select({
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+      })
+      .from(issues)
+      .where(eq(issues.id, childId));
+    expect(childRows[0]!.executionWorkspaceId).toBe(persisted.id);
+
+    // The parent's workspace is untouched: still on its own branch, still active.
+    const parentRows = await db
+      .select({
+        branchName: executionWorkspaces.branchName,
+        status: executionWorkspaces.status,
+      })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, parentWorkspaceId));
+    expect(parentRows[0]!.branchName).toBe("SUP-1-plan-deep-tools");
+    expect(parentRows[0]!.status).toBe("active");
+  }, 60_000);
+
+  it("restores a sourceless binding onto a genuinely shared branch (no sup id) — AC2", async () => {
+    // A branch that names no deliverable sup id is out of the gate's scope: the
+    // operator opted the child onto a genuinely shared branch, so it is
+    // restored verbatim. (The pre-fix test seeded "SUP-9-shared-feature", a
+    // foreign per-card branch, which is itself the inheritance-reachable strand
+    // this card closes — that shape now declines.)
+    const { parentWorkspaceId, provision } = await seed({
+      workspaceBranchName: "feature/shared-deep-alerts",
+      workspaceSource: "none",
+      childBound: true,
+    });
+
+    const result = await provision();
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+
+    expect(result.persistedExecutionWorkspace!.id).toBe(parentWorkspaceId);
+    expect(result.persistedExecutionWorkspace!.branchName).toBe("feature/shared-deep-alerts");
+  }, 60_000);
+
+  it(
+    "acceptance-delta: a shared_workspace row sourced by the parent on a foreign sup branch realizes the child's own branch",
+    async () => {
+      // The production shape from TSP #3443 / #3446: a child bound to a
+      // shared_workspace whose source row names the parent and whose recorded
+      // branch is a foreign per-card delivery branch. The pre-fix guard exempted
+      // shared_workspace rows, so it restored the child onto the parent's
+      // branch — exactly the strand this card closes. Now the guard is
+      // mode-agnostic, so this must realize the child's own branch.
+      const { childId, parentWorkspaceId, provision } = await seed({
+        workspaceBranchName: "SUP-1-plan-deep-tools",
+        workspaceSource: "parent",
+        childBound: true,
+        workspaceMode: "shared_workspace",
+      });
+
+      const result = await provision();
+      expect(result.kind).toBe("provisioned");
+      if (result.kind !== "provisioned") return;
+
+      const persisted = result.persistedExecutionWorkspace!;
+      expect(persisted.id).not.toBe(parentWorkspaceId);
+      expect(persisted.branchName).toBe("SUP-2");
+      expect(persisted.sourceIssueId).toBe(childId);
+      expect(
+        executionWorkspaceBranchNamesDifferentIssue({
+          issueIdentifier: "SUP-2",
+          workspaceBranchName: persisted.branchName,
+        }),
+      ).toBe(false);
+
+      const childRows = await db
+        .select({
+          executionWorkspaceId: issues.executionWorkspaceId,
+        })
+        .from(issues)
+        .where(eq(issues.id, childId));
+      expect(childRows[0]!.executionWorkspaceId).toBe(persisted.id);
+
+      // The parent's shared workspace is untouched.
+      const parentRows = await db
+        .select({
+          branchName: executionWorkspaces.branchName,
+          status: executionWorkspaces.status,
+        })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, parentWorkspaceId));
+      expect(parentRows[0]!.branchName).toBe("SUP-1-plan-deep-tools");
+      expect(parentRows[0]!.status).toBe("active");
+    },
+    60_000,
+  );
+
+  it("realizes a fresh branch for an unbound child (strategy_only regression guard)", async () => {
+    const { childId, parentWorkspaceId, provision } = await seed({
+      workspaceBranchName: "SUP-1-plan-deep-tools",
+      workspaceSource: "parent",
+      childBound: false,
+    });
+
+    const result = await provision();
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+
+    const persisted = result.persistedExecutionWorkspace!;
+    expect(persisted.id).not.toBe(parentWorkspaceId);
+    expect(persisted.branchName).toBe("SUP-2");
+    expect(persisted.sourceIssueId).toBe(childId);
+  }, 60_000);
+
+  it("restores a cross-source binding whose branch names the child's own sup id (resumption preserved)", async () => {
+    const { parentWorkspaceId, provision } = await seed({
+      workspaceBranchName: "SUP-2-resumed",
+      workspaceSource: "parent",
+      childBound: true,
+    });
+
+    const result = await provision();
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+
+    expect(result.persistedExecutionWorkspace!.id).toBe(parentWorkspaceId);
+    expect(result.persistedExecutionWorkspace!.branchName).toBe("SUP-2-resumed");
+  }, 60_000);
+
+  it("restores an ancestor-sourced shared_workspace plan carrier onto its carrier branch (SUP-15231 exemption)", async () => {
+    // The sanctioned carrier shape: a shared_workspace row sourced by the plan
+    // parent (SUP-1) on a deliverable per-card sup branch, with the child
+    // (SUP-2) as a real descendant of that source. The SUP-15205 branch-identity
+    // backstop must NOT decline: the child restores onto the carrier branch
+    // verbatim instead of realizing its own.
+    const { childId, parentWorkspaceId, provision } = await seed({
+      workspaceBranchName: "SUP-1-plan-deep-tools",
+      workspaceSource: "parent",
+      childBound: true,
+      workspaceMode: "shared_workspace",
+      childParentedToSource: true,
+    });
+
+    const result = await provision();
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+
+    expect(result.persistedExecutionWorkspace!.id).toBe(parentWorkspaceId);
+    expect(result.persistedExecutionWorkspace!.branchName).toBe("SUP-1-plan-deep-tools");
+
+    // The child stayed bound to the carrier workspace — no fresh SUP-2 workspace.
+    const childRows = await db
+      .select({ executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, childId));
+    expect(childRows[0]!.executionWorkspaceId).toBe(parentWorkspaceId);
+  }, 60_000);
+
+  it("still declines an ancestor-sourced isolated_workspace binding (SUP-15205 defect preserved, exemption not too broad)", async () => {
+    // An isolated_workspace row sourced by an ancestor is the exact defect
+    // SUP-15205 fixes. Even now that shared carriers are exempt, the backstop
+    // must decline it: the child realizes its own branch.
+    const { childId, parentWorkspaceId, provision } = await seed({
+      workspaceBranchName: "SUP-1-plan-deep-tools",
+      workspaceSource: "parent",
+      childBound: true,
+      workspaceMode: "isolated_workspace",
+      childParentedToSource: true,
+    });
+
+    const result = await provision();
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+
+    const persisted = result.persistedExecutionWorkspace!;
+    expect(persisted.id).not.toBe(parentWorkspaceId);
+    expect(persisted.branchName).toBe("SUP-2");
+    expect(persisted.sourceIssueId).toBe(childId);
   }, 60_000);
 });

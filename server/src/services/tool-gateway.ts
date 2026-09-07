@@ -36,6 +36,7 @@ import type {
   DeploymentExposure,
   DeploymentMode,
   McpConnectionCredentialRef,
+  PluginRecord,
   SecretVersionSelector,
   ToolAccessDecision,
   ToolAccessDecisionInput,
@@ -51,6 +52,7 @@ import type {
   UpdateToolMcpGateway,
 } from "@paperclipai/shared";
 import type { AgentToolDescriptor, PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
+import { pluginRegistryService } from "./plugin-registry.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
@@ -839,16 +841,54 @@ export function createToolGatewayService(
     };
   }
 
-  function pluginTools(): ToolGatewayDescriptor[] {
-    return (pluginToolDispatcher?.listToolsForAgent() ?? []).map((tool) => ({
+  function pluginKeyFromName(name: string): string {
+    const sepIndex = name.lastIndexOf(":");
+    return sepIndex > 0 ? name.slice(0, sepIndex) : name;
+  }
+
+  /**
+   * Resolve an agent's `permissions.pluginTools` allowlist.
+   *
+   * Returns `null` when the binding is absent (no agent row, or the key is
+   * missing) so callers keep today's behaviour — every ready plugin's tools
+   * stay visible. Returns a `Set` (possibly empty) when the key is present,
+   * scoping the agent to exactly those plugin keys. An empty array therefore
+   * hides all plugin tools.
+   */
+  async function pluginToolAllowlistForAgent(
+    companyId: string,
+    agentId: string,
+  ): Promise<Set<string> | null> {
+    const [agent] = await db
+      .select({ permissions: agents.permissions })
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
+      .limit(1);
+    if (!agent) return null;
+    const record =
+      agent.permissions && typeof agent.permissions === "object"
+        ? (agent.permissions as Record<string, unknown>)
+        : {};
+    if (!Object.prototype.hasOwnProperty.call(record, "pluginTools")) return null;
+    const raw = record.pluginTools;
+    if (!Array.isArray(raw)) return new Set<string>();
+    return new Set(raw.filter((entry): entry is string => typeof entry === "string"));
+  }
+
+  function pluginTools(allowlist?: Set<string> | null): ToolGatewayDescriptor[] {
+    const tools = pluginToolDispatcher?.listToolsForAgent() ?? [];
+    const scoped = allowlist
+      ? tools.filter((tool) => allowlist.has(pluginKeyFromName(tool.name)))
+      : tools;
+    return scoped.map((tool) => ({
       ...tool,
       providerType: "paperclip_plugin" as const,
       risk: inferToolRisk(tool.name),
     }));
   }
 
-  function allTools(): ToolGatewayDescriptor[] {
-    return [...BUILTIN_TOOLS, ...pluginTools()];
+  function allTools(allowlist?: Set<string> | null): ToolGatewayDescriptor[] {
+    return [...BUILTIN_TOOLS, ...pluginTools(allowlist)];
   }
 
   async function connectedMcpToolsForCompany(companyId: string): Promise<ToolGatewayDescriptor[]> {
@@ -1859,8 +1899,8 @@ export function createToolGatewayService(
     return 403;
   }
 
-  function findStaticTool(toolName: string): ToolGatewayDescriptor {
-    const tool = allTools().find((candidate) => candidate.name === toolName);
+  function findStaticTool(toolName: string, allowlist?: Set<string> | null): ToolGatewayDescriptor {
+    const tool = allTools(allowlist).find((candidate) => candidate.name === toolName);
     if (!tool) {
       throw new ToolGatewayHttpError(404, `Tool "${toolName}" not found`, "tool_not_found", { tool: toolName });
     }
@@ -1868,10 +1908,13 @@ export function createToolGatewayService(
   }
 
   async function findToolForSession(session: ToolGatewaySession, toolName: string): Promise<ToolGatewayDescriptor> {
+    const pluginToolAllowlist = session.agentId
+      ? await pluginToolAllowlistForAgent(session.companyId, session.agentId)
+      : null;
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
-    const tool = [...allTools(), ...connectedTools, ...virtualTools]
+    const tool = [...allTools(pluginToolAllowlist), ...connectedTools, ...virtualTools]
       .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"))
       .find((candidate) => candidate.name === toolName);
     if (!tool) {
@@ -1942,9 +1985,12 @@ export function createToolGatewayService(
     if (session.agentId) {
       await assertAgentInCompany(session.companyId, session.agentId);
     }
+    const pluginToolAllowlist = session.agentId
+      ? await pluginToolAllowlistForAgent(session.companyId, session.agentId)
+      : null;
     const allConnectedTools = await connectedMcpToolsForCompany(session.companyId);
     const onDemandTargets = allConnectedTools.filter(isOnDemandRemoteTool);
-    const tools = [...allTools(), ...allConnectedTools.filter((tool) => !isOnDemandRemoteTool(tool))].filter(
+    const tools = [...allTools(pluginToolAllowlist), ...allConnectedTools.filter((tool) => !isOnDemandRemoteTool(tool))].filter(
       (tool) => session.agentId || (tool.providerType !== "paperclip_self" && tool.providerType !== "paperclip_plugin"),
     );
     const decisions = await Promise.all(tools.map(async (tool) => {
@@ -4932,7 +4978,8 @@ export function createToolGatewayService(
 
     async listPluginToolsForAgent(input: { companyId: string; agentId: string }): Promise<AgentToolDescriptor[]> {
       await assertAgentInCompany(input.companyId, input.agentId);
-      const decisions = await Promise.all(pluginTools().map(async (tool) => {
+      const pluginToolAllowlist = await pluginToolAllowlistForAgent(input.companyId, input.agentId);
+      const decisions = await Promise.all(pluginTools(pluginToolAllowlist).map(async (tool) => {
         const decision = await policyService.decide(policyInputForAgentTool({
           companyId: input.companyId,
           agentId: input.agentId,
@@ -4946,6 +4993,79 @@ export function createToolGatewayService(
           const { providerType: _providerType, risk: _risk, ...descriptor } = tool;
           return descriptor;
         });
+    },
+
+    async pluginToolHealth(input: { companyId: string; agentId: string }) {
+      await assertAgentInCompany(input.companyId, input.agentId);
+
+      const pluginRegistry = pluginRegistryService(db);
+      const installedPlugins = (await pluginRegistry.listInstalled()) as PluginRecord[];
+
+      const allPluginTools = pluginTools();
+
+      const registeredByPlugin = new Map<string, number>();
+      for (const tool of allPluginTools) {
+        registeredByPlugin.set(tool.pluginId, (registeredByPlugin.get(tool.pluginId) ?? 0) + 1);
+      }
+
+      const decisions = await Promise.all(allPluginTools.map(async (tool) => {
+        const decision = await policyService.decide(policyInputForAgentTool({
+          companyId: input.companyId,
+          agentId: input.agentId,
+          tool,
+        }));
+        return { tool, allowed: decision.allowed || decision.decision === "require_approval" };
+      }));
+
+      const visibleByPlugin = new Map<string, number>();
+      for (const { tool, allowed } of decisions) {
+        if (allowed) {
+          visibleByPlugin.set(tool.pluginId, (visibleByPlugin.get(tool.pluginId) ?? 0) + 1);
+        }
+      }
+
+      // The "not bound" determination is keyed off the agent's declared
+      // `permissions.pluginTools` allowlist — the per-agent binding — not the
+      // tool-profile visibility, which is a different (profile) binding. An
+      // absent allowlist means the agent is bound to every ready plugin's
+      // tools, so only a present allowlist that excludes the plugin key reports
+      // it as not bound (SUP-15090, criterion 4 + consume contract).
+      const allowlist = await pluginToolAllowlistForAgent(input.companyId, input.agentId);
+
+      const plugins = installedPlugins
+        .filter((plugin) => (plugin.manifestJson?.tools?.length ?? 0) > 0)
+        .map((plugin) => {
+          const declaredToolCount = plugin.manifestJson!.tools!.length;
+          const registeredToolCount = registeredByPlugin.get(plugin.id) ?? 0;
+          const visibleToolCount = visibleByPlugin.get(plugin.id) ?? 0;
+          const isReady = plugin.status === "ready";
+          const notBound = allowlist !== null && !allowlist.has(plugin.pluginKey);
+
+          let deliverable = false;
+          let reason: string | null = null;
+
+          if (!isReady) {
+            reason = `Plugin "${plugin.pluginKey}" is in "${plugin.status}" status`;
+          } else if (notBound) {
+            reason = `Plugin "${plugin.pluginKey}" is not bound to this agent (excluded by permissions.pluginTools)`;
+          } else if (visibleToolCount === 0) {
+            reason = `Plugin "${plugin.pluginKey}" has no tools visible to this agent under its tool profile`;
+          } else {
+            deliverable = true;
+          }
+
+          return {
+            pluginKey: plugin.pluginKey,
+            pluginStatus: plugin.status,
+            declaredToolCount,
+            registeredToolCount,
+            visibleToolCount,
+            deliverable,
+            reason,
+          };
+        });
+
+      return { plugins };
     },
 
     async summarizeConnectionAccessForAgent(input: { companyId: string; connectionId: string; agentId: string }) {
@@ -6062,7 +6182,10 @@ export function createToolGatewayService(
         expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
       };
 
-      const tool = findStaticTool(input.tool);
+      const pluginToolAllowlist = input.runContext.agentId
+        ? await pluginToolAllowlistForAgent(input.runContext.companyId, input.runContext.agentId)
+        : null;
+      const tool = findStaticTool(input.tool, pluginToolAllowlist);
 
       if (tool.providerType !== "paperclip_plugin") {
         throw new ToolGatewayHttpError(404, `Tool "${input.tool}" is not a plugin tool`, "tool_not_found");

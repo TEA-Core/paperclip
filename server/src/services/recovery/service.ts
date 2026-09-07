@@ -965,6 +965,32 @@ export async function blockIssueWithUnresolvedBlockers(
   return (await issueService(db).update(issue.id, { status: "blocked", blockedByIssueIds, ...opts.extraUpdate })) ?? null;
 }
 
+/**
+ * A pending issue-thread interaction whose `continuationPolicy` wakes the assignee
+ * (`wake_assignee` / `wake_assignee_on_accept`) is a durable, self-resolving path:
+ * answering it wakes the assignee, who can then correct the status. Both the
+ * execution-review-participant recovery sweep (the producer that parks a card) and
+ * `reconcileBlockedWithoutBlockers` (the zero-blocker heal) must treat it as a live
+ * path. Exported as the single shared liveness predicate so the two sweeps cannot
+ * drift apart — the drift that minted blocked-with-empty-blocker cards on held
+ * review children (SUP-15237).
+ */
+export async function hasPendingWakeInteraction(db: Db, companyId: string, issueId: string) {
+  return db
+    .select({ id: issueThreadInteractions.id })
+    .from(issueThreadInteractions)
+    .where(
+      and(
+        eq(issueThreadInteractions.companyId, companyId),
+        eq(issueThreadInteractions.issueId, issueId),
+        eq(issueThreadInteractions.status, "pending"),
+        inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
+      ),
+    )
+    .limit(1)
+    .then((rows) => Boolean(rows[0]));
+}
+
 export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
@@ -1148,22 +1174,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ]);
 
     return Boolean(run || deferredWake);
-  }
-
-  async function hasPendingWakeInteraction(companyId: string, issueId: string) {
-    return db
-      .select({ id: issueThreadInteractions.id })
-      .from(issueThreadInteractions)
-      .where(
-        and(
-          eq(issueThreadInteractions.companyId, companyId),
-          eq(issueThreadInteractions.issueId, issueId),
-          eq(issueThreadInteractions.status, "pending"),
-          inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
-        ),
-      )
-      .limit(1)
-      .then((rows) => Boolean(rows[0]));
   }
 
   // "Live" means the action can still re-arm the issue on its own. An action
@@ -4654,7 +4664,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+      if (await hasPendingWakeInteraction(db, issue.companyId, issue.id)) {
         result.skipped += 1;
         continue;
       }
@@ -6505,7 +6515,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (await hasPendingWakeInteraction(companyId, candidate.id)) {
+        if (await hasPendingWakeInteraction(db, companyId, candidate.id)) {
           result.interactionSkipped += 1;
           continue;
         }
@@ -6767,7 +6777,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (await hasPendingWakeInteraction(companyId, candidate.id)) {
+        if (await hasPendingWakeInteraction(db, companyId, candidate.id)) {
           result.interactionSkipped += 1;
           continue;
         }
@@ -7509,7 +7519,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (await hasPendingWakeInteraction(companyId, candidate.id)) {
+        if (await hasPendingWakeInteraction(db, companyId, candidate.id)) {
           result.interactionSkipped++;
           continue;
         }
@@ -8770,7 +8780,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      if (await hasPendingWakeInteraction(candidate.companyId, candidate.id)) {
+      if (await hasPendingWakeInteraction(db, candidate.companyId, candidate.id)) {
         result.skipped += 1;
         continue;
       }
@@ -8832,7 +8842,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      if (await hasPendingWakeInteraction(candidate.companyId, candidate.id)) {
+      if (await hasPendingWakeInteraction(db, candidate.companyId, candidate.id)) {
         result.skipped += 1;
         continue;
       }
@@ -9025,7 +9035,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      if (await hasPendingWakeInteraction(candidate.companyId, candidate.id)) {
+      if (await hasPendingWakeInteraction(db, candidate.companyId, candidate.id)) {
         undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
         continue;

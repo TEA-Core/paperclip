@@ -466,6 +466,23 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
     }
   });
 
+  router.get("/tool-gateway/plugin-tools/health", async (req, res) => {
+    try {
+      assertBoardOrAgent(req);
+      const companyId = req.actor.type === "agent" ? req.actor.companyId : (req.query.companyId as string);
+      const agentId = req.actor.type === "agent" ? req.actor.agentId : (req.query.agentId as string);
+      if (!companyId || !agentId) {
+        res.status(400).json({ error: "companyId and agentId are required for board actors" });
+        return;
+      }
+      assertCompanyAccess(req, companyId);
+      const health = await toolGateway.pluginToolHealth({ companyId, agentId });
+      res.json(health);
+    } catch (err) {
+      sendGatewayError(res, err);
+    }
+  });
+
   router.get("/tool-gateway/tools", async (req, res) => {
     try {
       const token = gatewayToken(req);
