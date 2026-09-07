@@ -1,6 +1,11 @@
 name: Paperclip Approval Enforcer
 
 on:
+  # Advisory leg. Green by design (the control plane publishes the status only
+  # at review-stage approval, after CI first runs), but never bare green: when
+  # `paperclip/approved` is absent on the head the script writes a job summary
+  # and a warning annotation naming the head sha and stating the PR will be
+  # evicted from the merge queue until the status publishes (SUP-15389).
   pull_request:
     branches:
       - 'fold/**'
@@ -49,7 +54,7 @@ jobs:
       - name: Event note
         run: |
           case "${{ github.event_name }}" in
-            pull_request) echo "paperclip-approved: pull_request — advisory; the merge queue enforces at the merge boundary" ;;
+            pull_request) echo "paperclip-approved: pull_request — advisory; the merge queue enforces at the merge boundary; the verdict (present / will-be-evicted) is surfaced as a job summary + warning annotation" ;;
             merge_group)  echo "paperclip-approved: merge_group — enforcing the approval gate" ;;
             *)            echo "paperclip-approved: '${{ github.event_name }}' — no-op, reporting success" ;;
           esac

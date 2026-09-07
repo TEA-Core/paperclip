@@ -109,6 +109,10 @@ set -euo pipefail
 CONTEXT="paperclip/approved"
 STATE="success"
 
+# A literal backtick, so the job-summary blocks below can render inline code
+# without an unquoted delimiter treating backticks as command substitution.
+BT='`'
+
 # The ONLY identity whose `paperclip/approved` status counts: the control-plane
 # GitHub App's bot user. A bot user's numeric id is stable for the life of the
 # App and cannot be re-registered, which a login can. Overridable so the same
@@ -156,6 +160,69 @@ fail() {
   fi
   note "ADVISORY: $* — pull_request is non-blocking; the merge queue enforces at the merge boundary"
   exit 0
+}
+
+# --- reporting the verdict to the PR checks view (advisory leg) -------------
+# The pull_request leg is green on purpose (advisory), so a bare exit 0 is all
+# an operator sees in the PR checks view even when the merge queue is about to
+# evict this entry. The two surfaces that reach the checks view WITHOUT a red
+# check are the runner's job summary and this step's annotations, so the verdict
+# is written to both. Both no-op safely when the script runs outside a workflow.
+job_summary() {
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+  fi
+}
+
+# A GitHub Actions warning annotation is parsed from this step's stdout and shown
+# on the step in the PR checks view even though the step (and the job) still
+# report success. The message must be a single line. Outside a workflow
+# (GITHUB_ACTIONS unset) fall back to a plain log line so a local run still
+# surfaces the verdict.
+warn_annotation() {
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    printf '::warning::%s\n' "$1"
+  else
+    note "WARNING: $1"
+  fi
+}
+
+# Job-summary block for the two advisory outcomes. Kept in functions so the
+# scratch variable stays out of the global scope of this linear script.
+advisory_summary_present() {
+  local block
+  block="$(
+    printf '%s\n' \
+      "### ${BT}${CONTEXT}${BT} is present on this PR" \
+      "" \
+      "- **PR:** #${PR_NUMBER}" \
+      "- **Head SHA:** ${BT}${HEAD_SHA}${BT}" \
+      "- **Context state:** ${BT}${STATE}${BT} (published by ${APPROVAL_CREATOR_LOGIN})" \
+      "" \
+      "${BT}${CONTEXT}${BT} = ${STATE} is present on head ${BT}${HEAD_SHA}${BT}, published by the control" \
+      "plane. The merge queue will admit this entry, subject to every other required check. This" \
+      "check is advisory on ${BT}pull_request${BT} and reports ${BT}success${BT}."
+  )"
+  job_summary "$block"
+}
+
+advisory_summary_absent() {
+  local block
+  block="$(
+    printf '%s\n' \
+      "### ${BT}${CONTEXT}${BT} is not published on this PR" \
+      "" \
+      "- **PR:** #${PR_NUMBER}" \
+      "- **Head SHA:** ${BT}${HEAD_SHA}${BT}" \
+      "- **Observed state:** ${BT}${APPROVAL_STATE:-missing}${BT} (expected ${BT}${STATE}${BT})" \
+      "" \
+      "This check is **advisory** on ${BT}pull_request${BT} and reports **success**. The merge queue" \
+      "enforces the same gate at the merge boundary (${BT}merge_group${BT})." \
+      "" \
+      "Until the control plane publishes ${BT}${CONTEXT}${BT} = ${STATE} on head ${BT}${HEAD_SHA}${BT}," \
+      "**this PR will be evicted from the merge queue** on every entry."
+  )"
+  job_summary "$block"
 }
 
 # --- push (main): no-op ------------------------------------------------------
@@ -436,11 +503,16 @@ if [ "$APPROVAL_STATE" = "$STATE" ]; then
     fail "${CONTEXT} on ${HEAD_SHA} was not published by the control plane"
   fi
   note "pass: ${CONTEXT} = ${STATE} on PR #${PR_NUMBER} head ${HEAD_SHA} (published by ${APPROVAL_CREATOR_LOGIN})"
+  if [ "$MODE" = "advisory" ]; then
+    advisory_summary_present
+  fi
   exit 0
 fi
 
 if [ "$MODE" = "advisory" ]; then
   note "ADVISORY: ${CONTEXT} is ${APPROVAL_STATE}, expected ${STATE}; pull_request is non-blocking — the merge queue enforces at the merge boundary"
+  advisory_summary_absent
+  warn_annotation "${CONTEXT} is ${APPROVAL_STATE:-missing} on head ${HEAD_SHA} (PR #${PR_NUMBER}): this PR will be evicted from the merge queue until the control plane publishes ${CONTEXT} = ${STATE}. This check is advisory and reports success."
   exit 0
 fi
 
