@@ -1,6 +1,9 @@
 import express from "express";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { ZodError } from "zod";
+
+import { HttpError } from "../errors.js";
 
 const mockInstanceSettingsService = vi.hoisted(() => ({
   get: vi.fn(),
@@ -65,6 +68,26 @@ async function createApp(actor: any) {
     next();
   });
   app.use("/api", instanceSettingsRoutes(mockDb as any));
+  // Name the cause of an unexpected 500 before the error handler swallows it.
+  // `errorHandler` answers an unhandled throw with a fixed
+  // `{"error":"Internal server error"}` body and logs nothing itself — only
+  // `httpLogger` prints the context it attaches, and route unit tests do not
+  // mount `httpLogger`. So an intermittent crash in here reports exactly
+  // `expected 200 "OK", got 500 "Internal Server Error"` and nothing else, and
+  // the cause has to be reconstructed from CI log archaeology after the fact.
+  // Deliberate 4xx outcomes (`HttpError`, Zod validation) are the normal
+  // business of these tests and stay quiet.
+  app.use((err: unknown, _req: express.Request, _res: express.Response, next: express.NextFunction) => {
+    const isExpectedRejection =
+      (err instanceof HttpError && err.status < 500)
+      || err instanceof ZodError
+      || (err as { name?: unknown } | null)?.name === "ZodError";
+    if (!isExpectedRejection) {
+      // eslint-disable-next-line no-console
+      console.error("[instance-settings-routes] route threw an unexpected error", err);
+    }
+    next(err);
+  });
   app.use(errorHandler);
   return app;
 }
@@ -744,10 +767,13 @@ describe("instance settings routes", () => {
     };
 
     beforeEach(() => {
-      process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = "test-server-token";
+      vi.stubEnv("PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN", "test-server-token");
     });
     afterEach(() => {
-      delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+      // Restores whatever the value was before this describe rather than
+      // deleting it outright, so a token the surrounding process legitimately
+      // set survives this suite.
+      vi.unstubAllEnvs();
     });
 
     it("rejects a write that changes executionMode", async () => {
@@ -838,12 +864,37 @@ describe("instance settings routes", () => {
       companyIds: ["company-1"],
     };
 
+    // A value the surrounding process already had. Every test below overrides
+    // it explicitly — including the "unset" case, which stubs it away rather
+    // than relying on nothing having set it — so this sentinel doubles as the
+    // proof in `afterAll` that the suite restores what it found instead of
+    // deleting it. `instance.general.keyboardShortcuts` is a real hideable key
+    // that no test in this block writes.
+    const PRE_EXISTING_HIDDEN_SETTINGS = "instance.general.keyboardShortcuts";
+    let hiddenSettingsBeforeSuite: string | undefined;
+
+    beforeAll(() => {
+      hiddenSettingsBeforeSuite = process.env.PAPERCLIP_HIDDEN_SETTINGS;
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = PRE_EXISTING_HIDDEN_SETTINGS;
+    });
+
     afterEach(() => {
-      delete process.env.PAPERCLIP_HIDDEN_SETTINGS;
+      // `vi.unstubAllEnvs` restores the value each test found, which is the
+      // sentinel above — not an unconditional `delete`. An unconditional
+      // delete destroys a pre-existing value for every later test in the
+      // process, which is exactly the leak this block must not have.
+      vi.unstubAllEnvs();
+      expect(process.env.PAPERCLIP_HIDDEN_SETTINGS).toBe(PRE_EXISTING_HIDDEN_SETTINGS);
+    });
+
+    afterAll(() => {
+      expect(process.env.PAPERCLIP_HIDDEN_SETTINGS).toBe(PRE_EXISTING_HIDDEN_SETTINGS);
+      if (hiddenSettingsBeforeSuite === undefined) delete process.env.PAPERCLIP_HIDDEN_SETTINGS;
+      else process.env.PAPERCLIP_HIDDEN_SETTINGS = hiddenSettingsBeforeSuite;
     });
 
     it("rejects a write that changes a hidden general field", async () => {
-      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.general.censorUsernameInLogs";
+      vi.stubEnv("PAPERCLIP_HIDDEN_SETTINGS", "instance.general.censorUsernameInLogs");
       const app = await createApp(adminActor);
 
       const res = await request(app)
@@ -856,7 +907,7 @@ describe("instance settings routes", () => {
     });
 
     it("allows a same-value echo of a hidden general field", async () => {
-      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.general.censorUsernameInLogs";
+      vi.stubEnv("PAPERCLIP_HIDDEN_SETTINGS", "instance.general.censorUsernameInLogs");
       const app = await createApp(adminActor);
 
       const res = await request(app)
@@ -871,7 +922,7 @@ describe("instance settings routes", () => {
     });
 
     it("deep-compares hidden backupRetention echoes instead of rejecting them", async () => {
-      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.general.backupRetention";
+      vi.stubEnv("PAPERCLIP_HIDDEN_SETTINGS", "instance.general.backupRetention");
       mockInstanceSettingsService.getGeneral.mockResolvedValue({
         censorUsernameInLogs: false,
         keyboardShortcuts: false,
@@ -893,7 +944,7 @@ describe("instance settings routes", () => {
     });
 
     it("rejects a write that changes a hidden experimental toggle", async () => {
-      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.experimental.enableEnvironments";
+      vi.stubEnv("PAPERCLIP_HIDDEN_SETTINGS", "instance.experimental.enableEnvironments");
       const app = await createApp(adminActor);
 
       const res = await request(app)
@@ -906,8 +957,10 @@ describe("instance settings routes", () => {
     });
 
     it("allows writes to non-hidden experimental toggles while others are hidden", async () => {
-      process.env.PAPERCLIP_HIDDEN_SETTINGS =
-        "instance.experimental.enableEnvironments,instance.experimental.enableServerInfoDebugView";
+      vi.stubEnv(
+        "PAPERCLIP_HIDDEN_SETTINGS",
+        "instance.experimental.enableEnvironments,instance.experimental.enableServerInfoDebugView",
+      );
       const app = await createApp(adminActor);
 
       const res = await request(app)
@@ -921,7 +974,7 @@ describe("instance settings routes", () => {
     });
 
     it("floors every experimental toggle when the whole Experimental page is hidden", async () => {
-      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.experimental";
+      vi.stubEnv("PAPERCLIP_HIDDEN_SETTINGS", "instance.experimental");
       const app = await createApp(adminActor);
 
       const res = await request(app)
@@ -934,6 +987,10 @@ describe("instance settings routes", () => {
     });
 
     it("keeps every field writable when the env var is unset", async () => {
+      // Stub it away rather than assuming it is absent: this block runs with a
+      // pre-existing value set, so "unset" has to be stated, and stating it is
+      // what makes the restore assertion in `afterEach` meaningful.
+      vi.stubEnv("PAPERCLIP_HIDDEN_SETTINGS", undefined);
       const app = await createApp(adminActor);
 
       const general = await request(app)
