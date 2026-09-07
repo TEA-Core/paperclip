@@ -17,6 +17,12 @@ import {
   type LinkedPullRequest,
 } from "./merge-arming.js";
 import { createGitHubExternalObjectProvider } from "./github-external-object-provider.js";
+import {
+  isSharedCarrierRefusal,
+  resolveCarrierOwner,
+  issueInBlockerClosure,
+  listNonTerminalRootCauseBlockers,
+} from "./blocker-closure.js";
 import type {
   ExternalObjectResolveResult,
   ExternalObjectResolver,
@@ -68,6 +74,13 @@ export const DONE_CLOSE_LANDING_FAILED_ACTION = "issue.done_close_landing_failed
 export const DONE_CLOSE_LANDING_REENQUEUED_ACTION = "issue.done_close_landing_reenqueued";
 export const DONE_CLOSE_LANDING_REENQUEUE_REFUSED_ACTION = "issue.done_close_landing_reenqueue_refused";
 export const DONE_CLOSE_LANDING_ESCALATED_ACTION = "issue.done_close_landing_escalated";
+// SUP-15381 (ADR-091 D1): a shared-carrier child whose close was refused by the
+// prefix predicate cannot land through its own card. Instead of re-opening it
+// into a board park that its own parent blocks on, the landing obligation is
+// attributed to the card that owns the carrier branch and the child is left
+// done. This row is the only record for that disposition (mirrors the
+// superseded-carrier ledger: an audit row, no status change).
+export const DONE_CLOSE_LANDING_ATTRIBUTED_ACTION = "issue.done_close_landing_attributed";
 const DECISION_CARRIED_SKIP_REASON_PREFIX = "open_linked_prs_decision_carried:";
 const SKIPPED_ACTION = "issue.done_transition_guard_skipped";
 
@@ -424,6 +437,7 @@ export function createDoneCloseLandingBackstopService(
               DONE_CLOSE_LANDING_FAILED_ACTION,
               DONE_CLOSE_LANDING_REENQUEUED_ACTION,
               DONE_CLOSE_LANDING_ESCALATED_ACTION,
+              DONE_CLOSE_LANDING_ATTRIBUTED_ACTION,
             ],
           ),
           // This card's own rows (per-card ledger) OR any company row that
@@ -453,6 +467,19 @@ export function createDoneCloseLandingBackstopService(
         .filter(
           (r) =>
             r.action === DONE_CLOSE_LANDING_FAILED_ACTION && r.entityId === issue.id,
+        )
+        .map((r) => readString(readRecord(r.details)?.pr))
+        .filter((value): value is string => value !== null),
+    );
+    // SUP-15381: per-card attribution ledger. Each shared-carrier child is a
+    // distinct done issue; once ITS attribution row exists it must not be
+    // re-attributed on every sweep (no status change, so the per-card scope —
+    // like confirmed/failed — is what bounds the spam).
+    const alreadyAttributed = new Set(
+      existing
+        .filter(
+          (r) =>
+            r.action === DONE_CLOSE_LANDING_ATTRIBUTED_ACTION && r.entityId === issue.id,
         )
         .map((r) => readString(readRecord(r.details)?.pr))
         .filter((value): value is string => value !== null),
@@ -619,6 +646,77 @@ export function createDoneCloseLandingBackstopService(
         }
         counts.failed += 1;
         continue;
+      }
+
+      // SUP-15381 (ADR-091 D1): a shared-carrier child whose close was refused by
+      // the prefix predicate can NEVER land through its own card — the head ref
+      // belongs to the parent's shared branch and can never carry this card's
+      // identifier prefix (SUP-15098 / SUP-15126 / SUP-15203). Re-opening it into
+      // a board park that its own parent blocks on is a semantic deadlock with no
+      // reportable surface. Instead, attribute the landing obligation to the card
+      // that owns the carrier branch and leave this card done: no re-enqueue, no
+      // escalation, no status change. When the child sits inside that owner's own
+      // blocker closure (the observed deadlock) the report names it as such.
+      if (isSharedCarrierRefusal(refusalReason)) {
+        if (alreadyAttributed.has(prKey)) {
+          // Already attributed this card+PR on a prior sweep. Leave it done and do
+          // NOTHING — do not fall through to the re-enqueue/escalate path, which
+          // is exactly the re-open-into-board-park behavior this fix removes.
+          continue;
+        }
+        const carrier = await resolveCarrierOwner(db, issue.companyId, issue.id);
+        if (carrier) {
+          const deadlocked = await issueInBlockerClosure(
+            db,
+            issue.companyId,
+            carrier.ownerId,
+            issue.id,
+          );
+          const rootCauses = deadlocked
+            ? await listNonTerminalRootCauseBlockers(db, issue.companyId, carrier.ownerId)
+            : [];
+          const carrierName = carrier.identifier ?? carrier.ownerId;
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: DONE_CLOSE_LANDING_ATTRIBUTED_ACTION,
+            entityType: "issue",
+            entityId: issue.id,
+            issueId: issue.id,
+            details: {
+              identifier: issue.identifier ?? null,
+              pr: prKey,
+              prState: "open",
+              sharedCarrier: true,
+              refusal: isArmingRefusal,
+              skipReason: skipReason ?? null,
+              carrierOwnerId: carrier.ownerId,
+              carrierIdentifier: carrier.identifier,
+              deadlocked,
+              rootCauseBlockers: rootCauses.map((r) => r.identifier ?? r.id),
+            },
+          });
+          const deadlockLine = deadlocked
+            ? " This card sits inside the blocker closure of that owning card, so no agent has a concrete action here — the deadlock has been reported for board escalation."
+            : "";
+          const rootCauseList =
+            rootCauses.length > 0
+              ? ` Root-cause non-terminal blockers on ${carrierName}: ${rootCauses
+                  .map((r) => r.identifier ?? r.id)
+                  .join(", ")}.`
+              : "";
+          await deps.svc.addComment(
+            issue.id,
+            `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: PR ${prKey} is a shared-carrier deliverable refused at the ADR-091 D1 prefix predicate — its head belongs to the shared branch owned by ${carrierName}, so this card cannot land on its own. The landing obligation is attributed to ${carrierName} and this card is left done. No re-open or park is recorded here.${deadlockLine}${rootCauseList}`,
+            {},
+            { authorType: "system" },
+          );
+          continue;
+        }
       }
 
       // state === "open" past the grace window: re-enqueue (bounded) or escalate.
