@@ -167,4 +167,45 @@ describe("external object references", () => {
       "https://example.com/exports/2026_daily",
     ]);
   });
+
+  it("strips a labelled bold span **PR: <url>** so the PR token stays clean (SUP-15395)", () => {
+    const markdown =
+      "Delivered the SUP-15377 systemic fix. **PR: https://github.com/TEA-Core/paperclip/pull/572** (branch `SUP-15377-x`), commit `6699713`";
+    expect(findExternalObjectUrlMatches(markdown).map((m) => m.matchedText)).toEqual([
+      "https://github.com/TEA-Core/paperclip/pull/572",
+    ]);
+
+    const [canonical] = extractExternalObjectCanonicalUrls(markdown);
+    expect(canonical).toMatchObject({
+      sanitizedCanonicalUrl: "https://github.com/TEA-Core/paperclip/pull/572",
+      canonicalIdentity: {
+        scheme: "https",
+        host: "github.com",
+        path: "/TEA-Core/paperclip/pull/572",
+      },
+    });
+  });
+
+  it("covers single-asterisk italics, mixed emphasis, and the five control shapes", () => {
+    const cases: Array<[string, string]> = [
+      ["**PR: https://github.com/acme/app/pull/572** (branch)", "https://github.com/acme/app/pull/572"],
+      ["*PR: https://github.com/acme/app/pull/571* (branch)", "https://github.com/acme/app/pull/571"],
+      ["**_https://github.com/acme/app/pull/570_** here", "https://github.com/acme/app/pull/570"],
+      ["**https://github.com/acme/app/pull/375**", "https://github.com/acme/app/pull/375"],
+      ["https://github.com/acme/app/pull/60,", "https://github.com/acme/app/pull/60"],
+      ["https://github.com/acme/app/pull/61.", "https://github.com/acme/app/pull/61"],
+      ["[x](https://github.com/acme/app/pull/62)", "https://github.com/acme/app/pull/62"],
+      ["Bare: https://github.com/acme/app/pull/63", "https://github.com/acme/app/pull/63"],
+    ];
+    for (const [input, expected] of cases) {
+      expect(findExternalObjectUrlMatches(input).map((m) => m.matchedText)).toEqual([expected]);
+    }
+  });
+
+  it("keeps a genuine terminal * with no unclosed opener on the line", () => {
+    const markdown = "Asset: https://example.com/exports/flag*";
+    expect(findExternalObjectUrlMatches(markdown).map((m) => m.matchedText)).toEqual([
+      "https://example.com/exports/flag*",
+    ]);
+  });
 });
