@@ -4347,4 +4347,105 @@ describe.sequential("issue comment reopen routes", () => {
       expect(garbage.lastActivityAt).toBeNull();
     });
   });
+
+  // SUP-15298: a human-assigned issue pushed to `blocked` with an empty
+  // blockedBy is a one-way door -- the follow-up guard demanded an agent
+  // assignee to leave blocked, while the single-assignee invariant forbade an
+  // agent from claiming the slot the human held. These tests pin the fix and
+  // the scoping that keeps the single-assignee invariant intact.
+  describe.sequential("SUP-15298: agent pulls a human-assigned blocked issue back to a live state", () => {
+    const emptyReadiness = {
+      issueId: "11111111-1111-4111-8111-111111111111",
+      blockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: true,
+      isDependencyReady: true,
+    };
+
+    it("lets a non-assignee agent move a human-assigned blocked issue back to todo without claiming the slot", async () => {
+      const issue = {
+        ...makeIssue("blocked"),
+        assigneeAgentId: null,
+        assigneeUserId: "human-1",
+        blockedByIssueIds: [],
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getDependencyReadiness.mockResolvedValue(emptyReadiness);
+      // The service preserves the human assignee; the route must not add an
+      // agent assignee as a side effect of the status transition.
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        assigneeAgentId: null,
+        assigneeUserId: "human-1",
+      }));
+
+      const res = await request(
+        await installActor(createApp(), agentActor("33333333-3333-4333-8333-333333333333")),
+      )
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.status).toBe("todo");
+      // The card stays human-owned; the agent did not take the slot.
+      expect(res.body.assigneeUserId).toBe("human-1");
+      expect(res.body.assigneeAgentId).toBeNull();
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issue.id,
+        expect.objectContaining({ status: "todo" }),
+      );
+      // No agent assignee means no agent run is queued.
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("keeps the follow-up guard closed for an unassigned blocked issue (still requires an agent assignee)", async () => {
+      const issue = {
+        ...makeIssue("blocked"),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        blockedByIssueIds: [],
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getDependencyReadiness.mockResolvedValue(emptyReadiness);
+
+      const res = await request(
+        await installActor(createApp(), agentActor("33333333-3333-4333-8333-333333333333")),
+      )
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "todo" });
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe("Issue follow-up requires an assigned agent");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("still refuses an agent to take a human-held assignee slot (single-assignee invariant held)", async () => {
+      const issue = {
+        ...makeIssue("blocked"),
+        assigneeAgentId: null,
+        assigneeUserId: "human-1",
+        blockedByIssueIds: [],
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getDependencyReadiness.mockResolvedValue(emptyReadiness);
+      // Mirrors the service-level invariant the route defers to: a card that
+      // already has a human assignee cannot gain an agent assignee.
+      const { unprocessable } = await import("../errors.js");
+      mockIssueService.update.mockRejectedValue(
+        unprocessable("Issue can only have one assignee"),
+      );
+
+      const res = await request(
+        await installActor(createApp(), agentActor("33333333-3333-4333-8333-333333333333")),
+      )
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "todo", assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toBe("Issue can only have one assignee");
+    });
+  });
 });

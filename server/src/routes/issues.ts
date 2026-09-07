@@ -6318,6 +6318,15 @@ export function issueRoutes(
       const ownerlessRecoveryAction =
         await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id).catch(() => null);
       if (ownerlessRecoveryAction && !ownerlessRecoveryAction.ownerAgentId) return true;
+      // SUP-15298: a human-assigned issue has no agent whose resume authority a
+      // follow-up could violate -- the card's owner is a person, not an agent.
+      // Requiring an agent assignee here turns a `blocked` card into a one-way
+      // door: an agent can push it into `blocked` (Guard B, the single-assignee
+      // invariant, then forbids it from claiming the slot). When there are no
+      // unresolved blockers (the readiness gate above already passed), let any
+      // same-company agent pull the card back to a state the human can act on.
+      // This reassigns nothing and triggers no agent run.
+      if (issue.assigneeUserId && issue.status === "blocked") return true;
       res.status(409).json({
         error: "Issue follow-up requires an assigned agent",
         details: { issueId: issue.id, actorAgentId },
@@ -12414,6 +12423,11 @@ export function issueRoutes(
               agentId: actor.agentId,
               runId: actor.runId,
               actorSource: actor.actorSource,
+              // SUP-15298: empty blocker set + no unblockDescriptor means no
+              // structural resolution path exists for the card; flag it so the
+              // worst combination is distinguishable from a card that still has
+              // a descriptor naming an owner + action.
+              hasUnblockDescriptor: Boolean(descriptor),
             },
             "issue PATCH committed blocked with an empty blocker set",
           );
@@ -12431,6 +12445,7 @@ export function issueRoutes(
               source: "issue_update_route",
               identifier: issue.identifier,
               blockerIssueIds: committedBlockerIssueIds,
+              hasUnblockDescriptor: Boolean(descriptor),
               actorSource: actor.actorSource,
               statusChanged: existing.status !== issue.status,
               blockersPatched: Array.isArray(req.body.blockedByIssueIds),
