@@ -25,7 +25,12 @@ function jobBlock(workflow, name) {
 
 function jobNames(workflow) {
   const jobs = workflow.slice(workflow.indexOf("\njobs:\n"));
-  return [...jobs.matchAll(/\n {2}([a-z_][a-z0-9_]*):\n/g)].map((m) => m[1]);
+  // GitHub Actions job ids allow uppercase and hyphens, not just the snake_case
+  // this file happens to use. A narrower pattern would silently skip a job like
+  // `security-scan` -- and skipping a job is exactly how one escapes the
+  // reachability check below, so the narrow read makes this test pass for the
+  // one case it exists to catch.
+  return [...jobs.matchAll(/\n {2}([A-Za-z_][A-Za-z0-9_-]*):\n/g)].map((m) => m[1]);
 }
 
 function needsOf(block) {
