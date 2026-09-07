@@ -97,6 +97,11 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
   getLiveContinuationForIssue: vi.fn(async () => null),
+  // Present so that a test which returns a non-null active action exercises the
+  // post-write revalidation instead of logging a "not a function" warning from
+  // its catch. Returns a truthy row: `revalidateActiveSourceRecovery` warns on a
+  // falsy resolve result.
+  resolveActiveForIssue: vi.fn(async () => ({ id: "recovery-action-1", status: "cancelled" })),
 }));
 const mockIssueTreeControlService = vi.hoisted(() => ({
   getActivePauseHoldGate: vi.fn(async () => null),
@@ -4446,6 +4451,182 @@ describe.sequential("issue comment reopen routes", () => {
 
       expect(res.status).toBe(422);
       expect(res.body.error).toBe("Issue can only have one assignee");
+    });
+  });
+
+  // SUP-15387: `assertExplicitResumeIntentAllowed`'s `!issue.assigneeAgentId`
+  // branch has two independent `return true` doors -- (1) an active recovery
+  // action with no agent owner, (2) the SUP-15298 human-assigned+blocked case.
+  // The decision recorded on SUP-15387 is ACCEPT AS DESIGNED, so these tests
+  // pin the shape deliberately rather than leaving it readable as an accident.
+  // The load-bearing fact is that (1) fires FIRST and subsumes (2) on any card
+  // the `blocked_without_blockers` sweep has already reached, which is why the
+  // (2) tests above are only meaningful with no active recovery action present.
+  describe.sequential("SUP-15387: the ownerless-recovery-action resume door", () => {
+    const emptyReadiness = {
+      issueId: "11111111-1111-4111-8111-111111111111",
+      blockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: true,
+      isDependencyReady: true,
+    };
+    const actorAgentId = "33333333-3333-4333-8333-333333333333";
+    // Shaped like the row `blocked_without_blockers` mints after the 15-minute
+    // grace: escalated to the board, therefore `ownerAgentId: null`.
+    const boardOwnedAction = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "blocked_without_blockers",
+      status: "escalated",
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+    };
+
+    it("path (1): an ownerless recovery action lets ANY same-company agent resume a fully unassigned blocked card", async () => {
+      const issue = {
+        ...makeIssue("blocked"),
+        assigneeAgentId: null,
+        // No human assignee either -- path (2) cannot carry this case.
+        assigneeUserId: null,
+        blockedByIssueIds: [],
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getDependencyReadiness.mockResolvedValue(emptyReadiness);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(boardOwnedAction);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+      }));
+
+      const res = await request(await installActor(createApp(), agentActor(actorAgentId)))
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.status).toBe("todo");
+      // Adoption authority is not assignment: the transition claims no slot and
+      // queues no run, so every board remedy survives it.
+      expect(res.body.assigneeAgentId).toBeNull();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("an agent-owned recovery action closes the door upstream, before the resume guard speaks", async () => {
+      const issue = {
+        ...makeIssue("blocked"),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        blockedByIssueIds: [],
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getDependencyReadiness.mockResolvedValue(emptyReadiness);
+      // An agent-owned action is the case the door must NOT open for: another
+      // agent holds the card's next action.
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        ...boardOwnedAction,
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: "44444444-4444-4444-8444-444444444444",
+      });
+
+      const res = await request(await installActor(createApp(), agentActor(actorAgentId)))
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "todo" });
+
+      // 403, not the resume guard's 409: on the PATCH path
+      // `requireRecoveryActionAuthority` runs first and rejects an agent that
+      // owns neither the issue nor the action. So the ownerAgentId test inside
+      // `assertExplicitResumeIntentAllowed` is load-bearing in the ALLOW
+      // direction only -- it exists to keep the resume guard from refusing the
+      // adoption the recovery guards already permit, not to add a denial.
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot resolve another owner's recovery action");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("negative control: with NO recovery action a fully unassigned blocked card stays shut", async () => {
+      const issue = {
+        ...makeIssue("blocked"),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        blockedByIssueIds: [],
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getDependencyReadiness.mockResolvedValue(emptyReadiness);
+      // Stated explicitly rather than inherited from beforeEach: this null is
+      // the entire reason the 409 below is reachable. A live fixture aged past
+      // BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS has an action here and
+      // returns 200 -- the non-discriminating pair that cost SUP-15311 several
+      // runs to diagnose.
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+
+      const res = await request(await installActor(createApp(), agentActor(actorAgentId)))
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "todo" });
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe("Issue follow-up requires an assigned agent");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("path (2) carries the human-assigned blocked card on its own, with no recovery action present", async () => {
+      const issue = {
+        ...makeIssue("blocked"),
+        assigneeAgentId: null,
+        assigneeUserId: "human-1",
+        blockedByIssueIds: [],
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getDependencyReadiness.mockResolvedValue(emptyReadiness);
+      // The sweep has not reached this card (inside the grace window, or it has
+      // a live path / queued wake / pending interaction). Path (1) is shut.
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        assigneeAgentId: null,
+        assigneeUserId: "human-1",
+      }));
+
+      const res = await request(await installActor(createApp(), agentActor(actorAgentId)))
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.status).toBe("todo");
+      expect(res.body.assigneeUserId).toBe("human-1");
+    });
+
+    it("path (1) is not scoped to `blocked`: an ownerless action reopens an unassigned done card", async () => {
+      // Recorded, not incidental. `isExplicitResumeCapableStatus` admits
+      // done/cancelled, and path (1) -- unlike path (2) -- does not re-narrow to
+      // `blocked`. The reach is bounded on the mint side (the sweeps skip
+      // terminal sources) and by `classifySourceRecoveryRevalidation`, which
+      // stales the action on the first touch or read projection. If this test
+      // ever fails, someone changed the guard's status scope: re-derive the
+      // decision on SUP-15387 before re-pinning it.
+      const issue = {
+        ...makeIssue("done"),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(boardOwnedAction);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+      }));
+
+      const res = await request(await installActor(createApp(), agentActor(actorAgentId)))
+        .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+        .send({ body: "adopting this stranded card", resume: true });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "11111111-1111-4111-8111-111111111111",
+        { status: "todo" },
+      );
     });
   });
 });
