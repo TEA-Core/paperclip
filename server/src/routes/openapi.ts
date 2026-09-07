@@ -857,6 +857,11 @@ const BOARD_ONLY_PREFIXES = [
 ];
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  // Both added upstream in the 2026-09-07 fold range. Their handlers call
+  // assertBoard() unconditionally, so publishing them as agent-callable made the
+  // spec contradict the code; the SUP-14798 parity guard caught it.
+  "GET /api/tools/oauth/paperclip-id/callback",
+  "PUT /api/tool-connections/{connectionId}/grants/{grantId}/members",
   "GET /api/cloud/stacks",
   "GET /api/companies",
   "POST /api/companies",
