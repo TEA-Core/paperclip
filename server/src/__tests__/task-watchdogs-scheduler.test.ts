@@ -803,6 +803,141 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(stale.reason).toContain("changed by an actor other than this run");
   });
 
+  async function seedStoppedWatchdogWithWokenLeavesRun() {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-BORNSTALE", status: "blocked" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    const { service } = createService();
+    await service.reconcileTaskWatchdogs({ companyId });
+
+    const [watchdogRow] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const frozenFingerprint = watchdogRow!.lastObservedFingerprint!;
+    expect(frozenFingerprint).toMatch(/^task_watchdog_stop:/);
+
+    // The watchdog's own run rides on the reusable task_watchdog child issue,
+    // which is excluded from the watched subtree so its live run does not flip
+    // the subtree to "live".
+    const [watchdogIssue] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.parentId, sourceId), eq(issues.originKind, "task_watchdog")));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "assignment",
+      contextSnapshot: {
+        issueId: watchdogIssue!.id,
+        taskWatchdog: { watchedIssueId: sourceId, stopFingerprint: frozenFingerprint },
+        stopFingerprint: frozenFingerprint,
+        // The leaves the run was woken with: the watched card still stuck.
+        stoppedLeaves: [
+          {
+            issueId: sourceId,
+            identifier: "WDOG-BORNSTALE",
+            title: "Watched issue",
+            status: "blocked",
+            assigneeAgentId: null,
+            assigneeUserId: null,
+            blockerIssueIds: [],
+            pendingInteractionIds: [],
+            pendingApprovalIds: [],
+            updatedAt: new Date().toISOString(),
+            latestCommentAt: null,
+            latestDocumentAt: null,
+            latestWorkProductAt: null,
+          },
+        ],
+      },
+    });
+    return { companyId, sourceId, agentId, watchdogId: watchdogRow!.id, runId, frozenFingerprint, service };
+  }
+
+  it("rebinds a born-stale run's fingerprint when an unrelated pending interaction landed (still stopped, core material unchanged)", async () => {
+    const { companyId, sourceId, agentId, watchdogId, runId, frozenFingerprint, service } =
+      await seedStoppedWatchdogWithWokenLeavesRun();
+
+    // An unrelated actor lands a pending interaction on the watched card between
+    // wake and the run's first write. Pending waits are part of the material
+    // leaf, so this moves the stop fingerprint — but the card is still stuck in
+    // the exact same state the run's review covers.
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId: sourceId,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { version: 1, prompt: "Confirm the stop." },
+      createdByAgentId: agentId,
+    });
+
+    const revalidated = await service.revalidateMutationScope({
+      kind: "watchdog",
+      watchdogId,
+      companyId,
+      watchedIssueId: sourceId,
+      stopFingerprint: frozenFingerprint,
+      runId,
+    });
+
+    expect(revalidated.allowed).toBe(true);
+    expect(revalidated.classification?.state).toBe("stopped");
+
+    // The run's stored fingerprint was rebound to the current one.
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const context = run!.contextSnapshot as Record<string, unknown>;
+    expect(context.stopFingerprint).not.toBe(frozenFingerprint);
+    expect((context.taskWatchdog as Record<string, unknown>).stopFingerprint).toBe(context.stopFingerprint);
+
+    // A follow-up preflight carrying the rebound fingerprint now revalidates, so
+    // the run can apply its intended mutation.
+    const afterRebind = await service.revalidateMutationScope({
+      kind: "watchdog",
+      watchdogId,
+      companyId,
+      watchedIssueId: sourceId,
+      stopFingerprint: context.stopFingerprint as string,
+      runId,
+    });
+    expect(afterRebind.allowed).toBe(true);
+  });
+
+  it("does not rebind a born-stale run when the watched card genuinely left the stopped state", async () => {
+    const { companyId, sourceId, agentId, watchdogId, runId, frozenFingerprint, service } =
+      await seedStoppedWatchdogWithWokenLeavesRun();
+
+    // An external actor moves the watched card out of the stopped state. It is
+    // still classifier-"stopped" (no live run yet) but the leaf's status changed,
+    // so the run's review no longer matches the source state.
+    await db.update(issues).set({ status: "in_progress", updatedAt: new Date() }).where(eq(issues.id, sourceId));
+
+    const revalidated = await service.revalidateMutationScope({
+      kind: "watchdog",
+      watchdogId,
+      companyId,
+      watchedIssueId: sourceId,
+      stopFingerprint: frozenFingerprint,
+      runId,
+    });
+
+    expect(revalidated.allowed).toBe(false);
+    expect(revalidated.reason).toContain("changed by an actor other than this run");
+
+    // The run's stored fingerprint must NOT have advanced.
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const context = run!.contextSnapshot as Record<string, unknown>;
+    expect(context.stopFingerprint).toBe(frozenFingerprint);
+  });
+
   it("does not raise a stopped-subtree review while a freshly-created assigned issue's first run is starting", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent(companyId);
