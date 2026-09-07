@@ -28,21 +28,29 @@ const FLEET_ONLY = { id: 999000111, login: "fleet-only[bot]", type: "Bot" };
 const GH_SHIM = [
   "#!/usr/bin/env bash",
   "set -euo pipefail",
-  'url=""',
-  'while [ "$#" -gt 0 ]; do',
-  '  case "$1" in',
-  "    api|--paginate|--slurp) ;;",
+  "url=\"\"",
+  "jqfilter=\"\"",
+  "paginate=0",
+  "while [ \"$#\" -gt 0 ]; do",
+  "  case \"$1\" in",
+  "    api|--slurp) ;;",
+  "    --paginate) paginate=1 ;;",
   "    -H) shift ;;",
-  "    --jq|-q) shift ;;",
-  '    *) [ -n "$url" ] || url="$1" ;;',
+  "    --jq|-q) shift; jqfilter=\"$1\" ;;",
+  "    *) [ -n \"$url\" ] || url=\"$1\" ;;",
   "  esac",
   "  shift",
   "done",
-  'case "$url" in',
-  '  */statuses*)  cat "$GH_SHIM_DIR/statuses.json" ;;',
-  '  */status*)    echo "gh shim: the combined /status endpoint omits creator and must not be used" >&2; exit 1 ;;',
-  '  */pulls/*)    cat "$GH_SHIM_DIR/pull.json" ;;',
-  '  *) echo "gh shim: unexpected call: $url" >&2; exit 1 ;;',
+  "case \"$url\" in",
+  "  */statuses*)",
+  "    if [ \"$paginate\" != \"1\" ]; then",
+  "      echo \"gh shim: the statuses read must be paginated\" >&2",
+  "      exit 1",
+  "    fi",
+  "    jq -r \"$jqfilter\" \"$GH_SHIM_DIR/statuses.json\" ;;",
+  "  */status*)    echo \"gh shim: the combined /status endpoint omits creator and must not be used\" >&2; exit 1 ;;",
+  "  */pulls/*)    cat \"$GH_SHIM_DIR/pull.json\" ;;",
+  "  *) echo \"gh shim: unexpected call: $url\" >&2; exit 1 ;;",
   "esac",
   "",
 ].join("\n");
@@ -137,6 +145,26 @@ test("statuses for other contexts are ignored", () => {
     status("success", TEA_CORE),
   ]);
   assert.equal(code, 0);
+});
+
+test("the approval is found behind a page's worth of newer unrelated statuses", () => {
+  // Anything holding `statuses:write` can add a context to the head commit, and
+  // this list is not filtered server-side. 100 newer unrelated statuses push the
+  // approval past the first page, where an unpaginated read reports `missing` --
+  // and this leg is fail-closed, so it would block an approved entry out of the
+  // queue rather than merely mis-reporting.
+  //
+  // Pagination itself is `gh --paginate`'s job and cannot be exercised through a
+  // shim, which has no way to emit a `Link: rel="next"` header. So this is
+  // covered from both ends: the shim refuses the call outright unless
+  // `--paginate` is passed, and the selection below is proven correct with a
+  // full page of newer rows ahead of the one that matters.
+  const noise = Array.from({ length: 100 }, (_, i) =>
+    status("success", FLEET_ONLY, `ci/unrelated-${i}`),
+  );
+  const { code, out } = run([...noise, status("success", TEA_CORE)]);
+  assert.equal(code, 0);
+  assert.match(out, /pass: paperclip\/approved = success/);
 });
 
 test("a pending approval still fails as not-approved, not as forged", () => {

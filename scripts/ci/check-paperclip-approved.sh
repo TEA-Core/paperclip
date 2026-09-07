@@ -238,24 +238,27 @@ fi
 # who wrote the signal it is enforcing. `GET /commits/{sha}/statuses` carries
 # `creator`, and returns entries newest-first, so the first entry matching the
 # context is the same value the combined endpoint would have reported.
-STATUSES_JSON="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" 2>&1)" \
-  || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_JSON}"
-jq -e . >/dev/null 2>&1 <<<"$STATUSES_JSON" \
-  || fail "malformed commit-status payload for ${HEAD_SHA}"
+# `--paginate`, not a bare first page. Anything holding `statuses:write` can
+# add a context to this commit, and the list is not filtered server-side; 100
+# newer unrelated statuses would push the approval onto page two, where an
+# unpaginated read sees `missing` and — this leg being fail-closed — blocks an
+# approved entry out of the queue. Pagination preserves order across pages, so
+# the first matching row is still the newest.
+STATUSES_TSV="$(gh api --paginate \
+  "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
+  --jq '.[] | [(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")] | @tsv' 2>&1)" \
+  || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_TSV}"
 
-LATEST_STATUS="$(jq -c --arg c "$CONTEXT" \
-  '[(. // [])[] | select(.context == $c)] | if length == 0 then null else .[0] end' \
-  <<<"$STATUSES_JSON")"
-
-if [ "$LATEST_STATUS" = "null" ] || [ -z "$LATEST_STATUS" ]; then
-  APPROVAL_STATE="missing"
-  APPROVAL_CREATOR_ID=""
-  APPROVAL_CREATOR_LOGIN=""
-else
-  APPROVAL_STATE="$(jq -r '.state // "missing"' <<<"$LATEST_STATUS")"
-  APPROVAL_CREATOR_ID="$(jq -r '.creator.id // "" | tostring' <<<"$LATEST_STATUS")"
-  APPROVAL_CREATOR_LOGIN="$(jq -r '.creator.login // ""' <<<"$LATEST_STATUS")"
-fi
+APPROVAL_STATE="missing"
+APPROVAL_CREATOR_ID=""
+APPROVAL_CREATOR_LOGIN=""
+while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login; do
+  [ "$status_context" = "$CONTEXT" ] || continue
+  APPROVAL_STATE="${status_state:-missing}"
+  APPROVAL_CREATOR_ID="$status_creator_id"
+  APPROVAL_CREATOR_LOGIN="$status_creator_login"
+  break
+done <<<"$STATUSES_TSV"
 
 if [ "$APPROVAL_STATE" = "$STATE" ]; then
   # `paperclip/approved` is a plain commit status, and the `fleet-only`
