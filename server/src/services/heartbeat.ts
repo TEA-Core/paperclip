@@ -2875,6 +2875,127 @@ export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, 
   return parseObject(bounded) ?? { _truncated: true };
 }
 
+// First-class driver/Postgres error text for the `error` column on
+// heartbeat_run_events (SUP-15309). The value is stored in the dedicated
+// `error` column verbatim and is intentionally NOT passed through the payload
+// bounder (boundHeartbeatRunEventPayloadForStorage), whose 16KB string bound is
+// exactly what truncated the SUP-15254 error away.
+//
+// Drizzle wraps driver failures in a `DrizzleQueryError` whose `.message` is the
+// top-line "Failed query: ..." and whose own `.stack` is a fresh
+// captureStackTrace that never includes the cause; the real Postgres/driver
+// error (message, SQLSTATE code, detail, constraint) is reachable ONLY on
+// `.cause` (the repo's server/src/db-errors.ts walks this same chain). To retain
+// the *underlying* driver error — the whole point of this column — we walk the
+// cause chain to the deepest node and format from it, so a large driver error is
+// captured intact rather than shadowed by the wrapper's redundant top line.
+const RUN_EVENT_ERROR_MAX_CAUSE_DEPTH = 4;
+
+// Walks `.cause` links to the deepest error. Bounded to a small depth and
+// cycle-guarded so a malformed chain can never loop.
+function runEventErrorDeepestCause(err: unknown): unknown {
+  let current: unknown = err;
+  let depth = 0;
+  while (
+    typeof current === "object" &&
+    current !== null &&
+    depth <= RUN_EVENT_ERROR_MAX_CAUSE_DEPTH
+  ) {
+    const next = (current as { cause?: unknown }).cause;
+    if (typeof next !== "object" || next === null || next === current) break;
+    current = next;
+    depth += 1;
+  }
+  return current;
+}
+
+// Renders the deepest error node as a single retained string: its stack (which
+// carries the driver message + frames) or, lacking that, its message; the
+// SQLSTATE code / detail / constraint are appended where the driver surfaces
+// them so the exact Postgres failure is reproducible from the row alone.
+function runEventErrorNodeText(node: unknown): string | undefined {
+  if (node === null || node === undefined) return undefined;
+  const record = typeof node === "object" ? (node as Record<string, unknown>) : undefined;
+  const stack =
+    typeof record?.stack === "string" && record.stack.length > 0 ? record.stack : undefined;
+  const message =
+    typeof record?.message === "string" && record.message.length > 0
+      ? record.message
+      : node instanceof Error && node.message.length > 0
+        ? node.message
+        : undefined;
+  const base = stack ?? message ?? String(node);
+  const code =
+    typeof record?.code === "string" && record.code.length > 0 ? `code: ${record.code}` : undefined;
+  const detail =
+    typeof record?.detail === "string" && record.detail.length > 0
+      ? `detail: ${record.detail}`
+      : undefined;
+  const constraint =
+    typeof record?.constraint === "string" && record.constraint.length > 0
+      ? `constraint: ${record.constraint}`
+      : typeof record?.constraint_name === "string" && record.constraint_name.length > 0
+        ? `constraint: ${record.constraint_name}`
+        : undefined;
+  const parts = [base, code, detail, constraint].filter(
+    (part): part is string => part !== undefined && part.length > 0,
+  );
+  return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
+export function runEventErrorText(err: unknown): string | undefined {
+  return runEventErrorNodeText(runEventErrorDeepestCause(err));
+}
+
+export interface HeartbeatRunEventInput {
+  eventType: string;
+  stream?: "system" | "stdout" | "stderr";
+  level?: "info" | "warn" | "error";
+  color?: string;
+  message?: string;
+  payload?: Record<string, unknown>;
+  error?: string;
+}
+
+// Builds the exact heartbeat_run_events insert values for a run event. Extracted
+// (and exported) so the retention contract is unit-testable: the `error` field is
+// written verbatim (only current-user identity is redacted) and is NOT passed
+// through the payload bounder, while `payload` is bounded as before.
+export function buildRunEventInsertValues(params: {
+  run: Pick<typeof heartbeatRuns.$inferSelect, "companyId" | "id" | "agentId">;
+  seq: number;
+  event: HeartbeatRunEventInput;
+  currentUserRedactionOptions?: CurrentUserRedactionOptions;
+}) {
+  const { run, seq, event, currentUserRedactionOptions } = params;
+  const sanitizedMessage = event.message
+    ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+    : event.message;
+  const sanitizedError = event.error
+    ? redactCurrentUserText(event.error, currentUserRedactionOptions)
+    : event.error;
+  const boundedPayload = event.payload
+    ? boundHeartbeatRunEventPayloadForStorage(event.payload)
+    : event.payload;
+  const secretSanitizedPayload = boundedPayload ? redactEventPayload(boundedPayload) : boundedPayload;
+  const sanitizedPayload = secretSanitizedPayload
+    ? redactCurrentUserValue(secretSanitizedPayload, currentUserRedactionOptions)
+    : secretSanitizedPayload;
+  return {
+    companyId: run.companyId,
+    runId: run.id,
+    agentId: run.agentId,
+    seq,
+    eventType: event.eventType,
+    stream: event.stream,
+    level: event.level,
+    color: event.color,
+    message: sanitizedMessage,
+    error: sanitizedError,
+    payload: sanitizedPayload,
+  };
+}
+
 function redactInlineBase64ImageData(chunk: string) {
   return chunk.replace(INLINE_BASE64_IMAGE_DATA_RE, (_match, prefix: string, data: string, suffix: string) =>
     `${prefix}[omitted base64 image data: ${data.length} chars]${suffix}`,
@@ -10477,27 +10598,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function appendRunEvent(
     run: typeof heartbeatRuns.$inferSelect,
     seq: number,
-    event: {
-      eventType: string;
-      stream?: "system" | "stdout" | "stderr";
-      level?: "info" | "warn" | "error";
-      color?: string;
-      message?: string;
-      payload?: Record<string, unknown>;
-    },
+    event: HeartbeatRunEventInput,
   ) {
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const sanitizedMessage = event.message
-      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
-      : event.message;
-    const boundedPayload = event.payload
-      ? boundHeartbeatRunEventPayloadForStorage(event.payload)
-      : event.payload;
-    const secretSanitizedPayload = boundedPayload ? redactEventPayload(boundedPayload) : boundedPayload;
-    const sanitizedPayload = secretSanitizedPayload
-      ? redactCurrentUserValue(secretSanitizedPayload, currentUserRedactionOptions)
-      : secretSanitizedPayload;
+    const insertValues = buildRunEventInsertValues({
+      run,
+      seq,
+      event,
+      currentUserRedactionOptions,
+    });
+    const sanitizedMessage = insertValues.message;
+    const sanitizedError = insertValues.error;
+    const sanitizedPayload = insertValues.payload;
     const issueId = readRuntimeStatusIssueIdCandidate(run) ?? null;
     const progress = buildRunEventRuntimeProgress({
       eventType: event.eventType,
@@ -10506,18 +10619,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       at: eventAt,
     });
 
-    await db.insert(heartbeatRunEvents).values({
-      companyId: run.companyId,
-      runId: run.id,
-      agentId: run.agentId,
-      seq,
-      eventType: event.eventType,
-      stream: event.stream,
-      level: event.level,
-      color: event.color,
-      message: sanitizedMessage,
-      payload: sanitizedPayload,
-    });
+    await db.insert(heartbeatRunEvents).values(insertValues);
 
     publishLiveEvent({
       companyId: run.companyId,
@@ -10532,6 +10634,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         level: event.level ?? null,
         color: event.color ?? null,
         message: sanitizedMessage ?? null,
+        error: sanitizedError ?? null,
         currentToolName: progress?.currentToolName ?? null,
         lastAssistantSnippet: progress?.lastAssistantSnippet ?? null,
         lastEventAt: (progress?.lastEventAt ?? eventAt).toISOString(),
@@ -18286,6 +18389,7 @@ function pendingCleanupAttemptsSql() {
         stream: "system",
         level: "error",
         message,
+        error: runEventErrorText(err),
       });
 
       const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
@@ -18458,6 +18562,7 @@ function pendingCleanupAttemptsSql() {
               stream: "system",
               level: "error",
               message,
+              error: runEventErrorText(outerErr),
             }).catch(() => undefined);
           }
           const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
@@ -18602,6 +18707,7 @@ function pendingCleanupAttemptsSql() {
                 stream: "system",
                 level: "warn",
                 message: "run scratch cleanup failed",
+                error: runEventErrorText(scratchCleanupError),
                 payload: {
                   dir: scratchForCleanup.dir,
                   error: scratchCleanupError instanceof Error

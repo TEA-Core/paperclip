@@ -28,6 +28,7 @@ export const heartbeatRunEvents = pgTable(
     level: text("level"),
     color: text("color"),
     message: text("message"),
+    error: text("error"),
     payload: jsonb("payload").$type<Record<string, unknown>>(),
     sourceInstanceId: text("source_instance_id"),
     sourceEventId: text("source_event_id"),

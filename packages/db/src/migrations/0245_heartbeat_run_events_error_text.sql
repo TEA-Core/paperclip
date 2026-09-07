@@ -1,0 +1,11 @@
+-- SUP-15309: retain the underlying Postgres/driver error on heartbeat_run_events.
+-- The driver/driver error text previously rode in `payload`, which is bounded at
+-- 16KB per string (boundHeartbeatRunEventPayloadForStorage) and was truncated to
+-- `{ _truncated: true }` / null during the SUP-15254 outage (dead run 603ee05e),
+-- making the incident that killed 79/79 issue-bound runs undiagnosable from
+-- inside the platform.
+--
+-- This first-class, non-truncated `error` column is populated from the caught
+-- error at the event-recording / failing-write sites and is intentionally NOT
+-- passed through the payload bounder. Forward-only: no backfill of existing rows.
+ALTER TABLE "heartbeat_run_events" ADD COLUMN IF NOT EXISTS "error" text;
