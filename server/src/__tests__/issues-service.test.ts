@@ -5177,6 +5177,147 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("releases the blocker edge on the source when a productivity review is cancelled (SUP-15296)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const sourceIssueId = randomUUID();
+    const reviewIssueId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: sourceIssueId,
+        companyId,
+        title: "Source issue",
+        status: "blocked",
+        priority: "medium",
+      },
+      {
+        id: reviewIssueId,
+        companyId,
+        title: "Review productivity for source",
+        status: "todo",
+        priority: "medium",
+        originKind: "issue_productivity_review",
+        originId: sourceIssueId,
+        parentId: sourceIssueId,
+      },
+    ]);
+
+    // The reconciliation hard-blocks the source by the open review (child blocks
+    // parent). A generic cancelled blocker is deliberately held as unresolved...
+    await svc.update(sourceIssueId, { blockedByIssueIds: [reviewIssueId] });
+    await expect(svc.getDependencyReadiness(sourceIssueId)).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [reviewIssueId],
+      unresolvedBlockerCount: 1,
+      isDependencyReady: false,
+    });
+
+    // ...but a productivity review is different: cancelling it is an operator
+    // resolving the review, so the hard edge it created on the source must be
+    // released instead of leaving the source stranded behind a dead card.
+    await svc.update(reviewIssueId, { status: "cancelled" });
+
+    await expect(svc.getRelationSummaries(sourceIssueId)).resolves.toMatchObject({
+      blockedBy: [],
+    });
+    await expect(svc.getDependencyReadiness(sourceIssueId)).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      isDependencyReady: true,
+    });
+  });
+
+  it("releases the blocker edge on the source when a productivity review is marked done (SUP-15296)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const sourceIssueId = randomUUID();
+    const reviewIssueId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: sourceIssueId,
+        companyId,
+        title: "Source issue",
+        status: "blocked",
+        priority: "medium",
+      },
+      {
+        id: reviewIssueId,
+        companyId,
+        title: "Review productivity for source",
+        status: "todo",
+        priority: "medium",
+        originKind: "issue_productivity_review",
+        originId: sourceIssueId,
+        parentId: sourceIssueId,
+      },
+    ]);
+
+    await svc.update(sourceIssueId, { blockedByIssueIds: [reviewIssueId] });
+    await svc.update(reviewIssueId, { status: "done" });
+
+    await expect(svc.getRelationSummaries(sourceIssueId)).resolves.toMatchObject({
+      blockedBy: [],
+    });
+    await expect(svc.getDependencyReadiness(sourceIssueId)).resolves.toMatchObject({
+      unresolvedBlockerCount: 0,
+      isDependencyReady: true,
+    });
+  });
+
+  it("leaves a generic cancelled blocker's edge intact (only productivity reviews self-release)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const sourceIssueId = randomUUID();
+    const genericChildId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: sourceIssueId,
+        companyId,
+        title: "Source issue",
+        status: "blocked",
+        priority: "medium",
+      },
+      {
+        id: genericChildId,
+        companyId,
+        title: "Ordinary open child",
+        status: "todo",
+        priority: "medium",
+        originKind: "manual",
+        originId: sourceIssueId,
+        parentId: sourceIssueId,
+      },
+    ]);
+
+    await svc.update(sourceIssueId, { blockedByIssueIds: [genericChildId] });
+    await svc.update(genericChildId, { status: "cancelled" });
+
+    // A plain cancelled child is NOT a productivity review, so its held blocker
+    // edge is preserved unchanged (the SUP-10347 cancelled-blocker contract).
+    await expect(svc.getDependencyReadiness(sourceIssueId)).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [genericChildId],
+      unresolvedBlockerCount: 1,
+      isDependencyReady: false,
+    });
+  });
+
   it("rejects execution when unresolved blockers remain", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();

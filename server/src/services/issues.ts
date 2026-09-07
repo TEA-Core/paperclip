@@ -8934,6 +8934,30 @@ export function issueService(db: Db) {
               );
           }
         }
+        // A productivity review's only job is to review its source issue; once it
+        // is done or cancelled it must stop blocking that source. The
+        // reconciliation hard-blocks the source by the review (child blocks
+        // parent), and a cancelled blocker is otherwise intentionally held as
+        // unresolved, so without this the source stays `blocked` by a card that
+        // no longer exists. Cancelling the review is an operator saying "this
+        // pattern is fine / not worth acting on" — a resolve, not a hold.
+        if (
+          (issueData.status === "done" || issueData.status === "cancelled") &&
+          existing.status !== issueData.status &&
+          existing.originKind === RECOVERY_ORIGIN_KINDS.issueProductivityReview &&
+          existing.originId
+        ) {
+          await tx
+            .delete(issueRelations)
+            .where(
+              and(
+                eq(issueRelations.companyId, existing.companyId),
+                eq(issueRelations.issueId, existing.id),
+                eq(issueRelations.relatedIssueId, existing.originId),
+                eq(issueRelations.type, "blocks"),
+              ),
+            );
+        }
         if (actorUserId && receiptExisting.status !== "done" && updated.status === "done") {
           if (dbOrTx !== db && !postCommitActivityPublications) {
             throw new Error("Human completion in an external transaction requires a post-commit activity queue");

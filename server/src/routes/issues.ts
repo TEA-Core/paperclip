@@ -188,6 +188,7 @@ import {
 export { IN_PROGRESS_SETTLE_WINDOW_MS, evaluateIssueContinuationPath, toContinuationPathDate };
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
+  issueIsInTaskWatchdogSubtree,
   resolveTaskWatchdogMutationScope,
   taskWatchdogScopeAllowsIssueMutation,
 } from "../services/task-watchdog-scope.js";
@@ -488,6 +489,7 @@ function noopTaskWatchdogService(): TaskWatchdogService {
         pendingInteractionsByIssueId: {},
       },
     }),
+    advanceWatchdogRunStopFingerprint: async () => null,
   };
 }
 
@@ -5320,6 +5322,36 @@ export function issueRoutes(
     return false;
   }
 
+  /**
+   * SUP-15257: after a successful watchdog-attributed source mutation, re-derive
+   * and advance the run's stop fingerprint so the next write in the same run is
+   * not rejected as stale. Fire-and-forget: a failure here degrades to the
+   * pre-fix behavior (subsequent writes may 409) and must never break the write
+   * that just committed.
+   *
+   * The advance only applies when the write actually touched the watched source
+   * subtree. Writes to the watchdog's own issue (or anything outside the subtree)
+   * do not move the stop fingerprint, and advancing on them would re-derive the
+   * current fingerprint — absorbing any external subtree change into the run's
+   * copy and eroding the guard's purpose of rejecting foreign changes (AC2).
+   */
+  async function advanceTaskWatchdogSourceMutationFingerprint(
+    scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
+    mutatedIssueId: string,
+  ) {
+    if (scope.kind !== "watchdog" || !scope.runId) return;
+    if (!(await issueIsInTaskWatchdogSubtree(db, scope.companyId, mutatedIssueId, scope.watchedIssueId))) return;
+    try {
+      await taskWatchdogsSvc.advanceWatchdogRunStopFingerprint({
+        runId: scope.runId,
+        companyId: scope.companyId,
+        watchdogId: scope.watchdogId,
+      });
+    } catch (err) {
+      logger.warn({ err, runId: scope.runId, watchdogId: scope.watchdogId }, "failed to advance task-watchdog run stop fingerprint");
+    }
+  }
+
   async function rejectTaskWatchdogConfigMutation(req: Request, res: Response) {
     if (req.actor.type !== "agent") return false;
     const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
@@ -5754,6 +5786,15 @@ export function issueRoutes(
       return false;
     }
     if (isAssignee) return assertAgentIssueMutationAllowed(req, res, issue);
+    // SUP-15257: a creator-withdraw (creator without assignee status) previously
+    // bypassed the stop-fingerprint freshness gate, so an out-of-sync withdraw
+    // would silently absorb an external subtree change via the post-write
+    // advance. Gate it on the same freshness preflight so an external
+    // fingerprint change still 409s instead of being absorbed.
+    const withdrawScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (withdrawScope.kind === "watchdog") {
+      return assertFreshTaskWatchdogSourceMutation(res, withdrawScope, issue);
+    }
     return true;
   }
 
@@ -6277,6 +6318,15 @@ export function issueRoutes(
       const ownerlessRecoveryAction =
         await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id).catch(() => null);
       if (ownerlessRecoveryAction && !ownerlessRecoveryAction.ownerAgentId) return true;
+      // SUP-15298: a human-assigned issue has no agent whose resume authority a
+      // follow-up could violate -- the card's owner is a person, not an agent.
+      // Requiring an agent assignee here turns a `blocked` card into a one-way
+      // door: an agent can push it into `blocked` (Guard B, the single-assignee
+      // invariant, then forbids it from claiming the slot). When there are no
+      // unresolved blockers (the readiness gate above already passed), let any
+      // same-company agent pull the card back to a state the human can act on.
+      // This reassigns nothing and triggers no agent run.
+      if (issue.assigneeUserId && issue.status === "blocked") return true;
       res.status(409).json({
         error: "Issue follow-up requires an assigned agent",
         details: { issueId: issue.id, actorAgentId },
@@ -10786,6 +10836,14 @@ export function issueRoutes(
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
 
+    // SUP-15257: creating a follow-up child mutates the watched subtree; advance
+    // this run's stop fingerprint so its next in-run write is not rejected.
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      await advanceTaskWatchdogSourceMutationFingerprint(
+        await resolveTaskWatchdogMutationScope(db, req.actor),
+        issue.id,
+      );
+    }
     res.status(201).json(issue);
   });
 
@@ -12206,6 +12264,15 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    // SUP-15257: this issue mutation just committed; if it came from a
+    // task-watchdog run, re-derive and advance that run's stop fingerprint so
+    // its next in-run write is not rejected as stale.
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      await advanceTaskWatchdogSourceMutationFingerprint(
+        await resolveTaskWatchdogMutationScope(db, req.actor),
+        issue.id,
+      );
+    }
     if (transition.reviewEscalation && transition.decision) {
       try {
         await mintReviewEscalationInteraction({
@@ -12356,6 +12423,11 @@ export function issueRoutes(
               agentId: actor.agentId,
               runId: actor.runId,
               actorSource: actor.actorSource,
+              // SUP-15298: empty blocker set + no unblockDescriptor means no
+              // structural resolution path exists for the card; flag it so the
+              // worst combination is distinguishable from a card that still has
+              // a descriptor naming an owner + action.
+              hasUnblockDescriptor: Boolean(descriptor),
             },
             "issue PATCH committed blocked with an empty blocker set",
           );
@@ -12373,6 +12445,7 @@ export function issueRoutes(
               source: "issue_update_route",
               identifier: issue.identifier,
               blockerIssueIds: committedBlockerIssueIds,
+              hasUnblockDescriptor: Boolean(descriptor),
               actorSource: actor.actorSource,
               statusChanged: existing.status !== issue.status,
               blockersPatched: Array.isArray(req.body.blockedByIssueIds),
@@ -13628,6 +13701,15 @@ export function issueRoutes(
       }, "failed to wake addressee on issue interaction creation"));
     }
 
+    // SUP-15257: creating an interaction mutates the watched subtree's pending
+    // interaction set; advance this run's stop fingerprint so its next
+    // write is not rejected as stale.
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      await advanceTaskWatchdogSourceMutationFingerprint(
+        await resolveTaskWatchdogMutationScope(db, req.actor),
+        issue.id,
+      );
+    }
     res.status(201).json(interaction);
   });
 
@@ -14221,6 +14303,15 @@ export function issueRoutes(
           actor,
           source: "issue.interaction.withdraw",
         });
+      }
+      // SUP-15257: withdrawing an interaction clears a pending interaction from
+      // the watched subtree; advance this run's stop fingerprint so its next
+      // in-run write is not rejected as stale.
+      if (req.actor.type === "agent" && req.actor.agentId) {
+        await advanceTaskWatchdogSourceMutationFingerprint(
+          await resolveTaskWatchdogMutationScope(db, req.actor),
+          issue.id,
+        );
       }
       res.json(interaction);
     },

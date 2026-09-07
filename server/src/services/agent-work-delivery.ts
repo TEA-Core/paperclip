@@ -1,5 +1,6 @@
 import type { agents } from "@paperclipai/db";
 import { asString, parseObject } from "../adapters/utils.js";
+import { parseHeartbeatPolicy } from "./heartbeat-policy.js";
 
 /**
  * How an agent's work reaches Paperclip.
@@ -44,4 +45,19 @@ export function parseAgentWorkDelivery(agent: AgentWorkDeliveryInput): AgentWork
 
 export function isExternalPullAgent(agent: AgentWorkDeliveryInput) {
   return parseAgentWorkDelivery(agent) === "external_pull";
+}
+
+/**
+ * True when Paperclip can never start a run for this agent: it is declared
+ * `external_pull` (work reaches Paperclip out of band, e.g. a GitLab MR-bot
+ * seat), or its heartbeat is fully off (no periodic timer AND no on-demand
+ * wake). For such seats every run-derived metric — run counts, cost,
+ * run-linked comments, and even the active-episode duration — is structurally
+ * zero or unmeasurable, so evaluating run-derived triggers against them is
+ * meaningless and produces a "blocked only by a cancelled review card" loop.
+ */
+export function hasNoPlatformDispatchPath(agent: AgentWorkDeliveryInput): boolean {
+  if (isExternalPullAgent(agent)) return true;
+  const policy = parseHeartbeatPolicy(agent);
+  return policy.enabled === false && policy.wakeOnDemand === false;
 }

@@ -256,6 +256,10 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
         actorSource: "local_implicit",
         statusChanged: true,
         blockersPatched: false,
+        // SUP-15298: this card carried an unblockDescriptor, so the no-
+        // resolution-path combination (empty blockers AND no descriptor) does
+        // not apply here.
+        hasUnblockDescriptor: true,
       }),
     );
     expect(mockLoggerWarn).toHaveBeenCalledWith(
@@ -307,5 +311,23 @@ describe("blocked-without-blockers telemetry signal in PATCH /issues/:id", () =>
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("done");
     expect(blockedWithoutBlockersWrites()).toHaveLength(0);
+  });
+
+  // SUP-15298: a transition into `blocked` that leaves no resolution path --
+  // empty blockedBy, no unblockDescriptor, and no pending interaction/approval
+  // (stubRows stays empty) -- is rejected rather than silently stranding the
+  // card behind the follow-up guard.
+  it("rejects entering blocked with an empty blocker set, no unblockDescriptor, and no pending interaction/approval", async () => {
+    mockIssueService.getById.mockResolvedValue(issueFixture({ status: "todo" }));
+    stubRows = [];
+
+    const res = await request(await createApp()).patch("/api/issues/issue-1").send({ status: "blocked" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe(
+      "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
+    );
+    expect(blockedWithoutBlockersWrites()).toHaveLength(0);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 });
