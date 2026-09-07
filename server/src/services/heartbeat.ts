@@ -7,9 +7,10 @@ import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNul
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  CONNECTION_INTENT_AGENT_GUIDANCE,
+  CONNECTION_RUNTIME_TOOL_NAMES,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
-  MAX_TASK_DRAIN_TTL_MS,
   MODEL_PROFILE_KEYS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   envBindingSchema,
@@ -69,7 +70,10 @@ import {
   routines,
   toolMcpGateways,
   toolMcpGatewayTokens,
+  toolCatalogEntries,
+  toolConnectionInstalls,
   toolConnections,
+  toolProfileEntries,
   toolProfiles,
   workspaceOperations,
 } from "@paperclipai/db";
@@ -109,10 +113,12 @@ import type {
   AdapterRuntimeEvent,
   AdapterRuntimeMcpAccess,
   AdapterRuntimeMcpServer,
+  AdapterRuntimeToolAccess,
   AdapterSessionCodec,
   UsageSummary,
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
@@ -547,6 +553,7 @@ const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+const NATIVE_QUESTION_CANCELLATION_CONTEXT_KEY = "nativeQuestionCancellation";
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const STALE_RUN_HANDOFF_HOPS_KEY = "staleRunHandoffHops";
 // A handoff wake that is itself cancelled as stale means issue ownership is still
@@ -994,38 +1001,6 @@ const activeRunExecutionPromises = new Set<Promise<void>>();
 // can await a wake that is still before run registration. A caller that tears
 // down a shared database (a test afterEach) then cannot race a late wake.
 const activeWakeupPromises = new Set<Promise<unknown>>();
-// executeRun's task-drain suppression branch can fail to release a run's
-// claim two ways in a row: the atomic release transaction fails, then its
-// fallback transaction (which marks the run "failed" instead) also fails.
-// When that happens the run, wakeup, and issue lock are left in an unknown
-// durable state. The dispatch site still removes this run's execution
-// promise from activeRunExecutionPromises once executeRun settles —
-// drainActiveRunExecutions loops on that set's size, so an entry that never
-// clears would hang it forever — so a promise-based set cannot carry this
-// signal. Track the runId here instead. getTaskDrainStatus() folds this set
-// into its active-run count, so it keeps reporting a non-quiescent instance
-// for this run. There is no in-process retry for a fallback that already
-// failed once, so the run's row stays "running" until reapOrphanedRuns picks
-// it up as an orphan and finalizes it — that is also where this marker gets
-// removed, right after the reaper finishes the durable issue-lock cleanup
-// for the run (releaseIssueExecutionAndPromote, or handing the run's pending
-// work to a retry), and before any later, lock-unrelated cleanup runs. An
-// entry here only outlives that reap, and so only clears on a process
-// restart, if the reaper itself never runs again for this run, or if
-// classification, retry scheduling, or the lock release itself keeps
-// failing for it.
-const stuckClaimReleaseRunIds = new Set<string>();
-// Thrown by executeRun's task-drain suppression branch when both the atomic
-// claim release and its fallback fail a durable write for the same run. The
-// dispatch site catches this to add the run to stuckClaimReleaseRunIds
-// instead of treating it as an ordinary execution failure.
-class RunClaimReleaseUnresolvedFailure extends Error {
-  constructor(runId: string, cause: unknown) {
-    const causeMessage = cause instanceof Error ? cause.message : String(cause);
-    super(`Run claim release failed durably for run ${runId}: ${causeMessage}`);
-    this.name = "RunClaimReleaseUnresolvedFailure";
-  }
-}
 // Task drain: an operator-controlled hold on new run admission, so a caller
 // can wait for active work to finish before it stops the process. The state
 // lives in process memory only — a process restart clears it — and it sits at
@@ -1033,13 +1008,6 @@ class RunClaimReleaseUnresolvedFailure extends Error {
 // resolveHeartbeatSchedulingSuppression() check and every heartbeatService()
 // instance see the same drain.
 let taskDrainState: { startedAt: Date; expiresAt: Date | null } | null = null;
-// Bumped on every explicit task-drain mutation (a start or a stop), so a
-// caller can tell whether a later mutation has already superseded its own.
-// A route rollback reads this right after its own mutation, then passes it
-// to restoreTaskDrainIfCurrent() before it restores prior state on a failed
-// audit write — so the rollback never overwrites a newer concurrent
-// mutation with stale state.
-let taskDrainGeneration = 0;
 
 function readTaskDrain(now: Date): { startedAt: Date; expiresAt: Date | null } | null {
   if (taskDrainState && taskDrainState.expiresAt !== null && taskDrainState.expiresAt.getTime() <= now.getTime()) {
@@ -1048,45 +1016,37 @@ function readTaskDrain(now: Date): { startedAt: Date; expiresAt: Date | null } |
   return taskDrainState;
 }
 
-export function startTaskDrain(opts: { ttlMs?: number | null } = {}): { startedAt: Date; expiresAt: Date | null } {
+/** Compute the drain a start call would apply, without changing state. */
+export function computeTaskDrain(opts: { ttlMs?: number | null } = {}): { startedAt: Date; expiresAt: Date | null } {
   const startedAt = new Date();
   const ttlMs = opts.ttlMs ?? null;
-  const expiresAt = ttlMs === null ? null : new Date(startedAt.getTime() + Math.min(ttlMs, MAX_TASK_DRAIN_TTL_MS));
-  taskDrainState = { startedAt, expiresAt };
-  taskDrainGeneration += 1;
-  return taskDrainState;
+  const expiresAt = ttlMs === null ? null : new Date(startedAt.getTime() + ttlMs);
+  return { startedAt, expiresAt };
+}
+
+/** Assign the given drain as the current task-drain state. */
+export function applyTaskDrain(drain: { startedAt: Date; expiresAt: Date | null }): void {
+  taskDrainState = drain;
+}
+
+export function startTaskDrain(opts: { ttlMs?: number | null } = {}): { startedAt: Date; expiresAt: Date | null } {
+  const drain = computeTaskDrain(opts);
+  applyTaskDrain(drain);
+  return drain;
 }
 
 export function stopTaskDrain(): { wasActive: boolean } {
   const wasActive = readTaskDrain(new Date()) !== null;
   taskDrainState = null;
-  taskDrainGeneration += 1;
   return { wasActive };
 }
 
-/** The current task-drain mutation count. See taskDrainGeneration above. */
-export function getTaskDrainGeneration(): number {
-  return taskDrainGeneration;
-}
-
 /**
- * Restore a captured task-drain state, but only if no other mutation has
- * happened since expectedGeneration was read. Returns false, and leaves the
- * current state untouched, when a newer mutation has already superseded it.
+ * Report the task-drain state for this process only. `activeRuns` and
+ * `pendingWakes` count in-process work. A process restart clears both
+ * counters, even when the database still holds `running` rows for runs
+ * this process did not finish.
  */
-export function restoreTaskDrainIfCurrent(
-  expectedGeneration: number,
-  restore: { draining: boolean; ttlMs: number | null },
-): boolean {
-  if (taskDrainGeneration !== expectedGeneration) return false;
-  if (restore.draining) {
-    startTaskDrain({ ttlMs: restore.ttlMs });
-  } else {
-    stopTaskDrain();
-  }
-  return true;
-}
-
 export function getTaskDrainStatus(): {
   draining: boolean;
   startedAt: Date | null;
@@ -1096,10 +1056,7 @@ export function getTaskDrainStatus(): {
   quiescent: boolean;
 } {
   const state = readTaskDrain(new Date());
-  // Fold in stuckClaimReleaseRunIds so a run whose claim release failed
-  // durably (see the set's own comment) keeps this read non-quiescent, even
-  // though its execution promise already left activeRunExecutionPromises.
-  const activeRuns = activeRunExecutionPromises.size + stuckClaimReleaseRunIds.size;
+  const activeRuns = activeRunExecutionPromises.size;
   const pendingWakes = activeWakeupPromises.size;
   return {
     draining: state !== null,
@@ -2824,6 +2781,7 @@ const heartbeatRunLogAccessColumns = {
 
 const heartbeatRunIssueSummaryColumns = {
   id: heartbeatRuns.id,
+  runtimeMode: heartbeatRuns.runtimeMode,
   status: heartbeatRuns.status,
   invocationSource: heartbeatRuns.invocationSource,
   triggerDetail: heartbeatRuns.triggerDetail,
@@ -3078,6 +3036,10 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  issueStateGuard?: {
+    statuses: string[];
+    assigneeAgentId: string;
+  };
 }
 
 type UsageTotals = {
@@ -3815,12 +3777,19 @@ type ManagedMcpGatewayRunConfig = {
   }>;
 };
 
-function paperclipApiBaseUrl(): string {
+function configuredPaperclipApiBaseUrl(): string | null {
   const configured = readNonEmptyString(process.env.PAPERCLIP_API_URL);
+  return configured
+    ? configured.replace(/\/+$/, "").replace(/\/api$/, "")
+    : null;
+}
+
+function paperclipApiBaseUrl(): string {
+  const configured = configuredPaperclipApiBaseUrl();
   if (!configured) {
     throw new Error("PAPERCLIP_API_URL is required to deliver managed runtime MCP servers");
   }
-  return configured.replace(/\/+$/, "").replace(/\/api$/, "");
+  return configured;
 }
 
 export async function revokeHeartbeatRunGatewayTokens(input: {
@@ -3955,7 +3924,11 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     });
     servers.push({
       name: connection.name,
-      url: `${paperclipApiBaseUrl()}/api/tool-gateway/gateways/${gateway.id}/mcp`,
+      // Runtime MCP clients authenticate with a short-lived gateway bearer, not
+      // a Paperclip agent JWT. Route them through the public gateway protocol
+      // endpoint mounted ahead of the API auth middleware; the gateway service
+      // still validates the bearer and its run binding on every request.
+      url: `${paperclipApiBaseUrl()}/mcp/gateways/${gateway.gatewayPublicId}`,
       token: token.token,
       connectionId: connection.id,
     });
@@ -3981,6 +3954,40 @@ function createAdapterRuntimeMcpAccess(
   });
 }
 
+function createAdapterRuntimeToolAccess(input: {
+  agentId: string;
+  companyId: string;
+  runId: string;
+  responsibleUserId: string | null;
+}): AdapterRuntimeToolAccess | undefined {
+  if (!input.responsibleUserId) return undefined;
+  const minted = createRuntimeToolsToken({
+    agentId: input.agentId,
+    companyId: input.companyId,
+    runId: input.runId,
+    responsibleUserId: input.responsibleUserId,
+  });
+  if (!minted) return undefined;
+  // The normal server bootstrap always exports PAPERCLIP_API_URL. Some service
+  // tests invoke heartbeat execution without booting an HTTP server, however;
+  // in that context there is no reachable endpoint to advertise and runtime
+  // tools should simply remain unavailable instead of failing the run.
+  const baseUrl = configuredPaperclipApiBaseUrl();
+  if (!baseUrl) return undefined;
+  return Object.freeze({
+    version: 1,
+    guidance: CONNECTION_INTENT_AGENT_GUIDANCE,
+    mcpEndpoint: `${baseUrl}/mcp/runtime-tools`,
+    rest: {
+      connectionsSearch: `${baseUrl}/runtime-tools/connections/search`,
+      connectionRequest: `${baseUrl}/runtime-tools/connections/request`,
+    },
+    bearerToken: minted.token,
+    expiresAt: minted.expiresAt,
+    tools: CONNECTION_RUNTIME_TOOL_NAMES,
+  });
+}
+
 const MANAGED_MCP_LOCAL_ADAPTERS = new Set(["codex_local"]);
 
 function adapterSupportsManagedMcpConfig(adapterType: string): boolean {
@@ -4003,7 +4010,68 @@ function gatewayAppliesToRun(input: {
   return true;
 }
 
-async function createManagedMcpRunConfig(input: {
+async function gatewayConnectionIds(input: {
+  db: Db;
+  companyId: string;
+  gateway: typeof toolMcpGateways.$inferSelect;
+}): Promise<Set<string>> {
+  const managedRuntimeConnectionId = readNonEmptyString(input.gateway.metadata?.managedRuntimeConnectionId);
+  if (managedRuntimeConnectionId) return new Set([managedRuntimeConnectionId]);
+
+  const [profile, entries, catalog, connections] = await Promise.all([
+    input.db
+      .select({ defaultAction: toolProfiles.defaultAction })
+      .from(toolProfiles)
+      .where(and(eq(toolProfiles.companyId, input.companyId), eq(toolProfiles.id, input.gateway.profileId)))
+      .then((rows) => rows[0] ?? null),
+    input.db
+      .select()
+      .from(toolProfileEntries)
+      .where(and(
+        eq(toolProfileEntries.companyId, input.companyId),
+        eq(toolProfileEntries.profileId, input.gateway.profileId),
+      )),
+    input.db
+      .select({
+        id: toolCatalogEntries.id,
+        connectionId: toolCatalogEntries.connectionId,
+        applicationId: toolCatalogEntries.applicationId,
+        toolName: toolCatalogEntries.toolName,
+        riskLevel: toolCatalogEntries.riskLevel,
+      })
+      .from(toolCatalogEntries)
+      .where(and(eq(toolCatalogEntries.companyId, input.companyId), eq(toolCatalogEntries.status, "active"))),
+    input.db
+      .select({ id: toolConnections.id, applicationId: toolConnections.applicationId })
+      .from(toolConnections)
+      .where(eq(toolConnections.companyId, input.companyId)),
+  ]);
+  if (!profile) return new Set();
+  if (profile.defaultAction === "allow") return new Set(catalog.map((entry) => entry.connectionId));
+
+  const connectionIds = new Set<string>();
+  for (const entry of entries) {
+    if (entry.effect !== "include") continue;
+    if (entry.connectionId) connectionIds.add(entry.connectionId);
+    if (entry.applicationId) {
+      for (const connection of connections) {
+        if (connection.applicationId === entry.applicationId) connectionIds.add(connection.id);
+      }
+    }
+    for (const catalogEntry of catalog) {
+      if (
+        (entry.catalogEntryId && entry.catalogEntryId === catalogEntry.id)
+        || (entry.toolName && entry.toolName === catalogEntry.toolName)
+        || (entry.riskLevel && entry.riskLevel === catalogEntry.riskLevel)
+      ) {
+        connectionIds.add(catalogEntry.connectionId);
+      }
+    }
+  }
+  return connectionIds;
+}
+
+export async function createManagedMcpRunConfig(input: {
   db: Db;
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name" | "adapterType">;
   runId: string;
@@ -4024,12 +4092,33 @@ async function createManagedMcpRunConfig(input: {
     ))
     .orderBy(asc(toolMcpGateways.name));
 
-  const gateways = rows.filter((gateway) => gatewayAppliesToRun({
+  const installRows = await input.db
+    .select({ connectionId: toolConnectionInstalls.connectionId })
+    .from(toolConnectionInstalls)
+    .where(and(
+      eq(toolConnectionInstalls.companyId, input.agent.companyId),
+      sql`((${toolConnectionInstalls.targetType} = 'company' and ${toolConnectionInstalls.targetId} = ${input.agent.companyId}) or (${toolConnectionInstalls.targetType} = 'agent' and ${toolConnectionInstalls.targetId} = ${input.agent.id}))`,
+    ));
+  const installedConnectionIds = new Set(installRows.map((install) => install.connectionId));
+
+  const applicableGateways = rows.filter((gateway) => gatewayAppliesToRun({
     gateway,
     agentId: input.agent.id,
     projectId: input.projectId,
     issueId: input.issueId,
   }));
+  const gateways = (await Promise.all(applicableGateways.map(async (gateway) => ({
+    gateway,
+    connectionIds: await gatewayConnectionIds({
+      db: input.db,
+      companyId: input.agent.companyId,
+      gateway,
+    }),
+  }))))
+    .filter(({ connectionIds }) =>
+      connectionIds.size > 0
+      && [...connectionIds].every((connectionId) => installedConnectionIds.has(connectionId)))
+    .map(({ gateway }) => gateway);
   if (gateways.length === 0) return null;
 
   const service = createToolGatewayService(input.db);
@@ -4053,7 +4142,9 @@ async function createManagedMcpRunConfig(input: {
     managedGateways.push({
       id: gateway.id,
       name: gateway.name,
-      endpointPath: `/api/tool-gateway/gateways/${gateway.id}/mcp`,
+      // This path must bypass the normal /api agent-JWT middleware. The MCP
+      // gateway performs its own bearer validation for the run-scoped token.
+      endpointPath: `/mcp/gateways/${gateway.gatewayPublicId}`,
       bearerToken: token.token,
       tokenPrefix: token.tokenPrefix,
     });
@@ -7479,6 +7570,16 @@ export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
+  /** Test seam for changing a continuation issue at the final pre-dispatch boundary. */
+  beforeResolvedInteractionContinuationDispatchCheck?: (input: {
+    runId: string;
+    issueId: string;
+  }) => Promise<void>;
+  /** Test seam for racing an issue mutation after validation while its row lock is held. */
+  afterResolvedInteractionContinuationDispatchCheck?: (input: {
+    runId: string;
+    issueId: string;
+  }) => Promise<void>;
 }
 
 type WorkspaceReadyCommentWriter = {
@@ -14029,7 +14130,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
       if (staleness.stale) {
-        const cancelledRun = await cancelQueuedRunForStaleIssue(run, issueId, staleness);
+        const cancelledRun = await cancelRunForStaleIssue(run, issueId, staleness);
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
@@ -14205,91 +14306,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
-  // Fallback for when the atomic release above itself fails (a genuine write
-  // error, not a normal no-op). executeRun's caller removes this run's
-  // promise from activeRunExecutionPromises as soon as executeRun settles,
-  // whether it resolves or rejects — so task-drain quiescence is about to
-  // read "no active runs" regardless of what happens here. If the run,
-  // wakeup, and issue lock stayed at "running"/"claimed"/locked, that read
-  // would be false: the database would still hold a claim nothing is
-  // tracking anymore. Fail the run outright instead, so the database
-  // reaches the same "not active" conclusion active tracking already
-  // reached. This does not retry the "queued" release: a run that could not
-  // even release cleanly is treated as failed, not requeued.
-  //
-  // The run row, the wakeup request, and the issue execution lock all guard
-  // the same claim, so — same as the atomic release above — one transaction
-  // commits all three writes together. A partial write here would leave the
-  // same false-quiescence gap this fallback exists to close. Live-event and
-  // plugin-event publishing run after the transaction commits, so a publish
-  // failure cannot roll back the durable claim writes.
-  //
-  // The update below carries the same status: "running" condition the atomic
-  // release above uses. While this fallback waits, a concurrent path (a
-  // cancellation, the orphan reaper) can move the run to a terminal status.
-  // Without the condition this update would match that row and overwrite its
-  // real outcome. With it, the update matches no row, so the function returns
-  // early below and leaves the terminal run, its wakeup request, and its
-  // issue lock untouched.
-  async function failRunClaimedJustBeforeSuppression(runId: string, cause: unknown) {
-    const now = new Date();
-    const causeMessage = cause instanceof Error ? cause.message : String(cause);
-
-    const failed = await db.transaction(async (tx) => {
-      const updated = await tx
-        .update(heartbeatRuns)
-        .set({
-          status: "failed",
-          finishedAt: now,
-          error: `Failed to release the run claim before task-drain suppression: ${causeMessage}`,
-          errorCode: "claim_release_failed",
-          updatedAt: now,
-        })
-        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      if (!updated) return null;
-
-      if (updated.wakeupRequestId) {
-        await tx
-          .update(agentWakeupRequests)
-          .set({
-            status: "failed",
-            finishedAt: now,
-            error: "Run claim release failed before task-drain suppression",
-            updatedAt: now,
-          })
-          .where(eq(agentWakeupRequests.id, updated.wakeupRequestId));
-      }
-
-      const context = parseObject(updated.contextSnapshot);
-      const issueId = readNonEmptyString(context.issueId);
-      if (issueId) {
-        await tx
-          .update(issues)
-          .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: now })
-          .where(and(
-            eq(issues.id, issueId),
-            eq(issues.companyId, updated.companyId),
-            eq(issues.executionRunId, updated.id),
-          ));
-      }
-
-      return updated;
-    });
-    if (!failed) return;
-
-    if (isHeartbeatRunTerminalStatus(failed.status)) {
-      clearHeartbeatRunRuntimeStatus(failed.id);
-    }
-    publishLiveEvent({
-      companyId: failed.companyId,
-      type: "heartbeat.run.status",
-      payload: buildHeartbeatRunStatusLiveEventPayload(failed),
-    });
-    publishRunLifecyclePluginEvent(failed);
-  }
-
   async function cancelQueuedRunForBlockedDependencies(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
@@ -14373,8 +14389,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
     context: Record<string, unknown>,
+    dbOrTx: Db = db,
   ): Promise<QueuedRunStaleness> {
-    const issue = await db
+    const issue = await dbOrTx
       .select({
         id: issues.id,
         status: issues.status,
@@ -14403,6 +14420,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);
     const hasResolvedInteractionEvidence = interactionResolvedAt !== null && !Number.isNaN(Date.parse(interactionResolvedAt));
+    const isResolvedInteractionContinuation = isResolvedInteractionContinuationWakeContext(context);
+
+    if (isResolvedInteractionContinuation && issue.status !== "in_progress") {
+      return {
+        stale: true,
+        errorCode: "issue_not_in_progress",
+        reason: `Cancelled because resolved-interaction continuation issue is no longer in_progress (current status: ${issue.status}) before the queued run could start`,
+        details: { issueId, currentStatus: issue.status, requiredStatus: "in_progress" },
+        handoffAgentId: null,
+      };
+    }
+
+    if (isResolvedInteractionContinuation && issue.assigneeAgentId !== run.agentId) {
+      return {
+        stale: true,
+        errorCode: "issue_assignee_changed",
+        reason:
+          "Cancelled because resolved-interaction continuation issue changed assignee before the queued run could start",
+        details: {
+          issueId,
+          previousAssigneeAgentId: run.agentId,
+          currentAssigneeAgentId: issue.assigneeAgentId,
+        },
+        handoffAgentId:
+          issue.assigneeAgentId && issue.assigneeAgentId !== run.agentId
+            ? issue.assigneeAgentId
+            : null,
+      };
+    }
 
     if (
       issue.status === "in_progress" &&
@@ -14416,7 +14462,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(parseObject(queuedWake.continuationSummary).body);
       const currentContinuationSummary = queuedContinuationSummary
         ? null
-        : await getIssueContinuationSummaryDocument(db, issueId);
+        : await getIssueContinuationSummaryDocument(dbOrTx, issueId);
       const continuationSummaryBody = queuedContinuationSummary ?? currentContinuationSummary?.body ?? null;
       if (continuationSummaryParksExecutor(continuationSummaryBody)) {
         return {
@@ -14444,7 +14490,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const recoveryActionId = readNonEmptyString(context.recoveryActionId);
     const authorizedSourceScopedRecovery = wakeReason === "source_scoped_recovery_action" && recoveryActionId
-      ? await db
+      ? await dbOrTx
         .select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions)
         .where(and(
@@ -14556,7 +14602,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { stale: false };
   }
 
-  async function cancelQueuedRunForStaleIssue(
+  async function cancelRunForStaleIssue(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
     staleness: Extract<QueuedRunStaleness, { stale: true }>,
@@ -15371,6 +15417,56 @@ function pendingCleanupAttemptsSql() {
     const selfDeclaredRunTtlMs = opts?.selfDeclaredRunTtlMs ?? DEFAULT_SELF_DECLARED_RUN_TTL_MS;
     const now = new Date();
 
+    // A terminal issue transition writes this intent in the same transaction
+    // that expires the native question. Consume it before generic orphan
+    // recovery so a restart preserves the requested cancellation outcome.
+    const cancellationRequests = await db
+      .select({
+        id: heartbeatRuns.id,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
+        sql`${heartbeatRuns.contextSnapshot} -> ${NATIVE_QUESTION_CANCELLATION_CONTEXT_KEY} is not null`,
+      ));
+    for (const request of cancellationRequests) {
+      const marker = parseObject(
+        parseObject(request.contextSnapshot)[NATIVE_QUESTION_CANCELLATION_CONTEXT_KEY],
+      );
+      const issueId = readNonEmptyString(marker.issueId);
+      const issueStatus = readNonEmptyString(marker.issueStatus);
+      const interactionId = readNonEmptyString(marker.interactionId);
+      const kind = readNonEmptyString(marker.kind);
+      const reason = kind === "interaction_withdrawn"
+        ? "Question withdrawn while waiting for operator input"
+        : kind === "interaction_cancelled"
+          ? "Cancelled while waiting for operator input"
+          : "Task closed while waiting for operator input";
+      try {
+        await cancelRunInternal(request.id, reason, {
+          resultJson: {
+            ...(kind === "interaction_withdrawn" && interactionId
+              ? { withdrawnInteractionId: interactionId }
+              : {}),
+            ...(kind === "interaction_cancelled" && interactionId
+              ? { cancelledInteractionId: interactionId }
+              : {}),
+            ...((!kind || kind === "issue_terminal") && issueStatus
+              ? { cancelledByIssueStatus: issueStatus }
+              : {}),
+            ...(issueId ? { cancelledIssueId: issueId } : {}),
+          },
+        });
+      } catch (err) {
+        // Keep the marker intact for the next startup/periodic sweep.
+        logger.warn(
+          { err, runId: request.id },
+          "native question cancellation recovery attempt failed",
+        );
+      }
+    }
+
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
       .select({
@@ -15574,19 +15670,6 @@ function pendingCleanupAttemptsSql() {
       if (!retriedRun) {
         await releaseIssueExecutionAndPromote(finalizedRun);
       }
-      // The run's row reached a terminal status above, and the block above
-      // just finished the durable issue-lock cleanup for it — either
-      // releaseIssueExecutionAndPromote cleared executionRunId/checkoutRunId,
-      // or the retry took over the run's pending work. Only now is it safe to
-      // drop this run's stuck claim-release marker (see stuckClaimReleaseRunIds
-      // above): a failure in classification, retry scheduling, or the release
-      // call above throws before this point, so the marker stays active and
-      // task-drain keeps reporting this instance non-quiescent while the
-      // issue may still be locked. Clearing it here, rather than after the
-      // unrelated cleanup below (event logging, agent-status finalization,
-      // queue promotion), keeps it from getting stuck on a failure in one of
-      // those instead.
-      stuckClaimReleaseRunIds.delete(run.id);
 
       await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
         eventType: "lifecycle",
@@ -15919,14 +16002,6 @@ function pendingCleanupAttemptsSql() {
 
       for (const claimedRun of claimedRuns) {
         const execution = executeRun(claimedRun.id).catch((err) => {
-          if (err instanceof RunClaimReleaseUnresolvedFailure) {
-            // The run's claim release failed durably (both the atomic release
-            // and its fallback failed a write), already logged inside
-            // executeRun. Track the runId so getTaskDrainStatus() keeps
-            // reporting this run as active — see stuckClaimReleaseRunIds.
-            stuckClaimReleaseRunIds.add(claimedRun.id);
-            return;
-          }
           logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
         });
         // Register the in-flight execution so drainActiveRunExecutions() can await
@@ -15935,11 +16010,8 @@ function pendingCleanupAttemptsSql() {
         // have landed before a caller (e.g. a test's afterEach) mutates the DB.
         activeRunExecutionPromises.add(execution);
         void execution.finally(() => {
-          // Always remove the settled execution promise itself — drainActiveRunExecutions
-          // loops on activeRunExecutionPromises.size, so an entry that never
-          // clears here would hang it forever. A run added to
-          // stuckClaimReleaseRunIds above stays reported as active through
-          // that separate set instead.
+          // drainActiveRunExecutions loops on activeRunExecutionPromises.size,
+          // so an entry that never clears here would hang it forever.
           activeRunExecutionPromises.delete(execution);
         });
       }
@@ -15991,17 +16063,8 @@ function pendingCleanupAttemptsSql() {
       } catch (err) {
         logger.error(
           { err, runId },
-          "failed to release run claimed just before task-drain suppression; failing the run instead",
+          "failed to release run claimed just before task-drain suppression; the run row stays running, and the orphan reaper finalizes it and releases the issue lock on its next cycle",
         );
-        try {
-          await failRunClaimedJustBeforeSuppression(runId, err);
-        } catch (fallbackErr) {
-          logger.error(
-            { err: fallbackErr, runId },
-            "failed to fail the run after its claim release also failed; the run, wakeup, and issue lock are in an unknown state, so task-drain will keep reporting this run as active until the process restarts",
-          );
-          throw new RunClaimReleaseUnresolvedFailure(runId, fallbackErr);
-        }
       }
       return;
     }
@@ -16048,9 +16111,29 @@ function pendingCleanupAttemptsSql() {
     const issueDependencyReadiness = issueId
       ? await issuesSvc.listDependencyReadiness(agent.companyId, [issueId]).then((rows) => rows.get(issueId) ?? null)
       : null;
+    if (issueId && issueContext && isResolvedInteractionContinuationWakeContext(context)) {
+      try {
+        // Claim the issue under the same in_progress predicate used by the
+        // queued-run staleness gate. This is the final atomic guard before
+        // dispatch: an operator parking the issue after claim but before this
+        // checkout must not be overwritten by the continuation.
+        await issuesSvc.checkout(issueId, agent.id, ["in_progress"], run.id);
+        context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
+      } catch (error) {
+        if (!isCheckoutConflictError(error)) throw error;
+        const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
+        if (staleness.stale) {
+          await cancelRunForStaleIssue(run, issueId, staleness);
+          return;
+        }
+        throw error;
+      }
+      issueContext = await getIssueExecutionContext(agent.companyId, issueId);
+    }
     if (
       issueId &&
       issueContext &&
+      !isResolvedInteractionContinuationWakeContext(context) &&
       shouldAutoCheckoutIssueForWake({
         contextSnapshot: context,
         issueStatus: issueContext.status,
@@ -17644,6 +17727,79 @@ function pendingCleanupAttemptsSql() {
         executionTarget,
       });
       const adapter = getServerAdapter(agent.adapterType);
+      const dispatchResolvedInteractionContinuationWithAtomicGate = async <T>(
+        dispatch: (markDispatchStarted: () => void) => Promise<T>,
+      ): Promise<
+        | { dispatched: true; resultPromise: Promise<T> }
+        | { dispatched: false }
+      > => {
+        if (!issueId || !isResolvedInteractionContinuationWakeContext(context)) {
+          return { dispatched: true, resultPromise: dispatch(() => {}) };
+        }
+        await options.beforeResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
+
+        const gate = await db.transaction(async (tx) => {
+          const lockedIssue = await tx
+            .select({ executionRunId: issues.executionRunId })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          const staleness = await evaluateQueuedRunStaleness(
+            run,
+            issueId,
+            context,
+            tx as unknown as Db,
+          );
+          if (staleness.stale) {
+            return { dispatched: false as const, staleness };
+          }
+          if (lockedIssue?.executionRunId !== run.id) {
+            return {
+              dispatched: false as const,
+              staleness: {
+                stale: true as const,
+                errorCode: "issue_execution_lock_changed" as const,
+                reason:
+                  "Cancelled because resolved-interaction continuation no longer owns the issue execution lock before adapter dispatch",
+                details: {
+                  issueId,
+                  expectedExecutionRunId: run.id,
+                  currentExecutionRunId: lockedIssue?.executionRunId ?? null,
+                },
+                // Mirrors the fork's own issue_execution_lock_changed case: the
+                // lock moved, so there is no owner to hand this run off to.
+                handoffAgentId: null,
+              },
+            };
+          }
+
+          await options.afterResolvedInteractionContinuationDispatchCheck?.({ runId: run.id, issueId });
+          let dispatchStarted = false;
+          let resolveDispatchStarted!: () => void;
+          const dispatchStartedPromise = new Promise<void>((resolve) => {
+            resolveDispatchStarted = resolve;
+          });
+          const markDispatchStarted = () => {
+            if (dispatchStarted) return;
+            dispatchStarted = true;
+            resolveDispatchStarted();
+          };
+
+          // Keep the issue row locked through the adapter's asynchronous
+          // preparation and release it only once the adapter reports an
+          // actual process spawn. If preparation fails or returns without a
+          // spawn, settling the adapter promise also releases the gate.
+          const resultPromise = dispatch(markDispatchStarted);
+          void resultPromise.then(markDispatchStarted, markDispatchStarted);
+          await dispatchStartedPromise;
+          return { dispatched: true as const, resultPromise };
+        });
+
+        if (gate.dispatched) return gate;
+        await cancelRunForStaleIssue(run, issueId, gate.staleness);
+        return { dispatched: false };
+      };
       const localAgentJwtScope =
         issueRef?.workMode === "skill_test"
           ? { kind: "skill_test" as const, issueId: issueRef.id }
@@ -17915,7 +18071,8 @@ function pendingCleanupAttemptsSql() {
             promptMetrics: { promptChars: prompt.length },
             context: { provider: "codex", protocolVersion: 1 },
           });
-          adapterResult = await executeNativeCodexRunner({
+          const guardedDispatch = await dispatchResolvedInteractionContinuationWithAtomicGate((markDispatchStarted) =>
+            executeNativeCodexRunner({
             db,
             companyId: agent.companyId,
             issueId: issueRef.id,
@@ -17934,16 +18091,50 @@ function pendingCleanupAttemptsSql() {
             timeoutMs,
             environment,
             onLog,
-            onSpawn,
-          });
+            onSpawn: async (meta) => {
+              markDispatchStarted();
+              await onSpawn(meta);
+            },
+            }),
+          );
+          if (!guardedDispatch.dispatched) return;
+          adapterResult = await guardedDispatch.resultPromise;
         } else {
           const adapterContext = { ...context };
+          const runtimeTools = createAdapterRuntimeToolAccess({
+            agentId: agent.id,
+            companyId: agent.companyId,
+            runId: run.id,
+            responsibleUserId: run.responsibleUserId,
+          });
+          if (!runtimeTools) {
+            logger.warn(
+              {
+                companyId: agent.companyId,
+                agentId: agent.id,
+                runId: run.id,
+              },
+              "runtime connection tools could not be delivered",
+            );
+          }
           const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
             db,
             agent,
             runId: run.id,
           });
+          const runtimeToolDelivery = adapter.runtimeToolDelivery ?? "invocation_context";
+          if (runtimeTools && runtimeToolDelivery === "native_mcp") {
+            runtimeMcpServers.unshift({
+              name: "Paperclip connections",
+              url: runtimeTools.mcpEndpoint,
+              token: runtimeTools.bearerToken,
+              connectionId: "paperclip-runtime-tools",
+            });
+          }
           const runtimeMcp = createAdapterRuntimeMcpAccess(runtimeMcpServers);
+          if (runtimeTools && runtimeToolDelivery === "invocation_context") {
+            adapterContext.paperclipRuntimeTools = runtimeTools;
+          }
           const managedMcpConfig = await createManagedMcpRunConfig({
             db,
             agent,
@@ -17955,7 +18146,8 @@ function pendingCleanupAttemptsSql() {
           if (managedMcpConfig) {
             adapterContext.paperclipManagedMcp = managedMcpConfig;
           }
-          adapterResult = await adapter.execute({
+          const guardedDispatch = await dispatchResolvedInteractionContinuationWithAtomicGate((markDispatchStarted) =>
+            adapter.execute({
             runId: run.id,
             agent,
             runtime: runtimeForAdapter,
@@ -17967,6 +18159,7 @@ function pendingCleanupAttemptsSql() {
               ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
               : undefined,
             runtimeMcp,
+            runtimeTools,
             onLog,
             onMeta: onAdapterMeta,
             onEvent: onAdapterEvent,
@@ -17978,9 +18171,16 @@ function pendingCleanupAttemptsSql() {
             onRuntimeProgress: async (progress) => {
               await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
             },
-            onSpawn,
+            onDispatch: markDispatchStarted,
+            onSpawn: async (meta) => {
+              markDispatchStarted();
+              await onSpawn(meta);
+            },
             authToken: authToken ?? undefined,
-          });
+            }),
+          );
+          if (!guardedDispatch.dispatched) return;
+          adapterResult = await guardedDispatch.resultPromise;
         }
         // Adapter returned cleanly, which means its workspace-restore finally
         // block also ran without throwing. Record the workspace_finalize
@@ -20349,6 +20549,40 @@ function pendingCleanupAttemptsSql() {
           return { kind: "skipped" as const };
         }
 
+        const issueStateGuard = opts.issueStateGuard;
+        if (
+          issueStateGuard
+          && (
+            !issueStateGuard.statuses.includes(issue.status)
+            || issue.assigneeAgentId !== issueStateGuard.assigneeAgentId
+          )
+        ) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_state_guard_mismatch",
+            payload: {
+              ...(payload ?? {}),
+              heartbeatSkip: {
+                reason: "Issue status or assignee changed before the wake could be queued.",
+                issueId: issue.id,
+                expectedStatuses: issueStateGuard.statuses,
+                actualStatus: issue.status,
+                expectedAssigneeAgentId: issueStateGuard.assigneeAgentId,
+                actualAssigneeAgentId: issue.assigneeAgentId,
+              },
+            },
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
+
         if (worktreeExecutionCutoff && issue.createdAt < worktreeExecutionCutoff) {
           await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
@@ -21849,8 +22083,8 @@ function pendingCleanupAttemptsSql() {
     startTaskDrain,
     stopTaskDrain,
     getTaskDrainStatus,
-    getTaskDrainGeneration,
-    restoreTaskDrainIfCurrent,
+    computeTaskDrain,
+    applyTaskDrain,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,

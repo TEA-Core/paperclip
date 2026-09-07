@@ -245,35 +245,30 @@ async function runExecutor(
   return { logs, meta, events, runtimeOptions, configOptions, sessionInputs, result };
 }
 
-// The engine's pre-handshake bring-up (staging, warm-handle lookups, real `fs`
-// calls) runs through ordinary promise chains, not timers. Under
-// `vi.useFakeTimers()` that chain still only advances on real event-loop turns,
-// so `advanceTimersByTimeAsync` alone cannot reliably unwind it: with no timer
-// due yet, a single call returns before the setup chain reaches the guarded
-// `ensureSession` call, and a deadline advance that runs before the guard's
-// timer is registered fires nothing — the run then hangs until the test's own
-// wall-clock budget kills it (the `Test timed out in 5000ms` ejections). Interleave
-// real macrotask turns (a real `setTimeout`, captured before fake timers are
-// installed) with zero-length advances until the guard arms (`getTimerCount`
-// reaches the guard's timeout + transport-poll pair), then advance past the
-// deadline. The second flush + deadline advance covers a guard that armed only
-// after the first advance, and lets the settlement unwind on real turns too.
-const realSetTimeout = globalThis.setTimeout.bind(globalThis);
-const realMacrotaskTurn = (): Promise<void> =>
-  new Promise((resolve) => {
-    realSetTimeout(resolve, 0);
+// Under `vi.useFakeTimers()`, setup before `ensureSession` still performs real
+// filesystem work. Advancing the fake clock before that work reaches the
+// handshake can leave the guard timer scheduled after the advance and hang the
+// test. Track the exact call boundary so the deadline always advances only
+// after the guard exists, regardless of runner load.
+function trackEnsureSessionCall<T>(call: () => Promise<T>): {
+  call: () => Promise<T>;
+  started: Promise<void>;
+} {
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
   });
+  return {
+    call: () => {
+      markStarted();
+      return call();
+    },
+    started,
+  };
+}
 
-async function flushSetupThenAdvanceTimersByTimeAsync(ms: number): Promise<void> {
-  for (let i = 0; i < 500 && vi.getTimerCount() < 2; i++) {
-    await realMacrotaskTurn();
-    await vi.advanceTimersByTimeAsync(0);
-  }
-  await vi.advanceTimersByTimeAsync(ms);
-  for (let i = 0; i < 20; i++) {
-    await realMacrotaskTurn();
-    await vi.advanceTimersByTimeAsync(0);
-  }
+async function advanceHandshakeGuardAfterStart(started: Promise<void>, ms: number): Promise<void> {
+  await started;
   await vi.advanceTimersByTimeAsync(ms);
 }
 
@@ -3024,35 +3019,26 @@ describe("summarizeAcpxTurnUsage no-report turns", () => {
   });
 });
 
-describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
-  it("passes process.env through the shared sanitizer before spawning", async () => {
-    process.env.DATABASE_URL = "postgres://example.test/paperclip";
-    process.env.ZZZ_SENTINEL = "sentinel-value";
-    try {
-      await runExecutor({
-        agent: "custom",
-        agentCommand: "node ./fake-acp.js",
-      });
-    } finally {
-      delete process.env.DATABASE_URL;
-      delete process.env.ZZZ_SENTINEL;
-    }
-
-    expect(sanitizeCalls.length).toBeGreaterThan(0);
-    expect(sanitizeCalls.at(-1)).toBe(process.env);
-    const sanitizedEnv = sanitizeResults.at(-1);
-    // `.at()` is `T | undefined`. Asserting it is defined keeps the sentinel
-    // assertions below meaningful — optional chaining would let a missing
-    // result pass `toBeUndefined()` and silently stop testing the strip.
-    expect(sanitizedEnv).toBeDefined();
-    expect(sanitizedEnv!.DATABASE_URL).toBeUndefined();
-    expect(sanitizedEnv!.ZZZ_SENTINEL).toBe("sentinel-value");
-  });
-
-  it("strips secrets from session options env while preserving non-secret inherited keys", async () => {
+// FORK DIVERGENCE (2026-09-07 fold, cutoff f0fbfb939). These tests used to
+// assert the MECHANISM — that `sanitizeInheritedPaperclipEnv` was called at the
+// ACPX spawn point, and that an arbitrary non-secret host var survived into the
+// agent env. Upstream replaced that denylist with
+// `projectAcpxInheritedHostEnvironment`, a CLOSED ALLOWLIST, and set
+// `inheritProcessEnv: false` so acpx builds the child env from `{}`. The
+// allowlist is strictly tighter: it drops a secret the denylist was never
+// taught about. So these now assert the PROPERTY the fork actually cares about
+// — no server secret reaches the agent — plus the allowlist's own contract.
+// `sanitizeInheritedPaperclipEnv` remains the choke point at every NON-ACPX
+// spawn boundary (codex/kimi/pi/cursor/hermes/opencode-local); see
+// server-utils.test.ts for the behavioural guard there.
+describe("ACPX spawn env admits no server secret", () => {
+  it("keeps every server secret out of the spawned session env", async () => {
     process.env.DATABASE_URL = "postgres://example.test/paperclip";
     process.env.BETTER_AUTH_SECRET = "secret-auth-value";
-    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "secret-tool-action";
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = "secret-master-key";
+    // Positive control on the allowlist. Without a key that MUST survive, the
+    // absence assertions below would pass for free against an empty object.
+    process.env.NO_PROXY = "localhost,127.0.0.1";
     process.env.ZZZ_SENTINEL = "sentinel-value";
     try {
       const { sessionInputs } = await runExecutor({
@@ -3060,15 +3046,43 @@ describe("sanitizeInheritedPaperclipEnv is called at ACPX spawn points", () => {
         agentCommand: "node ./fake-acp.js",
       });
       const sessionEnv = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+
+      expect(sessionEnv.NO_PROXY).toBe("localhost,127.0.0.1");
       expect(sessionEnv.DATABASE_URL).toBeUndefined();
       expect(sessionEnv.BETTER_AUTH_SECRET).toBeUndefined();
-      expect(sessionEnv.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
-      expect(sessionEnv.ZZZ_SENTINEL).toBe("sentinel-value");
-      expect(sessionEnv.PAPERCLIP_AGENT_ID).toBe("agent-1");
+      expect(sessionEnv.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
     } finally {
       delete process.env.DATABASE_URL;
       delete process.env.BETTER_AUTH_SECRET;
-      delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      delete process.env.NO_PROXY;
+      delete process.env.ZZZ_SENTINEL;
+    }
+  });
+
+  it("admits only allowlisted host env, and the run's explicit env still wins", async () => {
+    process.env.DATABASE_URL = "postgres://example.test/paperclip";
+    process.env.NO_PROXY = "localhost,127.0.0.1";
+    // Not on the allowlist and not a known secret. Under the fork's old
+    // denylist this reached the agent; under upstream's allowlist it does not.
+    // Asserted rather than deleted so the divergence cannot drift back
+    // unnoticed in either direction.
+    process.env.ZZZ_SENTINEL = "sentinel-value";
+    try {
+      const { sessionInputs } = await runExecutor({
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+      });
+      const sessionEnv = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+
+      expect(sessionEnv.NO_PROXY).toBe("localhost,127.0.0.1");
+      expect(sessionEnv.ZZZ_SENTINEL).toBeUndefined();
+      expect(sessionEnv.DATABASE_URL).toBeUndefined();
+      // Explicit run env is overlaid after the projection and is unaffected.
+      expect(sessionEnv.PAPERCLIP_AGENT_ID).toBe("agent-1");
+    } finally {
+      delete process.env.DATABASE_URL;
+      delete process.env.NO_PROXY;
       delete process.env.ZZZ_SENTINEL;
     }
   });
@@ -6863,11 +6877,12 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
 
   it("ends a handshake that stays pending past the startup deadline with a closed timeout code", async () => {
     const root = await makeTempRoot();
+    const ensureSession = trackEnsureSessionCall(() => new Promise<never>(() => {}));
     const execute = createAcpxEngineExecutor({
       createRuntime: () =>
         ({
           // Never settles on its own; only the guard's deadline can end it.
-          ensureSession: () => new Promise(() => {}),
+          ensureSession: ensureSession.call,
           startTurn: () => ({
             events: (async function* () {})(),
             result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
@@ -6888,7 +6903,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         onLog: async () => {},
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 50);
+      await advanceHandshakeGuardAfterStart(ensureSession.started, ACPX_HANDSHAKE_TIMEOUT_MS + 50);
       const result = await resultPromise;
 
       // The run terminalizes promptly on its own; no server restart needed.
@@ -6906,6 +6921,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     const ensureSessionPromise = new Promise((resolve) => {
       resolveEnsure = resolve;
     });
+    const ensureSession = trackEnsureSessionCall(() => ensureSessionPromise);
     const startTurn = vi.fn(() => ({
       events: (async function* () {
         yield { type: "done", stopReason: "end_turn" };
@@ -6916,7 +6932,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     const execute = createAcpxEngineExecutor({
       createRuntime: () =>
         ({
-          ensureSession: () => ensureSessionPromise,
+          ensureSession: ensureSession.call,
           startTurn,
           close: async () => {},
         }) as never,
@@ -6933,7 +6949,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         onLog: async () => {},
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 50);
+      await advanceHandshakeGuardAfterStart(ensureSession.started, ACPX_HANDSHAKE_TIMEOUT_MS + 50);
       const result = await resultPromise;
 
       expect(result.errorCode).toBe("acpx_handshake_timeout");
@@ -6954,7 +6970,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
+  }, 10_000);
 
   it("closes a late-resolving real handle exactly once, whether it arrives before or after settlement seals", async () => {
     const lateHandle = {
@@ -6973,11 +6989,12 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
       const ensureSessionPromise = new Promise((resolve) => {
         resolveEnsure = resolve;
       });
+      const ensureSession = trackEnsureSessionCall(() => ensureSessionPromise);
       const closeSpy = vi.fn(async () => {});
       const execute = createAcpxEngineExecutor({
         createRuntime: () =>
           ({
-            ensureSession: () => ensureSessionPromise,
+            ensureSession: ensureSession.call,
             startTurn: () => ({
               events: (async function* () {})(),
               result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
@@ -6995,7 +7012,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         onLog: async () => {},
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 1);
+      await advanceHandshakeGuardAfterStart(ensureSession.started, ACPX_HANDSHAKE_TIMEOUT_MS + 1);
       return { closeSpy, resolveEnsure, resultPromise };
     }
 
@@ -7027,16 +7044,17 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
+  }, 10_000);
 
   it("discards the reuse decision and leaves no warm entry after a guard rejection", async () => {
     const root = await makeTempRoot();
     const warmHandles = new Map();
+    const ensureSession = trackEnsureSessionCall(() => new Promise<never>(() => {}));
     const execute = createAcpxEngineExecutor({
       warmHandles,
       createRuntime: () =>
         ({
-          ensureSession: () => new Promise(() => {}),
+          ensureSession: ensureSession.call,
           startTurn: () => ({
             events: (async function* () {})(),
             result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
@@ -7063,7 +7081,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         onLog: async () => {},
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 50);
+      await advanceHandshakeGuardAfterStart(ensureSession.started, ACPX_HANDSHAKE_TIMEOUT_MS + 50);
       const result = await resultPromise;
 
       expect(result.errorCode).toBe("acpx_handshake_timeout");
@@ -7128,6 +7146,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     const ensureSessionPromise = new Promise((_resolve, reject) => {
       rejectEnsure = reject;
     });
+    const ensureSession = trackEnsureSessionCall(() => ensureSessionPromise);
     const logs: Array<{ stream: string; text: string }> = [];
     const unhandledRejections: unknown[] = [];
     const onUnhandledRejection = (err: unknown) => unhandledRejections.push(err);
@@ -7138,7 +7157,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
       const execute = createAcpxEngineExecutor({
         createRuntime: () =>
           ({
-            ensureSession: () => ensureSessionPromise,
+            ensureSession: ensureSession.call,
             startTurn: () => ({
               events: (async function* () {})(),
               result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
@@ -7158,7 +7177,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         },
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 1);
+      await advanceHandshakeGuardAfterStart(ensureSession.started, ACPX_HANDSHAKE_TIMEOUT_MS + 1);
       const result = await resultPromise;
       expect(result.errorCode).toBe("acpx_handshake_timeout");
 
@@ -7194,11 +7213,12 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     );
 
     const logs: Array<{ stream: string; text: string }> = [];
+    const ensureSession = trackEnsureSessionCall(() => new Promise<never>(() => {}));
     const execute = createAcpxEngineExecutor({
       createRuntime: () =>
         ({
           // Never settles on its own; only the guard's deadline can end it.
-          ensureSession: () => new Promise(() => {}),
+          ensureSession: ensureSession.call,
           startTurn: () => ({
             events: (async function* () {})(),
             result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
@@ -7221,7 +7241,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         },
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 50);
+      await advanceHandshakeGuardAfterStart(ensureSession.started, ACPX_HANDSHAKE_TIMEOUT_MS + 50);
       const result = await resultPromise;
 
       expect(result.errorCode).toBe("acpx_handshake_timeout");
@@ -7346,6 +7366,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
     const ensureSessionPromise = new Promise((resolve) => {
       resolveEnsure = resolve;
     });
+    const ensureSession = trackEnsureSessionCall(() => ensureSessionPromise);
     const logs: Array<{ stream: string; text: string }> = [];
     const unhandledRejections: unknown[] = [];
     const onUnhandledRejection = (err: unknown) => unhandledRejections.push(err);
@@ -7356,7 +7377,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
       const execute = createAcpxEngineExecutor({
         createRuntime: () =>
           ({
-            ensureSession: () => ensureSessionPromise,
+            ensureSession: ensureSession.call,
             startTurn: () => ({
               events: (async function* () {})(),
               result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
@@ -7378,7 +7399,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
         },
         onMeta: async () => {},
       } as never);
-      await flushSetupThenAdvanceTimersByTimeAsync(ACPX_HANDSHAKE_TIMEOUT_MS + 1);
+      await advanceHandshakeGuardAfterStart(ensureSession.started, ACPX_HANDSHAKE_TIMEOUT_MS + 1);
       const result = await resultPromise;
       expect(result.errorCode).toBe("acpx_handshake_timeout");
 
@@ -7402,7 +7423,7 @@ describe("ACPX startup handshake guard and late-completion fence", () => {
       process.off("unhandledRejection", onUnhandledRejection);
       vi.useRealTimers();
     }
-  });
+  }, 10000);
 });
 
 // SUP-14869 (GH-APP-8): the ACP/acpx-engine lane wires the agent-side GitHub

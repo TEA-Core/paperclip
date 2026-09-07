@@ -1,5 +1,5 @@
 diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
-index 243c9d1..11f2279 100644
+index 243c9d1..6d53177 100644
 --- a/dist/live-checkpoint-ClPCSdrW.js
 +++ b/dist/live-checkpoint-ClPCSdrW.js
 @@ -1532,7 +1532,7 @@ const ZED_TAG_KEYS = /* @__PURE__ */ new Set([
@@ -20,15 +20,17 @@ index 243c9d1..11f2279 100644
  		current: state.current,
  		quote: state.quote,
  		escaping: true,
-@@ -2912,7 +2912,7 @@ function promotePrefixedAuthEnvironment(env) {
+@@ -2912,8 +2912,8 @@ function promotePrefixedAuthEnvironment(env) {
  	}
  	return protectedKeys;
  }
 -function buildAgentEnvironment(authCredentials, sessionEnv) {
-+function buildAgentEnvironment(authCredentials, sessionEnv, envUnset) {
- 	const env = { ...process.env };
+-	const env = { ...process.env };
++function buildAgentEnvironment(authCredentials, sessionEnv, inheritProcessEnv = true, envUnset) {
++	const env = inheritProcessEnv ? { ...process.env } : {};
  	const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
  	if (authCredentials) for (const [methodId, credential] of Object.entries(authCredentials)) {
+ 		addAuthCredentialEnvKeys(protectedAuthEnvKeys, methodId, credential);
 @@ -2923,6 +2923,7 @@ function buildAgentEnvironment(authCredentials, sessionEnv) {
  		if (typeof value !== "string" || protectedAuthEnvKeys.has(protectedEnvKey(key))) continue;
  		assignSessionEnv(env, key, value);
@@ -42,11 +44,11 @@ index 243c9d1..11f2279 100644
  	return configCredentials[methodId] ?? configCredentials[toEnvToken(methodId)];
  }
 -function buildAgentSpawnOptions(cwd, authCredentials, sessionEnv) {
-+function buildAgentSpawnOptions(cwd, authCredentials, sessionEnv, envUnset) {
++function buildAgentSpawnOptions(cwd, authCredentials, sessionEnv, inheritProcessEnv, envUnset) {
  	return {
  		cwd,
 -		env: buildAgentEnvironment(authCredentials, sessionEnv),
-+		env: buildAgentEnvironment(authCredentials, sessionEnv, envUnset),
++		env: buildAgentEnvironment(authCredentials, sessionEnv, inheritProcessEnv, envUnset),
  		stdio: [
  			"pipe",
  			"pipe",
@@ -99,15 +101,15 @@ index 243c9d1..11f2279 100644
  			copilotAcp: isCopilotAcpCommand(spawnCommand, args),
  			claudeAcp: isClaudeAcpCommand(spawnCommand, args),
 -			spawnOptions: buildAgentSpawnOptions(this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env)
-+			spawnOptions: buildAgentSpawnOptions(this.options.spawnCwd ?? this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.sessionOptions?.envUnset)
++			spawnOptions: buildAgentSpawnOptions(this.options.spawnCwd ?? this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.inheritProcessEnv, this.options.sessionOptions?.envUnset)
  		};
  	}
  	logAgentLaunch(plan) {
 diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
-index ccdbe5b..e3dc18b 100644
+index ccdbe5b..e11d12a 100644
 --- a/dist/runtime.d.ts
 +++ b/dist/runtime.d.ts
-@@ -266,6 +266,18 @@ type AcpRuntimeOptions = {
+@@ -266,6 +266,19 @@ type AcpRuntimeOptions = {
    timeoutMs?: number;
    probeAgent?: string;
    verbose?: boolean;
@@ -123,11 +125,12 @@ index ccdbe5b..e3dc18b 100644
 +   * against the original plan and is unaffected.
 +   */
 +  agentSpawnTarget?: { command: string; args?: string[] };
++  inheritProcessEnv?: boolean;
    onPermissionRequest?: (req: AcpPermissionRequest, ctx: {
      signal: AbortSignal;
    }) => Promise<AcpPermissionDecision | undefined>;
 diff --git a/dist/runtime.js b/dist/runtime.js
-index 6c9cc99..d199f14 100644
+index 6c9cc99..b24dbfa 100644
 --- a/dist/runtime.js
 +++ b/dist/runtime.js
 @@ -744,7 +744,8 @@ var AcpRuntimeManager = class {
@@ -135,16 +138,16 @@ index 6c9cc99..d199f14 100644
  	}
  	createClient(options) {
 -		return this.deps.clientFactory?.(options) ?? new AcpClient(options);
-+		const clientOptions = { ...options, onAgentStderr: this.options.onAgentStderr, onAgentSpawn: this.options.onAgentSpawn, spawnCwd: this.options.spawnCwd, agentSpawnTarget: this.options.agentSpawnTarget };
++		const clientOptions = { ...options, onAgentStderr: this.options.onAgentStderr, onAgentSpawn: this.options.onAgentSpawn, spawnCwd: this.options.spawnCwd, agentSpawnTarget: this.options.agentSpawnTarget, inheritProcessEnv: this.options.inheritProcessEnv };
 +		return this.deps.clientFactory?.(clientOptions) ?? new AcpClient(clientOptions);
  	}
  	async readPendingPersistentClient(record, options) {
  		const pendingClient = this.pendingPersistentClients.get(record.acpxRecordId);
 diff --git a/dist/session-options-jkYbBxGE.d.ts b/dist/session-options-jkYbBxGE.d.ts
-index 9d37f37..f3f6252 100644
+index 9d37f37..5f17182 100644
 --- a/dist/session-options-jkYbBxGE.d.ts
 +++ b/dist/session-options-jkYbBxGE.d.ts
-@@ -84,6 +84,18 @@ type AcpClientOptions = {
+@@ -84,6 +84,19 @@ type AcpClientOptions = {
    terminal?: boolean;
    suppressSdkConsoleErrors?: boolean;
    verbose?: boolean;
@@ -160,10 +163,11 @@ index 9d37f37..f3f6252 100644
 +   * against the original plan and is unaffected.
 +   */
 +  agentSpawnTarget?: { command: string; args?: string[] };
++  inheritProcessEnv?: boolean;
    sessionOptions?: {
      model?: string;
      allowedTools?: string[];
-@@ -268,6 +280,12 @@ type SessionAgentOptions = {
+@@ -268,6 +281,12 @@ type SessionAgentOptions = {
     * passing them to acpx.
     */
    env?: Record<string, string>;

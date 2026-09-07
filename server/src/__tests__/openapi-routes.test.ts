@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "../routes/company-import-paths.js";
+import { OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH } from "../services/tool-access.js";
 import { buildOpenApiSpec, openApiRoutes } from "../routes/openapi.js";
 import {
   GITHUB_INSTALLATION_PERMISSION_LEVELS,
@@ -32,6 +33,7 @@ const apiPrefixes: Record<string, string> = {
   "companies.ts": "/api/companies",
   "company-skills.ts": "/api",
   "company-skill-policy.ts": "/api",
+  "connection-intents.ts": "/api",
   "costs.ts": "/api",
   "dashboard.ts": "/api",
   "decision-queues.ts": "/api",
@@ -115,6 +117,12 @@ function normalizeExpressPath(routePath: string) {
 
 function resolveMountedPath(file: string, prefix: string, routePath: string) {
   if (file === "tool-gateway.ts" && routePath.startsWith("/mcp/gateways/")) {
+    return routePath;
+  }
+  if (
+    file === "connection-intents.ts"
+    && (routePath.startsWith("/mcp/") || routePath.startsWith("/runtime-tools/"))
+  ) {
     return routePath;
   }
   if ((file === "companies.ts" || file === "health.ts") && routePath === "/") {
@@ -543,6 +551,12 @@ const BARE_PATH_ARG = /router\.(get|post|put|patch|delete|all)\(\s*([A-Za-z_$][A
 const BARE_PATH_CONSTANTS: Record<string, string> = {
   COMPANY_IMPORT_ROUTE_PATH: COMPANY_IMPORT_ROUTE_PATH,
   COMPANY_IMPORT_TRANSFERS_ROUTE_PATH: COMPANY_IMPORT_TRANSFERS_ROUTE_PATH,
+  // The values here are mount-relative. This constant is absolute and its
+  // registration strips the prefix inline
+  // (`router.get(OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH.replace(/^\/api/, ""))`),
+  // so mirror that strip rather than hardcoding the stripped literal.
+  OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH:
+    OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH.replace(/^\/api/, ""),
 };
 
 // Strip `if (req.actor.type !== "agent") { ... }` blocks: an assertBoard inside
