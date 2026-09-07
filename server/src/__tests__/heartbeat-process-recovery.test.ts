@@ -7633,23 +7633,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     await heartbeat.reconcileStrandedAssignedIssues();
 
-    // The recovery run executes asynchronously (startNextQueuedRunForAgent →
-    // executeRun) and settles with a plan_only classification; the
-    // run_liveness_continuation wake is minted during that settle path, after
-    // the plan_only classification lands. A plain wall-clock poll raced the
-    // settle chain and timed out under CI's serialized-runner load, so wait on
-    // the deterministic completion signal first, then give the wake a grace
-    // window.
-    const planOnlyRecoveryRun = await waitForValue(async () => {
-      const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-      return rows.find((row) => row.id !== runId && row.livenessState === "plan_only") ?? null;
-    }, 15_000);
+    // The recovery run executes fire-and-forget (startNextQueuedRunForAgent →
+    // executeRun); its settle path classifies it plan_only and mints the
+    // run_liveness_continuation wake before the run's executeRun promise
+    // resolves. A plain wall-clock poll (the 15s wait added in round 1) raced
+    // that settle chain and timed out under CI's serialized-runner load. Await
+    // the deterministic completion signal instead: drainActiveRunExecutions()
+    // resolves only after every in-flight executeRun promise has settled and
+    // flushed its rows/events, so the plan_only classification and the wake
+    // are guaranteed present afterwards — no timer race. The per-test timeout
+    // simply gives this (bounded) drain headroom under load.
+    await heartbeat.drainActiveRunExecutions();
+
+    const planOnlyRecoveryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows.find((row) => row.id !== runId && row.livenessState === "plan_only") ?? null);
     expect(planOnlyRecoveryRun).toBeTruthy();
 
+    // The wake is minted inside the recovery run's settle, so it is present
+    // after the drain; keep a small bounded wait only as a safety net.
     const livenessWake = await waitForValue(async () => {
       const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
       return rows.find((row) => row.reason === "run_liveness_continuation") ?? null;
-    }, 10_000);
+    });
     expect(livenessWake).toBeTruthy();
     expect(livenessWake?.payload).toMatchObject({
       issueId,
@@ -7664,12 +7672,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, String(sourceRunId)))
       .then((rows) => rows[0] ?? null);
-    if (sourceRun?.id) {
-      await waitForRunToSettle(heartbeat, sourceRun.id, 5_000);
-    }
     expect(sourceRun?.id).not.toBe(runId);
     expect(sourceRun?.livenessState).toBe("plan_only");
-  });
+  }, 30_000);
 
   it("treats a plan document update as progress and does not enqueue liveness continuation", async () => {
     const { agentId, companyId, issueId, runId } = await seedStrandedIssueFixture({
