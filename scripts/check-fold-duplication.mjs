@@ -44,7 +44,14 @@ import { execFileSync } from "node:child_process";
 // by two different line splits that happen to concatenate the same way.
 const SEP = "\u0000";
 
-const CODE_EXTENSIONS = new Set(["ts", "tsx", "js", "jsx", "mjs", "cjs", "sh", "sql", "py", "go"]);
+const CODE_EXTENSIONS = new Set(["ts", "tsx", "js", "jsx", "mjs", "cjs", "sh", "sql", "py", "go", "yml", "yaml"]);
+
+// Generated files whose structure repeats by construction. `pnpm-lock.yaml` is
+// the whole of the YAML noise: its dependency entries are near-identical blocks
+// laid out back to back, which is the exact shape rule 1 looks for. Nobody
+// resolves a lockfile conflict by hand here either -- pr.yml refuses the edit
+// outright and a fold takes upstream's resolved file wholesale.
+const GENERATED_PATHS = new Set(["pnpm-lock.yaml", "package-lock.json", "yarn.lock"]);
 
 // Lines that carry no meaning on their own; a window made of these is noise.
 const TRIVIAL_LINES = new Set([
@@ -205,7 +212,10 @@ export function findMergeDuplication(commit, options = {}) {
 
   const changedAgainst = (parent) => new Set(git(["diff", "--name-only", parent, commit]).split("\n").filter(Boolean));
   const [a, b] = parents.map(changedAgainst);
-  const resolved = [...a].filter((f) => b.has(f) && CODE_EXTENSIONS.has(f.split(".").pop()));
+  const resolved = [...a].filter((f) =>
+    b.has(f)
+    && CODE_EXTENSIONS.has(f.split(".").pop())
+    && !GENERATED_PATHS.has(f.split("/").pop()));
 
   const findings = [];
   const redeclarations = [];

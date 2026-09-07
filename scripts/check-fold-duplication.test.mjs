@@ -211,3 +211,46 @@ test("mergesToCheck falls back to the head alone with no base", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("generated lockfiles are excluded even though YAML is in scope", () => {
+  // `.yml` is in scope because a workflow file is a real place for a merge to
+  // keep both copies -- fold 1446a58c0 duplicated a whole `release.yml` step.
+  // `pnpm-lock.yaml` is the entire cost of that: its dependency entries are
+  // near-identical blocks laid out back to back, which is exactly the shape
+  // rule 1 looks for. Including it takes the full-history noise floor from 3
+  // flagged merges of 447 to 6; excluding it keeps the floor at 3 with YAML
+  // covered. Nobody hand-resolves a lockfile conflict here anyway -- pr.yml
+  // refuses the edit and a fold takes upstream's resolved file wholesale.
+  const { dir, git, gitAllowingConflict } = makeRepo();
+  try {
+    const write = (name, body) => writeFileSync(path.join(dir, name), body);
+    write("pnpm-lock.yaml", `${GUARD}\n`);
+    write("ci.yml", `${GUARD}\n`);
+    git("add", "-A");
+    git("commit", "-qm", "base");
+
+    git("checkout", "-q", "-b", "fork");
+    write("pnpm-lock.yaml", `${GUARD}\n\nfork: true\n`);
+    write("ci.yml", `${GUARD}\n\nfork: true\n`);
+    git("commit", "-qam", "fork side");
+
+    git("checkout", "-q", "base");
+    write("pnpm-lock.yaml", `${GUARD}\n\nupstream: true\n`);
+    write("ci.yml", `${GUARD}\n\nupstream: true\n`);
+    git("commit", "-qam", "upstream side");
+
+    gitAllowingConflict("merge", "-q", "--no-commit", "--no-ff", "fork");
+    for (const name of ["pnpm-lock.yaml", "ci.yml"]) {
+      write(name, `${GUARD}\n${GUARD}\n\nupstream: true\nfork: true\n`);
+    }
+    git("add", "-A");
+    git("commit", "-qm", "merge keeping both sides in both files");
+
+    const result = findMergeDuplication("HEAD", { cwd: dir, minLines: 5, maxGap: 4 });
+    const flagged = result.findings.map((f) => f.path);
+    assert.deepEqual(flagged, ["ci.yml"]);
+    assert.equal(result.redeclarations.every((r) => r.path === "ci.yml"), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
