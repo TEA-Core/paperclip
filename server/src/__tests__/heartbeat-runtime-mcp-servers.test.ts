@@ -307,6 +307,101 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     });
   });
 
+  it("writes no_permitted_mcp_connections when only a non-MCP connection is permitted", async () => {
+    const [company] = await db.insert(companies).values({
+      name: `Runtime MCP non-MCP ${randomUUID()}`,
+      issuePrefix: `NN${randomUUID().slice(0, 5).toUpperCase()}`,
+    }).returning();
+    const [agent] = await db.insert(agents).values({
+      companyId: company!.id,
+      name: "Non-MCP Permitted Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+    }).returning();
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company!.id,
+      applicationKey: `runtime-non-mcp-${randomUUID().slice(0, 8)}`,
+      name: "Plugin Tool",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company!.id,
+      applicationId: application!.id,
+      name: "Plugin REST Tool",
+      uid: `test/${randomUUID()}`,
+      transport: "rest_api",
+      status: "active",
+      enabled: true,
+      config: { url: "https://plugin.example.test/api" },
+    }).returning();
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company!.id,
+      profileKey: `app:${connection!.id}`,
+      name: "Plugin REST Tool",
+      defaultAction: "deny",
+    }).returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: company!.id,
+      profileId: profile!.id,
+      selectorType: "connection",
+      effect: "include",
+      applicationId: application!.id,
+      connectionId: connection!.id,
+    });
+    await db.insert(toolProfileBindings).values({
+      companyId: company!.id,
+      profileId: profile!.id,
+      targetType: "agent",
+      targetId: agent!.id,
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: company!.id,
+      agentId: agent!.id,
+      status: "running",
+      contextSnapshot: {},
+    });
+
+    const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId });
+
+    expect(servers).toEqual([]);
+    const [activity] = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "tool_gateway.runtime_mcp_delivery"));
+    expect(activity).toMatchObject({
+      companyId: company!.id,
+      agentId: agent!.id,
+      runId,
+      details: expect.objectContaining({
+        reasonCode: "no_permitted_mcp_connections",
+        scope: "mcp_connections",
+        deliveredServerCount: 0,
+        permittedConnectionCount: 0,
+        installedConnectionCount: 0,
+        permittedNotInstalledCount: 0,
+        permittedNotInstalledConnections: [],
+      }),
+    });
+    const [audit] = await db.select().from(toolAccessAuditEvents);
+    expect(audit).toMatchObject({
+      companyId: company!.id,
+      actorType: "agent",
+      actorId: agent!.id,
+      reasonCode: "no_permitted_mcp_connections",
+      details: expect.objectContaining({
+        runId,
+        deliveredServerCount: 0,
+        scope: "mcp_connections",
+        permittedConnectionCount: 0,
+        installedConnectionCount: 0,
+      }),
+    });
+  });
+
   it("injects only managed gateways whose profile connections are installed for the agent", async () => {
     const [company] = await db.insert(companies).values({
       name: `Managed gateway installs ${randomUUID()}`,

@@ -3879,9 +3879,14 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         inArray(toolConnections.id, [...permittedConnectionIds]),
       ))
     : [];
+  // The diagnostic's details declare scope "mcp_connections", so every count it reports must be
+  // MCP-transport-filtered. A permitted rest_api/plugin connection must never inflate these counts
+  // or flip the reason code away from no_permitted_mcp_connections.
+  const isMcpTransport = (transport: string) =>
+    transport === "mcp_remote" || transport === "local_stdio";
   const permittedNotInstalledConnections = permittedConnections
     .filter((connection) =>
-      (connection.transport === "mcp_remote" || connection.transport === "local_stdio")
+      isMcpTransport(connection.transport)
       && !installedConnectionIds.has(connection.id)
     )
     .map(({ id, name }) => ({ id, name }))
@@ -3891,8 +3896,18 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     && connection.status === "active"
     && connection.enabled
     && !["degraded", "failed", "error", "missing_secret"].includes(connection.healthStatus)
-    && (connection.transport === "mcp_remote" || connection.transport === "local_stdio")
+    && isMcpTransport(connection.transport)
   );
+  // Count MCP-transport connections only: permitted from the rows actually loaded (permitted AND
+  // existing in tool_connections), installed from the agent's profile. permittedConnectionIds and
+  // installedConnectionIds hold every connection regardless of transport, so .size on those sets
+  // would report unrelated plugin connections and misattribute the reason code.
+  const permittedMcpConnectionCount = permittedConnections
+    .filter((connection) => isMcpTransport(connection.transport))
+    .length;
+  const installedMcpConnectionCount = effective.installedConnections
+    .filter((connection) => isMcpTransport(connection.transport))
+    .length;
   const service = createToolGatewayService(input.db);
   if (assignedConnections.length === 0) {
     await service.recordRuntimeMcpDeliveryDiagnostic({
@@ -3900,8 +3915,8 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       agentId: input.agent.id,
       runId: input.runId,
       permittedNotInstalledConnections,
-      permittedConnectionCount: permittedConnectionIds.size,
-      installedConnectionCount: installedConnectionIds.size,
+      permittedConnectionCount: permittedMcpConnectionCount,
+      installedConnectionCount: installedMcpConnectionCount,
     });
     return [];
   }
