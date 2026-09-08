@@ -10992,7 +10992,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(eq(heartbeatRuns.id, failure.runId))
           .then((rows) => rows[0] ?? null);
         if (!run) return;
-        await appendRunEvent(run, await nextRunEventSeq(run.id), buildContextSnapshotWriteFailureEvent(failure));
+        await appendRunEvent(run, buildContextSnapshotWriteFailureEvent(failure));
       },
     });
   }
