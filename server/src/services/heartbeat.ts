@@ -10924,6 +10924,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  // Guard wrapper shared by every heartbeat_runs.context_snapshot write site. The snapshot is
+  // diagnostic persistence: a driver-level failure must be recorded (with its error class chain,
+  // since drizzle/postgres.js keep the real Postgres error and SQLSTATE on `.cause`) and the run
+  // must continue (SUP-15284). The guard never throws.
+  async function guardHeartbeatRunContextSnapshotWrite<T>(input: {
+    writeSite: string;
+    runId: string;
+    agentId?: string | null;
+    companyId?: string | null;
+    write: () => Promise<T>;
+    fallback: T;
+  }): Promise<T> {
+    return runContextSnapshotWriteGuarded({
+      writeSite: input.writeSite,
+      runId: input.runId,
+      write: input.write,
+      fallback: input.fallback,
+      record: (failure) => {
+        logger.error(
+          {
+            err: failure.error,
+            runId: failure.runId,
+            agentId: input.agentId ?? null,
+            companyId: input.companyId ?? null,
+            writeSite: failure.writeSite,
+            errorClasses: contextSnapshotWriteErrorClasses(failure.error),
+          },
+          `heartbeat_runs.context_snapshot write failed at ${failure.writeSite}; continuing run without persisting this snapshot`,
+        );
+      },
+    });
+  }
+
   async function persistRunProcessMetadata(
     runId: string,
     meta: { pid: number; processGroupId: number | null; startedAt: string },
@@ -15851,6 +15884,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
+      let descendantOnlyCleanup = false;
+      if (processGroupAlive) {
+        descendantOnlyCleanup = true;
+        await terminateHeartbeatRunProcess({
+          pid: run.processPid,
+          processGroupId: run.processGroupId,
+        });
+      }
+
       const runContext = parseObject(run.contextSnapshot);
       const monitorIssueId = readNonEmptyString(runContext.issueId);
       const monitorNextCheckAt = monitorIssueId
@@ -19171,7 +19213,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // and this event would be a spurious late error on a settled run.
           const failedRunPreFlip = await getRun(runId).catch(() => null);
           if (failedRunPreFlip?.status === "running") {
-            await appendRunEvent(failedRunPreFlip, 1, {
+            await appendRunEvent(failedRunPreFlip, {
               eventType: "error",
               stream: "system",
               level: "error",
@@ -19213,14 +19255,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           const failedRun = await getRun(runId).catch(() => null);
           if (setupFailureWrite.updated && failedRun) {
-            // Emit a run-log event so the failure is visible in the run timeline,
-            // consistent with what the inner catch block does for adapter failures.
-            await appendRunEvent(failedRun, {
-              eventType: "error",
-              stream: "system",
-              level: "error",
-              message,
-            }).catch(() => undefined);
             const livenessRun = await classifyAndPersistRunLiveness(failedRun).catch(() => failedRun);
             if (setupFailureIssueId) {
               await completeSkillTestRunForHeartbeatOutcome({

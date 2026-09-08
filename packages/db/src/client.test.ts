@@ -1414,7 +1414,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
 
       const nativePersistenceHash = await migrationHash("0239_modern_pandemic.sql");
       const eventSequenceUniquenessHash = await migrationHash(
-        "0235_heartbeat_run_event_sequence_uniqueness.sql",
+        "0250_heartbeat_run_event_sequence_uniqueness.sql",
       );
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       const companyId = "10000000-0000-4000-8000-000000000227";
@@ -1883,7 +1883,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       const connectionString = await createTempDatabase();
       await applyPendingMigrations(connectionString);
       const hash = await migrationHash(
-        "0234_provider_trace_records.sql",
+        "0249_provider_trace_records.sql",
       );
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {

@@ -19,7 +19,7 @@ describe("P6-18 / MIG-01..04 native finalization migration", () => {
     );
     const migrationHash = createHash("sha256").update(migration).digest("hex");
     const sequenceMigration = await readFile(
-      new URL("../../../packages/db/src/migrations/0235_heartbeat_run_event_sequence_uniqueness.sql", import.meta.url),
+      new URL("../../../packages/db/src/migrations/0250_heartbeat_run_event_sequence_uniqueness.sql", import.meta.url),
       "utf8",
     );
     const sequenceMigrationHash = createHash("sha256")
