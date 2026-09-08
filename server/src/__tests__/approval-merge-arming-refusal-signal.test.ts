@@ -27,6 +27,10 @@ import {
   MERGE_ARMING_ACTOR_ID,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
 } from "../services/merge-arming.js";
+import {
+  buildDiscoveryQuery,
+  selectLandingCandidates,
+} from "../services/done-close-landing-backstop.js";
 
 // SUP-14900: a CLOSING transition whose merge arming REFUSED (a principled
 // refusal, `statusOutcome.kind === "skipped"`) must not rest the card in quiet
@@ -371,6 +375,148 @@ describeEmbeddedPostgres("approval-arming refusal on a closing transition (SUP-1
     // No refusal: the arming succeeded, so no refusal signal is recorded.
     expect(await refusalSignals(issueId)).toHaveLength(0);
     // ...and the arm step ran.
+    expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(1);
+  });
+
+  // SUP-15394: the CLOSING path where the STATUS outcome was "armed" (the
+  // publisher certified + stamped a PR) but the ARMING outcome is "skipped" —
+  // the exact SUP-15377 shape (#572 stamped, fully authorized, never queued).
+  // The pre-existing tests above only pin the status-refusal branch
+  // (statusOutcome.kind === "skipped"); the arming-refusal branch at
+  // routes/issues.ts (closingTransition && armingOutcome.kind === "skipped")
+  // was delivered with no route-level regression. A synthetic row fed straight
+  // to the backstop selector (done-close-landing-backstop.test.ts) cannot catch
+  // a missing or malformed route write — this drives the real route hook.
+  it("armed status but ARMING refused (skipped) on a CLOSING transition: durable row carries the actuator refusalReason and is a backstop candidate (AC#3)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueClosing("ASIG1");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    // The publisher certified + stamped exactly one PR (the only outcome that
+    // reaches the arming call), handing the actuator its certified subject.
+    mockResolveApprovalDecisionHead.mockResolvedValue({
+      kind: "resolved",
+      headSha: "deadbeefcafe",
+      displayName: "TEA-Core/paperclip#572",
+    });
+    mockPublishApprovalStatus.mockResolvedValue({
+      kind: "armed",
+      message: "status:published (live re-resolve): paperclip/approved written to TEA-Core/paperclip#572 head deadbeefcafe",
+      headSha: "deadbeefcafe",
+      certifiedPr: {
+        id: "ext-pr-572",
+        owner: "TEA-Core",
+        repo: "paperclip",
+        number: 572,
+        nodeId: "PR_kwk0TEST572",
+        headRefName: "SUP-15377-test-branch",
+        displayName: "TEA-Core/paperclip#572",
+        title: "paperclip #572",
+        cachedState: "open",
+        lastErrorCode: null,
+        reviewDecision: null,
+      },
+    });
+    // The actuator refuses (this is what produced skipped:no-pr on #572).
+    mockArmMergeOnApproval.mockResolvedValue({
+      kind: "skipped",
+      message: "skipped:no-pr: No linked pull request found",
+    });
+
+    const res = await approveClosingStage(identifier);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+
+    // The armed status reached the arming step exactly once, handed the
+    // publisher-certified subject (no independent re-resolve — AC#1).
+    expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(1);
+    expect(mockArmMergeOnApproval).toHaveBeenCalledWith(
+      expect.anything(),
+      companyId,
+      issueId,
+      expect.anything(),
+      expect.objectContaining({ number: 572 }),
+    );
+
+    // The arming refusal is durable and first-class, not just an inert comment.
+    const signals = await refusalSignals(issueId);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]!.actorId).toBe(MERGE_ARMING_ACTOR_ID);
+    expect(signals[0]!.details).toMatchObject({
+      identifier,
+      decisionOutcome: "approved",
+      headSha: "deadbeefcafe",
+    });
+    // The refusalReason is the ACTUATOR's message, not the status outcome's.
+    expect(signals[0]!.details?.refusalReason).toBe(
+      "skipped:no-pr: No linked pull request found",
+    );
+
+    // The PERSISTED row is what the done-close-landing backstop discovers and
+    // qualifies: buildDiscoveryQuery is the exact WHERE the hourly sweep runs
+    // (action = issue.merge_arming_refused_on_close AND issue.status = done) and
+    // selectLandingCandidates is the per-row qualifier. A missing or malformed
+    // route write would fail here — which the synthetic-row selector test cannot
+    // catch.
+    const now = new Date();
+    const windowStart = new Date(now.getTime() - 60_000);
+    const graceCutoff = new Date(now.getTime() + 60_000);
+    const discovered = await buildDiscoveryQuery(db, windowStart, graceCutoff);
+    const candidates = selectLandingCandidates(discovered, windowStart, graceCutoff);
+    expect(candidates.map((c) => c.issue.id)).toContain(issueId);
+    expect(
+      candidates
+        .filter((c) => c.issue.id === issueId)
+        .some((c) =>
+          (c.details as Record<string, unknown> | null)?.refusalReason ===
+          "skipped:no-pr: No linked pull request found",
+        ),
+    ).toBe(true);
+  });
+
+  it("armed status but ARMING failed (not a refusal) on a CLOSING transition: card closes done, NO refusal signal (AC#4)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueClosing("ASIG4");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    mockResolveApprovalDecisionHead.mockResolvedValue({
+      kind: "resolved",
+      headSha: "deadbeefcafe",
+      displayName: "TEA-Core/paperclip#572",
+    });
+    mockPublishApprovalStatus.mockResolvedValue({
+      kind: "armed",
+      message: "status:published: paperclip/approved written to TEA-Core/paperclip#572 head deadbeefcafe",
+      headSha: "deadbeefcafe",
+      certifiedPr: {
+        id: "ext-pr-572",
+        owner: "TEA-Core",
+        repo: "paperclip",
+        number: 572,
+        nodeId: "PR_kwk0TEST572",
+        headRefName: "SUP-15377-test-branch",
+        displayName: "TEA-Core/paperclip#572",
+        title: "paperclip #572",
+        cachedState: "open",
+        lastErrorCode: null,
+        reviewDecision: null,
+      },
+    });
+    // A genuine arming FAILURE (GitHub 403, network, token flap) — distinct from
+    // a principled "skipped" refusal.
+    mockArmMergeOnApproval.mockResolvedValue({
+      kind: "failed",
+      message: "failed:enable_auto_merge: 403 resource not accessible by integration",
+    });
+
+    const res = await approveClosingStage(identifier);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+
+    // A genuine arming failure is NOT a principled refusal (SUP-13904 /
+    // SUP-14900 AC#4): the card still closes done and no durable refusal signal
+    // is raised. Only an arming "skipped" is a refusal.
+    expect(await refusalSignals(issueId)).toHaveLength(0);
+    // ...but the arm step DID run on the armed status (this is not the
+    // head-resolution throw path the pre-existing AC#4 test covers).
     expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(1);
   });
 
