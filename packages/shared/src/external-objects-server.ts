@@ -73,12 +73,18 @@ function stripMarkdownCode(markdown: string): string {
   return output;
 }
 
-function countChar(text: string, char: string): number {
-  let count = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    if (text[index] === char) count += 1;
+function hasUnclosedOpener(text: string, marker: string): boolean {
+  let open = false;
+  let index = 0;
+  while (index < text.length) {
+    if (text[index] !== marker) {
+      index += 1;
+      continue;
+    }
+    while (index < text.length && text[index] === marker) index += 1;
+    open = !open;
   }
-  return count;
+  return open;
 }
 
 function trimTrailingPunctuation(token: string, leftContext: string): string {
@@ -94,15 +100,15 @@ function trimTrailingPunctuation(token: string, leftContext: string): string {
       break;
     }
 
-    // A trailing run of `*`/`_` is a markdown emphasis close when the same-line
-    // source before the URL carries an unclosed opener of that marker so the
-    // total marker count balances out (e.g. `**PR: url**` or `*url*`). A genuine
-    // terminal marker with no opener — e.g. `…/wiki/Foo_` before `(bar)` — is kept.
+    // A trailing run of `*`/`_` is a markdown emphasis close only when the
+    // same-line source before the URL still carries an UNCLOSED opener of that
+    // marker (e.g. `**PR: url**` or `*url*`). A balanced span earlier on the
+    // line (`**bold** ... url**`) or a genuine terminal marker with no opener
+    // (`…/wiki/Foo_`) leaves the marker in place.
     if (last === "*" || last === "_") {
       let run = 0;
       while (run < trimmed.length && trimmed[trimmed.length - 1 - run] === last) run += 1;
-      const openers = countChar(leftContext, last);
-      if (!(openers > 0 && (openers + run) % 2 === 0)) break;
+      if (!hasUnclosedOpener(leftContext, last)) break;
       trimmed = trimmed.slice(0, trimmed.length - run);
       continue;
     }

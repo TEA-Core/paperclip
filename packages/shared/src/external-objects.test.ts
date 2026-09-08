@@ -208,4 +208,20 @@ describe("external object references", () => {
       "https://example.com/exports/flag*",
     ]);
   });
+
+  it("does not strip a genuine trailing ** when the earlier emphasis span is balanced (SUP-15395)", () => {
+    // `**bold**` is a complete emphasis span, so no opener is still open at the
+    // URL; the trailing `**` is genuine content and must survive the trim.
+    const cases: Array<[string, string]> = [
+      ["See **bold** then https://example.com/path**", "https://example.com/path**"],
+      ["See *ital* then https://example.com/path*", "https://example.com/path*"],
+      ["See _em_ then https://example.com/path_", "https://example.com/path_"],
+      // Contrast: an opener that is still open at the URL makes the trailing
+      // marker an emphasis close and strips it.
+      ["**See bold then https://example.com/path**", "https://example.com/path"],
+    ];
+    for (const [input, expected] of cases) {
+      expect(findExternalObjectUrlMatches(input).map((m) => m.matchedText)).toEqual([expected]);
+    }
+  });
 });
