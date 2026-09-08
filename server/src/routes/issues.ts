@@ -3461,13 +3461,45 @@ export function issueRoutes(
         .where(eq(companies.id, issue.companyId))
         .then((rows) => rows[0] ?? null);
       if (company?.mergeArmingEnabled) {
-        const armingOutcome = await armMergeOnApproval(db, issue.companyId, issue.id, decision);
+        const armingOutcome = await armMergeOnApproval(db, issue.companyId, issue.id, decision, statusOutcome.certifiedPr);
         await svc.addComment(
           issue.id,
           `[Merge-arming] ${armingOutcome.message}`,
           {},
           { authorType: "system" },
         );
+
+        // SUP-15394: a CLOSING transition whose ARMING refused (armingOutcome.kind ===
+        // "skipped" — no-pr, unowned-branch, not-pr-owner, owner-not-approved, …)
+        // means the publisher DID stamp a PR (statusOutcome was "armed", the only
+        // outcome that reaches this point) yet the merge was never armed. That is the
+        // SUP-15377 shape: #572 sat stamped and fully authorized but unqueued, and
+        // this refusal was recorded NOWHERE durable — the status-refusal path above
+        // fires only when the STATUS outcome is skipped, which it was not. Record the
+        // same first-class, queryable refusal the card-side done-close-landing
+        // backstop (done-close-landing-backstop.ts) keys on, so it can recover. A
+        // genuine arming failure (kind === "failed") is NOT a refusal signal
+        // (SUP-13904 / SUP-14900 AC#4), so only "skipped" is recorded here.
+        if (closingTransition && armingOutcome.kind === "skipped") {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: MERGE_ARMING_ACTOR_ID,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            action: MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
+            entityType: "issue",
+            entityId: issue.id,
+            issueId: issue.id,
+            details: {
+              identifier: issue.identifier ?? null,
+              refusalReason: armingOutcome.message,
+              headSha: statusOutcome.headSha ?? null,
+              decisionOutcome: decision?.outcome ?? null,
+            },
+          });
+        }
       }
     } catch (err) {
       logger.warn({ err, issueId: issue.id, companyId: issue.companyId }, "merge-arming hook failed");

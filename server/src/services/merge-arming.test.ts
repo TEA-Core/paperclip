@@ -17,6 +17,7 @@ import {
 } from "../__tests__/helpers/embedded-postgres.js";
 import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from "./github-credential.js";
 import {
+  armMergeOnApproval,
   publishApprovalStatus,
   resolveApprovalDecisionHead,
   resolveCardPullRequest,
@@ -736,6 +737,101 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(outcome.kind).toBe("skipped");
       expect(outcome.message).toContain("head_moved");
       expect(postStatusCalls()).toHaveLength(0);
+    });
+  });
+
+  // SUP-15394 (root SUP-15393): on the zero-mention card, publishApprovalStatus
+  // resolves a PR via live workspace discovery, stamps it, and hands the actuator
+  // the EXACT PR it certified. The actuator must arm THAT PR instead of running a
+  // second, independent resolveLinkedPullRequests — the divergent re-resolve that
+  // produced the no-pr refusal on main (SUP-15377's #572: stamped and fully
+  // authorized, yet unqueued and never durably refused).
+  describe("SUP-15394: arm the PR publishApprovalStatus certified (zero-mention card)", () => {
+    const PR455_URL = `https://api.github.com/repos/${OWNER}/${REPO}/pulls/455`;
+    // Serves both publishApprovalStatus's head-SHA read (head.sha) and
+    // armMergeOnApproval's node-id fetch (node_id) — one GET /pulls/455.
+    const PR455_BODY = {
+      node_id: "PR_node_455",
+      head: { ref: "SUP-42-branch", sha: APPROVED_HEAD },
+      title: "Unify PR resolution",
+      state: "open",
+    };
+
+    // A zero-mention card whose single review stage is complete and approved, so
+    // the owner-approved stage-completion gate in armMergeOnApproval passes.
+    async function insertApprovedCard() {
+      const issueId = await insertIssue();
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            mode: "normal",
+            stages: [{ id: "stage-a", type: "review", approvalsNeeded: 1 }],
+          },
+          executionState: {
+            completedStageIds: ["stage-a"],
+            lastDecisionOutcome: "approved",
+          },
+        })
+        .where(eq(issues.id, issueId));
+      return issueId;
+    }
+
+    it("arms the certified PR instead of refusing no-pr (AC#1, AC#2)", async () => {
+      const issueId = await insertApprovedCard();
+      // Zero pull_request mention rows — only live workspace discovery finds #455.
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 455 })] },
+        { url: PR455_URL, body: PR455_BODY },
+        { url: POST_STATUS_URL(APPROVED_HEAD), body: {} },
+        {
+          url: "https://api.github.com/graphql",
+          body: { data: { enablePullRequestAutoMerge: { clientMutationId: "mut-455" } } },
+        },
+      ]);
+
+      // The publisher resolves, delivery-gates, and stamps #455 — handing over the
+      // exact PR it certified.
+      const statusOutcome = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+        enforceDeliveryIdentity: true,
+      });
+      expect(statusOutcome.kind).toBe("armed");
+      expect(statusOutcome.headSha).toBe(APPROVED_HEAD);
+      expect(statusOutcome.certifiedPr).toMatchObject({
+        owner: OWNER,
+        repo: REPO,
+        number: 455,
+        headRefName: "SUP-42-branch",
+      });
+
+      // The actuator arms EXACTLY the certified PR. On main the 5th argument did
+      // not exist, so the actuator re-resolved (0 mentions) and returned no-pr.
+      const armingOutcome = await armMergeOnApproval(
+        db,
+        companyId,
+        issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+        statusOutcome.certifiedPr,
+      );
+      expect(armingOutcome.kind).toBe("armed");
+      expect(armingOutcome.message).toContain("Auto-merge enabled for TEA-Core/paperclip#455");
+    });
+
+    it("still refuses no-pr when no certified subject is supplied (fallback re-resolve unchanged)", async () => {
+      const issueId = await insertApprovedCard();
+      // The same zero-mention card, but no certified subject handed over: the
+      // historical cached resolve finds nothing, so the actuator still refuses.
+      installRoutes([]);
+
+      const armingOutcome = await armMergeOnApproval(
+        db,
+        companyId,
+        issueId,
+        { stageId: "stage-a", stageType: "review", outcome: "approved", body: "LGTM" },
+      );
+      expect(armingOutcome.kind).toBe("skipped");
+      expect(armingOutcome.message).toBe("skipped:no-pr: No linked pull request found");
     });
   });
 
