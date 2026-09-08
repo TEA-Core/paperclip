@@ -144,6 +144,30 @@ test("react: PR-workflow failure names verify when only the verify context faile
   }
 });
 
+test("react: a verify aggregate failure quotes the genuinely-failed lane, not the thin aggregate log", () => {
+  const dir = makeFixture({
+    jobs: [
+      job(1, "Approval precondition", "success"),
+      job(2, "General tests (server (2/5))", "failure"),
+      job(3, "verify", "failure"),
+    ],
+  });
+  try {
+    writeFileSync(path.join(dir, "2.log"), "server (2/5) real failure trace\nassertion failed on line 42\n");
+    writeFileSync(path.join(dir, "3.log"), "verify aggregate\n");
+    const r = run(dir, { workflowName: "PR" });
+    assert.equal(r.code, 0);
+    const all = r.out + r.err;
+    assert.match(all, /would surface check 'verify' on TEA-Core\/paperclip PR #4242/);
+    // The quoted reason must be the lane's real failure, not status-only.
+    assert.match(all, /--- General tests \(server \(2\/5\)\) failing output \(bounded tail\) ---/);
+    assert.match(all, /server \(2\/5\) real failure trace/);
+    assert.doesNotMatch(all, /verify aggregate\n--- verify failing output/, "the thin aggregate log must not be quoted");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("react: PR-workflow failure names e2e when only e2e failed", () => {
   const dir = makeFixture({
     jobs: [job(1, "e2e", "failure")],

@@ -131,21 +131,29 @@ trap 'rm -f "$reason"' EXIT
   echo "$failing_names" | sed 's/^/  - /'
 } > "$reason"
 
-chosen_job_id="$(jq -r --arg n "$check_name" '.jobs[] | select(.name == $n) | select(.conclusion == "failure") | .id' <<<"$jobs_json" | head -1 || true)"
+# The reason must be actionable, not status-only (merge-group-surface-reason-is-status-only):
+# an aggregate/gate context ('verify'/'e2e'/'Approval precondition') that
+# failed because its dependencies failed has a thin log of its own. Prefer the
+# first genuinely-failed *lane/shard* job's log (best-effort), and fall back to
+# the chosen check's own job when nothing deeper failed.
+AGGREGATE_JOBS='["verify", "e2e", "Approval precondition"]'
+reason_jid="$(jq -r --argjson agg "$AGGREGATE_JOBS" '.jobs[] | select(.conclusion == "failure") | select((.name | IN($agg[])) | not) | .id' <<<"$jobs_json" | head -1 || true)"
+if [ -z "$reason_jid" ]; then
+  reason_jid="$(jq -r --arg n "$check_name" '.jobs[] | select(.name == $n) | select(.conclusion == "failure") | .id' <<<"$jobs_json" | head -1 || true)"
+fi
+reason_name="$(jq -r --arg id "$reason_jid" '.jobs[] | select((.id | tostring) == $id) | .name' <<<"$jobs_json" | head -1 || true)"
 tail_one() {
   local name="$1" jid="$2" limit="${3:-1500}"
   [ -n "$jid" ] || return 0
   printf '\n--- %s failing output (bounded tail) ---\n' "$name" >> "$reason"
   gh api "repos/${GH_REPO}/actions/jobs/${jid}/logs" 2>/dev/null | tail -c "$limit" >> "$reason" || true
 }
-if [ -n "$chosen_job_id" ]; then
-  tail_one "$check_name" "$chosen_job_id"
+if [ -n "$reason_jid" ]; then
+  tail_one "$reason_name" "$reason_jid"
 else
-  # Chosen name is an aggregate context whose own job did not fail (only its
-  # deps did) — quote the first genuinely failing job instead.
-  first_jid="$(jq -r '.jobs[] | select(.conclusion == "failure") | .id' <<<"$jobs_json" | head -1 || true)"
-  first_name="$(head -1 <<<"$failing_names")"
-  tail_one "$first_name" "$first_jid"
+  # No failing job id resolved (defensive) — leave the failing-job list as the
+  # reason; the helper appends a pointer to the merge_group run.
+  :
 fi
 
 # --- 5. Post / update the artefact via the trusted posting helper -------------
