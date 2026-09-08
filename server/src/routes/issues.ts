@@ -8461,6 +8461,33 @@ export function issueRoutes(
       return;
     }
 
+    // Guard C (SUP-15459): ladder terminality. This route is an INDEPENDENT
+    // publishApprovalStatus write path, so Guard A (a recorded "approved"
+    // decision) plus Guard B (stage integrity) are not enough: Guard B's weakest
+    // condition is "at least one completed stage", so a mid-ladder card whose
+    // first stage was legitimately approved passes both and would be re-stamped
+    // here — re-opening the exact defect this card closes at the other two write
+    // sites. Same shared predicate, same refusal vocabulary, evaluated before any
+    // decision-head resolution or GitHub I/O.
+    const ladderPolicy = issue.executionPolicy as { stages?: Array<{ id: string }> } | null;
+    const ladderState = state as {
+      completedStageIds?: string[];
+      lastDecisionOutcome?: string | null;
+    };
+    if (!ladderIsTerminallyApproved(ladderPolicy, ladderState)) {
+      const policyStages = ladderPolicy?.stages ?? [];
+      const completedIds = ladderState.completedStageIds ?? [];
+      const incompleteIds = policyStages
+        .filter((s) => !completedIds.includes(s.id))
+        .map((s) => s.id);
+      res.status(409).json({
+        outcome: "rejected",
+        reason: "non_terminal_ladder",
+        message: `status:skipped:non-terminal-ladder: incomplete review/approval stages: ${incompleteIds.join(", ")}`,
+      });
+      return;
+    }
+
     // The publish pins the decision head by matching the card identifier against
     // the linked PR's head ref / title / body, so a card with no identifier cannot
     // be pinned. Fail closed.
