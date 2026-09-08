@@ -262,6 +262,42 @@ jobs:
       - name: Test PR security gate wiring
         run: node --test ./scripts/__tests__/pr-security-gate.test.mjs
 
+      - name: Fold duplication guard
+        # Catches the defect a 3-way merge produces when it resolves a
+        # conflicted region by keeping BOTH parents' copies of a block. Git
+        # reports no conflict, tsc reports nothing (identical adjacent
+        # statements are legal, and a cross-scope redeclaration is legal), and
+        # this repository has no ESLint config, so nothing else looks. Fold
+        # 1446a58c0 landed five at once, four of which are still on the branch.
+        #
+        # Checked over the RANGE, not just the head. A fold PR carries its fold
+        # merge inside the branch and its head is an ordinary follow-up commit:
+        # #573's head is single-parent, so a head-only check inspects nothing
+        # while the merge that matters (8e09d4db6, 88 resolved files) sits 80
+        # commits back. BASE_SHA/HEAD_SHA resolve both payload shapes at the job
+        # level and the checkout above uses fetch-depth: 0, so the range is
+        # present on either event.
+        #
+        # Only a two-parent merge can carry the defect, so a range with none
+        # exits 0. Deliberately NOT scoped to one event -- and `github.head_ref`
+        # is empty on `merge_group` anyway, which would void any branch-name
+        # exemption written here (the trap documented on the lockfile guards).
+        #
+        # ADVISORY FOR NOW, on purpose. A gate cannot first bind on the very PR
+        # that introduces it, and the 2026-09-07 fold (#573) is already open
+        # against this branch: it was authored before this check existed and
+        # must not be judged by it. Flip `continue-on-error` off in a follow-up
+        # once #573 has landed. The wiring test pins the current state, so the
+        # flip has to be deliberate rather than accidental.
+        continue-on-error: true
+        run: node ./scripts/check-fold-duplication.mjs "$HEAD_SHA" "$BASE_SHA"
+
+      - name: Test fold duplication guard
+        run: node --test ./scripts/check-fold-duplication.test.mjs
+
+      - name: Test fold duplication guard wiring
+        run: node --test ./scripts/__tests__/fold-duplication-guard.test.mjs
+
       - name: Test paperclip-approved enforcer fold-waiver contract
         # On a fold-sync head the waiver path is the ONLY route, so this file is
         # what pins its contract. As of 2026-09-07 the countersignature that used
