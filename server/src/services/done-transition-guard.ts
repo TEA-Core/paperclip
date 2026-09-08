@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { and, eq, inArray } from "drizzle-orm";
-import { agents, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
+import { agents, issueExecutionDecisions, issueLabels, issues, labels, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -55,8 +55,14 @@ const ADR072_CLOSE_LADDER: {
 }[] = [
   { stageType: "review", agentUrlKey: "support-qae", label: "review:support-QAE" },
   { stageType: "review", agentUrlKey: "coder-le", label: "review:coder-LE" },
-  { stageType: "approval", agentUrlKey: "exec-cto", label: "approval:exec-CTO" },
+   { stageType: "approval", agentUrlKey: "exec-cto", label: "approval:exec-CTO" },
 ];
+
+// SUP-15464: the label name that marks a work-type:redo child. A redo card
+// re-delivers the same deliverable its parent already gated, so it is not a
+// decomposition child. Matched by name and resolved company-scoped — the label
+// id is company-scoped and this guard is not.
+const REDO_LABEL_NAME = "work-type:redo";
 
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
@@ -909,10 +915,20 @@ function evaluateReviewLadderSatisfaction(
   * review, task_watchdog, stale_active_run_evaluation,
   * harness_liveness_escalation, ...) is platform-generated bookkeeping
   * parented to the card, not engineered sub-work — counting it re-arms the
-  * guard over a single genuine manual child. This exclusion lives here so
-  * both mechanism A and mechanism D inherit it; call sites never re-filter.
-  *
-  * A ladder-less parent (executionPolicy null, or `stages: []` — either way
+   * guard over a single genuine manual child. This exclusion lives here so
+   * both mechanism A and mechanism D inherit it; call sites never re-filter.
+   *
+   * SUP-15464: a `work-type:redo` child is likewise not a decomposition child.
+   * The review flow files a redo card on each bounce (origin_kind manual,
+   * parented to the card it re-delivers); it runs its own ladder and would
+   * otherwise satisfy every clause of this predicate. But a redo re-delivers
+   * the same deliverable, so it is not "which child gated this work?". Match
+   * by the label NAME `work-type:redo`, resolved company-scoped for the issue
+   * under test — the label id is company-scoped and this guard is not. This
+   * exclusion lives here too, so both mechanism A and mechanism D inherit it
+   * alongside the SUP-15451 origin_kind narrowing.
+   *
+   * A ladder-less parent (executionPolicy null, or `stages: []` — either way
  * `evaluateReviewLadderSatisfaction` reports no ladder) sitting over two or
  * more such children is a decomposed body of reviewed engineering work: the
  * work was gated at the children, so closing the parent with `done` would
@@ -945,6 +961,30 @@ async function countLadderedChildren(
     .from(issues)
     .where(and(eq(issues.companyId, companyId), eq(issues.parentId, parentId)));
 
+  // SUP-15464: a `work-type:redo` child re-delivers the same deliverable this
+  // parent already gated, so it is not a decomposition child. Resolve the redo
+  // label by name, scoped to this issue's company (the label id is
+  // company-scoped and this guard is not), then exclude any child carrying it.
+  // A company with no label named `work-type:redo` cannot have a redo child, so
+  // the issue_labels read is skipped entirely.
+  let redoChildIds: Set<string> | null = null;
+  const redoLabelRows = await db
+    .select({ id: labels.id })
+    .from(labels)
+    .where(and(eq(labels.companyId, companyId), eq(labels.name, REDO_LABEL_NAME)));
+  if (redoLabelRows.length > 0) {
+    const redoIssueLabelRows = await db
+      .select({ issueId: issueLabels.issueId })
+      .from(issueLabels)
+      .where(
+        and(
+          eq(issueLabels.companyId, companyId),
+          inArray(issueLabels.labelId, redoLabelRows.map((label) => label.id)),
+        ),
+      );
+    redoChildIds = new Set(redoIssueLabelRows.map((row) => row.issueId));
+  }
+
   let count = 0;
   const identifiers: string[] = [];
   for (const row of rows) {
@@ -957,6 +997,9 @@ async function countLadderedChildren(
     // is an ordinary manually-filed card and counts.
     const originKind = row.originKind ?? "manual";
     if (originKind !== "manual" && !originKind.startsWith("plugin:")) continue;
+    // SUP-15464: skip redo re-deliveries — they gate the same work this parent
+    // already gated, not a separate child's.
+    if (redoChildIds?.has(row.id)) continue;
     if (row.executionPolicy == null) continue;
     const state = parseIssueExecutionState(row.executionState);
     const completed = state?.completedStageIds?.length ?? 0;
