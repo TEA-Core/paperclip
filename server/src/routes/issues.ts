@@ -11594,13 +11594,6 @@ export function issueRoutes(
     ) {
       return;
     }
-    if (
-      resumeRequested !== true &&
-      agentStatusTransitionRequiresResumeAuthority &&
-      !(await assertExplicitResumeIntentAllowed(req, res, existing))
-    ) {
-      return;
-    }
     const scheduledRetryForHumanComment =
       shouldHumanCommentResumeInProgressScheduledRetry({
         hasComment: !!commentBody,
