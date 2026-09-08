@@ -127,8 +127,9 @@ Each artefact:
   rather than stacking a new one, and a comment for one failing check is never
   clobbered by another's.
 - **Names the failing check** (the `--check-name`) and **quotes the reason
-  verbatim** (the failing step tees its captured output / lane results to
-  `runner.temp`, passed via `--verdict`).
+  verbatim** (the failing step tees its captured output / lane results —
+  including a bounded tail of the genuinely-failed lane's own job log for
+  `verify`/`e2e` — to `runner.temp`, passed via `--verdict`).
 - **Reachable with the standard platform agent token** — it reads/writes PR
   comments via `gh api …/issues/{n}/comments` under the job's
   `pull-requests: write` grant (bumped from `read`); no `checks:read`/admin.
@@ -136,6 +137,16 @@ Each artefact:
   (`merge_group` conclusions are unchanged); the surface step runs only when
   that gate step already failed (explicit `failure()`, event == `merge_group`),
   cannot turn a green entry red, and exits 0 on any post failure.
+
+**Security boundary (merge-group-comment-token-executes-pr-code).** The jobs
+that post the artefact hold `pull-requests: write`, and on a `merge_group`
+event the default checkout is the `gh-readonly-queue` ref — whose tree the
+queued PR controls. The workflows therefore never execute `scripts/ci/*` from
+that tree. Control code (the enforcer gate script and the surface posting
+script) is fetched from the **pinned protected BASE SHA** (the commit the entry
+is built on) via the contents API into `$RUNNER_TEMP`, so a queued PR can never
+replace it with code that runs under the write token. This also removes the
+surface's dependence on a checkout that the queue may delete mid-ejection.
 
 ### ADR-091 D1 delivery-identity evidence order (SUP-14824)
 

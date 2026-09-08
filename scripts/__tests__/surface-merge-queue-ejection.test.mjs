@@ -367,15 +367,52 @@ test("the runner.temp verdict path is declared at step level, never job-level en
   }
 });
 
-test("the gate step still runs the enforcer and exits with its rc", () => {
+test("control code is never executed from a PR-controlled checkout", () => {
+  // SUP-15375 round 5 (security, merge-group-comment-token-executes-pr-code):
+  // the jobs that hold `pull-requests: write` must not run repo scripts from
+  // the entry's own (gh-readonly-queue / PR-controlled) tree. The enforcer
+  // workflow must have NO checkout at all; the gate and surface scripts are
+  // fetched from the pinned protected base SHA via the contents API instead.
+  const enforcer = readFileSync(workflow, "utf8");
+  const enforcerJob = enforcer.match(/\n {2}paperclip-approved-enforcer:((?: {4}.*\n|\n)*?)(?=\n {2}[A-Za-z_]|$)/)[1];
+  assert.doesNotMatch(enforcerJob, /actions\/checkout/, "the write-token job must not checkout the PR-controlled tree");
+  assert.doesNotMatch(enforcerJob, /bash scripts\/ci\//, "repo scripts must not run from the checkout");
+  // The gate (enforcer) and the surface are fetched from the base SHA.
+  assert.match(enforcerJob, /MERGE_EJECTION_BASE_SHA:/, "the trusted base SHA is pinned for the control code");
+  assert.match(
+    enforcerJob,
+    /contents\/scripts\/ci\/check-paperclip-approved\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/,
+    "the enforcer gate script is fetched from the base SHA",
+  );
+  assert.match(
+    enforcerJob,
+    /contents\/scripts\/ci\/surface-merge-queue-ejection\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/,
+    "the surface script is fetched from the base SHA",
+  );
+  // Same for pr.yml's write-token aggregate jobs: no checkout in verify/e2e.
+  const pr = readFileSync(prWorkflow, "utf8");
+  for (const jobName of ["verify", "e2e"]) {
+    const job = pr.match(new RegExp(`\\n {2}${jobName}:\\n((?: {4}.*\\n|\\n)*?)(?=\\n {2}(?:build|[a-z_]+):|\\s*$)`))[1];
+    assert.doesNotMatch(job, /actions\/checkout/, `${jobName} aggregate must not checkout the PR-controlled tree`);
+    assert.match(job, /MERGE_EJECTION_BASE_SHA:/, `${jobName} pins the trusted base SHA`);
+    assert.match(
+      job,
+      /contents\/scripts\/ci\/surface-merge-queue-ejection\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/,
+      `${jobName} fetches the surface from the base SHA`,
+    );
+  }
+});
+
+test("the enforcer gate still fails closed and quotes a fetched verdict", () => {
   const text = readFileSync(workflow, "utf8");
-  assert.match(text, /bash scripts\/ci\/check-paperclip-approved\.sh merge_group >"\$MERGE_EJECTION_VERDICT" 2>&1/);
-  // The job must still exit with the enforcer's rc — the fail-closed merge_group
-  // verdict is what turns the check-run red and ejects the entry.
+  // The gate runs the base-fetched enforcer script and must still exit with its
+  // rc — the fail-closed merge_group verdict is what turns the check-run red
+  // and ejects the entry.
+  assert.match(text, /bash "\$ENFORCER_SCRIPT" merge_group >"\$MERGE_EJECTION_VERDICT" 2>&1/);
   assert.match(text, /\[ "\$rc" -eq 0 \] \|\| exit "\$rc"/);
 });
 
-test("the surface step runs only on merge_group gate failure and calls the script", () => {
+test("the surface step runs only on merge_group gate failure and posts via the base-fetched script", () => {
   const text = readFileSync(workflow, "utf8");
   const m = text.match(/- name: Surface the merge-queue ejection reason on the PR\n\s*if: ([^\n]+)/);
   assert.ok(m, "the surface step must carry an `if` condition");
@@ -393,10 +430,6 @@ test("the surface step runs only on merge_group gate failure and calls the scrip
   // A naive condition without a status function must never come back: GitHub
   // would silently add `success()` and the artefact would never be posted.
   assert.doesNotMatch(ifExpr, /^if: github\.event_name/, "a bare (implicit-success) condition is the round-1 defect");
-  assert.match(
-    text,
-    /bash scripts\/ci\/surface-merge-queue-ejection\.sh --check-name paperclip-approved-enforcer --verdict "\$MERGE_EJECTION_VERDICT"/,
-  );
   // It is gated on the gate step's failure, not `always()` — so it can never run
   // on a green entry and turn one red, and it is not required for a conclusion.
   assert.match(text, /- name: Check the paperclip\/approved status/);
@@ -424,12 +457,12 @@ test("pr.yml verify aggregate gates a surface step on merge_group gate failure",
   assert.match(job, /> "\$MERGE_EJECTION_VERDICT"/, "lane results are teed for the surface step");
   assert.match(job, /test "\$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"/, "fail-closed assertion unchanged");
   // The surface step carries an explicit status function + the event/gate scope,
-  // and calls the shared script with its own --check-name.
+  // and posts through the base-fetched shared script with its own --check-name.
   assert.match(
     job,
     /- name: Surface the merge-queue ejection reason on the PR \(verify\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.verify_gate\.outcome == 'failure' \}\}/,
   );
-  assert.match(job, /bash scripts\/ci\/surface-merge-queue-ejection\.sh --check-name verify --verdict "\$MERGE_EJECTION_VERDICT"/);
+  assert.match(job, /bash "\$surface" --check-name verify --verdict "\$MERGE_EJECTION_VERDICT"/);
 });
 
 test("pr.yml e2e aggregate gates a surface step on merge_group gate failure", () => {
@@ -443,7 +476,24 @@ test("pr.yml e2e aggregate gates a surface step on merge_group gate failure", ()
     job,
     /- name: Surface the merge-queue ejection reason on the PR \(e2e\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.e2e_gate\.outcome == 'failure' \}\}/,
   );
-  assert.match(job, /bash scripts\/ci\/surface-merge-queue-ejection\.sh --check-name e2e --verdict "\$MERGE_EJECTION_VERDICT"/);
+  assert.match(job, /bash "\$surface" --check-name e2e --verdict "\$MERGE_EJECTION_VERDICT"/);
+});
+
+test("verify/e2e surfaces capture a bounded failing-lane reason, not status only", () => {
+  const text = readFileSync(prWorkflow, "utf8");
+  // SUP-15375 round 5 (merge-group-surface-reason-is-status-only): the gate
+  // steps fetch a bounded tail of the genuinely-failed lane's OWN job log from
+  // this run and append it to the verdict file, so the PR artefact names the
+  // underlying failure. This requires the read-only `actions: read` scope.
+  const verifyJob = text.match(/\n {2}verify:\n((?: {4}.*\n|\n)*?)(?=\n {2}build:)/)[1];
+  assert.match(verifyJob, /^ {6}actions: read$/m, "verify needs actions: read for the lane-log tail");
+  assert.match(verifyJob, /actions\/runs\/\$\{GITHUB_RUN_ID\}\/jobs/, "verify lists this run's jobs to find the failed lane");
+  assert.match(verifyJob, /actions\/jobs\/\$\{jid\}\/logs/, "verify fetches the failed lane's own job log");
+  assert.match(verifyJob, /failing output \(bounded tail\)/, "verify labels the appended lane output");
+  const e2eJob = text.match(/\n {2}e2e:\n((?: {4}.*\n|\n)*)/)[1];
+  assert.match(e2eJob, /^ {6}actions: read$/m, "e2e needs actions: read for the shard-log tail");
+  assert.match(e2eJob, /actions\/jobs\/\$\{jid\}\/logs/, "e2e fetches the failed shard's own job log");
+  assert.match(e2eJob, /failing shard log \(bounded tail\)/, "e2e labels the appended shard output");
 });
 
 test("pr.yml surface steps only post on a genuine failure, not skipped/cancelled lanes", () => {
@@ -453,14 +503,10 @@ test("pr.yml surface steps only post on a genuine failure, not skipped/cancelled
   // story) does not stack verify/e2e comments.
   assert.match(
     text,
-    /- name: Surface the merge-queue ejection reason on the PR \(verify\)\n((?: {6,}.*\n|\n)*?)(?=\n {4}- |\n {2}build:)/,
+    /Surface the merge-queue ejection reason on the PR \(verify\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.verify_gate\.outcome == 'failure' \}\}\n(?: {8}env:\n(?: {10}.*\n)*?)? {8}run: \|\n(?: {10}.*\n)*? {10}if ! grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
   );
   assert.match(
     text,
-    /Surface the merge-queue ejection reason on the PR \(verify\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.verify_gate\.outcome == 'failure' \}\}\n(?: {8}env:\n(?: {10}.*\n)*?)? {8}run: \|\n(?: {10}.*\n)*? {10}if grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
-  );
-  assert.match(
-    text,
-    /Surface the merge-queue ejection reason on the PR \(e2e\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.e2e_gate\.outcome == 'failure' \}\}\n(?: {8}env:\n(?: {10}.*\n)*?)? {8}run: \|\n(?: {10}.*\n)*? {10}if grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
+    /Surface the merge-queue ejection reason on the PR \(e2e\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.e2e_gate\.outcome == 'failure' \}\}\n(?: {8}env:\n(?: {10}.*\n)*?)? {8}run: \|\n(?: {10}.*\n)*? {10}if ! grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
   );
 });

@@ -206,5 +206,14 @@ test("the precondition runs the same script as the required enforcer context", (
   const enforcer = readWorkflow("paperclip-approved.yml");
 
   assert.match(precondition, /bash scripts\/ci\/check-paperclip-approved\.sh/);
-  assert.match(enforcer, /bash scripts\/ci\/check-paperclip-approved\.sh/);
+  // SUP-15375 round 5 (security): the enforcer job holds `pull-requests: write`,
+  // so it must not execute the enforcer script from the PR-controlled
+  // gh-readonly-queue checkout — a queued PR could replace that file and run
+  // arbitrary code with the write token (merge-group-comment-token-executes-pr-code).
+  // It fetches the SAME script path, pinned to the protected base SHA, instead.
+  assert.match(
+    enforcer,
+    /contents\/scripts\/ci\/check-paperclip-approved\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/,
+    "the enforcer must read the same check file, base-pinned, not from the PR tree",
+  );
 });

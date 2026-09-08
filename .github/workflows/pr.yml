@@ -576,6 +576,10 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      # `read` so the gate step can fetch a bounded tail of a genuinely failed
+      # lane's own job log (same run id) for the ejection reason — the lane
+      # output IS the reason, not the lane's status alone (SUP-15375 round 5).
+      actions: read
       # `write` so the SUP-15375 ejection surface can post/update a PR comment
       # when this required check fails a queue entry. Comment rights on the
       # job's own PR only — no `checks:read`, no admin escalation.
@@ -584,14 +588,6 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      # SUP-15375: the surface step needs the repo script. The gh-readonly-queue
-      # ref is deleted the moment the entry is ejected, so checkout at the TOP of
-      # the job — while the entry is still queued — not after the gate fails.
-      # merge_group-only (pull_request keeps the aggregate checkout-free) and
-      # continue-on-error, so a ref race can never redden a green run.
-      - uses: actions/checkout@v7
-        if: github.event_name == 'merge_group'
-        continue-on-error: true
       - name: Fail if any split verify lane failed
         id: verify_gate
         env:
@@ -617,6 +613,28 @@ jobs:
             echo "verify_serialized_server: $VERIFY_SERIALIZED_SERVER_RESULT"
             echo "canary_dry_run: $CANARY_DRY_RUN_RESULT"
           } > "$MERGE_EJECTION_VERDICT"
+          # SUP-15375 round 5: on a merge_group ejection, append a BOUNDED tail
+          # of each genuinely failed lane's own job log (this run id), so the
+          # artefact carries the underlying failure rather than only the lane
+          # status. Best-effort: a fetch failure leaves the status file and
+          # cannot change the fail-closed verdict. Skipped on pull_request runs
+          # (no ejection surface there; keeps the aggregate cheap).
+          if [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
+            tail_lane() {
+              lane="$1"; display="$2"; result="$3"
+              [ "$result" = "failure" ] || return 0
+              jid="$(gh api --paginate "repos/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}/jobs" \
+                --jq -r --arg n "$display" '.jobs[] | select(.name | startswith($n)) | select(.conclusion == "failure") | .id' 2>/dev/null | head -1 || true)"
+              [ -n "$jid" ] || return 0
+              printf '\n--- %s failing output (bounded tail) ---\n' "$lane" >> "$MERGE_EJECTION_VERDICT"
+              gh api "repos/${GH_REPO}/actions/jobs/${jid}/logs" 2>/dev/null | tail -c 1200 >> "$MERGE_EJECTION_VERDICT" || true
+            }
+            tail_lane typecheck_release_registry "Typecheck + Release Registry" "$TYPECHECK_RELEASE_REGISTRY_RESULT"
+            tail_lane general_tests "General tests" "$GENERAL_TESTS_RESULT"
+            tail_lane build "Build" "$BUILD_RESULT"
+            tail_lane verify_serialized_server "Verify serialized server suites" "$VERIFY_SERIALIZED_SERVER_RESULT"
+            tail_lane canary_dry_run "Canary Dry Run" "$CANARY_DRY_RUN_RESULT"
+          fi
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
@@ -632,22 +650,34 @@ jobs:
       # were skipped/cancelled because the approval precondition collapsed the
       # run first — the paperclip-approved surface owns that story). Best-effort:
       # a post failure never changes the red `verify` conclusion that ejected.
+      #
+      # Round 5 (security): this job's token is `pull-requests: write`, so the
+      # posting implementation is NEVER fetched from the PR-controlled
+      # gh-readonly-queue tree (a queued PR could replace it). It is fetched
+      # from the trusted merge-group BASE SHA via the contents API and executed
+      # from $RUNNER_TEMP — base-pinned, and independent of any checkout/ref
+      # race.
       - name: Surface the merge-queue ejection reason on the PR (verify)
         if: ${{ failure() && github.event_name == 'merge_group' && steps.verify_gate.outcome == 'failure' }}
         env:
           # Same step-level path as the gate step above (`runner.temp` is
           # constant for the job, so both steps agree on the file).
           MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-verify-verdict
+          # The posting implementation is pinned to the protected base commit
+          # this queue entry is built on — never to the entry's own tree.
+          MERGE_EJECTION_BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.sha }}
         run: |
-          if [ ! -f scripts/ci/surface-merge-queue-ejection.sh ]; then
-            echo "[merge-queue-ejection] checkout unavailable (queue ref already removed?) — skipping; enforcement unaffected"
+          if ! grep -q ': failure$' "$MERGE_EJECTION_VERDICT"; then
+            echo "[merge-queue-ejection] verify lanes skipped/cancelled (not failed) — no genuine failure to surface; enforcement unaffected"
             exit 0
           fi
-          if grep -q ': failure$' "$MERGE_EJECTION_VERDICT"; then
-            bash scripts/ci/surface-merge-queue-ejection.sh --check-name verify --verdict "$MERGE_EJECTION_VERDICT"
-          else
-            echo "[merge-queue-ejection] verify lanes skipped/cancelled (not failed) — no genuine failure to surface; enforcement unaffected"
+          surface="${RUNNER_TEMP}/surface-merge-queue-ejection.sh"
+          if ! gh api "repos/${GH_REPO}/contents/scripts/ci/surface-merge-queue-ejection.sh?ref=${MERGE_EJECTION_BASE_SHA}" --jq .content 2>/dev/null | base64 -d >"$surface"; then
+            echo "[merge-queue-ejection] trusted surface not on base ${MERGE_EJECTION_BASE_SHA} yet — skipping (best-effort); enforcement unaffected"
+            exit 0
           fi
+          [ -s "$surface" ] || { echo "[merge-queue-ejection] trusted surface fetch empty — skipping; enforcement unaffected"; exit 0; }
+          bash "$surface" --check-name verify --verdict "$MERGE_EJECTION_VERDICT"
 
   build:
     name: Build
@@ -972,6 +1002,9 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      # `read` so the gate step can fetch a bounded tail of a genuinely failed
+      # e2e shard's own job log (same run id) for the ejection reason.
+      actions: read
       # `write` so the SUP-15375 ejection surface can post/update a PR comment
       # when this required check fails a queue entry. Comment rights on the
       # job's own PR only — no `checks:read`, no admin escalation.
@@ -981,14 +1014,6 @@ jobs:
       GH_REPO: ${{ github.repository }}
 
     steps:
-      # SUP-15375: the surface step needs the repo script. The gh-readonly-queue
-      # ref is deleted the moment the entry is ejected, so checkout at the TOP of
-      # the job — while the entry is still queued — not after the gate fails.
-      # merge_group-only (pull_request keeps the aggregate checkout-free) and
-      # continue-on-error, so a ref race can never redden a green run.
-      - uses: actions/checkout@v7
-        if: github.event_name == 'merge_group'
-        continue-on-error: true
       - name: Fail if any e2e shard failed
         id: e2e_gate
         env:
@@ -1002,23 +1027,42 @@ jobs:
           # the step, so a merge-group ejection has a quoteable reason. The
           # fail-closed assertion below is unchanged.
           echo "e2e_shards: $E2E_SHARDS_RESULT" > "$MERGE_EJECTION_VERDICT"
+          # SUP-15375 round 5: on a merge_group ejection append a BOUNDED tail
+          # of the failed e2e shard's own job log (this run id). Best-effort; a
+          # fetch failure cannot change the fail-closed verdict.
+          if [ "$GITHUB_EVENT_NAME" = "merge_group" ] && [ "$E2E_SHARDS_RESULT" = "failure" ]; then
+            jid="$(gh api --paginate "repos/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}/jobs" \
+              --jq -r '.jobs[] | select(.name | startswith("e2e shard")) | select(.conclusion == "failure") | .id' 2>/dev/null | head -1 || true)"
+            if [ -n "$jid" ]; then
+              printf '\n[e2e_shards] failing shard log (bounded tail):\n' >> "$MERGE_EJECTION_VERDICT"
+              gh api "repos/${GH_REPO}/actions/jobs/${jid}/logs" 2>/dev/null | tail -c 2000 >> "$MERGE_EJECTION_VERDICT" || true
+            fi
+          fi
           test "$E2E_SHARDS_RESULT" = "success"
       # SUP-15375: surface a merge-group ejection caused by the required `e2e`
       # context. See the verify job's surface step for the full rationale —
       # same conditions: explicit `failure()`, merge_group only, genuine
-      # failure only, best-effort post.
+      # failure only, best-effort post. Round 5 (security): the posting
+      # implementation is fetched from the trusted merge-group BASE SHA via the
+      # contents API and executed from $RUNNER_TEMP — never from the entry's own
+      # (PR-controlled) tree, and with no checkout/ref race.
       - name: Surface the merge-queue ejection reason on the PR (e2e)
         if: ${{ failure() && github.event_name == 'merge_group' && steps.e2e_gate.outcome == 'failure' }}
         env:
           # Same step-level path as the gate step above.
           MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-e2e-verdict
+          # The posting implementation is pinned to the protected base commit
+          # this queue entry is built on — never to the entry's own tree.
+          MERGE_EJECTION_BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.sha }}
         run: |
-          if [ ! -f scripts/ci/surface-merge-queue-ejection.sh ]; then
-            echo "[merge-queue-ejection] checkout unavailable (queue ref already removed?) — skipping; enforcement unaffected"
+          if ! grep -q ': failure$' "$MERGE_EJECTION_VERDICT"; then
+            echo "[merge-queue-ejection] e2e_shards skipped/cancelled (not failed) — no genuine failure to surface; enforcement unaffected"
             exit 0
           fi
-          if grep -q ': failure$' "$MERGE_EJECTION_VERDICT"; then
-            bash scripts/ci/surface-merge-queue-ejection.sh --check-name e2e --verdict "$MERGE_EJECTION_VERDICT"
-          else
-            echo "[merge-queue-ejection] e2e_shards skipped/cancelled (not failed) — no genuine failure to surface; enforcement unaffected"
+          surface="${RUNNER_TEMP}/surface-merge-queue-ejection.sh"
+          if ! gh api "repos/${GH_REPO}/contents/scripts/ci/surface-merge-queue-ejection.sh?ref=${MERGE_EJECTION_BASE_SHA}" --jq .content 2>/dev/null | base64 -d >"$surface"; then
+            echo "[merge-queue-ejection] trusted surface not on base ${MERGE_EJECTION_BASE_SHA} yet — skipping (best-effort); enforcement unaffected"
+            exit 0
           fi
+          [ -s "$surface" ] || { echo "[merge-queue-ejection] trusted surface fetch empty — skipping; enforcement unaffected"; exit 0; }
+          bash "$surface" --check-name e2e --verdict "$MERGE_EJECTION_VERDICT"
