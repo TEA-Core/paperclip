@@ -583,9 +583,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      # The gate step tees each lane's result here so the surface step can
-      # quote the failing lane(s) verbatim as the ejection reason.
-      MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-verify-verdict
     steps:
       # SUP-15375: the surface step needs the repo script. The gh-readonly-queue
       # ref is deleted the moment the entry is ejected, so checkout at the TOP of
@@ -603,6 +600,11 @@ jobs:
           BUILD_RESULT: ${{ needs.build.result }}
           VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
           CANARY_DRY_RUN_RESULT: ${{ needs.canary_dry_run.result }}
+          # The gate step tees each lane's result here so the surface step can
+          # quote the failing lane(s) verbatim as the ejection reason. Step-level
+          # env (NOT job-level): `runner.temp` is only available in the runner
+          # context.
+          MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-verify-verdict
         run: |
           # SUP-15375: capture which lanes ended how BEFORE the assertions below
           # fail the step, so a merge-group ejection has a quoteable reason.
@@ -632,6 +634,10 @@ jobs:
       # a post failure never changes the red `verify` conclusion that ejected.
       - name: Surface the merge-queue ejection reason on the PR (verify)
         if: ${{ failure() && github.event_name == 'merge_group' && steps.verify_gate.outcome == 'failure' }}
+        env:
+          # Same step-level path as the gate step above (`runner.temp` is
+          # constant for the job, so both steps agree on the file).
+          MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-verify-verdict
         run: |
           if [ ! -f scripts/ci/surface-merge-queue-ejection.sh ]; then
             echo "[merge-queue-ejection] checkout unavailable (queue ref already removed?) — skipping; enforcement unaffected"
@@ -973,7 +979,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-e2e-verdict
 
     steps:
       # SUP-15375: the surface step needs the repo script. The gh-readonly-queue
@@ -988,6 +993,10 @@ jobs:
         id: e2e_gate
         env:
           E2E_SHARDS_RESULT: ${{ needs.e2e_shards.result }}
+          # Step-level env (NOT job-level): `runner.temp` is only available in
+          # the runner context. `runner.temp` is constant for the job, so the
+          # surface step below reads the same file.
+          MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-e2e-verdict
         run: |
           # SUP-15375: capture the aggregate result BEFORE the assertion fails
           # the step, so a merge-group ejection has a quoteable reason. The
@@ -1000,6 +1009,9 @@ jobs:
       # failure only, best-effort post.
       - name: Surface the merge-queue ejection reason on the PR (e2e)
         if: ${{ failure() && github.event_name == 'merge_group' && steps.e2e_gate.outcome == 'failure' }}
+        env:
+          # Same step-level path as the gate step above.
+          MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-e2e-verdict
         run: |
           if [ ! -f scripts/ci/surface-merge-queue-ejection.sh ]; then
             echo "[merge-queue-ejection] checkout unavailable (queue ref already removed?) — skipping; enforcement unaffected"

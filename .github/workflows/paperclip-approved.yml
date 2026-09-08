@@ -52,11 +52,10 @@ jobs:
       # `gh api` needs a token in the workflow environment — GITHUB_TOKEN is
       # not guaranteed on every runner class; without it every API call fails
       # and the merge_group leg would fail-closed on its own plumbing.
+      # `github` context IS valid in a job-level env, but `runner.temp` is not
+      # (the runner context is step-level only) — so the verdict file path is
+      # declared on the two steps that use it below.
       GH_TOKEN: ${{ github.token }}
-      # The gate step tees the enforcer's verdict here so the ejection-surface
-      # step can quote its reason verbatim. `runner.temp` is shared across the
-      # job's steps.
-      MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-approved-verdict
     steps:
       - name: Event note
         run: |
@@ -70,6 +69,10 @@ jobs:
         id: gate
         env:
           GH_REPO: ${{ github.repository }}
+          # The gate step tees the enforcer's verdict here so the ejection-surface
+          # step can quote its reason verbatim. Step-level env (NOT job-level):
+          # `runner.temp` is only available in the runner context.
+          MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-approved-verdict
         run: |
           # Capture the enforcer's verdict so the ejection step can quote its
           # reason verbatim; the job still exits with the enforcer's rc, so the
@@ -103,5 +106,8 @@ jobs:
         if: ${{ failure() && github.event_name == 'merge_group' && steps.gate.outcome == 'failure' }}
         env:
           GH_REPO: ${{ github.repository }}
+          # Same step-level path as the gate step above (`runner.temp` is
+          # constant for the job, so both steps agree on the file).
+          MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-approved-verdict
         run: |
           bash scripts/ci/surface-merge-queue-ejection.sh --check-name paperclip-approved-enforcer --verdict "$MERGE_EJECTION_VERDICT"

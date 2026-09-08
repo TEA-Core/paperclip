@@ -344,6 +344,29 @@ test("the enforcer job grants pull-requests write and captures the verdict", () 
   assert.match(block, /MERGE_EJECTION_VERDICT: \$\{\{ runner\.temp \}\}\/paperclip-approved-verdict/);
 });
 
+test("the runner.temp verdict path is declared at step level, never job-level env", () => {
+  // `runner` is a step-only context in GitHub Actions: `${{ runner.temp }}` in a
+  // job-level `env:` block makes the whole workflow fail validation before any
+  // job starts (actionlint: workflow-job-env-runner-context-invalid). The path
+  // must be declared on the step(s) that use it — env keys on a step are
+  // indented 10 spaces (job-level env keys are 6).
+  for (const file of [workflow, prWorkflow]) {
+    const text = readFileSync(file, "utf8");
+    for (const line of text.split("\n")) {
+      if (/MERGE_EJECTION_VERDICT: \$\{\{ runner\.temp \}\}/.test(line)) {
+        assert.match(
+          line,
+          /^ {10}MERGE_EJECTION_VERDICT/,
+          `runner.temp env must be step-level (10-space indent): ${line}`,
+        );
+      }
+    }
+    // Every runner.temp path lives under a step, and no job-level env key
+    // references the runner context.
+    assert.doesNotMatch(text, /^ {6}MERGE_EJECTION_VERDICT/m, "job-level env must not reference runner.temp");
+  }
+});
+
 test("the gate step still runs the enforcer and exits with its rc", () => {
   const text = readFileSync(workflow, "utf8");
   assert.match(text, /bash scripts\/ci\/check-paperclip-approved\.sh merge_group >"\$MERGE_EJECTION_VERDICT" 2>&1/);
@@ -434,10 +457,10 @@ test("pr.yml surface steps only post on a genuine failure, not skipped/cancelled
   );
   assert.match(
     text,
-    /Surface the merge-queue ejection reason on the PR \(verify\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.verify_gate\.outcome == 'failure' \}\}\n {8}run: \|\n(?: {10}.*\n)*? {10}if grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
+    /Surface the merge-queue ejection reason on the PR \(verify\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.verify_gate\.outcome == 'failure' \}\}\n(?: {8}env:\n(?: {10}.*\n)*?)? {8}run: \|\n(?: {10}.*\n)*? {10}if grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
   );
   assert.match(
     text,
-    /Surface the merge-queue ejection reason on the PR \(e2e\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.e2e_gate\.outcome == 'failure' \}\}\n {8}run: \|\n(?: {10}.*\n)*? {10}if grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
+    /Surface the merge-queue ejection reason on the PR \(e2e\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.e2e_gate\.outcome == 'failure' \}\}\n(?: {8}env:\n(?: {10}.*\n)*?)? {8}run: \|\n(?: {10}.*\n)*? {10}if grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
   );
 });
