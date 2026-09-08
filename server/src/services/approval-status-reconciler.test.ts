@@ -1083,6 +1083,110 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(postStatusCalls()).toHaveLength(0);
     });
 
+    it("re-publishes when the live diff-vs-base shrank to a byte-identical subset of the approved one (SUP-15391)", async () => {
+      // TSP PR #3462: main advanced past the branch's stale merge-base and
+      // absorbed most of the approved files. The live head is a strict subset
+      // of what was approved, every survivor byte-identical -- zero added, zero
+      // changed -- so it carries no unreviewed content and Guard A must let the
+      // stamp move forward. The old symmetric set-difference counted each
+      // absorbed file as `(removed)` and refused, stranding the PR with no
+      // in-band recovery because its card was already `completed`.
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        {
+          url: APPROVED_DIFF_URL,
+          body: {
+            status: "diverged",
+            ahead_by: 13,
+            behind_by: 10,
+            files: [
+              { filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000001", status: "modified" },
+              { filename: "server/src/absorbed-a.ts", sha: "blob0000000000000000000000000000000000000002", status: "modified" },
+              { filename: "server/src/absorbed-b.ts", sha: "blob0000000000000000000000000000000000000003", status: "modified" },
+            ],
+          },
+        },
+        {
+          url: LIVE_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 1,
+            files: [
+              // Same blob SHA as the approved side: byte-identical survivor.
+              { filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000001", status: "modified" },
+            ],
+          },
+        },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+        { url: COMMENT_LIST_URL, body: [] },
+        { url: COMMENT_POST_URL, body: { id: 9001 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["guard-a:changed-blob"]).toBeUndefined();
+      // A shrink is not a void: no advisory comment is posted on the PR.
+      expect(summary.voidWarnings ?? 0).toBe(0);
+      expect(postStatusCalls()).toHaveLength(1);
+    });
+
+    it("still refuses when the live diff-vs-base added a file the approval never saw (SUP-15391 guard preserved)", async () => {
+      // The narrowing must not open the gate: a file present live and absent
+      // from the approval is unreviewed content and still voids the stamp.
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: { publishedHeadSha: APPROVED_HEAD, publishedAt: APPROVED_AT },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        {
+          url: APPROVED_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 1,
+            files: [
+              { filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000001", status: "modified" },
+            ],
+          },
+        },
+        {
+          url: LIVE_DIFF_URL,
+          body: {
+            status: "ahead",
+            ahead_by: 2,
+            files: [
+              { filename: "server/src/config.ts", sha: "blob0000000000000000000000000000000000000001", status: "modified" },
+              { filename: "server/src/smuggled.ts", sha: "blob0000000000000000000000000000000000000009", status: "added" },
+            ],
+          },
+        },
+        { url: COMMENT_LIST_URL, body: [] },
+        { url: COMMENT_POST_URL, body: { id: 9001 } },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["guard-a:changed-blob"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+
     it("warns on the PR when a new head voids the published approval (SUP-14049, #349 repro)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
