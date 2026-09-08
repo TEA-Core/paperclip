@@ -1,0 +1,62 @@
+name: Merge-Queue Ejection Surface
+
+# SUP-15375 (rounds 7-9, merge-group-comment-token-executes-pr-code): this is
+# the ONLY workflow that may hold a write-capable token around the merge queue.
+# A `merge_group`-triggered workflow is loaded from the `gh-readonly-queue`
+# ref — a tree the queued PR controls — so any inline `run:` code in pr.yml or
+# paperclip-approved.yml executes PR-controlled code. Those workflows therefore
+# carry NO write token and NO posting code (they stay the fail-closed,
+# read-only gates on the fold). Posting lives HERE instead:
+#
+#   `workflow_run` fires when the required merge-group check workflows ("PR",
+#   "Paperclip Approval Enforcer") complete, and GitHub loads THIS file from
+#   the protected default branch — a queued PR cannot modify it. The write
+#   token therefore only ever runs code a pull request cannot edit. The reactor
+#   reacts to a FAILED merge_group run (the ejection cause), reads that run's
+#   own jobs/logs via the read-only actions API (never its tree — no pwn
+#   request), and posts/updates a PR comment naming the failing check and the
+#   reason. Enforcement is untouched: merge_group stays fail-closed in the two
+#   gating workflows, and this surface is off the enforcement path.
+on:
+  workflow_run:
+    workflows:
+      - PR
+      - Paperclip Approval Enforcer
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: merge-queue-ejection-surface-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  surface:
+    name: Surface a merge-group ejection on the PR
+    # The named workflows complete on every push / pull_request / merge_group;
+    # only a FAILED merge_group run can eject a queue entry. Everything else is
+    # skipped here (a skipped job costs no runner). The payload is re-verified
+    # from the API inside the runner script.
+    if: ${{ github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.event == 'merge_group' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # Checkout resolves to this run's GITHUB_REF — the protected default
+      # branch (workflow_run runs there) — so every executed byte is trusted
+      # fold content, never the triggering run's PR-controlled tree.
+      - name: Check out the trusted default branch
+        uses: actions/checkout@v7
+      - name: Run the trusted merge-queue ejection surface
+        env:
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          bash scripts/ci/surface-merge-queue-ejection-react.sh

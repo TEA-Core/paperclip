@@ -44,27 +44,12 @@ jobs:
     permissions:
       contents: read
       statuses: read
-      # `write` (not `read`) so the ejection-surface step can post/update the
-      # merge-queue ejection comment on a merge_group failure. It grants comment
-      # rights on this job's own PR only — no `checks:read`, no admin
-      # escalation. SECURITY (SUP-15375 round 5): because this job carries a
-      # write-capable token, it never executes code from the entry's own
-      # (PR-controlled) tree. Both control scripts are fetched from the pinned
-      # protected BASE SHA via the contents API below.
-      pull-requests: write
+      pull-requests: read
     env:
       # `gh api` needs a token in the workflow environment — GITHUB_TOKEN is
       # not guaranteed on every runner class; without it every API call fails
       # and the merge_group leg would fail-closed on its own plumbing.
-      # `github` context IS valid in a job-level env, but `runner.temp` is not
-      # (the runner context is step-level only) — so the verdict file path is
-      # declared on the steps that use it below.
       GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      # The BASE commit the entry is built on (protected fold): the gate and the
-      # ejection surface are CONTROL code and are always read from here, never
-      # from the queued PR's tree.
-      MERGE_EJECTION_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}
     steps:
       - name: Event note
         run: |
@@ -73,89 +58,13 @@ jobs:
             merge_group)  echo "paperclip-approved: merge_group — enforcing the approval gate" ;;
             *)            echo "paperclip-approved: '${{ github.event_name }}' — no-op, reporting success" ;;
           esac
-      - name: Fetch the trusted enforcer script from the base commit
-        env:
-          # `runner.temp` is only valid at step level; the file is shared with
-          # the gate step below via the same path.
-          ENFORCER_SCRIPT: ${{ runner.temp }}/check-paperclip-approved.sh
-        run: |
-          # Round 5 (security): the enforcer gate previously ran
-          # `scripts/ci/check-paperclip-approved.sh` from the default checkout —
-          # on merge_group that is the gh-readonly-queue ref, i.e. code the
-          # queued PR controls. With a write-capable token that lets a queued
-          # PR execute arbitrary code (merge-group-comment-token-executes-pr-code).
-          # Fetch the reviewed fold copy from the pinned base SHA instead.
-          if ! gh api "repos/${GH_REPO}/contents/scripts/ci/check-paperclip-approved.sh?ref=${MERGE_EJECTION_BASE_SHA}" \
-              --jq .content 2>/dev/null | base64 -d >"$ENFORCER_SCRIPT" || [ ! -s "$ENFORCER_SCRIPT" ]; then
-            echo "paperclip-approved: could not fetch the trusted enforcer script from base ${MERGE_EJECTION_BASE_SHA}" >&2
-            # Fail closed: without the reviewed gate script the merge_group leg
-            # must not report green.
-            exit 1
-          fi
+      - uses: actions/checkout@v7
       - name: Check the paperclip/approved status
-        id: gate
         env:
-          # The gate step tees the enforcer's verdict here so the ejection-surface
-          # step can quote its reason verbatim. Step-level env (NOT job-level):
-          # `runner.temp` is only available in the runner context.
-          MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-approved-verdict
-          ENFORCER_SCRIPT: ${{ runner.temp }}/check-paperclip-approved.sh
+          GH_REPO: ${{ github.repository }}
         run: |
-          # Capture the enforcer's verdict so the ejection step can quote its
-          # reason verbatim; the job still exits with the enforcer's rc, so the
-          # fail-closed merge_group semantics are unchanged.
-          set +e
           case "${{ github.event_name }}" in
-            pull_request) bash "$ENFORCER_SCRIPT" pull_request "${{ github.event.pull_request.number }}" >"$MERGE_EJECTION_VERDICT" 2>&1 ;;
-            merge_group)  bash "$ENFORCER_SCRIPT" merge_group >"$MERGE_EJECTION_VERDICT" 2>&1 ;;
-            *)            bash "$ENFORCER_SCRIPT" push >"$MERGE_EJECTION_VERDICT" 2>&1 ;;
+            pull_request) bash scripts/ci/check-paperclip-approved.sh pull_request "${{ github.event.pull_request.number }}" ;;
+            merge_group)  bash scripts/ci/check-paperclip-approved.sh merge_group ;;
+            *)            bash scripts/ci/check-paperclip-approved.sh push ;;
           esac
-          rc=$?
-          set -e
-          cat "$MERGE_EJECTION_VERDICT"
-          [ "$rc" -eq 0 ] || exit "$rc"
-      # SUP-15375: when the gate above fails, the merge queue ejects this entry
-      # and the PR head reads identical to a never-queued PR (no comment, no
-      # failing check on the head; the merge_group run is on the
-      # gh-readonly-queue/… ref agents do not think to query). Surface the
-      # reason on the PR so a standard agent token can see it. This runs only
-      # when the gate step already failed — it cannot turn a green entry red,
-      # and it is best-effort, so a post failure never changes the check
-      # conclusion that blocks the merge.
-      #
-      # The `if` MUST name an explicit status-check function: without one GitHub
-      # implicitly prepends `success()`, which is false exactly when the gate
-      # step fails — the step would be skipped on the very path it exists for.
-      # `failure()` disables that implicit success(), and the `steps.gate.outcome
-      # == 'failure'` term keeps it specific to the gate (not a fetch/event step
-      # failing earlier).
-      #
-      # Round 5 (security): the posting implementation is fetched from the
-      # pinned protected BASE SHA via the contents API (never from the entry's
-      # own tree), executed from $RUNNER_TEMP, and independent of any checkout
-      # or ref race. Round 7 (security, merge-group-comment-token-executes-pr-code):
-      # there is NO inline fallback poster. Inline shell in this workflow file is
-      # itself code a queued PR can rewrite (a merge_group event runs the file
-      # from the queue ref, which carries the PR's changes), so any inline body
-      # that POST/PATCHes with this job's write-capable GH_TOKEN would let a
-      # queued PR post or update arbitrary repository comments. The ENTIRE
-      # posting implementation therefore lives in the base-pinned helper below;
-      # the step only fetches it and runs it. If the helper is not on the base
-      # (pre-rollout) the step fails loudly — it never executes an untrusted
-      # inline fallback and never pretends the artefact was produced.
-      - name: Surface the merge-queue ejection reason on the PR
-        if: ${{ failure() && github.event_name == 'merge_group' && steps.gate.outcome == 'failure' }}
-        env:
-          # Same step-level path as the gate step above (`runner.temp` is
-          # constant for the job, so both steps agree on the file).
-          MERGE_EJECTION_VERDICT: ${{ runner.temp }}/paperclip-approved-verdict
-          MERGE_EJECTION_CHECK_NAME: paperclip-approved-enforcer
-        run: |
-          surface="${RUNNER_TEMP}/surface-merge-queue-ejection.sh"
-          if gh api "repos/${GH_REPO}/contents/scripts/ci/surface-merge-queue-ejection.sh?ref=${MERGE_EJECTION_BASE_SHA}" \
-              --jq .content 2>/dev/null | base64 -d >"$surface" 2>/dev/null && [ -s "$surface" ]; then
-            bash "$surface" --check-name "$MERGE_EJECTION_CHECK_NAME" --verdict "$MERGE_EJECTION_VERDICT"
-            exit $?
-          fi
-          echo "::error::[merge-queue-ejection] cannot surface the ejection on PR: the trusted posting helper scripts/ci/surface-merge-queue-ejection.sh is not available on the protected base ${MERGE_EJECTION_BASE_SHA} (it lands on the base when the SUP-15375 rollout merges). Failing loudly — no untrusted inline fallback runs with the write-capable token, and no artefact is claimed. Enforcement is unaffected (the gate step above already failed)."
-          exit 1

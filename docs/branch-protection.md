@@ -109,16 +109,19 @@ the platform token). The compound case — `paperclip-approved-enforcer` reading
 **green on the head** (advisory on `pull_request`) while the entry is not
 approved — reads as "all checks green, mysteriously evicted."
 
-When a required `merge_group` check fails a queue entry, the workflow that owns
-that check runs a best-effort surface step that posts/updates a PR comment
-(`scripts/ci/surface-merge-queue-ejection.sh`). One call site per required
-check, each passing its own `--check-name`:
+When a required `merge_group` check fails a queue entry, a **trusted observer
+workflow** — `paperclip-ejection-surface.yml`, triggered by `workflow_run` on
+completion of the `PR` and `Paperclip Approval Enforcer` workflows — reacts to
+the failed `merge_group` run and posts/updates a PR comment
+(`scripts/ci/surface-merge-queue-ejection-react.sh`, which delegates the
+post/update to `scripts/ci/surface-merge-queue-ejection.sh`). The artefact
+names the failing required check and quotes the reason (a bounded tail of the
+genuinely failed job's own log, read through the read-only actions API):
 
-- `paperclip-approved-enforcer` — in `paperclip-approved.yml`, when the gate
-  step fails.
-- `verify` and `e2e` — in `pr.yml`'s aggregate jobs, when a lane genuinely
-  ends `failure` (skipped/cancelled lanes mean an earlier gate collapsed the
-  run — the approval surface owns that story, so no comment is posted).
+- a failed `Paperclip Approval Enforcer` run names
+  `paperclip-approved-enforcer`;
+- a failed `PR` run names the failing required context, preferring the root
+  cause: `Approval precondition` (approval absent) → `verify` → `e2e`.
 
 Each artefact:
 
@@ -126,43 +129,42 @@ Each artefact:
   re-queueing updates the right check's existing comment in place (PATCH)
   rather than stacking a new one, and a comment for one failing check is never
   clobbered by another's.
-- **Names the failing check** (the `--check-name`) and **quotes the reason
-  verbatim** (the failing step tees its captured output / lane results —
-  including a bounded tail of the genuinely-failed lane's own job log for
-  `verify`/`e2e` — to `runner.temp`, passed via `--verdict`).
+- **Names the failing check** and **quotes the reason** (a bounded tail of the
+  genuinely-failed job's own log).
 - **Reachable with the standard platform agent token** — it reads/writes PR
-  comments via `gh api …/issues/{n}/comments` under the job's
-  `pull-requests: write` grant (bumped from `read`); no `checks:read`/admin.
-- **Not on the enforcement path.** Each gate step still fails closed
-  (`merge_group` conclusions are unchanged); the surface step runs only when
-  that gate step already failed (explicit `failure()`, event == `merge_group`),
-  cannot turn a green entry red, and exits 0 on any post failure.
+  comments via `gh api …/issues/{n}/comments`; no `checks:read`/admin.
+- **Not on the enforcement path.** The gating workflows are unchanged: each
+  required `merge_group` check still fails closed exactly as before, and this
+  surface runs only after a run has already failed.
 
-**Security boundary (merge-group-comment-token-executes-pr-code).** The jobs
-that post the artefact hold `pull-requests: write`, and on a `merge_group`
-event the workflow file and the default checkout both come from the
-`gh-readonly-queue` ref — whose tree the queued PR controls (it can rewrite
-`.github/workflows/*` itself). The workflows therefore NEVER carry an inline
-posting implementation, and never execute `scripts/ci/*` from that tree. The
-entire posting implementation is `scripts/ci/surface-merge-queue-ejection.sh`,
-fetched from the **pinned protected BASE SHA** (the commit the entry is built
-on) via the contents API into `$RUNNER_TEMP` and executed there — a queued PR
-can neither replace the fetched bytes nor add inline code that runs under the
-write token. This also removes the surface's dependence on a checkout that the
-queue may delete mid-ejection.
+**Security boundary (merge-group-comment-token-executes-pr-code).** A
+`merge_group`-triggered workflow is loaded from the `gh-readonly-queue` ref —
+a tree the queued PR controls (it can rewrite `.github/workflows/*` itself) —
+so ANY inline `run:` code in a `merge_group` job, and any token granted to it,
+executes code a queued PR can edit. Rounds 5-8 tried to make the posting safe
+inside those files (base-pinned fetch-and-run, then removing the inline
+fallback) — but the invoking wrapper itself was still PR-controlled, so the
+finding recurred. The write-capable token is therefore **never granted to
+`pr.yml` or `paperclip-approved.yml` at all** (they are read-only gates), and
+the posting implementation lives exclusively in `paperclip-ejection-surface.yml`
++ `scripts/ci/surface-merge-queue-ejection{-react,}.sh`:
 
-**First-rollout sequencing (merge-group-surface-checkout-failure-no-artifact).**
-Because the posting helper is read from the protected base, it must be ON the
-base before the surface is relied on: the helper lands on the fold when this
-rollout PR merges. Between this PR opening and that merge, a red `merge_group`
-on a queue entry cannot be commented (the base does not yet carry the helper).
-The surface step must not silently skip that case — it logs an `::error::` and
-fails, so the missing artefact is visible in the run rather than claimed
-absent; it never falls back to inline shell, because that would execute
-PR-controlled code with the write token. Once this PR merges, every subsequent
-ejected entry is surfaced in place. If a zero-window rollout is ever required,
-land `scripts/ci/surface-merge-queue-ejection.sh` (and its unit tests) on the
-fold in its own inert PR first, then wire the surface steps.
+- `workflow_run` reactors are loaded by GitHub from the **protected default
+  branch**, which a queued PR cannot modify — the executed code is trusted fold
+  content, not the triggering run's tree. This is GitHub's documented pattern
+  for "an unprivileged run, then a privileged reaction".
+- The reactor never checks out or executes anything from the triggering run
+  (pwn-request guard): it consumes only GitHub's event metadata (re-verified
+  via the API) and the run's jobs/logs through the read-only actions API. A
+  queued PR can at most make its own run fail; the artefact it can influence is
+  a truthful statement about that run on its own PR thread.
+
+**Rollout.** The reactor workflow and both scripts land on the fold in this one
+merge; there is no pre-rollout window where PR-controlled files carry a
+write-capable fallback, because they never do. The reactor itself cannot fire
+until it is on the protected default branch (the `workflow_run` trigger only
+honours default-branch files), so the first real ejection after this PR merges
+is also the first live exercise of the wiring.
 
 ### ADR-091 D1 delivery-identity evidence order (SUP-14824)
 

@@ -334,258 +334,91 @@ test("skips (exit 0) when the comment list call fails — enforcement is unaffec
 });
 
 // ---------------------------------------------------------------------------
-// Wiring: the workflow posts on merge_group failure and keeps enforcement
+// Wiring (SUP-15375 round 9): the write token must NEVER run PR-controlled code
 // ---------------------------------------------------------------------------
+// A merge_group run loads the workflow file from the gh-readonly-queue ref — a
+// tree the queued PR controls. Any write-capable token granted to a job inside
+// pr.yml / paperclip-approved.yml therefore executes code a queued PR can
+// rewrite (merge-group-comment-token-executes-pr-code, rounds 7-9). Those
+// gating workflows must carry NO write permission and NO posting code. The
+// write-capable posting lives exclusively in the `workflow_run` reactor
+// (paperclip-ejection-surface.yml), which GitHub loads from the protected
+// default branch a queued PR cannot modify.
+const reactorWorkflow = path.join(repoRoot, ".github/workflows/paperclip-ejection-surface.yml");
 
-test("the enforcer job grants pull-requests write and captures the verdict", () => {
-  const text = readFileSync(workflow, "utf8");
-  const block = text.match(/\n {2}paperclip-approved-enforcer:((?: {4}.*\n|\n)*?)(?=\n {2}[A-Za-z_]|$)/)[1];
-  assert.match(block, /^ {6}pull-requests: write$/m);
-  assert.match(block, /MERGE_EJECTION_VERDICT: \$\{\{ runner\.temp \}\}\/paperclip-approved-verdict/);
-});
-
-test("the runner.temp verdict path is declared at step level, never job-level env", () => {
-  // `runner` is a step-only context in GitHub Actions: `${{ runner.temp }}` in a
-  // job-level `env:` block makes the whole workflow fail validation before any
-  // job starts (actionlint: workflow-job-env-runner-context-invalid). The path
-  // must be declared on the step(s) that use it — env keys on a step are
-  // indented 10 spaces (job-level env keys are 6).
+test("the gating workflows grant no write-capable permission to any job", () => {
   for (const file of [workflow, prWorkflow]) {
     const text = readFileSync(file, "utf8");
-    for (const line of text.split("\n")) {
-      if (/MERGE_EJECTION_VERDICT: \$\{\{ runner\.temp \}\}/.test(line)) {
-        assert.match(
-          line,
-          /^ {10}MERGE_EJECTION_VERDICT/,
-          `runner.temp env must be step-level (10-space indent): ${line}`,
-        );
-      }
-    }
-    // Every runner.temp path lives under a step, and no job-level env key
-    // references the runner context.
-    assert.doesNotMatch(text, /^ {6}MERGE_EJECTION_VERDICT/m, "job-level env must not reference runner.temp");
+    assert.doesNotMatch(text, /pull-requests: write/, `${file} must not grant pull-requests: write`);
+    assert.doesNotMatch(text, /statuses: write/, `${file} must not grant statuses: write`);
+    assert.doesNotMatch(text, /checks: write/, `${file} must not grant checks: write`);
   }
 });
 
-test("control code is never executed from a PR-controlled checkout", () => {
-  // SUP-15375 round 5 (security, merge-group-comment-token-executes-pr-code):
-  // the jobs that hold `pull-requests: write` must not run repo scripts from
-  // the entry's own (gh-readonly-queue / PR-controlled) tree. The enforcer
-  // workflow must have NO checkout at all; the gate and surface scripts are
-  // fetched from the pinned protected base SHA via the contents API instead.
-  const enforcer = readFileSync(workflow, "utf8");
-  const enforcerJob = enforcer.match(/\n {2}paperclip-approved-enforcer:((?: {4}.*\n|\n)*?)(?=\n {2}[A-Za-z_]|$)/)[1];
-  assert.doesNotMatch(enforcerJob, /actions\/checkout/, "the write-token job must not checkout the PR-controlled tree");
-  assert.doesNotMatch(enforcerJob, /bash scripts\/ci\//, "repo scripts must not run from the checkout");
-  // The gate (enforcer) and the surface are fetched from the base SHA.
-  assert.match(enforcerJob, /MERGE_EJECTION_BASE_SHA:/, "the trusted base SHA is pinned for the control code");
-  assert.match(
-    enforcerJob,
-    /contents\/scripts\/ci\/check-paperclip-approved\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/,
-    "the enforcer gate script is fetched from the base SHA",
-  );
-  assert.match(
-    enforcerJob,
-    /contents\/scripts\/ci\/surface-merge-queue-ejection\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/,
-    "the surface script is fetched from the base SHA",
-  );
-  // Same for pr.yml's write-token aggregate jobs: no checkout in verify/e2e.
-  const pr = readFileSync(prWorkflow, "utf8");
-  for (const jobName of ["verify", "e2e"]) {
-    const job = pr.match(new RegExp(`\\n {2}${jobName}:\\n((?: {4}.*\\n|\\n)*?)(?=\\n {2}(?:build|[a-z_]+):|\\s*$)`))[1];
-    assert.doesNotMatch(job, /actions\/checkout/, `${jobName} aggregate must not checkout the PR-controlled tree`);
-    assert.match(job, /MERGE_EJECTION_BASE_SHA:/, `${jobName} pins the trusted base SHA`);
-    assert.match(
-      job,
-      /contents\/scripts\/ci\/surface-merge-queue-ejection\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/,
-      `${jobName} fetches the surface from the base SHA`,
-    );
-  }
-});
-
-test("no surface step may carry an inline write-token fallback poster", () => {
-  // SUP-15375 round 7 (merge-group-comment-token-executes-pr-code): a
-  // merge_group run executes this workflow file from the queue ref, whose tree
-  // a queued PR controls — including any rewrite of `.github/workflows/*`. An
-  // inline shell block that POST/PATCHes a comment with the job's write-capable
-  // GH_TOKEN is therefore code a queued PR can repurpose to post or update
-  // arbitrary repository comments. The ENTIRE posting implementation must live
-  // in the base-pinned helper; each workflow step may only fetch that helper
-  // and run it. The round-6 inline find-or-upsert is the round-7 defect.
-  const surfaces = [
-    { file: workflow, stepName: "- name: Surface the merge-queue ejection reason on the PR", checkName: "paperclip-approved-enforcer" },
-    { file: prWorkflow, stepName: "- name: Surface the merge-queue ejection reason on the PR (verify)", checkName: "verify" },
-    { file: prWorkflow, stepName: "- name: Surface the merge-queue ejection reason on the PR (e2e)", checkName: "e2e" },
-  ];
-  for (const { file, stepName, checkName } of surfaces) {
+test("the gating workflows carry no merge-group ejection posting code at all", () => {
+  for (const file of [workflow, prWorkflow]) {
     const text = readFileSync(file, "utf8");
-    const idx = text.indexOf(stepName);
-    assert.ok(idx >= 0, `surface step must exist (${checkName})`);
-    const rest = text.slice(idx);
-    const next = rest.match(/\n      - (?:name|uses): /);
-    const block = next ? rest.slice(0, next.index) : rest;
-    // The step fetches the base-pinned helper and runs it — nothing else.
-    assert.match(
-      block,
-      /contents\/scripts\/ci\/surface-merge-queue-ejection\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/,
-      `must fetch the base-pinned helper (${checkName})`,
-    );
-    assert.match(block, /bash "\$surface"/, `must run the fetched helper, not inline logic (${checkName})`);
-    // Round-6 inline find-or-upsert is gone: no inline poster announcement, no
-    // inline issue-comment write, no inline comment-body POST/PATCH.
-    assert.doesNotMatch(block, /inline fallback poster/, `no inline fallback poster (${checkName})`);
-    assert.doesNotMatch(block, /issues\/\$\{pr\}\/comments/, `no inline issue-comment write (${checkName})`);
-    assert.doesNotMatch(block, /gh api -X POST/, `no inline POST (${checkName})`);
-    assert.doesNotMatch(block, /gh api -X PATCH/, `no inline PATCH (${checkName})`);
-  }
-  // Whole-job scan: the write-token jobs (enforcer/verify/e2e) must not carry
-  // any inline comment-posting shell at all — the helper performs the write at
-  // runtime from base-pinned bytes, so the verb never appears in the workflow.
-  for (const { file, jobName } of [
-    { file: workflow, jobName: "paperclip-approved-enforcer" },
-    { file: prWorkflow, jobName: "verify" },
-    { file: prWorkflow, jobName: "e2e" },
-  ]) {
-    const text = readFileSync(file, "utf8");
-    const m = text.match(new RegExp(`\\n {2}${jobName}:((?: {4}.*\\n|\\n)*?)(?=\\n {2}[A-Za-z_]|$)`));
-    const job = m ? m[1] : "";
-    assert.ok(job.length > 0, `write-token job must exist (${jobName})`);
-    assert.doesNotMatch(job, /gh api -X POST/, `${jobName} must not POST inline`);
-    assert.doesNotMatch(job, /gh api -X PATCH/, `${jobName} must not PATCH inline`);
+    assert.doesNotMatch(text, /surface-merge-queue-ejection/, `${file} must not reference the surface helper`);
+    assert.doesNotMatch(text, /MERGE_EJECTION/, `${file} must not carry ejection-surface plumbing`);
+    assert.doesNotMatch(text, /paperclip:merge-queue-ejection/, `${file} must not post the ejection marker inline`);
+    assert.doesNotMatch(text, /gh api -X POST/, `${file} must not POST inline`);
+    assert.doesNotMatch(text, /gh api -X PATCH/, `${file} must not PATCH inline`);
+    assert.doesNotMatch(text, /issues\/\$\{pr\}\/comments/, `${file} must not write comments inline`);
   }
 });
 
-test("a surface step whose base-fetched helper is unavailable fails loudly (never an inline fallback, never a silent skip)", () => {
-  // SUP-15375 round 7: the trusted posting helper reaches the protected base
-  // only when the rollout PR merges, so a pre-merge ejection finds no helper to
-  // fetch. That path must neither exit 0 silently (round-6 defect: the required
-  // artefact vanishes with no trace) nor run inline shell (round-7 defect): it
-  // emits an ::error:: annotation and fails the step, making the missing
-  // artefact visible in the run. Enforcement is unaffected — the gate step the
-  // surface gates on has already failed.
-  const surfaces = [
-    { file: workflow, stepName: "- name: Surface the merge-queue ejection reason on the PR", checkName: "paperclip-approved-enforcer" },
-    { file: prWorkflow, stepName: "- name: Surface the merge-queue ejection reason on the PR (verify)", checkName: "verify" },
-    { file: prWorkflow, stepName: "- name: Surface the merge-queue ejection reason on the PR (e2e)", checkName: "e2e" },
-  ];
-  for (const { file, stepName, checkName } of surfaces) {
-    const text = readFileSync(file, "utf8");
-    const idx = text.indexOf(stepName);
-    assert.ok(idx >= 0, `surface step must exist (${checkName})`);
-    const rest = text.slice(idx);
-    const next = rest.match(/\n      - (?:name|uses): /);
-    const block = next ? rest.slice(0, next.index) : rest;
-    assert.match(block, /::error::/, `missing helper must be loud (::error::) (${checkName})`);
-    assert.match(block, /exit 1/, `missing helper must fail the step, not exit 0 silently (${checkName})`);
-    assert.doesNotMatch(block, /inline fallback poster/, `no inline fallback reintroduced (${checkName})`);
-    assert.doesNotMatch(block, /gh api -X POST/, `no inline POST fallback (${checkName})`);
-  }
-});
-
-test("the enforcer gate still fails closed and quotes a fetched verdict", () => {
-  const text = readFileSync(workflow, "utf8");
-  // The gate runs the base-fetched enforcer script and must still exit with its
-  // rc — the fail-closed merge_group verdict is what turns the check-run red
-  // and ejects the entry.
-  assert.match(text, /bash "\$ENFORCER_SCRIPT" merge_group >"\$MERGE_EJECTION_VERDICT" 2>&1/);
-  assert.match(text, /\[ "\$rc" -eq 0 \] \|\| exit "\$rc"/);
-});
-
-test("the surface step runs only on merge_group gate failure and posts via the base-fetched script", () => {
-  const text = readFileSync(workflow, "utf8");
-  const m = text.match(/- name: Surface the merge-queue ejection reason on the PR\n\s*if: ([^\n]+)/);
-  assert.ok(m, "the surface step must carry an `if` condition");
-  const ifExpr = m[1];
-  // A step-level `if` without a status-check function gets an implicit
-  // `success()` prepended — false right after the gate step fails, which would
-  // skip this step on the exact path (merge-group ejection) it exists for. The
-  // condition must therefore name an explicit status function (`failure()`,
-  // which also disables the implicit success()), plus the event and the gate
-  // outcome terms that scope it to the ejection case.
-  assert.match(ifExpr, /\$\{\{/, "the condition must be an explicit ${{ }} expression");
-  assert.match(ifExpr, /failure\(\)/, "the condition must name an explicit status-check function");
-  assert.match(ifExpr, /github\.event_name == 'merge_group'/, "the condition must be scoped to merge_group");
-  assert.match(ifExpr, /steps\.gate\.outcome == 'failure'/, "the condition must be scoped to the gate step's failure");
-  // A naive condition without a status function must never come back: GitHub
-  // would silently add `success()` and the artefact would never be posted.
-  assert.doesNotMatch(ifExpr, /^if: github\.event_name/, "a bare (implicit-success) condition is the round-1 defect");
-  // It is gated on the gate step's failure, not `always()` — so it can never run
-  // on a green entry and turn one red, and it is not required for a conclusion.
-  assert.match(text, /- name: Check the paperclip\/approved status/);
-  assert.match(text, /^\s*id: gate\s*$/m, "the gate step must carry id: gate for the surface step to gate on");
-});
-
-test("the surface step is not on the enforcement path (best-effort)", () => {
-  // The comment step has no `id` the gate depends on and no `continue-on-error`
-  // that would mask the gate; it simply runs after the gate has already failed.
-  const text = readFileSync(workflow, "utf8");
-  assert.doesNotMatch(text, /needs:.*surface/i, "nothing depends on the surface step");
-});
-
-// ---------------------------------------------------------------------------
-// Wiring: pr.yml's verify/e2e aggregates (the other required merge_group checks)
-// ---------------------------------------------------------------------------
-
-test("pr.yml verify aggregate gates a surface step on merge_group gate failure", () => {
-  const text = readFileSync(prWorkflow, "utf8");
-  // The `verify` job is an always() aggregator whose gate keeps its fail-closed
-  // assertions unchanged and tees the lane results before they run.
-  const job = text.match(/\n {2}verify:\n((?: {4}.*\n|\n)*?)(?=\n {2}build:)/)[1];
-  assert.match(job, /if: \$\{\{ always\(\) \}\}/, "verify stays an always() aggregator");
-  assert.match(job, /id: verify_gate/);
-  assert.match(job, /> "\$MERGE_EJECTION_VERDICT"/, "lane results are teed for the surface step");
-  assert.match(job, /test "\$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"/, "fail-closed assertion unchanged");
-  // The surface step carries an explicit status function + the event/gate scope,
-  // and posts through the base-fetched shared script with its own --check-name.
-  assert.match(
-    job,
-    /- name: Surface the merge-queue ejection reason on the PR \(verify\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.verify_gate\.outcome == 'failure' \}\}/,
+test("the reactor workflow is the only workflow that grants pull-requests: write", () => {
+  const files = ["paperclip-approved.yml", "pr.yml", "paperclip-ejection-surface.yml"];
+  const writers = files.filter((f) =>
+    /pull-requests: write/.test(readFileSync(path.join(repoRoot, ".github/workflows", f), "utf8")),
   );
-  assert.match(job, /bash "\$surface" --check-name verify --verdict "\$MERGE_EJECTION_VERDICT"/);
+  assert.deepEqual(writers, ["paperclip-ejection-surface.yml"], "only the trusted reactor may hold the write token");
 });
 
-test("pr.yml e2e aggregate gates a surface step on merge_group gate failure", () => {
-  const text = readFileSync(prWorkflow, "utf8");
-  const job = text.match(/\n {2}e2e:\n((?: {4}.*\n|\n)*)/)[1];
-  assert.match(job, /if: \$\{\{ always\(\) \}\}/, "e2e stays an always() aggregator");
-  assert.match(job, /id: e2e_gate/);
-  assert.match(job, /> "\$MERGE_EJECTION_VERDICT"/, "the e2e_shards result is teed for the surface step");
-  assert.match(job, /test "\$E2E_SHARDS_RESULT" = "success"/, "fail-closed assertion unchanged");
-  assert.match(
-    job,
-    /- name: Surface the merge-queue ejection reason on the PR \(e2e\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.e2e_gate\.outcome == 'failure' \}\}/,
+test("the reactor triggers on workflow_run completion of the required check workflows", () => {
+  const text = readFileSync(reactorWorkflow, "utf8");
+  assert.match(text, /name: Merge-Queue Ejection Surface/);
+  const trigger = text.match(
+    /on:\n\s+workflow_run:\n\s+workflows:\n((?:\s+- .*\n)+)\s+types:\n\s+- completed/,
   );
-  assert.match(job, /bash "\$surface" --check-name e2e --verdict "\$MERGE_EJECTION_VERDICT"/);
+  assert.ok(trigger, "reactor must trigger on workflow_run with types: [completed]");
+  assert.match(trigger[1], /- PR\n/);
+  assert.match(trigger[1], /- Paperclip Approval Enforcer\n/);
 });
 
-test("verify/e2e surfaces capture a bounded failing-lane reason, not status only", () => {
-  const text = readFileSync(prWorkflow, "utf8");
-  // SUP-15375 round 5 (merge-group-surface-reason-is-status-only): the gate
-  // steps fetch a bounded tail of the genuinely-failed lane's OWN job log from
-  // this run and append it to the verdict file, so the PR artefact names the
-  // underlying failure. This requires the read-only `actions: read` scope.
-  const verifyJob = text.match(/\n {2}verify:\n((?: {4}.*\n|\n)*?)(?=\n {2}build:)/)[1];
-  assert.match(verifyJob, /^ {6}actions: read$/m, "verify needs actions: read for the lane-log tail");
-  assert.match(verifyJob, /actions\/runs\/\$\{GITHUB_RUN_ID\}\/jobs/, "verify lists this run's jobs to find the failed lane");
-  assert.match(verifyJob, /actions\/jobs\/\$\{jid\}\/logs/, "verify fetches the failed lane's own job log");
-  assert.match(verifyJob, /failing output \(bounded tail\)/, "verify labels the appended lane output");
-  const e2eJob = text.match(/\n {2}e2e:\n((?: {4}.*\n|\n)*)/)[1];
-  assert.match(e2eJob, /^ {6}actions: read$/m, "e2e needs actions: read for the shard-log tail");
-  assert.match(e2eJob, /actions\/jobs\/\$\{jid\}\/logs/, "e2e fetches the failed shard's own job log");
-  assert.match(e2eJob, /failing shard log \(bounded tail\)/, "e2e labels the appended shard output");
-});
-
-test("pr.yml surface steps only post on a genuine failure, not skipped/cancelled lanes", () => {
-  const text = readFileSync(prWorkflow, "utf8");
-  // Both surface run blocks gate on a `: failure` verdict line, so an approval
-  // collapse (lanes skipped/cancelled → the paperclip-approved surface owns the
-  // story) does not stack verify/e2e comments.
+test("the reactor job is scoped to a failed merge_group run", () => {
+  const text = readFileSync(reactorWorkflow, "utf8");
   assert.match(
     text,
-    /Surface the merge-queue ejection reason on the PR \(verify\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.verify_gate\.outcome == 'failure' \}\}\n(?: {8}env:\n(?: {10}.*\n)*?)? {8}run: \|\n(?: {10}.*\n)*? {10}if ! grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
+    /if: \$\{\{ github\.event\.workflow_run\.conclusion == 'failure' && github\.event\.workflow_run\.event == 'merge_group' \}\}/,
+    "the reactor job must run only for a failed merge_group run",
   );
+});
+
+test("the reactor executes only trusted default-branch code, never the triggering run's tree", () => {
+  const text = readFileSync(reactorWorkflow, "utf8");
   assert.match(
     text,
-    /Surface the merge-queue ejection reason on the PR \(e2e\)\n {8}if: \$\{\{ failure\(\) && github\.event_name == 'merge_group' && steps\.e2e_gate\.outcome == 'failure' \}\}\n(?: {8}env:\n(?: {10}.*\n)*?)? {8}run: \|\n(?: {10}.*\n)*? {10}if ! grep -q ': failure\$' "\$MERGE_EJECTION_VERDICT"/,
+    /bash scripts\/ci\/surface-merge-queue-ejection-react\.sh/,
+    "the reactor must run the trusted react script",
   );
+  // pwn-request guard: the reactor must never checkout or target the triggering
+  // run's PR-controlled ref/commit. The default checkout resolves to GITHUB_REF,
+  // which for a workflow_run run is the protected default branch. `head_branch`
+  // may only travel as env data to the runner (for PR resolution), never select
+  // a checkout ref.
+  assert.doesNotMatch(text, /workflow_run\.head_branch\s*\n\s*ref:/,
+    "the reactor must not select its checkout from the triggering run's head branch");
+  assert.doesNotMatch(text, /workflow_run\.head_sha/,
+    "the reactor must not target the triggering run's commit");
+  assert.ok(
+    /WORKFLOW_HEAD_BRANCH: \$\{\{ github\.event\.workflow_run\.head_branch \}\}/.test(text),
+    "the head branch travels to the runner as data for PR resolution",
+  );
+});
+
+test("the reactor does not add a merge_group trigger (no new PR-controlled surface)", () => {
+  const text = readFileSync(reactorWorkflow, "utf8");
+  assert.doesNotMatch(text, /^\s{2}merge_group:/m, "the reactor must not run on merge_group");
+  assert.doesNotMatch(text, /^\s{2}pull_request:/m, "the reactor must not run on pull_request");
 });
