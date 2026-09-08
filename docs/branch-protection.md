@@ -120,8 +120,12 @@ genuinely failed job's own log, read through the read-only actions API):
 
 - a failed `Paperclip Approval Enforcer` run names
   `paperclip-approved-enforcer`;
-- a failed `PR` run names the failing required context, preferring the root
-  cause: `Approval precondition` (approval absent) → `verify` → `e2e`.
+- a failed `PR` run names the first failing **required** context (`verify` →
+  `e2e`). A run that collapsed on the internal `Approval precondition` fast-gate
+  (approval absent, so the required contexts never genuinely ran) posts nothing
+  — the enforcer workflow's artefact owns that story — so a non-required check
+  is never named as the ejected check
+  (`merge-group-required-check-attribution`).
 
 Each artefact:
 

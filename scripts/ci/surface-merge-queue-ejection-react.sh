@@ -101,18 +101,32 @@ if [ -z "$failing_names" ]; then
 fi
 
 # The artefact must name the *required merge_group check* that failed, not an
-# arbitrary cascade victim. Map the completed workflow + failing jobs to the
-# check an agent recognises:
-#   - "Paperclip Approval Enforcer" workflow -> paperclip-approved-enforcer
-#   - "PR" workflow -> the root required context among the failing jobs,
-#     preferring Approval precondition (approval absent) then verify then e2e,
-#     falling back to the first failing job.
+# arbitrary cascade victim. The required contexts are `verify`, `e2e` (the
+# pr.yml always() aggregates) and `paperclip-approved-enforcer` (its own
+# workflow); `Approval precondition` is an internal fast-gate and is NOT a
+# required context — it must never be named as the ejected check
+# (merge-group-required-check-attribution).
 ENFORCER_WORKFLOW_NAME='Paperclip Approval Enforcer'
 check_name=""
 if [ "$WORKFLOW_NAME" = "$ENFORCER_WORKFLOW_NAME" ]; then
   check_name='paperclip-approved-enforcer'
 else
-  for cand in 'Approval precondition' verify e2e; do
+  # A PR-workflow run in which `Approval precondition` failed collapsed on the
+  # approval gate BEFORE the required contexts could genuinely run: any verify /
+  # e2e failure in that run is a cascade conclusion, not a real check failure,
+  # and naming either would misattribute the ejection. The enforcer workflow
+  # runs for the same queue entry (same required gate) and its own reactor
+  # comment names paperclip-approved-enforcer with the approval remediation —
+  # defer to that artefact instead of posting a misleading one here.
+  if grep -Fxq 'Approval precondition' <<<"$failing_names"; then
+    log "run ${RUN_ID} collapsed on the approval precondition (Approval precondition failed) — the required paperclip-approved-enforcer check owns this story; skipping this workflow's surface to avoid a misattributed artefact"
+    exit 0
+  fi
+  # Otherwise the entry had approval and a required context genuinely failed.
+  # Name the first failing required context in workflow order (verify before
+  # e2e), falling back to the first failing job if neither required context
+  # concluded failure (defensive — should not occur).
+  for cand in verify e2e; do
     if grep -Fxq "$cand" <<<"$failing_names"; then
       check_name="$cand"
       break

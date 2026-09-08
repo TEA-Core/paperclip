@@ -104,7 +104,13 @@ test("react: enforcer-workflow failure surfaces check paperclip-approved-enforce
   }
 });
 
-test("react: PR-workflow failure prefers the Approval precondition root cause", () => {
+test("react: an approval-precondition collapse is not misattributed to a required check — skipped, deferring to the enforcer artefact", () => {
+  // `Approval precondition` is an internal fast-gate, NOT a required merge_group
+  // context (those are verify/e2e/paperclip-approved-enforcer). A PR-run whose
+  // precondition failed collapsed before the required contexts could genuinely
+  // run — verify/e2e conclusions are cascade. Naming any of them would
+  // misattribute the ejection (merge-group-required-check-attribution); the
+  // enforcer workflow's own reactor comment owns the approval story.
   const dir = makeFixture({
     jobs: [
       job(1, "Approval precondition", "failure"),
@@ -113,14 +119,31 @@ test("react: PR-workflow failure prefers the Approval precondition root cause", 
     ],
   });
   try {
-    writeFileSync(path.join(dir, "1.log"), "approval precondition output\n");
+    const r = run(dir, { workflowName: "PR" });
+    assert.equal(r.code, 0);
+    assert.match(r.out + r.err, /collapsed on the approval precondition.*skipping this workflow.s surface/);
+    assert.doesNotMatch(r.out + r.err, /would surface check/, "a collapse must not post a verify/e2e/precondition artefact");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("react: PR-workflow failure names verify (first required context) when a lane genuinely failed", () => {
+  const dir = makeFixture({
+    jobs: [
+      job(1, "Approval precondition", "success"),
+      job(2, "verify", "failure"),
+      job(3, "e2e", "failure"),
+    ],
+  });
+  try {
+    writeFileSync(path.join(dir, "2.log"), "verify aggregate output\n");
     const r = run(dir, { workflowName: "PR" });
     assert.equal(r.code, 0);
     const all = r.out + r.err;
-    assert.match(all, /would surface check 'Approval precondition'/);
-    assert.match(all, /- Approval precondition/);
-    assert.match(all, /- verify/);
-    assert.match(all, /- e2e/);
+    assert.match(all, /would surface check 'verify' on TEA-Core\/paperclip PR #4242/);
+    assert.doesNotMatch(all, /would surface check 'Approval precondition'/, "a non-required check must never be named");
+    assert.doesNotMatch(all, /would surface check 'e2e'/, "verify precedes e2e in workflow order");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
