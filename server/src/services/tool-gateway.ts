@@ -5903,8 +5903,15 @@ export function createToolGatewayService(
       agentId: string;
       runId: string;
       permittedNotInstalledConnections: Array<{ id: string; name: string }>;
+      permittedConnectionCount: number;
+      installedConnectionCount: number;
     }) {
-      if (input.permittedNotInstalledConnections.length === 0) return;
+      // Fire whenever zero runtime MCP servers are delivered, and state which
+      // condition actually holds so the row cannot be read as "permit this
+      // connection" when nothing is even permitted.
+      const reasonCode = input.permittedConnectionCount === 0
+        ? "no_permitted_mcp_connections"
+        : "permitted_connections_not_installed";
       const [run] = await db
         .select({ issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'` })
         .from(heartbeatRuns)
@@ -5922,8 +5929,13 @@ export function createToolGatewayService(
         action: "tool_gateway.runtime_mcp_delivery",
         details: {
           decision: "diagnostic",
-          reasonCode: "permitted_connections_not_installed",
+          reasonCode,
+          // Scope marker: evidence about mcp_remote connection delivery only,
+          // never about plugin-provided tools.
+          scope: "mcp_connections",
           deliveredServerCount: 0,
+          permittedConnectionCount: input.permittedConnectionCount,
+          installedConnectionCount: input.installedConnectionCount,
           permittedNotInstalledCount: input.permittedNotInstalledConnections.length,
           permittedNotInstalledConnections: input.permittedNotInstalledConnections,
         },
