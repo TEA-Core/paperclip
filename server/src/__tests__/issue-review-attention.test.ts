@@ -301,4 +301,120 @@ describeEmbeddedPostgres("issue review attention", () => {
       status: "queued",
     })).resolves.toBeDefined();
   });
+
+  it("does not score a dead review stage covered on stale undelivered wakes (SUP-15369)", async () => {
+    const { companyId, agentId } = await seed();
+    // The review participant is a dead (paused) agent, so it is not a live
+    // execution_participant path — mirroring SUP-15248's stuck review stage.
+    const deadAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: deadAgentId,
+      companyId,
+      name: "Dead Reviewer",
+      role: "engineer",
+      status: "paused",
+    });
+
+    const deadParticipantState = {
+      status: "pending",
+      currentStageType: "review",
+      currentStageIndex: 0,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      reviewRequest: null,
+      changesRequestedCount: 0,
+      currentParticipant: { type: "agent", agentId: deadAgentId },
+    };
+
+    const staleIssueId = await insertReview({
+      companyId,
+      agentId,
+      identifier: "RVA-STALE-1",
+      executionState: deadParticipantState,
+    });
+
+    // The exact SUP-15248 shape: nine undelivered review re-arm wakes, all older
+    // than the participant re-arm deferral window (30 min) and never delivered.
+    // Production re-arms use reason `execution_review_requested` with
+    // payload.rearm=true (recovery/service.ts PENDING_REVIEW_REARM_REASON), so the
+    // fixture mirrors that instead of the pre-fix test-only reason.
+    const staleAgeMs = 24 * 60 * 60 * 1000;
+    for (let i = 0; i < 9; i += 1) {
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId: deadAgentId,
+        source: "automation",
+        reason: "execution_review_requested",
+        status: "queued",
+        payload: { issueId: staleIssueId, mutation: "update", rearm: true },
+        requestedAt: new Date(Date.now() - staleAgeMs - i * 60_000),
+      });
+    }
+
+    // The 3/3 exhausted re-arm budget: the three re-arm attempts the platform
+    // already made reached a terminal status (completed/failed/timed_out).
+    // Terminal wakes are not `queued_wake` maintained paths — the attention fetch
+    // only reads queued/deferred/claimed rows — so their presence proves the
+    // exhausted-budget state is still not counted as covered.
+    const consumedRearmStatuses: string[] = ["completed", "failed", "timed_out"];
+    for (let i = 0; i < consumedRearmStatuses.length; i += 1) {
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId: deadAgentId,
+        source: "automation",
+        reason: "execution_review_requested",
+        status: consumedRearmStatuses[i],
+        payload: { issueId: staleIssueId, mutation: "update", rearm: true },
+        requestedAt: new Date(Date.now() - (i + 1) * 5 * 60 * 1000),
+        finishedAt: new Date(Date.now() - i * 5 * 60 * 1000),
+      });
+    }
+
+    // The real production 3/3 shape: when the re-arm budget is exhausted, the
+    // platform upserts a `pending_review_rearm_cap_exhausted` recovery action
+    // (ownerType: board) on the review issue (recovery/service.ts). That action is
+    // the terminal "re-arming stopped, escalate to board" marker — NOT a maintained
+    // action path — so it must not keep the card `covered`. Seed it to prove the
+    // exhausted undecided review still scores stalled even with the marker present.
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: staleIssueId,
+      kind: "pending_review_rearm_cap_exhausted",
+      status: "active",
+      ownerType: "board",
+      previousOwnerAgentId: deadAgentId,
+      cause: "pending_review_rearm_cap_exhausted",
+      fingerprint: `prr:${companyId}:${staleIssueId}`,
+      evidence: { identifier: "RVA-STALE-1", reArmCount: 3, reArmMax: 3, reArmWindowMs: 30 * 60 * 1000 },
+      nextAction: "This issue's pending review was re-armed repeatedly without a decision. Review and take action.",
+    });
+
+    let row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === staleIssueId);
+    expect(row?.reviewAttention?.state).not.toBe("covered");
+    expect(row?.reviewAttention).toMatchObject({ state: "stalled", paths: [] });
+
+    // Control: a fresh queued re-arm wake (within the deferral window) is still a
+    // maintained path -> covered.
+    const freshIssueId = await insertReview({
+      companyId,
+      agentId,
+      identifier: "RVA-STALE-2",
+      executionState: deadParticipantState,
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: deadAgentId,
+      source: "automation",
+      reason: "execution_review_requested",
+      status: "queued",
+      payload: { issueId: freshIssueId, mutation: "update", rearm: true },
+      requestedAt: new Date(),
+    });
+    row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === freshIssueId);
+    expect(row?.reviewAttention).toMatchObject({
+      state: "covered",
+      paths: [expect.objectContaining({ kind: "queued_wake" })],
+    });
+  });
 });

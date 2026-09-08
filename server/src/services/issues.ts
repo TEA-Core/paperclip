@@ -67,6 +67,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
+import { pendingReviewRearmWindowMsFromEnv } from "../config.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -3526,6 +3527,12 @@ async function listIssueReviewAttentionMap(
         eq(issueRecoveryActions.companyId, companyId),
         inArray(issueRecoveryActions.status, ["active", "escalated"]),
         inArray(issueRecoveryActions.sourceIssueId, reviewIds),
+        // SUP-15369: a `pending_review_rearm_cap_exhausted` action is the terminal
+        // "re-arming stopped, escalate to board" marker for a stuck review — it is
+        // evidence the review stage can no longer advance, not a maintained action
+        // path. Keeping it would leave a dead, undecided review stage `covered`, so
+        // it must instead surface as stalled.
+        ne(issueRecoveryActions.kind, "pending_review_rearm_cap_exhausted"),
       )),
     dbOrTx
       .select({
@@ -3592,6 +3599,7 @@ async function listIssueReviewAttentionMap(
     pendingInteractions: interactionRows,
     pendingApprovals: approvalRows,
     openRecoveryIssues: recoveryPaths,
+    queuedWakeStaleAfterMs: pendingReviewRearmWindowMsFromEnv(),
     now: new Date(),
   };
   const findingsByIssueId = new Map(
