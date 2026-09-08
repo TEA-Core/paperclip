@@ -3012,6 +3012,32 @@ export function buildRunEventInsertValues(params: {
   };
 }
 
+// Builds the heartbeat_run_events input emitted when a guarded
+// `heartbeat_runs.context_snapshot` write fails (SUP-15431). The `error` column
+// carries the deepest driver error text verbatim (only current-user identity is
+// redacted downstream, and it is NOT run through the payload bounder), so a
+// future guarded failure is diagnosable from GET /api/heartbeat-runs/{runId}/
+// events rather than only container logs. The payload keeps the write site, the
+// run id, and the bounded error-class chain for the incident signature.
+export function buildContextSnapshotWriteFailureEvent(failure: {
+  error: unknown;
+  writeSite: string;
+  runId: string;
+}): HeartbeatRunEventInput {
+  return {
+    eventType: "error",
+    stream: "system",
+    level: "error",
+    message: `heartbeat_runs.context_snapshot write failed at ${failure.writeSite}; continuing run without persisting this snapshot`,
+    error: runEventErrorText(failure.error),
+    payload: {
+      writeSite: failure.writeSite,
+      runId: failure.runId,
+      errorClasses: contextSnapshotWriteErrorClasses(failure.error),
+    },
+  };
+}
+
 function redactInlineBase64ImageData(chunk: string) {
   return chunk.replace(INLINE_BASE64_IMAGE_DATA_RE, (_match, prefix: string, data: string, suffix: string) =>
     `${prefix}[omitted base64 image data: ${data.length} chars]${suffix}`,
@@ -10941,7 +10967,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runId: input.runId,
       write: input.write,
       fallback: input.fallback,
-      record: (failure) => {
+      record: async (failure) => {
         logger.error(
           {
             err: failure.error,
@@ -10953,6 +10979,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           `heartbeat_runs.context_snapshot write failed at ${failure.writeSite}; continuing run without persisting this snapshot`,
         );
+        // Also retain the failure where an agent can read it (SUP-15431): append one
+        // heartbeat_run_events row so a future guarded failure is diagnosable from
+        // GET /api/heartbeat-runs/{runId}/events, not only container logs. Load the
+        // full run row here (failure path only — no happy-path cost) so appendRunEvent
+        // gets a complete row; skip the append if the row is already gone. A failure
+        // in this append is swallowed by the guard's outer catch, so it can never
+        // re-enter the guarded write path.
+        const run = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, failure.runId))
+          .then((rows) => rows[0] ?? null);
+        if (!run) return;
+        await appendRunEvent(run, await nextRunEventSeq(run.id), buildContextSnapshotWriteFailureEvent(failure));
       },
     });
   }
