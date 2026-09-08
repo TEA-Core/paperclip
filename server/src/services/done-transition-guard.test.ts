@@ -2,8 +2,10 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   agents as agentsTable,
   issueExecutionDecisions as issueExecutionDecisionsTable,
+  issueLabels as issueLabelsTable,
   issueRelations as issueRelationsTable,
   issues as issuesTable,
+  labels as labelsTable,
 } from "@paperclipai/db";
 import {
   evaluateDoneTransitionGuard,
@@ -91,7 +93,7 @@ function mockProjectRow(row: Partial<Record<string, unknown>> = {}) {
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[] }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -132,6 +134,19 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockResolvedValue(rows.issueExecutionDecisions ?? []),
     then: vi.fn().mockResolvedValue(rows.issueExecutionDecisions ?? []),
   };
+  // SUP-15464: the guard resolves the `work-type:redo` label by name (labels)
+  // and reads the issue_labels join for that label id (issueLabels). Dispatch by
+  // table identity; unseeded tests return [] so the redo exclusion is a no-op.
+  const labelsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.labels ?? []),
+    then: vi.fn().mockResolvedValue(rows.labels ?? []),
+  };
+  const issueLabelsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
+    then: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
+  };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
@@ -165,6 +180,8 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         }
         if (table === agentsTable && rows.agents !== undefined) return agentsChain;
         if (table === issueExecutionDecisionsTable) return decisionsChain;
+        if (table === labelsTable) return labelsChain;
+        if (table === issueLabelsTable) return issueLabelsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -1818,6 +1835,230 @@ describe("evaluateDoneTransitionGuard", () => {
           details: expect.objectContaining({ ladderedChildCount: 2 }),
         }),
       );
+    });
+  });
+
+  describe("work-type:redo children are not decomposition children (SUP-15464)", () => {
+    const supportCrId = "ddddddd4-0000-4000-8000-000000000004";
+    const supportQaeId = "aaaaaaa1-0000-4000-8000-000000000001";
+    const coderLeId = "bbbbbbb2-0000-4000-8000-000000000002";
+    const execCtoId = "ccccccc3-0000-4000-8000-000000000003";
+    const parentStageId = "30000000-0000-4000-8000-000000000003";
+    const redoLabelId = "60000000-0000-4000-8000-000000000006";
+
+    const agents = [
+      { id: supportCrId, name: "support-CR", role: "support" },
+      { id: supportQaeId, name: "support-QAE", role: "support" },
+      { id: coderLeId, name: "coder-LE", role: "engineer" },
+      { id: execCtoId, name: "exec-CTO", role: "executive" },
+    ];
+
+    // The literal SUP-15421 parent: a single support-CR review stage (the coding
+    // ladder), satisfied. It is shape-incomplete against the ADR-072 close ladder
+    // (missing review:support-QAE, review:coder-LE, approval:exec-CTO).
+    const parentLadder = {
+      stages: [
+        { id: parentStageId, type: "review", participants: [{ type: "agent", agentId: supportCrId }] },
+      ],
+    };
+
+    const satisfiedState = (stageIds: string[]) => ({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: stageIds,
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+
+    // A redo re-delivery child: origin_kind manual, a ran review ladder, and (via
+    // the issue_labels join) the redo label. The row carries an id so the guard
+    // can match it against the issue_labels read.
+    const redoChild = (id: string, identifier: string, childStageId: string) => ({
+      id,
+      identifier,
+      originKind: "manual",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    // A genuine manual decomposition child (no redo label).
+    const manualChild = (id: string, identifier: string, childStageId: string) => ({
+      id,
+      identifier,
+      originKind: "manual",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    const redoLabelRow = {
+      id: redoLabelId,
+      companyId: "company-1",
+      name: "work-type:redo",
+      color: "#000000",
+    };
+
+    it("does not arm mechanism D for the SUP-15421 shape: two work-type:redo children over a support-CR ladder (AC3 main)", async () => {
+      // SUP-15439 / SUP-15449 shape: two manual children, each laddered and each
+      // carrying the redo label. Before the fix both counted -> count 2 ->
+      // mechanism D armed and the close refused on the missing ADR-072 close
+      // ladder. After the fix the redo exclusion drops the count to 0, so the
+      // shape check is not armed and the card closes. This test fails against the
+      // unfixed guard (which counts both manual children and refuses the close).
+      setupDbMock({
+        issues: [
+          redoChild("redo-1", "SUP-15439", "40000000-0000-4000-8000-000000000001"),
+          redoChild("redo-2", "SUP-15449", "50000000-0000-4000-8000-000000000002"),
+        ],
+        labels: [redoLabelRow],
+        issueLabels: [
+          { issueId: "redo-1", labelId: redoLabelId, companyId: "company-1" },
+          { issueId: "redo-2", labelId: redoLabelId, companyId: "company-1" },
+        ],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("arms mechanism D for the identical two manual children when they carry no redo label (AC3 negative control)", async () => {
+      // Same shape, minus the redo label: the two manual laddered children are now
+      // decomposition children, count reaches >= 2, and mechanism D arms over the
+      // shape-incomplete support-CR ladder. This proves the exclusion — not the
+      // setup — is what clears the main case.
+      setupDbMock({
+        issues: [
+          manualChild("redo-1", "SUP-15439", "40000000-0000-4000-8000-000000000001"),
+          manualChild("redo-2", "SUP-15449", "50000000-0000-4000-8000-000000000002"),
+        ],
+        labels: [redoLabelRow],
+        issueLabels: [],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism D");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            reason: "adr072_close_ladder_shape_incomplete",
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-15439", "SUP-15449"],
+          }),
+        }),
+      );
+    });
+
+    it("still arms mechanism D for two genuine manual decomposition children with no redo label (AC4)", async () => {
+      // A card with two genuinely decomposed manual children (no redo labels) must
+      // still arm mechanism D — the exclusion must not over-suppress.
+      setupDbMock({
+        issues: [
+          manualChild("child-1", "SUP-9501", "40000000-0000-4000-8000-000000000001"),
+          manualChild("child-2", "SUP-9502", "50000000-0000-4000-8000-000000000002"),
+        ],
+        labels: [redoLabelRow],
+        issueLabels: [],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism D");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({ ladderedChildCount: 2 }),
+        }),
+      );
+    });
+
+    it("excludes a redo child so a 1-genuine-manual + 1-redo pair arms neither mechanism A nor D (AC1)", async () => {
+      // One genuine manual decomposition child + one redo child: the redo is
+      // excluded, so the count is 1 (< 2). Neither mechanism arms.
+      const children = [
+        manualChild("child-1", "SUP-9601", "40000000-0000-4000-8000-000000000001"),
+        redoChild("redo-1", "SUP-9602", "50000000-0000-4000-8000-000000000002"),
+      ];
+      const issueLabels = [{ issueId: "redo-1", labelId: redoLabelId, companyId: "company-1" }];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [redoLabelRow], issueLabels });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [redoLabelRow], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("skips the redo exclusion when the company has no work-type:redo label (AC2, company-scoped)", async () => {
+      // The exclusion is gated on resolving a label named `work-type:redo` in the
+      // issue's company. A company with no such label cannot have a redo child, so
+      // the issue_labels read is skipped and no exclusion happens — even if orphan
+      // issue_labels rows exist. Both manual children count and mechanism D arms.
+      // This proves the guard keys off the name-resolved label, not a hard-coded
+      // label uuid or the raw join rows.
+      const someLabelId = "70000000-0000-4000-8000-000000000007";
+      setupDbMock({
+        issues: [
+          manualChild("child-1", "SUP-9701", "40000000-0000-4000-8000-000000000001"),
+          manualChild("child-2", "SUP-9702", "50000000-0000-4000-8000-000000000002"),
+        ],
+        labels: [],
+        issueLabels: [
+          { issueId: "child-1", labelId: someLabelId, companyId: "company-1" },
+          { issueId: "child-2", labelId: someLabelId, companyId: "company-1" },
+        ],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism D");
     });
   });
 
