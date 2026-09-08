@@ -18,6 +18,7 @@ import {
 import { GITHUB_APP_PRIVATE_KEY_SECRET_NAME, GITHUB_TOKEN_SECRET_NAMES } from "./github-credential.js";
 import {
   armMergeOnApproval,
+  ladderIsTerminallyApproved,
   publishApprovalStatus,
   resolveApprovalDecisionHead,
   resolveCardPullRequest,
@@ -49,6 +50,76 @@ if (!embeddedPostgresSupport.supported) {
     `Skipping embedded Postgres merge-arming tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
 }
+
+// SUP-15459: the ladder-terminality predicate gates every paperclip/approved
+// write. It is pure (no I/O), so these run even where embedded Postgres is
+// absent — no DB fixtures required.
+describe("ladderIsTerminallyApproved", () => {
+  const A = "stage-a";
+  const B = "stage-b";
+  const policy = { stages: [{ id: A }, { id: B }] };
+
+  it("is true when every policy stage is completed and the last outcome is approved", () => {
+    expect(
+      ladderIsTerminallyApproved(policy, { completedStageIds: [A, B], lastDecisionOutcome: "approved" }),
+    ).toBe(true);
+  });
+
+  it("is false when a policy stage is not yet completed (the mid-ladder shape)", () => {
+    expect(
+      ladderIsTerminallyApproved(policy, { completedStageIds: [A], lastDecisionOutcome: "approved" }),
+    ).toBe(false);
+  });
+
+  it("replays the SUP-15163 4-stage shape: stage-1 of 4 approved is NOT terminally approved; all four complete + approved IS", () => {
+    // The exact executed-instance shape from the card: a 4-stage policy where
+    // only stage 1 (the support-CR review) is complete and approved. That is the
+    // mid-ladder stamp that armed and merged TSP PR #3484 at stage 1/4.
+    const s1 = "stage-1";
+    const s2 = "stage-2";
+    const s3 = "stage-3";
+    const s4 = "stage-4";
+    const fourStagePolicy = { stages: [{ id: s1 }, { id: s2 }, { id: s3 }, { id: s4 }] };
+
+    // Mid-ladder: completedStageIds length 1, last outcome approved -> refuse.
+    expect(
+      ladderIsTerminallyApproved(fourStagePolicy, {
+        completedStageIds: [s1],
+        lastDecisionOutcome: "approved",
+      }),
+    ).toBe(false);
+
+    // Terminal: all four ids completed and last outcome approved -> stamp + arm.
+    expect(
+      ladderIsTerminallyApproved(fourStagePolicy, {
+        completedStageIds: [s1, s2, s3, s4],
+        lastDecisionOutcome: "approved",
+      }),
+    ).toBe(true);
+  });
+
+  it("is false when the last decision outcome is not approved, even with all stages completed", () => {
+    expect(
+      ladderIsTerminallyApproved(policy, {
+        completedStageIds: [A, B],
+        lastDecisionOutcome: "changes_requested",
+      }),
+    ).toBe(false);
+  });
+
+  it("treats a null/empty policy as vacuously complete, so the outcome decides", () => {
+    expect(ladderIsTerminallyApproved(null, { lastDecisionOutcome: "approved" })).toBe(true);
+    expect(ladderIsTerminallyApproved({ stages: [] }, { lastDecisionOutcome: "approved" })).toBe(true);
+    expect(ladderIsTerminallyApproved(null, { lastDecisionOutcome: "changes_requested" })).toBe(false);
+  });
+
+  it("is false when the state is null/undefined or lacks an approved outcome for a declared policy", () => {
+    expect(ladderIsTerminallyApproved(policy, null)).toBe(false);
+    expect(ladderIsTerminallyApproved(policy, undefined)).toBe(false);
+    expect(ladderIsTerminallyApproved(policy, { completedStageIds: [A, B] })).toBe(false);
+    expect(ladderIsTerminallyApproved(undefined, undefined)).toBe(false);
+  });
+});
 
 const GITHUB_TOKEN = "ghp_test_token_value";
 // The head the approving decision was rendered against (decision-time pin).

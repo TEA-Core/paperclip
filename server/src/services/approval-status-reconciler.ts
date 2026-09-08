@@ -14,6 +14,7 @@ import {
 } from "./github-credential.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
+  ladderIsTerminallyApproved,
   postPullRequestComment,
   publishApprovalStatus,
   resolveCardPullRequest,
@@ -2068,6 +2069,27 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   const integrity = await evaluateStageIntegrity(db, row);
   if (integrity) {
     return { kind: "skipped", reason: integrity.reason, detail: `guard-b ${integrity.detail}` };
+  }
+
+  // SUP-15459: the delegated re-publish must not run on a card whose ladder is
+  // not terminally approved. The candidate selector only proves the LAST decision
+  // was approved; a mid-ladder card (completedStageIds short of the policy's full
+  // stage set) would otherwise be re-stamped with paperclip/approved, authorizing
+  // a merge on a partially-reviewed card. Same shared predicate as the routes
+  // arming write and armMergeOnApproval. Refuses before any GitHub read or write.
+  const ladderPolicy = row.executionPolicy as { stages?: Array<{ id: string }> } | null;
+  const ladderState = row.executionState as
+    | { completedStageIds?: string[]; lastDecisionOutcome?: string | null }
+    | null;
+  if (!ladderIsTerminallyApproved(ladderPolicy, ladderState)) {
+    const policyStages = ladderPolicy?.stages ?? [];
+    const completedIds = ladderState?.completedStageIds ?? [];
+    const incompleteIds = policyStages.filter((s) => !completedIds.includes(s.id)).map((s) => s.id);
+    return {
+      kind: "skipped",
+      reason: "non-terminal-ladder",
+      detail: `non-terminal-ladder: incomplete review/approval stages: ${incompleteIds.join(", ")}`,
+    };
   }
 
   const linked = await resolveLinkedPullRequestsWithState(db, row.companyId, row.id);

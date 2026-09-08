@@ -47,6 +47,36 @@ export function shouldPublishApprovalStatus<T extends Pick<MergeArmingDecision, 
   return decision != null && decision.outcome === "approved";
 }
 
+/**
+ * SUP-15459: the ladder-terminality predicate. True only when EVERY
+ * review/approval stage declared on the card's execution policy is present in
+ * `completedStageIds` AND the card's last recorded decision outcome is
+ * "approved" — i.e. the whole ladder was genuinely reviewed and approved, not
+ * just the stage the actor happened to just sign off on.
+ *
+ * This single shared predicate gates EVERY write of the `paperclip/approved`
+ * status: the post-approval routes arming hook, the approval-status reconciler's
+ * delegated re-publish, and armMergeOnApproval's actuator. Before this the check
+ * existed only inline inside armMergeOnApproval, and `publishApprovalStatus`
+ * (and therefore its two call sites) stamped on any approved stage — so a
+ * mid-ladder approval (completedStageIds short of the policy's full stage set)
+ * authorized a merge. Extracting it verbatim into one function keeps the
+ * "is the ladder fully reviewed + approved" question from drifting between the
+ * three call sites.
+ *
+ * Pure read of the policy/state shapes; no I/O, so it is unit-testable without a
+ * DB and safe to run at decision time, in the reconciler, and in the actuator.
+ */
+export function ladderIsTerminallyApproved(
+  policy: { stages?: Array<{ id: string }> } | null | undefined,
+  state: { completedStageIds?: string[]; lastDecisionOutcome?: string | null } | null | undefined,
+): boolean {
+  const policyStages = policy?.stages ?? [];
+  const completedIds = state?.completedStageIds ?? [];
+  const allCompleted = policyStages.every((s) => completedIds.includes(s.id));
+  return allCompleted && state?.lastDecisionOutcome === "approved";
+}
+
 export interface ArmingOutcome {
   kind: "armed" | "skipped" | "failed";
   message: string;
@@ -2389,12 +2419,12 @@ export async function armMergeOnApproval(
     | { completedStageIds?: string[]; lastDecisionOutcome?: string | null }
     | undefined;
 
-  const policyStages = policy?.stages ?? [];
-  const completedIds = state?.completedStageIds ?? [];
-  const allCompleted = policyStages.every((s) => completedIds.includes(s.id));
-  const isApproved = state?.lastDecisionOutcome === "approved";
-
-  if (!allCompleted || !isApproved) {
+  // SUP-15459: the ladder-terminality decision is the shared predicate, not an
+  // inline copy — the same check that gates the routes arming write and the
+  // reconciler's delegated re-publish.
+  if (!ladderIsTerminallyApproved(policy, state)) {
+    const policyStages = policy?.stages ?? [];
+    const completedIds = state?.completedStageIds ?? [];
     const incompleteIds = policyStages.filter((s) => !completedIds.includes(s.id)).map((s) => s.id);
     return {
       kind: "skipped",

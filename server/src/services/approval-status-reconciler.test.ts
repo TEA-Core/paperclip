@@ -533,6 +533,44 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(summary.voidWarnings).toBe(0);
     });
 
+    it("SUP-15459: a mid-ladder approved card is skipped:non-terminal-ladder and never re-stamps paperclip/approved", async () => {
+      // The exact SUP-15459 shape the bug allowed through: a two-stage ladder
+      // whose LAST decision was approved (so the candidate selector admits it)
+      // but whose completedStageIds is short of the policy's full stage set. The
+      // terminality gate must refuse the delegated re-publish before any GitHub
+      // read or write.
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          // Only the first of two stages is complete -> the ladder is NOT
+          // terminally approved.
+          completedStageIds: [APPROVAL_STAGE_ID],
+        }),
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            { id: APPROVAL_STAGE_ID, type: "approval", approvalsNeeded: 1 },
+            { id: REVIEW_STAGE_ID, type: "review", approvalsNeeded: 1 },
+          ],
+        },
+      });
+      // A decision row for the completed stage (guard-b stage-without-decision).
+      await insertDecision(issueId);
+      // A linked open PR mention so the candidate selector admits the card.
+      await insertMention(issueId);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.scanned).toBe(1);
+      expect(summary.republished).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(summary.skipped["non-terminal-ladder"]).toBe(1);
+
+      // The refusal happens before any GitHub I/O: no status POST was made.
+      expect(postStatusCalls()).toHaveLength(0);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
     it("scans and evaluates the head of a zero-mention approved card via live workspace discovery (AC1)", async () => {
       const issueId = await insertIssue();
       await insertDecision(issueId);

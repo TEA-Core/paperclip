@@ -133,14 +133,24 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
   }
 
   /**
-   * Seeds an issue parked on a PENDING first stage of a two-stage review ladder
-   * with the company's `mergeArmingEnabled` flag TRUE (the only flag seeded in
-   * the fixture, per the card's out-of-scope rule: never enable the flag on a
-   * real company). Approving stage 1 resolves to `in_review` (a non-closing
-   * transition), so the done-transition guards never run and the merge-arming
-   * post-hook is reached exactly as it would be on any approved review.
+   * Seeds an issue on a two-stage review ladder with the company's
+   * `mergeArmingEnabled` flag TRUE (the only flag seeded in the fixture, per the
+   * card's out-of-scope rule: never enable the flag on a real company).
+   *
+   * `preCompleted` controls how far up the ladder the card sits:
+   *   - 0 (default): parked on the PENDING first stage. Approving it resolves to
+   *     `in_review` (a NON-closing transition) and leaves the ladder MID-LADDER
+   *     (completedStageIds=[stage1], stage2 pending) — the SUP-15459 shape that
+   *     must refuse to stamp/arm.
+   *   - 1: stage 1 is pre-completed (a decision row is seeded for it) and the
+   *     card is parked on the PENDING final stage. Approving it resolves to
+   *     `done` (a CLOSING transition) and completes the ladder — the terminal
+   *     shape that stamps exactly once and arms.
    */
-  async function seedIssueAwaitingReview(issuePrefix: string) {
+  async function seedIssueAwaitingReview(
+    issuePrefix: string,
+    { preCompleted = 0 }: { preCompleted?: number } = {},
+  ) {
     const companyId = randomUUID();
     const reviewerAgentId = randomUUID();
     const implementerAgentId = randomUUID();
@@ -261,15 +271,15 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
       },
       executionState: {
         status: "pending",
-        currentStageId: firstStageId,
-        currentStageIndex: 0,
+        currentStageId: preCompleted >= 1 ? secondStageId : firstStageId,
+        currentStageIndex: preCompleted >= 1 ? 1 : 0,
         currentStageType: "review",
         currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
         returnAssignee: { type: "agent", agentId: implementerAgentId, userId: null },
         reviewRequest: null,
-        completedStageIds: [],
+        completedStageIds: preCompleted >= 1 ? [firstStageId] : [],
         lastDecisionId: null,
-        lastDecisionOutcome: null,
+        lastDecisionOutcome: preCompleted >= 1 ? "approved" : null,
         monitor: null,
         changesRequestedCount: 0,
       },
@@ -278,6 +288,23 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
       .update(executionWorkspaces)
       .set({ sourceIssueId: issueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
+
+    // A pre-completed stage must be backed by a decision row or guard-b
+    // (stage-without-decision) refuses the card before the merge-arming hook.
+    if (preCompleted >= 1) {
+      await db.insert(issueExecutionDecisions).values({
+        companyId,
+        issueId,
+        stageId: firstStageId,
+        stageType: "review",
+        actorAgentId: reviewerAgentId,
+        actorUserId: null,
+        outcome: "approved",
+        body: "Stage 1 approved",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
 
     return { companyId, reviewerAgentId, issueId, identifier };
   }
@@ -308,15 +335,26 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     return rows.filter((r) => typeof r.body === "string" && r.body.startsWith("[Merge-arming]"));
   }
 
-  /** Approves the pending first stage through the PATCH decision door. */
-  async function approveFirstStage(identifier: string) {
+  /** Approves the card's current pending stage through the PATCH decision door. */
+  async function approveCurrentStage(identifier: string) {
+    // The Tier-1 done declaration (SUP-12693) is only enforced on closing
+    // (-> done) transitions; a mid-ladder approval (-> in_review) ignores it, so
+    // it is safe to always include it here.
     return request(app)
       .patch(`/api/issues/${identifier}`)
-      .send({ status: "done", comment: "Stage 1 approved.\n\nkind: review\ndecision: approved" });
+      .send({
+        status: "done",
+        comment:
+          "Stage approved.\nClosed at Tier 1 (landed, not liveness-probed): review stage approved. Liveness unverified.\n\nkind: review\ndecision: approved",
+      });
   }
 
   it("head_unresolvable refusal: armMergeOnApproval is never reached; the refusal comment is still posted", async () => {
-    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DREF1");
+    // Terminal ladder (final stage pending, prior stage pre-completed) so the
+    // SUP-15459 terminality gate passes and the hook reaches head resolution.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DREF1", {
+      preCompleted: 1,
+    });
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
     // The decision-time head cannot be resolved -> the hook builds the
@@ -327,9 +365,9 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     });
     mockArmMergeOnApproval.mockResolvedValue({ kind: "skipped", message: "skipped: must-not-run" });
 
-    const res = await approveFirstStage(identifier);
+    const res = await approveCurrentStage(identifier);
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await statusOf(issueId)).toBe("done");
 
     expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(0);
     const comments = await mergeArmingComments(issueId);
@@ -338,7 +376,11 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
   });
 
   it("publishApprovalStatus skipped:not_delivered: armMergeOnApproval is never reached; exactly one [Merge-arming] comment", async () => {
-    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DREF2");
+    // Terminal ladder so the SUP-15459 terminality gate passes and the hook
+    // reaches the delegated publish.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DREF2", {
+      preCompleted: 1,
+    });
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
     // The head IS resolved, but the delegated publish refuses (the card did not
@@ -355,9 +397,9 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     });
     mockArmMergeOnApproval.mockResolvedValue({ kind: "skipped", message: "skipped: must-not-run" });
 
-    const res = await approveFirstStage(identifier);
+    const res = await approveCurrentStage(identifier);
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await statusOf(issueId)).toBe("done");
 
     expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(0);
     const comments = await mergeArmingComments(issueId);
@@ -365,8 +407,13 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     expect(comments[0]!.body).toContain("status:skipped:not_delivered:");
   });
 
-  it("armed path (no regression): armMergeOnApproval is called exactly once and both comments are posted", async () => {
-    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DREF3");
+  it("SUP-15163 terminal card: ladder completes -> publishApprovalStatus and armMergeOnApproval run exactly once, both comments posted", async () => {
+    // Terminal ladder (final stage pending, prior stage pre-completed): the
+    // SUP-15459 gate passes and the hook reaches the happy path exactly as
+    // before — the same fixture with all stages complete arms the card.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DREF3", {
+      preCompleted: 1,
+    });
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
     // The happy path: head resolves, the publish arms, and merge arming runs.
@@ -385,15 +432,45 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
       message: "armed: Auto-merge enabled for TEA-Core/paperclip#437",
     });
 
-    const res = await approveFirstStage(identifier);
+    const res = await approveCurrentStage(identifier);
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await statusOf(issueId)).toBe("done");
 
+    expect(mockPublishApprovalStatus).toHaveBeenCalledTimes(1);
     expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(1);
     const comments = await mergeArmingComments(issueId);
     expect(comments).toHaveLength(2);
     expect(comments[0]!.body).toContain("status:published:");
     expect(comments[1]!.body).toContain("armed:");
+  });
+
+  it("SUP-15163 mid-ladder card: approving stage 1 of 2 refuses -> no stamp, no arm, exactly one non-terminal-ladder comment, card stays in_review", async () => {
+    // The exact SUP-15163 shape that the bug allowed through: a two-stage card
+    // whose first stage is approved but whose second stage is still pending.
+    // The terminality gate must refuse before any GitHub write.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DREF4");
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    mockResolveApprovalDecisionHead.mockResolvedValue({
+      kind: "resolved",
+      headSha: "deadbeefcafe",
+      displayName: "TEA-Core/paperclip#437",
+    });
+    mockPublishApprovalStatus.mockResolvedValue({
+      kind: "skipped",
+      message: "status:skipped: must-not-run",
+    });
+    mockArmMergeOnApproval.mockResolvedValue({ kind: "skipped", message: "skipped: must-not-run" });
+
+    const res = await approveCurrentStage(identifier);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("in_review");
+
+    expect(mockPublishApprovalStatus).toHaveBeenCalledTimes(0);
+    expect(mockArmMergeOnApproval).toHaveBeenCalledTimes(0);
+    const comments = await mergeArmingComments(issueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.body).toContain("status:skipped:non-terminal-ladder:");
   });
 
   it("stage-integrity refusal at the route (ADR-092 D4): guard-b finding suppresses merge arming, status transition is untouched", async () => {
@@ -592,7 +669,7 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
       async () => Promise.reject(new Error("simulated transient DB error in stage-integrity check")),
     );
 
-    const res = await approveFirstStage(identifier);
+    const res = await approveCurrentStage(identifier);
     expect(res.status, JSON.stringify(res.body)).toBe(200);
 
     // D5: never refuse to close — approving stage 1 still resolves to in_review.

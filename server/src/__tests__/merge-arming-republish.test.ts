@@ -191,6 +191,12 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     sharedWorkspaceOwnedByParent?: boolean;
     /** Pre-seed executionState.approvalStatus.publishedHeadSha (idempotent path). */
     prePublishedHeadSha?: string | null;
+    /**
+     * SUP-15459: append extra stages to the execution policy that are NOT in
+     * completedStageIds — the mid-ladder shape (the ladder is still running, the
+     * card merely has one approved stage behind it).
+     */
+    pendingStageIds?: string[];
   }
 
   async function seedIssue(opts: SeedOptions = {}) {
@@ -338,24 +344,37 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
         // actor so the resolved gated principal does not collide with the reviewer
         // that cast the approval (keeps the happy-path card guard-b-legal).
         ...(opts.noReturnAssignee ? {} : { returnAssigneeAgentId }),
-        stages: [{ id: STAGE_ID, type: "approval", approvalsNeeded: 1 }],
+        stages: [
+          { id: STAGE_ID, type: "approval", approvalsNeeded: 1 },
+          ...(opts.pendingStageIds ?? []).map((id) => ({
+            id,
+            type: "review",
+            approvalsNeeded: 1,
+          })),
+        ],
       },
       executionState,
     });
 
     if (opts.seedDecision !== false) {
-      await db.insert(issueExecutionDecisions).values({
-        companyId,
-        issueId,
-        stageId: STAGE_ID,
-        stageType: "approval",
-        actorAgentId: opts.returnAssigneeDecides ? returnAssigneeAgentId : reviewerAgentId,
-        actorUserId: null,
-        outcome: "approved",
-        body: "Approved",
-        createdAt: now,
-        updatedAt: now,
-      });
+      // One decision row per COMPLETED stage: guard-b:stage-without-decision
+      // refuses any completed stage that has none, so a multi-stage terminal
+      // fixture has to carry a real verdict for every stage it claims completed.
+      const completedForDecisions = (executionState.completedStageIds as string[]) ?? [STAGE_ID];
+      await db.insert(issueExecutionDecisions).values(
+        completedForDecisions.map((stageId) => ({
+          companyId,
+          issueId,
+          stageId,
+          stageType: stageId === STAGE_ID ? "approval" : "review",
+          actorAgentId: opts.returnAssigneeDecides ? returnAssigneeAgentId : reviewerAgentId,
+          actorUserId: null,
+          outcome: "approved",
+          body: "Approved",
+          createdAt: now,
+          updatedAt: now,
+        })),
+      );
     }
 
     if (opts.pr) {
@@ -488,6 +507,80 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     expect(res.status).toBe(409);
     expect(res.body.reason).toBe("guard-b:return-assignee-unresolved");
     expect(mockGhFetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses with 409 non_terminal_ladder on a mid-ladder card, with zero GitHub I/O (SUP-15459)", async () => {
+    // SUP-15163 shape on the recovery surface: a 4-stage ladder whose FIRST stage
+    // was legitimately approved. Guard A passes (a real "approved" decision) and
+    // Guard B passes (that one completed stage has a decision row cast by a
+    // non-return-assignee) — so before the terminality gate this route would
+    // re-stamp paperclip/approved and authorize a merge with three stages never
+    // executed. It must refuse before resolving the decision head.
+    const { companyId, issueId } = await seedIssue({
+      lastDecisionOutcome: "approved",
+      pendingStageIds: [
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+        "44444444-4444-4444-8444-444444444444",
+      ],
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+    });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.reason).toBe("non_terminal_ladder");
+    expect(res.body.message).toContain("status:skipped:non-terminal-ladder");
+    expect(res.body.message).toContain("22222222-2222-4222-8222-222222222222");
+    expect(res.body.message).toContain("33333333-3333-4333-8333-333333333333");
+    expect(res.body.message).toContain("44444444-4444-4444-8444-444444444444");
+    expect(mockGhFetch).not.toHaveBeenCalled();
+
+    // Nothing was recorded as published, so a later sweep cannot read this card
+    // as stamped either.
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const approvalStatus = (row?.executionState ?? {})?.approvalStatus as
+      | Record<string, unknown>
+      | undefined;
+    expect(approvalStatus?.publishedHeadSha).toBeUndefined();
+  });
+
+  it("re-publishes on the SAME multi-stage card once every stage is completed (SUP-15459 positive control)", async () => {
+    // The over-tight failure mode (SUP-11580 class) is a terminally-approved card
+    // that never re-stamps. Same 4-stage policy as the refusal above, with all
+    // four ids in completedStageIds: the route must stamp exactly once.
+    const pendingStageIds = [
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+      "44444444-4444-4444-8444-444444444444",
+    ];
+    const { companyId, issueId } = await seedIssue({
+      lastDecisionOutcome: "approved",
+      pendingStageIds,
+      completedStageIds: [STAGE_ID, ...pendingStageIds],
+      pr: { owner: OWNER, repo: REPO, number: PR_NUMBER, headRefName: DELIVERY_BRANCH },
+    });
+    currentActor = boardActor(companyId);
+
+    mockGhFetch
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}` }))
+      .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA } }))
+      .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+
+    const res = await request(app).post(`/api/issues/${issueId}/merge-arming/republish`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.outcome).toBe("armed");
+    expect(res.body.headSha).toBe(HEAD_SHA);
+    const statusWrites = mockGhFetch.mock.calls.filter(
+      (call) => typeof call[0] === "string" && (call[0] as string).includes("/statuses/"),
+    );
+    expect(statusWrites).toHaveLength(1);
+    expect(JSON.parse(statusWrites[0]![1]!.body as string).context).toBe("paperclip/approved");
   });
 
   it("answers 200 already_published when the stamp is already published, with no GitHub writes", async () => {
