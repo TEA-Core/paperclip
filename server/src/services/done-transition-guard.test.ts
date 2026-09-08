@@ -1640,6 +1640,187 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
+  describe("platform-generated review children are not decomposition children (SUP-15451)", () => {
+    const supportQaeId = "aaaaaaa1-0000-4000-8000-000000000001";
+    const coderLeId = "bbbbbbb2-0000-4000-8000-000000000002";
+    const execCtoId = "ccccccc3-0000-4000-8000-000000000003";
+    const stage1 = "10000000-0000-4000-8000-000000000001";
+
+    const agents = [
+      { id: supportQaeId, name: "support-QAE", role: "support" },
+      { id: coderLeId, name: "coder-LE", role: "engineer" },
+      { id: execCtoId, name: "exec-CTO", role: "executive" },
+    ];
+
+    const singleStageLadder = {
+      stages: [
+        { id: stage1, type: "review", participants: [{ type: "agent", agentId: supportQaeId }] },
+      ],
+    };
+
+    const satisfiedState = (stageIds: string[]) => ({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: stageIds,
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+
+    // A decomposition child: a satisfied single-stage ladder under `identifier`.
+    // origin_kind `manual` or `plugin:*` are the only kinds that count.
+    const ladderedChild = (identifier: string, childStageId: string, originKind: string = "manual") => ({
+      identifier,
+      originKind,
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    // The phantom: a platform-generated card parented to the same card, laddered,
+    // but origin_kind issue_productivity_review — not a decomposition child.
+    const phantomProductivityChild = (identifier: string, childStageId: string) => ({
+      identifier,
+      originKind: "issue_productivity_review",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    it("excludes a platform-generated review child from the count: 1 manual + 1 productivity review yields count == 1, refused by neither mechanism A nor D (AC2)", async () => {
+      // Mechanism A (null policy): the single genuine manual child is the only
+      // decomposition child; the phantom productivity-review card does not push
+      // the count to >= 2, so the parent closes ungated-legal.
+      setupDbMock({
+        issues: [
+          ladderedChild("SUP-9101", "40000000-0000-4000-8000-000000000001"),
+          phantomProductivityChild("SUP-9102", "50000000-0000-4000-8000-000000000002"),
+        ],
+      });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+
+      // Mechanism D (satisfied but shape-incomplete single-stage ladder): the
+      // exact live shape SUP-15139/15140/15157 — one genuine manual child plus
+      // one phantom. Count stays 1, below the >= 2 arm threshold, so the shape
+      // check is not armed and the parent closes.
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({
+        issues: [
+          ladderedChild("SUP-9101", "40000000-0000-4000-8000-000000000001"),
+          phantomProductivityChild("SUP-9102", "50000000-0000-4000-8000-000000000002"),
+        ],
+        agents,
+      });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(d.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("still counts two genuine manual children as 2: mechanism A and mechanism D both keep refusing (AC3)", async () => {
+      // Mechanism A: two manual decomposition children -> count 2 -> refused.
+      setupDbMock({
+        issues: [
+          ladderedChild("SUP-9201", "40000000-0000-4000-8000-000000000001", "manual"),
+          ladderedChild("SUP-9202", "50000000-0000-4000-8000-000000000002", "manual"),
+        ],
+      });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(false);
+      expect(a.reason).toContain("Mechanism A");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_null_policy_refused",
+          details: expect.objectContaining({
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-9201", "SUP-9202"],
+          }),
+        }),
+      );
+
+      // Mechanism D: two manual children over a shape-incomplete single-stage
+      // ladder -> count 2 -> refused, and the audit lists only the two counted
+      // decomposition children (AC5).
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({
+        issues: [
+          ladderedChild("SUP-9201", "40000000-0000-4000-8000-000000000001", "manual"),
+          ladderedChild("SUP-9202", "50000000-0000-4000-8000-000000000002", "manual"),
+        ],
+        agents,
+      });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: singleStageLadder, executionState: satisfiedState([stage1]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            reason: "adr072_close_ladder_shape_incomplete",
+            missingStageLabels: ["review:coder-LE", "approval:exec-CTO"],
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-9201", "SUP-9202"],
+          }),
+        }),
+      );
+    });
+
+    it("treats a plugin:* origin kind as a decomposition child (counts toward the threshold)", async () => {
+      // The two allowed origin kinds are `manual` and `plugin:*`. A plugin-filed
+      // laddered child counts the same as a manual one: two of them reach >= 2
+      // and mechanism A fires.
+      setupDbMock({
+        issues: [
+          ladderedChild("SUP-9301", "40000000-0000-4000-8000-000000000001", "plugin:foo:operation"),
+          ladderedChild("SUP-9302", "50000000-0000-4000-8000-000000000002", "plugin:bar:operation"),
+        ],
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism A");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_null_policy_refused",
+          details: expect.objectContaining({ ladderedChildCount: 2 }),
+        }),
+      );
+    });
+  });
+
   describe("open linked PRs block", () => {
     it("blocks transition when a linked PR is cached open, no GitHub token configured, and the last refresh succeeded (zero outbound fetch)", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([

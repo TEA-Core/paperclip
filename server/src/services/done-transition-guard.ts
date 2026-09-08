@@ -902,9 +902,17 @@ function evaluateReviewLadderSatisfaction(
  * was contained before its blockers cleared (SUP-15032 installed the close
  * ladder) and is closed; the SUP-15031 corpus scan found no other instance
  * (0 of 130 recently completed issues closed with >=2 blockedBy relations),
- * and `parent_id` linkage is the dominant decomposition edge.
- *
- * A ladder-less parent (executionPolicy null, or `stages: []` — either way
+  * and `parent_id` linkage is the dominant decomposition edge.
+  *
+  * SUP-15451: a child is only a decomposition child when its `origin_kind` is
+  * `manual` or matches `plugin:*`. Every other origin kind (issue_productivity_
+  * review, task_watchdog, stale_active_run_evaluation,
+  * harness_liveness_escalation, ...) is platform-generated bookkeeping
+  * parented to the card, not engineered sub-work — counting it re-arms the
+  * guard over a single genuine manual child. This exclusion lives here so
+  * both mechanism A and mechanism D inherit it; call sites never re-filter.
+  *
+  * A ladder-less parent (executionPolicy null, or `stages: []` — either way
  * `evaluateReviewLadderSatisfaction` reports no ladder) sitting over two or
  * more such children is a decomposed body of reviewed engineering work: the
  * work was gated at the children, so closing the parent with `done` would
@@ -932,6 +940,7 @@ async function countLadderedChildren(
       identifier: issues.identifier,
       executionPolicy: issues.executionPolicy,
       executionState: issues.executionState,
+      originKind: issues.originKind,
     })
     .from(issues)
     .where(and(eq(issues.companyId, companyId), eq(issues.parentId, parentId)));
@@ -939,6 +948,15 @@ async function countLadderedChildren(
   let count = 0;
   const identifiers: string[] = [];
   for (const row of rows) {
+    // SUP-15451: only decomposition children count. A platform-generated card
+    // parented to this issue (issue_productivity_review, task_watchdog,
+    // stale_active_run_evaluation, ...) is not a decomposition signal — it is
+    // not "which child gated this work?". The same reasoning as the SUP-15233
+    // drop of the blocks edge: an edge the platform itself draws must not arm
+    // the guard. The column defaults to 'manual' (notNull), so a missing value
+    // is an ordinary manually-filed card and counts.
+    const originKind = row.originKind ?? "manual";
+    if (originKind !== "manual" && !originKind.startsWith("plugin:")) continue;
     if (row.executionPolicy == null) continue;
     const state = parseIssueExecutionState(row.executionState);
     const completed = state?.completedStageIds?.length ?? 0;
