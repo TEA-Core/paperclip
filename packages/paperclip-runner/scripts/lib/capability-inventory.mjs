@@ -31,6 +31,12 @@ const groupPolicies = {
 // MCP names are retained only as traceability aliases into that contract; they
 // are not a second tool catalog and do not receive independent dispositions.
 const legacyMcpFoldTargets = {
+  // Fork-only tools (SUP-11809). They are this fork's self-declared analogue of the
+  // control-plane checkout/release pair, so they fold into the same eval coverage:
+  // paperclipCheckoutIssue -> eval:co-body-contract-01, paperclipReleaseIssue -> eval:er-release-01.
+  paperclipOpenWorkSession: "eval:co-body-contract-01",
+  paperclipHeartbeatWorkSession: "eval:co-body-contract-01",
+  paperclipCloseWorkSession: "eval:er-release-01",
   paperclipMe: "eval:hb-inbox-lite-01",
   paperclipInboxLite: "eval:hb-inbox-lite-01",
   paperclipListAgents: "eval:rf-api-mgr-heartbeat-01",
@@ -157,6 +163,14 @@ function parseCase(source, sourceAnchor) {
   };
 }
 
+/**
+ * The number of legacy MCP tools this repository classifies. Derived from the fold-target
+ * table, which is the one place a new tool has to be registered, so adding a tool cannot
+ * leave a second literal behind. Exported because the validator and its test fixture must
+ * agree on it.
+ */
+export const LEGACY_MCP_ALIAS_COUNT = Object.keys(legacyMcpFoldTargets).length;
+
 function parseMcpTools(source) {
   return [...source.matchAll(/makeTool\(\s*"([^"]+)"\s*,\s*"([^"]+)"/g)].map((match) => {
     const [name, description] = [match[1], match[2]];
@@ -247,7 +261,10 @@ export async function buildMcpInventory(repoRoot) {
 
 export function validateInventories(inventories) {
   const errors = [];
-  const expectedCounts = { capabilities: 152, evaluations: 106, legacyMcpAliases: 42 };
+  // legacyMcpAliases was a literal 42 upstream. This fork ships its own MCP tools, so the
+  // count is derived from the fold-target table above — the one place a new tool must be
+  // registered — instead of being a second number to edit and to re-resolve on every fold.
+  const expectedCounts = { capabilities: 152, evaluations: 106, legacyMcpAliases: LEGACY_MCP_ALIAS_COUNT };
   const normativeNames = ["capabilities", "evaluations"];
   const normativeRows = new Map();
   const globalNormativeIds = new Set();

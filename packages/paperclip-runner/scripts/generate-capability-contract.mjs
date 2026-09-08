@@ -132,7 +132,7 @@ function renderOverview(capabilities, tools, evals) {
   ].join("\n") + "\n";
 }
 
-function renderHandoff() {
+function renderHandoff(toolCount) {
   return [
     "# Capability Downstream Handoff",
     "",
@@ -141,7 +141,7 @@ function renderHandoff() {
     "## Stable Inputs",
     "",
     "- `capabilities.yaml`: every current Paperclip skill and reference heading, including its source anchor, disposition, semantic operation, and mock-state expectation.",
-    "- `mcp-tool-map.yaml`: the complete 42-tool legacy MCP replacement map.",
+    `- \`mcp-tool-map.yaml\`: the complete ${toolCount}-tool legacy MCP replacement map.`,
     "- `eval-traceability.yaml`: all 106 corpus cases in 16 groups, including fixtures, grants, operations, state projections, forbids, and browser evidence IDs.",
     "- `contract-schema.json`: required row fields and the closed disposition enum.",
     "",
@@ -183,7 +183,21 @@ async function buildContract() {
   for (const mappedToolName of Object.keys(contract.toolMappings)) {
     if (!discoveredToolNames.has(mappedToolName)) throw new Error(`MCP mapping has no registered source tool: ${mappedToolName}`);
   }
-  if (tools.length !== 42 || Object.keys(contract.toolMappings).length !== 42) throw new Error(`Expected 42 legacy MCP tools, found ${tools.length}`);
+  // Fork divergence: upstream pins this at a literal 42. This fork ships its own MCP tools
+  // (SUP-11809 added the three work-session ones), so a hardcoded count is a number the fork
+  // has to edit on every tool it adds AND re-resolve on every fold. The invariant the error
+  // actually cares about is that the discovered set and the classified set are the same set —
+  // "unclassified" is caught above, and this catches the other direction, a stale mapping for
+  // a tool that no longer exists.
+  const expectedToolCount = Object.keys(contract.toolMappings).length;
+  if (tools.length !== expectedToolCount) {
+    const discovered = new Set(tools.map((tool) => tool.name));
+    const stale = Object.keys(contract.toolMappings).filter((name) => !discovered.has(name));
+    throw new Error(
+      `Expected ${expectedToolCount} legacy MCP tools, found ${tools.length}` +
+        (stale.length > 0 ? `; mapped but not discovered: ${stale.join(", ")}` : ""),
+    );
+  }
   if (evals.length !== 106 || new Set(evals.map((row) => row.group)).size !== 16) throw new Error(`Expected 106 eval cases in 16 groups, found ${evals.length}`);
 
   return {
@@ -191,7 +205,7 @@ async function buildContract() {
     [outputPaths.tools]: stableJson({ schemaVersion: 1, rows: tools }),
     [outputPaths.evals]: stableJson({ schemaVersion: 1, rows: evals }),
     [outputPaths.overview]: renderOverview(capabilities, tools, evals),
-    [outputPaths.handoff]: renderHandoff(),
+    [outputPaths.handoff]: renderHandoff(tools.length),
   };
 }
 
