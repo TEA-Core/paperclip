@@ -519,25 +519,39 @@ function fileMapFromCompare(body: unknown): Map<string, string> | null {
 }
 
 /**
- * Bounded, human-readable summary of the difference between the approved and
- * live diff-vs-base maps, or null when the two maps are identical.
+ * Bounded, human-readable summary of the content the LIVE head introduces that
+ * the reviewer did not approve, or null when it introduces none.
+ *
+ * Only two shapes can carry unreviewed content, and both still refuse:
+ *   - a file in LIVE that is absent from APPROVED  -> `(added)`
+ *   - a file in both whose blob SHA differs        -> `(changed)`
+ *
+ * A file present in APPROVED and absent from LIVE is deliberately NOT a
+ * substance change. Its absence from the live diff-vs-base means the live head
+ * is byte-identical to base for that file, so whatever it holds is already on
+ * the base branch and was already reviewed there. That is the ordinary
+ * `update-branch` / rebase-past-a-sibling-merge shape this guard's contract
+ * promises to make inert.
+ *
+ * Counting it made the predicate a symmetric set-difference, which contradicted
+ * that contract and is what stranded TSP PR #3462 (SUP-15391): main advanced 10
+ * commits past the branch's stale merge-base and absorbed 31 of the 35 approved
+ * files, leaving a live diff of 4 files that were each a byte-identical member
+ * of the approved set -- zero added, zero changed. The head carried no
+ * unreviewed content, Guard A refused anyway, and because the card was already
+ * `completed` no in-band path could re-publish the stamp.
  */
 function diffSubstanceChange(
   approved: Map<string, string>,
   live: Map<string, string>,
 ): string | null {
   const changed: string[] = [];
-  for (const [filename, sha] of approved) {
-    const liveSha = live.get(filename);
-    if (liveSha === undefined) {
-      changed.push(`${filename} (removed)`);
-    } else if (liveSha !== sha) {
-      changed.push(`${filename} (changed)`);
-    }
-  }
-  for (const filename of live.keys()) {
-    if (!approved.has(filename)) {
+  for (const [filename, sha] of live) {
+    const approvedSha = approved.get(filename);
+    if (approvedSha === undefined) {
       changed.push(`${filename} (added)`);
+    } else if (approvedSha !== sha) {
+      changed.push(`${filename} (changed)`);
     }
   }
   if (changed.length === 0) return null;
