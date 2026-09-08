@@ -133,11 +133,16 @@ jobs:
       # Round 5 (security): the posting implementation is fetched from the
       # pinned protected BASE SHA via the contents API (never from the entry's
       # own tree), executed from $RUNNER_TEMP, and independent of any checkout
-      # or ref race. Round 6 (availability): if the trusted helper is not yet
-      # on the base (it first ships on the PR that rolls this out), do NOT
-      # silently skip the artefact — fall back to the inline trusted
-      # find-or-upsert below, which uses the same per-check marker so the two
-      # paths update the same comment in place.
+      # or ref race. Round 7 (security, merge-group-comment-token-executes-pr-code):
+      # there is NO inline fallback poster. Inline shell in this workflow file is
+      # itself code a queued PR can rewrite (a merge_group event runs the file
+      # from the queue ref, which carries the PR's changes), so any inline body
+      # that POST/PATCHes with this job's write-capable GH_TOKEN would let a
+      # queued PR post or update arbitrary repository comments. The ENTIRE
+      # posting implementation therefore lives in the base-pinned helper below;
+      # the step only fetches it and runs it. If the helper is not on the base
+      # (pre-rollout) the step fails loudly — it never executes an untrusted
+      # inline fallback and never pretends the artefact was produced.
       - name: Surface the merge-queue ejection reason on the PR
         if: ${{ failure() && github.event_name == 'merge_group' && steps.gate.outcome == 'failure' }}
         env:
@@ -149,39 +154,8 @@ jobs:
           surface="${RUNNER_TEMP}/surface-merge-queue-ejection.sh"
           if gh api "repos/${GH_REPO}/contents/scripts/ci/surface-merge-queue-ejection.sh?ref=${MERGE_EJECTION_BASE_SHA}" \
               --jq .content 2>/dev/null | base64 -d >"$surface" 2>/dev/null && [ -s "$surface" ]; then
-            bash "$surface" --check-name paperclip-approved-enforcer --verdict "$MERGE_EJECTION_VERDICT"
+            bash "$surface" --check-name "$MERGE_EJECTION_CHECK_NAME" --verdict "$MERGE_EJECTION_VERDICT"
             exit $?
           fi
-          echo "[merge-queue-ejection] trusted surface not on base yet — using the inline fallback poster (best-effort)"
-          # --- inline trusted find-or-upsert (no repo file needed) ---
-          pr=""
-          for ref in "${GITHUB_REF_NAME:-}" "${GITHUB_REF:-}"; do
-            [ -n "$ref" ] || continue
-            short="${ref#refs/heads/}"
-            if [[ "$short" =~ ^gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$ ]]; then pr="${BASH_REMATCH[1]}"; break; fi
-          done
-          if ! [[ "${pr:-}" =~ ^[0-9]+$ ]]; then
-            echo "[merge-queue-ejection] could not resolve the PR number — skipping (best-effort); enforcement unaffected"
-            exit 0
-          fi
-          marker="<!-- paperclip:merge-queue-ejection:${MERGE_EJECTION_CHECK_NAME} -->"
-          reason="$(tr -d '\r' <"$MERGE_EJECTION_VERDICT" 2>/dev/null | tail -c 4096 | sed -e '/^[[:space:]]*$/d')"
-          if [ -z "$reason" ]; then
-            reason="(the ${MERGE_EJECTION_CHECK_NAME} check failed on the merge-group commit; see its merge_group run for the full log)"
-          fi
-          body="$(printf '%s\n## Ejected from the merge queue\n\nThe required **%s** check failed on this entry'"'"'s merge-group commit, so the merge queue removed it.\n\n**Failing check:** %s\n\n**Reason:**\n\n```\n%s\n```\n' \
-            "$marker" "$MERGE_EJECTION_CHECK_NAME" "$MERGE_EJECTION_CHECK_NAME" "$reason")"
-          existing_id="$(gh api --paginate "repos/${GH_REPO}/issues/${pr}/comments?per_page=100" \
-            --jq -r --arg m "paperclip:merge-queue-ejection:${MERGE_EJECTION_CHECK_NAME}" '.[] | select((.body // "") | contains($m)) | .id' 2>/dev/null | head -1 || true)"
-          if [ -n "${existing_id:-}" ]; then
-            jq -n --arg b "$body" '{body: $b}' \
-              | gh api -X PATCH "repos/${GH_REPO}/issues/${pr}/comments/${existing_id}" --input - >/dev/null 2>&1 \
-              && echo "[merge-queue-ejection] updated inline ejection comment ${existing_id}" \
-              || echo "[merge-queue-ejection] could not update the inline comment — best-effort; enforcement unaffected"
-          else
-            jq -n --arg b "$body" '{body: $b}' \
-              | gh api -X POST "repos/${GH_REPO}/issues/${pr}/comments" --input - >/dev/null 2>&1 \
-              && echo "[merge-queue-ejection] posted inline ejection comment" \
-              || echo "[merge-queue-ejection] could not post the inline comment — best-effort; enforcement unaffected"
-          fi
-          exit 0
+          echo "::error::[merge-queue-ejection] cannot surface the ejection on PR: the trusted posting helper scripts/ci/surface-merge-queue-ejection.sh is not available on the protected base ${MERGE_EJECTION_BASE_SHA} (it lands on the base when the SUP-15375 rollout merges). Failing loudly — no untrusted inline fallback runs with the write-capable token, and no artefact is claimed. Enforcement is unaffected (the gate step above already failed)."
+          exit 1

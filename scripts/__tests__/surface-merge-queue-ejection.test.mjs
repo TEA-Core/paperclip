@@ -403,13 +403,15 @@ test("control code is never executed from a PR-controlled checkout", () => {
   }
 });
 
-test("each surface step falls back to an inline poster when the trusted helper is absent from base", () => {
-  // SUP-15375 round 6 (merge-group-surface-checkout-failure-no-artifact): the
-  // posting helper first ships on THIS PR, so on the very first rollout /
-  // current-PR merge-group failure the base fetch cannot succeed. The surface
-  // steps must therefore not silently skip — each must carry an inline trusted
-  // find-or-upsert (same per-check marker + issues-comment endpoint) used when
-  // the base-fetched helper is unavailable.
+test("no surface step may carry an inline write-token fallback poster", () => {
+  // SUP-15375 round 7 (merge-group-comment-token-executes-pr-code): a
+  // merge_group run executes this workflow file from the queue ref, whose tree
+  // a queued PR controls — including any rewrite of `.github/workflows/*`. An
+  // inline shell block that POST/PATCHes a comment with the job's write-capable
+  // GH_TOKEN is therefore code a queued PR can repurpose to post or update
+  // arbitrary repository comments. The ENTIRE posting implementation must live
+  // in the base-pinned helper; each workflow step may only fetch that helper
+  // and run it. The round-6 inline find-or-upsert is the round-7 defect.
   const surfaces = [
     { file: workflow, stepName: "- name: Surface the merge-queue ejection reason on the PR", checkName: "paperclip-approved-enforcer" },
     { file: prWorkflow, stepName: "- name: Surface the merge-queue ejection reason on the PR (verify)", checkName: "verify" },
@@ -419,25 +421,64 @@ test("each surface step falls back to an inline poster when the trusted helper i
     const text = readFileSync(file, "utf8");
     const idx = text.indexOf(stepName);
     assert.ok(idx >= 0, `surface step must exist (${checkName})`);
-    // The step runs until the next top-level "- name:" / "- uses:" at 6-space
-    // indent (or the end of file for the last step).
     const rest = text.slice(idx);
     const next = rest.match(/\n      - (?:name|uses): /);
     const block = next ? rest.slice(0, next.index) : rest;
-    // Tries the trusted base helper first…
-    assert.match(block, /contents\/scripts\/ci\/surface-merge-queue-ejection\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/, "must try the base-pinned helper");
-    // …and, when that is unavailable, posts/updates via an inline implementation
-    // rather than exiting 0 silently (the round-6 defect).
-    assert.ok(block.includes("using the inline fallback poster"), `inline fallback announced (${checkName})`);
-    // The per-check marker: either hard-coded (verify/e2e) or env-driven with
-    // the check name in the step env (enforcer). Both reference the check.
-    const markerExpr = `paperclip:merge-queue-ejection:${checkName}`;
-    assert.ok(
-      block.includes(markerExpr) || (block.includes("paperclip:merge-queue-ejection:") && block.includes(`${checkName}`)),
-      `inline fallback uses the ${checkName} per-check marker`,
+    // The step fetches the base-pinned helper and runs it — nothing else.
+    assert.match(
+      block,
+      /contents\/scripts\/ci\/surface-merge-queue-ejection\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/,
+      `must fetch the base-pinned helper (${checkName})`,
     );
-    assert.ok(block.includes('gh api -X POST "repos/${GH_REPO}/issues/${pr}/comments" --input -'), "inline fallback can create the comment");
-    assert.ok(block.includes('gh api -X PATCH "repos/${GH_REPO}/issues/${pr}/comments/${existing_id}" --input -'), "inline fallback can update in place");
+    assert.match(block, /bash "\$surface"/, `must run the fetched helper, not inline logic (${checkName})`);
+    // Round-6 inline find-or-upsert is gone: no inline poster announcement, no
+    // inline issue-comment write, no inline comment-body POST/PATCH.
+    assert.doesNotMatch(block, /inline fallback poster/, `no inline fallback poster (${checkName})`);
+    assert.doesNotMatch(block, /issues\/\$\{pr\}\/comments/, `no inline issue-comment write (${checkName})`);
+    assert.doesNotMatch(block, /gh api -X POST/, `no inline POST (${checkName})`);
+    assert.doesNotMatch(block, /gh api -X PATCH/, `no inline PATCH (${checkName})`);
+  }
+  // Whole-job scan: the write-token jobs (enforcer/verify/e2e) must not carry
+  // any inline comment-posting shell at all — the helper performs the write at
+  // runtime from base-pinned bytes, so the verb never appears in the workflow.
+  for (const { file, jobName } of [
+    { file: workflow, jobName: "paperclip-approved-enforcer" },
+    { file: prWorkflow, jobName: "verify" },
+    { file: prWorkflow, jobName: "e2e" },
+  ]) {
+    const text = readFileSync(file, "utf8");
+    const m = text.match(new RegExp(`\\n {2}${jobName}:((?: {4}.*\\n|\\n)*?)(?=\\n {2}[A-Za-z_]|$)`));
+    const job = m ? m[1] : "";
+    assert.ok(job.length > 0, `write-token job must exist (${jobName})`);
+    assert.doesNotMatch(job, /gh api -X POST/, `${jobName} must not POST inline`);
+    assert.doesNotMatch(job, /gh api -X PATCH/, `${jobName} must not PATCH inline`);
+  }
+});
+
+test("a surface step whose base-fetched helper is unavailable fails loudly (never an inline fallback, never a silent skip)", () => {
+  // SUP-15375 round 7: the trusted posting helper reaches the protected base
+  // only when the rollout PR merges, so a pre-merge ejection finds no helper to
+  // fetch. That path must neither exit 0 silently (round-6 defect: the required
+  // artefact vanishes with no trace) nor run inline shell (round-7 defect): it
+  // emits an ::error:: annotation and fails the step, making the missing
+  // artefact visible in the run. Enforcement is unaffected — the gate step the
+  // surface gates on has already failed.
+  const surfaces = [
+    { file: workflow, stepName: "- name: Surface the merge-queue ejection reason on the PR", checkName: "paperclip-approved-enforcer" },
+    { file: prWorkflow, stepName: "- name: Surface the merge-queue ejection reason on the PR (verify)", checkName: "verify" },
+    { file: prWorkflow, stepName: "- name: Surface the merge-queue ejection reason on the PR (e2e)", checkName: "e2e" },
+  ];
+  for (const { file, stepName, checkName } of surfaces) {
+    const text = readFileSync(file, "utf8");
+    const idx = text.indexOf(stepName);
+    assert.ok(idx >= 0, `surface step must exist (${checkName})`);
+    const rest = text.slice(idx);
+    const next = rest.match(/\n      - (?:name|uses): /);
+    const block = next ? rest.slice(0, next.index) : rest;
+    assert.match(block, /::error::/, `missing helper must be loud (::error::) (${checkName})`);
+    assert.match(block, /exit 1/, `missing helper must fail the step, not exit 0 silently (${checkName})`);
+    assert.doesNotMatch(block, /inline fallback poster/, `no inline fallback reintroduced (${checkName})`);
+    assert.doesNotMatch(block, /gh api -X POST/, `no inline POST fallback (${checkName})`);
   }
 });
 

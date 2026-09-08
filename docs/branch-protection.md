@@ -97,7 +97,7 @@ contract violation (fake approval). The only sanctioned recovery is the
   against its own identifier prefix on the PR head ref instead (`SUP-123-...`
   for card `SUP-123`). The repo half is identical in both cases: a PR in another
   repo is always refused (ADR-091 D5). A shared-workspace card whose head ref is
-   unreadable, or which carries another card's prefix, is still refused.
+  unreadable, or which carries another card's prefix, is still refused.
 
 ### Merge-queue ejection surface (SUP-15375)
 
@@ -140,22 +140,29 @@ Each artefact:
 
 **Security boundary (merge-group-comment-token-executes-pr-code).** The jobs
 that post the artefact hold `pull-requests: write`, and on a `merge_group`
-event the default checkout is the `gh-readonly-queue` ref — whose tree the
-queued PR controls. The workflows therefore never execute `scripts/ci/*` from
-that tree. Control code (the enforcer gate script and the surface posting
-script) is fetched from the **pinned protected BASE SHA** (the commit the entry
-is built on) via the contents API into `$RUNNER_TEMP`, so a queued PR can never
-replace it with code that runs under the write token. This also removes the
-surface's dependence on a checkout that the queue may delete mid-ejection.
+event the workflow file and the default checkout both come from the
+`gh-readonly-queue` ref — whose tree the queued PR controls (it can rewrite
+`.github/workflows/*` itself). The workflows therefore NEVER carry an inline
+posting implementation, and never execute `scripts/ci/*` from that tree. The
+entire posting implementation is `scripts/ci/surface-merge-queue-ejection.sh`,
+fetched from the **pinned protected BASE SHA** (the commit the entry is built
+on) via the contents API into `$RUNNER_TEMP` and executed there — a queued PR
+can neither replace the fetched bytes nor add inline code that runs under the
+write token. This also removes the surface's dependence on a checkout that the
+queue may delete mid-ejection.
 
-**First-rollout availability (merge-group-surface-checkout-failure-no-artifact).**
-The posting helper first ships on the PR that rolls this surface out, so on the
-current PR's own merge-group failure the base does not yet carry it. Each
-surface step therefore has an **inline trusted find-or-upsert fallback** (same
-per-check marker and `issues/{n}/comments` contract) that posts/updates the
-comment directly when the base-fetched helper is unavailable — the required
-artefact is never silently skipped. Once the helper lands on the protected base
-the fetched path takes over and keeps updating the same in-place comment.
+**First-rollout sequencing (merge-group-surface-checkout-failure-no-artifact).**
+Because the posting helper is read from the protected base, it must be ON the
+base before the surface is relied on: the helper lands on the fold when this
+rollout PR merges. Between this PR opening and that merge, a red `merge_group`
+on a queue entry cannot be commented (the base does not yet carry the helper).
+The surface step must not silently skip that case — it logs an `::error::` and
+fails, so the missing artefact is visible in the run rather than claimed
+absent; it never falls back to inline shell, because that would execute
+PR-controlled code with the write token. Once this PR merges, every subsequent
+ejected entry is surfaced in place. If a zero-window rollout is ever required,
+land `scripts/ci/surface-merge-queue-ejection.sh` (and its unit tests) on the
+fold in its own inert PR first, then wire the surface steps.
 
 ### ADR-091 D1 delivery-identity evidence order (SUP-14824)
 
