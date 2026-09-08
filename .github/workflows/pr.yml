@@ -672,12 +672,43 @@ jobs:
             exit 0
           fi
           surface="${RUNNER_TEMP}/surface-merge-queue-ejection.sh"
-          if ! gh api "repos/${GH_REPO}/contents/scripts/ci/surface-merge-queue-ejection.sh?ref=${MERGE_EJECTION_BASE_SHA}" --jq .content 2>/dev/null | base64 -d >"$surface"; then
-            echo "[merge-queue-ejection] trusted surface not on base ${MERGE_EJECTION_BASE_SHA} yet — skipping (best-effort); enforcement unaffected"
+          if gh api "repos/${GH_REPO}/contents/scripts/ci/surface-merge-queue-ejection.sh?ref=${MERGE_EJECTION_BASE_SHA}" \
+              --jq .content 2>/dev/null | base64 -d >"$surface" 2>/dev/null && [ -s "$surface" ]; then
+            bash "$surface" --check-name verify --verdict "$MERGE_EJECTION_VERDICT"
+            exit $?
+          fi
+          echo "[merge-queue-ejection] trusted surface not on base yet — using the inline fallback poster (best-effort)"
+          # --- inline trusted find-or-upsert (no repo file needed) ---
+          pr=""
+          for ref in "${GITHUB_REF_NAME:-}" "${GITHUB_REF:-}"; do
+            [ -n "$ref" ] || continue
+            short="${ref#refs/heads/}"
+            if [[ "$short" =~ ^gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$ ]]; then pr="${BASH_REMATCH[1]}"; break; fi
+          done
+          if ! [[ "${pr:-}" =~ ^[0-9]+$ ]]; then
+            echo "[merge-queue-ejection] could not resolve the PR number — skipping (best-effort); enforcement unaffected"
             exit 0
           fi
-          [ -s "$surface" ] || { echo "[merge-queue-ejection] trusted surface fetch empty — skipping; enforcement unaffected"; exit 0; }
-          bash "$surface" --check-name verify --verdict "$MERGE_EJECTION_VERDICT"
+          marker="<!-- paperclip:merge-queue-ejection:verify -->"
+          reason="$(tr -d '\r' <"$MERGE_EJECTION_VERDICT" 2>/dev/null | tail -c 4096 | sed -e '/^[[:space:]]*$/d')"
+          if [ -z "$reason" ]; then
+            reason="(the verify check failed on the merge-group commit; see its merge_group run for the full log)"
+          fi
+          body="$(printf '%s\n## Ejected from the merge queue\n\nThe required **verify** check failed on this entry'"'"'s merge-group commit, so the merge queue removed it.\n\n**Failing check:** verify\n\n**Reason:**\n\n\`\`\`\n%s\n\`\`\`\n' "$marker" "$reason")"
+          existing_id="$(gh api --paginate "repos/${GH_REPO}/issues/${pr}/comments?per_page=100" \
+            --jq -r --arg m 'paperclip:merge-queue-ejection:verify' '.[] | select((.body // "") | contains($m)) | .id' 2>/dev/null | head -1 || true)"
+          if [ -n "${existing_id:-}" ]; then
+            jq -n --arg b "$body" '{body: $b}' \
+              | gh api -X PATCH "repos/${GH_REPO}/issues/${pr}/comments/${existing_id}" --input - >/dev/null 2>&1 \
+              && echo "[merge-queue-ejection] updated inline ejection comment ${existing_id}" \
+              || echo "[merge-queue-ejection] could not update the inline comment — best-effort; enforcement unaffected"
+          else
+            jq -n --arg b "$body" '{body: $b}' \
+              | gh api -X POST "repos/${GH_REPO}/issues/${pr}/comments" --input - >/dev/null 2>&1 \
+              && echo "[merge-queue-ejection] posted inline ejection comment" \
+              || echo "[merge-queue-ejection] could not post the inline comment — best-effort; enforcement unaffected"
+          fi
+          exit 0
 
   build:
     name: Build
@@ -1060,9 +1091,40 @@ jobs:
             exit 0
           fi
           surface="${RUNNER_TEMP}/surface-merge-queue-ejection.sh"
-          if ! gh api "repos/${GH_REPO}/contents/scripts/ci/surface-merge-queue-ejection.sh?ref=${MERGE_EJECTION_BASE_SHA}" --jq .content 2>/dev/null | base64 -d >"$surface"; then
-            echo "[merge-queue-ejection] trusted surface not on base ${MERGE_EJECTION_BASE_SHA} yet — skipping (best-effort); enforcement unaffected"
+          if gh api "repos/${GH_REPO}/contents/scripts/ci/surface-merge-queue-ejection.sh?ref=${MERGE_EJECTION_BASE_SHA}" \
+              --jq .content 2>/dev/null | base64 -d >"$surface" 2>/dev/null && [ -s "$surface" ]; then
+            bash "$surface" --check-name e2e --verdict "$MERGE_EJECTION_VERDICT"
+            exit $?
+          fi
+          echo "[merge-queue-ejection] trusted surface not on base yet — using the inline fallback poster (best-effort)"
+          # --- inline trusted find-or-upsert (no repo file needed) ---
+          pr=""
+          for ref in "${GITHUB_REF_NAME:-}" "${GITHUB_REF:-}"; do
+            [ -n "$ref" ] || continue
+            short="${ref#refs/heads/}"
+            if [[ "$short" =~ ^gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$ ]]; then pr="${BASH_REMATCH[1]}"; break; fi
+          done
+          if ! [[ "${pr:-}" =~ ^[0-9]+$ ]]; then
+            echo "[merge-queue-ejection] could not resolve the PR number — skipping (best-effort); enforcement unaffected"
             exit 0
           fi
-          [ -s "$surface" ] || { echo "[merge-queue-ejection] trusted surface fetch empty — skipping; enforcement unaffected"; exit 0; }
-          bash "$surface" --check-name e2e --verdict "$MERGE_EJECTION_VERDICT"
+          marker="<!-- paperclip:merge-queue-ejection:e2e -->"
+          reason="$(tr -d '\r' <"$MERGE_EJECTION_VERDICT" 2>/dev/null | tail -c 4096 | sed -e '/^[[:space:]]*$/d')"
+          if [ -z "$reason" ]; then
+            reason="(the e2e check failed on the merge-group commit; see its merge_group run for the full log)"
+          fi
+          body="$(printf '%s\n## Ejected from the merge queue\n\nThe required **e2e** check failed on this entry'"'"'s merge-group commit, so the merge queue removed it.\n\n**Failing check:** e2e\n\n**Reason:**\n\n\`\`\`\n%s\n\`\`\`\n' "$marker" "$reason")"
+          existing_id="$(gh api --paginate "repos/${GH_REPO}/issues/${pr}/comments?per_page=100" \
+            --jq -r --arg m 'paperclip:merge-queue-ejection:e2e' '.[] | select((.body // "") | contains($m)) | .id' 2>/dev/null | head -1 || true)"
+          if [ -n "${existing_id:-}" ]; then
+            jq -n --arg b "$body" '{body: $b}' \
+              | gh api -X PATCH "repos/${GH_REPO}/issues/${pr}/comments/${existing_id}" --input - >/dev/null 2>&1 \
+              && echo "[merge-queue-ejection] updated inline ejection comment ${existing_id}" \
+              || echo "[merge-queue-ejection] could not update the inline comment — best-effort; enforcement unaffected"
+          else
+            jq -n --arg b "$body" '{body: $b}' \
+              | gh api -X POST "repos/${GH_REPO}/issues/${pr}/comments" --input - >/dev/null 2>&1 \
+              && echo "[merge-queue-ejection] posted inline ejection comment" \
+              || echo "[merge-queue-ejection] could not post the inline comment — best-effort; enforcement unaffected"
+          fi
+          exit 0

@@ -148,6 +148,15 @@ is built on) via the contents API into `$RUNNER_TEMP`, so a queued PR can never
 replace it with code that runs under the write token. This also removes the
 surface's dependence on a checkout that the queue may delete mid-ejection.
 
+**First-rollout availability (merge-group-surface-checkout-failure-no-artifact).**
+The posting helper first ships on the PR that rolls this surface out, so on the
+current PR's own merge-group failure the base does not yet carry it. Each
+surface step therefore has an **inline trusted find-or-upsert fallback** (same
+per-check marker and `issues/{n}/comments` contract) that posts/updates the
+comment directly when the base-fetched helper is unavailable — the required
+artefact is never silently skipped. Once the helper lands on the protected base
+the fetched path takes over and keeps updating the same in-place comment.
+
 ### ADR-091 D1 delivery-identity evidence order (SUP-14824)
 
 When resolving a card's delivery identity (`resolveDeliveryIdentity`), the

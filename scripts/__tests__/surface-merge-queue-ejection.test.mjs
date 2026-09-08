@@ -403,6 +403,44 @@ test("control code is never executed from a PR-controlled checkout", () => {
   }
 });
 
+test("each surface step falls back to an inline poster when the trusted helper is absent from base", () => {
+  // SUP-15375 round 6 (merge-group-surface-checkout-failure-no-artifact): the
+  // posting helper first ships on THIS PR, so on the very first rollout /
+  // current-PR merge-group failure the base fetch cannot succeed. The surface
+  // steps must therefore not silently skip — each must carry an inline trusted
+  // find-or-upsert (same per-check marker + issues-comment endpoint) used when
+  // the base-fetched helper is unavailable.
+  const surfaces = [
+    { file: workflow, stepName: "- name: Surface the merge-queue ejection reason on the PR", checkName: "paperclip-approved-enforcer" },
+    { file: prWorkflow, stepName: "- name: Surface the merge-queue ejection reason on the PR (verify)", checkName: "verify" },
+    { file: prWorkflow, stepName: "- name: Surface the merge-queue ejection reason on the PR (e2e)", checkName: "e2e" },
+  ];
+  for (const { file, stepName, checkName } of surfaces) {
+    const text = readFileSync(file, "utf8");
+    const idx = text.indexOf(stepName);
+    assert.ok(idx >= 0, `surface step must exist (${checkName})`);
+    // The step runs until the next top-level "- name:" / "- uses:" at 6-space
+    // indent (or the end of file for the last step).
+    const rest = text.slice(idx);
+    const next = rest.match(/\n      - (?:name|uses): /);
+    const block = next ? rest.slice(0, next.index) : rest;
+    // Tries the trusted base helper first…
+    assert.match(block, /contents\/scripts\/ci\/surface-merge-queue-ejection\.sh\?ref=\$\{MERGE_EJECTION_BASE_SHA\}/, "must try the base-pinned helper");
+    // …and, when that is unavailable, posts/updates via an inline implementation
+    // rather than exiting 0 silently (the round-6 defect).
+    assert.ok(block.includes("using the inline fallback poster"), `inline fallback announced (${checkName})`);
+    // The per-check marker: either hard-coded (verify/e2e) or env-driven with
+    // the check name in the step env (enforcer). Both reference the check.
+    const markerExpr = `paperclip:merge-queue-ejection:${checkName}`;
+    assert.ok(
+      block.includes(markerExpr) || (block.includes("paperclip:merge-queue-ejection:") && block.includes(`${checkName}`)),
+      `inline fallback uses the ${checkName} per-check marker`,
+    );
+    assert.ok(block.includes('gh api -X POST "repos/${GH_REPO}/issues/${pr}/comments" --input -'), "inline fallback can create the comment");
+    assert.ok(block.includes('gh api -X PATCH "repos/${GH_REPO}/issues/${pr}/comments/${existing_id}" --input -'), "inline fallback can update in place");
+  }
+});
+
 test("the enforcer gate still fails closed and quotes a fetched verdict", () => {
   const text = readFileSync(workflow, "utf8");
   // The gate runs the base-fetched enforcer script and must still exit with its
