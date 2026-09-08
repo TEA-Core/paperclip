@@ -371,13 +371,24 @@ describeEmbeddedPostgres("issue review attention", () => {
       });
     }
 
-    // NB: a `pending_review_rearm_cap_exhausted` recovery action (ownerType: board)
-    // is deliberately NOT seeded here. classifyIssueReviewPaths turns any open
-    // recovery action into a maintained `recovery` path (issues.ts), which would
-    // flip the card to `covered` and contradict the acceptance criterion that an
-    // exhausted re-arm budget is not covered. That recovery-path classification is
-    // a separate concern (the issue's "Out of scope" recovery/blocker analogue),
-    // not part of this scoring fix.
+    // The real production 3/3 shape: when the re-arm budget is exhausted, the
+    // platform upserts a `pending_review_rearm_cap_exhausted` recovery action
+    // (ownerType: board) on the review issue (recovery/service.ts). That action is
+    // the terminal "re-arming stopped, escalate to board" marker — NOT a maintained
+    // action path — so it must not keep the card `covered`. Seed it to prove the
+    // exhausted undecided review still scores stalled even with the marker present.
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: staleIssueId,
+      kind: "pending_review_rearm_cap_exhausted",
+      status: "active",
+      ownerType: "board",
+      previousOwnerAgentId: deadAgentId,
+      cause: "pending_review_rearm_cap_exhausted",
+      fingerprint: `prr:${companyId}:${staleIssueId}`,
+      evidence: { identifier: "RVA-STALE-1", reArmCount: 3, reArmMax: 3, reArmWindowMs: 30 * 60 * 1000 },
+      nextAction: "This issue's pending review was re-armed repeatedly without a decision. Review and take action.",
+    });
 
     let row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === staleIssueId);
     expect(row?.reviewAttention?.state).not.toBe("covered");
