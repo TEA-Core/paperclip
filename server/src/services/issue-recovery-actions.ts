@@ -435,17 +435,17 @@ export function issueRecoveryActionService(db: Db) {
       }
       const nextAttemptCount =
         input.attemptCount ?? existing.attemptCount + 1;
-      // SUP-14151: an unset `maxAttempts` is not an unbounded budget. The sweep
-      // holds every row to `maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS`,
-      // so leaving this null would let the count climb past the ceiling the sweep
-      // enforces and re-escalate on the very next pass.
-      const effectiveMaxAttempts =
-        (input.preserveExistingOwner
+      const effectiveMaxAttempts = input.preserveExistingOwner
+        ? existing.maxAttempts
+        : input.maxAttempts === undefined
           ? existing.maxAttempts
-          : input.maxAttempts === undefined
-            ? existing.maxAttempts
-            : input.maxAttempts) ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS;
+          : input.maxAttempts;
+      // Upstream escalates in place once the budget is consumed. SUP-14151 requires
+      // that a re-upsert which asserts NO budget of its own must never bump an active
+      // row past the ceiling nor escalate it — the sweep owns that transition. So the
+      // in-place escalation fires only when this call actually carries `maxAttempts`.
       if (
+        input.maxAttempts !== undefined &&
         effectiveMaxAttempts !== null &&
         nextAttemptCount >= effectiveMaxAttempts
       ) {
@@ -542,10 +542,13 @@ export function issueRecoveryActionService(db: Db) {
           monitorPolicy: input.preserveExistingOwner
             ? existing.monitorPolicy
             : input.monitorPolicy ?? null,
-          // Reaching this update means the exhaustion transition above did not
-          // fire, so `nextAttemptCount` is strictly below the effective ceiling
-          // and SUP-14151's clamp would be a no-op.
-          attemptCount: nextAttemptCount,
+          // SUP-14151: never bump past the effective ceiling -- the sweep holds this
+          // row to `maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS`, so a
+          // post-ceiling count would escalate on the very next pass.
+          attemptCount: input.attemptCount ?? Math.min(
+            existing.attemptCount + 1,
+            input.maxAttempts ?? existing.maxAttempts ?? DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
+          ),
           maxAttempts: input.preserveExistingOwner
             ? existing.maxAttempts
             : input.maxAttempts === undefined

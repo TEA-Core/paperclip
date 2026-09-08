@@ -15874,24 +15874,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
         }
-        // SUP-6706: bound the detached window. A run whose pid stays alive but
-        // whose in-memory handle is lost would otherwise be pinned `running`
-        // forever. After 10 min, fall through to process_lost convergence below.
-        const detachedRefMs = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
-        const DETACHED_RUN_MAX_MS = 10 * 60 * 1000;
-        if (!(detachedRefMs > 0 && Date.now() - detachedRefMs >= DETACHED_RUN_MAX_MS)) {
-          continue;
-        }
+        // SUP-6706 bounded this detached window at 10 minutes and then fell through
+        // to process_lost convergence, because a run whose pid stayed alive while its
+        // in-memory handle was lost would otherwise be pinned `running` forever. That
+        // guard predates `checksPersistedChildLiveness`: the case it was written for is
+        // an UNOWNED pid that merely looks alive, and liveness is now gated on ownership,
+        // so such a run reports no live child and converges normally. An alive pid here
+        // therefore means a genuinely owned, still-running child — which must not be
+        // reaped or signalled while it works. Upstream's policy subsumes SUP-6706.
+        continue;
       }
 
-      let descendantOnlyCleanup = false;
-      if (processGroupAlive) {
-        descendantOnlyCleanup = true;
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
+      // The fork used to terminate a still-alive process group here and record it as
+      // `descendantOnlyCleanup`. Upstream has since made this path a READ-ONLY liveness
+      // check that carries no termination authority (see `checksPersistedChildLiveness`
+      // above), and enforces it with tests that a persisted, unowned group is neither
+      // signalled nor reaped. Taking upstream's policy: the flag stays so the stillborn
+      // evidence shape below is unchanged, but nothing is signalled from this path.
+      const descendantOnlyCleanup = false;
 
       const runContext = parseObject(run.contextSnapshot);
       const monitorIssueId = readNonEmptyString(runContext.issueId);
