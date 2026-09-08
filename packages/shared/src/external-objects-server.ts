@@ -73,7 +73,21 @@ function stripMarkdownCode(markdown: string): string {
   return output;
 }
 
-function trimTrailingPunctuation(token: string, preceding?: string): string {
+function hasUnclosedOpener(text: string, marker: string): boolean {
+  let open = false;
+  let index = 0;
+  while (index < text.length) {
+    if (text[index] !== marker) {
+      index += 1;
+      continue;
+    }
+    while (index < text.length && text[index] === marker) index += 1;
+    open = !open;
+  }
+  return open;
+}
+
+function trimTrailingPunctuation(token: string, leftContext: string): string {
   let trimmed = token;
   while (trimmed.length > 0) {
     const last = trimmed[trimmed.length - 1]!;
@@ -86,11 +100,18 @@ function trimTrailingPunctuation(token: string, preceding?: string): string {
       break;
     }
 
-    // A trailing `*` or `_` is a markdown emphasis close only when the source
-    // shows a matching opener abutting the start of the URL (e.g. `**url**`).
-    // Otherwise it is preserved when it is genuinely part of the path that the
-    // token regex cut off, e.g. `…/wiki/Foo_` immediately before `(bar)`.
-    if ((last === "*" || last === "_") && preceding !== last) break;
+    // A trailing run of `*`/`_` is a markdown emphasis close only when the
+    // same-line source before the URL still carries an UNCLOSED opener of that
+    // marker (e.g. `**PR: url**` or `*url*`). A balanced span earlier on the
+    // line (`**bold** ... url**`) or a genuine terminal marker with no opener
+    // (`…/wiki/Foo_`) leaves the marker in place.
+    if (last === "*" || last === "_") {
+      let run = 0;
+      while (run < trimmed.length && trimmed[trimmed.length - 1 - run] === last) run += 1;
+      if (!hasUnclosedOpener(leftContext, last)) break;
+      trimmed = trimmed.slice(0, trimmed.length - run);
+      continue;
+    }
 
     trimmed = trimmed.slice(0, -1);
   }
@@ -128,8 +149,9 @@ export function findExternalObjectUrlMatches(markdown: string): ExternalObjectUr
   const re = new RegExp(EXTERNAL_URL_TOKEN_RE);
 
   while ((match = re.exec(scrubbed)) !== null) {
-    const preceding = match.index > 0 ? scrubbed[match.index - 1] : undefined;
-    const matchedText = trimTrailingPunctuation(match[0], preceding);
+    const lineStart = scrubbed.lastIndexOf("\n", match.index - 1) + 1;
+    const leftContext = scrubbed.slice(lineStart, match.index);
+    const matchedText = trimTrailingPunctuation(match[0], leftContext);
     if (!matchedText || parseIssueReferenceHref(matchedText)) continue;
 
     matches.push({
