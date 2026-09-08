@@ -30,6 +30,7 @@ import {
   provisionExecutionWorkspaceForFreshnessDecision,
   readRuntimeStateSessionParams,
   reconcileReusedExecutionWorkspaceProjectWorkspaceId,
+  resolveNativeRecoveryExecutionWorkspaceBinding,
   resolveExecutionWorkspaceBranchOwnership,
   resolveExecutionWorkspaceConfigFreshness,
   readExecutionWorkspaceOccupancyDeferrals,
@@ -1925,6 +1926,17 @@ describe("effective run execution workspace config freshness", () => {
     expect(reuseRequest.bindingUnrestorable).toBe(false);
     expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(true);
     expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+  });
+
+  it("does not mistake a projectless native run-id binding for a missing persisted workspace", () => {
+    expect(resolveNativeRecoveryExecutionWorkspaceBinding({
+      bindingId: "run-projectless",
+      persistedWorkspaceFound: false,
+    })).toBeNull();
+    expect(resolveNativeRecoveryExecutionWorkspaceBinding({
+      bindingId: "workspace-persisted",
+      persistedWorkspaceFound: true,
+    })).toBe("workspace-persisted");
   });
 
   it.each([
