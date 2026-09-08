@@ -156,6 +156,7 @@ import {
   resolveApprovalDecisionHead,
   resolveIssueRepoContext,
   shouldPublishApprovalStatus,
+  ladderIsTerminallyApproved,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   MERGE_ARMING_ACTOR_ID,
   type ArmingOutcome,
@@ -3350,6 +3351,37 @@ export function issueRoutes(
         { err, issueId: issue.id },
         "stage-integrity check at decision time threw; refusing to stamp/arm (fail-closed)",
       );
+      return;
+    }
+    // SUP-15459: gate the FIRST publish on ladder terminality. publishApprovalStatus
+    // stamps paperclip/approved on ANY approved stage, so without this a mid-ladder
+    // approval (completedStageIds short of the policy's full stage set) would
+    // authorize a merge. Refuse to stamp/arm when the ladder is not fully reviewed
+    // + approved. Same fail-closed posture as stage-integrity above: a refusal
+    // skips only stamp/arm (the hook runs post-commit), never refuses to close
+    // (ADR-073 D3 / ADR-092 D5 "never refuse to close").
+    const ladderPolicy = candidate.executionPolicy as { stages?: Array<{ id: string }> } | null;
+    const ladderState = candidate.executionState as
+      | { completedStageIds?: string[]; lastDecisionOutcome?: string | null }
+      | null;
+    if (!ladderIsTerminallyApproved(ladderPolicy, ladderState)) {
+      const policyStages = ladderPolicy?.stages ?? [];
+      const completedIds = ladderState?.completedStageIds ?? [];
+      const incompleteIds = policyStages.filter((s) => !completedIds.includes(s.id)).map((s) => s.id);
+      const msg = `status:skipped:non-terminal-ladder: incomplete review/approval stages: ${incompleteIds.join(", ")}`;
+      try {
+        await svc.addComment(
+          issue.id,
+          `[Merge-arming] ${msg}`,
+          {},
+          { authorType: "system" },
+        );
+      } catch (commentErr) {
+        logger.warn(
+          { err: commentErr, issueId: issue.id },
+          "non-terminal-ladder refusal comment write failed; still refusing to stamp/arm",
+        );
+      }
       return;
     }
     // SUP-14602: the live-discovery / decision-head needle must be the issue's
