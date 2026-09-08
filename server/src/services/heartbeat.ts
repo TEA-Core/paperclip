@@ -483,6 +483,10 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
+  // Zero-MCP-connection delivery diagnostic: a marker row, not task progress.
+  // Counting it as concrete action evidence would flip the common plan-only
+  // zero-MCP case to "advanced" and suppress the run_liveness_continuation wake.
+  "tool_gateway.runtime_mcp_delivery",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
@@ -3896,6 +3900,8 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       agentId: input.agent.id,
       runId: input.runId,
       permittedNotInstalledConnections,
+      permittedConnectionCount: permittedConnectionIds.size,
+      installedConnectionCount: installedConnectionIds.size,
     });
     return [];
   }
