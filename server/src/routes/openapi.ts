@@ -858,6 +858,15 @@ const BOARD_ONLY_PREFIXES = [
 ];
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  // Added upstream in the 2026-09-08 slice-2a fold range. Each handler calls
+  // assertBoard() unconditionally, so publishing them as agent-callable made the
+  // spec contradict the code; the SUP-14798 parity guard caught it.
+  "POST /api/heartbeat-runs/{runId}/runtime-requests/{requestId}/resolve",
+  "POST /api/heartbeat-runs/{runId}/provider-trace/reproject-workspace-diffs",
+  "PATCH /api/issues/{id}/queued-comments/{commentId}",
+  "PUT /api/issues/{id}/queued-comments/order",
+  "DELETE /api/issues/{id}/queued-comments/{commentId}",
+  "GET /api/tools/oauth/cloud-connector/enrollment",
   // Both added upstream in the 2026-09-07 fold range. Their handlers call
   // assertBoard() unconditionally, so publishing them as agent-callable made the
   // spec contradict the code; the SUP-14798 parity guard caught it.
@@ -1082,6 +1091,24 @@ const BOARD_ONLY_OPERATIONS = new Set([
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
+  // Added upstream in the 2026-09-08 slice-2a fold range. Each handler calls
+  // assertInstanceAdmin() unconditionally, except the last — see below.
+  "GET /api/companies/{companyId}/provider-traces",
+  "GET /api/heartbeat-runs/{runId}/provider-trace",
+  "POST /api/heartbeat-runs/{runId}/provider-trace/frames/{frameId}/reveal",
+  "GET /api/heartbeat-runs/{runId}/provider-trace/download",
+  "DELETE /api/heartbeat-runs/{runId}/provider-trace",
+  "POST /api/tools/oauth/cloud-connector/enrollment",
+  "GET /api/tools/oauth/cloud-connector/enrollment-callback",
+  // Conditional, and registered here deliberately. An agent may invoke ITSELF on
+  // this route; upstream added `if (providerTraceRequested) { assertInstanceAdmin(req); }`
+  // for the `debug.providerTrace === "raw"` escalation only. The fork already treats a
+  // conditional base assertion as closing the route — `POST /api/issues/{id}/recovery-actions/resolve`
+  // gates `assertBoard` on `outcome === "false_positive" || "cancelled"` and is registered
+  // board-only — so this follows that precedent rather than weakening the SUP-14798 scanner
+  // to ignore conditional assertions, which would have unregistered that route too.
+  // Effect is on the published document only; enforcement stays in the handler.
+  "POST /api/agents/{id}/heartbeat/invoke",
   "POST /api/companies",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
