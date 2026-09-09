@@ -2806,6 +2806,9 @@ function toCompactIssue(issue: any): CompactIssue {
     startedAt: issue.startedAt,
     completedAt: issue.completedAt,
     cancelledAt: issue.cancelledAt,
+    // SUP-15501: expose the hidden marker so compact rows returned via
+    // includeHidden=true stay distinguishable from ordinary rows.
+    hiddenAt: issue.hiddenAt ?? null,
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
     ...(issue.labelIds ? { labelIds: issue.labelIds } : {}),

@@ -193,6 +193,34 @@ describeEmbeddedPostgres("issue list includeHidden + hiddenAt audit (SUP-15501)"
     expect(issueIds(withHidden.body).has(seeded.hiddenIssueId)).toBe(true);
   });
 
+  it("marks hidden rows with hiddenAt in the compact (view=compact) projection", async () => {
+    const seeded = await seed();
+    const app = appFor(seeded);
+
+    const compactDefault = await request(app)
+      .get(`/api/companies/${seeded.companyId}/issues`)
+      .query({ view: "compact" })
+      .expect(200);
+    expect(issueIds(compactDefault.body).has(seeded.hiddenIssueId)).toBe(false);
+
+    const compactWithHidden = await request(app)
+      .get(`/api/companies/${seeded.companyId}/issues`)
+      .query({ view: "compact", includeHidden: "true" })
+      .expect(200);
+    expect(issueIds(compactWithHidden.body).has(seeded.hiddenIssueId)).toBe(true);
+    const hiddenRow = (compactWithHidden.body as Array<Record<string, unknown>>).find(
+      (row) => row.id === seeded.hiddenIssueId,
+    );
+    expect(hiddenRow?.hiddenAt).toBeTruthy();
+
+    // Ordinary (non-hidden) compact rows carry a null marker so callers can
+    // distinguish hidden rows by `hiddenAt != null` even in the compact view.
+    const visibleRow = (compactWithHidden.body as Array<Record<string, unknown>>).find(
+      (row) => row.id === seeded.visibleIssueId,
+    );
+    expect(visibleRow?.hiddenAt).toBeNull();
+  });
+
   it("rejects a malformed includeHidden value with 400", async () => {
     const seeded = await seed();
     await request(appFor(seeded))
