@@ -2062,6 +2062,344 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
+  describe("work-type:delivery children are not decomposition children (SUP-15533)", () => {
+    const supportCrId = "ddddddd4-0000-4000-8000-000000000004";
+    const supportQaeId = "aaaaaaa1-0000-4000-8000-000000000001";
+    const coderLeId = "bbbbbbb2-0000-4000-8000-000000000002";
+    const execCtoId = "ccccccc3-0000-4000-8000-000000000003";
+    const parentStageId = "30000000-0000-4000-8000-000000000003";
+    const deliveryLabelId = "60000000-0000-4000-8000-000000000008";
+    const redoLabelId = "60000000-0000-4000-8000-000000000009";
+
+    const agents = [
+      { id: supportCrId, name: "support-CR", role: "support" },
+      { id: supportQaeId, name: "support-QAE", role: "support" },
+      { id: coderLeId, name: "coder-LE", role: "engineer" },
+      { id: execCtoId, name: "exec-CTO", role: "executive" },
+    ];
+
+    // The literal SUP-15140 parent: a coding child with a single, satisfied
+    // review stage. It is shape-incomplete against the ADR-072 close ladder
+    // (missing review:support-QAE, review:coder-LE, approval:exec-CTO), so the
+    // only thing that arms mechanism D is the laddered child count reaching >= 2.
+    const parentLadder = {
+      stages: [
+        { id: parentStageId, type: "review", participants: [{ type: "agent", agentId: supportCrId }] },
+      ],
+    };
+
+    const satisfiedState = (stageIds: string[]) => ({
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      completedStageIds: stageIds,
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+
+    // A carrier/delivery helper child: origin_kind manual, a ran review ladder,
+    // and (via the issue_labels join) the delivery label. The row carries an id so
+    // the guard can match it against the issue_labels read.
+    const deliveryChild = (id: string, identifier: string, childStageId: string) => ({
+      id,
+      identifier,
+      originKind: "manual",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    // A genuine manual decomposition child (no carve-out label).
+    const manualChild = (id: string, identifier: string, childStageId: string) => ({
+      id,
+      identifier,
+      originKind: "manual",
+      executionPolicy: { mode: "normal", stages: [{ id: childStageId, type: "review" }] },
+      executionState: satisfiedState([childStageId]),
+    });
+
+    const deliveryLabelRow = {
+      id: deliveryLabelId,
+      companyId: "company-1",
+      name: "work-type:delivery",
+      color: "#000000",
+    };
+
+    it("excludes a work-type:delivery child so a 1-genuine + 1-delivery pair arms neither mechanism A nor D (AC2 + AC4)", async () => {
+      // One genuine manual decomposition child + one delivery helper: the delivery
+      // child is excluded, so the count is 1 (< 2). Neither mechanism arms — the
+      // single genuine child is not enough to declare a decomposed body. Mirrors
+      // the redo AC1 pair test, but for the delivery label.
+      const children = [
+        manualChild("child-1", "SUP-9801", "40000000-0000-4000-8000-000000000001"),
+        deliveryChild("delivery-1", "SUP-9802", "50000000-0000-4000-8000-000000000002"),
+      ];
+      const issueLabels = [{ issueId: "delivery-1", labelId: deliveryLabelId, companyId: "company-1" }];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [deliveryLabelRow], issueLabels });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_null_policy_refused" }),
+      );
+
+      // Mechanism D (shape-incomplete single-stage ladder): the excluded delivery
+      // child drops the count to 1, below the >= 2 arm threshold.
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [deliveryLabelRow], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("still counts an unlabelled sibling: 1-genuine + 1-unlabelled-manual arms mechanism A and D (AC4 negative control)", async () => {
+      // Same child pair minus the delivery label: both are now genuine
+      // decomposition children, the count reaches >= 2, and both mechanisms arm.
+      // This proves the exclusion — not the setup — is what clears the pair case.
+      const children = [
+        manualChild("child-1", "SUP-9811", "40000000-0000-4000-8000-000000000001"),
+        manualChild("child-2", "SUP-9812", "50000000-0000-4000-8000-000000000002"),
+      ];
+
+      // Mechanism A (null policy): two genuine children -> count 2 -> refused.
+      setupDbMock({ issues: children, labels: [deliveryLabelRow], issueLabels: [] });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(false);
+      expect(a.reason).toContain("Mechanism A");
+
+      // Mechanism D: two genuine children over the shape-incomplete ladder.
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [deliveryLabelRow], issueLabels: [], agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+    });
+
+    it("skips the carve-out when the company has neither label (AC4, zero-extra-query path, no throw)", async () => {
+      // Neither `work-type:redo` nor `work-type:delivery` resolves in the company,
+      // so the single labels read returns nothing and the issue_labels read is
+      // skipped entirely (the zero-extra-query path). Even with orphan
+      // issue_labels rows present, no exclusion happens: both children count and
+      // mechanism D arms. The guard must not throw on this path.
+      const someLabelId = "70000000-0000-4000-8000-000000000007";
+      setupDbMock({
+        issues: [
+          manualChild("child-1", "SUP-9821", "40000000-0000-4000-8000-000000000001"),
+          manualChild("child-2", "SUP-9822", "50000000-0000-4000-8000-000000000002"),
+        ],
+        labels: [],
+        issueLabels: [
+          { issueId: "child-1", labelId: someLabelId, companyId: "company-1" },
+          { issueId: "child-2", labelId: someLabelId, companyId: "company-1" },
+        ],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("Mechanism D");
+    });
+
+    it("resolves work-type:redo and work-type:delivery in one exclusion set (AC1: both names honored)", async () => {
+      // Two delivery children + one redo child: all three carry a carve-out label,
+      // so all are excluded and the count is 0. This discriminates: if the guard
+      // resolved only one of the two names, the other's children would count and
+      // mechanism D would arm over the shape-incomplete ladder (refusal), failing
+      // this assertion. Over the shape-incomplete ladder the close is allowed.
+      setupDbMock({
+        issues: [
+          deliveryChild("delivery-1", "SUP-9831", "40000000-0000-4000-8000-000000000001"),
+          deliveryChild("delivery-2", "SUP-9832", "50000000-0000-4000-8000-000000000002"),
+          {
+            id: "redo-1",
+            identifier: "SUP-9833",
+            originKind: "manual",
+            executionPolicy: { mode: "normal", stages: [{ id: "60000001-0000-4000-8000-000000000009", type: "review" }] },
+            executionState: satisfiedState(["60000001-0000-4000-8000-000000000009"]),
+          },
+        ],
+        labels: [
+          deliveryLabelRow,
+          { id: redoLabelId, companyId: "company-1", name: "work-type:redo", color: "#000000" },
+        ],
+        issueLabels: [
+          { issueId: "delivery-1", labelId: deliveryLabelId, companyId: "company-1" },
+          { issueId: "delivery-2", labelId: deliveryLabelId, companyId: "company-1" },
+          { issueId: "redo-1", labelId: redoLabelId, companyId: "company-1" },
+        ],
+        agents,
+      });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+
+    it("records excludedChildIdentifiers in the mechanism A and D audit payloads while still counting the genuine children (AC3)", async () => {
+      // Two genuine decomposition children + one delivery helper: the delivery
+      // child is carved out (the count stays 2, so both mechanisms still refuse),
+      // and the excluded identifier must be visible in the audit trail so a
+      // mislabel is detectable.
+      const children = [
+        manualChild("genuine-1", "SUP-9841", "40000000-0000-4000-8000-000000000001"),
+        manualChild("genuine-2", "SUP-9842", "50000000-0000-4000-8000-000000000002"),
+        deliveryChild("delivery-1", "SUP-9843", "60000001-0000-4000-8000-000000000003"),
+      ];
+      const issueLabels = [{ issueId: "delivery-1", labelId: deliveryLabelId, companyId: "company-1" }];
+
+      // Mechanism A (null policy):
+      setupDbMock({ issues: children, labels: [deliveryLabelRow], issueLabels });
+      const a = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: null, executionState: null },
+        null,
+      );
+      expect(a.allowed).toBe(false);
+      expect(a.reason).toContain("Mechanism A");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_null_policy_refused",
+          details: expect.objectContaining({
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-9841", "SUP-9842"],
+            excludedChildIdentifiers: ["SUP-9843"],
+          }),
+        }),
+      );
+
+      // Mechanism D (shape-incomplete single-stage ladder):
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({ issues: children, labels: [deliveryLabelRow], issueLabels, agents });
+      const d = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, parentId: null, executionPolicy: parentLadder, executionState: satisfiedState([parentStageId]) },
+        null,
+      );
+      expect(d.allowed).toBe(false);
+      expect(d.reason).toContain("Mechanism D");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-9841", "SUP-9842"],
+            excludedChildIdentifiers: ["SUP-9843"],
+          }),
+        }),
+      );
+    });
+
+    it("reproduces the SUP-15140 shape: two laddered children over a satisfied single-stage ladder (AC5)", async () => {
+      // The live defect: SUP-15140 (a coding child) has a satisfied single-stage
+      // review ladder and two manual laddered children — SUP-15410 (carrier PR
+      // landing) and SUP-15405 (carrier-conflict merge) — that land and re-deliver
+      // its own already-gated deliverable. Before SUP-15533 both counted ->
+      // count 2 -> mechanism D armed and the close was refused for the missing
+      // ADR-072 close-ladder stages.
+      const children = [
+        manualChild("sup-15410", "SUP-15410", "40000000-0000-4000-8000-000000000001"),
+        manualChild("sup-15405", "SUP-15405", "50000000-0000-4000-8000-000000000002"),
+      ];
+
+      // (a) unlabelled: the two children are decomposition children, mechanism D
+      // arms over the shape-incomplete ladder, and the audit names both.
+      setupDbMock({
+        issues: children,
+        labels: [deliveryLabelRow],
+        issueLabels: [],
+        agents,
+      });
+      const refused = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          identifier: "SUP-15140",
+          parentId: "sup-15098",
+          executionPolicy: parentLadder,
+          executionState: satisfiedState([parentStageId]),
+        },
+        null,
+      );
+      expect(refused.allowed).toBe(false);
+      expect(refused.reason).toContain("Mechanism D");
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_shape_refused",
+          details: expect.objectContaining({
+            reason: "adr072_close_ladder_shape_incomplete",
+            ladderedChildCount: 2,
+            ladderedChildIdentifiers: ["SUP-15410", "SUP-15405"],
+          }),
+        }),
+      );
+
+      // (b) both carry work-type:delivery: both are carved out, the count is 0,
+      // and the close passes mechanism D.
+      vi.mocked(logActivity).mockClear();
+      setupDbMock({
+        issues: children,
+        labels: [deliveryLabelRow],
+        issueLabels: [
+          { issueId: "sup-15410", labelId: deliveryLabelId, companyId: "company-1" },
+          { issueId: "sup-15405", labelId: deliveryLabelId, companyId: "company-1" },
+        ],
+        agents,
+      });
+      const allowed = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          identifier: "SUP-15140",
+          parentId: "sup-15098",
+          executionPolicy: parentLadder,
+          executionState: satisfiedState([parentStageId]),
+        },
+        null,
+      );
+      expect(allowed.allowed).toBe(true);
+      expect(logActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.done_transition_ladder_shape_refused" }),
+      );
+    });
+  });
+
   describe("open linked PRs block", () => {
     it("blocks transition when a linked PR is cached open, no GitHub token configured, and the last refresh succeeded (zero outbound fetch)", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([

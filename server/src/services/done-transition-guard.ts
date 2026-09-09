@@ -62,7 +62,14 @@ const ADR072_CLOSE_LADDER: {
 // re-delivers the same deliverable its parent already gated, so it is not a
 // decomposition child. Matched by name and resolved company-scoped — the label
 // id is company-scoped and this guard is not.
+// SUP-15533: the second non-decomposition label name, `work-type:delivery`,
+// marks a carrier/delivery helper child (the SUP-15410/SUP-15405 shape over the
+// coding leaf SUP-15140) that lands and re-delivers the parent's already-gated
+// deliverable. It is resolved by the same single company-scoped name read as
+// `work-type:redo` and feeds the same exclusion set, so both mechanism A and D
+// inherit the carve-out.
 const REDO_LABEL_NAME = "work-type:redo";
+const DELIVERY_LABEL_NAME = "work-type:delivery";
 
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
@@ -924,9 +931,18 @@ function evaluateReviewLadderSatisfaction(
    * otherwise satisfy every clause of this predicate. But a redo re-delivers
    * the same deliverable, so it is not "which child gated this work?". Match
    * by the label NAME `work-type:redo`, resolved company-scoped for the issue
-   * under test — the label id is company-scoped and this guard is not. This
-   * exclusion lives here too, so both mechanism A and mechanism D inherit it
-   * alongside the SUP-15451 origin_kind narrowing.
+   * under test — the label id is company-scoped and this guard is not.
+   *
+   * SUP-15533: the carve-out extends to a second company-scoped label name,
+   * `work-type:delivery`, which marks a carrier/delivery helper child (the
+   * SUP-15410/SUP-15405 shape over the coding leaf SUP-15140) that lands and
+   * re-delivers the parent's already-gated deliverable. Both names are resolved
+   * by the SAME single company-scoped labels read and feed one exclusion set.
+   * A laddered child excluded this way is also recorded in
+   * `excludedChildIdentifiers`, so a carve-out is visible in the mechanism A /
+   * D audit trail and a mislabelled genuine child is detectable. This exclusion
+   * lives here too, so both mechanism A and mechanism D inherit it alongside
+   * the SUP-15451 origin_kind narrowing.
    *
    * A ladder-less parent (executionPolicy null, or `stages: []` — either way
  * `evaluateReviewLadderSatisfaction` reports no ladder) sitting over two or
@@ -945,7 +961,11 @@ async function countLadderedChildren(
   db: Db,
   companyId: string,
   parentId: string,
-): Promise<{ count: number; identifiers: string[] }> {
+): Promise<{
+  count: number;
+  identifiers: string[];
+  excludedChildIdentifiers: string[];
+}> {
   // Children link up via `issues.parent_id`. Dependency edges
   // (`issue_relations` rows of type `blocks`) are not decomposition edges
   // and are not consulted here (SUP-15233; supersedes the SUP-15031
@@ -961,32 +981,40 @@ async function countLadderedChildren(
     .from(issues)
     .where(and(eq(issues.companyId, companyId), eq(issues.parentId, parentId)));
 
-  // SUP-15464: a `work-type:redo` child re-delivers the same deliverable this
-  // parent already gated, so it is not a decomposition child. Resolve the redo
-  // label by name, scoped to this issue's company (the label id is
-  // company-scoped and this guard is not), then exclude any child carrying it.
-  // A company with no label named `work-type:redo` cannot have a redo child, so
-  // the issue_labels read is skipped entirely.
-  let redoChildIds: Set<string> | null = null;
-  const redoLabelRows = await db
+  // SUP-15464 / SUP-15533: a `work-type:redo` or `work-type:delivery` child
+  // re-delivers the same deliverable this parent already gated, so it is not a
+  // decomposition child. Resolve BOTH carve-out label names in a single
+  // company-scoped labels read — the label id is company-scoped and this guard
+  // is not, and one read covers both names (a second query would only add a
+  // round trip for a name the first already resolves). A company with neither
+  // label present cannot have such a child, so the issue_labels read is
+  // skipped entirely.
+  let carveOutChildIds: Set<string> | null = null;
+  const carveOutLabelRows = await db
     .select({ id: labels.id })
     .from(labels)
-    .where(and(eq(labels.companyId, companyId), eq(labels.name, REDO_LABEL_NAME)));
-  if (redoLabelRows.length > 0) {
-    const redoIssueLabelRows = await db
+    .where(
+      and(
+        eq(labels.companyId, companyId),
+        inArray(labels.name, [REDO_LABEL_NAME, DELIVERY_LABEL_NAME]),
+      ),
+    );
+  if (carveOutLabelRows.length > 0) {
+    const carveOutIssueLabelRows = await db
       .select({ issueId: issueLabels.issueId })
       .from(issueLabels)
       .where(
         and(
           eq(issueLabels.companyId, companyId),
-          inArray(issueLabels.labelId, redoLabelRows.map((label) => label.id)),
+          inArray(issueLabels.labelId, carveOutLabelRows.map((label) => label.id)),
         ),
       );
-    redoChildIds = new Set(redoIssueLabelRows.map((row) => row.issueId));
+    carveOutChildIds = new Set(carveOutIssueLabelRows.map((row) => row.issueId));
   }
 
   let count = 0;
   const identifiers: string[] = [];
+  const excludedChildIdentifiers: string[] = [];
   for (const row of rows) {
     // SUP-15451: only decomposition children count. A platform-generated card
     // parented to this issue (issue_productivity_review, task_watchdog,
@@ -997,19 +1025,24 @@ async function countLadderedChildren(
     // is an ordinary manually-filed card and counts.
     const originKind = row.originKind ?? "manual";
     if (originKind !== "manual" && !originKind.startsWith("plugin:")) continue;
-    // SUP-15464: skip redo re-deliveries — they gate the same work this parent
-    // already gated, not a separate child's.
-    if (redoChildIds?.has(row.id)) continue;
     if (row.executionPolicy == null) continue;
     const state = parseIssueExecutionState(row.executionState);
     const completed = state?.completedStageIds?.length ?? 0;
     const skipped = state?.skippedStageIds?.length ?? 0;
-    if (completed > 0 || skipped > 0) {
-      count += 1;
-      identifiers.push(row.identifier ?? "<unnamed>");
+    if (completed === 0 && skipped === 0) continue;
+    // SUP-15464 / SUP-15533: a `work-type:redo` or `work-type:delivery` child
+    // re-delivers the same work this parent already gated, not a separate
+    // child's. Record it so the carve-out is visible in the mechanism A / D
+    // audit trail (a mislabelled genuine child is detectable there), and do not
+    // count it toward the decomposition.
+    if (carveOutChildIds?.has(row.id)) {
+      excludedChildIdentifiers.push(row.identifier ?? "<unnamed>");
+      continue;
     }
+    count += 1;
+    identifiers.push(row.identifier ?? "<unnamed>");
   }
-  return { count, identifiers };
+  return { count, identifiers, excludedChildIdentifiers };
 }
 
 /**
@@ -1205,6 +1238,7 @@ export async function evaluateDoneTransitionGuard(
   let ladderShape: {
     ladderedChildCount: number;
     ladderedChildIdentifiers: string[];
+    excludedChildIdentifiers: string[];
     missingStageLabels: string[];
   } | null = null;
   if (reviewLadder !== null && reviewLadder.satisfied) {
@@ -1219,6 +1253,7 @@ export async function evaluateDoneTransitionGuard(
         ladderShape = {
           ladderedChildCount: laddered.count,
           ladderedChildIdentifiers: laddered.identifiers,
+          excludedChildIdentifiers: laddered.excludedChildIdentifiers,
           missingStageLabels,
         };
       }
@@ -1274,6 +1309,7 @@ export async function evaluateDoneTransitionGuard(
       reason: "ungated_decomposed_parent",
       ladderedChildCount: mechanismA.count,
       ladderedChildIdentifiers: mechanismA.identifiers,
+      excludedChildIdentifiers: mechanismA.excludedChildIdentifiers,
       source: "done_transition_guard",
     });
     return {
@@ -1304,6 +1340,7 @@ export async function evaluateDoneTransitionGuard(
       missingStageLabels: ladderShape.missingStageLabels,
       ladderedChildCount: ladderShape.ladderedChildCount,
       ladderedChildIdentifiers: ladderShape.ladderedChildIdentifiers,
+      excludedChildIdentifiers: ladderShape.excludedChildIdentifiers,
       source: "done_transition_guard",
     });
     return {
