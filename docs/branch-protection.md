@@ -99,6 +99,77 @@ contract violation (fake approval). The only sanctioned recovery is the
   repo is always refused (ADR-091 D5). A shared-workspace card whose head ref is
   unreadable, or which carries another card's prefix, is still refused.
 
+### Merge-queue ejection surface (SUP-15375)
+
+A merge-queue ejection is otherwise invisible to agent tokens: the entry is
+pulled, `autoMergeRequest`/`isInMergeQueue` revert to their never-queued state,
+and the failing `merge_group` run lives on a `gh-readonly-queue/…` ref that
+agents do not think to query (while `GET /branches/{b}/protection` is 403 for
+the platform token). The compound case — `paperclip-approved-enforcer` reading
+**green on the head** (advisory on `pull_request`) while the entry is not
+approved — reads as "all checks green, mysteriously evicted."
+
+When a required `merge_group` check fails a queue entry, a **trusted observer
+workflow** — `paperclip-ejection-surface.yml`, triggered by `workflow_run` on
+completion of the `PR` and `Paperclip Approval Enforcer` workflows — reacts to
+the failed `merge_group` run and posts/updates a PR comment
+(`scripts/ci/surface-merge-queue-ejection-react.sh`, which delegates the
+post/update to `scripts/ci/surface-merge-queue-ejection.sh`). The artefact
+names the failing required check and quotes the reason (a bounded tail of the
+genuinely failed job's own log, read through the read-only actions API):
+
+- a failed `Paperclip Approval Enforcer` run names
+  `paperclip-approved-enforcer`;
+- a failed `PR` run names the first failing **required** context (`verify` →
+  `e2e`). A run that collapsed on the internal `Approval precondition` fast-gate
+  (approval absent, so the required contexts never genuinely ran) posts nothing
+  — the enforcer workflow's artefact owns that story — so a non-required check
+  is never named as the ejected check
+  (`merge-group-required-check-attribution`).
+
+Each artefact:
+
+- **Per-check marker** `<!-- paperclip:merge-queue-ejection:<check-name> -->` —
+  re-queueing updates the right check's existing comment in place (PATCH)
+  rather than stacking a new one, and a comment for one failing check is never
+  clobbered by another's.
+- **Names the failing check** and **quotes the reason** (a bounded tail of the
+  genuinely-failed job's own log).
+- **Reachable with the standard platform agent token** — it reads/writes PR
+  comments via `gh api …/issues/{n}/comments`; no `checks:read`/admin.
+- **Not on the enforcement path.** The gating workflows are unchanged: each
+  required `merge_group` check still fails closed exactly as before, and this
+  surface runs only after a run has already failed.
+
+**Security boundary (merge-group-comment-token-executes-pr-code).** A
+`merge_group`-triggered workflow is loaded from the `gh-readonly-queue` ref —
+a tree the queued PR controls (it can rewrite `.github/workflows/*` itself) —
+so ANY inline `run:` code in a `merge_group` job, and any token granted to it,
+executes code a queued PR can edit. Rounds 5-8 tried to make the posting safe
+inside those files (base-pinned fetch-and-run, then removing the inline
+fallback) — but the invoking wrapper itself was still PR-controlled, so the
+finding recurred. The write-capable token is therefore **never granted to
+`pr.yml` or `paperclip-approved.yml` at all** (they are read-only gates), and
+the posting implementation lives exclusively in `paperclip-ejection-surface.yml`
++ `scripts/ci/surface-merge-queue-ejection{-react,}.sh`:
+
+- `workflow_run` reactors are loaded by GitHub from the **protected default
+  branch**, which a queued PR cannot modify — the executed code is trusted fold
+  content, not the triggering run's tree. This is GitHub's documented pattern
+  for "an unprivileged run, then a privileged reaction".
+- The reactor never checks out or executes anything from the triggering run
+  (pwn-request guard): it consumes only GitHub's event metadata (re-verified
+  via the API) and the run's jobs/logs through the read-only actions API. A
+  queued PR can at most make its own run fail; the artefact it can influence is
+  a truthful statement about that run on its own PR thread.
+
+**Rollout.** The reactor workflow and both scripts land on the fold in this one
+merge; there is no pre-rollout window where PR-controlled files carry a
+write-capable fallback, because they never do. The reactor itself cannot fire
+until it is on the protected default branch (the `workflow_run` trigger only
+honours default-branch files), so the first real ejection after this PR merges
+is also the first live exercise of the wiring.
+
 ### ADR-091 D1 delivery-identity evidence order (SUP-14824)
 
 When resolving a card's delivery identity (`resolveDeliveryIdentity`), the

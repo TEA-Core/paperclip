@@ -206,5 +206,21 @@ test("the precondition runs the same script as the required enforcer context", (
   const enforcer = readWorkflow("paperclip-approved.yml");
 
   assert.match(precondition, /bash scripts\/ci\/check-paperclip-approved\.sh/);
-  assert.match(enforcer, /bash scripts\/ci\/check-paperclip-approved\.sh/);
+  // SUP-15375 round 9 (merge-group-comment-token-executes-pr-code): the enforcer
+  // job must NOT hold any write-capable token. A merge_group run executes this
+  // workflow file from the gh-readonly-queue ref (a queued PR controls that
+  // tree), so a write token here would run PR-controlled code — the recurring
+  // security finding. With only read scopes the script may run from the
+  // checkout; the write-capable posting lives exclusively in the trusted
+  // workflow_run reactor (paperclip-ejection-surface.yml), loaded from the
+  // protected default branch. Assert the read-only shape: no write grant and no
+  // leftover base-pinned-fetch plumbing that the write token required.
+  const enforcerJob = enforcer.match(
+    /\n {2}paperclip-approved-enforcer:((?: {4}.*\n|\n)*?)(?=\n {2}[A-Za-z_]|$)/,
+  )?.[1] ?? "";
+  assert.ok(enforcerJob.length > 0, "paperclip-approved-enforcer job must exist");
+  assert.match(enforcerJob, /^ {6}pull-requests: read$/m, "the enforcer must be read-only on pull-requests");
+  assert.doesNotMatch(enforcerJob, /pull-requests: write/, "the enforcer must not hold a write-capable token");
+  assert.doesNotMatch(enforcerJob, /MERGE_EJECTION_BASE_SHA/, "no base-pinned fetch needed without a write token");
+  assert.match(enforcerJob, /bash scripts\/ci\/check-paperclip-approved\.sh/, "the enforcer runs the same check file from the checkout");
 });
