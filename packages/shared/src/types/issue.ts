@@ -943,6 +943,12 @@ export type CompactIssue = Pick<
   lastActivityAt?: Date | null;
   isUnreadForMe?: boolean;
   archivedAt?: Date | null;
+  /**
+   * SUP-15501: present so a caller can distinguish rows returned by
+   * `includeHidden=true` in the compact board projection. Always emitted on
+   * compact rows; a non-null value marks a hidden row, `null` an ordinary one.
+   */
+  hiddenAt?: Date | null;
   archivedByActorType?: "user" | "agent" | null;
   archivedByAgentId?: string | null;
   archivedByRunId?: string | null;

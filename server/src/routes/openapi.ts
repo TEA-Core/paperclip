@@ -2439,10 +2439,25 @@ registry.registerPath({
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
   summary: "List issues in a company",
-  description: "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract.",
+  description:
+    "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract. Pass `includeHidden=true` to include issues whose `hiddenAt` is set (e.g. load-bearing blockers parked out of the live projections); hidden rows carry `hiddenAt` on the row.",
   request: {
     params: z.object({ companyId: z.string() }),
-    query: z.object({ view: z.enum(["compact"]).optional() }).passthrough(),
+    query: z
+      .object({
+        view: z.enum(["compact"]).optional(),
+        status: z.string().optional().describe("Filter by issue status (comma-separated for multiple)."),
+        parentId: z.string().optional().describe("Filter to direct children of this issue id."),
+        assigneeAgentId: z.string().optional().describe("Filter to issues assigned to this agent."),
+        assigneeUserId: z.string().optional().describe("Filter to issues assigned to this user."),
+        limit: z.coerce.number().int().positive().optional().describe("Maximum number of rows to return."),
+        offset: z.coerce.number().int().nonnegative().optional().describe("Number of rows to skip."),
+        includeHidden: z
+          .enum(["true", "false"])
+          .optional()
+          .describe("SUP-15501: include hidden issues (hiddenAt set). Default false."),
+      })
+      .passthrough(),
   },
   responses: { 200: r.ok(), 304: { description: "Not Modified" }, 401: r.unauthorized },
 });

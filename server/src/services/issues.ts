@@ -708,6 +708,13 @@ export interface IssueFilters {
   includeBlockedBy?: boolean;
   includeBlockedInboxAttention?: boolean;
   includeLiveDescendantSummary?: boolean;
+  /**
+   * SUP-15501: opt in to rows whose `hiddenAt` is set. Default (`false`) keeps
+   * the historical behavior of hiding them from every list projection. Only the
+   * `hiddenAt` leg of the visibility condition is relaxed; harness-kind rows are
+   * still excluded, so this never leaks internal harness work.
+   */
+  includeHidden?: boolean;
   hasPlanDocument?: boolean;
   lowTrustBoundary?: LowTrustBoundary & { companyId: string };
   q?: string;
@@ -6190,7 +6197,10 @@ export function issueService(db: Db) {
         });
       }
 
-      const conditions = [eq(issues.companyId, companyId), visibleIssueCondition()];
+      const conditions = [
+        eq(issues.companyId, companyId),
+        filters?.includeHidden === true ? isNull(issues.harnessKind) : visibleIssueCondition(),
+      ];
       const assigneeAgentFilter = parseIssueAssigneeAgentFilter(filters?.assigneeAgentId);
       assertValidAssigneeAgentFilter(assigneeAgentFilter);
       const limit = typeof filters?.limit === "number" && Number.isFinite(filters.limit)
@@ -6453,7 +6463,10 @@ export function issueService(db: Db) {
         return countBlockedInboxIssues(db, companyId, filters);
       }
 
-      const conditions = [eq(issues.companyId, companyId), visibleIssueCondition()];
+      const conditions = [
+        eq(issues.companyId, companyId),
+        filters?.includeHidden === true ? isNull(issues.harnessKind) : visibleIssueCondition(),
+      ];
       const statuses = parseStatusFilter(filters?.status);
       if (statuses.length === 1) conditions.push(eq(issues.status, statuses[0]!));
       else if (statuses.length > 1) conditions.push(inArray(issues.status, statuses));
@@ -9082,6 +9095,29 @@ export function issueService(db: Db) {
               : {}),
           },
         );
+        // SUP-15501: a hiddenAt write used to vanish from every list projection
+        // with no audit trail — who hid it was not recoverable from the feed.
+        // Emit a dedicated, fate-shared row (not just the generic issue.updated)
+        // so the visibility transition is auditable on its own: it names the
+        // actor and carries the before/after value.
+        if (changes.hiddenAt !== undefined) {
+          await logActivityInTransaction(tx as unknown as Db, {
+            companyId: updated.companyId,
+            actorType: actorAgentId ? "agent" : actorUserId ? "user" : "system",
+            actorId: actorAgentId ?? actorUserId ?? "issue_service",
+            agentId: actorAgentId ?? null,
+            action: updated.hiddenAt ? "issue.hidden" : "issue.unhidden",
+            entityType: "issue",
+            entityId: updated.id,
+            issueId: updated.id,
+            details: {
+              identifier: updated.identifier ?? null,
+              issueId: updated.id,
+              hiddenAtFrom: changes.hiddenAt.from ?? null,
+              hiddenAtTo: changes.hiddenAt.to ?? null,
+            },
+          }, activityPublications);
+        }
         if (
           (issueData.status === "done" || issueData.status === "cancelled") &&
           existing.status !== issueData.status &&

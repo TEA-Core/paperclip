@@ -2806,6 +2806,9 @@ function toCompactIssue(issue: any): CompactIssue {
     startedAt: issue.startedAt,
     completedAt: issue.completedAt,
     cancelledAt: issue.cancelledAt,
+    // SUP-15501: expose the hidden marker so compact rows returned via
+    // includeHidden=true stay distinguishable from ordinary rows.
+    hiddenAt: issue.hiddenAt ?? null,
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
     ...(issue.labelIds ? { labelIds: issue.labelIds } : {}),
@@ -7938,6 +7941,7 @@ export function issueRoutes(
     const compactView = view === "compact";
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
     const includeLiveDescendantSummary = parseOptionalBooleanQuery(req.query.includeLiveDescendantSummary);
+    const includeHidden = parseOptionalBooleanQuery(req.query.includeHidden);
     const assigneeAgentFilterRaw = req.query.assigneeAgentId;
     let assigneeAgentId: string | null | undefined;
     const rawUpdatedSince = req.query.updatedSince as string | undefined;
@@ -7988,6 +7992,10 @@ export function issueRoutes(
     }
     if (includeLiveDescendantSummary === null) {
       res.status(400).json({ error: "includeLiveDescendantSummary must be true or false when provided" });
+      return;
+    }
+    if (includeHidden === null) {
+      res.status(400).json({ error: "includeHidden must be true or false when provided" });
       return;
     }
     if (assigneeAgentFilterRaw !== undefined) {
@@ -8076,6 +8084,7 @@ export function issueRoutes(
       includeBlockedInboxAttention:
         req.query.includeBlockedInboxAttention === "true" || req.query.includeBlockedInboxAttention === "1",
       includeLiveDescendantSummary: includeLiveDescendantSummary === true,
+      includeHidden: includeHidden === true,
       hasPlanDocument,
       q: req.query.q as string | undefined,
       limit,
