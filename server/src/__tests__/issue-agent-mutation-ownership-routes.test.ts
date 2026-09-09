@@ -2130,6 +2130,87 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision).not.toHaveBeenCalled();
     });
+
+    it("refuses a re-provision when the pinned vehicle leaves the closeable live set before the close lands (409, no update)", async () => {
+      // The pre-flight assessment saw the vehicle live (proceed: true), but by
+      // the time the in-transaction close runs the row has left the closeable
+      // live set (active/idle/in_review) — the close service reports `not_live`
+      // and does not archive it. The route must abort and roll back, persisting
+      // no issue update (the pointer clear would otherwise strand the still-live
+      // vehicle unclaimed).
+      mockExecutionWorkspaceService.assessReprovisionClose.mockResolvedValue({
+        proceed: true,
+        reason: "ok",
+        status: "active",
+      });
+      mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision.mockResolvedValue({
+        outcome: "not_live",
+        workspace: null,
+      });
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: null, executionWorkspacePreference: "isolated_workspace" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("issue_workspace_reprovision_close_lost_race");
+      expect(res.body.details.closeOutcome).toBe("not_live");
+      expect(res.body.details.pinnedExecutionWorkspaceId).toBe(pinnedWorkspaceId);
+      expect(mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision).toHaveBeenCalledWith(
+        pinnedWorkspaceId,
+        { companyId },
+        expect.anything(),
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses a re-provision when an in-flight reopen owns the vehicle's live fence (409, no update)", async () => {
+      mockExecutionWorkspaceService.assessReprovisionClose.mockResolvedValue({
+        proceed: true,
+        reason: "ok",
+        status: "active",
+      });
+      mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision.mockResolvedValue({
+        outcome: "reopening",
+        workspace: null,
+      });
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: null, executionWorkspacePreference: "isolated_workspace" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("issue_workspace_reprovision_close_lost_race");
+      expect(res.body.details.closeOutcome).toBe("reopening");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("commits a re-provision when the pinned vehicle is already terminal (already_closed)", async () => {
+      // A terminal (already-closed) vehicle is a safe close outcome: the row is
+      // already detached, so clearing the card's pointer is the meaningful
+      // action and the correction lands.
+      mockExecutionWorkspaceService.assessReprovisionClose.mockResolvedValue({
+        proceed: true,
+        reason: "already_closed",
+        status: "archived",
+      });
+      mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision.mockResolvedValue({
+        outcome: "already_closed",
+        workspace: null,
+      });
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: null, executionWorkspacePreference: "isolated_workspace" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          parentId: null,
+          executionWorkspacePreference: "isolated_workspace",
+          executionWorkspaceId: null,
+        }),
+        expect.anything(),
+      );
+    });
   });
 
   describe("assignee write self-satisfiable review stage guard (SUP-13526)", () => {

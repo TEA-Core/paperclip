@@ -13015,20 +13015,48 @@ export function issueRoutes(
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
-          const updated = await updateIssue(tx);
-          if (!updated) return null;
-
-          // SUP-15543: mark the abandoned pinned workspace reclaimable in the
-          // same transaction as the pointer clear so a correction either fully
-          // lands or fully rolls back. Runs after the issue update so the card's
-          // new pointer is durable before the old row is closed.
+          // SUP-15543 (round-1 fail-closed gate): reclaim the pinned vehicle
+          // BEFORE the issue update so the correction commits only when the
+          // vehicle can actually be invalidated. The pre-flight
+          // assessReprovisionClose is a fast path; the authoritative state is
+          // only known here, in this transaction, via the close service's
+          // returned outcome. Commit only on the safe outcomes: the fenced
+          // write landed (`archived`), the row was already terminal
+          // (`already_closed`), or it no longer exists (`missing`, a dangling
+          // pointer). On `not_live` (the row left the closeable live set between
+          // the assessment and here — it lost the status fence to a concurrent
+          // close/reopen) or `reopening` (an in-flight reopen owns the live
+          // fence), the vehicle could not be invalidated, so throw: the whole
+          // transaction rolls back and no pointer clear or corrected inputs are
+          // persisted. Committing a pointer clear on top of a still-live
+          // vehicle would strand the old workspace live and unreclaimed.
           if (workspaceReprovisionCloseId !== null) {
-            await executionWorkspacesSvc.closePinnedWorkspaceForReprovision(
+            const closeOutcome = await executionWorkspacesSvc.closePinnedWorkspaceForReprovision(
               workspaceReprovisionCloseId,
-              { companyId: updated.companyId },
+              { companyId: existing.companyId },
               tx,
             );
+            if (
+              closeOutcome.outcome !== "archived"
+              && closeOutcome.outcome !== "already_closed"
+              && closeOutcome.outcome !== "missing"
+            ) {
+              throw conflict(
+                "Cannot re-provision the execution workspace: the pinned vehicle is no longer in a closeable live state",
+                {
+                  code: "issue_workspace_reprovision_close_lost_race",
+                  issueId: existing.id,
+                  identifier: existing.identifier ?? null,
+                  pinnedExecutionWorkspaceId: workspaceReprovisionCloseId,
+                  closeOutcome: closeOutcome.outcome,
+                  workspaceStatus: closeOutcome.workspace?.status ?? null,
+                },
+              );
+            }
           }
+
+          const updated = await updateIssue(tx);
+          if (!updated) return null;
 
           if (decision && decisionId) {
             await tx.insert(issueExecutionDecisions).values({
