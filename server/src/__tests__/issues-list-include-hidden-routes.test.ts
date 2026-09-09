@@ -13,6 +13,7 @@ import {
   issueRelations,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
+import { activityRoutes } from "../routes/activity.js";
 import { issueRoutes } from "../routes/issues.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -140,6 +141,7 @@ describeEmbeddedPostgres("issue list includeHidden + hiddenAt audit (SUP-15501)"
       next();
     });
     app.use("/api", issueRoutes(db, {} as never));
+    app.use("/api", activityRoutes(db));
     app.use(errorHandler);
     return app;
   }
@@ -283,4 +285,56 @@ describeEmbeddedPostgres("issue list includeHidden + hiddenAt audit (SUP-15501)"
     expect(rows[0].actorType).toBe("user");
     expect(rows[0].actorId).toBe(seeded.operatorUserId);
   });
+
+  it("keeps the hidden/unhidden transition visible in the company activity feed with actor + before/after", async () => {
+    const seeded = await seed();
+    const app = appFor(seeded);
+
+    // Hide the visible issue; the target row then no longer satisfies
+    // visibleIssueCondition(), which used to swallow the very audit row below.
+    await request(app)
+      .patch(`/api/issues/${seeded.visibleIssueId}`)
+      .send({ hiddenAt: new Date().toISOString() })
+      .expect(200);
+
+    const hiddenFeed = (await request(app)
+      .get(`/api/companies/${seeded.companyId}/activity`)
+      .expect(200)).body as Array<Record<string, unknown>>;
+    const hiddenRows = hiddenFeed.filter(
+      (row) => row.entityId === seeded.visibleIssueId && row.action === "issue.hidden",
+    );
+    expect(hiddenRows).toHaveLength(1);
+    expect(hiddenRows[0].actorType).toBe("user");
+    expect(hiddenRows[0].actorId).toBe(seeded.operatorUserId);
+    expect(hiddenRows[0].details).toEqual(
+      expect.objectContaining({
+        issueId: seeded.visibleIssueId,
+        hiddenAtFrom: null,
+        hiddenAtTo: expect.anything(),
+      }),
+    );
+
+    // Clear the flag; the unhidden transition is auditable the same way.
+    await request(app)
+      .patch(`/api/issues/${seeded.visibleIssueId}`)
+      .send({ hiddenAt: null })
+      .expect(200);
+
+    const unhiddenFeed = (await request(app)
+      .get(`/api/companies/${seeded.companyId}/activity`)
+      .expect(200)).body as Array<Record<string, unknown>>;
+    const unhiddenRows = unhiddenFeed.filter(
+      (row) => row.entityId === seeded.visibleIssueId && row.action === "issue.unhidden",
+    );
+    expect(unhiddenRows).toHaveLength(1);
+    expect(unhiddenRows[0].actorType).toBe("user");
+    expect(unhiddenRows[0].actorId).toBe(seeded.operatorUserId);
+    expect(unhiddenRows[0].details).toEqual(
+      expect.objectContaining({
+        issueId: seeded.visibleIssueId,
+        hiddenAtFrom: expect.anything(),
+        hiddenAtTo: null,
+      }),
+    );
+  }, 30_000);
 });

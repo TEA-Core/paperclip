@@ -33,6 +33,11 @@ export interface ActivityFilters {
 
 const DEFAULT_ACTIVITY_LIMIT = 100;
 const MAX_ACTIVITY_LIMIT = 500;
+// SUP-15501: visibility transitions must stay auditable after the target issue
+// is hidden. The company feed joins the issue and applies visibleIssueCondition()
+// to issue rows; without an explicit carve-out those rows would reject the very
+// audit row written for the hide/unhide, leaving the transition unrecoverable.
+const HIDDEN_VISIBILITY_AUDIT_ACTIONS = ["issue.hidden", "issue.unhidden"];
 
 export function normalizeActivityLimit(limit: number | undefined) {
   if (!Number.isFinite(limit)) return DEFAULT_ACTIVITY_LIMIT;
@@ -371,6 +376,7 @@ export function activityService(db: Db) {
             ...conditions,
             or(
               sql`${activityLog.entityType} != 'issue'`,
+              inArray(activityLog.action, HIDDEN_VISIBILITY_AUDIT_ACTIONS),
               visibleIssueCondition(),
             ),
           ),
