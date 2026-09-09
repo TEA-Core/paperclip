@@ -78,6 +78,10 @@ const mockStorageService = vi.hoisted(() => ({
   headObject: vi.fn(),
   deleteObject: vi.fn(),
 }));
+const mockExecutionWorkspaceService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null),
+  closePinnedWorkspaceForReprovision: vi.fn(async () => ({ outcome: "archived", workspace: null })),
+}));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
@@ -198,6 +202,11 @@ function registerRouteMocks() {
     ),
   }));
 
+  vi.doMock("../services/execution-workspaces.js", () => ({
+    executionWorkspaceService: () => mockExecutionWorkspaceService,
+    STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS: 5 * 60 * 1000,
+  }));
+
   vi.doMock("../services/index.js", () => ({
     ISSUE_LIST_DEFAULT_LIMIT: 100,
     ISSUE_LIST_MAX_LIMIT: 500,
@@ -211,7 +220,7 @@ function registerRouteMocks() {
     companyService: () => mockCompanyService,
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => mockDocumentService,
-    executionWorkspaceService: () => ({}),
+    executionWorkspaceService: () => mockExecutionWorkspaceService,
     feedbackService: () => ({
       listIssueVotesForUser: vi.fn(async () => []),
       saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
@@ -1940,7 +1949,7 @@ describe("agent issue mutation checkout ownership", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toBe(
-        "Ancestor escape hatch only permits assigneeAgentId, status, and blockedByIssueIds changes",
+        "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
       );
       expect(res.body.details.forbiddenFields).toContain(_field);
       expect(mockIssueService.update).not.toHaveBeenCalled();
@@ -1953,10 +1962,134 @@ describe("agent issue mutation checkout ownership", () => {
 
       expect(res.status).toBe(403);
       expect(res.body.error).toBe(
-        "Ancestor escape hatch only permits assigneeAgentId, status, and blockedByIssueIds changes",
+        "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
       );
       expect(res.body.details.forbiddenFields).toContain("reviewRequest");
       expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("authorized in-place execution-workspace re-provision (SUP-15543)", () => {
+    const parentIssueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const pinnedWorkspaceId = "99999999-9999-4999-8999-999999999999";
+
+    function ancestorActor() {
+      return {
+        type: "agent",
+        agentId: peerAgentId,
+        companyId,
+        source: "agent_key",
+        runId: "66666666-6666-4666-8666-666666666666",
+      };
+    }
+
+    // SUP-15526 shape: a child card parented to P, reusing P's shared carrier
+    // (pinned to pinnedWorkspaceId, sourceIssueId = P). The card is not mid-run.
+    function pinnedCard(overrides: Record<string, unknown> = {}) {
+      return makeIssue({
+        status: "in_progress",
+        assigneeAgentId: ownerAgentId,
+        executionRunId: null,
+        parentId: parentIssueId,
+        executionWorkspaceId: pinnedWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+        ...overrides,
+      });
+    }
+
+    beforeEach(() => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed:
+          input.action === "tasks:assign" ||
+          input.action === "issue:comment" ||
+          input.action === "issue:read" ||
+          input.action === "company_scope:read",
+        action: input.action,
+        reason:
+          input.action === "tasks:assign" ||
+          input.action === "issue:comment" ||
+          input.action === "issue:read" ||
+          input.action === "company_scope:read"
+            ? "allow_explicit_grant"
+            : "deny_missing_grant",
+        explanation: "Re-provision test boundary default.",
+      }));
+      mockAccessService.isManagerOf.mockResolvedValue(true);
+      mockAgentService.getById.mockImplementation(async (id: string) => ({
+        id,
+        companyId,
+        name: `Agent ${id}`,
+      }));
+      mockAgentService.resolveByReference.mockImplementation(async (_companyId: string, raw: string) => ({
+        agent: { id: raw, companyId, name: `Agent ${raw}`, status: "active" },
+        ambiguous: false,
+      }));
+      mockIssueService.getById.mockResolvedValue(pinnedCard());
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...pinnedCard(),
+        ...patch,
+      }));
+      // The pinned carrier is a live shared carrier, not a closed/isolated row, so
+      // the reopen path is not triggered — only the re-provision close fires.
+      mockExecutionWorkspaceService.getById.mockResolvedValue({
+        id: pinnedWorkspaceId,
+        companyId,
+        mode: "shared_workspace",
+        status: "active",
+        sourceIssueId: parentIssueId,
+      });
+      mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision.mockResolvedValue({
+        outcome: "archived",
+        workspace: null,
+      });
+    });
+
+    it("lets an ancestor correct the card's provisioning inputs, clear the pointer, and close the pinned row", async () => {
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: null, executionWorkspacePreference: "isolated_workspace" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          parentId: null,
+          executionWorkspacePreference: "isolated_workspace",
+          executionWorkspaceId: null,
+        }),
+        expect.anything(),
+      );
+      expect(mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision).toHaveBeenCalledWith(
+        pinnedWorkspaceId,
+        { companyId },
+        expect.anything(),
+      );
+    });
+
+    it("rejects a re-provision while the card has an active execution run (409)", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        pinnedCard({ executionRunId: "66666666-6666-4666-8666-666666666666" }),
+      );
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: null, executionWorkspacePreference: "isolated_workspace" });
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe("issue_workspace_reprovision_run_active");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision).not.toHaveBeenCalled();
+    });
+
+    it("still 403s when a correction field is mixed with a forbidden substance field", async () => {
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: null, executionWorkspacePreference: "isolated_workspace", title: "Spoofed" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.forbiddenFields).toContain("title");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision).not.toHaveBeenCalled();
     });
   });
 

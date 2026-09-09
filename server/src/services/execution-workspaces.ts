@@ -3154,6 +3154,85 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       return row ? toExecutionWorkspace(row) : null;
     },
 
+    // SUP-15543: mark a card's pinned execution workspace reclaimable as part of an
+    // authorized in-place re-provision. The caller (the issue PATCH route) has
+    // already cleared the card's executionWorkspaceId pointer in the same
+    // transaction; this only flips the abandoned row to a terminal, reclaimable
+    // state so the reaper can free the worktree. The write runs under the
+    // per-workspace lifecycle lock and is fenced on the lifecycle generation so a
+    // concurrent reopen never has its live fence clobbered. A row that is already
+    // closed, or in the middle of a reopen, is left untouched (reported via the
+    // outcome). Passing `tx` folds the write into the caller's transaction so the
+    // pointer clear and the close commit or roll back together; omitting `tx`
+    // wraps it in its own transaction.
+    closePinnedWorkspaceForReprovision: async (
+      workspaceId: string,
+      scope: { companyId: string },
+      tx?: unknown,
+    ): Promise<{
+      outcome: "archived" | "already_closed" | "reopening" | "not_live" | "missing";
+      workspace: ExecutionWorkspace | null;
+    }> => {
+      const apply = async (dbOrTx: DbTransaction) => {
+        await acquireExecutionWorkspaceLifecycleLock(dbOrTx, workspaceId);
+        const fresh = await dbOrTx
+          .select()
+          .from(executionWorkspaces)
+          .where(and(
+            eq(executionWorkspaces.id, workspaceId),
+            eq(executionWorkspaces.companyId, scope.companyId),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (!fresh) return { outcome: "missing" as const, workspace: null };
+        if (isClosedExecutionWorkspaceStatus(fresh.status)) {
+          return { outcome: "already_closed" as const, workspace: toExecutionWorkspace(fresh) };
+        }
+        if (metadataHasReopenPendingConsumption(fresh.metadata as Record<string, unknown> | null)) {
+          // A reopen is in flight on this row; leave its live fence alone. The
+          // card's pointer is already cleared, so the next dispatch provisions a
+          // fresh card-owned worktree regardless.
+          return { outcome: "reopening" as const, workspace: toExecutionWorkspace(fresh) };
+        }
+        const metadata = bumpExecutionWorkspaceLifecycleGeneration(
+          fresh.metadata as Record<string, unknown> | null,
+        );
+        const now = new Date();
+        const row = await dbOrTx
+          .update(executionWorkspaces)
+          .set({
+            status: "archived",
+            closedAt: now,
+            cleanupEligibleAt: now,
+            cleanupReason: "re-provisioned_by_patch",
+            metadata,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(executionWorkspaces.id, workspaceId),
+            inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+            sql<boolean>`(${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY}) IS DISTINCT FROM 'true'`,
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!row) {
+          // Lost the race to a concurrent close/reopen. Re-read to report the true
+          // state rather than claiming a write that did not land.
+          const reread = await dbOrTx
+            .select()
+            .from(executionWorkspaces)
+            .where(eq(executionWorkspaces.id, workspaceId))
+            .then((rows) => rows[0] ?? null);
+          return {
+            outcome: isClosedExecutionWorkspaceStatus(reread?.status) ? ("already_closed" as const) : ("not_live" as const),
+            workspace: reread ? toExecutionWorkspace(reread) : null,
+          };
+        }
+        return { outcome: "archived" as const, workspace: toExecutionWorkspace(row) };
+      };
+      if (tx) return apply(tx as unknown as DbTransaction);
+      return db.transaction((innerTx) => apply(innerTx));
+    },
+
     // Reopen one closed isolated execution workspace so an authorized issue can
     // use it again. The caller must first authorize the request on the issue.
     // The whole operation runs under the per-workspace lifecycle lock: it reads
