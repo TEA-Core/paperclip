@@ -25,6 +25,12 @@ const mockExecutionWorkspaceService = vi.hoisted(() => ({
   reopenClosedIsolatedExecutionWorkspaceForIssue: vi.fn(),
   clearReopenPendingConsumptionForUnconsumedReopen: vi.fn(async () => ({ cleared: true })),
   refreshReopenPendingConsumption: vi.fn(async () => ({ refreshed: true })),
+  closePinnedWorkspaceForReprovision: vi.fn(async () => ({ outcome: "archived", workspace: null })),
+  assessReprovisionClose: vi.fn(async () => ({
+    proceed: true,
+    reason: "already_closed",
+    status: "archived",
+  })),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -217,7 +223,14 @@ describe.sequential("closed isolated workspace issue routes", () => {
       };
       next();
     });
-    app.use("/api", issueRoutes({} as any, {} as any));
+    app.use("/api", issueRoutes({
+      // The authorized in-place re-provision (SUP-15543) commits the pointer
+      // clear/rebind and the pinned-workspace close in one transaction, so the
+      // route needs a working `db.transaction`. The other routes in this file only
+      // touch the mocked issue/execution-workspace services, so a pass-through
+      // transaction stub is enough for the rebind test.
+      transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({}),
+    } as any, {} as any));
     app.use(errorHandler);
     return app;
   }

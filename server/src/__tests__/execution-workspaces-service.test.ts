@@ -30,6 +30,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   detachIssuesFromClosedSharedExecutionWorkspace,
+  decideReprovisionProceed,
   EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY,
@@ -48,6 +49,50 @@ import {
 import { workspaceGitOperationScheduler } from "../services/workspace-git-operation-scheduler.ts";
 
 const execFileAsync = promisify(execFile);
+
+// SUP-15543 (round-1 fix): fail-closed precondition for an authorized in-place
+// execution-workspace re-provision. The re-provision close only lands on a row in
+// a live-closeable state; a transient/non-live status (a row still provisioning
+// or closing) must be refused so the correction is never committed on top of a
+// vehicle that could not be invalidated. Terminal rows and dangling pointers
+// still proceed, because clearing/rebinding the pointer is the safe, meaningful
+// action the operator asked for.
+describe("decideReprovisionProceed (SUP-15543 re-provision precondition)", () => {
+  it("refuses a vehicle that is still provisioning or closing (fail-closed)", () => {
+    expect(decideReprovisionProceed("provisioning", false)).toEqual({
+      proceed: false,
+      reason: "not_live",
+    });
+    expect(decideReprovisionProceed("closing", false)).toEqual({
+      proceed: false,
+      reason: "not_live",
+    });
+  });
+
+  it("refuses a live vehicle with a reopen in flight", () => {
+    expect(decideReprovisionProceed("active", true)).toEqual({ proceed: false, reason: "reopening" });
+    expect(decideReprovisionProceed("idle", true)).toEqual({ proceed: false, reason: "reopening" });
+    expect(decideReprovisionProceed("in_review", true)).toEqual({ proceed: false, reason: "reopening" });
+  });
+
+  it("proceeds for a live-closeable vehicle with no reopen in flight", () => {
+    expect(decideReprovisionProceed("active", false)).toEqual({ proceed: true, reason: "ok" });
+    expect(decideReprovisionProceed("idle", false)).toEqual({ proceed: true, reason: "ok" });
+    expect(decideReprovisionProceed("in_review", false)).toEqual({ proceed: true, reason: "ok" });
+  });
+
+  it("proceeds for an already-terminal vehicle and for a dangling pointer", () => {
+    expect(decideReprovisionProceed("archived", false)).toEqual({
+      proceed: true,
+      reason: "already_closed",
+    });
+    expect(decideReprovisionProceed("cleanup_failed", false)).toEqual({
+      proceed: true,
+      reason: "already_closed",
+    });
+    expect(decideReprovisionProceed(null, false)).toEqual({ proceed: true, reason: "missing" });
+  });
+});
 
 describe("execution workspace delivery state", () => {
   it.each([

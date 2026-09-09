@@ -646,6 +646,24 @@ const ISSUE_WORKSPACE_AUDIT_FIELDS = new Set([
  */
 const ANCESTOR_ALLOWED_FIELDS = new Set(["assigneeAgentId", "status", "blockedByIssueIds"]);
 
+/**
+ * SUP-15543: the execution-workspace provisioning inputs an authorized actor
+ * (full-rights OR an org-chain ancestor via the manager escape hatch) may
+ * correct in place to re-provision a mis-provisioned card's workspace, instead
+ * of cancel-and-re-file. `parentId` is included because the mis-provision
+ * defect (SUP-15526 shape) is driven by the parent-child linkage that makes
+ * the platform reuse the parent's shared carrier. This is a narrow, audited
+ * surface — it is NOT a general widening of the ancestor escape hatch. The
+ * manager-chain guard filter below only relaxes these keys; any other field
+ * still 403s.
+ */
+const ANCESTOR_WORKSPACE_CORRECTION_FIELDS = new Set([
+  "parentId",
+  "executionWorkspaceId",
+  "executionWorkspacePreference",
+  "executionWorkspaceSettings",
+]);
+
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
@@ -12028,10 +12046,12 @@ export function issueRoutes(
       typeof mutationAccess === "object" &&
       mutationAccess.reason === "allow_manager_chain"
     ) {
-      const forbidden = Object.keys(req.body).filter((k) => !ANCESTOR_ALLOWED_FIELDS.has(k));
+      const forbidden = Object.keys(req.body).filter(
+        (k) => !ANCESTOR_ALLOWED_FIELDS.has(k) && !ANCESTOR_WORKSPACE_CORRECTION_FIELDS.has(k),
+      );
       if (forbidden.length > 0) {
         res.status(403).json({
-          error: "Ancestor escape hatch only permits assigneeAgentId, status, and blockedByIssueIds changes",
+          error: "Ancestor escape hatch only permits assigneeAgentId, status, blockedByIssueIds, and execution-workspace provisioning corrections",
           details: { forbiddenFields: forbidden },
         });
         return;
@@ -12524,6 +12544,98 @@ export function issueRoutes(
     }
     Object.assign(updateFields, transition.patch);
 
+    // SUP-15543: authorized in-place re-provision of a mis-provisioned card's
+    // execution workspace. When an authorized actor corrects the card's
+    // provisioning inputs (parentId / executionWorkspacePreference /
+    // executionWorkspaceSettings / executionWorkspaceId) while the card is
+    // pinned to an existing workspace, the card is leaving that pinned row: the
+    // card's pointer is cleared to null (unless the operator explicitly rebinds
+    // to a specific id) and the pinned row is marked reclaimable in the same
+    // transaction, so the next dispatch provisions a fresh card-owned worktree
+    // (sourceIssueId = this card) instead of inheriting the old vehicle. This is
+    // the sanctioned "re-provision, not cancel-and-re-file" path.
+    let workspaceReprovisionCloseId: string | null = null;
+    {
+      const oldPinnedWorkspaceId = existing.executionWorkspaceId ?? null;
+      if (oldPinnedWorkspaceId !== null) {
+        const parentChanged =
+          req.body.parentId !== undefined &&
+          (req.body.parentId ?? null) !== (existing.parentId ?? null);
+        const preferenceChanged =
+          req.body.executionWorkspacePreference !== undefined &&
+          (req.body.executionWorkspacePreference ?? null) !== (existing.executionWorkspacePreference ?? null);
+        const settingsChanged =
+          req.body.executionWorkspaceSettings !== undefined &&
+          JSON.stringify(parseIssueExecutionWorkspaceSettings(req.body.executionWorkspaceSettings, { includeEnvironmentId: true }))
+            !==
+          JSON.stringify(parseIssueExecutionWorkspaceSettings(existing.executionWorkspaceSettings, { includeEnvironmentId: true }));
+        const execWsIdChanged =
+          req.body.executionWorkspaceId !== undefined &&
+          (req.body.executionWorkspaceId ?? null) !== oldPinnedWorkspaceId;
+        const reprovisionRequested =
+          parentChanged || preferenceChanged || settingsChanged || execWsIdChanged;
+        if (reprovisionRequested) {
+          // Precondition (acceptance §3): a re-provision is only legal while the
+          // card is not mid-run and its vehicle is not in provisioning/closing.
+          // The "provisioning/closing" vehicle state has no dedicated status in
+          // this build; an in-flight run is the concrete live signal, so the
+          // active-run guard is the operative check. A row already in a closed
+          // status is a no-op inside the close service call.
+          if (existing.executionRunId != null) {
+            res.status(409).json({
+              error: "Cannot re-provision the execution workspace while a run is active on this issue; wait for the run to finish before correcting the card's workspace",
+              code: "issue_workspace_reprovision_run_active",
+              details: {
+                issueId: existing.id,
+                identifier: existing.identifier ?? null,
+                executionRunId: existing.executionRunId,
+                pinnedExecutionWorkspaceId: oldPinnedWorkspaceId,
+              },
+            });
+            return;
+          }
+          // SUP-15543 (round-1 fix): fail-closed precondition on the pinned vehicle.
+          // Refuse, and commit nothing, when the pinned row is not in a state the
+          // re-provision close can cleanly invalidate — an in-flight reopen, or a
+          // transient/non-live status (a row still provisioning or closing) that the
+          // close's status fence will not touch. A row that is already terminal, or a
+          // dangling pointer, still proceeds: the vehicle is dead or detached, so
+          // clearing or rebinding the card's pointer is the safe, meaningful action.
+          const reprovisionAssessment = await executionWorkspacesSvc.assessReprovisionClose(
+            oldPinnedWorkspaceId,
+            { companyId: existing.companyId },
+          );
+          if (!reprovisionAssessment.proceed) {
+            res.status(409).json({
+              error:
+                "Cannot re-provision the execution workspace while its vehicle is not in a closeable live state; retry once the workspace has settled",
+              code: "issue_workspace_reprovision_vehicle_not_live",
+              details: {
+                issueId: existing.id,
+                identifier: existing.identifier ?? null,
+                pinnedExecutionWorkspaceId: oldPinnedWorkspaceId,
+                workspaceStatus: reprovisionAssessment.status,
+                reason: reprovisionAssessment.reason,
+              },
+            });
+            return;
+          }
+          // Clear the card's pointer unless the operator explicitly rebinds to a
+          // specific workspace id. Everything else lands on a fresh card-owned
+          // worktree on the next dispatch.
+          const explicitRebindId =
+            req.body.executionWorkspaceId !== undefined &&
+            typeof req.body.executionWorkspaceId === "string"
+              ? req.body.executionWorkspaceId
+              : null;
+          if (explicitRebindId === null) {
+            updateFields.executionWorkspaceId = null;
+          }
+          workspaceReprovisionCloseId = oldPinnedWorkspaceId;
+        }
+      }
+    }
+
     // ADR-091 D1 (SUP-14824): record the delivery identity on in_review transition.
     // Only a run that holds the issue's lease may write it, and only on a transition
     // INTO in_review. Any other actor or transition is rejected without partial write.
@@ -12894,7 +13006,8 @@ export function issueRoutes(
       Boolean(decision)
       || shouldRelayStop
       || persistReviewActivityTransactionally
-      || reviewPolicySensitiveMutationRequested;
+      || reviewPolicySensitiveMutationRequested
+      || workspaceReprovisionCloseId !== null;
     try {
       if (shouldUseTransactionalIssueUpdate) {
         issue = await db.transaction(async (tx) => {
@@ -12902,6 +13015,46 @@ export function issueRoutes(
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
+          // SUP-15543 (round-1 fail-closed gate): reclaim the pinned vehicle
+          // BEFORE the issue update so the correction commits only when the
+          // vehicle can actually be invalidated. The pre-flight
+          // assessReprovisionClose is a fast path; the authoritative state is
+          // only known here, in this transaction, via the close service's
+          // returned outcome. Commit only on the safe outcomes: the fenced
+          // write landed (`archived`), the row was already terminal
+          // (`already_closed`), or it no longer exists (`missing`, a dangling
+          // pointer). On `not_live` (the row left the closeable live set between
+          // the assessment and here — it lost the status fence to a concurrent
+          // close/reopen) or `reopening` (an in-flight reopen owns the live
+          // fence), the vehicle could not be invalidated, so throw: the whole
+          // transaction rolls back and no pointer clear or corrected inputs are
+          // persisted. Committing a pointer clear on top of a still-live
+          // vehicle would strand the old workspace live and unreclaimed.
+          if (workspaceReprovisionCloseId !== null) {
+            const closeOutcome = await executionWorkspacesSvc.closePinnedWorkspaceForReprovision(
+              workspaceReprovisionCloseId,
+              { companyId: existing.companyId },
+              tx,
+            );
+            if (
+              closeOutcome.outcome !== "archived"
+              && closeOutcome.outcome !== "already_closed"
+              && closeOutcome.outcome !== "missing"
+            ) {
+              throw conflict(
+                "Cannot re-provision the execution workspace: the pinned vehicle is no longer in a closeable live state",
+                {
+                  code: "issue_workspace_reprovision_close_lost_race",
+                  issueId: existing.id,
+                  identifier: existing.identifier ?? null,
+                  pinnedExecutionWorkspaceId: workspaceReprovisionCloseId,
+                  closeOutcome: closeOutcome.outcome,
+                  workspaceStatus: closeOutcome.workspace?.status ?? null,
+                },
+              );
+            }
+          }
+
           const updated = await updateIssue(tx);
           if (!updated) return null;
 
