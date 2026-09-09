@@ -81,6 +81,11 @@ const mockStorageService = vi.hoisted(() => ({
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   getById: vi.fn(async () => null),
   closePinnedWorkspaceForReprovision: vi.fn(async () => ({ outcome: "archived", workspace: null })),
+  assessReprovisionClose: vi.fn(async () => ({
+    proceed: true,
+    reason: "ok",
+    status: "active",
+  })),
 }));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
@@ -2088,6 +2093,40 @@ describe("agent issue mutation checkout ownership", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.details.forbiddenFields).toContain("title");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision).not.toHaveBeenCalled();
+    });
+
+    it("refuses a re-provision when the pinned vehicle is still provisioning (409, no update)", async () => {
+      mockExecutionWorkspaceService.assessReprovisionClose.mockResolvedValue({
+        proceed: false,
+        reason: "not_live",
+        status: "provisioning",
+      });
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: null, executionWorkspacePreference: "isolated_workspace" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("issue_workspace_reprovision_vehicle_not_live");
+      expect(res.body.details.workspaceStatus).toBe("provisioning");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision).not.toHaveBeenCalled();
+    });
+
+    it("refuses a re-provision when the pinned vehicle is closing (409, no update)", async () => {
+      mockExecutionWorkspaceService.assessReprovisionClose.mockResolvedValue({
+        proceed: false,
+        reason: "not_live",
+        status: "closing",
+      });
+      const res = await request(await createApp(ancestorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parentId: null, executionWorkspacePreference: "isolated_workspace" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("issue_workspace_reprovision_vehicle_not_live");
+      expect(res.body.details.workspaceStatus).toBe("closing");
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockExecutionWorkspaceService.closePinnedWorkspaceForReprovision).not.toHaveBeenCalled();
     });

@@ -138,6 +138,35 @@ function isClosedExecutionWorkspaceStatus(status: string | null | undefined): bo
   return status === "archived" || status === "cleanup_failed";
 }
 
+// SUP-15543 (round-1 fix): the fail-closed precondition for an authorized in-place
+// execution-workspace re-provision. Given the pinned vehicle's current status and
+// whether a reopen of it is in flight, decide whether the re-provision close can
+// cleanly invalidate it. `closePinnedWorkspaceForReprovision` only lands on a row
+// whose status is one of the live-closeable values (active/idle/in_review) under
+// a status fence; any other value is a transient/in-flight state (e.g. a row that
+// is still provisioning or closing) the fence will not touch. Refusing those keeps
+// the correction from being committed on top of a vehicle that could not be
+// invalidated. A row that is already terminal (archived/cleanup_failed), or that
+// no longer exists (a dangling pointer), still proceeds: the vehicle is dead or
+// already detached, so clearing or rebinding the card's pointer is the safe,
+// meaningful action the operator asked for.
+export function decideReprovisionProceed(
+  status: string | null | undefined,
+  reopenPending: boolean,
+): {
+  proceed: boolean;
+  reason: "ok" | "already_closed" | "missing" | "reopening" | "not_live";
+} {
+  if (status === null || status === undefined) return { proceed: true, reason: "missing" };
+  if (isClosedExecutionWorkspaceStatus(status)) {
+    return { proceed: true, reason: "already_closed" };
+  }
+  if (status === "active" || status === "idle" || status === "in_review") {
+    return reopenPending ? { proceed: false, reason: "reopening" } : { proceed: true, reason: "ok" };
+  }
+  return { proceed: false, reason: "not_live" };
+}
+
 // The metadata key that marks a workspace as reopened for a source issue that is
 // still terminal. A reopen sets this flag in the same write that publishes the
 // row as active. The source issue is still terminal at that moment, because the
@@ -3152,6 +3181,47 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toExecutionWorkspace(row) : null;
+    },
+
+    // SUP-15543 (round-1 fix): fail-closed pre-check for an authorized in-place
+    // re-provision. Reads the pinned row under the per-workspace lifecycle lock and
+    // reports whether the re-provision close will cleanly invalidate it, delegating
+    // the status->decision mapping to decideReprovisionProceed. The caller (the issue
+    // PATCH route) calls this BEFORE committing the issue update; a `proceed: false`
+    // result means the vehicle is in a state the close cannot land on (an in-flight
+    // reopen, or a transient/non-live status such as a row still provisioning or
+    // closing), so the route must refuse the correction and leave the card
+    // untouched. A terminal row, or a missing (dangling) pointer, reports
+    // `proceed: true` because clearing/rebinding the pointer is still the safe,
+    // meaningful action the operator asked for.
+    assessReprovisionClose: async (
+      workspaceId: string,
+      scope: { companyId: string },
+    ): Promise<{
+      proceed: boolean;
+      reason: "ok" | "already_closed" | "missing" | "reopening" | "not_live";
+      status: string | null;
+    }> => {
+      return db.transaction(async (tx) => {
+        await acquireExecutionWorkspaceLifecycleLock(tx, workspaceId);
+        const row = await tx
+          .select()
+          .from(executionWorkspaces)
+          .where(
+            and(
+              eq(executionWorkspaces.id, workspaceId),
+              eq(executionWorkspaces.companyId, scope.companyId),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        if (!row) {
+          return { ...decideReprovisionProceed(null, false), status: null };
+        }
+        const reopenPending = metadataHasReopenPendingConsumption(
+          row.metadata as Record<string, unknown> | null,
+        );
+        return { ...decideReprovisionProceed(row.status, reopenPending), status: row.status };
+      });
     },
 
     // SUP-15543: mark a card's pinned execution workspace reclaimable as part of an

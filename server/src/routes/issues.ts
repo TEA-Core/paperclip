@@ -12594,7 +12594,33 @@ export function issueRoutes(
             });
             return;
           }
-          // Clear the pointer unless the operator explicitly rebinds to a
+          // SUP-15543 (round-1 fix): fail-closed precondition on the pinned vehicle.
+          // Refuse, and commit nothing, when the pinned row is not in a state the
+          // re-provision close can cleanly invalidate — an in-flight reopen, or a
+          // transient/non-live status (a row still provisioning or closing) that the
+          // close's status fence will not touch. A row that is already terminal, or a
+          // dangling pointer, still proceeds: the vehicle is dead or detached, so
+          // clearing or rebinding the card's pointer is the safe, meaningful action.
+          const reprovisionAssessment = await executionWorkspacesSvc.assessReprovisionClose(
+            oldPinnedWorkspaceId,
+            { companyId: existing.companyId },
+          );
+          if (!reprovisionAssessment.proceed) {
+            res.status(409).json({
+              error:
+                "Cannot re-provision the execution workspace while its vehicle is not in a closeable live state; retry once the workspace has settled",
+              code: "issue_workspace_reprovision_vehicle_not_live",
+              details: {
+                issueId: existing.id,
+                identifier: existing.identifier ?? null,
+                pinnedExecutionWorkspaceId: oldPinnedWorkspaceId,
+                workspaceStatus: reprovisionAssessment.status,
+                reason: reprovisionAssessment.reason,
+              },
+            });
+            return;
+          }
+          // Clear the card's pointer unless the operator explicitly rebinds to a
           // specific workspace id. Everything else lands on a fresh card-owned
           // worktree on the next dispatch.
           const explicitRebindId =
