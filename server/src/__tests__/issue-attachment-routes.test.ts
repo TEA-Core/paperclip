@@ -78,6 +78,7 @@ function registerRouteMocks() {
       cancelRun: vi.fn(async () => null),
     }),
     instanceSettingsService: () => ({
+      getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),
       get: vi.fn(async () => ({
         id: "instance-settings-1",
         general: {

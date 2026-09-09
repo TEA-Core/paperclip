@@ -36,6 +36,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   cancelRun: vi.fn(async () => null),
 }));
 const mockInstanceSettingsService = vi.hoisted(() => ({
+  getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),
   get: vi.fn(async () => ({
     id: "instance-settings-1",
     general: {
@@ -83,6 +84,8 @@ function registerModuleMocks() {
   }));
 
   vi.doMock("../services/index.js", () => ({
+    feedbackService: () => mockFeedbackService,
+    instanceSettingsService: () => mockInstanceSettingsService,
     companyService: () => ({
       getById: vi.fn(async () => ({ id: "company-1" })),
     }),

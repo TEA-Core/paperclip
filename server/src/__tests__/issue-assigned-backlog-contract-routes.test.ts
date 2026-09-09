@@ -70,6 +70,7 @@ vi.mock("../services/index.js", () => ({
   }),
   getIssueContinuationSummaryDocument: vi.fn(async () => null),
   instanceSettingsService: () => ({
+    getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),
     get: vi.fn(async () => ({
       id: "instance-settings-1",
       general: {

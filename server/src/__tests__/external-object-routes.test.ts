@@ -48,6 +48,7 @@ function registerRouteMocks() {
   }));
 
   vi.doMock("../services/index.js", () => ({
+    instanceSettingsService: () => mockInstanceSettingsService,
     accessService: () => mockAccessService,
     agentService: () => mockAgentService,
     companySkillService: () => ({}),
