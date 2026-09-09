@@ -128,12 +128,14 @@ import {
   companyService,
   companySearchService,
   executionWorkspaceService,
+  feedbackService,
   goalService,
   heartbeatService,
   issueApprovalService,
   issueRecoveryActionService,
   issueThreadInteractionService,
   inboxAgentPolicyService,
+  instanceSettingsService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
   issueReferenceService,
@@ -235,8 +237,6 @@ import { isBlockedWithoutBlockers } from "../services/recovery/service.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS } from "../services/execution-workspaces.js";
 import { decisionTrainingService } from "../services/decision-training.js";
-import { feedbackService } from "../services/feedback.js";
-import { instanceSettingsService } from "../services/instance-settings.js";
 import {
   ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,

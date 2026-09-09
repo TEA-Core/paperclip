@@ -59,6 +59,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
 }));
 
 const mockInstanceSettingsService = vi.hoisted(() => ({
+  getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),
   get: vi.fn(async () => ({
     id: "instance-settings-1",
     general: {

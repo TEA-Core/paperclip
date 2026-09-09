@@ -95,7 +95,8 @@ function registerModuleMocks() {
       wakeup: vi.fn(async () => undefined),
       reportRunActivity: vi.fn(async () => undefined),
     }),
-    instanceSettingsService: () => ({}),
+    instanceSettingsService: () => ({
+    getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),}),
     issueApprovalService: () => ({}),
     issueReferenceService: () => ({
       deleteDocumentSource: async () => undefined,
