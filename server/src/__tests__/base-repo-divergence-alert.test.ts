@@ -174,6 +174,128 @@ describe("observeDivergedRefusal", () => {
     expect(obs.record.firstObservedAtMs).toBe(now);
     expect(obs.ageMs).toBe(0);
   });
+
+  it("does not inherit a stale episode when the base ref changes on the same checkout path", async () => {
+    const repoRoot = await makeRepoRoot();
+    const now = 1_700_000_000_000;
+    // An old episode started 10 days ago under base ref "main".
+    await observeDivergedRefusal(repoRoot, {
+      ...base,
+      baseRef: "main",
+      repoIdentity: repoRoot,
+      nowMs: now - 10 * DAY,
+      thresholdMs: 7 * DAY,
+    });
+
+    // The same checkout path now tracks a different base ref. The old start must
+    // not leak in: the new episode begins now, reports zero age, does not alert,
+    // and clears the stale dedup key.
+    const obs = await observeDivergedRefusal(repoRoot, {
+      ...base,
+      baseRef: "release",
+      repoIdentity: repoRoot,
+      nowMs: now,
+      thresholdMs: 7 * DAY,
+    });
+    expect(obs.record.baseRef).toBe("release");
+    expect(obs.record.firstObservedAtMs).toBe(now);
+    expect(obs.record.lastObservedAtMs).toBe(now);
+    expect(obs.ageMs).toBe(0);
+    expect(obs.alertDue).toBe(false);
+    expect(obs.shouldEmitFirstClassSignal).toBe(false);
+    expect(obs.record.alertedForFirstObservedAtMs).toBeNull();
+
+    // The persisted record reflects the current episode, not the stale one.
+    const onDisk = await readDivergenceRecord(repoRoot);
+    expect(onDisk?.baseRef).toBe("release");
+    expect(onDisk?.firstObservedAtMs).toBe(now);
+  });
+
+  it("does not inherit a stale episode when the repo identity changes", async () => {
+    const repoRoot = await makeRepoRoot();
+    const now = 1_700_000_000_000;
+    // Simulate the checkout path being reused for a different repository.
+    await observeDivergedRefusal(repoRoot, {
+      ...base,
+      repoIdentity: "/old/repo",
+      nowMs: now - 10 * DAY,
+      thresholdMs: 7 * DAY,
+    });
+    const obs = await observeDivergedRefusal(repoRoot, {
+      ...base,
+      repoIdentity: repoRoot,
+      nowMs: now,
+      thresholdMs: 7 * DAY,
+    });
+    expect(obs.record.repoIdentity).toBe(repoRoot);
+    expect(obs.record.firstObservedAtMs).toBe(now);
+    expect(obs.ageMs).toBe(0);
+    expect(obs.alertDue).toBe(false);
+    expect(obs.shouldEmitFirstClassSignal).toBe(false);
+  });
+
+  it("carries the episode forward when identity and base ref are unchanged", async () => {
+    const repoRoot = await makeRepoRoot();
+    const now = 1_700_000_000_000;
+    await observeDivergedRefusal(repoRoot, {
+      ...base,
+      repoIdentity: repoRoot,
+      nowMs: now - 10 * DAY,
+      thresholdMs: 7 * DAY,
+    });
+    const obs = await observeDivergedRefusal(repoRoot, {
+      ...base,
+      repoIdentity: repoRoot,
+      nowMs: now,
+      thresholdMs: 7 * DAY,
+    });
+    // Same repo + ref => the episode start is preserved, not reset.
+    expect(obs.record.firstObservedAtMs).toBe(now - 10 * DAY);
+    expect(obs.ageMs).toBe(10 * DAY);
+    expect(obs.alertDue).toBe(true);
+  });
+
+  it("emits the first-class signal exactly once when many probes race on one episode", async () => {
+    const repoRoot = await makeRepoRoot();
+    const now = 1_700_000_000_000;
+    // Seed the episode start 10 days ago so it is already past the threshold.
+    await observeDivergedRefusal(repoRoot, {
+      ...base,
+      repoIdentity: repoRoot,
+      nowMs: now - 10 * DAY,
+      thresholdMs: 7 * DAY,
+    });
+
+    // Eight concurrent provisioning passes of the same stuck episode: exactly
+    // one may claim the alert; the rest must observe it already claimed.
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        observeDivergedRefusal(repoRoot, {
+          ...base,
+          repoIdentity: repoRoot,
+          nowMs: now,
+          thresholdMs: 7 * DAY,
+        }),
+      ),
+    );
+    expect(results.every((r) => r.alertDue)).toBe(true);
+    expect(results.filter((r) => r.shouldEmitFirstClassSignal).length).toBe(1);
+
+    const winner = results.find((r) => r.shouldEmitFirstClassSignal)!;
+    expect(winner.record.firstObservedAtMs).toBe(now - 10 * DAY);
+    expect(winner.ageMs).toBe(10 * DAY);
+
+    // A follow-up probe after the race still sees the single-claimed episode.
+    const followUp = await observeDivergedRefusal(repoRoot, {
+      ...base,
+      repoIdentity: repoRoot,
+      nowMs: now + DAY,
+      thresholdMs: 7 * DAY,
+    });
+    expect(followUp.shouldEmitFirstClassSignal).toBe(false);
+    const onDisk = await readDivergenceRecord(repoRoot);
+    expect(onDisk?.alertedForFirstObservedAtMs).toBe(now - 10 * DAY);
+  });
 });
 
 describe("clearDivergenceRecord / readDivergenceRecord", () => {
