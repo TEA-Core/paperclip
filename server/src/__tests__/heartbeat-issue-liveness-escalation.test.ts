@@ -1491,8 +1491,6 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   });
 
   describe("SUP-15591 participant freshness gate in the recovery sweep", () => {
-    // The config mock pins the participant grace to 30 minutes, so "stale" is
-    // anything armed more than 30 minutes ago without a card-scoped run/wake.
     function pendingAgentExecutionState(agentId: string, pendingSince?: Date) {
       return {
         status: "pending",
