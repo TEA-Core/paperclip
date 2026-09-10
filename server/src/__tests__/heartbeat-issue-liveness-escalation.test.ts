@@ -1490,6 +1490,119 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
   });
 
+  describe("SUP-15591 participant freshness gate in the recovery sweep", () => {
+    function pendingAgentExecutionState(agentId: string, pendingSince?: Date) {
+      return {
+        status: "pending",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId },
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+        ...(pendingSince ? { pendingSince: pendingSince.toISOString() } : {}),
+      };
+    }
+
+    it("escalates an in_review blocker whose participant is live but stale for the card", async () => {
+      await enableAutoRecovery();
+      const { companyId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+      const armedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+      await db
+        .update(issues)
+        .set({
+          status: "in_review",
+          assigneeAgentId: coderId,
+          executionState: pendingAgentExecutionState(coderId, armedAt),
+          updatedAt: armedAt,
+        })
+        .where(eq(issues.id, blockerIssueId));
+
+      const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+      expect(result.findings).toBe(1);
+      expect(result.escalationsCreated).toBe(1);
+      const escalations = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]).toMatchObject({
+        parentId: blockerIssueId,
+        originId: [
+          "harness_liveness",
+          companyId,
+          blockedIssueId,
+          "in_review_without_action_path",
+          blockerIssueId,
+        ].join(":"),
+      });
+    });
+
+    it("keeps an in_review blocker covered while its participant armed within the grace window", async () => {
+      await enableAutoRecovery();
+      const { companyId, coderId, blockerIssueId } = await seedBlockedChain();
+      const armedAt = new Date(Date.now() - 1 * 60 * 1000);
+      await db
+        .update(issues)
+        .set({
+          status: "in_review",
+          assigneeAgentId: coderId,
+          executionState: pendingAgentExecutionState(coderId, armedAt),
+        })
+        .where(eq(issues.id, blockerIssueId));
+
+      const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+      expect(result.findings).toBe(0);
+      expect(result.escalationsCreated).toBe(0);
+      const escalations = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+      expect(escalations).toHaveLength(0);
+    });
+
+    it("escalates a legacy in_review blocker armed without an immutable pendingSince, ignoring its fresh updatedAt", async () => {
+      await enableAutoRecovery();
+      const { companyId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+      const updatedRecently = new Date(Date.now() - 1 * 60 * 1000);
+      await db
+        .update(issues)
+        .set({
+          status: "in_review",
+          assigneeAgentId: coderId,
+          executionState: pendingAgentExecutionState(coderId),
+          updatedAt: updatedRecently,
+        })
+        .where(eq(issues.id, blockerIssueId));
+
+      const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+      expect(result.findings).toBe(1);
+      expect(result.escalationsCreated).toBe(1);
+      const escalations = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]).toMatchObject({
+        parentId: blockerIssueId,
+        originId: [
+          "harness_liveness",
+          companyId,
+          blockedIssueId,
+          "in_review_without_action_path",
+          blockerIssueId,
+        ].join(":"),
+      });
+    });
+  });
+
   it("parents recovery under the leaf blocker without inheriting dependent or blocker execution state for manager-owned recovery", async () => {
     await enableAutoRecovery();
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
