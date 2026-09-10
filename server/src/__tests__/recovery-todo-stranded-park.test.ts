@@ -48,7 +48,7 @@ const ALL_FALSE_GUARDS: TodoStrandedDisjuncts = {
   leased: false,
   activeRun: false,
   monitorNextCheckAtInFuture: false,
-  queuedWake: false,
+  liveWake: false,
   boardRecoveryAction: false,
 };
 
@@ -92,7 +92,7 @@ describe("evaluateTodoStranded (ADR-093 D2 predicate)", () => {
       leased: false,
       activeRun: false,
       monitorNextCheckAtInFuture: false,
-      queuedWake: false,
+      liveWake: false,
       boardRecoveryAction: false,
       lastContactAt: stale,
       ...overrides,
@@ -121,8 +121,8 @@ describe("evaluateTodoStranded (ADR-093 D2 predicate)", () => {
     ).toBe(false);
   });
 
-  it("is not stranded when a wake is queued (AC2d)", () => {
-    expect(evaluateTodoStranded(evidence({ queuedWake: true }), { now: NOW }).stranded).toBe(false);
+  it("is not stranded when a wake is live — queued, claimed or deferred (AC2d)", () => {
+    expect(evaluateTodoStranded(evidence({ liveWake: true }), { now: NOW }).stranded).toBe(false);
   });
 
   it("is not stranded when a board recovery action owns it (AC2e)", () => {
@@ -390,6 +390,62 @@ describeEmbeddedPostgres("recovery reconcileTodoStrandedCards", () => {
       reason: "issue_blockers_resolved",
       payload: { issueId },
       status: "queued",
+    });
+    const svc = recovery();
+
+    const result = await svc.reconcileTodoStrandedCards({ now: new Date() });
+    expect(result.parked).toBe(0);
+    expect(result.livePathSkipped).toBe(1);
+    expect((await readIssue(issueId))?.status).toBe("todo");
+  });
+
+  // SUP-15574 regression. `claimed` is the wake lifecycle's in-flight delivery
+  // state: `runId` is assigned and the wake has not finished. It is neither
+  // `queued` (so the old queued-only disjunct missed it) nor an active run when
+  // the run crashed/was killed (so `hasActiveExecutionPath` missed it too) —
+  // which parked a live card. Both the card and the wake are aged past the
+  // window here so the ONLY thing standing between this card and a park is the
+  // wake-status set: with `queued`-only the card parks; with the shared live set
+  // it does not.
+  it("does not park a card with a claimed (in-flight) wake (AC2d — SUP-15574)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedTodoCard({ companyId, agentId, lastContactMsAgo: DAY_MS });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId },
+      status: "claimed",
+      runId: randomUUID(),
+      claimedAt: new Date(Date.now() - DAY_MS),
+      createdAt: new Date(Date.now() - DAY_MS),
+    });
+    const svc = recovery();
+
+    const result = await svc.reconcileTodoStrandedCards({ now: new Date() });
+    expect(result.parked).toBe(0);
+    expect(result.livePathSkipped).toBe(1);
+    expect((await readIssue(issueId))?.status).toBe("todo");
+  });
+
+  // Same shared status set, third member. `deferred_issue_execution` is also
+  // covered by `hasActiveExecutionPath`; asserting it here pins the whole
+  // `SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES` set to the todo arm so a future
+  // edit cannot drop a member without a red test.
+  it("does not park a card with a deferred_issue_execution wake (AC2d — SUP-15574)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedTodoCard({ companyId, agentId, lastContactMsAgo: DAY_MS });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId },
+      status: "deferred_issue_execution",
+      createdAt: new Date(Date.now() - DAY_MS),
     });
     const svc = recovery();
 

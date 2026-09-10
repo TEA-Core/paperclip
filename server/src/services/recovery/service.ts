@@ -94,6 +94,7 @@ import {
   noticeMetadataReferencesRecoveryAction,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
+import { SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES } from "../successful-run-handoff-state.js";
 import {
   buildDispatchSuppressionParkNotice,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
@@ -1303,6 +1304,34 @@ export function recoveryService(db: Db, deps: {
         and(
           eq(agentWakeupRequests.companyId, companyId),
           eq(agentWakeupRequests.status, "queued"),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+          agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  // The `todo` arm's wake disjunct (ADR-093 D2). `hasQueuedIssueWake` above
+  // matches `queued` only, but the wake lifecycle has three ACTIVE states:
+  // `queued` -> `claimed` (in flight, `runId` assigned, not yet finished) and
+  // `deferred_issue_execution` (deferred, pending re-drive). A `claimed` wake
+  // whose run is not active is neither `queued` nor an active run, so both
+  // existing guards read "no live wake" and a live card is parked. Bound to the
+  // shared `SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES` set so this sweep and
+  // the handoff/blocked-inbox liveness contract can never drift apart.
+  // Deliberately separate from `hasQueuedIssueWake`: that helper is shared by
+  // the in_progress/D1/D3 park, review-participant recovery,
+  // blocked_without_blockers and accepted-interaction continuation sweeps,
+  // which are out of scope here and must stay behaviourally unchanged.
+  async function hasLiveIssueWake(companyId: string, issueId: string, agentId?: string | null) {
+    return db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          inArray(agentWakeupRequests.status, [...SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES]),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
         ),
@@ -8604,7 +8633,7 @@ export function recoveryService(db: Db, deps: {
         candidate.assigneeAgentId,
         candidate.monitorNextCheckAt,
       );
-      const queuedWake = await hasQueuedIssueWake(
+      const liveWake = await hasLiveIssueWake(
         candidate.companyId,
         candidate.id,
         candidate.assigneeAgentId,
@@ -8633,7 +8662,7 @@ export function recoveryService(db: Db, deps: {
           leased,
           activeRun: activePath,
           monitorNextCheckAtInFuture: monitorFuture,
-          queuedWake,
+          liveWake,
           boardRecoveryAction: activeRecoveryAction !== null,
           lastContactAt: lastContact,
         },
@@ -8649,7 +8678,7 @@ export function recoveryService(db: Db, deps: {
         continue;
       }
       if (!verdict.stranded) {
-        if (activePath || monitorFuture || queuedWake) result.livePathSkipped += 1;
+        if (activePath || monitorFuture || liveWake) result.livePathSkipped += 1;
         else result.thresholdSkipped += 1;
         continue;
       }

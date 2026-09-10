@@ -182,7 +182,10 @@ export interface TodoStrandedDisjuncts {
   leased: boolean;
   activeRun: boolean;
   monitorNextCheckAtInFuture: boolean;
-  queuedWake: boolean;
+  // A wake in ANY active status — `queued`, `claimed` (in flight) or
+  // `deferred_issue_execution` — not just `queued`. Caller-side this is
+  // `SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES`.
+  liveWake: boolean;
   boardRecoveryAction: boolean;
 }
 
@@ -190,7 +193,7 @@ export interface TodoStrandedEvidence {
   leased: boolean;
   activeRun: boolean;
   monitorNextCheckAtInFuture: boolean;
-  queuedWake: boolean;
+  liveWake: boolean;
   boardRecoveryAction: boolean;
   lastContactAt: Date | string | null | undefined;
 }
@@ -212,7 +215,7 @@ export function evaluateTodoStranded(
     leased: evidence.leased === true,
     activeRun: evidence.activeRun === true,
     monitorNextCheckAtInFuture: evidence.monitorNextCheckAtInFuture === true,
-    queuedWake: evidence.queuedWake === true,
+    liveWake: evidence.liveWake === true,
     boardRecoveryAction: evidence.boardRecoveryAction === true,
   };
   const lastContactAt = toContinuationPathDate(evidence.lastContactAt);
