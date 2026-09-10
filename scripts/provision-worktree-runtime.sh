@@ -21,6 +21,7 @@ fi
 
 worktree_config_path="$paperclip_dir/config.json"
 seed_manifest_path="$paperclip_dir/seed-manifest.json"
+seed_skip_marker_path="$paperclip_dir/seed-skip-no-source"
 
 if [[ ! -d "$base_cwd" ]]; then
   echo "Base workspace does not exist: $base_cwd" >&2
@@ -63,6 +64,14 @@ EOF
   fi
 fi
 
+# SUP-15609: an intentional no-source skip is recorded as durable evidence that
+# the worktree has nothing to seed. Re-dispatches must fast-exit on it instead of
+# re-deriving the (still missing) source.
+if [[ -e "$seed_skip_marker_path" ]]; then
+  echo "Worktree recorded a no-source seed skip; nothing to seed." >&2
+  exit 0
+fi
+
 if [[ ! -f "$worktree_config_path" ]]; then
   initial_provision_script="$base_cwd/scripts/provision-worktree.sh"
   if [[ ! -f "$initial_provision_script" ]]; then
@@ -100,9 +109,15 @@ if [[ ! -e "$base_cwd/.paperclip/config.json" && ! -L "$base_cwd/.paperclip/conf
     # A deployment may be configured entirely from process state (for example, a
     # shared DATABASE_URL in the environment) and have no on-disk instance config
     # anywhere. That is not an error: there is simply no seed source to clone
-    # from, so exit without demanding one. A source that is present but malformed
-    # (a symlink or a non-canonical alias) is still refused by the CLI.
+    # from, so exit without demanding one. Record the intentional skip as durable
+    # evidence: the runtime consumer accepts the marker where it otherwise demands
+    # a verified seed manifest (workspace-runtime.ts). A source that is present
+    # but malformed (a symlink or a non-canonical alias) is still refused by the
+    # CLI.
     if [[ ! -e "$source_config_path" && ! -L "$source_config_path" ]]; then
+      SEED_SKIP_MARKER_PATH="$seed_skip_marker_path" \
+      SEED_SKIP_SOURCE_CONFIG_PATH="$source_config_path" \
+      node -e 'const fs = require("node:fs"); const marker = { reason: "no-on-disk-seed-source", sourceConfigPath: process.env.SEED_SKIP_SOURCE_CONFIG_PATH || null, at: new Date().toISOString() }; fs.writeFileSync(process.env.SEED_SKIP_MARKER_PATH, JSON.stringify(marker, null, 2) + "\n");'
       echo "No on-disk Paperclip seed source config found; the self-contained worktree has nothing to seed." >&2
       exit 0
     fi

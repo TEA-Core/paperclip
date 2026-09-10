@@ -53,6 +53,7 @@ import {
   MANAGED_RUNTIME_PUBLIC_URL_ENV,
   resolveManagedPaperclipRuntimePublicOrigin,
   resolveRuntimeProvisionCommand,
+  readWorkspaceSeedOperationEvidence,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
@@ -1275,6 +1276,104 @@ describe("resolveRuntimeProvisionCommand", () => {
       expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
     } finally {
       await fs.rm(baseCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not re-run the seed command when a no-source seed skip is recorded", async () => {
+    // SUP-15609: an env-only worktree has no database to seed; the recorded
+    // skip marker is its completion evidence, so the built-in seed command must
+    // not surface again on later dispatches.
+    const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-skip-"));
+    const cwd = path.join(baseCwd, "worktree");
+    try {
+      await fs.mkdir(path.join(baseCwd, "scripts"), { recursive: true });
+      await fs.writeFile(
+        path.join(baseCwd, "scripts", "provision-worktree-runtime.sh"),
+        "#!/usr/bin/env bash\n",
+      );
+      await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+      await fs.writeFile(path.join(cwd, ".paperclip", "config.json"), "{}\n");
+      const workspace = {
+        ...buildWorkspace(cwd),
+        baseCwd,
+        strategy: "git_worktree" as const,
+        worktreePath: cwd,
+      };
+
+      // Without any evidence the seed command still surfaces.
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
+
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-skip-no-source"),
+        JSON.stringify({ reason: "no-on-disk-seed-source", at: "2026-09-10T00:00:00.000Z" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+
+      // A scoped uid state dir with its own recorded skip is complete too.
+      const scopedCwd = path.join(baseCwd, "scoped-worktree");
+      await fs.mkdir(path.join(scopedCwd, ".paperclip", "uid-1001"), { recursive: true });
+      await fs.writeFile(path.join(scopedCwd, ".paperclip", "uid-1001", "seed-skip-no-source"), "{}\n");
+      const scopedWorkspace = {
+        ...buildWorkspace(scopedCwd),
+        baseCwd,
+        strategy: "git_worktree" as const,
+        worktreePath: scopedCwd,
+      };
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace: scopedWorkspace })).toBe("");
+    } finally {
+      await fs.rm(baseCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readWorkspaceSeedOperationEvidence", () => {
+  it("accepts a recorded no-source seed skip as verified seed evidence", async () => {
+    // SUP-15609: the runtime recorder marks a workspace_seed operation failed
+    // when the worktree has no verified seed manifest. An env-only worktree
+    // can never produce one, so the recorded no-source skip is the accepted
+    // evidence.
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-"));
+    try {
+      await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+
+      // No evidence at all: unverified.
+      expect(readWorkspaceSeedOperationEvidence(cwd).verified).toBe(false);
+      expect(readWorkspaceSeedOperationEvidence(cwd).metadata.seedState).toBe("absent");
+
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-skip-no-source"),
+        JSON.stringify({ reason: "no-on-disk-seed-source", at: "2026-09-10T00:00:00.000Z" }),
+      );
+      const evidence = readWorkspaceSeedOperationEvidence(cwd);
+      expect(evidence.verified).toBe(true);
+      expect(evidence.error).toBeNull();
+      expect(evidence.metadata).toMatchObject({
+        provisionKind: "workspace_seed",
+        seedState: "skipped-no-source",
+        seedSkippedNoSource: true,
+      });
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps refusing an unverified manifest even when a stale skip marker is present", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-stale-"));
+    try {
+      await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+      await fs.writeFile(path.join(cwd, ".paperclip", "seed-skip-no-source"), "{}\n");
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ version: 2, state: "pending" }),
+      );
+
+      const evidence = readWorkspaceSeedOperationEvidence(cwd);
+      expect(evidence.verified).toBe(false);
+      expect(evidence.error).toMatch(/without a verified manifest/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
     }
   });
 });
