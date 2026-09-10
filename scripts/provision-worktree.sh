@@ -54,16 +54,32 @@ if [[ ! -e "$source_config_path" && ! -L "$source_config_path" ]]; then
   # state this workspace cannot rewrite.
   source_config_path="${PAPERCLIP_CONFIG:-$paperclip_home/instances/$paperclip_instance_id/config.json}"
 fi
-if [[ ! -f "$source_config_path" || -L "$source_config_path" ]]; then
-  echo "Registered Paperclip seed source config is missing or is not a canonical file: $source_config_path" >&2
+# A deployment may be configured entirely from process state (for example, a shared
+# DATABASE_URL in the environment) and have no on-disk instance config anywhere. That
+# is not an error: there is simply no seed source to clone from, so provision a
+# self-contained isolated worktree config instead of hard-failing. A source that is
+# present but malformed (a symlink or a non-canonical alias) is still refused.
+have_source_config=0
+source_env_path=""
+if [[ -L "$source_config_path" ]]; then
+  echo "Registered Paperclip seed source config is a symlink: $source_config_path" >&2
   exit 1
 fi
-canonical_source_dir="$(cd "$(dirname "$source_config_path")" && pwd -P)"
-if [[ "$canonical_source_dir/config.json" != "$source_config_path" ]]; then
-  echo "Registered Paperclip seed source config uses a symlink alias: $source_config_path" >&2
-  exit 1
+if [[ -e "$source_config_path" ]]; then
+  if [[ ! -f "$source_config_path" ]]; then
+    echo "Registered Paperclip seed source config is not a regular file: $source_config_path" >&2
+    exit 1
+  fi
+  have_source_config=1
+  canonical_source_dir="$(cd "$(dirname "$source_config_path")" && pwd -P)"
+  if [[ "$canonical_source_dir/config.json" != "$source_config_path" ]]; then
+    echo "Registered Paperclip seed source config uses a symlink alias: $source_config_path" >&2
+    exit 1
+  fi
+  source_env_path="$(dirname "$source_config_path")/.env"
+else
+  echo "No on-disk Paperclip seed source config found; provisioning a self-contained isolated worktree config without a seed source." >&2
 fi
-source_env_path="$(dirname "$source_config_path")/.env"
 
 mkdir -p "$paperclip_dir"
 
@@ -722,9 +738,13 @@ fi
 # source, and older/fallback CLI writers may default this field independently.
 # Reconcile it after either create or reuse so the final guest config always
 # carries the source's deployment/auth contract without replacing its database.
-reconcile_worktree_deployment_mode
+# With no on-disk source there is nothing to inherit, so skip it and let the
+# freshly written isolated config keep its own defaults.
+if [[ "$have_source_config" -eq 1 ]]; then
+  reconcile_worktree_deployment_mode
+fi
 
-if [[ "$created_worktree_config" -eq 1 && ! -e "$seed_manifest_path" && ! -e "$seed_pending_marker_path" && ! -e "$seed_complete_marker_path" ]]; then
+if [[ "$have_source_config" -eq 1 && "$created_worktree_config" -eq 1 && ! -e "$seed_manifest_path" && ! -e "$seed_pending_marker_path" && ! -e "$seed_complete_marker_path" ]]; then
   write_seed_pending_manifest
 fi
 

@@ -195,7 +195,7 @@ test("rejects a dangling base workspace config symlink instead of falling back",
   const { result } = runProvision(baseCwd);
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /is missing or is not a canonical file/);
+  assert.match(result.stderr, /seed source config is a symlink/);
 });
 
 test("rejects a dangling base workspace .paperclip symlink instead of falling back", () => {
@@ -208,6 +208,105 @@ test("rejects a dangling base workspace .paperclip symlink instead of falling ba
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /\.paperclip is a broken symlink/);
+});
+
+test("provisions a self-contained worktree when no seed source config exists on disk", () => {
+  // Env-configured deployment: the base is a plain checkout (no instance config),
+  // the registered PAPERCLIP_HOME instance home has no config.json, and no
+  // PAPERCLIP_CONFIG is set — only DATABASE_URL. Provisioning must not hard-fail;
+  // it degrades to a fresh isolated config instead of demanding a seed source.
+  const baseCwd = makeBaseWorkspace({ helpExit: 1, initExit: 0 });
+  const worktreeCwd = makeTempDir("paperclip-provision-env-only-worktree-");
+  const worktreesHome = makeTempDir("paperclip-provision-env-only-home-");
+  const emptyInstanceHome = makeTempDir("paperclip-provision-env-only-instance-");
+  fs.mkdirSync(path.join(emptyInstanceHome, "instances", "default"), { recursive: true });
+  // No config.json written into the instance home: this is the env-only case.
+
+  const result = spawnSync("bash", [script], {
+    cwd: worktreeCwd,
+    encoding: "utf8",
+    env: {
+      PATH: testPath,
+      HOME: os.homedir(),
+      PAPERCLIP_WORKSPACE_BASE_CWD: baseCwd,
+      PAPERCLIP_WORKSPACE_CWD: worktreeCwd,
+      PAPERCLIP_WORKSPACE_BRANCH: "feature/provision-env-only",
+      PAPERCLIP_WORKTREES_DIR: worktreesHome,
+      PAPERCLIP_HOME: emptyInstanceHome,
+      PAPERCLIP_PROJECT_WORKSPACE_ID: "project-workspace-1",
+      PAPERCLIP_SEED_EXPECTED_COMPANY_ID: "company-1",
+      DATABASE_URL: "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(
+    result.stderr,
+    /No on-disk Paperclip seed source config found; provisioning a self-contained isolated worktree config without a seed source/,
+  );
+  const config = readWorktreeConfig(worktreeCwd);
+  assert.equal(config.$meta.source, "configure");
+  const dataDir = config.database.embeddedPostgresDataDir;
+  assert.ok(
+    !path.relative(worktreesHome, dataDir).startsWith(".."),
+    `expected ${dataDir} to live under ${worktreesHome}`,
+  );
+  const env = fs.readFileSync(path.join(worktreeCwd, ".paperclip", ".env"), "utf8");
+  assert.match(env, /PAPERCLIP_IN_WORKTREE=true/);
+  // Nothing to seed from: no pending manifest may reference a source that does not exist.
+  assert.equal(
+    fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-manifest.json")),
+    false,
+  );
+});
+
+test("provisions through the base CLI when no seed source config exists on disk", () => {
+  // The production-shaped env-only case: the base CLI is healthy (its import graph
+  // boots), so the init rung runs with a missing --from-config, and there is still
+  // no on-disk source anywhere (no base config, empty instance home, no
+  // PAPERCLIP_CONFIG, only DATABASE_URL). Provisioning must succeed through the
+  // CLI init rung and must not write a seed manifest that references a source that
+  // does not exist.
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const worktreeCwd = makeTempDir("paperclip-provision-env-only-cli-worktree-");
+  const worktreesHome = makeTempDir("paperclip-provision-env-only-cli-home-");
+  const emptyInstanceHome = makeTempDir("paperclip-provision-env-only-cli-instance-");
+  fs.mkdirSync(path.join(emptyInstanceHome, "instances", "default"), { recursive: true });
+
+  const result = spawnSync("bash", [script], {
+    cwd: worktreeCwd,
+    encoding: "utf8",
+    env: {
+      PATH: testPath,
+      HOME: os.homedir(),
+      PAPERCLIP_WORKSPACE_BASE_CWD: baseCwd,
+      PAPERCLIP_WORKSPACE_CWD: worktreeCwd,
+      PAPERCLIP_WORKSPACE_BRANCH: "feature/provision-env-only-cli",
+      PAPERCLIP_WORKTREES_DIR: worktreesHome,
+      PAPERCLIP_HOME: emptyInstanceHome,
+      PAPERCLIP_PROJECT_WORKSPACE_ID: "project-workspace-1",
+      PAPERCLIP_SEED_EXPECTED_COMPANY_ID: "company-1",
+      DATABASE_URL: "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(
+    result.stderr,
+    /No on-disk Paperclip seed source config found; provisioning a self-contained isolated worktree config without a seed source/,
+  );
+  // The base CLI init rung was taken (its marker config), not the fallback writer.
+  const initInvocation = readCliInvocations(baseCwd).find(
+    (args) => args[0] === "worktree" && args[1] === "init",
+  );
+  assert.ok(initInvocation, "expected the base CLI init rung to be invoked");
+  const config = readWorktreeConfig(worktreeCwd);
+  assert.equal(config.$meta.source, "fake-cli");
+  // No on-disk source to seed from: no pending manifest may reference one.
+  assert.equal(
+    fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-manifest.json")),
+    false,
+  );
 });
 
 test("falls back to an isolated config when the base CLI cannot boot", () => {
