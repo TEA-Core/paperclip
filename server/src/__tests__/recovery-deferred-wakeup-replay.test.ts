@@ -8,7 +8,9 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  instanceSettings,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -354,8 +356,10 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
+    await db.delete(instanceSettings);
   });
 
   afterAll(async () => {
@@ -797,6 +801,121 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
       .then((rows) => rows[0]);
     expect(row.status).toBe("skipped");
     expect(row.finishedAt).toBeNull();
+  });
+
+  // Regression (review round 2, `Finding signature:
+  // deferrable-worktree-cutoff-remains-terminal`): `heartbeat.worktree_execution_cutoff`
+  // is classified DEFERRABLE, but the resolved-issue path inside the
+  // execution-lock transaction still hand-rolled its own insert with
+  // `finishedAt: new Date()`. That row is invisible to this sweep (which
+  // selects `status = 'skipped' AND finished_at IS NULL`), so an issue-bound
+  // wake hitting the worktree cutoff was destroyed exactly as the original
+  // defect destroyed the scheduling-suppressed one. Against the parent commit
+  // the `finishedAt` assertion below fails.
+  //
+  // This drives the REAL heartbeat write path (not a seeded row) with the
+  // worktree cutoff armed, past the projectId-resolution branch — so it lands
+  // on the transaction-side site, which is the live one for an issue-bound wake.
+  it("regression: a wake for a card behind the armed worktree cutoff defers, holds while armed, and re-drives when the cutoff lifts", async () => {
+    const { companyId, agentId, issueId } = await seedCard("todo");
+
+    // Card sits behind the cutoff, so the worktree-execution cutoff suppresses it.
+    const cutoff = new Date(Date.now() - 60 * 60 * 1000);
+    await db
+      .update(issues)
+      .set({ createdAt: new Date(cutoff.getTime() - 60 * 60 * 1000) })
+      .where(eq(issues.id, issueId));
+
+    // A real project so the wake carries a projectId in its context snapshot:
+    // with projectId already known, enqueueWakeup skips the projectId-resolution
+    // lookup (and its own cutoff check) and reaches the transaction-side path.
+    const projectId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Cutoff project" });
+    await db.update(issues).set({ projectId }).where(eq(issues.id, issueId));
+
+    const instanceId = "sup15552-worktree-instance";
+    await db.delete(instanceSettings);
+    await db.insert(instanceSettings).values({
+      id: randomUUID(),
+      singletonKey: "default",
+      general: {},
+      experimental: {
+        enableWorktreeRunExecution: true,
+        worktreeRunExecutionActivatedAt: cutoff.toISOString(),
+        worktreeRunExecutionActivationInstanceId: instanceId,
+      },
+    });
+
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: {
+        PAPERCLIP_IN_WORKTREE: "1",
+        PAPERCLIP_INSTANCE_ID: instanceId,
+      },
+    });
+    const skippedRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { projectId },
+      requestedByActorType: "system",
+      requestedByActorId: "deferred_wake_cutoff_test",
+    });
+    expect(skippedRun).toBeNull();
+
+    const rows = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        finishedAt: agentWakeupRequests.finishedAt,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].reason).toBe("heartbeat.worktree_execution_cutoff");
+    expect(rows[0].status).toBe("skipped");
+    // The regression assertion: deferred, not destroyed.
+    expect(rows[0].finishedAt).toBeNull();
+    expect(rows[0].payload).toMatchObject({ issueId });
+    expect((rows[0].payload as { heartbeatSkip?: Record<string, unknown> }).heartbeatSkip)
+      .toMatchObject({ reason: "worktree_execution_cutoff", issueId, cutoff: cutoff.toISOString() });
+
+    const enqueueWakeup = vi.fn().mockResolvedValue({ id: randomUUID(), agentId } as never);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+
+    // Cutoff still armed: the suppression that skipped this wake has NOT
+    // lifted, so the wake is held pending rather than claimed and re-skipped.
+    const held = await recovery.reconcileDeferredWakeupReplay({ issueCreatedAtGte: cutoff });
+    expect(held.reDriven).toBe(0);
+    expect(held.cutoffHeldSkipped).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const stillPending = await db
+      .select({ finishedAt: agentWakeupRequests.finishedAt })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((r) => r[0]);
+    expect(stillPending.finishedAt).toBeNull();
+
+    // Cutoff lifts: the wake is re-driven carrying the ORIGINAL payload.issueId.
+    const result = await recovery.reconcileDeferredWakeupReplay({ issueCreatedAtGte: null });
+    expect(result.reDriven).toBe(1);
+    expect(result.issueIds).toContain(issueId);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    const [enqAgentId, enqOpts] = enqueueWakeup.mock.calls[0] as [
+      string,
+      { payload?: Record<string, unknown> | null },
+    ];
+    expect(enqAgentId).toBe(agentId);
+    expect(enqOpts.payload).toMatchObject({ issueId });
+
+    // Retired, so a second sweep does not drive it again (acceptance #3).
+    const second = await recovery.reconcileDeferredWakeupReplay({ issueCreatedAtGte: null });
+    expect(second.reDriven).toBe(0);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 
   it("does not re-drive a deferrable skip whose card has since been closed", async () => {
