@@ -1,9 +1,14 @@
 import { and, desc, eq, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import type {
+  IssueExecutionMonitorPolicy,
+  IssueExecutionPolicy,
+  IssueMonitorScheduledBy,
+} from "@paperclipai/shared";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
 import { issueService } from "../issues.js";
-import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import { applyIssueMonitorPolicyTransition, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { readHostRestartMarker, resolveHostBootId } from "../host-boot-identity.js";
 import { blockIssueWithUnresolvedBlockers } from "./service.js";
 import {
@@ -19,21 +24,34 @@ import {
 // sweep runs once at startup, right after the reap, and repairs those cards.
 //
 // Two repair shapes, picked per card:
-//   - re-arm: the card's monitor policy is still live (not exhausted) → point
-//     `monitorNextCheckAt` back at "now" and clear any pending wake marker so the
-//     existing `tickDueIssueMonitors` scheduler dispatches it.
+//   - re-arm: the card's monitor policy is still live (not exhausted) → restore
+//     the scheduled monitor (policy + state + flat columns) and point
+//     `monitorNextCheckAt` back at "now" so the existing `tickDueIssueMonitors`
+//     scheduler dispatches it.
 //   - escalate: the monitor is exhausted, was never armed, or the card is not
 //     monitorable → mirror `reconcileStrandedAssignedIssues` by blocking the card
 //     and posting a host-restart-flavored stranded-notice.
 //
 // Never touch a card that still has a live run, or whose most recent run was not
-// a failed run carrying a host-restart marker. The whole pass is idempotent: a
-// repaired card leaves the candidate set on the next pass.
+// a failed run carrying a host-restart marker stamped for the currently detected
+// boot. The whole pass is idempotent per boot: a second invocation for the same
+// detected boot is a no-op, and a repaired card leaves the candidate set on any
+// later boot.
 
 const MONITORABLE_STATUSES = ["in_progress", "in_review", "blocked"] as const;
 const DEFAULT_SWEEP_REPAIR_CAP = 50;
 const MAX_CANDIDATES_INSPECTED = 500;
 const SWEEP_SOURCE = "host-restart-strand-sweep";
+
+// Per-boot idempotency guard. The sweep is a one-shot per detected boot: a double
+// startup path, a hot reconcile, or a manual re-run for the same boot must not
+// re-repair already-repaired cards or re-post notices. Null (unresolvable) boot
+// ids are never gated, so the sweep always runs when boot detection is absent.
+let lastSweptBootId: string | null = null;
+
+export function __resetHostRestartStrandSweepForTests(): void {
+  lastSweptBootId = null;
+}
 
 export interface HostRestartStrandCandidate {
   id: string;
@@ -42,11 +60,30 @@ export interface HostRestartStrandCandidate {
   status: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  executionPolicy: unknown;
   executionState: unknown;
   monitorAttemptCount: number | null;
   monitorNextCheckAt: Date | null;
   monitorWakeRequestedAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
+  monitorNotes: string | null;
+  monitorScheduledBy: string | null;
 }
+
+// The candidate fields the re-arm patch needs. Kept as a Pick so tests can pass
+// a full candidate and the builder stays decoupled from the collection columns.
+export type HostRestartStrandRearmSource = Pick<
+  HostRestartStrandCandidate,
+  | "status"
+  | "assigneeAgentId"
+  | "assigneeUserId"
+  | "executionPolicy"
+  | "executionState"
+  | "monitorAttemptCount"
+  | "monitorLastTriggeredAt"
+  | "monitorNotes"
+  | "monitorScheduledBy"
+>;
 
 export interface HostRestartStrandSourceRun {
   id: string;
@@ -72,9 +109,13 @@ export type HostRestartStrandDecision =
   | { action: "rearm" }
   | { action: "escalate"; reason: "exhausted" | "never-armed" | "not-monitorable" };
 
-export interface HostRestartStrandRepairPatch {
+export interface HostRestartStrandRearmPatch {
+  executionPolicy: Record<string, unknown>;
+  executionState: Record<string, unknown>;
   monitorNextCheckAt: Date;
   monitorWakeRequestedAt: null;
+  monitorNotes: string | null;
+  monitorScheduledBy: string | null;
 }
 
 // A card is eligible for monitor re-arm only if it mirrors `issueAllowsMonitor`
@@ -115,7 +156,8 @@ export function isMonitorExhausted(
   return false;
 }
 
-// The per-card repair decision. Pure: no db, no clock reads (uses `now`).
+// The per-card repair decision. Pure: no db, no clock reads (uses `now`), no host
+// reads (uses the injected `detectedBootId`).
 export function decideHostRestartStrandRepair(input: {
   status: string;
   assigneeAgentId: string | null;
@@ -126,13 +168,21 @@ export function decideHostRestartStrandRepair(input: {
   alreadyEscalated: boolean;
   latestRun: HostRestartStrandLatestRun | null;
   now: Date;
+  detectedBootId?: string | null;
 }): HostRestartStrandDecision {
   if (input.hasLiveRun) return { action: "skip-live" };
 
   const run = input.latestRun;
   // Only a failed run stamped with a host-restart marker (by B1's reap) proves
   // this card was torn down by a host restart. Anything else is out of scope.
-  if (!run || run.status !== "failed" || !readHostRestartMarker(run.resultJson)) {
+  const marker = run ? readHostRestartMarker(run.resultJson) : null;
+  if (!run || run.status !== "failed" || !marker) {
+    return { action: "skip-no-marker" };
+  }
+  // A marker stamped for a different (older) boot is stale for the currently
+  // detected boot — the reap for this boot would have re-stamped it. Never act
+  // on a marker we cannot attribute to the current boot (fail-safe: skip).
+  if (input.detectedBootId && marker.currentBootId !== input.detectedBootId) {
     return { action: "skip-no-marker" };
   }
 
@@ -147,20 +197,102 @@ export function decideHostRestartStrandRepair(input: {
     assigneeUserId: input.assigneeUserId,
   });
   const monitorState = parseIssueExecutionState(input.executionState)?.monitor ?? null;
+  // Only a "triggered" monitor (the shape left by a fired monitor) carries the
+  // bounds/metadata needed to reconstruct a scheduled re-arm. A "cleared" or
+  // absent monitor cannot be re-armed.
+  const armed = monitorState?.status === "triggered";
 
-  if (monitorable && monitorState && !isMonitorExhausted(monitorState, input.monitorAttemptCount, input.now)) {
+  if (monitorable && armed && !isMonitorExhausted(monitorState, input.monitorAttemptCount, input.now)) {
     return { action: "rearm" };
   }
 
-  const reason = !monitorable ? "not-monitorable" : !monitorState ? "never-armed" : "exhausted";
+  const reason = !monitorable ? "not-monitorable" : !armed ? "never-armed" : "exhausted";
   return { action: "escalate", reason };
 }
 
-// The re-arm patch: re-arm the monitor at "now" and drop any pending wake marker.
-// Setting `monitorNextCheckAt <= now` is what re-enters the card into the
-// existing `tickDueIssueMonitors` scheduler's due set.
-export function buildRearmMonitorPatch(now: Date): HostRestartStrandRepairPatch {
-  return { monitorNextCheckAt: now, monitorWakeRequestedAt: null };
+// The re-arm patch. Reconstructs the `executionPolicy.monitor` stripped by the
+// fire path (`buildIssueMonitorTriggeredPatch`, issue-execution-policy.ts), then
+// delegates the scheduled-state + flat-column write to the canonical
+// `applyIssueMonitorPolicyTransition` re-arm branch — so the persisted monitor
+// state, its bounds/metadata, and the flat columns stay in lockstep with the
+// policy module instead of a hand-rolled shape that can drift. The transition
+// preserves the card's existing execution state (stages/review) via
+// `executionStateWithMonitor`. Returns null when the persisted monitor is not a
+// fired ("triggered") monitor — there is nothing to reconstruct from — or when
+// the policy module rejects the transition; the caller then skips the card.
+export function buildRearmMonitorPatch(input: {
+  now: Date;
+  candidate: HostRestartStrandRearmSource;
+}): HostRestartStrandRearmPatch | null {
+  const { candidate } = input;
+  const state = parseIssueExecutionState(candidate.executionState);
+  const monitor = state?.monitor;
+  if (!state || !monitor || monitor.status !== "triggered") return null;
+
+  // A fired monitor carries the bounds/metadata forward; only `nextCheckAt` is
+  // reset to "now" so the scheduler picks the card up on the next tick.
+  const scheduledBy: IssueMonitorScheduledBy =
+    monitor.scheduledBy === "board" ? "board" : "assignee";
+  const policyMonitor: IssueExecutionMonitorPolicy = {
+    nextCheckAt: input.now.toISOString(),
+    notes: monitor.notes ?? null,
+    scheduledBy,
+    kind: monitor.kind ?? null,
+    serviceName: monitor.serviceName ?? null,
+    externalRef: monitor.externalRef ?? null,
+    timeoutAt: monitor.timeoutAt ?? null,
+    maxAttempts: monitor.maxAttempts ?? null,
+    recoveryPolicy: monitor.recoveryPolicy ?? null,
+  };
+  const currentPolicy =
+    candidate.executionPolicy && typeof candidate.executionPolicy === "object"
+      ? (candidate.executionPolicy as Record<string, unknown>)
+      : { mode: "normal", commentRequired: true, stages: [] };
+  const executionPolicy: Record<string, unknown> = { ...currentPolicy, monitor: policyMonitor };
+
+  let monitorPatch: Record<string, unknown>;
+  try {
+    monitorPatch = applyIssueMonitorPolicyTransition({
+      issue: {
+        status: candidate.status,
+        assigneeAgentId: candidate.assigneeAgentId,
+        assigneeUserId: candidate.assigneeUserId,
+        executionPolicy: currentPolicy,
+        executionState: candidate.executionState as Record<string, unknown> | null,
+        monitorNextCheckAt: null,
+        monitorWakeRequestedAt: null,
+        monitorLastTriggeredAt: candidate.monitorLastTriggeredAt,
+        monitorAttemptCount: candidate.monitorAttemptCount,
+        monitorNotes: candidate.monitorNotes,
+        monitorScheduledBy: candidate.monitorScheduledBy,
+      },
+      policy: executionPolicy as unknown as IssueExecutionPolicy,
+      requestedAssigneePatch: {
+        assigneeAgentId: candidate.assigneeAgentId,
+        assigneeUserId: candidate.assigneeUserId,
+      },
+      actor: { agentId: null, userId: null },
+    }).patch;
+  } catch {
+    // The policy module refuses this monitor (e.g. bounds exhausted under its own
+    // clock). Fail safe: do not re-arm; the caller skips the card.
+    return null;
+  }
+
+  // The scheduled re-arm branch always writes both; if it did not, the
+  // transition took a different branch and we must not claim a re-arm.
+  if (monitorPatch.monitorNextCheckAt === undefined || monitorPatch.executionState === undefined) {
+    return null;
+  }
+
+  return {
+    executionPolicy,
+    executionState: monitorPatch.executionState as Record<string, unknown>,
+    monitorNextCheckAt: monitorPatch.monitorNextCheckAt as Date,
+    monitorWakeRequestedAt: null,
+    monitorNotes: (monitorPatch.monitorNotes as string | null) ?? null,
+    monitorScheduledBy: (monitorPatch.monitorScheduledBy as string | null) ?? scheduledBy,
+  };
 }
 
 export interface HostRestartStrandEscalationComment {
@@ -227,6 +359,7 @@ export function planHostRestartStrandRepairs(input: {
   facts: Map<string, HostRestartStrandFacts>;
   now: Date;
   cap: number;
+  detectedBootId?: string | null;
 }): HostRestartStrandPlan {
   const repairs: HostRestartStrandPlanItem[] = [];
   const skipped: HostRestartStrandSkip = {
@@ -250,6 +383,7 @@ export function planHostRestartStrandRepairs(input: {
       alreadyEscalated: facts.alreadyEscalated,
       latestRun: facts.latestRun,
       now: input.now,
+      detectedBootId: input.detectedBootId ?? null,
     });
 
     if (decision.action === "skip-live") {
@@ -300,9 +434,16 @@ export interface HostRestartStrandSweepInput {
   now?: Date;
   companyId?: string | null;
   cap?: number;
+  // Injectable clock/boot seam so tests can pin the detected boot id. Defaults to
+  // B1's `resolveHostBootId`.
+  resolveBootId?: () => Promise<string | null>;
   // Injectable mutation seams. Defaults apply the real re-arm UPDATE and the
   // real block + stranded-notice escalation; tests pass fakes to stay hermetic.
-  rearmMonitor?: (db: Db, issueId: string, patch: HostRestartStrandRepairPatch) => Promise<number>;
+  rearmMonitor?: (
+    db: Db,
+    candidate: HostRestartStrandCandidate,
+    patch: HostRestartStrandRearmPatch,
+  ) => Promise<number>;
   escalateIssue?: (
     db: Db,
     candidate: HostRestartStrandCandidate,
@@ -317,6 +458,10 @@ export interface HostRestartStrandSweepReport {
   reArmed: string[];
   escalated: string[];
   skipped: HostRestartStrandSkip;
+}
+
+function emptySkipped(): HostRestartStrandSkip {
+  return { liveRun: [], noHostRestartMarker: [], alreadyEscalated: [], capExceeded: [] };
 }
 
 function candidateWhere(companyId: string | null) {
@@ -336,18 +481,38 @@ function issueRunCondition(companyId: string, issueId: string) {
   );
 }
 
-// Real re-arm: flip the monitor's next check back to `now` (so it re-enters the
-// due set) and clear the pending wake marker. Guarded on `monitorNextCheckAt IS
-// NULL` so a concurrent repair wins without a double write; returns rows affected.
+// True when any heartbeat run for this card is currently in flight. Used both at
+// collection (to skip a live card) and just before an escalation write (so a run
+// that starts after planning is not raced out from under the block).
+async function hasLiveRun(db: Db, companyId: string, issueId: string): Promise<boolean> {
+  const rows = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(and(issueRunCondition(companyId, issueId), eq(heartbeatRuns.status, "running")))
+    .limit(1);
+  return rows.length > 0;
+}
+
+// Real re-arm. Writes the restored policy + scheduled monitor state + flat
+// columns, and is guarded atomically on both `monitorNextCheckAt IS NULL` (a
+// concurrent repair wins without a double write) and a NOT-EXISTS live-run
+// subquery (a run that started between planning and this write is not raced out
+// from under the re-arm). Returns rows affected.
 async function defaultRearmMonitor(
   db: Db,
-  issueId: string,
-  patch: HostRestartStrandRepairPatch,
+  candidate: HostRestartStrandCandidate,
+  patch: HostRestartStrandRearmPatch,
 ): Promise<number> {
+  const noLiveRun = sql`NOT EXISTS (
+    SELECT 1 FROM ${heartbeatRuns} live_run
+    WHERE ${heartbeatRuns.companyId} = ${candidate.companyId}
+      AND ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${candidate.id}
+      AND ${heartbeatRuns.status} = 'running'
+  )`;
   const rows = await db
     .update(issues)
     .set(patch)
-    .where(and(eq(issues.id, issueId), isNull(issues.monitorNextCheckAt)))
+    .where(and(eq(issues.id, candidate.id), isNull(issues.monitorNextCheckAt), noLiveRun))
     .returning({ id: issues.id });
   return rows.length;
 }
@@ -387,7 +552,13 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
   const db = input.db;
   const now = input.now ?? new Date();
   const cap = input.cap ?? DEFAULT_SWEEP_REPAIR_CAP;
-  const bootId = await resolveHostBootId();
+  const bootId = await (input.resolveBootId ?? resolveHostBootId)();
+
+  // Per-boot idempotency guard: a second invocation for the same detected boot is
+  // a no-op. A null (unresolvable) boot id is never gated, so the sweep runs.
+  if (bootId !== null && lastSweptBootId === bootId) {
+    return { bootId, considered: 0, reArmed: [], escalated: [], skipped: emptySkipped() };
+  }
 
   const candidates = await db
     .select({
@@ -397,10 +568,14 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
       status: issues.status,
       assigneeAgentId: issues.assigneeAgentId,
       assigneeUserId: issues.assigneeUserId,
+      executionPolicy: issues.executionPolicy,
       executionState: issues.executionState,
       monitorAttemptCount: issues.monitorAttemptCount,
       monitorNextCheckAt: issues.monitorNextCheckAt,
       monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+      monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+      monitorNotes: issues.monitorNotes,
+      monitorScheduledBy: issues.monitorScheduledBy,
     })
     .from(issues)
     .where(candidateWhere(input.companyId ?? null))
@@ -413,17 +588,12 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
     considered: candidates.length,
     reArmed: [],
     escalated: [],
-    skipped: { liveRun: [], noHostRestartMarker: [], alreadyEscalated: [], capExceeded: [] },
+    skipped: emptySkipped(),
   };
 
   const facts = new Map<string, HostRestartStrandFacts>();
   for (const candidate of candidates) {
-    const liveRun = await db
-      .select({ id: heartbeatRuns.id })
-      .from(heartbeatRuns)
-      .where(and(issueRunCondition(candidate.companyId, candidate.id), eq(heartbeatRuns.status, "running")))
-      .limit(1)
-      .then((rows) => rows.length > 0);
+    const liveRun = await hasLiveRun(db, candidate.companyId, candidate.id);
 
     const latestRunRow = await db
       .select({
@@ -470,7 +640,7 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
     facts.set(candidate.id, { hasLiveRun: liveRun, latestRun, alreadyEscalated });
   }
 
-  const plan = planHostRestartStrandRepairs({ candidates, facts, now, cap });
+  const plan = planHostRestartStrandRepairs({ candidates, facts, now, cap, detectedBootId: bootId });
   report.skipped = plan.skipped;
 
   for (const repair of plan.repairs) {
@@ -478,8 +648,9 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
     if (!candidate) continue;
 
     if (repair.kind === "rearm") {
-      const patch = buildRearmMonitorPatch(now);
-      const rowsAffected = await (input.rearmMonitor ?? defaultRearmMonitor)(db, candidate.id, patch);
+      const patch = buildRearmMonitorPatch({ now, candidate });
+      if (!patch) continue;
+      const rowsAffected = await (input.rearmMonitor ?? defaultRearmMonitor)(db, candidate, patch);
       if (rowsAffected > 0) {
         report.reArmed.push(candidate.id);
         logger.info(
@@ -491,6 +662,9 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
     }
 
     if (repair.kind === "escalate" && repair.escalation) {
+      // Re-check just before the write: do not block a card that gained a live
+      // run since it was planned (a live run is itself the §2a continuation).
+      if (await hasLiveRun(db, candidate.companyId, candidate.id)) continue;
       await (input.escalateIssue ?? defaultEscalateIssue)(db, candidate, repair.escalation, bootId);
       report.escalated.push(candidate.id);
       logger.info(
@@ -507,5 +681,6 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
     );
   }
 
+  if (bootId !== null) lastSweptBootId = bootId;
   return report;
 }
