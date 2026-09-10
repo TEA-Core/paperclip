@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { realizeExecutionWorkspace, prepareBaseRepoForWorkspace } from "../services/workspace-runtime.ts";
+import { readDivergenceRecord } from "../services/base-repo-divergence-alert.ts";
 
 // SUP-14458 — when base-repo hygiene ends in diverged-without-reset or indeterminate,
 // the worktree must be based on the verified remote-tracking tip, never on the local
@@ -269,12 +270,37 @@ describe("stale remote tip after a failed fetch must not be trusted (SUP-14458)"
           identifier: "PAP-998",
           title: "Stale Tip",
         },
-        agent: {
-          id: "agent-1",
-          name: "Test Agent",
-          companyId: "company-1",
-        },
-      }),
-    ).rejects.toThrow(/no verified remote tip could be resolved/i);
+      agent: {
+        id: "agent-1",
+        name: "Test Agent",
+        companyId: "company-1",
+      },
+    }),
+  ).rejects.toThrow(/no verified remote tip could be resolved/i);
+  });
+});
+
+describe("base-repo divergence first-class signal wiring (SUP-15615)", () => {
+  it("returns divergenceAlert = null and leaves no record for an in-sync base repo", async () => {
+    const f = await makeOriginAndClone();
+    const result = await prepareBaseRepoForWorkspace({ repoRoot: f.work, configuredBaseRef: "main" });
+    expect(result.divergenceAlert).toBeNull();
+    // In-sync base: nothing tracked, and any stale sidecar is cleared.
+    expect(await readDivergenceRecord(f.work)).toBeNull();
+  });
+
+  it("starts tracking a diverged-refused base repo but does not alert while under the age threshold", async () => {
+    const f = await makeOriginAndClone();
+    await commit(f.work, "only-here");
+    await commit(f.seed, "c4");
+    await publish(f);
+
+    const result = await prepareBaseRepoForWorkspace({ repoRoot: f.work, configuredBaseRef: "main" });
+
+    expect(result.localBaseUnsafe).toBe(true);
+    // A just-observed divergence is far under the 7-day threshold: no first-class
+    // signal yet, but tracking has begun so the age starts accumulating.
+    expect(result.divergenceAlert).toBeNull();
+    expect(await readDivergenceRecord(f.work)).not.toBeNull();
   });
 });
