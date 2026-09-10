@@ -1,14 +1,15 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import {
+  buildEscalationGateSelect,
   buildHostRestartStrandEscalationComment,
   buildRearmMonitorPatch,
+  buildRearmMonitorUpdate,
   decideHostRestartStrandRepair,
   isMonitorableIssueShape,
   planHostRestartStrandRepairs,
   sweepHostRestartStrandedIssues,
-  __resetHostRestartStrandSweepForTests,
   type HostRestartStrandCandidate,
   type HostRestartStrandFacts,
   type HostRestartStrandLatestRun,
@@ -434,17 +435,13 @@ function makeEscalateMock() {
       _candidate: HostRestartStrandCandidate,
       _escalation: { reason: "exhausted" | "never-armed" | "not-monitorable"; sourceRun: HostRestartStrandSourceRun },
       _bootId: string | null,
-    ): Promise<void> => {},
+    ): Promise<boolean> => true,
   );
 }
 
 const resolveBootNew = async () => BOOT_NEW;
 
 describe("sweepHostRestartStrandedIssues", () => {
-  beforeEach(() => {
-    __resetHostRestartStrandSweepForTests();
-  });
-
   it("re-arms a stranded card and escalates an unrecoverable one", async () => {
     const rearmable = makeCandidate({ id: "issue-rearm" });
     const unrecoverable = makeCandidate({
@@ -600,8 +597,12 @@ describe("sweepHostRestartStrandedIssues", () => {
       latestRunRows: [makeLatestRun()],
       escalationRows: [],
     };
+    // Persist the notice the way the real escalation does: the durable
+    // system-comment keyed to the source run is what makes the second pass a
+    // no-op (there is no in-memory per-boot flag).
     const escalateIssue = vi.fn(async () => {
       state.escalationRows = [{ id: "comment-1" }];
+      return true;
     });
     const db = makeFakeDb(state);
 
@@ -610,7 +611,8 @@ describe("sweepHostRestartStrandedIssues", () => {
 
     expect(first.escalated).toEqual(["issue-escalate"]);
     expect(second.escalated).toEqual([]);
-    expect(second.considered).toBe(0);
+    expect(second.considered).toBe(1);
+    expect(second.skipped.alreadyEscalated).toEqual(["issue-escalate"]);
     expect(escalateIssue).toHaveBeenCalledTimes(1);
   });
 
@@ -659,5 +661,115 @@ describe("sweepHostRestartStrandedIssues", () => {
 
     expect(report.escalated).toEqual([]);
     expect(escalateIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not re-repair after a process restart (persisted state, no in-memory flag)", async () => {
+    // Simulate a restart: a brand-new Db handle over the SAME persistent store.
+    // There is no module-local per-boot flag anymore, so correctness must come
+    // from what the first pass persisted.
+    const rearmState: FakeDbState = {
+      candidates: [makeCandidate({ id: "issue-rearm" })],
+      liveRunQueue: [[]],
+      latestRunRows: [makeLatestRun()],
+      escalationRows: [],
+      updateRows: [{ id: "issue-rearm" }],
+    };
+    const firstRearm = await sweepHostRestartStrandedIssues({
+      db: makeFakeDb(rearmState),
+      now: NOW,
+      resolveBootId: resolveBootNew,
+    });
+    const secondRearm = await sweepHostRestartStrandedIssues({
+      db: makeFakeDb(rearmState),
+      now: NOW,
+      resolveBootId: resolveBootNew,
+    });
+    expect(firstRearm.reArmed).toEqual(["issue-rearm"]);
+    expect(secondRearm.reArmed).toEqual([]);
+    expect(secondRearm.considered).toBe(0);
+
+    const escalateState: FakeDbState = {
+      candidates: [
+        makeCandidate({
+          id: "issue-escalate",
+          executionState: executionStateWithMonitor({ attemptCount: 5, maxAttempts: 5 }),
+          monitorAttemptCount: 5,
+        }),
+      ],
+      liveRunQueue: [[], []],
+      latestRunRows: [makeLatestRun()],
+      escalationRows: [],
+    };
+    const escalateIssue = vi.fn(async () => {
+      escalateState.escalationRows = [{ id: "comment-1" }];
+      return true;
+    });
+    const firstEsc = await sweepHostRestartStrandedIssues({
+      db: makeFakeDb(escalateState),
+      now: NOW,
+      resolveBootId: resolveBootNew,
+      escalateIssue,
+    });
+    const secondEsc = await sweepHostRestartStrandedIssues({
+      db: makeFakeDb(escalateState),
+      now: NOW,
+      resolveBootId: resolveBootNew,
+      escalateIssue,
+    });
+    expect(firstEsc.escalated).toEqual(["issue-escalate"]);
+    expect(secondEsc.escalated).toEqual([]);
+    expect(secondEsc.skipped.alreadyEscalated).toEqual(["issue-escalate"]);
+    expect(escalateIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it("applies a re-arm exactly once under two overlapping invocations (atomic guarded write)", async () => {
+    const state: FakeDbState = {
+      candidates: [makeCandidate({ id: "issue-rearm" })],
+      liveRunQueue: [[], [], []],
+      latestRunRows: [makeLatestRun()],
+      escalationRows: [],
+      updateRows: [{ id: "issue-rearm" }],
+    };
+    const db = makeFakeDb(state);
+
+    const [a, b] = await Promise.all([
+      sweepHostRestartStrandedIssues({ db, now: NOW, resolveBootId: resolveBootNew }),
+      sweepHostRestartStrandedIssues({ db, now: NOW, resolveBootId: resolveBootNew }),
+    ]);
+
+    // However the two invocations interleave, the conditional UPDATE means at
+    // most one reports the re-arm; the other sees monitorNextCheckAt already set
+    // (or the candidate already gone from the set).
+    expect([...a.reArmed, ...b.reArmed]).toEqual(["issue-rearm"]);
+  });
+});
+
+describe("real SQL shape (Postgres-acceptable guards)", () => {
+  it("compiles the re-arm UPDATE with an alias-free no-live-run guard", () => {
+    const db = createDb("postgres://user:pass@127.0.0.1:59999/probe");
+    const candidate = makeCandidate({ id: "issue-rearm" });
+    const patch = buildRearmMonitorPatch({ now: NOW, candidate });
+    expect(patch).not.toBeNull();
+
+    const compiled = buildRearmMonitorUpdate(db, candidate, patch!).toSQL();
+    // Regression (SUP-15581 round 2): the subquery must NOT alias heartbeat_runs
+    // while the correlated columns stay fully qualified, or Postgres rejects the
+    // whole statement with `missing FROM-clause entry for table "heartbeat_runs"`.
+    expect(compiled.sql).not.toContain("live_run");
+    expect(compiled.sql).toContain('"heartbeat_runs"."company_id"');
+    expect(compiled.sql).toContain('"heartbeat_runs"."context_snapshot"');
+    expect(compiled.sql).toContain("->> 'issueId'");
+    expect(compiled.sql.toLowerCase()).toContain("not exists");
+    expect(compiled.sql).toContain('"issues"."monitor_next_check_at" is null');
+  });
+
+  it("compiles the escalation gate with the same alias-free guard and a row lock", () => {
+    const db = createDb("postgres://user:pass@127.0.0.1:59999/probe");
+    const compiled = buildEscalationGateSelect(db, "company-1", "issue-1").toSQL();
+    expect(compiled.sql).not.toContain("live_run");
+    expect(compiled.sql).toContain('"heartbeat_runs"."company_id"');
+    expect(compiled.sql).toContain('"issues"."id"');
+    expect(compiled.sql.toLowerCase()).toContain("not exists");
+    expect(compiled.sql.toLowerCase()).toContain("for update");
   });
 });

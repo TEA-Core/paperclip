@@ -34,24 +34,21 @@ import {
 //
 // Never touch a card that still has a live run, or whose most recent run was not
 // a failed run carrying a host-restart marker stamped for the currently detected
-// boot. The whole pass is idempotent per boot: a second invocation for the same
-// detected boot is a no-op, and a repaired card leaves the candidate set on any
-// later boot.
+// boot.
+//
+// Idempotency is DURABLE and per-card, never an in-memory per-boot flag: a
+// repaired card leaves the candidate set in persisted state — a re-arm writes
+// `monitorNextCheckAt`, an escalation posts a system notice keyed to the source
+// run — so a second invocation (a double startup path, a hot reconcile, a manual
+// re-run) finds nothing left to repair. That survives a process restart, which an
+// in-memory flag cannot. Each repair write is additionally guarded in SQL, so two
+// overlapping invocations cannot double-apply: the re-arm is one conditional
+// UPDATE and the escalation takes a row lock before it writes.
 
 const MONITORABLE_STATUSES = ["in_progress", "in_review", "blocked"] as const;
 const DEFAULT_SWEEP_REPAIR_CAP = 50;
 const MAX_CANDIDATES_INSPECTED = 500;
 const SWEEP_SOURCE = "host-restart-strand-sweep";
-
-// Per-boot idempotency guard. The sweep is a one-shot per detected boot: a double
-// startup path, a hot reconcile, or a manual re-run for the same boot must not
-// re-repair already-repaired cards or re-post notices. Null (unresolvable) boot
-// ids are never gated, so the sweep always runs when boot detection is absent.
-let lastSweptBootId: string | null = null;
-
-export function __resetHostRestartStrandSweepForTests(): void {
-  lastSweptBootId = null;
-}
 
 export interface HostRestartStrandCandidate {
   id: string;
@@ -449,7 +446,7 @@ export interface HostRestartStrandSweepInput {
     candidate: HostRestartStrandCandidate,
     escalation: { reason: "exhausted" | "never-armed" | "not-monitorable"; sourceRun: HostRestartStrandSourceRun },
     bootId: string | null,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
 }
 
 export interface HostRestartStrandSweepReport {
@@ -481,9 +478,26 @@ function issueRunCondition(companyId: string, issueId: string) {
   );
 }
 
-// True when any heartbeat run for this card is currently in flight. Used both at
-// collection (to skip a live card) and just before an escalation write (so a run
-// that starts after planning is not raced out from under the block).
+// Correlated "no live run for this card" predicate, with NO table alias. The
+// subquery intentionally does not alias `heartbeat_runs`: the correlated columns
+// are emitted fully qualified (`"heartbeat_runs"."company_id"`), so aliasing the
+// FROM (`... live_run`) leaves that qualifier dangling and Postgres rejects the
+// entire statement with `missing FROM-clause entry for table "heartbeat_runs"`.
+// Shared by the re-arm UPDATE and the escalation row-lock gate so both are
+// guarded by exactly the same SQL.
+export function buildNoLiveRunGuard(companyId: string, issueId: string) {
+  return sql`NOT EXISTS (
+    SELECT 1 FROM ${heartbeatRuns}
+    WHERE ${heartbeatRuns.companyId} = ${companyId}
+      AND ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}
+      AND ${heartbeatRuns.status} = 'running'
+  )`;
+}
+
+// True when any heartbeat run for this card is currently in flight. Used at
+// collection to skip a live card and as a cheap pre-check before an escalation
+// write; the escalation's authoritative guard is the row-lock gate below, which
+// cannot be raced.
 async function hasLiveRun(db: Db, companyId: string, issueId: string): Promise<boolean> {
   const rows = await db
     .select({ id: heartbeatRuns.id })
@@ -493,58 +507,107 @@ async function hasLiveRun(db: Db, companyId: string, issueId: string): Promise<b
   return rows.length > 0;
 }
 
-// Real re-arm. Writes the restored policy + scheduled monitor state + flat
-// columns, and is guarded atomically on both `monitorNextCheckAt IS NULL` (a
-// concurrent repair wins without a double write) and a NOT-EXISTS live-run
-// subquery (a run that started between planning and this write is not raced out
-// from under the re-arm). Returns rows affected.
+// Real re-arm as a single conditional UPDATE, guarded atomically on both
+// `monitorNextCheckAt IS NULL` (a concurrent repair wins without a double write)
+// and the no-live-run subquery (a run that started between planning and this
+// write is not raced out from under the re-arm). Exported so tests can compile
+// and assert the real SQL shape.
+export function buildRearmMonitorUpdate(
+  db: Db,
+  candidate: HostRestartStrandCandidate,
+  patch: HostRestartStrandRearmPatch,
+) {
+  return db
+    .update(issues)
+    .set(patch)
+    .where(and(eq(issues.id, candidate.id), isNull(issues.monitorNextCheckAt), buildNoLiveRunGuard(candidate.companyId, candidate.id)))
+    .returning({ id: issues.id });
+}
+
+// Real re-arm. Returns rows affected.
 async function defaultRearmMonitor(
   db: Db,
   candidate: HostRestartStrandCandidate,
   patch: HostRestartStrandRearmPatch,
 ): Promise<number> {
-  const noLiveRun = sql`NOT EXISTS (
-    SELECT 1 FROM ${heartbeatRuns} live_run
-    WHERE ${heartbeatRuns.companyId} = ${candidate.companyId}
-      AND ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${candidate.id}
-      AND ${heartbeatRuns.status} = 'running'
-  )`;
-  const rows = await db
-    .update(issues)
-    .set(patch)
-    .where(and(eq(issues.id, candidate.id), isNull(issues.monitorNextCheckAt), noLiveRun))
-    .returning({ id: issues.id });
-  return rows.length;
+  return (await buildRearmMonitorUpdate(db, candidate, patch)).length;
+}
+
+// Row-lock gate for the escalation write. `SELECT ... FOR UPDATE` acquires the
+// issue-row lock ONLY while no run is live; holding that lock for the rest of the
+// transaction both serializes concurrent escalations of the same card and closes
+// the check-then-write race — a run claimed after planning either blocks on this
+// lock or is seen by the NOT-EXISTS predicate at lock time. Exported so tests can
+// compile and assert the real SQL shape.
+export function buildEscalationGateSelect(db: Db, companyId: string, issueId: string) {
+  return db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), buildNoLiveRunGuard(companyId, issueId)))
+    .limit(1)
+    .for("update");
 }
 
 // Real escalation: block the card (canonical recovery write) and post the
-// host-restart-flavored stranded notice as a system comment.
+// host-restart-flavored stranded notice as a system comment. Returns whether the
+// escalation was applied; `false` means the card was left untouched because a
+// live run owns it or a prior pass already posted the notice.
 async function defaultEscalateIssue(
   db: Db,
   candidate: HostRestartStrandCandidate,
   escalation: { reason: "exhausted" | "never-armed" | "not-monitorable"; sourceRun: HostRestartStrandSourceRun },
   bootId: string | null,
-): Promise<void> {
-  await blockIssueWithUnresolvedBlockers(
-    db,
-    {
-      id: candidate.id,
-      companyId: candidate.companyId,
+): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const txDb = tx as unknown as Db;
+
+    // Never-touch-live-run gate. Acquire the card's row lock only while no run is
+    // live, and hold it for the whole escalation, so a run claimed after planning
+    // cannot be raced out from under the block.
+    const gate = await buildEscalationGateSelect(txDb, candidate.companyId, candidate.id).then((rows) => rows.length > 0);
+    if (!gate) return false;
+
+    // Idempotency is re-checked AFTER the lock, so a concurrent escalation that
+    // committed first is observed here and cannot double-post the notice.
+    const alreadyNoticed = await tx
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, candidate.id),
+          eq(issueComments.authorType, "system"),
+          sql`${issueComments.metadata} ->> 'sourceRunId' = ${escalation.sourceRun.id}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    if (alreadyNoticed) return false;
+
+    // Canonical block write: sets status blocked from the card's ORIGINAL status
+    // (so the status-transition side effects still run) and syncs blocker
+    // relations, on the same transaction and row lock as the gate.
+    await blockIssueWithUnresolvedBlockers(
+      txDb,
+      {
+        id: candidate.id,
+        companyId: candidate.companyId,
+        identifier: candidate.identifier,
+        status: candidate.status,
+      },
+      { source: SWEEP_SOURCE, previousStatus: candidate.status },
+    );
+    const comment = buildHostRestartStrandEscalationComment({
       identifier: candidate.identifier,
-      status: candidate.status,
-    },
-    { source: SWEEP_SOURCE, previousStatus: candidate.status },
-  );
-  const comment = buildHostRestartStrandEscalationComment({
-    identifier: candidate.identifier,
-    sourceRun: escalation.sourceRun,
-    reason: escalation.reason,
-    bootId,
-  });
-  await issueService(db).addComment(candidate.id, comment.body, {}, {
-    authorType: "system",
-    presentation: comment.presentation,
-    metadata: comment.metadata,
+      sourceRun: escalation.sourceRun,
+      reason: escalation.reason,
+      bootId,
+    });
+    await issueService(txDb).addComment(candidate.id, comment.body, {}, {
+      authorType: "system",
+      presentation: comment.presentation,
+      metadata: comment.metadata,
+    });
+    return true;
   });
 }
 
@@ -553,12 +616,6 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
   const now = input.now ?? new Date();
   const cap = input.cap ?? DEFAULT_SWEEP_REPAIR_CAP;
   const bootId = await (input.resolveBootId ?? resolveHostBootId)();
-
-  // Per-boot idempotency guard: a second invocation for the same detected boot is
-  // a no-op. A null (unresolvable) boot id is never gated, so the sweep runs.
-  if (bootId !== null && lastSweptBootId === bootId) {
-    return { bootId, considered: 0, reArmed: [], escalated: [], skipped: emptySkipped() };
-  }
 
   const candidates = await db
     .select({
@@ -662,10 +719,11 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
     }
 
     if (repair.kind === "escalate" && repair.escalation) {
-      // Re-check just before the write: do not block a card that gained a live
-      // run since it was planned (a live run is itself the §2a continuation).
+      // Cheap pre-check only; the authoritative never-touch-live-run guard lives
+      // inside the escalation write (row lock + NOT-EXISTS) and cannot be raced.
       if (await hasLiveRun(db, candidate.companyId, candidate.id)) continue;
-      await (input.escalateIssue ?? defaultEscalateIssue)(db, candidate, repair.escalation, bootId);
+      const escalated = await (input.escalateIssue ?? defaultEscalateIssue)(db, candidate, repair.escalation, bootId);
+      if (!escalated) continue;
       report.escalated.push(candidate.id);
       logger.info(
         { issueId: candidate.id, identifier: candidate.identifier, reason: repair.escalation.reason, bootId },
@@ -681,6 +739,5 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
     );
   }
 
-  if (bootId !== null) lastSweptBootId = bootId;
   return report;
 }
