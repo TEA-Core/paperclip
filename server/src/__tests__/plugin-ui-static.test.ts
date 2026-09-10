@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -63,10 +64,8 @@ function boardActor(companyIds: string[]) {
 }
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ pluginUiStaticRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/plugin-ui-static.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { pluginUiStaticRoutes } = await import("../routes/plugin-ui-static.js");
+  const { errorHandler } = await import("../middleware/index.js");
 
   const app = express();
   app.use((req, _res, next) => {
@@ -74,6 +73,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use(pluginUiStaticRoutes({} as never, { localPluginDir: tmpdir() }));
+  app.use(reportUnexpectedRouteError("plugin-ui-static"));
   app.use(errorHandler);
   return app;
 }

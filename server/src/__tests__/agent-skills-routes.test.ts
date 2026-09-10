@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -178,10 +179,12 @@ function createDb(requireBoardApprovalForNewAgents = false) {
 }
 
 async function createApp(db: Record<string, unknown> = createDb()) {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { agentRoutes } = await vi.importActual<typeof import("../routes/agents.js")>(
+    "../routes/agents.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -195,6 +198,7 @@ async function createApp(db: Record<string, unknown> = createDb()) {
     next();
   });
   app.use("/api", agentRoutes(db as any));
+  app.use(reportUnexpectedRouteError("agent-skills-routes"));
   app.use(errorHandler);
   return app;
 }

@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockFolderService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -20,10 +21,8 @@ vi.mock("../services/index.js", () => ({
 
 async function createApp() {
   vi.resetModules();
-  const [{ errorHandler }, { folderRoutes }] = await Promise.all([
-    import("../middleware/index.js") as Promise<typeof import("../middleware/index.js")>,
-    import("../routes/folders.js") as Promise<typeof import("../routes/folders.js")>,
-  ]);
+  const { errorHandler } = (await import("../middleware/index.js")) as typeof import("../middleware/index.js");
+  const { folderRoutes } = (await import("../routes/folders.js")) as typeof import("../routes/folders.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -37,6 +36,7 @@ async function createApp() {
     next();
   });
   app.use("/api", folderRoutes({} as any));
+  app.use(reportUnexpectedRouteError("folders-routes"));
   app.use(errorHandler);
   return app;
 }

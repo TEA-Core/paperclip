@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -164,10 +165,8 @@ function createApp() {
 }
 
 async function installActor(app: express.Express, actor?: Record<string, unknown>) {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/issues.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { issueRoutes } = await import("../routes/issues.js");
+  const { errorHandler } = await import("../middleware/index.js");
 
   app.use((req, _res, next) => {
     (req as any).actor = actor ?? {
@@ -189,6 +188,7 @@ async function installActor(app: express.Express, actor?: Record<string, unknown
     })),
   };
   app.use("/api", issueRoutes(db as any, {} as any));
+  app.use(reportUnexpectedRouteError("issue-comment-cancel-routes"));
   app.use(errorHandler);
   return app;
 }

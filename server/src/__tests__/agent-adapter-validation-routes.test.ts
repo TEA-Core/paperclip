@@ -4,6 +4,7 @@ import path from "node:path";
 import request from "supertest";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import type { ServerAdapterModule } from "../adapters/index.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockAgentService = vi.hoisted(() => ({
   create: vi.fn(),
@@ -147,10 +148,12 @@ const externalAdapter: ServerAdapterModule = {
 const missingAdapterType = "missing_adapter_validation_test";
 
 async function createApp() {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { agentRoutes } = await vi.importActual<typeof import("../routes/agents.js")>(
+    "../routes/agents.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -176,6 +179,7 @@ async function createApp() {
     })),
   };
   app.use("/api", agentRoutes(db as any));
+  app.use(reportUnexpectedRouteError("agent-adapter-validation-routes"));
   app.use(errorHandler);
   return app;
 }

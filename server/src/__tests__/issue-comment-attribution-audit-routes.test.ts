@@ -36,10 +36,8 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 type Db = ReturnType<typeof createDb>;
 
 async function createApp(db: Db, actor: Express.Request["actor"]) {
-  const [{ activityRoutes }, { issueRoutes }] = await Promise.all([
-    import("../routes/activity.js"),
-    import("../routes/issues.js"),
-  ]);
+  const { activityRoutes } = await import("../routes/activity.js");
+  const { issueRoutes } = await import("../routes/issues.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {

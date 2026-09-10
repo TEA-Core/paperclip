@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockProjectService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -82,10 +83,12 @@ function registerModuleMocks() {
 }
 
 async function createApp() {
-  const [{ projectRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/projects.js")>("../routes/projects.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { projectRoutes } = await vi.importActual<typeof import("../routes/projects.js")>(
+    "../routes/projects.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -99,6 +102,7 @@ async function createApp() {
     next();
   });
   app.use("/api", projectRoutes({} as any));
+  app.use(reportUnexpectedRouteError("project-routes-env"));
   app.use(errorHandler);
   return app;
 }

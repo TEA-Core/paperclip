@@ -3,6 +3,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { vi } from "vitest";
 import type { ServerAdapterModule } from "../adapters/index.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockAdapterPluginStore = vi.hoisted(() => ({
   listAdapterPlugins: vi.fn(),
@@ -78,6 +79,7 @@ function createApp(
     next();
   });
   app.use("/api", adapterRoutes(options));
+  app.use(reportUnexpectedRouteError("adapter-routes"));
   app.use(errorHandler);
   return app;
 }
@@ -105,11 +107,11 @@ describe("adapter routes", () => {
     mockPluginLoader.getUiParserSource.mockResolvedValue(null);
     mockPluginLoader.getOrExtractUiParserSource.mockResolvedValue(null);
     mockPluginLoader.reloadExternalAdapter.mockResolvedValue(null);
-    const [registry, routes, middleware] = await Promise.all([
-      vi.importActual<typeof import("../adapters/registry.js")>("../adapters/registry.js"),
-      import("../routes/adapters.js"),
-      import("../middleware/index.js"),
-    ]);
+    const registry = await vi.importActual<typeof import("../adapters/registry.js")>(
+      "../adapters/registry.js",
+    );
+    const routes = await import("../routes/adapters.js");
+    const middleware = await import("../middleware/index.js");
     registerServerAdapter = registry.registerServerAdapter;
     unregisterServerAdapter = registry.unregisterServerAdapter;
     findServerAdapter = registry.findServerAdapter;

@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockLoggerWarn = vi.hoisted(() => vi.fn());
@@ -133,10 +134,12 @@ function createStubDb() {
 }
 
 async function createApp() {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
+    "../routes/issues.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -150,6 +153,7 @@ async function createApp() {
     next();
   });
   app.use("/api", issueRoutes(createStubDb() as any, {} as any));
+  app.use(reportUnexpectedRouteError("issue-blocked-without-blockers-signal-routes"));
   app.use(errorHandler);
   return app;
 }

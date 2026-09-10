@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -181,10 +182,12 @@ async function createApp(
   },
   db: unknown = {},
 ) {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
+    "../routes/issues.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -192,6 +195,7 @@ async function createApp(
     next();
   });
   app.use("/api", issueRoutes(db as any, {} as any));
+  app.use(reportUnexpectedRouteError("issue-document-restore-routes"));
   app.use(errorHandler);
   return app;
 }

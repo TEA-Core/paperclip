@@ -23,6 +23,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 function makeDb(overrides: Record<string, unknown> = {}) {
   const selectChain = {
@@ -131,10 +132,12 @@ function registerModuleMocks() {
 
 describe("cost routes", () => {
   const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
-    const [costsRouteModule, middlewareModule] = await Promise.all([
-      vi.importActual<typeof import("../routes/costs.js")>("../routes/costs.js"),
-      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    ]);
+    const costsRouteModule = await vi.importActual<typeof import("../routes/costs.js")>(
+      "../routes/costs.js",
+    );
+    const middlewareModule = await vi.importActual<typeof import("../middleware/index.js")>(
+      "../middleware/index.js",
+    );
     return { ...costsRouteModule, errorHandler: middlewareModule.errorHandler };
   });
 
@@ -147,6 +150,7 @@ describe("cost routes", () => {
       next();
     });
     app.use("/api", costRoutes(makeDb() as any));
+    app.use(reportUnexpectedRouteError("costs-service"));
     app.use(errorHandler);
     return app;
   }
@@ -160,6 +164,7 @@ describe("cost routes", () => {
       next();
     });
     app.use("/api", costRoutes(makeDb() as any));
+    app.use(reportUnexpectedRouteError("costs-service"));
     app.use(errorHandler);
     return app;
   }

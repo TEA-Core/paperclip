@@ -232,10 +232,8 @@ describeEmbeddedPostgres("company import transfer routes", () => {
     appImportCounter += 1;
     const routeModulePath = `../routes/companies.js?company-import-transfer-routes-${appImportCounter}`;
     const middlewareModulePath = `../middleware/index.js?company-import-transfer-routes-${appImportCounter}`;
-    const [{ companyRoutes }, { errorHandler }] = await Promise.all([
-      import(routeModulePath) as Promise<typeof import("../routes/companies.js")>,
-      import(middlewareModulePath) as Promise<typeof import("../middleware/index.js")>,
-    ]);
+    const { companyRoutes } = (await import(routeModulePath)) as typeof import("../routes/companies.js");
+    const { errorHandler } = (await import(middlewareModulePath)) as typeof import("../middleware/index.js");
     const built = express();
     built.use(express.json());
     built.use((req, _res, next) => {

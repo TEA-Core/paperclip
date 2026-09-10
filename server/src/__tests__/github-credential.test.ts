@@ -1078,9 +1078,7 @@ describe("diagnostics route", () => {
       isInstanceAdmin: false,
     },
   ) {
-    const [{ diagnosticsRoutes }] = await Promise.all([
-      import("../routes/diagnostics.js") as Promise<typeof import("../routes/diagnostics.js")>,
-    ]);
+    const { diagnosticsRoutes } = (await import("../routes/diagnostics.js")) as typeof import("../routes/diagnostics.js");
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {

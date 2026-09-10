@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 // The cheap host-local authentication-signal route. It reads no sandbox and
 // runs no shell command or model process, so every test drives it through a
@@ -125,10 +126,12 @@ function boardActor(userId: string, companyIds: string[] = [COMPANY_1, OTHER_COM
 }
 
 async function createApp() {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { agentRoutes } = await vi.importActual<typeof import("../routes/agents.js")>(
+    "../routes/agents.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -136,6 +139,7 @@ async function createApp() {
     next();
   });
   app.use("/api", agentRoutes({} as never));
+  app.use(reportUnexpectedRouteError("adapter-auth-signal-routes"));
   app.use(errorHandler);
   return app;
 }

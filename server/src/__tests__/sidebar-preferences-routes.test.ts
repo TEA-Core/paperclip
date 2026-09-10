@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockSidebarPreferenceService = vi.hoisted(() => ({
   getCompanyOrder: vi.fn(),
@@ -18,10 +19,8 @@ function registerModuleMocks() {
 }
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ sidebarPreferenceRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/sidebar-preferences.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { sidebarPreferenceRoutes } = await import("../routes/sidebar-preferences.js");
+  const { errorHandler } = await import("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -29,6 +28,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api", sidebarPreferenceRoutes({} as never));
+  app.use(reportUnexpectedRouteError("sidebar-preferences-routes"));
   app.use(errorHandler);
   return app;
 }

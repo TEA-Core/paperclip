@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -198,10 +199,12 @@ function registerModuleMocks() {
 
 describe("company skill mutation permissions", () => {
   const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
-    const [{ companySkillRoutes }, { errorHandler }] = await Promise.all([
-      vi.importActual<typeof import("../routes/company-skills.js")>("../routes/company-skills.js"),
-      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    ]);
+    const { companySkillRoutes } = await vi.importActual<typeof import("../routes/company-skills.js")>(
+      "../routes/company-skills.js",
+    );
+    const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+      "../middleware/index.js",
+    );
     return { companySkillRoutes, errorHandler };
   });
 
@@ -214,6 +217,7 @@ describe("company skill mutation permissions", () => {
       next();
     });
     app.use("/api", companySkillRoutes({} as any));
+    app.use(reportUnexpectedRouteError("company-skills-routes"));
     app.use(errorHandler);
     return app;
   }

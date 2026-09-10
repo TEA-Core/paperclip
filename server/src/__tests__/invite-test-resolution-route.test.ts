@@ -51,10 +51,8 @@ async function createApp(
     requestHead: ReturnType<typeof vi.fn>;
   },
 ) {
-  const [access, middleware] = await Promise.all([
-    import("../routes/access.js"),
-    import("../middleware/index.js"),
-  ]);
+  const access = await import("../routes/access.js");
+  const middleware = await import("../middleware/index.js");
   const app = express();
   app.use((req, _res, next) => {
     (req as any).actor = { type: "anon" };

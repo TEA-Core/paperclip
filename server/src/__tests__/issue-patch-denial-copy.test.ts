@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 // The route module's logger resolves its log dir from the Paperclip config
 // file at import time; point it at a scratch home so the suite does not
@@ -209,10 +210,8 @@ function createApp() {
 }
 
 async function installActor(app: express.Express, actor?: Record<string, unknown>) {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/issues.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { issueRoutes } = await import("../routes/issues.js");
+  const { errorHandler } = await import("../middleware/index.js");
   app.use((req, _res, next) => {
     (req as any).actor = actor ?? {
       type: "board",
@@ -224,6 +223,7 @@ async function installActor(app: express.Express, actor?: Record<string, unknown
     next();
   });
   app.use("/api", issueRoutes(mockDb as any, {} as any));
+  app.use(reportUnexpectedRouteError("issue-patch-denial-copy"));
   app.use(errorHandler);
   return app;
 }
@@ -255,7 +255,8 @@ describe.sequential("issue PATCH authz denial copy", () => {
   // Warm the route module cache outside the measured tests (see
   // issue-comment-reopen-routes.test.ts for the rationale).
   beforeAll(async () => {
-    await Promise.all([import("../routes/issues.js"), import("../middleware/index.js")]);
+    await import("../routes/issues.js");
+    await import("../middleware/index.js");
   });
 
   beforeEach(() => {

@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -121,10 +122,8 @@ function buildExecutionWorkspace(overrides: Record<string, unknown> = {}) {
 }
 
 async function createApp() {
-  const [{ executionWorkspaceRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/execution-workspaces.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { executionWorkspaceRoutes } = await import("../routes/execution-workspaces.js");
+  const { errorHandler } = await import("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -149,6 +148,7 @@ async function createApp() {
     }),
   };
   app.use("/api", executionWorkspaceRoutes(db as any));
+  app.use(reportUnexpectedRouteError("execution-workspace-runtime-control-conflict"));
   app.use(errorHandler);
   return app;
 }

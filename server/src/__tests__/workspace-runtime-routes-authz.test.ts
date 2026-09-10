@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockProjectService = vi.hoisted(() => ({
   create: vi.fn(),
@@ -107,10 +108,8 @@ async function createProjectApp(actor: Record<string, unknown>) {
   appImportCounter += 1;
   const routeModulePath = `../routes/projects.js?workspace-runtime-routes-authz-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?workspace-runtime-routes-authz-${appImportCounter}`;
-  const [{ projectRoutes }, { errorHandler }] = await Promise.all([
-    import(routeModulePath) as Promise<typeof import("../routes/projects.js")>,
-    import(middlewareModulePath) as Promise<typeof import("../middleware/index.js")>,
-  ]);
+  const { projectRoutes } = (await import(routeModulePath)) as typeof import("../routes/projects.js");
+  const { errorHandler } = (await import(middlewareModulePath)) as typeof import("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -118,6 +117,7 @@ async function createProjectApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api", projectRoutes({} as any));
+  app.use(reportUnexpectedRouteError("workspace-runtime-routes-authz"));
   app.use(errorHandler);
   return app;
 }
@@ -127,10 +127,8 @@ async function createExecutionWorkspaceApp(actor: Record<string, unknown>) {
   appImportCounter += 1;
   const routeModulePath = `../routes/execution-workspaces.js?workspace-runtime-routes-authz-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?workspace-runtime-routes-authz-${appImportCounter}`;
-  const [{ executionWorkspaceRoutes }, { errorHandler }] = await Promise.all([
-    import(routeModulePath) as Promise<typeof import("../routes/execution-workspaces.js")>,
-    import(middlewareModulePath) as Promise<typeof import("../middleware/index.js")>,
-  ]);
+  const { executionWorkspaceRoutes } = (await import(routeModulePath)) as typeof import("../routes/execution-workspaces.js");
+  const { errorHandler } = (await import(middlewareModulePath)) as typeof import("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -138,6 +136,7 @@ async function createExecutionWorkspaceApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api", executionWorkspaceRoutes({} as any));
+  app.use(reportUnexpectedRouteError("workspace-runtime-routes-authz"));
   app.use(errorHandler);
   return app;
 }

@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { pluginManifestV1Schema, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -59,10 +60,8 @@ async function createApp(input: {
   workerRunning?: boolean;
   workerResult?: unknown;
 }) {
-  const [{ pluginRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/plugins.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { pluginRoutes } = await import("../routes/plugins.js");
+  const { errorHandler } = await import("../middleware/index.js");
 
   const workerManager = {
     isRunning: vi.fn().mockReturnValue(input.workerRunning ?? true),
@@ -89,6 +88,7 @@ async function createApp(input: {
       { workerManager } as never,
     ),
   );
+  app.use(reportUnexpectedRouteError("plugin-scoped-api-routes"));
   app.use(errorHandler);
 
   return { app, workerManager };

@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 vi.unmock("http");
 vi.unmock("node:http");
@@ -234,10 +235,11 @@ let routeModules:
   | null = null;
 
 async function loadRouteModules() {
-  routeModules ??= Promise.all([
-    import("../middleware/index.js"),
-    import("../routes/agents.js"),
-  ]);
+  routeModules ??= (async () => {
+    const middleware = await import("../middleware/index.js");
+    const routes = await import("../routes/agents.js");
+    return [middleware, routes] as [typeof middleware, typeof routes];
+  })();
   return routeModules;
 }
 
@@ -253,6 +255,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api", agentRoutes({} as any));
+  app.use(reportUnexpectedRouteError("agent-cross-tenant-authz-routes"));
   app.use(errorHandler);
   return app;
 }
