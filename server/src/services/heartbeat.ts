@@ -7841,6 +7841,57 @@ export type HeartbeatSchedulingSuppression = {
   reason: HeartbeatSchedulingSuppressionReason | null;
 };
 
+// SUP-15552 / D1 of SUP-15551 (ADR-096): a wake skipped for a transient,
+// instance-level condition is a DEFERRAL, not a drop. The class is decided by
+// what the skip reason describes — the instance (re-drive once it clears) vs
+// the work or the agent (stay terminal). Every dispatch-prologue skip reason
+// MUST be named in `WakeSkipReason` and classified in
+// `WAKE_SKIP_CLASSIFICATION`; a reason typed as `string` at a
+// `writeSkippedRequest` call site that is not a member of the union is a
+// compile error, and adding a union member without a classification entry is a
+// compile error (`Record<WakeSkipReason, WakeSkipClass>`). That exhaustiveness
+// check is the guard against this defect recurring with an unclassified reason
+// silently defaulting to terminal.
+export type WakeSkipReason =
+  | "heartbeat.scheduling_suppressed"
+  | "heartbeat.worktree_execution_cutoff"
+  | "budget.blocked"
+  | "agent.not_invokable"
+  | "heartbeat.disabled"
+  | "heartbeat.wakeOnDemand.disabled"
+  | "company.inactive"
+  | "issue_tree_hold_active"
+  | "heartbeat.timer.all_work_leased"
+  | "heartbeat.timer.no_actionable_work";
+
+export type WakeSkipClass = "deferrable" | "terminal";
+
+export const WAKE_SKIP_CLASSIFICATION: Record<WakeSkipReason, WakeSkipClass> = {
+  // Describes the INSTANCE — the transient condition that suppressed dispatch
+  // will clear, so the wake must be re-driven, not destroyed.
+  "heartbeat.scheduling_suppressed": "deferrable",
+  "heartbeat.worktree_execution_cutoff": "deferrable",
+  "budget.blocked": "deferrable",
+  // Describes the WORK or the AGENT — re-driving cannot help while the state
+  // persists, so it stays terminal exactly as before.
+  "agent.not_invokable": "terminal",
+  "heartbeat.disabled": "terminal",
+  "heartbeat.wakeOnDemand.disabled": "terminal",
+  "company.inactive": "terminal",
+  "issue_tree_hold_active": "terminal",
+  "heartbeat.timer.all_work_leased": "terminal",
+  "heartbeat.timer.no_actionable_work": "terminal",
+};
+
+export function wakeSkipClassForReason(reason: string | null | undefined): WakeSkipClass | null {
+  if (typeof reason !== "string" || !(reason in WAKE_SKIP_CLASSIFICATION)) return null;
+  return WAKE_SKIP_CLASSIFICATION[reason as WakeSkipReason];
+}
+
+export function isDeferrableWakeSkipReason(reason: string | null | undefined): boolean {
+  return wakeSkipClassForReason(reason) === "deferrable";
+}
+
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
   overrides: { allowWorktreeRunExecution?: boolean; dispatchQuiesced?: boolean } = {},
@@ -7972,7 +8023,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    // SUP-15552: the deferred-wake replay sweep must only re-drive once the
+    // instance-level dispatch suppression that skipped the wake has cleared.
+    resolveSchedulingSuppression: getSchedulingSuppression,
+  });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
     const target = parseObject(parseObject(payload).target);
@@ -20881,9 +20937,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!agent) throw notFound("Agent not found");
 
     const writeSkippedRequest = async (
-      skipReason: string,
+      skipReason: WakeSkipReason,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
+      const deferrable = isDeferrableWakeSkipReason(skipReason);
+      if (deferrable && issueId) {
+        // Write-time coalescing (SUP-15552): while the transient condition
+        // persists a busy card can be skipped repeatedly (timer, comment-driven
+        // wakes). Coalesce a repeat deferrable skip of the SAME reason for the
+        // same (agent, issue) onto the existing pending row instead of
+        // inserting a fresh terminal-looking row, so the recovery sweep's
+        // candidate set stays bounded and per-reason blast-radius counts stay
+        // meaningful.
+        const existing = await db
+          .select({ id: agentWakeupRequests.id, coalescedCount: agentWakeupRequests.coalescedCount })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "skipped_deferrable"),
+              eq(agentWakeupRequests.reason, skipReason),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            ),
+          )
+          .limit(1);
+        if (existing[0]) {
+          await db
+            .update(agentWakeupRequests)
+            .set({
+              coalescedCount: existing[0].coalescedCount + 1,
+              requestedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, existing[0].id));
+          return;
+        }
+      }
       await db.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
         agentId,
@@ -20891,15 +20981,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         triggerDetail,
         reason: skipReason,
         payload,
-        status: "skipped",
+        // A deferrable skip is a deferral, not a finished event: no finishedAt
+        // and re-drivable by the recovery sweep. Terminal skips stay finished
+        // exactly as before.
+        status: deferrable ? "skipped_deferrable" : "skipped",
         requestedByActorType: opts.requestedByActorType ?? null,
         requestedByActorId: opts.requestedByActorId ?? null,
         idempotencyKey: opts.idempotencyKey ?? null,
-        finishedAt: new Date(),
+        finishedAt: deferrable ? null : new Date(),
         ...patch,
       });
     };
-    const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
+    const writeSkippedHeartbeatRequest = async (skipReason: WakeSkipReason, details: Record<string, unknown>) => {
       await writeSkippedRequest(skipReason, {
         payload: {
           ...(payload ?? {}),
