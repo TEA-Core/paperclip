@@ -4306,7 +4306,7 @@ async function resetBaseRepoToBaseRefWithRescue(input: {
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<{ reset: boolean; rescueRef: string | null; warnings: string[] }> {
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
-  const rescueRef = `refs/paperclip/rescue/base-repo/${stamp}/head`;
+  const rescueRef = `${RESCUE_REF_PREFIX}/base-repo/${stamp}/head`;
 
   try {
     await runGit(["update-ref", rescueRef, input.priorTip], input.repoRoot);
@@ -4336,6 +4336,12 @@ async function resetBaseRepoToBaseRefWithRescue(input: {
       ],
     };
   }
+
+  // This path pins a base-repo tip into the shared store and then throws it away. Sweep the
+  // rescue store right here rather than leaving it to an unrelated worktree teardown — this is
+  // what kept the correctly-namespaced refs accumulating. Best-effort; pruning never changes
+  // whether this reset is safe.
+  await pruneExpiredRescueRefs(input.repoRoot);
 
   try {
     await runGit(["reset", "--hard", input.baseRefSha], input.repoRoot);
@@ -4408,7 +4414,7 @@ async function restoreBaseRepoToDefaultRef(input: {
   const warnings: string[] = [];
   const rescueRefs: string[] = [];
   const shortDefault = input.baseRef.replace(/^origin\//, "");
-  const prefix = `refs/heads/paperclip/rescue/base-repo/${input.timestamp}-${randomUUID().slice(0, 8)}`;
+  const prefix = `${RESCUE_REF_PREFIX}/base-repo/${input.timestamp}-${randomUUID().slice(0, 8)}`;
 
   const headSha = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
   if (headSha) {
@@ -4488,6 +4494,11 @@ async function restoreBaseRepoToDefaultRef(input: {
       }),
     }).catch(() => undefined);
   }
+
+  // Same as the reset path: this one pins a base-repo tip into the shared store and moves the
+  // tree. Sweep the rescue store here so the pile is bounded, not left to incident teardown.
+  // Best-effort; pruning never changes whether this restore was safe.
+  await pruneExpiredRescueRefs(input.repoRoot);
 
   return { restored, warnings, rescueRefs };
 }
@@ -5973,15 +5984,26 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   };
 }
 
-/** Namespace for refs that keep rescued work reachable after its worktree is gone. */
-export const WORKTREE_RESCUE_REF_PREFIX = "refs/paperclip/rescue";
+/**
+ * Namespace for refs that keep rescued work reachable after its source is gone.
+ *
+ * The name is deliberately not "worktree" because two producers share it, and the single
+ * pruner below must sweep both:
+ *   - `refs/paperclip/rescue/<workspaceId>` — a worktree's uncommitted work
+ *     (preserveUncommittedWorktreeWork)
+ *   - `refs/paperclip/rescue/base-repo/<stamp>…/…` — a discarded base-repo tip (the two
+ *     base-repo hygiene paths)
+ * Nothing under `refs/paperclip/manual-rescue/**` ever enters this namespace: that holds
+ * attributable operator records and is never swept.
+ */
+export const RESCUE_REF_PREFIX = "refs/paperclip/rescue";
 
 /**
  * How long a rescue ref is kept. A ref keeps its whole commit reachable, so without expiry every
  * dirty teardown would pin another tree in the base repo forever and `git gc` could never reclaim
  * any of it. Long enough that a lost diff is still recoverable days later by a human who noticed.
  */
-export const WORKTREE_RESCUE_REF_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const RESCUE_REF_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 // Identity plus an explicit signing opt-out: a host with `commit.gpgsign=true` in global config
 // would otherwise block this commit on a passphrase it can never be given, and the work the
@@ -5998,24 +6020,59 @@ const RESCUE_COMMIT_IDENTITY = [
 /**
  * Drops rescue refs older than the TTL. Best-effort and never throws: failing to prune is not a
  * reason to fail the preservation that just succeeded.
+ *
+ * Age is read off the honest clock for each ref kind:
+ *   - a base-repo rescue ref (`refs/paperclip/rescue/base-repo/<stamp>…`) pins a PRE-EXISTING tip,
+ *     so the pinned commit's committerdate says nothing about when the ref was made. Age it by the
+ *     `<stamp>` already baked into the ref name.
+ *   - a worktree rescue ref points at a commit created at rescue time, so committerdate is the
+ *     right age signal.
+ * Only refs under `refs/paperclip/rescue` are ever touched — never `refs/paperclip/manual-rescue/**`.
  */
-async function pruneExpiredWorktreeRescueRefs(cwd: string, ttlMs = WORKTREE_RESCUE_REF_TTL_MS) {
+export async function pruneExpiredRescueRefs(cwd: string, ttlMs = RESCUE_REF_TTL_MS) {
   try {
     const listed = await runGit(
-      ["for-each-ref", "--format=%(refname) %(committerdate:unix)", WORKTREE_RESCUE_REF_PREFIX],
+      ["for-each-ref", "--format=%(refname) %(committerdate:unix)", RESCUE_REF_PREFIX],
       cwd,
     );
     const cutoffSeconds = (Date.now() - ttlMs) / 1000;
     for (const line of listed.split("\n")) {
       const [refName, committedAt] = line.trim().split(/\s+/);
       if (!refName || !committedAt) continue;
-      const committedSeconds = Number(committedAt);
-      if (!Number.isFinite(committedSeconds) || committedSeconds >= cutoffSeconds) continue;
+      const ageSeconds = rescueRefAgeSeconds(refName, Number(committedAt));
+      if (ageSeconds === null || ageSeconds >= cutoffSeconds) continue;
       await runGit(["update-ref", "-d", refName], cwd);
     }
   } catch {
     // Pruning is housekeeping; a failure here must not surface as a preservation failure.
   }
+}
+
+/**
+ * The age signal for a rescue ref, in unix seconds, or null when the ref must be left alone.
+ *
+ * Base-repo rescue refs carry their creation `<stamp>` in the name and pin a pre-existing tip,
+ * whose committerdate is meaningless as an age signal — use the stamp. Anything else (the worktree
+ * rescue refs) points at a commit made at rescue time, so committerdate is right. A base-repo ref
+ * whose stamp cannot be parsed is skipped: an undatable ref is not pruned.
+ */
+function rescueRefAgeSeconds(refName: string, committerSeconds: number): number | null {
+  const baseRepoTail = refName.startsWith(`${RESCUE_REF_PREFIX}/base-repo/`)
+    ? refName.slice(`${RESCUE_REF_PREFIX}/base-repo/`.length)
+    : null;
+  if (baseRepoTail !== null) {
+    const stamp = /^(\d{8}T\d{6}Z)/.exec(baseRepoTail);
+    return stamp ? rescueStampToUnixSeconds(stamp[1]) : null;
+  }
+  return Number.isFinite(committerSeconds) ? committerSeconds : null;
+}
+
+/** Parse a `YYYYMMDDTHHMMSSZ` stamp into unix seconds, or null if it is not that shape. */
+function rescueStampToUnixSeconds(stamp: string): number | null {
+  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(stamp);
+  if (!m) return null;
+  const seconds = Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1000);
+  return Number.isFinite(seconds) ? seconds : null;
 }
 
 const WORKTREE_PRESERVATION_REF_PREFIX = "refs/preserved";
@@ -6142,7 +6199,7 @@ async function preserveUncommittedWorktreeWork(input: {
     const status = await runGit(["status", "--porcelain", "--untracked-files=all"], input.workspacePath);
     if (!status.trim()) return notPreserved;
 
-    const rescueRef = `${WORKTREE_RESCUE_REF_PREFIX}/${input.workspaceId}`;
+    const rescueRef = `${RESCUE_REF_PREFIX}/${input.workspaceId}`;
     const message =
       `wip(paperclip): preserve uncommitted work from workspace ${input.workspaceId}` +
       `${input.sourceIssueId ? `\n\nIssue: ${input.sourceIssueId}` : ""}` +
@@ -6156,7 +6213,7 @@ async function preserveUncommittedWorktreeWork(input: {
     );
     const commitSha = await runGit(["rev-parse", "HEAD"], input.workspacePath);
     await runGit(["update-ref", rescueRef, commitSha], input.workspacePath);
-    await pruneExpiredWorktreeRescueRefs(input.workspacePath);
+    await pruneExpiredRescueRefs(input.workspacePath);
 
     if (input.recorder) {
       await input.recorder.recordOperation({
