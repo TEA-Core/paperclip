@@ -118,6 +118,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       mutation: "summary_slot.generate",
       contextSource: "summary-slot-refresh-sweep",
       requestedByActorType: "system",
+      rethrowOnError: true,
       issue: expect.objectContaining({ id: "issue-1" }),
     }));
     expect(db.select).toHaveBeenCalledTimes(1);
@@ -173,6 +174,30 @@ describe("createSummarySlotRefreshSweepService", () => {
       failed: 1,
     });
     expect(mockQueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("counts a rejected wakeup as failed rather than claimed (regression: swallowed-wakeup)", async () => {
+    const rows = [{ ...SCOPES[0], status: "idle", lastGeneratedAt: null }];
+    mockGenerate.mockResolvedValue(generateResponse());
+    // Simulates a heartbeat.wakeup rejection that rethrowOnError: true surfaces
+    // out of queueIssueAssignmentWakeup (it would otherwise log-and-resolve).
+    mockQueueWakeup.mockRejectedValue(new Error("heartbeat wakeup rejected"));
+    const { service } = makeService(rows, { wakeup: vi.fn() });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 0,
+      failed: 1,
+    });
+    // The wake must be asked to rethrow so a reject is surfaced, mirroring the
+    // HTTP route — and the slot is not miscounted as a successful claim.
+    expect(mockQueueWakeup).toHaveBeenCalledWith(
+      expect.objectContaining({ rethrowOnError: true }),
+    );
+    expect(mockQueueWakeup).toHaveBeenCalledTimes(1);
   });
 
   it("skips the wake when no wakeup dispatcher is injected but still claims", async () => {

@@ -66,11 +66,11 @@ export interface SummarySlotRefreshSweepResult {
   summariesEnabled: boolean;
   /** Slots selected this tick that needed a generation claim. */
   candidates: number;
-  /** `generate` calls that minted a fresh (or recovered a failed/wedged) generation task. */
+  /** Slots whose `generate` minted a fresh task AND whose assignee wake was delivered (or no wake dispatcher was configured). */
   claimed: number;
   /** Slots already in flight: a live generation issue existed, so no re-fire. */
   inFlight: number;
-  /** Slots whose `generate` threw (Summarizer not configured, target gone, etc.); retried next sweep. */
+  /** Slots whose `generate` or its assignee wake threw (Summarizer not configured, target gone, wake rejected, etc.); retried next sweep. */
   failed: number;
 }
 
@@ -174,7 +174,6 @@ export function createSummarySlotRefreshSweepService(
           result.inFlight += 1;
           continue;
         }
-        result.claimed += 1;
         if (opts.wakeup) {
           await queueIssueAssignmentWakeup({
             heartbeat: { wakeup: opts.wakeup },
@@ -188,8 +187,19 @@ export function createSummarySlotRefreshSweepService(
             contextSource: "summary-slot-refresh-sweep",
             requestedByActorType: "system",
             taskKey: summarySlotRefreshTaskKey(candidate),
+            // Mirror the HTTP route (routes/summary-slots.ts): a rejected
+            // assignee wake must surface as a failure, not resolve silently.
+            // Without this the helper logs-and-resolves on a rejected wake and
+            // this tick would count a claim for a slot whose Summarizer was
+            // never woken.
+            rethrowOnError: true,
           });
         }
+        // Count the claim only after the wake has been delivered (or no wake
+        // dispatcher was configured). A rejected wake throws and lands in the
+        // catch below, so it counts `failed` and is retried next sweep — never
+        // a false `claimed`.
+        result.claimed += 1;
       } catch (err) {
         result.failed += 1;
         logger.warn(
