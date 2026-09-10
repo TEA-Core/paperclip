@@ -918,6 +918,59 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 
+  // The worktree-cutoff sites resolve the issue themselves and record it under
+  // `heartbeatSkip.issueId`, so a wake whose caller passed the card only in the
+  // context snapshot has a deferred row that names the card there and nowhere
+  // else. Deriving the candidate's issue id from `payload.issueId` alone would
+  // treat it as generic: no open-issue check, no live-path check, and no cutoff
+  // hold — so it would be re-driven straight back into the still-armed cutoff,
+  // once per sweep. Same drift-between-two-derivations as the round-2 finding.
+  it("treats a cutoff skip that names its card only under heartbeatSkip as issue-bound", async () => {
+    const { companyId, agentId, issueId } = await seedCard("todo");
+    const cutoff = new Date(Date.now() - 60 * 60 * 1000);
+    await db
+      .update(issues)
+      .set({ createdAt: new Date(cutoff.getTime() - 60 * 60 * 1000) })
+      .where(eq(issues.id, issueId));
+
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "heartbeat.worktree_execution_cutoff",
+      status: "skipped",
+      finishedAt: null,
+      // No top-level issueId — the card is named only by the skip detail.
+      payload: {
+        heartbeatSkip: {
+          reason: "worktree_execution_cutoff",
+          cutoff: cutoff.toISOString(),
+          issueId,
+        },
+      },
+    });
+
+    const enqueueWakeup = vi.fn().mockResolvedValue({ id: randomUUID(), agentId } as never);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+
+    const held = await recovery.reconcileDeferredWakeupReplay({ issueCreatedAtGte: cutoff });
+    expect(held.reDriven).toBe(0);
+    expect(held.genericReDriven).toBe(0);
+    expect(held.cutoffHeldSkipped).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    // Cutoff lifts: now it is re-driven, and reported against its card.
+    const result = await recovery.reconcileDeferredWakeupReplay({ issueCreatedAtGte: null });
+    expect(result.reDriven).toBe(1);
+    expect(result.genericReDriven).toBe(0);
+    expect(result.issueIds).toContain(issueId);
+  });
+
   it("does not re-drive a deferrable skip whose card has since been closed", async () => {
     const { companyId, agentId, issueId } = await seedCard("done");
     await seedDeferrableWake(companyId, agentId, issueId);

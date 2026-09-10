@@ -8273,8 +8273,25 @@ export function recoveryService(db: Db, deps: {
     result.checked = candidates.length;
     if (candidates.length === 0) return result;
 
+    // Which card a deferred wake names has to be derived the SAME way the write
+    // path derives it, or the issue-bound guards below (open-issue, live-path,
+    // cutoff hold) silently miss wakes that do name a card and treat them as
+    // generic:
+    //   - `payload.taskId` is an issue id — `enrichWakeContextSnapshot` accepts
+    //     it interchangeably with `payload.issueId`.
+    //   - `payload.heartbeatSkip.issueId` is written by the worktree-cutoff skip
+    //     sites, which resolve the issue themselves and record it there even
+    //     when the caller's payload never named it.
+    // Reading only `payload.issueId` is the same drift-between-two-derivations
+    // that let the cutoff skip stay terminal after it had been classified.
+    const readWakeIssueId = (payload: unknown) => {
+      const parsed = parseObject(payload);
+      return readNonEmptyString(parsed.issueId)
+        ?? readNonEmptyString(parsed.taskId)
+        ?? readNonEmptyString(parseObject(parsed.heartbeatSkip).issueId);
+    };
     const issueIdByWake = new Map<string, string | null>(
-      candidates.map((wake) => [wake.id, readNonEmptyString(parseObject(wake.payload).issueId)]),
+      candidates.map((wake) => [wake.id, readWakeIssueId(wake.payload)]),
     );
     const candidateIssueIds = [
       ...new Set(
