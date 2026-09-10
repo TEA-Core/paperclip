@@ -146,19 +146,38 @@ describe("POST /projects/:id/workspaces/:workspaceId/base-repo/rescue-reset", ()
       repoRoot: "/srv/projects/paperclip",
       targetRef: "origin/main",
     });
-    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    // F3: two-phase audit — attempt before mutation, result after.
+    expect(mockLogActivity).toHaveBeenCalledTimes(2);
+    // Attempt phase.
     expect(mockLogActivity.mock.calls[0][1]).toMatchObject({
       action: "project.base_repo_rescue_reset",
       entityType: "project_workspace",
       entityId: "workspace-1",
+      // F5: board actor maps to user/board-user.
+      actorType: "user",
+      actorId: "board-user",
     });
     expect(mockLogActivity.mock.calls[0][1].details).toMatchObject({
+      repo: "/srv/projects/paperclip",
+      targetRef: "origin/main",
+      phase: "attempt",
+    });
+    // Result phase.
+    expect(mockLogActivity.mock.calls[1][1]).toMatchObject({
+      action: "project.base_repo_rescue_reset",
+      entityType: "project_workspace",
+      entityId: "workspace-1",
+      actorType: "user",
+      actorId: "board-user",
+    });
+    expect(mockLogActivity.mock.calls[1][1].details).toMatchObject({
       repo: "/srv/projects/paperclip",
       targetRef: "origin/main",
       targetSha: "aaaaaaaaaaaa",
       priorTip: "bbbbbbbbbbbb",
       rescueRef: "refs/paperclip/rescue/base-repo/x/head",
       reset: true,
+      phase: "result",
     });
   });
 
@@ -178,7 +197,10 @@ describe("POST /projects/:id/workspaces/:workspaceId/base-repo/rescue-reset", ()
     const res = await request(app).post("/api/projects/project-1/workspaces/workspace-1/base-repo/rescue-reset");
     expect(res.status).toBe(409);
     expect(res.body.error).toMatch(/uncommitted tracked change/);
-    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    // F3: both phases are recorded even on refusal.
+    expect(mockLogActivity).toHaveBeenCalledTimes(2);
+    expect(mockLogActivity.mock.calls[0][1].details.phase).toBe("attempt");
+    expect(mockLogActivity.mock.calls[1][1].details.phase).toBe("result");
   });
 
   it("is board-only: an agent key gets 403", async () => {
@@ -211,5 +233,16 @@ describe("POST /projects/:id/workspaces/:workspaceId/base-repo/rescue-reset", ()
     const res = await request(app).post("/api/projects/project-1/workspaces/workspace-1/base-repo/rescue-reset");
     expect(res.status).toBe(422);
     expect(mockReset).not.toHaveBeenCalled();
+  });
+
+  it("F6: 400 when targetRef is not a string", async () => {
+    mockReset.mockResolvedValue({ reset: true, rescueRef: null, priorTip: null, targetRef: "x", targetSha: null, refused: null, warnings: [] });
+    const app = await createApp(BOARD);
+    const res = await request(app)
+      .post("/api/projects/project-1/workspaces/workspace-1/base-repo/rescue-reset")
+      .send({ targetRef: 12345 });
+    expect(res.status).toBe(400);
+    expect(mockReset).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 });

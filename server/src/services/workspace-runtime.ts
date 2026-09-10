@@ -4354,7 +4354,7 @@ async function resolveBaseRepoAheadCommitsAllUpstream(input: {
  * unreachable. If the pin cannot be proven, nothing moves at all — the diverged
  * repo is an inconvenience, an unreachable commit is data loss.
  */
-async function resetBaseRepoToBaseRefWithRescue(input: {
+export async function resetBaseRepoToBaseRefWithRescue(input: {
   repoRoot: string;
   baseRef: string;
   baseRefSha: string;
@@ -4369,8 +4369,11 @@ async function resetBaseRepoToBaseRefWithRescue(input: {
    */
   operatorDirected?: boolean;
 }): Promise<{ reset: boolean; rescueRef: string | null; warnings: string[] }> {
+  // F2: second-resolution timestamp alone is not collision-safe — two invocations
+  // in the same second would overwrite each other's pin. The random suffix makes
+  // the ref unique without any coordination.
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
-  const rescueRef = `${RESCUE_REF_PREFIX}/base-repo/${stamp}/head`;
+  const rescueRef = `${RESCUE_REF_PREFIX}/base-repo/${stamp}-${randomUUID().slice(0, 8)}/head`;
 
   try {
     await runGit(["update-ref", rescueRef, input.priorTip], input.repoRoot);
@@ -4406,6 +4409,23 @@ async function resetBaseRepoToBaseRefWithRescue(input: {
   // what kept the correctly-namespaced refs accumulating. Best-effort; pruning never changes
   // whether this reset is safe.
   await pruneExpiredRescueRefs(input.repoRoot);
+
+  // F1: compare-and-swap — re-read HEAD right before the destructive reset and
+  // verify it still matches the tip we pinned. A concurrent op that moved HEAD
+  // between capture and reset would otherwise cause the reset to discard
+  // commits that were never pinned.
+  const casHead = await runGit(["rev-parse", "HEAD"], input.repoRoot).catch(() => null);
+  if (casHead !== input.priorTip) {
+    return {
+      reset: false,
+      rescueRef,
+      warnings: [
+        `Base repository at ${input.repoRoot} changed between capture and reset ` +
+          `(prior tip ${input.priorTip.slice(0, 12)}, now ${casHead ? casHead.slice(0, 12) : "unknown"}). ` +
+          `NOT reset — the rescue ref ${rescueRef} still holds the original tip.`,
+      ],
+    };
+  }
 
   try {
     await runGit(["reset", "--hard", input.baseRefSha], input.repoRoot);

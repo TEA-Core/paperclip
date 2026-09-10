@@ -395,11 +395,13 @@ export {
   updateProjectWorkspaceSchema,
   projectExecutionWorkspacePolicySchema,
   projectWorkspaceRuntimeConfigSchema,
+  baseRepoRescueResetSchema,
   type CreateProject,
   type UpdateProject,
   type CreateProjectWorkspace,
   type UpdateProjectWorkspace,
   type ProjectExecutionWorkspacePolicy,
+  type BaseRepoRescueReset,
 } from "./project.js";
 
 export {

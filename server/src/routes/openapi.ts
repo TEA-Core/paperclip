@@ -42,6 +42,7 @@ import {
   updateProjectSchema,
   createProjectWorkspaceSchema,
   updateProjectWorkspaceSchema,
+  baseRepoRescueResetSchema,
   // Company
   createCompanySchema,
   updateCompanySchema,
@@ -3089,10 +3090,7 @@ registry.registerPath({
     "Board-only. Clears a base-repo divergence that the auto-reset content proof refuses. Refuses a dirty or unmerged worktree, pins the prior tip on a rescue ref, verifies the pin, then resets. Runs in the server process as the repo-owning uid. The prior tip, target ref/sha and actor are audit-logged.",
   request: {
     params: z.object({ id: z.string(), workspaceId: z.string() }),
-    body: jsonBody(z.object({
-      targetRef: z.string().min(1).optional(),
-      reason: z.string().max(2000).optional(),
-    })),
+    body: jsonBody(baseRepoRescueResetSchema),
   },
   responses: {
     200: r.ok(),
@@ -3101,6 +3099,7 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+    422: r.unprocessable,
   },
 });
 

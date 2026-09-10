@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import {
+  baseRepoRescueResetSchema,
   createProjectSchema,
   createProjectWorkspaceSchema,
   findWorkspaceCommandDefinition,
@@ -395,7 +396,7 @@ export function projectRoutes(db: Db) {
    * then resets. Every attempt is audit-logged with the repo, prior tip, target and
    * actor.
    */
-  router.post("/projects/:id/workspaces/:workspaceId/base-repo/rescue-reset", async (req, res) => {
+  router.post("/projects/:id/workspaces/:workspaceId/base-repo/rescue-reset", validate(baseRepoRescueResetSchema), async (req, res) => {
     const id = req.params.id as string;
     const workspaceId = req.params.workspaceId as string;
     assertBoard(req);
@@ -413,7 +414,7 @@ export function projectRoutes(db: Db) {
       return;
     }
 
-    const body = req.body as { targetRef?: unknown; reason?: unknown } | null | undefined;
+    const body = req.body as { targetRef?: string; reason?: string };
     const requestedTargetRef = typeof body?.targetRef === "string" ? body.targetRef.trim() : "";
     const targetRef = requestedTargetRef || (workspace.defaultRef ?? "").trim();
     if (!targetRef) {
@@ -421,10 +422,36 @@ export function projectRoutes(db: Db) {
       return;
     }
 
-    const result = await resetProjectBaseRepoWithRescue({ repoRoot, targetRef });
     const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
-
     const actor = getActorInfo(req);
+
+    // F3: record the attempt before the destructive mutation so that a failed
+    // reset (e.g. CAS guard, git error) still leaves an audit trail.
+    try {
+      await logActivity(db, {
+        companyId: project.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "project.base_repo_rescue_reset",
+        entityType: "project_workspace",
+        entityId: workspace.id,
+        details: {
+          repo: repoRoot,
+          targetRef,
+          phase: "attempt",
+          reason: reason || null,
+        },
+      });
+    } catch {
+      res.status(500).json({ error: "Could not record audit entry before reset" });
+      return;
+    }
+
+    const result = await resetProjectBaseRepoWithRescue({ repoRoot, targetRef });
+
     await logActivity(db, {
       companyId: project.companyId,
       actorType: actor.actorType,
@@ -443,6 +470,7 @@ export function projectRoutes(db: Db) {
         rescueRef: result.rescueRef,
         reset: result.reset,
         refused: result.refused,
+        phase: "result",
         reason: reason || null,
       },
     });

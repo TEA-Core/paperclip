@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { resetProjectBaseRepoWithRescue } from "./workspace-runtime.js";
+import { resetBaseRepoToBaseRefWithRescue, resetProjectBaseRepoWithRescue } from "./workspace-runtime.js";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, stdio: "pipe" }).toString().trim();
@@ -113,5 +113,100 @@ describe("resetProjectBaseRepoWithRescue", () => {
     expect(result.reset).toBe(false);
     expect(result.refused).toMatch(/not a valid ref/);
     expect(git(repoRoot, "rev-parse", "HEAD")).toBe(before);
+  });
+
+  it("F4: refuses when the base repo has unmerged paths from a merge conflict", async () => {
+    const repoRoot = await makeRepo();
+    // Create a divergent branch with a conflicting change on the same file.
+    git(repoRoot, "checkout", "-b", "feature");
+    fs.writeFileSync(path.join(repoRoot, "a.txt"), "feature-version\n");
+    git(repoRoot, "add", "a.txt");
+    git(repoRoot, "commit", "-m", "feature change");
+    // Switch back to main and make a conflicting change to the same file.
+    git(repoRoot, "checkout", "main");
+    fs.writeFileSync(path.join(repoRoot, "a.txt"), "main-version\n");
+    git(repoRoot, "add", "a.txt");
+    git(repoRoot, "commit", "-m", "main change");
+    // Merge feature into main — this produces a conflict on a.txt.
+    // A conflicted merge exits non-zero, so catch it.
+    try {
+      git(repoRoot, "merge", "feature", "--no-ff", "--no-commit");
+    } catch {
+      // Expected: merge conflict causes non-zero exit.
+    }
+    const status = git(repoRoot, "status", "--porcelain");
+    expect(status).toMatch(/^(UU|AA|DD)/m);
+
+    const shaMainBefore = git(repoRoot, "rev-parse", "HEAD");
+    const result = await resetProjectBaseRepoWithRescue({ repoRoot, targetRef: "main" });
+    expect(result.reset).toBe(false);
+    expect(result.rescueRef).toBeNull();
+    expect(result.refused).toMatch(/unmerged path/);
+    // HEAD must not have moved.
+    expect(git(repoRoot, "rev-parse", "HEAD")).toBe(shaMainBefore);
+  });
+
+  it("F1: CAS guard fails when HEAD changed between capture and reset", async () => {
+    const repoRoot = await makeRepo();
+    const shaA = git(repoRoot, "rev-parse", "HEAD");
+    fs.writeFileSync(path.join(repoRoot, "a.txt"), "second\n");
+    git(repoRoot, "add", "a.txt");
+    git(repoRoot, "commit", "-m", "second");
+    const shaB = git(repoRoot, "rev-parse", "HEAD");
+
+    // Simulate a stale priorTip: the capture said HEAD was shaA, but it's actually shaB.
+    const result = await resetBaseRepoToBaseRefWithRescue({
+      repoRoot,
+      baseRef: "main",
+      baseRefSha: shaA,
+      priorTip: shaA, // stale — HEAD is actually shaB
+      aheadCount: 1,
+      operatorDirected: true,
+    });
+    expect(result.reset).toBe(false);
+    // The rescue ref was created (pinned the stale tip), but the reset was refused.
+    expect(result.rescueRef).not.toBeNull();
+    expect(result.warnings[0]).toMatch(/changed between capture and reset/);
+    // HEAD is still at shaB — nothing was reset.
+    expect(git(repoRoot, "rev-parse", "HEAD")).toBe(shaB);
+  });
+
+  it("F2: two rescue resets in the same second produce distinct refs", async () => {
+    const repoRoot = await makeRepo();
+    const shaA = git(repoRoot, "rev-parse", "HEAD");
+    fs.writeFileSync(path.join(repoRoot, "a.txt"), "second\n");
+    git(repoRoot, "add", "a.txt");
+    git(repoRoot, "commit", "-m", "second");
+    const shaB = git(repoRoot, "rev-parse", "HEAD");
+
+    const r1 = await resetBaseRepoToBaseRefWithRescue({
+      repoRoot,
+      baseRef: "main",
+      baseRefSha: shaA,
+      priorTip: shaB,
+      aheadCount: 1,
+      operatorDirected: true,
+    });
+    expect(r1.reset).toBe(true);
+    const ref1 = r1.rescueRef!;
+
+    // Create another commit and do a second reset.
+    fs.writeFileSync(path.join(repoRoot, "a.txt"), "third\n");
+    git(repoRoot, "add", "a.txt");
+    git(repoRoot, "commit", "-m", "third");
+    const shaC = git(repoRoot, "rev-parse", "HEAD");
+
+    const r2 = await resetBaseRepoToBaseRefWithRescue({
+      repoRoot,
+      baseRef: "main",
+      baseRefSha: shaA,
+      priorTip: shaC,
+      aheadCount: 1,
+      operatorDirected: true,
+    });
+    expect(r2.reset).toBe(true);
+    const ref2 = r2.rescueRef!;
+
+    expect(ref1).not.toBe(ref2);
   });
 });

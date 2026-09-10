@@ -132,3 +132,10 @@ export const updateProjectSchema = objectWithoutDefaults(
 export type UpdateProject = z.infer<typeof updateProjectSchema>;
 
 export type ProjectExecutionWorkspacePolicy = z.infer<typeof projectExecutionWorkspacePolicySchema>;
+
+export const baseRepoRescueResetSchema = z.object({
+  targetRef: z.string().min(1).optional(),
+  reason: z.string().max(2000).optional(),
+}).default({});
+
+export type BaseRepoRescueReset = z.infer<typeof baseRepoRescueResetSchema>;
