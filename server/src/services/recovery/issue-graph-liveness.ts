@@ -220,21 +220,28 @@ export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now
 // participant that has never been woken for this card and runs only on other
 // assignments must not keep the card `covered` indefinitely. Fresh = the stage
 // armed within the grace window, OR the participant already holds a card-scoped
-// live path (an active run, or a non-stale queued wake, on THIS card).
+// live path (an active run, or a non-stale queued wake, on THIS card owned by
+// THIS participant). A legacy stage with no immutable pendingSince arm signal
+// resolves stale by design: a mutable issue.updatedAt must not renew the grace.
 function participantHasCardScopedLivePath(
   companyId: string,
   issueId: string,
+  participantAgentId: string,
   activeRuns: IssueLivenessExecutionPathInput[],
   queuedWakeRequests: IssueLivenessExecutionPathInput[],
   nowMs: number,
   queuedWakeStaleAfterMs: number | null,
 ): boolean {
   const hasActiveRun = activeRuns.some(
-    (entry) => entry.companyId === companyId && entry.issueId === issueId,
+    (entry) =>
+      entry.companyId === companyId &&
+      entry.issueId === issueId &&
+      entry.agentId === participantAgentId,
   );
   if (hasActiveRun) return true;
   return queuedWakeRequests.some((entry) => {
     if (entry.companyId !== companyId || entry.issueId !== issueId) return false;
+    if (entry.agentId !== participantAgentId) return false;
     if (queuedWakeStaleAfterMs !== null) {
       const createdAtMs = readDateMs(entry.createdAt);
       if (createdAtMs !== null && nowMs - createdAtMs > queuedWakeStaleAfterMs) return false;
@@ -247,16 +254,21 @@ function executionParticipantPathIsFresh(
   input: IssueGraphLivenessInput,
   issue: IssueLivenessIssueInput,
   nowMs: number,
+  participantAgentId: string,
 ): boolean {
   const graceMs = readNonNegativeMs(input.participantGraceMs);
   // Grace not configured (e.g. callers that never set it): preserve the prior
   // maintained-path behavior so only the review-attention scorer is gated.
   if (graceMs === null) return true;
-  const armedAtMs = readDateMs(issue.executionState?.pendingSince) ?? readDateMs(issue.updatedAt);
+  // The arm signal must be the immutable pendingSince set at stage arm. A
+  // missing pendingSince is an unknown arm time and resolves stale; the
+  // mutable updatedAt is deliberately NOT a fallback (SUP-15556 bounce #1).
+  const armedAtMs = readDateMs(issue.executionState?.pendingSince);
   if (armedAtMs !== null && nowMs - armedAtMs <= graceMs) return true;
   return participantHasCardScopedLivePath(
     issue.companyId,
     issue.id,
+    participantAgentId,
     input.activeRuns ?? [],
     input.queuedWakeRequests ?? [],
     nowMs,
@@ -294,7 +306,7 @@ export function classifyIssueReviewPaths(
       // fresh for THIS card (armed within the grace window, or already holding
       // a card-scoped live path). Otherwise it would keep the card `covered`
       // indefinitely while busy on other assignments (SUP-15565).
-      if (executionParticipantPathIsFresh(input, issue, nowMs)) {
+      if (executionParticipantPathIsFresh(input, issue, nowMs, participantAgentId)) {
         paths.push({
           kind: "execution_participant",
           ref: participantAgentId,
