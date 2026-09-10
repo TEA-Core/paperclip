@@ -94,17 +94,26 @@ import {
   noticeMetadataReferencesRecoveryAction,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
+import { SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES } from "../successful-run-handoff-state.js";
 import {
   buildDispatchSuppressionParkNotice,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
   buildExecutionReviewParticipantUnavailableNoticeSeed,
   buildStrandedRecoveryEscalationNotice,
+  buildTodoStrandedParkNotice,
   type StrandedRecoveryNoticeSeed,
 } from "./stranded-notice.js";
 import {
   TIMER_DISPATCH_SUPPRESSED_ACTION,
+  TODO_STRANDED_ACTION,
+  buildTodoStrandedDetails,
+  evaluateTodoStranded,
   type ContinuationPathDisjuncts,
 } from "../issue-continuation-path.js";
+import {
+  resolveLiveExecutionLeases,
+  type LiveExecutionLease,
+} from "../issue-execution-lease.js";
 import {
   RECOVERY_ORIGIN_KINDS,
   buildIssueGraphLivenessLeafKey,
@@ -164,6 +173,10 @@ const BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS = 15 * 60 * 1000;
 // park; a card that regains a live path inside the window never does.
 const DISPATCH_SUPPRESSED_PARK_SUSTAINED_MS = 2 * 60 * 60 * 1000;
 const DISPATCH_SUPPRESSED_PARK_CANDIDATE_LIMIT = 100;
+// ADR-093 D2 (SUP-15553): the `todo` arm's candidate ceiling. Matches the D3
+// park sweep — both are bounded, level-triggered liveness parks that must never
+// balloon a single sweep across the whole company.
+const TODO_STRANDED_PARK_CANDIDATE_LIMIT = 100;
 const STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT = 100;
 const STILLBORN_ASSIGNED_BACKLOG_RELOG_INTERVAL_MS = 5 * 60_000;
 // SUP-14907: grace window so the detector does not fire against an issue that
@@ -1291,6 +1304,34 @@ export function recoveryService(db: Db, deps: {
         and(
           eq(agentWakeupRequests.companyId, companyId),
           eq(agentWakeupRequests.status, "queued"),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+          agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  // The `todo` arm's wake disjunct (ADR-093 D2). `hasQueuedIssueWake` above
+  // matches `queued` only, but the wake lifecycle has three ACTIVE states:
+  // `queued` -> `claimed` (in flight, `runId` assigned, not yet finished) and
+  // `deferred_issue_execution` (deferred, pending re-drive). A `claimed` wake
+  // whose run is not active is neither `queued` nor an active run, so both
+  // existing guards read "no live wake" and a live card is parked. Bound to the
+  // shared `SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES` set so this sweep and
+  // the handoff/blocked-inbox liveness contract can never drift apart.
+  // Deliberately separate from `hasQueuedIssueWake`: that helper is shared by
+  // the in_progress/D1/D3 park, review-participant recovery,
+  // blocked_without_blockers and accepted-interaction continuation sweeps,
+  // which are out of scope here and must stay behaviourally unchanged.
+  async function hasLiveIssueWake(companyId: string, issueId: string, agentId?: string | null) {
+    return db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          inArray(agentWakeupRequests.status, [...SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES]),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
         ),
@@ -7067,6 +7108,12 @@ export function recoveryService(db: Db, deps: {
       deferredWakeupReplayCutoffHeldSkipped: 0,
       deferredWakeupReplayCandidateLimitApplied: false,
       deferredWakeupReplayedIssueIds: [] as string[],
+      todoStrandedParked: 0,
+      todoStrandedParkedIssueIds: [] as string[],
+      todoStrandedParkedLivePathSkipped: 0,
+      todoStrandedParkedThresholdSkipped: 0,
+      todoStrandedParkedLeasedSkipped: 0,
+      todoStrandedParkedAlreadyActionedSkipped: 0,
       blockedWithoutBlockersChecked: 0,
       blockedWithoutBlockersHealed: 0,
       blockedWithoutBlockersEscalated: 0,
@@ -7131,6 +7178,17 @@ export function recoveryService(db: Db, deps: {
     result.deferredWakeupReplayCutoffHeldSkipped = deferredWakeupReplay.cutoffHeldSkipped;
     result.deferredWakeupReplayCandidateLimitApplied = deferredWakeupReplay.candidateLimitApplied;
     result.deferredWakeupReplayedIssueIds = deferredWakeupReplay.issueIds;
+
+    const todoStrandedPark = await reconcileTodoStrandedCards({
+      runId: opts?.runId ?? null,
+      now,
+    });
+    result.todoStrandedParked = todoStrandedPark.parked;
+    result.todoStrandedParkedIssueIds = todoStrandedPark.issueIds;
+    result.todoStrandedParkedLivePathSkipped = todoStrandedPark.livePathSkipped;
+    result.todoStrandedParkedThresholdSkipped = todoStrandedPark.thresholdSkipped;
+    result.todoStrandedParkedLeasedSkipped = todoStrandedPark.leasedSkipped;
+    result.todoStrandedParkedAlreadyActionedSkipped = todoStrandedPark.alreadyActionedSkipped;
 
     const blockedWithoutBlockers = await reconcileBlockedWithoutBlockers({
       runId: opts?.runId ?? null,
@@ -8444,6 +8502,235 @@ export function recoveryService(db: Db, deps: {
     return result;
   }
 
+  // ADR-093 D2 (SUP-15553) — the `todo` arm of the stranded-card detector.
+  //
+  // A `todo` card with an assignee agent that has had no wake or run for the
+  // liveness window is stranded: the D1 dispatch path treats every unleased
+  // `todo` card as actionable, so it is never dispatch-suppressed and the D3
+  // in_progress park never sees it (the gap that left SUP-15460 sitting on
+  // `todo`). This sweep parks those cards onto the blocked_without_blockers
+  // surface so the existing escalation/heal machinery owns them. Idempotent: a
+  // parked card leaves the `todo` candidate set, so a re-run adds no second
+  // activity row.
+  async function reconcileTodoStrandedCards(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+  }) {
+    const result = {
+      checked: 0,
+      parked: 0,
+      leasedSkipped: 0,
+      livePathSkipped: 0,
+      thresholdSkipped: 0,
+      alreadyActionedSkipped: 0,
+      candidateLimitSkipped: 0,
+      issueIds: [] as string[],
+    };
+
+    const source = "issue_graph_liveness.todo_stranded_park";
+    const now = opts?.now ?? new Date();
+
+    const issueFilters = [
+      eq(issues.status, "todo"),
+      sql`${issues.assigneeAgentId} is not null`,
+      isNull(issues.assigneeUserId),
+      visibleIssueCondition(),
+    ];
+    if (opts?.companyId) issueFilters.push(eq(issues.companyId, opts.companyId));
+
+    const issueRows = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        assigneeAgentId: issues.assigneeAgentId,
+        updatedAt: issues.updatedAt,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        totalCount: sql<number>`count(*) over()::int`,
+      })
+      .from(issues)
+      .where(and(...issueFilters))
+      .orderBy(asc(issues.id))
+      .limit(TODO_STRANDED_PARK_CANDIDATE_LIMIT);
+
+    result.checked = issueRows.length;
+    result.candidateLimitSkipped = Math.max(0, (issueRows[0]?.totalCount ?? 0) - issueRows.length);
+    if (issueRows.length === 0) return result;
+
+    const candidateIdList = issueRows.map((row) => row.id);
+
+    // (a) live execution leases, grouped so the company-scoped resolver stays in
+    //     its home company even when the sweep runs unscoped.
+    const candidatesByCompany = new Map<string, string[]>();
+    for (const row of issueRows) {
+      const ids = candidatesByCompany.get(row.companyId) ?? [];
+      ids.push(row.id);
+      candidatesByCompany.set(row.companyId, ids);
+    }
+    const leasesByCompany = new Map<string, Map<string, LiveExecutionLease>>();
+    for (const [companyId, ids] of candidatesByCompany) {
+      leasesByCompany.set(companyId, await resolveLiveExecutionLeases(db, companyId, ids));
+    }
+
+    // Last wake and last run per candidate — the anchors for "last contact".
+    const wakeRows = await db
+      .select({
+        issueId: sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`,
+        latestWakeAt: sql<Date | null>`max(${agentWakeupRequests.createdAt})`,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        sql`${agentWakeupRequests.payload} ->> 'issueId' in (${sql.join(
+          candidateIdList.map((id) => sql`${id}`),
+          sql`, `,
+        )})`,
+      )
+      .groupBy(sql`${agentWakeupRequests.payload} ->> 'issueId'`);
+    const wakeLatestById = new Map(
+      wakeRows.map((row) => [row.issueId, row.latestWakeAt] as const),
+    );
+
+    const runRows = await db
+      .select({
+        issueId: sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+        latestRunAt: sql<Date | null>`max(${heartbeatRuns.startedAt})`,
+      })
+      .from(heartbeatRuns)
+      .where(
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' in (${sql.join(
+          candidateIdList.map((id) => sql`${id}`),
+          sql`, `,
+        )})`,
+      )
+      .groupBy(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`);
+    const runLatestById = new Map(
+      runRows.map((row) => [row.issueId, row.latestRunAt] as const),
+    );
+
+    const assigneeIds = [
+      ...new Set(
+        issueRows.map((row) => row.assigneeAgentId).filter((id): id is string => Boolean(id)),
+      ),
+    ];
+    const assigneeRows =
+      assigneeIds.length > 0
+        ? await db
+            .select({ id: agents.id, name: agents.name })
+            .from(agents)
+            .where(inArray(agents.id, assigneeIds))
+        : [];
+    const assigneeNameById = new Map(
+      assigneeRows.map((row) => [row.id, row.name] as const),
+    );
+
+    for (const candidate of issueRows) {
+      const leased = Boolean(leasesByCompany.get(candidate.companyId)?.has(candidate.id));
+      const monitorFuture = hasFutureMonitorCheck(candidate.monitorNextCheckAt);
+      const activePath = await hasActiveExecutionPath(
+        candidate.companyId,
+        candidate.id,
+        candidate.assigneeAgentId,
+        candidate.monitorNextCheckAt,
+      );
+      const liveWake = await hasLiveIssueWake(
+        candidate.companyId,
+        candidate.id,
+        candidate.assigneeAgentId,
+      );
+      const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+        candidate.companyId,
+        candidate.id,
+      );
+
+      const contactAnchors = [
+        candidate.updatedAt,
+        wakeLatestById.get(candidate.id) ?? null,
+        runLatestById.get(candidate.id) ?? null,
+      ]
+        .map((value) => (value ? new Date(value) : null))
+        .filter((value): value is Date => Boolean(value && !Number.isNaN(value.getTime())));
+      const lastContact =
+        contactAnchors.length > 0
+          ? contactAnchors.reduce((latest, value) =>
+              value.getTime() > latest.getTime() ? value : latest,
+            )
+          : null;
+
+      const verdict = evaluateTodoStranded(
+        {
+          leased,
+          activeRun: activePath,
+          monitorNextCheckAtInFuture: monitorFuture,
+          liveWake,
+          boardRecoveryAction: activeRecoveryAction !== null,
+          lastContactAt: lastContact,
+        },
+        { now },
+      );
+
+      if (leased) {
+        result.leasedSkipped += 1;
+        continue;
+      }
+      if (activeRecoveryAction !== null) {
+        result.alreadyActionedSkipped += 1;
+        continue;
+      }
+      if (!verdict.stranded) {
+        if (activePath || monitorFuture || liveWake) result.livePathSkipped += 1;
+        else result.thresholdSkipped += 1;
+        continue;
+      }
+
+      await issuesSvc.update(candidate.id, { status: "blocked" });
+
+      const notice = buildTodoStrandedParkNotice({
+        identifier: candidate.identifier,
+        assignee: candidate.assigneeAgentId
+          ? {
+              id: candidate.assigneeAgentId,
+              name: assigneeNameById.get(candidate.assigneeAgentId) ?? null,
+            }
+          : null,
+      });
+      await issuesSvc.addComment(candidate.id, notice.body, {}, {
+        authorType: "system",
+        presentation: notice.presentation,
+        metadata: notice.metadata,
+      });
+
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: source,
+        runId: opts?.runId ?? null,
+        agentId: candidate.assigneeAgentId ?? null,
+        action: TODO_STRANDED_ACTION,
+        entityType: "issue",
+        entityId: candidate.id,
+        details: buildTodoStrandedDetails({
+          issueId: candidate.id,
+          disjuncts: verdict.disjuncts,
+          lastContactAt: verdict.lastContactAt,
+          elapsedMs: verdict.elapsedMs,
+        }),
+      });
+
+      result.parked += 1;
+      result.issueIds.push(candidate.id);
+    }
+
+    if (result.parked > 0) {
+      logger.warn(
+        { parked: result.parked, issueIds: result.issueIds, source },
+        "stranded assigned todo cards parked onto blocked_without_blockers surface",
+      );
+    }
+
+    return result;
+  }
+
   // Ceiling applied to source-scoped recovery actions so the level-triggered
   // backstop below cannot re-fire the same wake forever.
   // MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS is declared above reconcileBlockedWithoutBlockers.
@@ -9559,6 +9846,7 @@ export function recoveryService(db: Db, deps: {
     reconcileBlockedWithoutBlockers,
     reconcileDispatchSuppressionParks,
     reconcileDeferredWakeupReplay,
+    reconcileTodoStrandedCards,
     reconcilePendingReviewRearm,
     reconcileStaleRecoveryActionWakes,
     reconcileActiveRecoveryActions,
