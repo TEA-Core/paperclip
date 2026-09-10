@@ -128,7 +128,7 @@ describeEmbeddedPostgres("heartbeat write path records deferrable vs terminal sk
       .then((rows) => rows);
   }
 
-  it("acceptance #1: a scheduling_suppressed skip is a deferral (skipped_deferrable, no finishedAt)", async () => {
+  it("acceptance #1: a scheduling_suppressed skip is a deferral (status stays skipped, no finishedAt)", async () => {
     const { agentId } = await seedActiveAgent();
     const issueId = randomUUID();
 
@@ -148,7 +148,7 @@ describeEmbeddedPostgres("heartbeat write path records deferrable vs terminal sk
     const rows = await readSkips(agentId);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
-      status: "skipped_deferrable",
+      status: "skipped",
       reason: "heartbeat.scheduling_suppressed",
     });
     expect(rows[0].finishedAt).toBeNull();
@@ -175,7 +175,8 @@ describeEmbeddedPostgres("heartbeat write path records deferrable vs terminal sk
 
     const rows = await readSkips(agentId);
     expect(rows).toHaveLength(1);
-    expect(rows[0].status).toBe("skipped_deferrable");
+    expect(rows[0].status).toBe("skipped");
+    expect(rows[0].finishedAt).toBeNull();
     expect(rows[0].coalescedCount).toBeGreaterThanOrEqual(1);
   });
 
@@ -198,6 +199,104 @@ describeEmbeddedPostgres("heartbeat write path records deferrable vs terminal sk
       reason: "heartbeat.disabled",
     });
     expect(rows[0].finishedAt).not.toBeNull();
+  });
+
+  // Regression: recording the deferral as a DISTINCT status value (e.g.
+  // `skipped_deferrable`) silently changes the meaning of three partial unique
+  // indexes on agent_wakeup_requests whose predicates exclude `'skipped'`
+  // precisely so that a skipped wake can be retried under the same idempotency
+  // key. Under a distinct status the deferred row satisfies the predicate,
+  // takes the idempotency slot, and the legitimate retry raises 23505 — the
+  // fix for a lost wake would itself lose wakes.
+  it("a deferrable skip does not consume the retry slot of a keyed wake (partial unique indexes)", async () => {
+    const { companyId, agentId } = await seedActiveAgent();
+    const issueId = randomUUID();
+
+    dispatchQuiesce.engage({ reason: "test-quiesce", ttlMs: 60_000 });
+
+    const heartbeat = heartbeatService(db);
+    for (const idempotencyKey of [
+      `question-response:${randomUUID()}`,
+      `issue_review_path_lost:${randomUUID()}`,
+      `issue_disposition_repair:${randomUUID()}`,
+    ]) {
+      const run = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId },
+        idempotencyKey,
+        requestedByActorType: "system",
+        requestedByActorId: "deferred_wake_test",
+      });
+      expect(run).toBeNull();
+
+      // The retry path re-enqueues under the SAME key. It must not collide
+      // with the deferred row.
+      await expect(
+        db.insert(agentWakeupRequests).values({
+          id: randomUUID(),
+          companyId,
+          agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_commented",
+          status: "queued",
+          idempotencyKey,
+          payload: { issueId },
+        }),
+      ).resolves.toBeDefined();
+    }
+  });
+
+  // Regression: coalescing is a payload-destroying operation. A wake carrying an
+  // idempotency key is a distinct durable signal (a question-response
+  // continuation, a review-path recovery) whose payload IS the delivery.
+  // Merging it into an unrelated generic wake for the same card discards that
+  // payload and key outright.
+  it("coalescing never merges wakes that carry different idempotency keys", async () => {
+    const { agentId } = await seedActiveAgent();
+    const issueId = randomUUID();
+    const deliveryKey = `question-response:${randomUUID()}`;
+    const interactionId = randomUUID();
+
+    dispatchQuiesce.engage({ reason: "test-quiesce", ttlMs: 60_000 });
+    const heartbeat = heartbeatService(db);
+
+    // A generic assignment wake for the card lands first and is deferred.
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId, mutation: "update" },
+      requestedByActorType: "system",
+      requestedByActorId: "deferred_wake_test",
+    });
+
+    // Then the question-response continuation wake for the SAME card arrives.
+    await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId, interactionId, mutation: "interaction" },
+      idempotencyKey: deliveryKey,
+      requestedByActorType: "system",
+      requestedByActorId: "deferred_wake_test",
+    });
+
+    const rows = await db
+      .select({
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    // Two distinct deferred rows — the delivery was not swallowed.
+    expect(rows).toHaveLength(2);
+    const delivery = rows.find((r) => r.idempotencyKey === deliveryKey);
+    expect(delivery).toBeDefined();
+    expect(delivery!.payload).toMatchObject({ issueId, interactionId });
   });
 });
 
@@ -264,7 +363,11 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
       source: "assignment",
       triggerDetail: "system",
       reason: "heartbeat.scheduling_suppressed",
-      status: "skipped_deferrable",
+      // A deferral is `skipped` with NO finishedAt — deliberately the same
+      // status value a terminal skip uses, so the idempotency indexes that
+      // exclude 'skipped' keep treating it as retryable.
+      status: "skipped",
+      finishedAt: null,
       payload: { issueId, source: "assignment" },
     });
   }
@@ -296,8 +399,8 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
 
     const result = await recovery.reconcileDeferredWakeupReplay();
 
-    // The sweep only re-drives `skipped_deferrable` rows; terminal `skipped` rows
-    // are invisible to it and stay terminal.
+    // The sweep only re-drives rows whose reason is deferrable AND which are
+    // unfinished; terminal skips are finished, so they are invisible to it.
     expect(result.reDriven).toBe(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
     const statuses = await db
@@ -306,6 +409,12 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
       .where(eq(agentWakeupRequests.agentId, agentId))
       .then((rows) => rows.map((r) => r.status).sort());
     expect(statuses).toEqual(["skipped", "skipped"]);
+    const terminalFinished = await db
+      .select({ finishedAt: agentWakeupRequests.finishedAt })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.map((r) => r.finishedAt));
+    expect(terminalFinished.every((f) => f !== null)).toBe(true);
   });
 
   it("acceptance #2: when the suppression clears, the sweep re-drives the original payload", async () => {
@@ -328,13 +437,15 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     expect(enqAgentId).toBe(agentId);
     expect(enqOpts.payload).toMatchObject({ issueId });
 
-    // The deferrable row is now the terminal replayed audit marker.
+    // The deferred row is retired by stamping finishedAt. Status stays
+    // `skipped`, so it still occupies no idempotency-key slot.
     const row = await db
-      .select({ status: agentWakeupRequests.status })
+      .select({ status: agentWakeupRequests.status, finishedAt: agentWakeupRequests.finishedAt })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId))
       .then((rows) => rows[0]);
-    expect(row.status).toBe("skipped_deferrable_replayed");
+    expect(row.status).toBe("skipped");
+    expect(row.finishedAt).not.toBeNull();
   });
 
   it("acceptance #1 + #5 (end-to-end): todo-card assignment wake, suppressed → clear → re-driven carrying the original payload.issueId", async () => {
@@ -354,11 +465,12 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     });
     expect(skippedRun).toBeNull();
     const pending = await db
-      .select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
+      .select({ status: agentWakeupRequests.status, finishedAt: agentWakeupRequests.finishedAt, payload: agentWakeupRequests.payload })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId))
       .then((rows) => rows[0]);
-    expect(pending.status).toBe("skipped_deferrable");
+    expect(pending.status).toBe("skipped");
+    expect(pending.finishedAt).toBeNull();
     expect(pending.payload).toMatchObject({ issueId });
 
     // 2) clear: the suppression lifts.
@@ -378,11 +490,12 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     expect(opts.payload).toMatchObject({ issueId });
 
     const row = await db
-      .select({ status: agentWakeupRequests.status })
+      .select({ status: agentWakeupRequests.status, finishedAt: agentWakeupRequests.finishedAt })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId))
       .then((rows) => rows[0]);
-    expect(row.status).toBe("skipped_deferrable_replayed");
+    expect(row.status).toBe("skipped");
+    expect(row.finishedAt).not.toBeNull();
   });
 
   it("acceptance #3: re-drive is idempotent — a second sweep does not drive the same wake again", async () => {
@@ -473,13 +586,15 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     expect(result.suppressedSkipped).toBe(1);
     expect(enqueueWakeup).not.toHaveBeenCalled();
 
-    // Row is untouched, still deferrable, so a later sweep can still pick it up.
+    // Row is untouched, still deferrable (unfinished), so a later sweep can
+    // still pick it up.
     const row = await db
-      .select({ status: agentWakeupRequests.status })
+      .select({ status: agentWakeupRequests.status, finishedAt: agentWakeupRequests.finishedAt })
       .from(agentWakeupRequests)
       .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "heartbeat.scheduling_suppressed")))
       .then((rows) => rows[0]);
-    expect(row.status).toBe("skipped_deferrable");
+    expect(row.status).toBe("skipped");
+    expect(row.finishedAt).toBeNull();
   });
 
   it("does not re-drive a deferrable skip whose card has since been closed", async () => {
@@ -496,5 +611,130 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
 
     expect(result.reDriven).toBe(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+});
+
+// Acceptance #6: the blast-radius query. The live numbers must be produced by
+// running this against the production database (see the close comment); this
+// test pins the QUERY itself against the real migrated schema on seeded data,
+// so the SQL pasted into the close comment is known to be correct rather than
+// hand-written and unverified.
+describeEmbeddedPostgres("blast radius query for deferrable skips (SUP-15552 acceptance #6)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("deferred-wake-blast-");
+    db = createDb(tempDb.connectionString);
+  }, 30_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  // Kept verbatim in the close comment.
+  const REASON_TALLY_SQL = `
+SELECT reason, count(*) AS skipped_count
+FROM agent_wakeup_requests
+WHERE status = 'skipped'
+  AND reason IN (
+    'heartbeat.scheduling_suppressed',
+    'heartbeat.worktree_execution_cutoff',
+    'budget.blocked'
+  )
+GROUP BY reason
+ORDER BY skipped_count DESC`;
+
+  const STRANDED_OPEN_SQL = `
+WITH latest_wake AS (
+  SELECT DISTINCT ON (w.payload ->> 'issueId')
+         w.payload ->> 'issueId' AS issue_id,
+         w.reason,
+         w.status
+  FROM agent_wakeup_requests w
+  WHERE w.payload ->> 'issueId' IS NOT NULL
+  ORDER BY w.payload ->> 'issueId', w.requested_at DESC, w.id DESC
+)
+SELECT lw.reason, count(*) AS stranded_open_issues
+FROM latest_wake lw
+JOIN issues i ON i.id = lw.issue_id::uuid
+WHERE lw.status = 'skipped'
+  AND lw.reason IN (
+    'heartbeat.scheduling_suppressed',
+    'heartbeat.worktree_execution_cutoff',
+    'budget.blocked'
+  )
+  AND i.status NOT IN ('done', 'cancelled')
+GROUP BY lw.reason
+ORDER BY stranded_open_issues DESC`;
+
+  it("tallies deferrable skips per reason and counts still-open cards stranded by one", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Blast Co",
+      status: "active",
+      issuePrefix: `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Blast Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60, wakeOnDemand: true } },
+      permissions: {},
+    });
+
+    const openIssueId = randomUUID();
+    const closedIssueId = randomUUID();
+    const recoveredIssueId = randomUUID();
+    await db.insert(issues).values([
+      { id: openIssueId, companyId, title: "stranded + open", status: "todo", assigneeAgentId: agentId },
+      { id: closedIssueId, companyId, title: "stranded but closed", status: "done", assigneeAgentId: agentId },
+      { id: recoveredIssueId, companyId, title: "skipped then re-woken", status: "in_progress", assigneeAgentId: agentId },
+    ]);
+
+    const wake = (issueId: string, reason: string, status: string, requestedAt: Date) => ({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason,
+      status,
+      payload: { issueId },
+      requestedAt,
+    });
+
+    await db.insert(agentWakeupRequests).values([
+      // Open card whose most recent wake is a deferrable skip — the stranded shape.
+      wake(openIssueId, "heartbeat.scheduling_suppressed", "skipped", new Date("2026-09-08T21:54:39Z")),
+      // Same reason, but the card is closed — counted in the tally, not stranded.
+      wake(closedIssueId, "heartbeat.scheduling_suppressed", "skipped", new Date("2026-09-08T21:00:00Z")),
+      // A different deferrable reason, on a card that was later re-woken by
+      // another path: it is in the tally but is NOT stranded, because the
+      // deferrable skip is not its most recent wake.
+      wake(recoveredIssueId, "budget.blocked", "skipped", new Date("2026-09-07T10:00:00Z")),
+      wake(recoveredIssueId, "issue_assigned", "completed", new Date("2026-09-07T11:00:00Z")),
+      // A terminal skip is not a deferrable skip and appears in neither result.
+      wake(randomUUID(), "heartbeat.timer.no_actionable_work", "skipped", new Date("2026-09-07T12:00:00Z")),
+    ]);
+
+    const tally = await db.execute(sql.raw(REASON_TALLY_SQL));
+    expect([...tally].map((r) => ({ reason: r.reason, count: Number(r.skipped_count) }))).toEqual([
+      { reason: "heartbeat.scheduling_suppressed", count: 2 },
+      { reason: "budget.blocked", count: 1 },
+    ]);
+
+    const stranded = await db.execute(sql.raw(STRANDED_OPEN_SQL));
+    // Only the open card whose LATEST wake is a deferrable skip.
+    expect([...stranded].map((r) => ({ reason: r.reason, count: Number(r.stranded_open_issues) }))).toEqual([
+      { reason: "heartbeat.scheduling_suppressed", count: 1 },
+    ]);
   });
 });

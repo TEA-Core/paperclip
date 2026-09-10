@@ -77,6 +77,10 @@ import {
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb, type AgentInvokability } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled, parseHeartbeatPolicy } from "../heartbeat-policy.js";
+// SUP-15552: shared with the heartbeat skip write path. Imported from the
+// standalone classification module, not from heartbeat.ts, which imports THIS
+// module — see wake-skip-classification.ts for why.
+import { DEFERRABLE_WAKE_SKIP_REASONS } from "../wake-skip-classification.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -8175,19 +8179,26 @@ export function recoveryService(db: Db, deps: {
   }
 
   // SUP-15552 / D1 of SUP-15551 (ADR-096): a wake skipped for a transient,
-  // instance-level dispatch suppression is recorded as `skipped_deferrable`
-  // (a deferral, not a terminal drop). This level-triggered backstop — same
-  // shape as reconcileDispatchSuppressionParks / SUP-10796 — re-drives those
-  // deferred wakes once the suppression that skipped them has cleared.
+  // instance-level dispatch suppression is recorded as a DEFERRAL rather than a
+  // terminal drop — `status = 'skipped'` (unchanged) with `finishedAt IS NULL`
+  // and a deferrable `reason`. This level-triggered backstop — same shape as
+  // reconcileDispatchSuppressionParks / SUP-10796 — re-drives those deferred
+  // wakes once the suppression that skipped them has cleared.
+  //
+  // The deferral is deliberately NOT a new status value: several partial unique
+  // indexes and their app-level mirrors key retry-ability off
+  // `status <> 'skipped'`, so a distinct status would permanently occupy the
+  // idempotency slot of the very wake it is trying to save. See the write path
+  // in heartbeat.ts for the full list.
   //
   // - Re-drive is gated on `resolveSchedulingSuppression()` reporting the
   //   instance as dispatchable, so a still-quiesced instance never re-fires
   //   (the skip is still in effect).
-  // - Re-drive is idempotent: a compare-and-swap flips the deferrable row to
-  //   `skipped_deferrable_replayed` before the enqueue, so concurrent sweeps
-  //   never double-drive the same wake; a card that has since been claimed,
-  //   closed, or re-woken by another path is detected via hasActiveExecutionPath
-  //   / hasQueuedIssueWake and left alone.
+  // - Re-drive is idempotent: a compare-and-swap stamps `finishedAt` on the
+  //   deferred row before the enqueue, so concurrent sweeps never double-drive
+  //   the same wake; a card that has since been claimed, closed, or re-woken by
+  //   another path is detected via hasActiveExecutionPath / hasQueuedIssueWake
+  //   and left alone.
   // - Re-drive re-runs the full dispatch through enqueueWakeup (owner
   //   resolution, budget, invokability, issue state, ownership) on the
   //   ORIGINAL payload, so the resulting run carries the original
@@ -8214,7 +8225,15 @@ export function recoveryService(db: Db, deps: {
       return result;
     }
 
-    const wakeFilters = [eq(agentWakeupRequests.status, "skipped_deferrable")];
+    // A deferred wake is `status = 'skipped'` (unchanged, so the idempotency
+    // indexes that exclude 'skipped' keep treating it as retryable) that has
+    // NOT been finished, carrying a deferrable reason. `finishedAt IS NULL` is
+    // the pending marker and the CAS target below.
+    const wakeFilters = [
+      eq(agentWakeupRequests.status, "skipped"),
+      isNull(agentWakeupRequests.finishedAt),
+      inArray(agentWakeupRequests.reason, [...DEFERRABLE_WAKE_SKIP_REASONS]),
+    ];
     if (opts?.companyId) wakeFilters.push(eq(agentWakeupRequests.companyId, opts.companyId));
     const wakes = await db
       .select({
@@ -8278,13 +8297,18 @@ export function recoveryService(db: Db, deps: {
 
       // Idempotency (B): compare-and-swap so two concurrent sweeps cannot both
       // claim the same deferrable wake.
+      // The CAS stamps `finishedAt`, retiring the row from the deferred set
+      // while leaving `status = 'skipped'` intact — so the row still does not
+      // occupy any idempotency-key slot, and a caller whose own retry path is
+      // gated on `status <> 'skipped'` remains free to re-enqueue.
       const claimed = await db
         .update(agentWakeupRequests)
-        .set({ status: "skipped_deferrable_replayed", finishedAt: now, updatedAt: now })
+        .set({ finishedAt: now, updatedAt: now })
         .where(
           and(
             eq(agentWakeupRequests.id, wake.id),
-            eq(agentWakeupRequests.status, "skipped_deferrable"),
+            eq(agentWakeupRequests.status, "skipped"),
+            isNull(agentWakeupRequests.finishedAt),
           ),
         )
         .returning({ id: agentWakeupRequests.id });
@@ -8314,12 +8338,22 @@ export function recoveryService(db: Db, deps: {
           result.wakeIds.push(wake.id);
           result.issueIds.push(issueId);
         } else {
-          // enqueueWakeup no-opped on a still-active gate (it wrote its own
-          // skipped row). The replayed marker is an audit trail; any fresh
-          // deferrable row is picked up on the next cycle.
+          // enqueueWakeup no-opped on a still-active gate. It wrote its own
+          // skip row on the way out, so if that gate was itself deferrable the
+          // replacement row is deferred too and the next cycle picks it up; if
+          // it was terminal, the wake is correctly done. Either way this row
+          // stays retired.
           result.reDriveFailed++;
         }
       } catch {
+        // The enqueue threw (e.g. a database blip) rather than declining. The
+        // row is already retired by the CAS above and is NOT rolled back: the
+        // level-triggered sweeps in this file are deliberately ceilinged (see
+        // MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS) so a persistently failing
+        // re-drive cannot re-fire the same wake forever. The cost is that a
+        // wake lost to a throw here is not retried; `deferredWakeupReplayFailed`
+        // is the signal that this happened, and the D2 liveness backstop is
+        // what catches the resulting stranded card.
         result.reDriveFailed++;
       }
     }

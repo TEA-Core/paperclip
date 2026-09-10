@@ -334,6 +334,8 @@ import {
   type AgentOrgRow,
 } from "./agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
+import { isDeferrableWakeSkipReason as isDeferrableWakeSkipReasonInternal } from "./wake-skip-classification.js";
+import type { WakeSkipReason as WakeSkipReasonInternal } from "./wake-skip-classification.js";
 import {
   redactQuarantinedBodyForHigherTrust,
   sanitizeQuarantinedCommentForHigherTrust,
@@ -7841,56 +7843,17 @@ export type HeartbeatSchedulingSuppression = {
   reason: HeartbeatSchedulingSuppressionReason | null;
 };
 
-// SUP-15552 / D1 of SUP-15551 (ADR-096): a wake skipped for a transient,
-// instance-level condition is a DEFERRAL, not a drop. The class is decided by
-// what the skip reason describes — the instance (re-drive once it clears) vs
-// the work or the agent (stay terminal). Every dispatch-prologue skip reason
-// MUST be named in `WakeSkipReason` and classified in
-// `WAKE_SKIP_CLASSIFICATION`; a reason typed as `string` at a
-// `writeSkippedRequest` call site that is not a member of the union is a
-// compile error, and adding a union member without a classification entry is a
-// compile error (`Record<WakeSkipReason, WakeSkipClass>`). That exhaustiveness
-// check is the guard against this defect recurring with an unclassified reason
-// silently defaulting to terminal.
-export type WakeSkipReason =
-  | "heartbeat.scheduling_suppressed"
-  | "heartbeat.worktree_execution_cutoff"
-  | "budget.blocked"
-  | "agent.not_invokable"
-  | "heartbeat.disabled"
-  | "heartbeat.wakeOnDemand.disabled"
-  | "company.inactive"
-  | "issue_tree_hold_active"
-  | "heartbeat.timer.all_work_leased"
-  | "heartbeat.timer.no_actionable_work";
-
-export type WakeSkipClass = "deferrable" | "terminal";
-
-export const WAKE_SKIP_CLASSIFICATION: Record<WakeSkipReason, WakeSkipClass> = {
-  // Describes the INSTANCE — the transient condition that suppressed dispatch
-  // will clear, so the wake must be re-driven, not destroyed.
-  "heartbeat.scheduling_suppressed": "deferrable",
-  "heartbeat.worktree_execution_cutoff": "deferrable",
-  "budget.blocked": "deferrable",
-  // Describes the WORK or the AGENT — re-driving cannot help while the state
-  // persists, so it stays terminal exactly as before.
-  "agent.not_invokable": "terminal",
-  "heartbeat.disabled": "terminal",
-  "heartbeat.wakeOnDemand.disabled": "terminal",
-  "company.inactive": "terminal",
-  "issue_tree_hold_active": "terminal",
-  "heartbeat.timer.all_work_leased": "terminal",
-  "heartbeat.timer.no_actionable_work": "terminal",
-};
-
-export function wakeSkipClassForReason(reason: string | null | undefined): WakeSkipClass | null {
-  if (typeof reason !== "string" || !(reason in WAKE_SKIP_CLASSIFICATION)) return null;
-  return WAKE_SKIP_CLASSIFICATION[reason as WakeSkipReason];
-}
-
-export function isDeferrableWakeSkipReason(reason: string | null | undefined): boolean {
-  return wakeSkipClassForReason(reason) === "deferrable";
-}
+// SUP-15552 / D1 of SUP-15551 (ADR-096): the wake-skip classification lives in
+// ./wake-skip-classification.js so the replay sweep in recovery/service.ts can
+// share it without a runtime import cycle (this module imports that one).
+// Re-exported here because the skip write path below is the primary consumer.
+export {
+  WAKE_SKIP_CLASSIFICATION,
+  DEFERRABLE_WAKE_SKIP_REASONS,
+  wakeSkipClassForReason,
+  isDeferrableWakeSkipReason,
+} from "./wake-skip-classification.js";
+export type { WakeSkipReason, WakeSkipClass } from "./wake-skip-classification.js";
 
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
@@ -20937,18 +20900,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!agent) throw notFound("Agent not found");
 
     const writeSkippedRequest = async (
-      skipReason: WakeSkipReason,
+      skipReason: WakeSkipReasonInternal,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
-      const deferrable = isDeferrableWakeSkipReason(skipReason);
+      const deferrable = isDeferrableWakeSkipReasonInternal(skipReason);
+      const idempotencyKey = opts.idempotencyKey ?? null;
       if (deferrable && issueId) {
         // Write-time coalescing (SUP-15552): while the transient condition
         // persists a busy card can be skipped repeatedly (timer, comment-driven
         // wakes). Coalesce a repeat deferrable skip of the SAME reason for the
         // same (agent, issue) onto the existing pending row instead of
-        // inserting a fresh terminal-looking row, so the recovery sweep's
-        // candidate set stays bounded and per-reason blast-radius counts stay
-        // meaningful.
+        // inserting a fresh row, so the recovery sweep's candidate set stays
+        // bounded and per-reason blast-radius counts stay meaningful.
+        //
+        // Coalescing is keyed on `idempotencyKey` as well as (agent, issue,
+        // reason). A wake that carries an idempotency key is a DISTINCT durable
+        // signal — a question-response continuation, a review-path recovery, a
+        // disposition repair — whose payload (interactionId, recoveryActionId,
+        // …) is the thing being delivered. Merging it into an unrelated generic
+        // wake for the same card would discard that payload and its key, and
+        // the delivery would be lost exactly as this card's own defect lost a
+        // wake. Only like-for-like keys coalesce.
         const existing = await db
           .select({ id: agentWakeupRequests.id, coalescedCount: agentWakeupRequests.coalescedCount })
           .from(agentWakeupRequests)
@@ -20956,8 +20928,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             and(
               eq(agentWakeupRequests.companyId, agent.companyId),
               eq(agentWakeupRequests.agentId, agentId),
-              eq(agentWakeupRequests.status, "skipped_deferrable"),
+              eq(agentWakeupRequests.status, "skipped"),
+              isNull(agentWakeupRequests.finishedAt),
               eq(agentWakeupRequests.reason, skipReason),
+              idempotencyKey === null
+                ? isNull(agentWakeupRequests.idempotencyKey)
+                : eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
             ),
           )
@@ -20981,18 +20957,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         triggerDetail,
         reason: skipReason,
         payload,
-        // A deferrable skip is a deferral, not a finished event: no finishedAt
-        // and re-drivable by the recovery sweep. Terminal skips stay finished
-        // exactly as before.
-        status: deferrable ? "skipped_deferrable" : "skipped",
+        // A deferrable skip stays `status: "skipped"`. The deferral is carried
+        // by `finishedAt IS NULL` (not finished — the recovery sweep may still
+        // re-drive it) plus the deferrable `reason`, NOT by a new status value.
+        //
+        // This is load-bearing. Three partial unique indexes on
+        // agent_wakeup_requests, and the app-level guards that mirror them,
+        // deliberately exclude `status = 'skipped'` so that a wake which was
+        // skipped can be re-enqueued under the same idempotency key:
+        //   agent_wakeup_requests_review_path_recovery_idempotency_uq
+        //     … WHERE idempotency_key LIKE 'issue_review_path_lost:%'
+        //           AND status <> 'skipped'
+        //   agent_wakeup_requests_disposition_repair_idempotency_uq
+        //     … WHERE idempotency_key LIKE 'issue_disposition_repair:%'
+        //           AND status <> 'skipped'
+        //   agent_wakeup_requests_question_response_delivery_idempotency_uq
+        //     … WHERE idempotency_key LIKE 'question-response:%'
+        //           AND status NOT IN ('skipped', 'failed', 'cancelled')
+        // A distinct status such as `skipped_deferrable` satisfies every one of
+        // those predicates, so a deferrably-skipped wake would occupy the
+        // idempotency slot permanently: the retry path either sees a live wake
+        // that will never run and stands down forever, or inserts and takes a
+        // 23505 unique violation. Keeping the value `skipped` preserves all
+        // three contracts unchanged.
+        status: "skipped",
         requestedByActorType: opts.requestedByActorType ?? null,
         requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
+        idempotencyKey,
         finishedAt: deferrable ? null : new Date(),
         ...patch,
       });
     };
-    const writeSkippedHeartbeatRequest = async (skipReason: WakeSkipReason, details: Record<string, unknown>) => {
+    const writeSkippedHeartbeatRequest = async (skipReason: WakeSkipReasonInternal, details: Record<string, unknown>) => {
       await writeSkippedRequest(skipReason, {
         payload: {
           ...(payload ?? {}),
