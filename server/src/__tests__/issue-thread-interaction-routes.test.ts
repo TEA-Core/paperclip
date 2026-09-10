@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const UNRELATED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
@@ -283,10 +284,8 @@ async function createApp(actor: Record<string, unknown> = {
       responsibleUserId: actor.onBehalfOfUserId ?? null,
     };
   }
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/issues.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { issueRoutes } = await import("../routes/issues.js");
+  const { errorHandler } = await import("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -294,6 +293,7 @@ async function createApp(actor: Record<string, unknown> = {
     next();
   });
   app.use("/api", issueRoutes(mockDb as any, {} as any, routeOptions));
+  app.use(reportUnexpectedRouteError("issue-thread-interaction-routes"));
   app.use(errorHandler);
   return app;
 }

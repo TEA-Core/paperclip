@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockActivityService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -56,10 +57,8 @@ async function createApp(
   },
 ) {
   vi.resetModules();
-  const [{ errorHandler }, { activityRoutes }] = await Promise.all([
-    import("../middleware/index.js") as Promise<typeof import("../middleware/index.js")>,
-    import("../routes/activity.js") as Promise<typeof import("../routes/activity.js")>,
-  ]);
+  const { errorHandler } = (await import("../middleware/index.js")) as typeof import("../middleware/index.js");
+  const { activityRoutes } = (await import("../routes/activity.js")) as typeof import("../routes/activity.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -70,6 +69,7 @@ async function createApp(
     next();
   });
   app.use("/api", activityRoutes({} as any));
+  app.use(reportUnexpectedRouteError("activity-routes"));
   app.use(errorHandler);
   return app;
 }

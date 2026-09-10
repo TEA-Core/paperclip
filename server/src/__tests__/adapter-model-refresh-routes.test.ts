@@ -3,6 +3,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { models as openCodeFallbackModels } from "@paperclipai/adapter-opencode-local";
 import type { ServerAdapterModule } from "../adapters/index.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 vi.mock("acpx/runtime", () => ({
   createAcpRuntime: vi.fn(),
@@ -104,10 +105,12 @@ function registerModuleMocks() {
 const refreshableAdapterType = "refreshable_adapter_route_test";
 
 async function createApp() {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { agentRoutes } = await vi.importActual<typeof import("../routes/agents.js")>(
+    "../routes/agents.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -121,6 +124,7 @@ async function createApp() {
     next();
   });
   app.use("/api", agentRoutes({} as any));
+  app.use(reportUnexpectedRouteError("adapter-model-refresh-routes"));
   app.use(errorHandler);
   return app;
 }

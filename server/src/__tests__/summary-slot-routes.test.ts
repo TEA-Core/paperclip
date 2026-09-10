@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const companyId = "22222222-2222-4222-8222-222222222222";
 const otherCompanyId = "33333333-3333-4333-8333-333333333333";
@@ -72,10 +73,12 @@ function registerModuleMocks() {
 }
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ summarySlotRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/summary-slots.js")>("../routes/summary-slots.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { summarySlotRoutes } = await vi.importActual<typeof import("../routes/summary-slots.js")>(
+    "../routes/summary-slots.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -83,6 +86,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api", summarySlotRoutes({} as any));
+  app.use(reportUnexpectedRouteError("summary-slot-routes"));
   app.use(errorHandler);
   return app;
 }

@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockStorage = vi.hoisted(() => ({
   headObject: vi.fn(),
@@ -49,10 +50,12 @@ async function createApp(
   db: Record<string, unknown>,
   actor: Record<string, unknown> = { type: "anon" },
 ) {
-  const [{ accessRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/access.js")>("../routes/access.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { accessRoutes } = await vi.importActual<typeof import("../routes/access.js")>(
+    "../routes/access.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use((req, _res, next) => {
     (req as any).actor = actor;
@@ -67,6 +70,7 @@ async function createApp(
       allowedHostnames: [],
     }),
   );
+  app.use(reportUnexpectedRouteError("invite-summary-route"));
   app.use(errorHandler);
   return app;
 }

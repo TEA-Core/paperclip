@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
@@ -153,10 +154,12 @@ function registerRouteMocks() {
 }
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-  ]);
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
+  const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
+    "../routes/issues.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -164,6 +167,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api", issueRoutes(mockDb as any, {} as any));
+  app.use(reportUnexpectedRouteError("issue-workspace-command-authz"));
   app.use(errorHandler);
   return app;
 }

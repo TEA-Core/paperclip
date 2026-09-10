@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockApprovalService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -51,10 +52,8 @@ function registerModuleMocks() {
 }
 
 async function createApp(actorOverrides: Record<string, unknown> = {}) {
-  const [{ errorHandler }, { approvalRoutes }] = await Promise.all([
-    import("../middleware/index.js"),
-    import("../routes/approvals.js"),
-  ]);
+  const { errorHandler } = await import("../middleware/index.js");
+  const { approvalRoutes } = await import("../routes/approvals.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -69,6 +68,7 @@ async function createApp(actorOverrides: Record<string, unknown> = {}) {
     next();
   });
   app.use("/api", approvalRoutes(createRouteDb()));
+  app.use(reportUnexpectedRouteError("approval-routes-idempotency"));
   app.use(errorHandler);
   return app;
 }
@@ -94,10 +94,8 @@ function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "r
 }
 
 async function createAgentApp(options: { runId?: string; contextSnapshot?: Record<string, unknown> } = {}) {
-  const [{ errorHandler }, { approvalRoutes }] = await Promise.all([
-    import("../middleware/index.js"),
-    import("../routes/approvals.js"),
-  ]);
+  const { errorHandler } = await import("../middleware/index.js");
+  const { approvalRoutes } = await import("../routes/approvals.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -112,6 +110,7 @@ async function createAgentApp(options: { runId?: string; contextSnapshot?: Recor
     next();
   });
   app.use("/api", approvalRoutes(createRouteDb(options.contextSnapshot, options.runId ?? "run-1")));
+  app.use(reportUnexpectedRouteError("approval-routes-idempotency"));
   app.use(errorHandler);
   return app;
 }

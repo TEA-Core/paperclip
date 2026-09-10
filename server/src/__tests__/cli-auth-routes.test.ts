@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockAccessService = vi.hoisted(() => ({
   isInstanceAdmin: vi.fn(),
@@ -56,10 +57,8 @@ async function createApp(actor: any, db: any = {} as any) {
   appImportCounter += 1;
   const routeModulePath = `../routes/access.js?cli-auth-routes-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?cli-auth-routes-${appImportCounter}`;
-  const [{ accessRoutes }, { errorHandler }] = await Promise.all([
-    import(routeModulePath) as Promise<typeof import("../routes/access.js")>,
-    import(middlewareModulePath) as Promise<typeof import("../middleware/index.js")>,
-  ]);
+  const { accessRoutes } = (await import(routeModulePath)) as typeof import("../routes/access.js");
+  const { errorHandler } = (await import(middlewareModulePath)) as typeof import("../middleware/index.js");
 
   const app = express();
   app.use(express.json());
@@ -86,6 +85,7 @@ async function createApp(actor: any, db: any = {} as any) {
       allowedHostnames: [],
     }),
   );
+  app.use(reportUnexpectedRouteError("cli-auth-routes"));
   app.use(errorHandler);
   return app;
 }

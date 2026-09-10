@@ -1,9 +1,8 @@
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { ZodError } from "zod";
 
-import { HttpError } from "../errors.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockInstanceSettingsService = vi.hoisted(() => ({
   get: vi.fn(),
@@ -62,10 +61,12 @@ const mockDb = {
  * the module instances the current test's mocks were registered against.
  */
 async function createApp(actor: any) {
-  const [{ errorHandler }, { instanceSettingsRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/instance-settings.js")>("../routes/instance-settings.js"),
-  ]);
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
+  const { instanceSettingsRoutes } = await vi.importActual<typeof import("../routes/instance-settings.js")>(
+    "../routes/instance-settings.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -73,26 +74,7 @@ async function createApp(actor: any) {
     next();
   });
   app.use("/api", instanceSettingsRoutes(mockDb as any));
-  // Name the cause of an unexpected 500 before the error handler swallows it.
-  // `errorHandler` answers an unhandled throw with a fixed
-  // `{"error":"Internal server error"}` body and logs nothing itself — only
-  // `httpLogger` prints the context it attaches, and route unit tests do not
-  // mount `httpLogger`. So an intermittent crash in here reports exactly
-  // `expected 200 "OK", got 500 "Internal Server Error"` and nothing else, and
-  // the cause has to be reconstructed from CI log archaeology after the fact.
-  // Deliberate 4xx outcomes (`HttpError`, Zod validation) are the normal
-  // business of these tests and stay quiet.
-  app.use((err: unknown, _req: express.Request, _res: express.Response, next: express.NextFunction) => {
-    const isExpectedRejection =
-      (err instanceof HttpError && err.status < 500)
-      || err instanceof ZodError
-      || (err as { name?: unknown } | null)?.name === "ZodError";
-    if (!isExpectedRejection) {
-      // eslint-disable-next-line no-console
-      console.error("[instance-settings-routes] route threw an unexpected error", err);
-    }
-    next(err);
-  });
+  app.use(reportUnexpectedRouteError("instance-settings-routes"));
   app.use(errorHandler);
   return app;
 }

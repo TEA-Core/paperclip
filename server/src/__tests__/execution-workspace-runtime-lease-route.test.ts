@@ -15,6 +15,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -198,10 +199,8 @@ describeEmbeddedPostgres("execution workspace runtime control lease enforcement"
   });
 
   async function createApp() {
-    const [{ executionWorkspaceRoutes }, { errorHandler }] = await Promise.all([
-      import("../routes/execution-workspaces.js"),
-      import("../middleware/index.js"),
-    ]);
+    const { executionWorkspaceRoutes } = await import("../routes/execution-workspaces.js");
+    const { errorHandler } = await import("../middleware/index.js");
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -215,6 +214,7 @@ describeEmbeddedPostgres("execution workspace runtime control lease enforcement"
       next();
     });
     app.use("/api", executionWorkspaceRoutes(db as never));
+    app.use(reportUnexpectedRouteError("execution-workspace-runtime-lease-route"));
     app.use(errorHandler);
     return app;
   }
@@ -316,10 +316,8 @@ describeEmbeddedPostgres("execution workspace runtime control lease enforcement"
   });
 
   it("leaves board actors unleased and unblocked", async () => {
-    const [{ executionWorkspaceRoutes }, { errorHandler }] = await Promise.all([
-      import("../routes/execution-workspaces.js"),
-      import("../middleware/index.js"),
-    ]);
+    const { executionWorkspaceRoutes } = await import("../routes/execution-workspaces.js");
+    const { errorHandler } = await import("../middleware/index.js");
     mockAssertCanManage.mockResolvedValue({
       actorType: "board",
       agentId: null,
@@ -339,6 +337,7 @@ describeEmbeddedPostgres("execution workspace runtime control lease enforcement"
       next();
     });
     app.use("/api", executionWorkspaceRoutes(db as never));
+    app.use(reportUnexpectedRouteError("execution-workspace-runtime-lease-route"));
     app.use(errorHandler);
 
     const res = await request(app)

@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockCompanyService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -77,10 +78,12 @@ function createCompany() {
 }
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ companyRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/companies.js")>("../routes/companies.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { companyRoutes } = await vi.importActual<typeof import("../routes/companies.js")>(
+    "../routes/companies.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -88,6 +91,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api/companies", companyRoutes({} as any));
+  app.use(reportUnexpectedRouteError("company-branding-route"));
   app.use(errorHandler);
   return app;
 }

@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -34,10 +35,12 @@ function registerModuleMocks() {
 }
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ teamsCatalogRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/teams-catalog.js")>("../routes/teams-catalog.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { teamsCatalogRoutes } = await vi.importActual<typeof import("../routes/teams-catalog.js")>(
+    "../routes/teams-catalog.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -45,6 +48,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api", teamsCatalogRoutes({} as any));
+  app.use(reportUnexpectedRouteError("teams-catalog-routes"));
   app.use(errorHandler);
   return app;
 }

@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const closedWorkspaceId = "33333333-3333-4333-8333-333333333333";
@@ -203,10 +204,12 @@ async function assertNoBackgroundClearWithinRetryWindow() {
 
 describe.sequential("closed isolated workspace issue routes", () => {
   const routeModules = hoistModuleGraph(registerServiceMocks, async () => {
-    const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-      vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    ]);
+    const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
+      "../routes/issues.js",
+    );
+    const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+      "../middleware/index.js",
+    );
     return { issueRoutes, errorHandler };
   });
 
@@ -232,6 +235,7 @@ describe.sequential("closed isolated workspace issue routes", () => {
       // transaction stub is enough for the rebind test.
       transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({}),
     } as any, {} as any));
+    app.use(reportUnexpectedRouteError("issue-closed-workspace-routes"));
     app.use(errorHandler);
     return app;
   }

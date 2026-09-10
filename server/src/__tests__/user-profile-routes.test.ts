@@ -17,6 +17,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 let errorHandler: typeof import("../middleware/index.js").errorHandler;
 let userProfileRoutes: typeof import("../routes/user-profiles.js").userProfileRoutes;
 
@@ -46,10 +47,12 @@ describeEmbeddedPostgres("GET /companies/:companyId/users/:userSlug/profile", ()
     vi.doUnmock("../routes/user-profiles.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
-    const [routes, middleware] = await Promise.all([
-      vi.importActual<typeof import("../routes/user-profiles.js")>("../routes/user-profiles.js"),
-      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    ]);
+    const routes = await vi.importActual<typeof import("../routes/user-profiles.js")>(
+      "../routes/user-profiles.js",
+    );
+    const middleware = await vi.importActual<typeof import("../middleware/index.js")>(
+      "../middleware/index.js",
+    );
     userProfileRoutes = routes.userProfileRoutes;
     errorHandler = middleware.errorHandler;
     companyId = randomUUID();
@@ -122,6 +125,7 @@ describeEmbeddedPostgres("GET /companies/:companyId/users/:userSlug/profile", ()
       next();
     });
     app.use("/api", userProfileRoutes(db));
+    app.use(reportUnexpectedRouteError("user-profile-routes"));
     app.use(errorHandler);
     return app;
   }

@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StorageService } from "../storage/types.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const ISSUE_ID = "11111111-1111-4111-8111-111111111111";
 const WORK_PRODUCT_ID = "22222222-2222-4222-8222-222222222222";
@@ -138,10 +139,12 @@ function createStorageService(): StorageService {
 }
 
 async function createApp(options?: { companyIds?: string[] }) {
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-  ]);
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
+  const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
+    "../routes/issues.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -155,6 +158,7 @@ async function createApp(options?: { companyIds?: string[] }) {
     next();
   });
   app.use("/api", issueRoutes({} as any, createStorageService()));
+  app.use(reportUnexpectedRouteError("artifact-review-document-routes"));
   app.use(errorHandler);
   return app;
 }

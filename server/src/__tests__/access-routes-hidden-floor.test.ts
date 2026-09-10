@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 /**
  * Operator-hidden Access surface floor (`instance.access` in
@@ -23,10 +24,8 @@ const stubDb = {
 } as never;
 
 async function createApp() {
-  const [{ accessRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/access.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { accessRoutes } = await import("../routes/access.js");
+  const { errorHandler } = await import("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -46,6 +45,7 @@ async function createApp() {
     bindHost: "127.0.0.1",
     allowedHostnames: [],
   }));
+  app.use(reportUnexpectedRouteError("access-routes-hidden-floor"));
   app.use(errorHandler);
   return app;
 }

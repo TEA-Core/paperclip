@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -334,10 +335,12 @@ async function createApp(actor: Record<string, unknown>, db?: unknown) {
     typeof actor.agentId === "string" ? actor.agentId : holderAgentId,
     typeof actor.runId === "string" ? actor.runId : holderRunId,
   );
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-  ]);
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
+  const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
+    "../routes/issues.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -345,6 +348,7 @@ async function createApp(actor: Record<string, unknown>, db?: unknown) {
     next();
   });
   app.use("/api", issueRoutes(routeDb as any, mockStorageService as any));
+  app.use(reportUnexpectedRouteError("issue-duplicate-run-write-refusal"));
   app.use(errorHandler);
   return app;
 }

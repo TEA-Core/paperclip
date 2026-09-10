@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -232,10 +233,8 @@ type TestActor =
     };
 
 async function createApp(actor?: TestActor) {
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-    import("../middleware/index.js"),
-    import("../routes/issues.js"),
-  ]);
+  const { errorHandler } = await import("../middleware/index.js");
+  const { issueRoutes } = await import("../routes/issues.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -249,6 +248,7 @@ async function createApp(actor?: TestActor) {
     next();
   });
   app.use("/api", issueRoutes(mockDb as any, {} as any));
+  app.use(reportUnexpectedRouteError("issue-execution-policy-routes"));
   app.use(errorHandler);
   return app;
 }

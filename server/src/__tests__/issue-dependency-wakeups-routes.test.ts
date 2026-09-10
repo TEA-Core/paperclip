@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildIssueBlockersResolvedWakeStateKey,
 } from "../services/issue-dependency-wakeups.ts";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 // The first test in this suite imports the large `routes/issues.ts` module
 // through `vi.importActual` inside `createApp`. `vi.resetModules()` in
@@ -134,10 +135,12 @@ async function createApp() {
     })),
     transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
   };
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
+    "../routes/issues.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -151,6 +154,7 @@ async function createApp() {
     next();
   });
   app.use("/api", issueRoutes(routeDb as any, {} as any));
+  app.use(reportUnexpectedRouteError("issue-dependency-wakeups-routes"));
   app.use(errorHandler);
   return app;
 }

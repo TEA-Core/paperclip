@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -54,10 +55,8 @@ async function createApp(
     captureJsonContext?: (context: unknown, body: unknown) => void;
   } = {},
 ) {
-  const [{ pluginRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/plugins.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { pluginRoutes } = await import("../routes/plugins.js");
+  const { errorHandler } = await import("../middleware/index.js");
 
   const loader = {
     installPlugin: vi.fn(),
@@ -88,6 +87,7 @@ async function createApp(
     routeOverrides.toolDeps as never,
     routeOverrides.bridgeDeps as never,
   ));
+  app.use(reportUnexpectedRouteError("plugin-routes-authz"));
   app.use(errorHandler);
 
   return { app, loader };

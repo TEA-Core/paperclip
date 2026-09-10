@@ -21,6 +21,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockLifecycle = vi.hoisted(() => ({
   load: vi.fn(),
@@ -118,10 +119,8 @@ async function createBuiltPluginFixture(parentDir: string, nameSuffix: string): 
 }
 
 async function createInstallApp(db: ReturnType<typeof createDb>) {
-  const [{ pluginRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/plugins.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { pluginRoutes } = await import("../routes/plugins.js");
+  const { errorHandler } = await import("../middleware/index.js");
 
   const loader = pluginLoader(db, {
     enableLocalFilesystem: false,
@@ -141,6 +140,7 @@ async function createInstallApp(db: ReturnType<typeof createDb>) {
     next();
   });
   app.use("/api", pluginRoutes(db as never, loader as never, {} as never, undefined, {} as never, {} as never));
+  app.use(reportUnexpectedRouteError("plugin-install-route-security"));
   app.use(errorHandler);
   return app;
 }

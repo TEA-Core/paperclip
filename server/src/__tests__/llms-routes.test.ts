@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -27,10 +28,12 @@ function registerModuleMocks() {
 }
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ llmRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/llms.js")>("../routes/llms.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { llmRoutes } = await vi.importActual<typeof import("../routes/llms.js")>(
+    "../routes/llms.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -38,6 +41,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api", llmRoutes({} as never));
+  app.use(reportUnexpectedRouteError("llms-routes"));
   app.use(errorHandler);
   return app;
 }

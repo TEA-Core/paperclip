@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockCompanyService = vi.hoisted(() => ({
   create: vi.fn(),
@@ -36,10 +37,8 @@ const createdCompany = {
 };
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ companyRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/companies.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { companyRoutes } = await import("../routes/companies.js");
+  const { errorHandler } = await import("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -47,6 +46,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api/companies", companyRoutes({} as any));
+  app.use(reportUnexpectedRouteError("company-cloud-floor"));
   app.use(errorHandler);
   return app;
 }

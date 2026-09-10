@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockHeartbeatService = vi.hoisted(() => ({
   summarizeInFlightRuns: vi.fn(),
@@ -28,12 +29,8 @@ async function createApp(
     isInstanceAdmin: true,
   },
 ) {
-  const [{ errorHandler }, { dispatchQuiesceRoutes }] = await Promise.all([
-    import("../middleware/index.js") as Promise<typeof import("../middleware/index.js")>,
-    import("../routes/dispatch-quiesce.js") as Promise<
-      typeof import("../routes/dispatch-quiesce.js")
-    >,
-  ]);
+  const { errorHandler } = (await import("../middleware/index.js")) as typeof import("../middleware/index.js");
+  const { dispatchQuiesceRoutes } = (await import("../routes/dispatch-quiesce.js")) as typeof import("../routes/dispatch-quiesce.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -41,6 +38,7 @@ async function createApp(
     next();
   });
   app.use("/api", dispatchQuiesceRoutes({} as any));
+  app.use(reportUnexpectedRouteError("dispatch-quiesce-routes"));
   app.use(errorHandler);
   return app;
 }

@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -30,10 +31,8 @@ vi.mock("../services/index.js", () => ({
 }));
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ errorHandler }, { issueTreeControlRoutes }] = await Promise.all([
-    import("../middleware/index.js"),
-    import("../routes/issue-tree-control.js"),
-  ]);
+  const { errorHandler } = await import("../middleware/index.js");
+  const { issueTreeControlRoutes } = await import("../routes/issue-tree-control.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -41,6 +40,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api", issueTreeControlRoutes({} as any));
+  app.use(reportUnexpectedRouteError("issue-tree-control-routes"));
   app.use(errorHandler);
   return app;
 }

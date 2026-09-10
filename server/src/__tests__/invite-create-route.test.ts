@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const logActivityMock = vi.fn();
 
@@ -76,10 +77,8 @@ function createDbStub() {
 }
 
 async function createApp() {
-  const [{ accessRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/access.js"),
-    import("../middleware/index.js"),
-  ]);
+  const { accessRoutes } = await import("../routes/access.js");
+  const { errorHandler } = await import("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -100,6 +99,7 @@ async function createApp() {
       allowedHostnames: [],
     }),
   );
+  app.use(reportUnexpectedRouteError("invite-create-route"));
   app.use(errorHandler);
   return app;
 }

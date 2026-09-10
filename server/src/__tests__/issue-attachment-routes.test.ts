@@ -4,6 +4,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StorageService } from "../storage/types.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -163,10 +164,12 @@ function createStorageService(body = Buffer.from("test")): TestStorageService {
 }
 
 async function createApp(storage: StorageService, options?: { companyIds?: string[]; source?: string }) {
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-  ]);
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
+  const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
+    "../routes/issues.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -180,6 +183,7 @@ async function createApp(storage: StorageService, options?: { companyIds?: strin
     next();
   });
   app.use("/api", issueRoutes({} as any, storage));
+  app.use(reportUnexpectedRouteError("issue-attachment-routes"));
   app.use(errorHandler);
   return app;
 }

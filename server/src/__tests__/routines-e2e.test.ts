@@ -33,6 +33,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { accessService } from "../services/access.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 function registerRoutineServiceMock() {
   vi.doMock("../services/routines.js", async () => {
@@ -152,10 +153,8 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   });
 
   async function createApp(actor: Record<string, unknown>) {
-    const [{ routineRoutes }, { errorHandler }] = await Promise.all([
-      import("../routes/routines.js"),
-      import("../middleware/index.js"),
-    ]);
+    const { routineRoutes } = await import("../routes/routines.js");
+    const { errorHandler } = await import("../middleware/index.js");
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -163,6 +162,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       next();
     });
     app.use("/api", routineRoutes(db));
+    app.use(reportUnexpectedRouteError("routines-e2e"));
     app.use(errorHandler);
     return app;
   }

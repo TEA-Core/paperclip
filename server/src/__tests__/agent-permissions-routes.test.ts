@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 vi.mock("acpx/runtime", () => ({
   createAcpRuntime: vi.fn(),
@@ -262,10 +263,12 @@ async function requestApp(
 
 describe.sequential("agent permission routes", () => {
   const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
-    const [{ errorHandler }, { agentRoutes }] = await Promise.all([
-      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-      vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    ]);
+    const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+      "../middleware/index.js",
+    );
+    const { agentRoutes } = await vi.importActual<typeof import("../routes/agents.js")>(
+      "../routes/agents.js",
+    );
     return { errorHandler, agentRoutes };
   });
 
@@ -281,6 +284,7 @@ describe.sequential("agent permission routes", () => {
       next();
     });
     app.use("/api", agentRoutes(createDbStub(dbOptions) as any));
+    app.use(reportUnexpectedRouteError("agent-permissions-routes"));
     app.use(errorHandler);
     return app;
   }

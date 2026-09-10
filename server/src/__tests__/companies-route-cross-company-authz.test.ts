@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const companyAId = "11111111-1111-4111-8111-111111111111";
 const companyBId = "22222222-2222-4222-8222-222222222222";
@@ -66,10 +67,8 @@ async function createApp(actor: Record<string, unknown>) {
   appImportCounter += 1;
   const routeModulePath = `../routes/companies.js?cross-company-authz-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?cross-company-authz-${appImportCounter}`;
-  const [{ companyRoutes }, { errorHandler }] = await Promise.all([
-    import(routeModulePath) as Promise<typeof import("../routes/companies.js")>,
-    import(middlewareModulePath) as Promise<typeof import("../middleware/index.js")>,
-  ]);
+  const { companyRoutes } = (await import(routeModulePath)) as typeof import("../routes/companies.js");
+  const { errorHandler } = (await import(middlewareModulePath)) as typeof import("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -77,6 +76,7 @@ async function createApp(actor: Record<string, unknown>) {
     next();
   });
   app.use("/api/companies", companyRoutes({} as any));
+  app.use(reportUnexpectedRouteError("companies-route-cross-company-authz"));
   app.use(errorHandler);
   return app;
 }

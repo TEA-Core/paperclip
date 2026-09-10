@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 function createSelectChain(rows: unknown[]) {
   const query = {
@@ -51,10 +52,8 @@ async function createApp(
     requestHead: ReturnType<typeof vi.fn>;
   },
 ) {
-  const [access, middleware] = await Promise.all([
-    import("../routes/access.js"),
-    import("../middleware/index.js"),
-  ]);
+  const access = await import("../routes/access.js");
+  const middleware = await import("../middleware/index.js");
   const app = express();
   app.use((req, _res, next) => {
     (req as any).actor = { type: "anon" };
@@ -70,6 +69,7 @@ async function createApp(
       inviteResolutionNetwork: network,
     }),
   );
+  app.use(reportUnexpectedRouteError("invite-test-resolution-route"));
   app.use(middleware.errorHandler);
   return app;
 }

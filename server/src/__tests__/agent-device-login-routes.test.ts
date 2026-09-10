@@ -9,6 +9,7 @@ import type {
   LoginSessionLease,
   LoginSessionRuntime,
 } from "../services/device-login-service.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 // The company-scoped adapter device-login routes. These tests drive the real
 // login-session service through the route layer. A fake in-memory store models
@@ -322,10 +323,12 @@ function boardActor(userId: string, companyIds: string[] = [COMPANY_1, COMPANY_2
 }
 
 async function createApp() {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { agentRoutes } = await vi.importActual<typeof import("../routes/agents.js")>(
+    "../routes/agents.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -333,6 +336,7 @@ async function createApp() {
     next();
   });
   app.use("/api", agentRoutes({} as never));
+  app.use(reportUnexpectedRouteError("agent-device-login-routes"));
   app.use(errorHandler);
   return app;
 }

@@ -19,6 +19,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 vi.hoisted(() => {
   process.env.PAPERCLIP_HOME = "/tmp/paperclip-test-home";
@@ -36,10 +37,8 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 type Db = ReturnType<typeof createDb>;
 
 async function createApp(db: Db, actor: Express.Request["actor"]) {
-  const [{ activityRoutes }, { issueRoutes }] = await Promise.all([
-    import("../routes/activity.js"),
-    import("../routes/issues.js"),
-  ]);
+  const { activityRoutes } = await import("../routes/activity.js");
+  const { issueRoutes } = await import("../routes/issues.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -48,6 +47,7 @@ async function createApp(db: Db, actor: Express.Request["actor"]) {
   });
   app.use("/api", issueRoutes(db, {} as never));
   app.use("/api", activityRoutes(db));
+  app.use(reportUnexpectedRouteError("issue-comment-attribution-audit-routes"));
   app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(error.status ?? 500).json({ error: error.message ?? "Internal server error" });
   });

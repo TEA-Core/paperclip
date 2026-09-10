@@ -23,6 +23,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 vi.hoisted(() => {
   process.env.PAPERCLIP_HOME = "/tmp/paperclip-test-home";
@@ -53,10 +54,8 @@ function agentActor(companyId: string, agentId: string): Express.Request["actor"
 async function createApp(db: Db, actor: Express.Request["actor"]) {
   process.env.PAPERCLIP_LOG_DIR = "/tmp/paperclip-test-home/logs";
   process.env.PAPERCLIP_IN_WORKTREE = "false";
-  const [{ activityRoutes }, { issueRoutes }] = await Promise.all([
-    import("../routes/activity.js"),
-    import("../routes/issues.js"),
-  ]);
+  const { activityRoutes } = await import("../routes/activity.js");
+  const { issueRoutes } = await import("../routes/issues.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -65,6 +64,7 @@ async function createApp(db: Db, actor: Express.Request["actor"]) {
   });
   app.use("/api", issueRoutes(db, {} as any));
   app.use("/api", activityRoutes(db));
+  app.use(reportUnexpectedRouteError("permissions-upgrade-boundary-routes"));
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error" });
   });

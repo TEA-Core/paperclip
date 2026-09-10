@@ -4,6 +4,7 @@ import { getTableName } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { buildIssueChanges } from "../services/issue-change-receipt.ts";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -128,10 +129,12 @@ function registerModuleMocks() {
 }
 
 async function createApp(db: unknown = {}) {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
+    "../routes/issues.js",
+  );
+  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
+    "../middleware/index.js",
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -145,6 +148,7 @@ async function createApp(db: unknown = {}) {
     next();
   });
   app.use("/api", issueRoutes(db as any, {} as any));
+  app.use(reportUnexpectedRouteError("issue-activity-events-routes"));
   app.use(errorHandler);
   return app;
 }
