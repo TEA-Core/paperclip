@@ -211,6 +211,7 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
   }, 30_000);
 
   afterEach(async () => {
+    dispatchQuiesce.release();
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -268,6 +269,45 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     });
   }
 
+  async function seedTerminalSkip(companyId: string, agentId: string, issueId: string, reason: string) {
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      source: "timer",
+      triggerDetail: "system",
+      reason,
+      status: "skipped",
+      finishedAt: new Date(),
+      payload: { issueId, source: "assignment" },
+    });
+  }
+
+  it("acceptance #2: a terminal skip is never re-driven (agent.not_invokable + heartbeat.timer.no_actionable_work)", async () => {
+    const { companyId, agentId, issueId } = await seedCard();
+    await seedTerminalSkip(companyId, agentId, issueId, "agent.not_invokable");
+    await seedTerminalSkip(companyId, agentId, issueId, "heartbeat.timer.no_actionable_work");
+
+    const enqueueWakeup = vi.fn().mockResolvedValue(null);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+
+    const result = await recovery.reconcileDeferredWakeupReplay();
+
+    // The sweep only re-drives `skipped_deferrable` rows; terminal `skipped` rows
+    // are invisible to it and stay terminal.
+    expect(result.reDriven).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const statuses = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.map((r) => r.status).sort());
+    expect(statuses).toEqual(["skipped", "skipped"]);
+  });
+
   it("acceptance #2: when the suppression clears, the sweep re-drives the original payload", async () => {
     const { companyId, agentId, issueId } = await seedCard();
     await seedDeferrableWake(companyId, agentId, issueId);
@@ -289,6 +329,54 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     expect(enqOpts.payload).toMatchObject({ issueId });
 
     // The deferrable row is now the terminal replayed audit marker.
+    const row = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0]);
+    expect(row.status).toBe("skipped_deferrable_replayed");
+  });
+
+  it("acceptance #1 + #5 (end-to-end): todo-card assignment wake, suppressed → clear → re-driven carrying the original payload.issueId", async () => {
+    const { agentId, issueId } = await seedCard("todo");
+
+    // 1) enqueue → skip: while the instance is quiesced, the REAL heartbeat write
+    //    path records a deferrable skip carrying the card's id (not a seeded row).
+    dispatchQuiesce.engage({ reason: "test-quiesce", ttlMs: 60_000 });
+    const heartbeat = heartbeatService(db);
+    const skippedRun = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      requestedByActorType: "system",
+      requestedByActorId: "deferred_wake_e2e",
+    });
+    expect(skippedRun).toBeNull();
+    const pending = await db
+      .select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0]);
+    expect(pending.status).toBe("skipped_deferrable");
+    expect(pending.payload).toMatchObject({ issueId });
+
+    // 2) clear: the suppression lifts.
+    dispatchQuiesce.release();
+
+    // 3) re-drive: the sweep re-enqueues the wake, carrying the original issue id.
+    const enqueueWakeup = vi.fn().mockResolvedValue({ id: randomUUID(), agentId } as never);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+    const result = await recovery.reconcileDeferredWakeupReplay();
+
+    expect(result.reDriven).toBe(1);
+    expect(result.issueIds).toContain(issueId);
+    const [, opts] = enqueueWakeup.mock.calls[0] as [string, { payload?: Record<string, unknown> }];
+    expect(opts.payload).toMatchObject({ issueId });
+
     const row = await db
       .select({ status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
