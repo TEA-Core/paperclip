@@ -971,6 +971,191 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     expect(result.issueIds).toContain(issueId);
   });
 
+  // Regression (review round 3, `Finding signature:
+  // deferrable-wake-coalescing-collapses-context-only-issues`): the write path's
+  // coalescing predicate read `payload ->> 'issueId'` while the transaction-side
+  // cutoff writer records the card it resolved under `heartbeatSkip.issueId`.
+  // When the caller names the card in `contextSnapshot` instead of `payload` —
+  // the shape the routes commonly use, and the one the replay path explicitly
+  // supports — the key was null on both sides, the predicate degraded to
+  // `payload ->> 'issueId' IS NULL`, and the SECOND card's deferred cutoff wake
+  // coalesced onto the FIRST card's row. Coalescing bumps `coalescedCount` and
+  // does NOT replace `payload`, so card B's id was destroyed along with the only
+  // wake that carried it: one pending row, one replay, one card stranded.
+  //
+  // This drives the REAL transaction-side cutoff path twice, for two different
+  // cards on ONE agent, with the card supplied only through `contextSnapshot`.
+  // Against the parent commit it fails on the first assertion (1 row, not 2).
+  it("regression: two context-only cutoff wakes stay two pending rows and two replays", async () => {
+    const { companyId, agentId, issueId: issueIdA } = await seedCard("todo");
+
+    const cutoff = new Date(Date.now() - 60 * 60 * 1000);
+    const behindCutoff = new Date(cutoff.getTime() - 60 * 60 * 1000);
+    const projectId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Cutoff project" });
+
+    // A SECOND card on the same company and the same agent — the pair that used
+    // to collapse onto one row.
+    const issueIdB = randomUUID();
+    await db.insert(issues).values({
+      id: issueIdB,
+      companyId,
+      projectId,
+      title: "Second sweep card",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await db
+      .update(issues)
+      .set({ projectId, createdAt: behindCutoff })
+      .where(eq(issues.id, issueIdA));
+    await db.update(issues).set({ createdAt: behindCutoff }).where(eq(issues.id, issueIdB));
+
+    const instanceId = "sup15552-context-only-instance";
+    await db.delete(instanceSettings);
+    await db.insert(instanceSettings).values({
+      id: randomUUID(),
+      singletonKey: "default",
+      general: {},
+      experimental: {
+        enableWorktreeRunExecution: true,
+        worktreeRunExecutionActivatedAt: cutoff.toISOString(),
+        worktreeRunExecutionActivationInstanceId: instanceId,
+      },
+    });
+
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: {
+        PAPERCLIP_IN_WORKTREE: "1",
+        PAPERCLIP_INSTANCE_ID: instanceId,
+      },
+    });
+    // No `payload` at all: the card is named ONLY in the context snapshot, so
+    // the deferred row can name it only under `heartbeatSkip.issueId`.
+    for (const issueId of [issueIdA, issueIdB]) {
+      const skipped = await heartbeat.wakeup(agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        contextSnapshot: { issueId, projectId },
+        requestedByActorType: "system",
+        requestedByActorId: "deferred_wake_context_only_test",
+      });
+      expect(skipped).toBeNull();
+    }
+
+    const rows = await db
+      .select({
+        reason: agentWakeupRequests.reason,
+        status: agentWakeupRequests.status,
+        finishedAt: agentWakeupRequests.finishedAt,
+        coalescedCount: agentWakeupRequests.coalescedCount,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    // Two distinct cards, two distinct pending rows — nothing coalesced away.
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.reason).toBe("heartbeat.worktree_execution_cutoff");
+      expect(row.status).toBe("skipped");
+      expect(row.finishedAt).toBeNull();
+      expect(row.coalescedCount).toBe(0);
+      // The card is carried ONLY here — this is the derivation the coalescing
+      // key must agree with.
+      expect((row.payload as { issueId?: unknown }).issueId).toBeUndefined();
+    }
+    const deferredIssueIds = rows
+      .map((row) => (row.payload as { heartbeatSkip?: { issueId?: string } }).heartbeatSkip?.issueId)
+      .sort();
+    expect(deferredIssueIds).toEqual([issueIdA, issueIdB].sort());
+
+    const enqueueWakeup = vi.fn().mockResolvedValue({ id: randomUUID(), agentId } as never);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+
+    // Both are issue-bound, so both are HELD while the cutoff is still armed —
+    // proving neither was misread as generic.
+    const held = await recovery.reconcileDeferredWakeupReplay({ issueCreatedAtGte: cutoff });
+    expect(held.reDriven).toBe(0);
+    expect(held.genericReDriven).toBe(0);
+    expect(held.cutoffHeldSkipped).toBe(2);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    // Cutoff lifts: two replays, each carrying its OWN original card id.
+    const result = await recovery.reconcileDeferredWakeupReplay({ issueCreatedAtGte: null });
+    expect(result.reDriven).toBe(2);
+    expect(result.genericReDriven).toBe(0);
+    expect([...result.issueIds].sort()).toEqual([issueIdA, issueIdB].sort());
+    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
+    const replayedIssueIds = enqueueWakeup.mock.calls
+      .map(([, enqOpts]) =>
+        (enqOpts as { payload?: { heartbeatSkip?: { issueId?: string } } }).payload
+          ?.heartbeatSkip?.issueId,
+      )
+      .sort();
+    expect(replayedIssueIds).toEqual([issueIdA, issueIdB].sort());
+  });
+
+  // Coalescing must still merge repeat skips for the SAME card when that card is
+  // named only under `heartbeatSkip` — widening the key must not turn every
+  // context-only skip into an unbounded row-per-tick, which is the failure mode
+  // the coalescing exists to prevent.
+  it("still coalesces repeat context-only cutoff skips for the same card", async () => {
+    const { companyId, agentId, issueId } = await seedCard("todo");
+    const cutoff = new Date(Date.now() - 60 * 60 * 1000);
+    const projectId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Cutoff project" });
+    await db
+      .update(issues)
+      .set({ projectId, createdAt: new Date(cutoff.getTime() - 60 * 60 * 1000) })
+      .where(eq(issues.id, issueId));
+
+    const instanceId = "sup15552-context-only-coalesce";
+    await db.delete(instanceSettings);
+    await db.insert(instanceSettings).values({
+      id: randomUUID(),
+      singletonKey: "default",
+      general: {},
+      experimental: {
+        enableWorktreeRunExecution: true,
+        worktreeRunExecutionActivatedAt: cutoff.toISOString(),
+        worktreeRunExecutionActivationInstanceId: instanceId,
+      },
+    });
+
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: { PAPERCLIP_IN_WORKTREE: "1", PAPERCLIP_INSTANCE_ID: instanceId },
+    });
+    for (let i = 0; i < 3; i++) {
+      expect(
+        await heartbeat.wakeup(agentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          contextSnapshot: { issueId, projectId },
+          requestedByActorType: "system",
+          requestedByActorId: "deferred_wake_context_only_coalesce_test",
+        }),
+      ).toBeNull();
+    }
+
+    const rows = await db
+      .select({
+        coalescedCount: agentWakeupRequests.coalescedCount,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].coalescedCount).toBe(2);
+    expect((rows[0].payload as { heartbeatSkip?: { issueId?: string } }).heartbeatSkip?.issueId)
+      .toBe(issueId);
+  });
+
   it("does not re-drive a deferrable skip whose card has since been closed", async () => {
     const { companyId, agentId, issueId } = await seedCard("done");
     await seedDeferrableWake(companyId, agentId, issueId);
