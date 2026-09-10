@@ -80,6 +80,23 @@ if (cliArgs[0] === "worktree" && cliArgs[1] === "init") {
   process.exit(0);
 }
 if (cliArgs[0] === "worktree" && cliArgs[1] === "ensure-seeded") {
+  // Mirror the real CLI's resolveRegisteredWorktreeSeedSource source checks:
+  // a missing, symlinked, or alias-named explicit source is refused.
+  const fromConfigIndex = cliArgs.indexOf("--from-config");
+  if (fromConfigIndex !== -1) {
+    const sourceConfig = cliArgs[fromConfigIndex + 1];
+    let sourceCanonical;
+    try {
+      sourceCanonical = fs.realpathSync(sourceConfig);
+    } catch {
+      console.error("Registered source Paperclip config does not exist at " + sourceConfig + ".");
+      process.exit(1);
+    }
+    if (sourceCanonical !== sourceConfig) {
+      console.error("Explicit source Paperclip config must be a canonical path and cannot use a symlink alias.");
+      process.exit(1);
+    }
+  }
   if (${ensureExit} !== 0) {
     console.error("fake worktree ensure-seeded failure");
     process.exit(${ensureExit});
@@ -146,6 +163,41 @@ function runRuntimeProvision(baseCwd, worktreeCwd) {
       PAPERCLIP_HOME: paperclipHome,
       PAPERCLIP_PROJECT_WORKSPACE_ID: "project-workspace-1",
       PAPERCLIP_COMPANY_ID: "company-1",
+    },
+  });
+}
+
+// An env-only worktree: a pre-seeded self-contained .paperclip config with
+// seed-pending, and an instance home that has no config.json on disk.
+function makeEnvOnlyWorktree(prefix) {
+  const worktreeCwd = makeTempDir(prefix);
+  const emptyInstanceHome = makeTempDir(`${prefix}instance-`);
+  fs.mkdirSync(path.join(emptyInstanceHome, "instances", "default"), { recursive: true });
+  fs.mkdirSync(path.join(worktreeCwd, ".paperclip"), { recursive: true });
+  fs.writeFileSync(path.join(worktreeCwd, ".paperclip", "config.json"), "{}\n");
+  fs.writeFileSync(path.join(worktreeCwd, ".paperclip", "seed-pending"), "{}\n");
+  return { worktreeCwd, emptyInstanceHome };
+}
+
+// Runs the runtime provisioner in the env-only shape: base is a plain checkout,
+// only DATABASE_URL in env. `paperclipConfig` optionally sets PAPERCLIP_CONFIG.
+function runEnvOnlyRuntimeProvision(baseCwd, worktreeCwd, { emptyInstanceHome, paperclipConfig }) {
+  const worktreesHome = makeTempDir("paperclip-provision-runtime-env-only-home-");
+  return spawnSync("bash", [runtimeScript], {
+    cwd: worktreeCwd,
+    encoding: "utf8",
+    env: {
+      PATH: testPath,
+      HOME: os.homedir(),
+      PAPERCLIP_WORKSPACE_BASE_CWD: baseCwd,
+      PAPERCLIP_WORKSPACE_CWD: worktreeCwd,
+      PAPERCLIP_WORKSPACE_BRANCH: "feature/provision-runtime-env-only",
+      PAPERCLIP_WORKTREES_DIR: worktreesHome,
+      PAPERCLIP_HOME: emptyInstanceHome,
+      ...(paperclipConfig ? { PAPERCLIP_CONFIG: paperclipConfig } : {}),
+      PAPERCLIP_PROJECT_WORKSPACE_ID: "project-workspace-1",
+      PAPERCLIP_COMPANY_ID: "company-1",
+      DATABASE_URL: "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip",
     },
   });
 }
@@ -502,6 +554,133 @@ test("runtime provisioning omits the source override when the base config exists
   );
   assert.ok(ensureCall, "expected the runtime provisioner to invoke ensure-seeded");
   assert.ok(!ensureCall.includes("--from-config"));
+});
+
+test("runtime provisioning exits 0 when no seed source config exists on disk", () => {
+  // Env-configured deployment: the base is a plain checkout (no instance config),
+  // the registered PAPERCLIP_HOME instance home has no config.json, and no
+  // PAPERCLIP_CONFIG is set — only DATABASE_URL. The self-contained worktree
+  // config has no database to seed from, so runtime provisioning must skip
+  // seeding instead of hard-failing on the missing registered source.
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const { worktreeCwd, emptyInstanceHome } = makeEnvOnlyWorktree(
+    "paperclip-provision-runtime-env-only-worktree-",
+  );
+
+  const first = runEnvOnlyRuntimeProvision(baseCwd, worktreeCwd, { emptyInstanceHome });
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(
+    first.stderr,
+    /No on-disk Paperclip seed source config found; the self-contained worktree has nothing to seed/,
+  );
+  assert.equal(
+    readCliInvocations(baseCwd).filter((args) => args[0] === "worktree" && args[1] === "ensure-seeded").length,
+    0,
+    "expected no ensure-seeded call when there is no on-disk seed source",
+  );
+  // The intentional skip is recorded as durable evidence for the runtime
+  // consumer, which otherwise demands a verified seed manifest after the
+  // workspace_seed command.
+  const skipEvidence = JSON.parse(
+    fs.readFileSync(path.join(worktreeCwd, ".paperclip", "seed-skip-no-source"), "utf8"),
+  );
+  assert.equal(skipEvidence.reason, "no-on-disk-seed-source");
+  // No source to seed from: no verified manifest may reference one.
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-manifest.json")), false);
+
+  // A re-dispatch fast-exits on the recorded skip instead of re-deriving the
+  // (still missing) source.
+  const second = runEnvOnlyRuntimeProvision(baseCwd, worktreeCwd, { emptyInstanceHome });
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stderr, /recorded a no-source seed skip/);
+  assert.equal(
+    readCliInvocations(baseCwd).filter((args) => args[0] === "worktree" && args[1] === "ensure-seeded").length,
+    0,
+  );
+});
+
+test("runtime provisioning exits 0 when the registered PAPERCLIP_CONFIG points at nothing", () => {
+  // The production-shaped env-only case: PAPERCLIP_CONFIG is set at the control
+  // plane's registered instance config path but no such file exists, and the
+  // base is a plain checkout. The CLI's resolver would throw "Registered source
+  // Paperclip config does not exist", so the runtime provisioner must skip
+  // seeding and exit 0 instead of failing every dispatch.
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const { worktreeCwd, emptyInstanceHome } = makeEnvOnlyWorktree(
+    "paperclip-provision-runtime-env-only-cfg-worktree-",
+  );
+  const danglingRegistered = path.join(emptyInstanceHome, "instances", "default", "config.json");
+
+  const result = runEnvOnlyRuntimeProvision(baseCwd, worktreeCwd, {
+    emptyInstanceHome,
+    paperclipConfig: danglingRegistered,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(
+    result.stderr,
+    /No on-disk Paperclip seed source config found; the self-contained worktree has nothing to seed/,
+  );
+  assert.equal(
+    readCliInvocations(baseCwd).filter((args) => args[0] === "worktree" && args[1] === "ensure-seeded").length,
+    0,
+    "expected no ensure-seeded call when the registered PAPERCLIP_CONFIG does not exist",
+  );
+  const skipEvidence = JSON.parse(
+    fs.readFileSync(path.join(worktreeCwd, ".paperclip", "seed-skip-no-source"), "utf8"),
+  );
+  assert.equal(skipEvidence.sourceConfigPath, danglingRegistered);
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-manifest.json")), false);
+});
+
+test("runtime provisioning refuses a dangling registered source-config symlink", () => {
+  // A source that is present but malformed is NOT a no-source skip: the script
+  // must still hand it to the CLI, which refuses it, so the dispatch fails
+  // without writing any success evidence.
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const { worktreeCwd, emptyInstanceHome } = makeEnvOnlyWorktree(
+    "paperclip-provision-runtime-symlink-source-",
+  );
+  const danglingRegistered = path.join(emptyInstanceHome, "instances", "default", "config.json");
+  fs.symlinkSync(path.join(emptyInstanceHome, "absent.json"), danglingRegistered);
+
+  const result = runEnvOnlyRuntimeProvision(baseCwd, worktreeCwd, {
+    emptyInstanceHome,
+    paperclipConfig: danglingRegistered,
+  });
+
+  assert.notEqual(result.status, 0, "a dangling source symlink must be refused, not skipped");
+  assert.match(result.stderr, /does not exist at/);
+  assert.equal(
+    readCliInvocations(baseCwd).filter((args) => args[0] === "worktree" && args[1] === "ensure-seeded").length,
+    1,
+    "the malformed source must still reach the CLI, which refuses it",
+  );
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-skip-no-source")), false);
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-manifest.json")), false);
+});
+
+test("runtime provisioning refuses a symlink-alias registered source config", () => {
+  // A non-canonical alias of a real config is refused by the CLI's source
+  // resolver; the runtime provisioner must propagate the refusal verbatim and
+  // record no success evidence.
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const { worktreeCwd, emptyInstanceHome } = makeEnvOnlyWorktree(
+    "paperclip-provision-runtime-alias-source-",
+  );
+  fs.writeFileSync(path.join(emptyInstanceHome, "instances", "default", "real-config.json"), "{}\n");
+  const aliasRegistered = path.join(emptyInstanceHome, "instances", "default", "config.json");
+  fs.symlinkSync("real-config.json", aliasRegistered);
+
+  const result = runEnvOnlyRuntimeProvision(baseCwd, worktreeCwd, {
+    emptyInstanceHome,
+    paperclipConfig: aliasRegistered,
+  });
+
+  assert.notEqual(result.status, 0, "a symlink-alias source must be refused, not skipped");
+  assert.match(result.stderr, /cannot use a symlink alias/);
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-skip-no-source")), false);
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-manifest.json")), false);
 });
 
 test("runtime provisioning guards every optional source-config expansion for Bash 3.2", () => {

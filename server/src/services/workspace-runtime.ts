@@ -8068,16 +8068,45 @@ function readRuntimeProvisionCommand(config: Record<string, unknown>) {
 
 const BUILTIN_WORKSPACE_SEED_COMMAND = "bash ./scripts/provision-worktree-runtime.sh";
 
+// SUP-15609: an env-only deployment (no on-disk instance config anywhere) has
+// nothing to clone a seed from. The runtime seed script records this intentional
+// skip as a durable marker instead of a verified seed manifest, which can never
+// exist without a source. The marker is accepted seed evidence exactly where a
+// verified manifest would be, and nowhere else.
+const NO_SOURCE_SEED_SKIP_MARKER = "seed-skip-no-source";
+
+function hasNoSourceSeedSkip(worktreePath: string): boolean {
+  const stateDir = path.join(worktreePath, ".paperclip");
+  if (existsSync(path.join(stateDir, NO_SOURCE_SEED_SKIP_MARKER))) return true;
+  let scopedDirs: string[] = [];
+  try {
+    scopedDirs = readdirSync(stateDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^uid-\d+$/.test(entry.name))
+      .map((entry) => path.join(stateDir, entry.name));
+  } catch {
+    scopedDirs = [];
+  }
+  return scopedDirs.some((scopedDir) =>
+    existsSync(path.join(scopedDir, NO_SOURCE_SEED_SKIP_MARKER)),
+  );
+}
+
 type RuntimeProvisionKind = "workspace_seed" | "runtime_dependencies";
 
-function readWorkspaceSeedOperationEvidence(worktreePath: string): {
+export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
   verified: boolean;
   error: string | null;
   metadata: Record<string, unknown>;
 } {
   const manifestPath = path.join(worktreePath, ".paperclip", "seed-manifest.json");
+  const noSourceSkip = hasNoSourceSeedSkip(worktreePath);
+  let manifest: Record<string, unknown> | null = null;
   try {
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+  } catch {
+    manifest = null;
+  }
+  if (manifest) {
     const state = typeof manifest.state === "string" ? manifest.state : "unknown";
     const phase = typeof manifest.phase === "string" ? manifest.phase : null;
     const verified = isVerifiedWorktreeSeedManifest(manifest);
@@ -8095,18 +8124,30 @@ function readWorkspaceSeedOperationEvidence(worktreePath: string): {
         seedFailurePhase: state === "failed" ? phase : null,
       },
     };
-  } catch {
+  }
+  if (noSourceSkip) {
     return {
-      verified: false,
-      error: "Workspace seed command returned without a readable seed manifest.",
+      verified: true,
+      error: null,
       metadata: {
         provisionKind: "workspace_seed",
-        seedState: existsSync(manifestPath) ? "unreadable" : "absent",
+        seedState: "skipped-no-source",
         seedPhase: null,
-        seedFailurePhase: "seed_manifest_unreadable",
+        seedFailurePhase: null,
+        seedSkippedNoSource: true,
       },
     };
   }
+  return {
+    verified: false,
+    error: "Workspace seed command returned without a readable seed manifest.",
+    metadata: {
+      provisionKind: "workspace_seed",
+      seedState: existsSync(manifestPath) ? "unreadable" : "absent",
+      seedPhase: null,
+      seedFailurePhase: "seed_manifest_unreadable",
+    },
+  };
 }
 
 export function resolveRuntimeProvisionCommand(input: {
@@ -8151,6 +8192,11 @@ export function resolveRuntimeProvisionCommand(input: {
         if (!hasVerifiedWorktreeSeedManifest(scopedManifest)) return BUILTIN_WORKSPACE_SEED_COMMAND;
         continue;
       }
+      // SUP-15609: a recorded no-source skip is the completion evidence for a
+      // scoped state dir that has no manifest to verify.
+      if (existsSync(path.join(scopedDir, NO_SOURCE_SEED_SKIP_MARKER))) {
+        continue;
+      }
       const scopedPending = path.join(scopedDir, "seed-pending");
       const scopedComplete = path.join(scopedDir, "seed-complete");
       if (existsSync(scopedPending) && !existsSync(scopedComplete)) {
@@ -8160,7 +8206,10 @@ export function resolveRuntimeProvisionCommand(input: {
     return "";
   }
 
-  const needsSeed = !existsSync(manifestPath) || !hasVerifiedWorktreeSeedManifest(manifestPath);
+  // SUP-15609: an env-only worktree with a recorded no-source skip has no
+  // database to seed; the marker is its completion evidence.
+  const needsSeed = !hasNoSourceSeedSkip(input.workspace.cwd)
+    && (!existsSync(manifestPath) || !hasVerifiedWorktreeSeedManifest(manifestPath));
   return needsSeed ? BUILTIN_WORKSPACE_SEED_COMMAND : "";
 }
 
