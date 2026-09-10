@@ -107,7 +107,9 @@ import {
   buildTimerDispatchSuppressionDetails,
   evaluateIssueContinuationPath,
   isTimerCandidateActionable,
+  shouldEmitTimerDispatchSuppression,
   TIMER_DISPATCH_SUPPRESSED_ACTION,
+  TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS,
   type ContinuationPathEvidence,
   type ContinuationPathResult,
 } from "./issue-continuation-path.js";
@@ -13735,16 +13737,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * candidates exist, so "nothing assigned" (possible starvation) stays
    * distinct from "everything assigned is live elsewhere" (healthy).
    *
-   * ADR-093 D1 (SUP-14880) adds a second term to the same actionability test:
-   * an `in_progress` card is only actionable while it keeps a live continuation
-   * path (the §2a predicate shared with the write-path guard). A card that is
-   * `in_progress` with `executionRunId: null`, no live lease and no live
-   * disjunct is a ghost that would otherwise keep this agent's timer actionable
-   * forever (the SUP-14761 burn). A `todo` card has no continuation to have
-   * lost, so it stays actionable (subject to the lease). Every suppressed
-   * in_progress candidate writes one observability activity row naming the
-   * failing disjuncts (ADR-093 D1/D3 observability contract).
-   */
+    * ADR-093 D1 (SUP-14880) adds a second term to the same actionability test:
+    * an `in_progress` card is only actionable while it keeps a live continuation
+    * path (the §2a predicate shared with the write-path guard). A card that is
+    * `in_progress` with `executionRunId: null`, no live lease and no live
+    * disjunct is a ghost that would otherwise keep this agent's timer actionable
+    * forever (the SUP-14761 burn). A `todo` card has no continuation to have
+    * lost, so it stays actionable (subject to the lease).
+    *
+    * Observability: each suppressed in_progress candidate emits one
+    * `issue.timer_dispatch_suppressed` row (see
+    * maybeLogTimerDispatchSuppressed) — but ONLY because this function is the
+    * timer dispatch gate itself. This gate runs only when the assignee's timer
+    * actually fires (tickTimers requires heartbeat.enabled) and reaches this
+    * point (enqueue: skipTimerWhenNoActionableWork; claim: a generic timer run),
+    * so the row is a side effect of the timer running, not a guaranteed sweep.
+    */
   async function timerWorkLeaseState(agent: typeof agents.$inferSelect): Promise<TimerWorkLeaseState> {
     const candidates = await db
       .select({
@@ -14036,17 +14044,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * dispatch-suppressed in_progress candidate. timerWorkLeaseState runs on both
    * the enqueue and claim paths and can run on successive ticks, so a single
    * stuck card must not emit a row per tick — at most one row per issue in the
-   * trailing 10 minutes. The row names the failing disjuncts, so a suppressed
-   * card is auditable before the D3 board-visible park lands.
+   * trailing dedup window, decided by shouldEmitTimerDispatchSuppression (shared
+   * + tested in services/issue-continuation-path.js). The row names the failing
+   * disjuncts, so a suppressed card is auditable before the D3 board-visible
+   * park lands.
    */
   async function maybeLogTimerDispatchSuppressed(
     agent: typeof agents.$inferSelect,
     issueId: string,
     path: ContinuationPathResult,
   ): Promise<void> {
-    const windowStart = new Date(Date.now() - 10 * 60 * 1000);
-    const [recent] = await db
-      .select({ id: activityLog.id })
+    const [prior] = await db
+      .select({
+        latestSuppressedAt: sql<Date | null>`MAX(${activityLog.createdAt})`,
+      })
       .from(activityLog)
       .where(
         and(
@@ -14054,11 +14065,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(activityLog.entityType, "issue"),
           eq(activityLog.entityId, issueId),
           eq(activityLog.action, TIMER_DISPATCH_SUPPRESSED_ACTION),
-          gte(activityLog.createdAt, windowStart),
         ),
-      )
-      .limit(1);
-    if (recent) return;
+      );
+    if (
+      !shouldEmitTimerDispatchSuppression({
+        lastSuppressedAt: prior?.latestSuppressedAt ?? null,
+        now: new Date(),
+        windowMs: TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS,
+      })
+    ) {
+      return;
+    }
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: "system",
