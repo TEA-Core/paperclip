@@ -14067,7 +14067,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(activityLog.action, TIMER_DISPATCH_SUPPRESSED_ACTION),
         ),
       );
-    if (!shouldEmitTimerDispatchSuppression({ lastSuppressedAt: prior?.latestSuppressedAt ?? null, now: new Date() })) {
+    if (
+      !shouldEmitTimerDispatchSuppression({
+        lastSuppressedAt: prior?.latestSuppressedAt ?? null,
+        now: new Date(),
+        windowMs: TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS,
+      })
+    ) {
       return;
     }
     await logActivity(db, {
