@@ -72,6 +72,13 @@ import { workspaceOperationService, type WorkspaceOperationRecorder } from "./wo
 import { executionWorkspaceService, readExecutionWorkspaceConfig, type ExecutionWorkspaceBranchReconcileMode } from "./execution-workspaces.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
 import { logActivity } from "./activity-log.js";
+import {
+  buildDivergenceAlertText,
+  clearDivergenceRecord,
+  observeDivergedRefusal,
+  resolveDivergenceAlertThresholdMs,
+  type BaseRepoDivergenceAlert,
+} from "./base-repo-divergence-alert.js";
 import { logger } from "../middleware/logger.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
@@ -4939,6 +4946,10 @@ export async function prepareBaseRepoForWorkspace(input: {
   worktreeBaseRef: string;
   worktreeBaseSha: string | null;
   localBaseUnsafe: boolean;
+  // SUP-15615: set when a non-resettable diverged base repo has persisted past
+  // the configured age threshold — the first-class, escalated signal (distinct
+  // from the routine advisory in `warnings`). Null otherwise.
+  divergenceAlert: BaseRepoDivergenceAlert | null;
 }> {
   const resolution = await resolveAuthoritativeBaseRef(
     input.repoRoot,
@@ -4973,6 +4984,7 @@ export async function prepareBaseRepoForWorkspace(input: {
   // the dispatch proceeds whatever happens here, because the issue being run did
   // not cause the mess and must not be held hostage to it.
   const baseRepoHygieneWarnings: string[] = [];
+  let divergenceAlert: BaseRepoDivergenceAlert | null = null;
   try {
     const hygiene = await inspectBaseRepoHygiene(input.repoRoot);
     if (hygiene) {
@@ -5042,6 +5054,9 @@ export async function prepareBaseRepoForWorkspace(input: {
               : ""),
           ...result.warnings,
         );
+        // SUP-15615: a restore puts the base back on its default ref, so it is no
+        // longer in the stuck-diverged state — drop any tracked divergence.
+        await clearDivergenceRecord(input.repoRoot);
       } else if (decision.action === "fastForward") {
         const result = await fastForwardBaseRepoToDefaultRef({
           repoRoot: input.repoRoot,
@@ -5057,6 +5072,9 @@ export async function prepareBaseRepoForWorkspace(input: {
                   : "")
             : `Could not fast-forward base repository at ${input.repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
         );
+        // SUP-15615: a successful fast-forward puts the base on its default ref —
+        // no longer stuck-diverged, so drop any tracked divergence.
+        if (result.fastForwarded) await clearDivergenceRecord(input.repoRoot);
       } else if (decision.action === "diverged") {
         // SUP-13858 / SUP-15572: `diverged` never resets, by design — which is right
         // when the ahead commits are real work, and a permanent freeze when they are
@@ -5085,6 +5103,9 @@ export async function prepareBaseRepoForWorkspace(input: {
         if (resetOutcome) {
           baseRepoHygieneWarnings.push(...resetOutcome.warnings);
           for (const warning of resetOutcome.warnings) logger.warn(warning);
+          // SUP-15615: the auto-reset self-healed this repo, so it is no longer in
+          // the stuck-diverged state — drop any tracked divergence (no signal).
+          await clearDivergenceRecord(input.repoRoot);
         } else {
           // Unchanged, verbatim: at least one ahead commit is unique, or duplication
           // could not be proven. Warn, preserve, never reset.
@@ -5110,6 +5131,36 @@ export async function prepareBaseRepoForWorkspace(input: {
           }
           baseRepoHygieneWarnings.push(message);
           logger.warn(message);
+          // SUP-15615: this is the non-resettable diverged state. Track when it
+          // began (per base repo) and, if it has persisted past the configured
+          // age threshold, escalate to a first-class signal — a distinct alert
+          // line plus a durable board attention row — not just the advisory.
+          const observation = await observeDivergedRefusal(input.repoRoot, {
+            baseRef,
+            repoIdentity: input.repoRoot,
+            aheadCount: decision.aheadCount,
+            behindCount: decision.behindCount,
+            aheadCommitSubjects: decision.aheadCommitSubjects,
+            nowMs: Date.now(),
+            thresholdMs: resolveDivergenceAlertThresholdMs(),
+          });
+          if (observation.shouldEmitFirstClassSignal) {
+            const alert: BaseRepoDivergenceAlert = {
+              repoIdentity: input.repoRoot,
+              baseRef,
+              aheadCount: decision.aheadCount,
+              behindCount: decision.behindCount,
+              aheadCommitSubjects: decision.aheadCommitSubjects,
+              firstObservedAtMs: observation.record.firstObservedAtMs,
+              lastObservedAtMs: observation.record.lastObservedAtMs,
+              divergenceAgeMs: observation.ageMs,
+              thresholdMs: observation.thresholdMs,
+            };
+            const alertText = buildDivergenceAlertText(alert);
+            baseRepoHygieneWarnings.push(alertText);
+            logger.warn(alertText);
+            divergenceAlert = alert;
+          }
         }
       } else if (decision.action === "indeterminate") {
         // No integers in this message, by contract: the whole point is that there is
@@ -5136,6 +5187,10 @@ export async function prepareBaseRepoForWorkspace(input: {
         baseRepoHygieneWarnings.push(message);
         logger.warn(message);
       } else if (decision.action === "ok") {
+        // SUP-15615: `ok` means the base is on its default ref and not stuck-
+        // diverged (in sync, or merely ahead-only/unmerged). Drop any tracked
+        // divergence so an in-sync or self-healed base leaves no signal.
+        await clearDivergenceRecord(input.repoRoot);
         if (shallowState.divergenceComputable && headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
           const revList = await runGit(
             ["rev-list", "--left-right", "--count", `HEAD...${baseRef}`],
@@ -5170,7 +5225,47 @@ export async function prepareBaseRepoForWorkspace(input: {
     worktreeBaseRef,
     worktreeBaseSha,
     localBaseUnsafe,
+    divergenceAlert,
   };
+}
+
+async function emitBaseRepoDivergenceSignal(input: {
+  db: Db | null | undefined;
+  companyId: string;
+  agentId: string | null;
+  runId: string | null;
+  projectId: string | null;
+  alert: BaseRepoDivergenceAlert;
+}) {
+  if (!input.db) return;
+  // SUP-15615: the first-class signal — a durable, board-published attention row
+  // that is deliberately distinct from the routine per-realization advisory that
+  // also lands in the workspace-ready comment. Best-effort: logActivity swallows
+  // its own errors, so a signal failure never blocks the dispatch that produced
+  // it (the alert line is already in the comment by the time we get here).
+  await logActivity(input.db, {
+    companyId: input.companyId,
+    actorType: "system",
+    actorId: "workspace_runtime",
+    agentId: input.agentId,
+    runId: input.runId,
+    action: "base_repo.divergence_threshold_exceeded",
+    entityType: "project_base_repo",
+    entityId: input.projectId ?? input.alert.repoIdentity,
+    details: {
+      signalKind: "base_repo_divergence_threshold_exceeded",
+      baseRepoPath: input.alert.repoIdentity,
+      baseRef: input.alert.baseRef,
+      aheadCount: input.alert.aheadCount,
+      behindCount: input.alert.behindCount,
+      aheadCommitSubjects: input.alert.aheadCommitSubjects,
+      firstObservedAtMs: input.alert.firstObservedAtMs,
+      lastObservedAtMs: input.alert.lastObservedAtMs,
+      divergenceAgeMs: input.alert.divergenceAgeMs,
+      thresholdMs: input.alert.thresholdMs,
+      actor: { type: "system", id: "workspace_runtime", source: "workspace_runtime" },
+    },
+  });
 }
 
 export async function realizeExecutionWorkspace(input: {
@@ -5308,6 +5403,16 @@ export async function realizeExecutionWorkspace(input: {
     resolveGitAuth: input.resolveGitAuth ?? null,
     recorder: input.recorder ?? null,
   });
+  if (baseRepoHygiene.divergenceAlert) {
+    await emitBaseRepoDivergenceSignal({
+      db: input.db,
+      companyId: input.agent.companyId,
+      agentId: input.agent.id,
+      runId: input.heartbeatRunId ?? null,
+      projectId: input.base.projectId,
+      alert: baseRepoHygiene.divergenceAlert,
+    });
+  }
   const baseRef = baseRepoHygiene.baseRef;
   const currentBaseRefSha = baseRepoHygiene.baseRefSha;
   // The fork's base-repo hygiene already raises UnresolvedWorkspaceBaseRefError
@@ -5796,7 +5901,17 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           resolveGitAuth: input.resolveGitAuth ?? null,
           recorder: input.recorder ?? null,
         })
-      : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: reuseBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false };
+      : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: reuseBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
+    if (baseRepoHygiene.divergenceAlert) {
+      await emitBaseRepoDivergenceSignal({
+        db: input.db,
+        companyId: input.agent.companyId,
+        agentId: input.agent.id,
+        runId: input.heartbeatRunId ?? null,
+        projectId: input.workspace.projectId ?? input.base.projectId,
+        alert: baseRepoHygiene.divergenceAlert,
+      });
+    }
     const currentBaseRefSha = baseRepoHygiene.baseRefSha;
     // An unstarted-worktree refresh can fast-forward the checked-out branch.
     // Never run it for an attached operator-owned ref.
@@ -5854,7 +5969,17 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         resolveGitAuth: input.resolveGitAuth ?? null,
         recorder: input.recorder ?? null,
       })
-    : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: restoreBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false };
+    : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: restoreBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
+  if (baseRepoHygiene.divergenceAlert) {
+    await emitBaseRepoDivergenceSignal({
+      db: input.db,
+      companyId: input.agent.companyId,
+      agentId: input.agent.id,
+      runId: input.heartbeatRunId ?? null,
+      projectId: input.workspace.projectId ?? input.base.projectId,
+      alert: baseRepoHygiene.divergenceAlert,
+    });
+  }
   const restoreCurrentBaseRefSha = baseRepoHygiene.baseRefSha;
   const restoreWorktreeBaseRef = baseRepoHygiene.worktreeBaseRef;
   const restoreWorktreeBaseSha = baseRepoHygiene.worktreeBaseSha;
