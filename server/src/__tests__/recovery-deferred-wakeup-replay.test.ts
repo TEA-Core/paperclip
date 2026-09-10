@@ -432,6 +432,31 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("acceptance #3: a card already claimed (a live heartbeat run) is not re-driven", async () => {
+    const { companyId, agentId, issueId } = await seedCard();
+    await seedDeferrableWake(companyId, agentId, issueId);
+    // The card is already claimed: a live (running) run exists for it, so
+    // hasActiveExecutionPath is true and the sweep must not drive a second one.
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+
+    const enqueueWakeup = vi.fn().mockResolvedValue(null);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+
+    const result = await recovery.reconcileDeferredWakeupReplay();
+
+    expect(result.reDriven).toBe(0);
+    expect(result.livePathSkipped).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
   it("does not re-drive while the instance is still suppressed", async () => {
     const { companyId, agentId, issueId } = await seedCard();
     await seedDeferrableWake(companyId, agentId, issueId);
