@@ -1,11 +1,15 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_BASE_REPO_DIVERGENCE_ALERT_AGE_DAYS,
   buildDivergenceAlertText,
   clearDivergenceRecord,
+  divergenceClaimLockPath,
   divergenceRecordPath,
   formatDivergenceDuration,
   observeDivergedRefusal,
@@ -35,6 +39,70 @@ async function makeRepoRoot(): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "sup15615-"));
   tempRoots.push(root);
   return root;
+}
+
+const execFileAsync = promisify(execFile);
+const SERVICE_PATH = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../services/base-repo-divergence-alert.ts",
+);
+
+/**
+ * A worker that runs in its OWN Node process (spawned under the same runtime,
+ * type-stripping this `.ts` service). It makes a single observation and writes
+ * the decision to a result file. Running the observation in a distinct process
+ * — rather than a `Promise.all` inside this Vitest process — is what proves the
+ * cross-process claim: the in-process `observeChains` map cannot span two
+ * processes, so only the exclusive claim lock can serialise them.
+ */
+const OBSERVATION_WORKER = `
+import { observeDivergedRefusal } from ${JSON.stringify(SERVICE_PATH)};
+const [outPath, repoRoot, baseRef, repoIdentity, nowMs, thresholdMs] = process.argv.slice(2);
+(async () => {
+  const fs = await import("node:fs/promises");
+  try {
+    const res = await observeDivergedRefusal(repoRoot, {
+      baseRef,
+      repoIdentity,
+      aheadCount: 3,
+      behindCount: 1,
+      aheadCommitSubjects: ["a", "b", "c"],
+      nowMs: Number(nowMs),
+      thresholdMs: Number(thresholdMs),
+    });
+    await fs.writeFile(outPath, JSON.stringify({
+      shouldEmit: res.shouldEmitFirstClassSignal,
+      alertDue: res.alertDue,
+      ageMs: res.ageMs,
+      firstObservedAtMs: res.record.firstObservedAtMs,
+    }));
+  } catch (err) {
+    await fs.writeFile(outPath, JSON.stringify({ error: String(err) }));
+  }
+})();
+`;
+
+async function writeObservationWorker(dir: string): Promise<string> {
+  const script = path.join(dir, "divergence-observe-worker.ts");
+  await fs.writeFile(script, OBSERVATION_WORKER);
+  return script;
+}
+
+/** Spawn one independent process to run a single observation; resolve its result. */
+async function runObservationInProcess(
+  dir: string,
+  script: string,
+  args: [repoRoot: string, baseRef: string, repoIdentity: string, nowMs: number, thresholdMs: number],
+): Promise<Record<string, unknown>> {
+  const outPath = path.join(dir, `result-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
+  await execFileAsync(
+    process.execPath,
+    [script, outPath, args[0], args[1], args[2], String(args[3]), String(args[4])],
+    { timeout: 30_000 },
+  );
+  const parsed = JSON.parse(await fs.readFile(outPath, "utf8")) as Record<string, unknown>;
+  if (typeof parsed.error === "string") throw new Error(`worker failed: ${parsed.error}`);
+  return parsed;
 }
 
 describe("resolveDivergenceAlertThresholdMs", () => {
@@ -295,6 +363,102 @@ describe("observeDivergedRefusal", () => {
     expect(followUp.shouldEmitFirstClassSignal).toBe(false);
     const onDisk = await readDivergenceRecord(repoRoot);
     expect(onDisk?.alertedForFirstObservedAtMs).toBe(now - 10 * DAY);
+  });
+});
+
+describe("cross-process atomic claim (SUP-15648)", () => {
+  const now = 1_700_000_000_000;
+
+  // Seed the durable sidecar in the exact state two concurrent provisioning
+  // workers would both read: an episode already past the threshold, not yet
+  // alerted.
+  async function seedOverThresholdEpisode(repoRoot: string): Promise<void> {
+    await fs.mkdir(path.dirname(divergenceRecordPath(repoRoot)), { recursive: true });
+    await fs.writeFile(
+      divergenceRecordPath(repoRoot),
+      JSON.stringify(
+        {
+          repoIdentity: repoRoot,
+          baseRef: "main",
+          firstObservedAtMs: now - 10 * DAY,
+          lastObservedAtMs: now - 10 * DAY,
+          aheadCount: 3,
+          behindCount: 1,
+          aheadCommitSubjects: ["a", "b", "c"],
+          alertedForFirstObservedAtMs: null,
+        },
+        null,
+        2,
+      ),
+    );
+  }
+
+  it("lets exactly one of two independent Node processes claim the episode", async () => {
+    const repoRoot = await makeRepoRoot();
+    await seedOverThresholdEpisode(repoRoot);
+    const worker = await writeObservationWorker(repoRoot);
+
+    // Two genuinely separate processes (not a Promise.all inside this process),
+    // same repo, seeded unalerted & over the threshold. Each imports the service
+    // fresh; only the one that atomically wins the cross-process claim may emit.
+    const [a, b] = await Promise.all([
+      runObservationInProcess(repoRoot, worker, [repoRoot, "main", repoRoot, now, 7 * DAY]),
+      runObservationInProcess(repoRoot, worker, [repoRoot, "main", repoRoot, now, 7 * DAY]),
+    ]);
+
+    const claims = [a, b].filter((r) => r.shouldEmit === true).length;
+    expect(claims).toBe(1);
+    // Both genuinely saw the episode as due; only one claimed the signal.
+    expect([a.alertDue, b.alertDue]).toEqual([true, true]);
+    expect([a.firstObservedAtMs, b.firstObservedAtMs]).toEqual([now - 10 * DAY, now - 10 * DAY]);
+
+    // The durable sidecar carries a single alerted episode key, not a clobber.
+    const onDisk = await readDivergenceRecord(repoRoot);
+    expect(onDisk?.alertedForFirstObservedAtMs).toBe(now - 10 * DAY);
+
+    // No stray claim lock is left behind by the two processes.
+    await expect(fs.access(divergenceClaimLockPath(repoRoot))).rejects.toThrow();
+  });
+
+  it("recovers a stale claim lock left by a crashed owner instead of blocking", async () => {
+    const repoRoot = await makeRepoRoot();
+    await seedOverThresholdEpisode(repoRoot);
+    const worker = await writeObservationWorker(repoRoot);
+
+    // A crashed owner left a lock whose age exceeds the stale threshold.
+    const lockPath = divergenceClaimLockPath(repoRoot);
+    await fs.writeFile(lockPath, "999999:stale-owner\n");
+    const staleTime = new Date(Date.now() - 90_000);
+    await fs.utimes(lockPath, staleTime, staleTime);
+
+    const res = await runObservationInProcess(repoRoot, worker, [repoRoot, "main", repoRoot, now, 7 * DAY]);
+
+    // The stale lock did not block: the process recovered it, claimed, and emitted.
+    expect(res.shouldEmit).toBe(true);
+    expect(res.firstObservedAtMs).toBe(now - 10 * DAY);
+    const onDisk = await readDivergenceRecord(repoRoot);
+    expect(onDisk?.alertedForFirstObservedAtMs).toBe(now - 10 * DAY);
+
+    // The recovered lock was released, not left as a permanent blocker.
+    await expect(fs.access(divergenceClaimLockPath(repoRoot))).rejects.toThrow();
+  });
+
+  it("defers to a live holder rather than emitting a second signal", async () => {
+    const repoRoot = await makeRepoRoot();
+    await seedOverThresholdEpisode(repoRoot);
+    const worker = await writeObservationWorker(repoRoot);
+
+    // Hold a fresh (non-stale) lock for long enough that a contender times out.
+    const lockPath = divergenceClaimLockPath(repoRoot);
+    const holder = process.pid;
+    await fs.writeFile(lockPath, `${holder}:live-holder\n`);
+
+    const res = await runObservationInProcess(repoRoot, worker, [repoRoot, "main", repoRoot, now, 7 * DAY]);
+
+    // The contender gave up (live holder still owns the lock) and deferred: it did
+    // not claim a second signal and did not clobber the sidecar.
+    expect(res.shouldEmit).toBe(false);
+    await fs.rm(lockPath, { force: true });
   });
 });
 
