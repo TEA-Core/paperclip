@@ -3,9 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { realizeExecutionWorkspace, prepareBaseRepoForWorkspace } from "../services/workspace-runtime.ts";
-import { readDivergenceRecord } from "../services/base-repo-divergence-alert.ts";
+import { divergenceRecordPath, readDivergenceRecord } from "../services/base-repo-divergence-alert.ts";
 
 // SUP-14458 — when base-repo hygiene ends in diverged-without-reset or indeterminate,
 // the worktree must be based on the verified remote-tracking tip, never on the local
@@ -302,5 +302,98 @@ describe("base-repo divergence first-class signal wiring (SUP-15615)", () => {
     // signal yet, but tracking has begun so the age starts accumulating.
     expect(result.divergenceAlert).toBeNull();
     expect(await readDivergenceRecord(f.work)).not.toBeNull();
+  });
+});
+
+// SUP-15647 — the divergence episode must be keyed on a stable repository
+// identity (the checkout's canonical fetch-remote URL), not the mutable checkout
+// path. A different repository materialized at the same path must start a fresh
+// episode instead of inheriting the previous one's age; an unchanged repository
+// must carry its episode start forward.
+describe("divergence episode keyed on canonical repo identity (SUP-15647)", () => {
+  // A fixed "now" makes the age math exact: the second observation is measured
+  // at NOW, and a 10-day-old episode is NOW - 10 days (the default threshold is
+  // 7 days, so that old episode is over due).
+  const NOW = 1700000000000;
+  const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Put the base checkout into the non-resettable diverged-refused state (a
+   *  unique local ahead commit plus an origin advance), so
+   *  prepareBaseRepoForWorkspace reaches observeDivergedRefusal. */
+  async function makeDivergedRefused(f: Fixture): Promise<void> {
+    await commit(f.work, "only-here");
+    await commit(f.seed, "c4");
+    await publish(f);
+  }
+
+  /** Seed the sidecar through the production path, then back-date it so the
+   *  episode appears to have persisted for TEN_DAYS_MS. */
+  async function seedAndAgeSidecar(repoRoot: string): Promise<void> {
+    await prepareBaseRepoForWorkspace({ repoRoot, configuredBaseRef: "main" });
+    const seeded = await readDivergenceRecord(repoRoot);
+    expect(seeded, "seed must write a divergence sidecar").not.toBeNull();
+    await fs.writeFile(
+      divergenceRecordPath(repoRoot),
+      JSON.stringify({
+        ...seeded,
+        firstObservedAtMs: NOW - TEN_DAYS_MS,
+        lastObservedAtMs: NOW - TEN_DAYS_MS,
+      }),
+      "utf8",
+    );
+  }
+
+  it("starts a fresh episode when a different repository is materialized at the same path", async () => {
+    const f = await makeOriginAndClone();
+    await makeDivergedRefused(f);
+    await seedAndAgeSidecar(f.work);
+
+    // The seeded identity is the checkout's fetch-remote URL, not the path.
+    const oldIdentity = (await readDivergenceRecord(f.work))?.repoIdentity;
+    expect(oldIdentity).toBe(await git(["remote", "get-url", "origin"], f.work));
+
+    // Replace the checkout's remote repository at the same path.
+    const replacedUrl = `file://${f.root}/replaced-origin.git`;
+    await gitVoid(["remote", "set-url", "origin", replacedUrl], f.work);
+
+    const result = await prepareBaseRepoForWorkspace({ repoRoot: f.work, configuredBaseRef: "main" });
+    const record = await readDivergenceRecord(f.work);
+
+    // The episode is re-keyed to the new repository identity and starts now; it
+    // did NOT inherit the 10-day-old age of the replaced repository.
+    expect(record?.repoIdentity).toBe(replacedUrl);
+    expect(record?.firstObservedAtMs).toBe(NOW);
+    expect(record?.lastObservedAtMs).toBe(NOW);
+    expect(NOW - (record?.firstObservedAtMs ?? NOW)).toBe(0); // ageMs === 0
+    // The replaced repo's old age was past the 7-day threshold and would have
+    // manufactured a spurious first-class signal; the fresh episode must not.
+    expect(result.divergenceAlert).toBeNull();
+    expect(record?.repoIdentity).not.toBe(oldIdentity);
+  });
+
+  it("carries the old episode start forward when the remote identity is unchanged", async () => {
+    const f = await makeOriginAndClone();
+    await makeDivergedRefused(f);
+    await seedAndAgeSidecar(f.work);
+
+    const result = await prepareBaseRepoForWorkspace({ repoRoot: f.work, configuredBaseRef: "main" });
+    const record = await readDivergenceRecord(f.work);
+
+    // Same repository (unchanged remote) at the same path: the episode start is
+    // preserved, so the divergence age keeps accumulating and the over-threshold
+    // episode escalates to a first-class signal.
+    expect(record?.firstObservedAtMs).toBe(NOW - TEN_DAYS_MS);
+    expect(result.divergenceAlert).not.toBeNull();
+    expect(result.divergenceAlert?.firstObservedAtMs).toBe(NOW - TEN_DAYS_MS);
+    expect(result.divergenceAlert?.divergenceAgeMs).toBe(TEN_DAYS_MS);
+    expect(result.divergenceAlert?.repoIdentity).toBe(await git(["remote", "get-url", "origin"], f.work));
   });
 });

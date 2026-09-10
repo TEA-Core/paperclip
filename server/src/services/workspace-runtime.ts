@@ -1196,6 +1196,56 @@ async function remoteExists(repoRoot: string, remote: string): Promise<boolean> 
     .catch(() => false);
 }
 
+/**
+ * SUP-15647: a stable, canonical identity for the repository a base-repo
+ * checkout represents, used as the divergence-episode key. The sidecar that
+ * tracks a non-resettable divergence lives under the checkout path, so a mere
+ * path match cannot prove the same repository: a different repository
+ * materialized at the same path must start a fresh episode rather than inherit
+ * the previous one's age. The identity is the checkout's canonical fetch-remote
+ * URL with any embedded credentials/userinfo stripped; when no remote identity
+ * can be resolved it falls back to the resolved checkout path, which stays
+ * deterministic for that checkout. Fail-open: a git error never blocks
+ * provisioning, it only degrades the identity to the path fallback.
+ */
+async function resolveCanonicalBaseRepoIdentity(repoRoot: string): Promise<string> {
+  const pathFallback = path.resolve(repoRoot);
+  const remotesRaw = await runGit(["remote"], repoRoot).catch(() => null);
+  const remotes = remotesRaw
+    ? remotesRaw.split("\n").map((name) => name.trim()).filter((name) => name.length > 0)
+    : [];
+  // Prefer `origin` (the canonical default remote the base ref tracks); fall back
+  // to any other configured remote so two checkouts of the same repository share
+  // one identity regardless of which remote names are present.
+  const candidates = remotes.includes("origin")
+    ? ["origin", ...remotes.filter((name) => name !== "origin")]
+    : remotes;
+  for (const remote of candidates) {
+    const rawUrl = await runGit(["remote", "get-url", remote], repoRoot).catch(() => null);
+    const identity = stripRemoteUrlCredentials(rawUrl ?? "");
+    if (identity.length > 0) return identity;
+  }
+  return pathFallback;
+}
+
+/**
+ * Strip embedded credentials/userinfo from a git remote URL so the canonical
+ * identity carries no secret and does not change when only the credential does.
+ * Handles both scheme form (`scheme://user:pass@host/...`) and scp form
+ * (`user@host:repo`); a bare path or an empty string is returned unchanged.
+ */
+function stripRemoteUrlCredentials(remoteUrl: string): string {
+  let url = remoteUrl.trim();
+  if (url.length === 0) return url;
+  // Scheme form: drop `user:pass@` (or `user@`) immediately after `scheme://`.
+  url = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/i, "$1");
+  // scp-like form (`user@host:repo`, no `://`): drop the leading `user@`.
+  if (!url.includes("://")) {
+    url = url.replace(/^[^/\s@]+@(?=[^:]*:)/, "");
+  }
+  return url.trim();
+}
+
 const GIT_WORKTREE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKTREE_METADATA_MISSING_REASON = "worktree_metadata_missing";
 
@@ -5146,9 +5196,14 @@ export async function prepareBaseRepoForWorkspace(input: {
           // began (per base repo) and, if it has persisted past the configured
           // age threshold, escalate to a first-class signal — a distinct alert
           // line plus a durable board attention row — not just the advisory.
+          // SUP-15647: key the divergence episode on a stable repository identity
+          // (the checkout's canonical fetch-remote URL), not the mutable checkout
+          // path, so a different repository materialized at the same path starts
+          // a fresh episode instead of inheriting the previous one's age.
+          const repoIdentity = await resolveCanonicalBaseRepoIdentity(input.repoRoot);
           const observation = await observeDivergedRefusal(input.repoRoot, {
             baseRef,
-            repoIdentity: input.repoRoot,
+            repoIdentity,
             aheadCount: decision.aheadCount,
             behindCount: decision.behindCount,
             aheadCommitSubjects: decision.aheadCommitSubjects,
@@ -5157,7 +5212,7 @@ export async function prepareBaseRepoForWorkspace(input: {
           });
           if (observation.shouldEmitFirstClassSignal) {
             const alert: BaseRepoDivergenceAlert = {
-              repoIdentity: input.repoRoot,
+              repoIdentity,
               baseRef,
               aheadCount: decision.aheadCount,
               behindCount: decision.behindCount,
