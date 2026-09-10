@@ -161,3 +161,82 @@ export function shouldEmitTimerDispatchSuppression(input: {
   // still counts as "in window" and suppresses the emit).
   return input.now.getTime() - input.lastSuppressedAt.getTime() > windowMs;
 }
+
+// ADR-093 D2 (SUP-15553) — the `todo` arm of the stranded-card detector.
+//
+// A `todo` card with an assignee agent that has had no wake or run for a
+// threshold window is stranded. The D1 dispatch path treats every unleased
+// `todo` card as actionable (`isTimerCandidateActionable` bullet 3), so it is
+// never dispatch-suppressed and the D3 in_progress park never sees it — the gap
+// that left SUP-15460 sitting on `todo` for days. This is the mirror of the §2a
+// disjuncts: a `todo` card is stranded only when NONE of the live-path guards
+// holds AND its last contact (wake, run, or card mutation) predates the window.
+//
+// `TODO_STRANDED_THRESHOLD_MS` is exported so the timer/dispatch sweep can reuse
+// the same window instead of hard-coding a second one.
+export const TODO_STRANDED_THRESHOLD_MS = 2 * 60 * 60 * 1000;
+
+export const TODO_STRANDED_ACTION = "issue.todo_stranded_no_continuation";
+
+export interface TodoStrandedDisjuncts {
+  leased: boolean;
+  activeRun: boolean;
+  monitorNextCheckAtInFuture: boolean;
+  queuedWake: boolean;
+  boardRecoveryAction: boolean;
+}
+
+export interface TodoStrandedEvidence {
+  leased: boolean;
+  activeRun: boolean;
+  monitorNextCheckAtInFuture: boolean;
+  queuedWake: boolean;
+  boardRecoveryAction: boolean;
+  lastContactAt: Date | string | null | undefined;
+}
+
+export interface TodoStrandedResult {
+  stranded: boolean;
+  disjuncts: TodoStrandedDisjuncts;
+  lastContactAt: Date | null;
+  elapsedMs: number;
+}
+
+export function evaluateTodoStranded(
+  evidence: TodoStrandedEvidence,
+  options: { now?: Date; thresholdMs?: number } = {},
+): TodoStrandedResult {
+  const now = options.now ?? new Date();
+  const thresholdMs = options.thresholdMs ?? TODO_STRANDED_THRESHOLD_MS;
+  const disjuncts: TodoStrandedDisjuncts = {
+    leased: evidence.leased === true,
+    activeRun: evidence.activeRun === true,
+    monitorNextCheckAtInFuture: evidence.monitorNextCheckAtInFuture === true,
+    queuedWake: evidence.queuedWake === true,
+    boardRecoveryAction: evidence.boardRecoveryAction === true,
+  };
+  const lastContactAt = toContinuationPathDate(evidence.lastContactAt);
+  const elapsedMs = lastContactAt ? now.getTime() - lastContactAt.getTime() : 0;
+  const anyGuardHolds = Object.values(disjuncts).some(Boolean);
+  const stranded =
+    !anyGuardHolds && lastContactAt !== null && elapsedMs >= thresholdMs;
+  return { stranded, disjuncts, lastContactAt, elapsedMs };
+}
+
+export function buildTodoStrandedDetails(input: {
+  issueId: string;
+  disjuncts: TodoStrandedDisjuncts;
+  lastContactAt: Date | null;
+  elapsedMs: number;
+}): Record<string, unknown> {
+  return {
+    issueId: input.issueId,
+    reason: "todo_without_live_continuation",
+    status: "todo",
+    disjuncts: input.disjuncts,
+    lastContactAt: input.lastContactAt ? input.lastContactAt.toISOString() : null,
+    elapsedMs: input.elapsedMs,
+    thresholdMs: TODO_STRANDED_THRESHOLD_MS,
+    adr: "ADR-093-D2",
+  };
+}

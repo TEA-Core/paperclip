@@ -249,3 +249,46 @@ export function buildDispatchSuppressionParkNotice(input: {
     },
   };
 }
+
+// ADR-093 D2 (SUP-15553) — the board-visible notice posted when a stranded
+// assigned `todo` card is parked onto the blocked_without_blockers surface.
+// Mirrors buildDispatchSuppressionParkNotice for the `todo` arm: names the
+// assignee to unblock and a concrete next action, since no in_progress
+// reconciler ever surfaced these cards before.
+export type TodoStrandedParkNotice = {
+  body: string;
+  presentation: IssueCommentPresentation;
+  metadata: IssueCommentMetadata;
+};
+
+export function buildTodoStrandedParkNotice(input: {
+  identifier: string | null;
+  assignee: { id: string; name: string | null } | null;
+}): TodoStrandedParkNotice {
+  const cardRef = input.identifier ? ` \`${input.identifier}\`` : "";
+  const body =
+    `Paperclip found this${cardRef} \`todo\` card with an assigned agent that has had no wake or run ` +
+    "and no live continuation path for the liveness window. The card was parked on the " +
+    "blocked_without_blockers surface so the board can reassign it, re-arm a monitor, or record " +
+    "the intended resolution.";
+
+  const actionRows: NoticeMetadataRow[] = [
+    input.assignee
+      ? agentLinkRow("Unblock owner", input.assignee)
+      : keyValueRow("Unblock owner", "Board decision required"),
+    keyValueRow(
+      "Next action",
+      "Reassign to a live agent, re-arm a monitor next check, or record the intended resolution",
+    ),
+  ];
+
+  return {
+    body,
+    presentation: systemNoticePresentation({ tone: "danger", title: "Stranded assigned todo — parked" }),
+    metadata: {
+      version: 1,
+      sourceRunId: null,
+      sections: [{ title: "Action", rows: actionRows }],
+    },
+  };
+}
