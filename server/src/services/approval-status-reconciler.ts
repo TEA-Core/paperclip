@@ -935,6 +935,65 @@ export async function findStageIntegrityAuditCandidates(
 }
 
 /**
+ * The gated principal of a card, resolved in the ADR-092 D3 order:
+ * `policy.returnAssigneeAgentId` first; when that is absent, the state cascade
+ * `state.returnAssignee` → `state.deliveryAuthor` → `createdByAgentId`.
+ *
+ * SUP-15650: extracted (and exported) so that the ADR-092 Guard B integrity
+ * check (ADR-073, {@link evaluateStageIntegrity}) and the ADR-072 close-ladder
+ * shape check (SUP-15650, done-transition-guard mechanism D) resolve the SAME
+ * principal from ONE code path and cannot drift. It resolves to a set of agent
+ * ids and a set of user ids; either may be empty when the principal is
+ * unresolvable (the caller decides what an empty result means — Guard B
+ * refuses on a done card, mechanism D simply leaves the rungs verbatim).
+ */
+export interface GatedPrincipal {
+  agentIds: Set<string>;
+  userIds: Set<string>;
+}
+
+export function resolveGatedPrincipal(
+  policy: Record<string, unknown>,
+  state: Record<string, unknown>,
+  createdByAgentId: string | null | undefined,
+): GatedPrincipal {
+  const agentIds = new Set<string>();
+  const userIds = new Set<string>();
+  if (typeof policy.returnAssigneeAgentId === "string" && policy.returnAssigneeAgentId) {
+    agentIds.add(policy.returnAssigneeAgentId);
+  } else {
+    const returnAssignee = state.returnAssignee as
+      | { type?: unknown; agentId?: unknown; userId?: unknown }
+      | null
+      | undefined;
+    if (returnAssignee && typeof returnAssignee === "object") {
+      if (returnAssignee.type === "agent" && typeof returnAssignee.agentId === "string") {
+        agentIds.add(returnAssignee.agentId);
+      } else if (returnAssignee.type === "user" && typeof returnAssignee.userId === "string") {
+        userIds.add(returnAssignee.userId);
+      }
+    }
+    if (agentIds.size === 0 && userIds.size === 0) {
+      const deliveryAuthor = state.deliveryAuthor as
+        | { type?: unknown; agentId?: unknown; userId?: unknown }
+        | null
+        | undefined;
+      if (deliveryAuthor && typeof deliveryAuthor === "object") {
+        if (deliveryAuthor.type === "agent" && typeof deliveryAuthor.agentId === "string") {
+          agentIds.add(deliveryAuthor.agentId);
+        } else if (deliveryAuthor.type === "user" && typeof deliveryAuthor.userId === "string") {
+          userIds.add(deliveryAuthor.userId);
+        }
+      }
+    }
+    if (agentIds.size === 0 && userIds.size === 0) {
+      if (createdByAgentId) agentIds.add(createdByAgentId);
+    }
+  }
+  return { agentIds, userIds };
+}
+
+/**
  * ADR-073 / ADR-092 stage-integrity audit of the recorded approval. Returns a
  * skip verdict when the "approved" record is not backed by a real, non-self
  * decision: an auto-skipped review stage writes no decision row and lands in
@@ -1062,51 +1121,27 @@ export async function evaluateStageIntegrity(
     }
   }
 
-  const forbiddenAgents = new Set<string>();
-  const forbiddenUsers = new Set<string>();
-  if (typeof policy.returnAssigneeAgentId === "string" && policy.returnAssigneeAgentId) {
-    forbiddenAgents.add(policy.returnAssigneeAgentId);
-  } else {
-    const returnAssignee = state.returnAssignee as
-      | { type?: unknown; agentId?: unknown; userId?: unknown }
-      | null
-      | undefined;
-    if (returnAssignee && typeof returnAssignee === "object") {
-      if (returnAssignee.type === "agent" && typeof returnAssignee.agentId === "string") {
-        forbiddenAgents.add(returnAssignee.agentId);
-      } else if (returnAssignee.type === "user" && typeof returnAssignee.userId === "string") {
-        forbiddenUsers.add(returnAssignee.userId);
-      }
-    }
-    if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
-      const deliveryAuthor = state.deliveryAuthor as
-        | { type?: unknown; agentId?: unknown; userId?: unknown }
-        | null
-        | undefined;
-      if (deliveryAuthor && typeof deliveryAuthor === "object") {
-        if (deliveryAuthor.type === "agent" && typeof deliveryAuthor.agentId === "string") {
-          forbiddenAgents.add(deliveryAuthor.agentId);
-        } else if (deliveryAuthor.type === "user" && typeof deliveryAuthor.userId === "string") {
-          forbiddenUsers.add(deliveryAuthor.userId);
-        }
-      }
-    }
-    if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
-      if (row.createdByAgentId) forbiddenAgents.add(row.createdByAgentId);
-    }
-    if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
-      // SUP-15212: a live ladder is not expected to have its gated principal
-      // resolved yet, so an unresolvable one is not a finding there. On a done
-      // card it still refuses (the terminal card's approval cannot be
-      // attributed to a non-gated actor). Suppressed on live cards this also
-      // stops it from shadowing the inverse guard (the cascade returns on the
-      // first match).
-      if (!isLiveLadder) {
-        return {
-          reason: "guard-b:return-assignee-unresolved",
-          detail: "no return assignee, delivery author, or creator agent recorded",
-        };
-      }
+  // SUP-15650: the gated principal is resolved through the shared ADR-092 D3
+  // helper (one resolution order, one code path) so Guard B and mechanism D
+  // cannot drift apart on who the principal is. The unresolved-cascade step
+  // below is Guard-B-specific and stays here.
+  const { agentIds: forbiddenAgents, userIds: forbiddenUsers } = resolveGatedPrincipal(
+    policy,
+    state,
+    row.createdByAgentId,
+  );
+  if (forbiddenAgents.size === 0 && forbiddenUsers.size === 0) {
+    // SUP-15212: a live ladder is not expected to have its gated principal
+    // resolved yet, so an unresolvable one is not a finding there. On a done
+    // card it still refuses (the terminal card's approval cannot be
+    // attributed to a non-gated actor). Suppressed on live cards this also
+    // stops it from shadowing the inverse guard (the cascade returns on the
+    // first match).
+    if (!isLiveLadder) {
+      return {
+        reason: "guard-b:return-assignee-unresolved",
+        detail: "no return assignee, delivery author, or creator agent recorded",
+      };
     }
   }
 
