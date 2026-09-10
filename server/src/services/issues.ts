@@ -67,7 +67,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
-import { pendingReviewRearmWindowMsFromEnv } from "../config.js";
+import { pendingReviewParticipantGraceMsFromEnv, pendingReviewRearmWindowMsFromEnv } from "../config.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -3598,6 +3598,7 @@ async function listIssueReviewAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      updatedAt: issue.updatedAt,
     })),
     relations: [],
     agents: agentRows,
@@ -3607,6 +3608,7 @@ async function listIssueReviewAttentionMap(
     pendingApprovals: approvalRows,
     openRecoveryIssues: recoveryPaths,
     queuedWakeStaleAfterMs: pendingReviewRearmWindowMsFromEnv(),
+    participantGraceMs: pendingReviewParticipantGraceMsFromEnv(),
     now: new Date(),
   };
   const findingsByIssueId = new Map(

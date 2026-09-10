@@ -340,7 +340,13 @@ describeEmbeddedPostgres("attention service", () => {
       identifier: "ATN-7",
       title: "Agent review excluded",
       status: "in_review",
-      executionState: pendingAgentExecutionState(reviewerId),
+      // SUP-15565: a live participant maintains the card only while the stage is
+      // fresh, so arm it within the participant grace window (the fixture's
+      // updatedAt is a fixed past date) to keep this exclusion under test.
+      executionState: {
+        ...pendingAgentExecutionState(reviewerId),
+        pendingSince: new Date().toISOString(),
+      },
       updatedAt: new Date("2026-07-09T12:07:00.000Z"),
     });
 

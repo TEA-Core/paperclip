@@ -28,6 +28,7 @@ export interface IssueLivenessIssueInput {
   executionState?: Record<string, unknown> | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  updatedAt?: Date | string | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -127,6 +128,7 @@ export interface IssueGraphLivenessInput {
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
   queuedWakeStaleAfterMs?: number;
+  participantGraceMs?: number;
   now?: Date | string;
 }
 
@@ -213,6 +215,55 @@ export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now
   return true;
 }
 
+// SUP-15565: the execution_participant path is a maintained action path only
+// while the review stage is expected to produce a wake for THIS card. A live
+// participant that has never been woken for this card and runs only on other
+// assignments must not keep the card `covered` indefinitely. Fresh = the stage
+// armed within the grace window, OR the participant already holds a card-scoped
+// live path (an active run, or a non-stale queued wake, on THIS card).
+function participantHasCardScopedLivePath(
+  companyId: string,
+  issueId: string,
+  activeRuns: IssueLivenessExecutionPathInput[],
+  queuedWakeRequests: IssueLivenessExecutionPathInput[],
+  nowMs: number,
+  queuedWakeStaleAfterMs: number | null,
+): boolean {
+  const hasActiveRun = activeRuns.some(
+    (entry) => entry.companyId === companyId && entry.issueId === issueId,
+  );
+  if (hasActiveRun) return true;
+  return queuedWakeRequests.some((entry) => {
+    if (entry.companyId !== companyId || entry.issueId !== issueId) return false;
+    if (queuedWakeStaleAfterMs !== null) {
+      const createdAtMs = readDateMs(entry.createdAt);
+      if (createdAtMs !== null && nowMs - createdAtMs > queuedWakeStaleAfterMs) return false;
+    }
+    return true;
+  });
+}
+
+function executionParticipantPathIsFresh(
+  input: IssueGraphLivenessInput,
+  issue: IssueLivenessIssueInput,
+  nowMs: number,
+): boolean {
+  const graceMs = readNonNegativeMs(input.participantGraceMs);
+  // Grace not configured (e.g. callers that never set it): preserve the prior
+  // maintained-path behavior so only the review-attention scorer is gated.
+  if (graceMs === null) return true;
+  const armedAtMs = readDateMs(issue.executionState?.pendingSince) ?? readDateMs(issue.updatedAt);
+  if (armedAtMs !== null && nowMs - armedAtMs <= graceMs) return true;
+  return participantHasCardScopedLivePath(
+    issue.companyId,
+    issue.id,
+    input.activeRuns ?? [],
+    input.queuedWakeRequests ?? [],
+    nowMs,
+    readNonNegativeMs(input.queuedWakeStaleAfterMs),
+  );
+}
+
 export function classifyIssueReviewPaths(
   input: IssueGraphLivenessInput,
   issue: IssueLivenessIssueInput,
@@ -239,13 +290,19 @@ export function classifyIssueReviewPaths(
   if (participantAgentId) {
     const participantAgent = agentsById.get(participantAgentId);
     if (participantAgent?.companyId === issue.companyId && isInvokableAgent(participantAgent, agentsById)) {
-      paths.push({
-        kind: "execution_participant",
-        ref: participantAgentId,
-        agentId: participantAgentId,
-        userId: null,
-        since: null,
-      });
+      // A live invokable participant only maintains the card while the stage is
+      // fresh for THIS card (armed within the grace window, or already holding
+      // a card-scoped live path). Otherwise it would keep the card `covered`
+      // indefinitely while busy on other assignments (SUP-15565).
+      if (executionParticipantPathIsFresh(input, issue, nowMs)) {
+        paths.push({
+          kind: "execution_participant",
+          ref: participantAgentId,
+          agentId: participantAgentId,
+          userId: null,
+          since: null,
+        });
+      }
     }
   } else if (principalIsResolvableUser(participant)) {
     const userId = (participant as Record<string, unknown>).userId as string;
