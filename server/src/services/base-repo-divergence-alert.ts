@@ -150,6 +150,16 @@ export async function clearDivergenceRecord(repoRoot: string): Promise<void> {
   }
 }
 
+export interface DivergedRefusalObservationInput {
+  baseRef: string;
+  repoIdentity: string;
+  aheadCount: number;
+  behindCount: number;
+  aheadCommitSubjects: string[];
+  nowMs?: number;
+  thresholdMs?: number;
+}
+
 export interface DivergedRefusalObservation {
   record: BaseRepoDivergenceRecord;
   ageMs: number;
@@ -160,40 +170,78 @@ export interface DivergedRefusalObservation {
 }
 
 /**
+ * In-process per-repo-root serialization for {@link observeDivergedRefusal}.
+ * The sidecar record is the durable, cross-restart dedup key, but two
+ * concurrent provisioning passes in the same server process can both read an
+ * unalerted record and both emit a first-class signal for one episode. Chaining
+ * the read-modify-write per checkout path closes that window so a single
+ * divergence episode produces at most one signal.
+ */
+const observeChains = new Map<string, Promise<unknown>>();
+
+function serializeObservationByKey<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const prev = observeChains.get(key) ?? Promise.resolve();
+  const next = prev.then(task);
+  const settled = next.catch(() => {});
+  observeChains.set(key, settled);
+  // Drop the entry once it is the tail of the chain so a long-lived server does
+  // not accumulate one entry per distinct base-repo checkout path.
+  settled.then(() => {
+    if (observeChains.get(key) === settled) observeChains.delete(key);
+  });
+  return next;
+}
+
+/**
  * Record one observation of the diverged-refused state and decide whether a
  * first-class signal is due.
  *
  * `firstObservedAtMs` preserves the EARLIEST observation seen so far, so the
  * age grows monotonically for the life of a divergence episode regardless of
  * how many times the repo is probed. `lastObservedAtMs` and the ahead/behind
- * counts/subjects are refreshed to the newest observation. The alert dedup key
- * (see {@link BaseRepoDivergenceRecord.alertedForFirstObservedAtMs}) makes the
- * caller emit the signal exactly once per episode: concurrent probes may each
- * read "not yet alerted" before either writes, so a rare duplicate row is
- * possible but a missed alert is not.
+ * counts/subjects are refreshed to the newest observation.
+ *
+ * A prior record is only reused when it was written for the SAME repo identity
+ * and base ref. The record lives under the checkout path's `.paperclip/` tree,
+ * so a path that now hosts a different repository or ref must not inherit an
+ * old `firstObservedAtMs` — that would manufacture an instantly-old episode and
+ * emit a spurious alert, breaking per-base-repo tracking and the no-noise rule.
+ *
+ * Observations for the same checkout path are serialized (see
+ * {@link serializeObservationByKey}) so concurrent provisioning passes cannot
+ * each read "not yet alerted" and both fire; combined with the persisted
+ * `alertedForFirstObservedAtMs` dedup key, one episode yields at most one
+ * first-class signal.
  */
-export async function observeDivergedRefusal(
+export function observeDivergedRefusal(
   repoRoot: string,
-  input: {
-    baseRef: string;
-    repoIdentity: string;
-    aheadCount: number;
-    behindCount: number;
-    aheadCommitSubjects: string[];
-    nowMs?: number;
-    thresholdMs?: number;
-  },
+  input: DivergedRefusalObservationInput,
+): Promise<DivergedRefusalObservation> {
+  return serializeObservationByKey(path.resolve(repoRoot), () =>
+    recordDivergedRefusal(repoRoot, input),
+  );
+}
+
+async function recordDivergedRefusal(
+  repoRoot: string,
+  input: DivergedRefusalObservationInput,
 ): Promise<DivergedRefusalObservation> {
   const nowMs = input.nowMs ?? Date.now();
   const thresholdMs = input.thresholdMs ?? resolveDivergenceAlertThresholdMs();
   const existing = await readDivergenceRecord(repoRoot);
+  // Only trust a prior record written for the current repo identity AND base
+  // ref; otherwise start a fresh episode rather than inheriting its age.
+  const prior =
+    existing && existing.repoIdentity === input.repoIdentity && existing.baseRef === input.baseRef
+      ? existing
+      : null;
   // A future-dated existing record (clock skew) must not shrink the window we
   // have already been watching; fall back to now for that episode's start.
   const firstObservedAtMs =
-    existing && existing.firstObservedAtMs <= nowMs ? existing.firstObservedAtMs : nowMs;
+    prior && prior.firstObservedAtMs <= nowMs ? prior.firstObservedAtMs : nowMs;
   const ageMs = Math.max(0, nowMs - firstObservedAtMs);
   const alertDue = ageMs >= thresholdMs;
-  const shouldEmitFirstClassSignal = alertDue && existing?.alertedForFirstObservedAtMs !== firstObservedAtMs;
+  const shouldEmitFirstClassSignal = alertDue && prior?.alertedForFirstObservedAtMs !== firstObservedAtMs;
 
   const record: BaseRepoDivergenceRecord = {
     repoIdentity: input.repoIdentity,
@@ -205,7 +253,7 @@ export async function observeDivergedRefusal(
     aheadCommitSubjects: input.aheadCommitSubjects,
     alertedForFirstObservedAtMs: shouldEmitFirstClassSignal
       ? firstObservedAtMs
-      : existing?.alertedForFirstObservedAtMs ?? null,
+      : prior?.alertedForFirstObservedAtMs ?? null,
   };
   try {
     await fs.mkdir(path.dirname(divergenceRecordPath(repoRoot)), { recursive: true });
