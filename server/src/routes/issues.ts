@@ -11243,6 +11243,38 @@ export function issueRoutes(
       },
     });
 
+    // Observability (SUP-15668): an agent that creates a top-level issue (no
+    // parentId) is how "orphan" work trees begin. Record one audit row so the
+    // pattern is queryable before we enforce anything on the create path.
+    // Fail-open: an audit failure must never break the create (logActivity is
+    // already best-effort; the extra try/catch guards building the payload).
+    if (actor.actorType === "agent" && !effectiveParentId && !watchdogProductBugFollowUp) {
+      try {
+        await logActivity(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.created_without_parent",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            issueId: issue.id,
+            identifier: issue.identifier,
+            companyId,
+            projectId: issue.projectId ?? null,
+            actorAgentId: actor.agentId ?? null,
+            hasBlockedByIssueIds:
+              Array.isArray(req.body.blockedByIssueIds) && req.body.blockedByIssueIds.length > 0,
+          },
+        });
+      } catch {
+        // Best-effort audit row — never let it fail the issue create.
+      }
+    }
+
     if (executionPolicy?.monitor) {
       await logActivity(db, {
         companyId,
