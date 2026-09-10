@@ -7061,6 +7061,7 @@ export function recoveryService(db: Db, deps: {
       deferredWakeupReplayFailed: 0,
       deferredWakeupReplayLivePathSkipped: 0,
       deferredWakeupReplaySuppressedSkipped: 0,
+      deferredWakeupReplayCutoffHeldSkipped: 0,
       deferredWakeupReplayCandidateLimitApplied: false,
       deferredWakeupReplayedIssueIds: [] as string[],
       blockedWithoutBlockersChecked: 0,
@@ -7114,12 +7115,17 @@ export function recoveryService(db: Db, deps: {
 
     const deferredWakeupReplay = await reconcileDeferredWakeupReplay({
       now,
+      // Same value every other sweep in this reconciler receives: the armed
+      // worktree-execution cutoff. Here it decides which deferred wakes are
+      // still suppressed rather than which issues are in scope.
+      issueCreatedAtGte: opts?.issueCreatedAtGte ?? null,
     });
     result.deferredWakeupReplayChecked = deferredWakeupReplay.checked;
     result.deferredWakeupReplayed = deferredWakeupReplay.reDriven;
     result.deferredWakeupReplayFailed = deferredWakeupReplay.reDriveFailed;
     result.deferredWakeupReplayLivePathSkipped = deferredWakeupReplay.livePathSkipped;
     result.deferredWakeupReplaySuppressedSkipped = deferredWakeupReplay.suppressedSkipped;
+    result.deferredWakeupReplayCutoffHeldSkipped = deferredWakeupReplay.cutoffHeldSkipped;
     result.deferredWakeupReplayCandidateLimitApplied = deferredWakeupReplay.candidateLimitApplied;
     result.deferredWakeupReplayedIssueIds = deferredWakeupReplay.issueIds;
 
@@ -8194,6 +8200,12 @@ export function recoveryService(db: Db, deps: {
   // - Re-drive is gated on `resolveSchedulingSuppression()` reporting the
   //   instance as dispatchable, so a still-quiesced instance never re-fires
   //   (the skip is still in effect).
+  // - The worktree-execution cutoff is the OTHER instance-level suppression
+  //   that produces deferrable skips, and unlike dispatch quiesce it is
+  //   per-issue (it excludes issues created before the cutoff). A candidate
+  //   whose issue is still below the armed cutoff is HELD — left pending, not
+  //   claimed — so it is re-driven when the cutoff moves rather than being
+  //   retired into a fresh skip row on every sweep.
   // - Re-drive is idempotent: a compare-and-swap stamps `finishedAt` on the
   //   deferred row before the enqueue, so concurrent sweeps never double-drive
   //   the same wake; a card that has since been claimed, closed, or re-woken by
@@ -8204,7 +8216,11 @@ export function recoveryService(db: Db, deps: {
   //   ORIGINAL payload, so the resulting run carries the original
   //   payload.issueId — we re-drive the wake, not a frozen wake policy.
   const DEFERRED_WAKE_REPLAY_CANDIDATE_LIMIT = 200;
-  async function reconcileDeferredWakeupReplay(opts?: { now?: Date; companyId?: string | null }) {
+  async function reconcileDeferredWakeupReplay(opts?: {
+    now?: Date;
+    companyId?: string | null;
+    issueCreatedAtGte?: Date | null;
+  }) {
     const result = {
       checked: 0,
       reDriven: 0,
@@ -8212,6 +8228,7 @@ export function recoveryService(db: Db, deps: {
       reDriveFailed: 0,
       livePathSkipped: 0,
       suppressedSkipped: 0,
+      cutoffHeldSkipped: 0,
       candidateLimitApplied: false,
       wakeIds: [] as string[],
       issueIds: [] as string[],
@@ -8276,15 +8293,14 @@ export function recoveryService(db: Db, deps: {
       visibleIssueCondition(),
     ];
     if (opts?.companyId) openIssueFilters.push(eq(issues.companyId, opts.companyId));
-    const openIssueIds = new Set(
-      candidateIssueIds.length === 0
-        ? []
-        : (await db
-            .select({ id: issues.id })
-            .from(issues)
-            .where(and(...openIssueFilters)))
-            .map((i) => i.id),
-    );
+    const openIssueRows = candidateIssueIds.length === 0
+      ? []
+      : await db
+          .select({ id: issues.id, createdAt: issues.createdAt })
+          .from(issues)
+          .where(and(...openIssueFilters));
+    const openIssueIds = new Set(openIssueRows.map((i) => i.id));
+    const openIssueCreatedAt = new Map(openIssueRows.map((i) => [i.id, i.createdAt]));
 
     for (const wake of candidates) {
       const issueId = issueIdByWake.get(wake.id);
@@ -8301,6 +8317,21 @@ export function recoveryService(db: Db, deps: {
       // existing queued/running run instead of starting a second one.
       if (issueId) {
         if (!openIssueIds.has(issueId)) continue; // issue no longer open/visible.
+
+        // The worktree-execution cutoff is still armed over this card, so the
+        // suppression that produced the skip has NOT lifted. Hold the row
+        // pending (no CAS, no enqueue): re-driving now would take the same
+        // cutoff branch in enqueueWakeup and simply retire this row in favour
+        // of an identical new one, once per sweep, forever.
+        const issueCreatedAt = openIssueCreatedAt.get(issueId);
+        if (
+          opts?.issueCreatedAtGte
+          && issueCreatedAt
+          && issueCreatedAt < opts.issueCreatedAtGte
+        ) {
+          result.cutoffHeldSkipped++;
+          continue;
+        }
 
         // Idempotency (A): another path already owns a live execution path for
         // this card — never drive a second run.

@@ -7855,6 +7855,11 @@ export {
 } from "./wake-skip-classification.js";
 export type { WakeSkipReason, WakeSkipClass } from "./wake-skip-classification.js";
 
+// Skip writes happen both outside and inside the issue-execution transaction,
+// so the shared write helper takes the executor explicitly instead of closing
+// over `db`. Same shape as `CompanyTx` in ./companies.ts.
+type WakeupWriteExecutor = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
   overrides: { allowWorktreeRunExecution?: boolean; dispatchQuiesced?: boolean } = {},
@@ -20899,9 +20904,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
 
+    // Some skip decisions are taken inside the issue-execution transaction
+    // below (which holds `select … for update` on the issue row), so the skip
+    // write has to be able to run on that transaction rather than on a second
+    // connection. Every skip write therefore goes through this one helper with
+    // an explicit executor — a skip site that hand-rolls its own insert is how
+    // `heartbeat.worktree_execution_cutoff` stayed terminal after it had been
+    // classified deferrable (SUP-15552 review round 2).
     const writeSkippedRequest = async (
       skipReason: WakeSkipReasonInternal,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
+      executor: WakeupWriteExecutor = db,
     ) => {
       const deferrable = isDeferrableWakeSkipReasonInternal(skipReason);
       const idempotencyKey = opts.idempotencyKey ?? null;
@@ -20936,7 +20949,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // wake for the same card would discard that payload and its key, and
         // the delivery would be lost exactly as this card's own defect lost a
         // wake. Only like-for-like keys coalesce.
-        const existing = await db
+        const existing = await executor
           .select({ id: agentWakeupRequests.id, coalescedCount: agentWakeupRequests.coalescedCount })
           .from(agentWakeupRequests)
           .where(
@@ -20956,7 +20969,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
           .limit(1);
         if (existing[0]) {
-          await db
+          await executor
             .update(agentWakeupRequests)
             .set({
               coalescedCount: existing[0].coalescedCount + 1,
@@ -20967,7 +20980,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return;
         }
       }
-      await db.insert(agentWakeupRequests).values({
+      await executor.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
         agentId,
         source,
@@ -21005,13 +21018,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ...patch,
       });
     };
-    const writeSkippedHeartbeatRequest = async (skipReason: WakeSkipReasonInternal, details: Record<string, unknown>) => {
+    const writeSkippedHeartbeatRequest = async (
+      skipReason: WakeSkipReasonInternal,
+      details: Record<string, unknown>,
+      executor: WakeupWriteExecutor = db,
+    ) => {
       await writeSkippedRequest(skipReason, {
         payload: {
           ...(payload ?? {}),
           heartbeatSkip: details,
         },
-      });
+      }, executor);
     };
 
     const schedulingSuppression = await getSchedulingSuppression();
@@ -21351,26 +21368,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (worktreeExecutionCutoff && issue.createdAt < worktreeExecutionCutoff) {
-          await tx.insert(agentWakeupRequests).values({
-            companyId: agent.companyId,
-            agentId,
-            source,
-            triggerDetail,
-            reason: "heartbeat.worktree_execution_cutoff",
-            payload: {
-              ...(payload ?? {}),
-              heartbeatSkip: {
-                reason: "worktree_execution_cutoff",
-                cutoff: worktreeExecutionCutoff.toISOString(),
-                issueId: issue.id,
-              },
-            },
-            status: "skipped",
-            requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
-            finishedAt: new Date(),
-          });
+          // `heartbeat.worktree_execution_cutoff` is classified DEFERRABLE: it
+          // describes the instance (a worktree-runtime execution cutoff that is
+          // moved or lifted by an operator), not the work or the agent. This
+          // site — the resolved-issue path inside the execution-lock
+          // transaction — is the live one for an issue-bound wake, so it must
+          // go through the shared classification write rather than inserting a
+          // finished row of its own. A hand-rolled `finishedAt: new Date()`
+          // here is invisible to `reconcileDeferredWakeupReplay` (which selects
+          // `status = 'skipped' AND finished_at IS NULL`) and the wake is
+          // destroyed exactly as this card's defect destroyed the original one.
+          // Runs on `tx` so the skip write is atomic with the issue-row lock
+          // this transaction holds, and it inherits the same deferrable
+          // write/coalescing contract as every other deferrable skip.
+          await writeSkippedHeartbeatRequest("heartbeat.worktree_execution_cutoff", {
+            reason: "worktree_execution_cutoff",
+            cutoff: worktreeExecutionCutoff.toISOString(),
+            issueId: issue.id,
+          }, tx);
           return { kind: "skipped" as const };
         }
 
