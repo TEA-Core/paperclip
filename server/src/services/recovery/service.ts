@@ -114,7 +114,7 @@ import {
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../issue-assignee-review-gate.js";
-import { loadConfig } from "../../config.js";
+import { loadConfig, pendingReviewParticipantGraceMsFromEnv, pendingReviewRearmWindowMsFromEnv } from "../../config.js";
 import {
   canAgentSatisfyIssueWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
@@ -5481,6 +5481,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         executionState: issues.executionState,
         monitorNextCheckAt: issues.monitorNextCheckAt,
         monitorAttemptCount: issues.monitorAttemptCount,
+        updatedAt: issues.updatedAt,
       })
       .from(issues)
       .where(
@@ -5553,6 +5554,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           agentId: agentWakeupRequests.agentId,
           status: agentWakeupRequests.status,
           payload: agentWakeupRequests.payload,
+          createdAt: agentWakeupRequests.requestedAt,
         })
         .from(agentWakeupRequests)
         .where(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])),
@@ -5678,10 +5680,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         agentId: row.agentId,
         status: row.status,
         issueId: issueIdFromWakePayload(row.payload),
+        createdAt: row.createdAt,
       })),
       pendingInteractions: interactionRows,
       pendingApprovals: approvalRows,
       openRecoveryIssues: openRecoveryIssues.concat(healthyRecoveryActions),
+      queuedWakeStaleAfterMs: pendingReviewRearmWindowMsFromEnv(),
+      participantGraceMs: pendingReviewParticipantGraceMsFromEnv(),
       now: new Date(),
     });
   }

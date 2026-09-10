@@ -4368,6 +4368,7 @@ async function listIssueBlockedInboxAttentionMap(
             )`,
             agentId: agentWakeupRequests.agentId,
             status: agentWakeupRequests.status,
+            createdAt: agentWakeupRequests.requestedAt,
           })
           .from(agentWakeupRequests)
           .where(and(
@@ -4391,6 +4392,7 @@ async function listIssueBlockedInboxAttentionMap(
             )`,
             agentId: heartbeatRuns.agentId,
             status: heartbeatRuns.status,
+            createdAt: heartbeatRuns.createdAt,
           })
           .from(heartbeatRuns)
           .where(and(
@@ -4481,6 +4483,7 @@ async function listIssueBlockedInboxAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      updatedAt: issue.updatedAt,
     })),
     relations: graphRelations,
     agents: companyAgents,
@@ -4489,15 +4492,23 @@ async function listIssueBlockedInboxAttentionMap(
         ? [{ companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, status: row.status }]
         : []),
     queuedWakeRequests: [
-      ...(wakeRows as Array<{ companyId: string; issueId: string | null; agentId: string | null; status: string }>),
-      ...(scheduledRetryRows as Array<{ companyId: string; issueId: string | null; agentId: string | null; status: string }>),
+      ...(wakeRows as Array<{ companyId: string; issueId: string | null; agentId: string | null; status: string; createdAt: Date }>),
+      ...(scheduledRetryRows as Array<{ companyId: string; issueId: string | null; agentId: string | null; status: string; createdAt: Date }>),
     ]
       .flatMap((row) => row.issueId
-        ? [{ companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, status: row.status }]
+        ? [{
+          companyId: row.companyId,
+          issueId: row.issueId,
+          agentId: row.agentId,
+          status: row.status,
+          createdAt: row.createdAt ?? null,
+        }]
         : []),
     pendingInteractions,
     pendingApprovals,
     openRecoveryIssues,
+    queuedWakeStaleAfterMs: pendingReviewRearmWindowMsFromEnv(),
+    participantGraceMs: pendingReviewParticipantGraceMsFromEnv(),
     now: new Date(),
   });
   const findingByIssueId = new Map<string, IssueLivenessFinding>();

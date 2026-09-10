@@ -631,7 +631,30 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     const participantAgentId = readPrincipalAgentId(participant);
     if (participantAgentId) {
       const participantAgent = agentsById.get(participantAgentId);
-      if (isInvokableAgent(participantAgent, agentsById) && participantAgent?.companyId === reviewIssue.companyId) return null;
+      if (isInvokableAgent(participantAgent, agentsById) && participantAgent?.companyId === reviewIssue.companyId) {
+        // A live, invokable participant reaches this branch only when
+        // classifyIssueReviewPaths returned zero paths: the gate rejected its
+        // execution_participant path for THIS card — the stage armed past the
+        // participant grace window and no card-scoped run or non-stale wake
+        // exists (SUP-15565). Participant liveness alone is not a maintained
+        // action path: busy on other assignments must not keep the card
+        // covered, so it falls through to the no-action-path finding
+        // (SUP-15556/SUP-15591) instead of being suppressed.
+        if (!reviewIssue.assigneeAgentId || reviewIssue.assigneeUserId) return null;
+        return finding({
+          issue: source,
+          state: "in_review_without_action_path",
+          reason: `${issueLabel(reviewIssue)} is in review; its execution participant ${participantAgent.name} holds no card-scoped wake or run since the stage armed, and no interaction, approval, user owner, active run, or recovery issue owns the next action.`,
+          dependencyPath,
+          recoveryIssue: reviewIssue,
+          recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
+          recommendedOwnerCandidates: ownerCandidates,
+          recommendedAction:
+            `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`,
+          blockerIssueId: reviewIssue.id,
+          participantAgentId,
+        });
+      }
 
       return finding({
         issue: source,
