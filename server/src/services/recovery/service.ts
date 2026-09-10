@@ -77,6 +77,13 @@ import {
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb, type AgentInvokability } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled, parseHeartbeatPolicy } from "../heartbeat-policy.js";
+// SUP-15552: shared with the heartbeat skip write path. Imported from the
+// standalone classification module, not from heartbeat.ts, which imports THIS
+// module — see wake-skip-classification.ts for why.
+import {
+  DEFERRABLE_WAKE_SKIP_REASONS,
+  readWakeIssueIdFromPayload,
+} from "../wake-skip-classification.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -1013,7 +1020,16 @@ export async function hasPendingWakeInteraction(db: Db, companyId: string, issue
     .then((rows) => Boolean(rows[0]));
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(db: Db, deps: {
+  enqueueWakeup: RecoveryWakeup;
+  // SUP-15552: optional so the many route-scoped recoveryService(db, { enqueueWakeup })
+  // callers are unchanged. When provided, the deferred-wake replay sweep re-drives
+  // only after this reports the instance dispatchable; when omitted the sweep
+  // assumes dispatchable (safe — re-drive is idempotent and re-gated by the
+  // full dispatch). Structural mirror of HeartbeatSchedulingSuppression to keep
+  // this module free of a runtime import cycle with heartbeat.ts.
+  resolveSchedulingSuppression?: () => Promise<{ suppressed: boolean; reason: string | null }>;
+}) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -7043,6 +7059,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       dispatchSuppressionParkedLivePathSkipped: 0,
       dispatchSuppressionParkedSustainedWindowSkipped: 0,
       dispatchSuppressionParkedAlreadyActionedSkipped: 0,
+      deferredWakeupReplayChecked: 0,
+      deferredWakeupReplayed: 0,
+      deferredWakeupReplayFailed: 0,
+      deferredWakeupReplayLivePathSkipped: 0,
+      deferredWakeupReplaySuppressedSkipped: 0,
+      deferredWakeupReplayCutoffHeldSkipped: 0,
+      deferredWakeupReplayCandidateLimitApplied: false,
+      deferredWakeupReplayedIssueIds: [] as string[],
       blockedWithoutBlockersChecked: 0,
       blockedWithoutBlockersHealed: 0,
       blockedWithoutBlockersEscalated: 0,
@@ -7091,6 +7115,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.dispatchSuppressionParkedLivePathSkipped = dispatchSuppressionPark.livePathSkipped;
     result.dispatchSuppressionParkedSustainedWindowSkipped = dispatchSuppressionPark.sustainedWindowSkipped;
     result.dispatchSuppressionParkedAlreadyActionedSkipped = dispatchSuppressionPark.alreadyActionedSkipped;
+
+    const deferredWakeupReplay = await reconcileDeferredWakeupReplay({
+      now,
+      // Same value every other sweep in this reconciler receives: the armed
+      // worktree-execution cutoff. Here it decides which deferred wakes are
+      // still suppressed rather than which issues are in scope.
+      issueCreatedAtGte: opts?.issueCreatedAtGte ?? null,
+    });
+    result.deferredWakeupReplayChecked = deferredWakeupReplay.checked;
+    result.deferredWakeupReplayed = deferredWakeupReplay.reDriven;
+    result.deferredWakeupReplayFailed = deferredWakeupReplay.reDriveFailed;
+    result.deferredWakeupReplayLivePathSkipped = deferredWakeupReplay.livePathSkipped;
+    result.deferredWakeupReplaySuppressedSkipped = deferredWakeupReplay.suppressedSkipped;
+    result.deferredWakeupReplayCutoffHeldSkipped = deferredWakeupReplay.cutoffHeldSkipped;
+    result.deferredWakeupReplayCandidateLimitApplied = deferredWakeupReplay.candidateLimitApplied;
+    result.deferredWakeupReplayedIssueIds = deferredWakeupReplay.issueIds;
 
     const blockedWithoutBlockers = await reconcileBlockedWithoutBlockers({
       runId: opts?.runId ?? null,
@@ -8141,6 +8181,263 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       logger.warn(
         { parked: result.parked, issueIds: result.issueIds, source },
         "dispatch-suppressed in_progress cards parked onto blocked_without_blockers surface",
+      );
+    }
+
+    return result;
+  }
+
+  // SUP-15552 / D1 of SUP-15551 (ADR-096): a wake skipped for a transient,
+  // instance-level dispatch suppression is recorded as a DEFERRAL rather than a
+  // terminal drop — `status = 'skipped'` (unchanged) with `finishedAt IS NULL`
+  // and a deferrable `reason`. This level-triggered backstop — same shape as
+  // reconcileDispatchSuppressionParks / SUP-10796 — re-drives those deferred
+  // wakes once the suppression that skipped them has cleared.
+  //
+  // The deferral is deliberately NOT a new status value: several partial unique
+  // indexes and their app-level mirrors key retry-ability off
+  // `status <> 'skipped'`, so a distinct status would permanently occupy the
+  // idempotency slot of the very wake it is trying to save. See the write path
+  // in heartbeat.ts for the full list.
+  //
+  // - Re-drive is gated on `resolveSchedulingSuppression()` reporting the
+  //   instance as dispatchable, so a still-quiesced instance never re-fires
+  //   (the skip is still in effect).
+  // - The worktree-execution cutoff is the OTHER instance-level suppression
+  //   that produces deferrable skips, and unlike dispatch quiesce it is
+  //   per-issue (it excludes issues created before the cutoff). A candidate
+  //   whose issue is still below the armed cutoff is HELD — left pending, not
+  //   claimed — so it is re-driven when the cutoff moves rather than being
+  //   retired into a fresh skip row on every sweep.
+  // - Re-drive is idempotent: a compare-and-swap stamps `finishedAt` on the
+  //   deferred row before the enqueue, so concurrent sweeps never double-drive
+  //   the same wake; a card that has since been claimed, closed, or re-woken by
+  //   another path is detected via hasActiveExecutionPath / hasQueuedIssueWake
+  //   and left alone.
+  // - Re-drive re-runs the full dispatch through enqueueWakeup (owner
+  //   resolution, budget, invokability, issue state, ownership) on the
+  //   ORIGINAL payload, so the resulting run carries the original
+  //   payload.issueId — we re-drive the wake, not a frozen wake policy.
+  const DEFERRED_WAKE_REPLAY_CANDIDATE_LIMIT = 200;
+  async function reconcileDeferredWakeupReplay(opts?: {
+    now?: Date;
+    companyId?: string | null;
+    issueCreatedAtGte?: Date | null;
+  }) {
+    const result = {
+      checked: 0,
+      reDriven: 0,
+      genericReDriven: 0,
+      reDriveFailed: 0,
+      livePathSkipped: 0,
+      suppressedSkipped: 0,
+      cutoffHeldSkipped: 0,
+      candidateLimitApplied: false,
+      wakeIds: [] as string[],
+      issueIds: [] as string[],
+    };
+    const logSource = "issue_graph_liveness.deferred_wake_replay";
+    const now = opts?.now ?? new Date();
+
+    const suppression =
+      (await deps.resolveSchedulingSuppression?.()) ?? { suppressed: false, reason: null };
+    if (suppression.suppressed) {
+      result.suppressedSkipped = 1;
+      return result;
+    }
+
+    // A deferred wake is `status = 'skipped'` (unchanged, so the idempotency
+    // indexes that exclude 'skipped' keep treating it as retryable) that has
+    // NOT been finished, carrying a deferrable reason. `finishedAt IS NULL` is
+    // the pending marker and the CAS target below.
+    const wakeFilters = [
+      eq(agentWakeupRequests.status, "skipped"),
+      isNull(agentWakeupRequests.finishedAt),
+      inArray(agentWakeupRequests.reason, [...DEFERRABLE_WAKE_SKIP_REASONS]),
+    ];
+    if (opts?.companyId) wakeFilters.push(eq(agentWakeupRequests.companyId, opts.companyId));
+    const wakes = await db
+      .select({
+        id: agentWakeupRequests.id,
+        companyId: agentWakeupRequests.companyId,
+        agentId: agentWakeupRequests.agentId,
+        source: agentWakeupRequests.source,
+        triggerDetail: agentWakeupRequests.triggerDetail,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+        requestedAt: agentWakeupRequests.requestedAt,
+      })
+      .from(agentWakeupRequests)
+      .where(and(...wakeFilters))
+      .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
+      .limit(DEFERRED_WAKE_REPLAY_CANDIDATE_LIMIT + 1);
+    result.candidateLimitApplied = wakes.length > DEFERRED_WAKE_REPLAY_CANDIDATE_LIMIT;
+    const candidates = wakes.slice(0, DEFERRED_WAKE_REPLAY_CANDIDATE_LIMIT);
+    result.checked = candidates.length;
+    if (candidates.length === 0) return result;
+
+    // Which card a deferred wake names has to be derived the SAME way the write
+    // path derives it, or the issue-bound guards below (open-issue, live-path,
+    // cutoff hold) silently miss wakes that do name a card and treat them as
+    // generic:
+    //   - `payload.taskId` is an issue id — `enrichWakeContextSnapshot` accepts
+    //     it interchangeably with `payload.issueId`.
+    //   - `payload.heartbeatSkip.issueId` is written by the worktree-cutoff skip
+    //     sites, which resolve the issue themselves and record it there even
+    //     when the caller's payload never named it.
+    // Reading only `payload.issueId` is the same drift-between-two-derivations
+    // that let the cutoff skip stay terminal after it had been classified.
+    // Shared with the write path's coalescing key and its SQL twin
+    // (`WAKE_ISSUE_ID_PAYLOAD_PATHS` in wake-skip-classification.ts). This
+    // derivation existed here in a second, hand-written copy; the copy in
+    // heartbeat.ts read `payload.issueId` only, and the disagreement collapsed
+    // two cards' deferred cutoff wakes onto one row (SUP-15552 review round 3).
+    // One reader, one path list, no drift.
+    const issueIdByWake = new Map<string, string | null>(
+      candidates.map((wake) => [wake.id, readWakeIssueIdFromPayload(wake.payload)]),
+    );
+    const candidateIssueIds = [
+      ...new Set(
+        candidates.map((w) => issueIdByWake.get(w.id)).filter((id): id is string => Boolean(id)),
+      ),
+    ];
+
+    // Open, visible issues only: a deferrable skip whose issue has since been
+    // closed/cancelled/hidden has nothing left to drive.
+    // Every candidate can be generic (no `payload.issueId`), in which case there
+    // is nothing to look up — and an empty `inArray` is not a query worth
+    // issuing.
+    const openIssueFilters = [
+      inArray(issues.id, candidateIssueIds),
+      notInArray(issues.status, ["done", "cancelled"]),
+      visibleIssueCondition(),
+    ];
+    if (opts?.companyId) openIssueFilters.push(eq(issues.companyId, opts.companyId));
+    const openIssueRows = candidateIssueIds.length === 0
+      ? []
+      : await db
+          .select({ id: issues.id, createdAt: issues.createdAt })
+          .from(issues)
+          .where(and(...openIssueFilters));
+    const openIssueIds = new Set(openIssueRows.map((i) => i.id));
+    const openIssueCreatedAt = new Map(openIssueRows.map((i) => [i.id, i.createdAt]));
+
+    for (const wake of candidates) {
+      const issueId = issueIdByWake.get(wake.id);
+
+      // A wake with no `payload.issueId` — a generic timer or on-demand wake —
+      // is a durable signal too, and the ruling is about the SKIP REASON, not
+      // about whether the wake happened to name a card. Dropping it here was
+      // the same defect one layer over: the wake would sit `finishedAt IS NULL`
+      // forever, never re-driven and never retired. Generic wakes are therefore
+      // re-driven as well; only the issue-state and live-execution-path guards
+      // below are issue-bound, because there is no card whose state could have
+      // superseded the wake. Duplicate suppression for a generic re-drive is
+      // enqueueWakeup's own same-scope coalescing, which merges onto the agent's
+      // existing queued/running run instead of starting a second one.
+      if (issueId) {
+        if (!openIssueIds.has(issueId)) continue; // issue no longer open/visible.
+
+        // The worktree-execution cutoff is still armed over this card, so the
+        // suppression that produced the skip has NOT lifted. Hold the row
+        // pending (no CAS, no enqueue): re-driving now would take the same
+        // cutoff branch in enqueueWakeup and simply retire this row in favour
+        // of an identical new one, once per sweep, forever.
+        const issueCreatedAt = openIssueCreatedAt.get(issueId);
+        if (
+          opts?.issueCreatedAtGte
+          && issueCreatedAt
+          && issueCreatedAt < opts.issueCreatedAtGte
+        ) {
+          result.cutoffHeldSkipped++;
+          continue;
+        }
+
+        // Idempotency (A): another path already owns a live execution path for
+        // this card — never drive a second run.
+        if (
+          (await hasActiveExecutionPath(wake.companyId, issueId, wake.agentId)) ||
+          (await hasQueuedIssueWake(wake.companyId, issueId, wake.agentId))
+        ) {
+          result.livePathSkipped++;
+          continue;
+        }
+      }
+
+      // Idempotency (B): compare-and-swap so two concurrent sweeps cannot both
+      // claim the same deferrable wake.
+      // The CAS stamps `finishedAt`, retiring the row from the deferred set
+      // while leaving `status = 'skipped'` intact — so the row still does not
+      // occupy any idempotency-key slot, and a caller whose own retry path is
+      // gated on `status <> 'skipped'` remains free to re-enqueue.
+      const claimed = await db
+        .update(agentWakeupRequests)
+        .set({ finishedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, wake.id),
+            eq(agentWakeupRequests.status, "skipped"),
+            isNull(agentWakeupRequests.finishedAt),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      if (claimed.length === 0) continue;
+
+      const replaySource: "timer" | "assignment" | "on_demand" | "automation" =
+        wake.source === "timer" || wake.source === "on_demand" || wake.source === "automation"
+          ? wake.source
+          : "assignment";
+      const replayTriggerDetail: "manual" | "ping" | "callback" | "system" =
+        wake.triggerDetail === "manual" || wake.triggerDetail === "ping" || wake.triggerDetail === "callback"
+          ? wake.triggerDetail
+          : "system";
+
+      try {
+        const run = await deps.enqueueWakeup(wake.agentId, {
+          source: replaySource,
+          triggerDetail: replayTriggerDetail,
+          reason: `wake_deferral_replay:${wake.reason ?? "unknown"}`,
+          idempotencyKey: `deferred_wake_replay:${wake.id}`,
+          payload: wake.payload,
+          requestedByActorType: "system",
+          requestedByActorId: null,
+        });
+        if (run) {
+          result.reDriven++;
+          result.wakeIds.push(wake.id);
+          if (issueId) result.issueIds.push(issueId);
+          else result.genericReDriven++;
+        } else {
+          // enqueueWakeup no-opped on a still-active gate. It wrote its own
+          // skip row on the way out, so if that gate was itself deferrable the
+          // replacement row is deferred too and the next cycle picks it up; if
+          // it was terminal, the wake is correctly done. Either way this row
+          // stays retired.
+          result.reDriveFailed++;
+        }
+      } catch {
+        // The enqueue threw (e.g. a database blip) rather than declining. The
+        // row is already retired by the CAS above and is NOT rolled back: the
+        // level-triggered sweeps in this file are deliberately ceilinged (see
+        // MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS) so a persistently failing
+        // re-drive cannot re-fire the same wake forever. The cost is that a
+        // wake lost to a throw here is not retried; `deferredWakeupReplayFailed`
+        // is the signal that this happened, and the D2 liveness backstop is
+        // what catches the resulting stranded card.
+        result.reDriveFailed++;
+      }
+    }
+
+    if (result.reDriven > 0) {
+      logger.info(
+        {
+          reDriven: result.reDriven,
+          genericReDriven: result.genericReDriven,
+          livePathSkipped: result.livePathSkipped,
+          issueIds: result.issueIds,
+          source: logSource,
+        },
+        "deferred dispatch-suppression wakes re-driven",
       );
     }
 
@@ -9261,6 +9558,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     sweepStaleIssueLocks,
     reconcileBlockedWithoutBlockers,
     reconcileDispatchSuppressionParks,
+    reconcileDeferredWakeupReplay,
     reconcilePendingReviewRearm,
     reconcileStaleRecoveryActionWakes,
     reconcileActiveRecoveryActions,

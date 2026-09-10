@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -334,6 +334,12 @@ import {
   type AgentOrgRow,
 } from "./agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
+import {
+  isDeferrableWakeSkipReason as isDeferrableWakeSkipReasonInternal,
+  readWakeIssueIdFromPayload,
+  WAKE_ISSUE_ID_PAYLOAD_PATHS,
+} from "./wake-skip-classification.js";
+import type { WakeSkipReason as WakeSkipReasonInternal } from "./wake-skip-classification.js";
 import {
   redactQuarantinedBodyForHigherTrust,
   sanitizeQuarantinedCommentForHigherTrust,
@@ -7841,6 +7847,44 @@ export type HeartbeatSchedulingSuppression = {
   reason: HeartbeatSchedulingSuppressionReason | null;
 };
 
+// SUP-15552 / D1 of SUP-15551 (ADR-096): the wake-skip classification lives in
+// ./wake-skip-classification.js so the replay sweep in recovery/service.ts can
+// share it without a runtime import cycle (this module imports that one).
+// Re-exported here because the skip write path below is the primary consumer.
+export {
+  WAKE_SKIP_CLASSIFICATION,
+  DEFERRABLE_WAKE_SKIP_REASONS,
+  wakeSkipClassForReason,
+  isDeferrableWakeSkipReason,
+} from "./wake-skip-classification.js";
+export type { WakeSkipReason, WakeSkipClass } from "./wake-skip-classification.js";
+
+// The SQL twin of `readWakeIssueIdFromPayload`, generated from the SAME path
+// list rather than hand-written, so the coalescing predicate and the key it is
+// matched against cannot disagree about which card a deferred wake names
+// (SUP-15552 review round 3). Yields:
+//   COALESCE(payload ->> 'issueId', payload ->> 'taskId',
+//            payload -> 'heartbeatSkip' ->> 'issueId')
+// Segments are bound as parameters and cast to text so Postgres resolves the
+// `jsonb -> text` operator rather than the `jsonb -> integer` overload.
+const wakeIssueIdFromPayloadSql = sql`COALESCE(${sql.join(
+  WAKE_ISSUE_ID_PAYLOAD_PATHS.map((path) =>
+    path.reduce<SQL>(
+      (expr, segment, index) =>
+        index === path.length - 1
+          ? sql`${expr} ->> ${segment}::text`
+          : sql`${expr} -> ${segment}::text`,
+      sql`${agentWakeupRequests.payload}`,
+    ),
+  ),
+  sql`, `,
+)})`;
+
+// Skip writes happen both outside and inside the issue-execution transaction,
+// so the shared write helper takes the executor explicitly instead of closing
+// over `db`. Same shape as `CompanyTx` in ./companies.ts.
+type WakeupWriteExecutor = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
   overrides: { allowWorktreeRunExecution?: boolean; dispatchQuiesced?: boolean } = {},
@@ -7972,7 +8016,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    // SUP-15552: the deferred-wake replay sweep must only re-drive once the
+    // instance-level dispatch suppression that skipped the wake has cleared.
+    resolveSchedulingSuppression: getSchedulingSuppression,
+  });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
     const target = parseObject(parseObject(payload).target);
@@ -20880,32 +20929,151 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
 
+    // Some skip decisions are taken inside the issue-execution transaction
+    // below (which holds `select … for update` on the issue row), so the skip
+    // write has to be able to run on that transaction rather than on a second
+    // connection. Every skip write therefore goes through this one helper with
+    // an explicit executor — a skip site that hand-rolls its own insert is how
+    // `heartbeat.worktree_execution_cutoff` stayed terminal after it had been
+    // classified deferrable (SUP-15552 review round 2).
     const writeSkippedRequest = async (
-      skipReason: string,
+      skipReason: WakeSkipReasonInternal,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
+      executor: WakeupWriteExecutor = db,
     ) => {
-      await db.insert(agentWakeupRequests).values({
+      const deferrable = isDeferrableWakeSkipReasonInternal(skipReason);
+      const idempotencyKey = opts.idempotencyKey ?? null;
+      // The payload this call actually stores: `patch.payload` when the caller
+      // overrode it (every `writeSkippedHeartbeatRequest` does, to attach
+      // `heartbeatSkip`), otherwise the wake's own payload. Deriving the
+      // coalescing key from anything else keys the lookup off a value the row
+      // does not contain.
+      const storedPayload = patch.payload !== undefined ? patch.payload : payload;
+      const coalescingIssueId = readWakeIssueIdFromPayload(storedPayload);
+      if (deferrable) {
+        // Write-time coalescing (SUP-15552): while the transient condition
+        // persists an agent can be skipped repeatedly (timer, assignment and
+        // comment-driven wakes). Coalesce a repeat deferrable skip of the SAME
+        // reason for the same (agent, issue) onto the existing pending row
+        // instead of inserting a fresh row, so the recovery sweep's candidate
+        // set stays bounded and per-reason blast-radius counts stay meaningful.
+        //
+        // A wake with no `payload.issueId` — a generic timer or on-demand wake —
+        // coalesces on (agent, reason, key) with `issueId` absent on both sides.
+        // Generic skips are re-driven by the sweep exactly like issue-bound
+        // ones, so leaving them uncoalesced would let a single agent under a
+        // long suppression accumulate one pending row per timer tick and crowd
+        // every other card out of the sweep's bounded candidate set. A generic
+        // wake carries no card-specific payload, so merging two of them loses
+        // nothing that the single re-drive does not deliver.
+        //
+        // Keyed on the card as recorded in the payload THIS WRITE STORES, not
+        // on the enriched context snapshot: the predicate below reads the
+        // stored `payload`, and the enriched snapshot can name a card the
+        // payload itself never carries, which would make the lookup and the row
+        // it is meant to find disagree.
+        //
+        // Both the key and the predicate derive from
+        // `WAKE_ISSUE_ID_PAYLOAD_PATHS` — the same list the replay sweep walks.
+        // Reading only `payload ->> 'issueId'` here was a live defect (SUP-15552
+        // review round 3): both worktree-cutoff sites resolve the issue
+        // themselves and record it under `heartbeatSkip.issueId`, so when the
+        // caller passed the card through `contextSnapshot` rather than
+        // `payload` the key was null on both sides and the predicate degraded
+        // to `payload ->> 'issueId' IS NULL`. Two cutoff skips for DIFFERENT
+        // cards then matched each other, the second coalesced onto the first —
+        // which does not replace `payload` — and the second card's id was lost
+        // with the only wake that carried it. Exactly this card's defect,
+        // reintroduced by the fix for it.
+        //
+        // Coalescing is keyed on `idempotencyKey` as well as (agent, issue,
+        // reason). A wake that carries an idempotency key is a DISTINCT durable
+        // signal — a question-response continuation, a review-path recovery, a
+        // disposition repair — whose payload (interactionId, recoveryActionId,
+        // …) is the thing being delivered. Merging it into an unrelated generic
+        // wake for the same card would discard that payload and its key, and
+        // the delivery would be lost exactly as this card's own defect lost a
+        // wake. Only like-for-like keys coalesce.
+        const existing = await executor
+          .select({ id: agentWakeupRequests.id, coalescedCount: agentWakeupRequests.coalescedCount })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "skipped"),
+              isNull(agentWakeupRequests.finishedAt),
+              eq(agentWakeupRequests.reason, skipReason),
+              idempotencyKey === null
+                ? isNull(agentWakeupRequests.idempotencyKey)
+                : eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+              coalescingIssueId
+                ? sql`${wakeIssueIdFromPayloadSql} = ${coalescingIssueId}`
+                : sql`${wakeIssueIdFromPayloadSql} IS NULL`,
+            ),
+          )
+          .limit(1);
+        if (existing[0]) {
+          await executor
+            .update(agentWakeupRequests)
+            .set({
+              coalescedCount: existing[0].coalescedCount + 1,
+              requestedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, existing[0].id));
+          return;
+        }
+      }
+      await executor.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
         agentId,
         source,
         triggerDetail,
         reason: skipReason,
         payload,
+        // A deferrable skip stays `status: "skipped"`. The deferral is carried
+        // by `finishedAt IS NULL` (not finished — the recovery sweep may still
+        // re-drive it) plus the deferrable `reason`, NOT by a new status value.
+        //
+        // This is load-bearing. Three partial unique indexes on
+        // agent_wakeup_requests, and the app-level guards that mirror them,
+        // deliberately exclude `status = 'skipped'` so that a wake which was
+        // skipped can be re-enqueued under the same idempotency key:
+        //   agent_wakeup_requests_review_path_recovery_idempotency_uq
+        //     … WHERE idempotency_key LIKE 'issue_review_path_lost:%'
+        //           AND status <> 'skipped'
+        //   agent_wakeup_requests_disposition_repair_idempotency_uq
+        //     … WHERE idempotency_key LIKE 'issue_disposition_repair:%'
+        //           AND status <> 'skipped'
+        //   agent_wakeup_requests_question_response_delivery_idempotency_uq
+        //     … WHERE idempotency_key LIKE 'question-response:%'
+        //           AND status NOT IN ('skipped', 'failed', 'cancelled')
+        // A distinct status such as `skipped_deferrable` satisfies every one of
+        // those predicates, so a deferrably-skipped wake would occupy the
+        // idempotency slot permanently: the retry path either sees a live wake
+        // that will never run and stands down forever, or inserts and takes a
+        // 23505 unique violation. Keeping the value `skipped` preserves all
+        // three contracts unchanged.
         status: "skipped",
         requestedByActorType: opts.requestedByActorType ?? null,
         requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        finishedAt: new Date(),
+        idempotencyKey,
+        finishedAt: deferrable ? null : new Date(),
         ...patch,
       });
     };
-    const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
+    const writeSkippedHeartbeatRequest = async (
+      skipReason: WakeSkipReasonInternal,
+      details: Record<string, unknown>,
+      executor: WakeupWriteExecutor = db,
+    ) => {
       await writeSkippedRequest(skipReason, {
         payload: {
           ...(payload ?? {}),
           heartbeatSkip: details,
         },
-      });
+      }, executor);
     };
 
     const schedulingSuppression = await getSchedulingSuppression();
@@ -21245,26 +21413,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (worktreeExecutionCutoff && issue.createdAt < worktreeExecutionCutoff) {
-          await tx.insert(agentWakeupRequests).values({
-            companyId: agent.companyId,
-            agentId,
-            source,
-            triggerDetail,
-            reason: "heartbeat.worktree_execution_cutoff",
-            payload: {
-              ...(payload ?? {}),
-              heartbeatSkip: {
-                reason: "worktree_execution_cutoff",
-                cutoff: worktreeExecutionCutoff.toISOString(),
-                issueId: issue.id,
-              },
-            },
-            status: "skipped",
-            requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
-            finishedAt: new Date(),
-          });
+          // `heartbeat.worktree_execution_cutoff` is classified DEFERRABLE: it
+          // describes the instance (a worktree-runtime execution cutoff that is
+          // moved or lifted by an operator), not the work or the agent. This
+          // site — the resolved-issue path inside the execution-lock
+          // transaction — is the live one for an issue-bound wake, so it must
+          // go through the shared classification write rather than inserting a
+          // finished row of its own. A hand-rolled `finishedAt: new Date()`
+          // here is invisible to `reconcileDeferredWakeupReplay` (which selects
+          // `status = 'skipped' AND finished_at IS NULL`) and the wake is
+          // destroyed exactly as this card's defect destroyed the original one.
+          // Runs on `tx` so the skip write is atomic with the issue-row lock
+          // this transaction holds, and it inherits the same deferrable
+          // write/coalescing contract as every other deferrable skip.
+          await writeSkippedHeartbeatRequest("heartbeat.worktree_execution_cutoff", {
+            reason: "worktree_execution_cutoff",
+            cutoff: worktreeExecutionCutoff.toISOString(),
+            issueId: issue.id,
+          }, tx);
           return { kind: "skipped" as const };
         }
 
