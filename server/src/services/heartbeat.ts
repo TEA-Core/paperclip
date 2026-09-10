@@ -152,6 +152,13 @@ import {
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import {
+  HOST_BOOT_ID_CONTEXT_KEY,
+  buildHostRestartMessage,
+  detectHostRestart,
+  resolveHostBootId,
+  withHostBootIdInRunContext,
+} from "./host-boot-identity.js";
+import {
   ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
   ISSUE_PROGRESS_ACTIVITY_ACTIONS,
   ISSUE_REWAKE_LOOKBACK_MS,
@@ -14370,6 +14377,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const claimedAt = new Date();
+    const hostBootId = await resolveHostBootId();
     const responsibleUserId = await resolveResponsibleUserIdForRun({
       run,
       contextSnapshot: context,
@@ -14438,6 +14446,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   status: "running",
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
+                  contextSnapshot: withHostBootIdInRunContext(
+                    parseObject(lockedRun.contextSnapshot),
+                    hostBootId,
+                  ),
                   updatedAt: claimedAt,
                 })
                 .where(and(
@@ -14516,12 +14528,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 status: "running",
                 responsibleUserId,
-                startedAt: lockedRun.startedAt ?? claimedAt,
-                contextSnapshot: withQueuedCommentIdsInRunContext(
-                  lockedRun.contextSnapshot,
-                  liveIds,
-                ),
-                updatedAt: claimedAt,
+                 startedAt: lockedRun.startedAt ?? claimedAt,
+                 contextSnapshot: withHostBootIdInRunContext(
+                   withQueuedCommentIdsInRunContext(
+                     lockedRun.contextSnapshot,
+                     liveIds,
+                   ),
+                   hostBootId,
+                 ),
+                 updatedAt: claimedAt,
               })
               .where(and(
                 eq(heartbeatRuns.id, lockedRun.id),
@@ -14570,6 +14585,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           status: "running",
           responsibleUserId,
           startedAt: run.startedAt ?? claimedAt,
+          contextSnapshot: withHostBootIdInRunContext(
+            parseObject(run.contextSnapshot),
+            hostBootId,
+          ),
           updatedAt: claimedAt,
         })
         .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
@@ -15763,6 +15782,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const stillbornTtlMs = opts?.stillbornTtlMs ?? DEFAULT_STILLBORN_RUN_TTL_MS;
     const selfDeclaredRunTtlMs = opts?.selfDeclaredRunTtlMs ?? DEFAULT_SELF_DECLARED_RUN_TTL_MS;
     const now = new Date();
+    // Resolved once per sweep: the boot identity of THIS host. A lost process whose run
+    // recorded a different boot id was in flight on a previous boot and its host went down;
+    // we re-reap it as a host restart, not as an ordinary child crash. The distinction rides
+    // in the message + resultJson.hostRestart; errorCode stays process_lost.
+    const currentHostBootId = await resolveHostBootId();
 
     await dispatchPendingNativeStatusWakeups().catch((error) => {
       logger.warn(
@@ -15972,9 +15996,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // infrastructure-failure classifier and recovery routing, and a distinct code would silently
       // opt these runs out of all of it. The distinction rides in the message instead, which is
       // enough to tell them apart in triage.
-      const baseMessage = stillborn
+      let baseMessage = stillborn
         ? buildStillbornRunMessage(run, stillbornTtlMs)
         : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const hostRestartMarker = detectHostRestart({
+        recordedBootId: readNonEmptyString(runContext[HOST_BOOT_ID_CONTEXT_KEY]),
+        currentBootId: currentHostBootId,
+        detectedAt: now.toISOString(),
+      });
+      if (hostRestartMarker) baseMessage = buildHostRestartMessage(hostRestartMarker);
       const unmanagedBackgroundTaskEvidence = descendantOnlyCleanup
         ? {
           kind: "orphaned_process_group_cleanup",
@@ -16000,6 +16030,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
             },
           );
+          if (hostRestartMarker) result.hostRestart = hostRestartMarker;
           return result;
         })(),
       });
