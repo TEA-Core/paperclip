@@ -9,7 +9,9 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRuns,
   issues,
+  issueWatchdogs,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -176,6 +178,72 @@ describeEmbeddedPostgres("issue created without parent audit row (SUP-15668)", (
     return rows.length;
   }
 
+  /** A logged-in human user session. Like `boardActor`, this is a `type: "board"`
+   *  request actor, but with a session source so the create path reports a
+   *  non-agent `actorType`. Neither board keys nor user sessions may write the
+   *  audit row — only a genuine `actorType: "agent"` caller does. */
+  function userActor(companyId: string): Express.Request["actor"] {
+    return {
+      type: "board",
+      userId: "cloud-user-1",
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+      source: "session",
+      isInstanceAdmin: false,
+    };
+  }
+
+  /** Seed an active task-watchdog scope so a follow-up create with
+   *  `watchdogDiscovery` resolves as a valid product-bug follow-up. */
+  async function seedWatchdogScope(companyId: string, agentId: string) {
+    const [watchedIssue] = await db.insert(issues).values({
+      companyId,
+      title: "Watched source issue",
+      status: "in_progress",
+      priority: "medium",
+    }).returning();
+    await db.insert(issueWatchdogs).values({
+      companyId,
+      issueId: watchedIssue.id,
+      watchdogAgentId: agentId,
+      status: "active",
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      contextSnapshot: {
+        taskWatchdog: {
+          watchedIssueId: watchedIssue.id,
+          stopFingerprint: "fp-1",
+        },
+      },
+    });
+    return { runId, watchedIssueId: watchedIssue.id };
+  }
+
+  /** The audit write is fire-and-forget, so the row is not guaranteed to be
+   *  visible the instant the response returns. Poll until `target` matching rows
+   *  land (or the timeout elapses) so positive assertions are deterministic. */
+  async function waitForCreatedWithoutParentRows(companyId: string, target: number, timeoutMs = 3_000) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const rows = await createdWithoutParentRows(companyId);
+      if (rows.length >= target) return rows;
+      if (Date.now() >= deadline) return rows;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  /** For a no-row case, give a fire-and-forget write a brief grace window so a
+   *  spurious row would surface, then assert the count is still zero. */
+  async function expectNoCreatedWithoutParentRow(companyId: string, graceMs = 300) {
+    await new Promise((resolve) => setTimeout(resolve, graceMs));
+    expect(await createdWithoutParentRows(companyId)).toHaveLength(0);
+  }
+
   it("records exactly one issue.created_without_parent row when an agent creates a top-level issue", async () => {
     const companyId = await seedCompany("NPW");
     const agentId = await seedAgent(companyId);
@@ -188,7 +256,7 @@ describeEmbeddedPostgres("issue created without parent audit row (SUP-15668)", (
     const createdId = res.body.id as string;
     const createdIdentifier = res.body.identifier as string;
 
-    const rows = await createdWithoutParentRows(companyId);
+    const rows = await waitForCreatedWithoutParentRows(companyId, 1);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       entityType: "issue",
@@ -218,7 +286,7 @@ describeEmbeddedPostgres("issue created without parent audit row (SUP-15668)", (
       .send({ title: "Blocked orphan root", blockedByIssueIds: [blocker.id] })
       .expect(201);
 
-    const rows = await createdWithoutParentRows(companyId);
+    const rows = await waitForCreatedWithoutParentRows(companyId, 1);
     expect(rows).toHaveLength(1);
     expect(rows[0].details).toMatchObject({
       issueId: res.body.id,
@@ -237,7 +305,7 @@ describeEmbeddedPostgres("issue created without parent audit row (SUP-15668)", (
       .send({ parentId: parent.id, title: "Ordinary child" })
       .expect(201);
 
-    expect(await createdWithoutParentRows(companyId)).toHaveLength(0);
+    await expectNoCreatedWithoutParentRow(companyId);
   });
 
   it("records no issue.created_without_parent row when a board user creates a top-level issue", async () => {
@@ -250,7 +318,76 @@ describeEmbeddedPostgres("issue created without parent audit row (SUP-15668)", (
       .send({ title: "Board root card" })
       .expect(201);
 
-    expect(await createdWithoutParentRows(companyId)).toHaveLength(0);
+    await expectNoCreatedWithoutParentRow(companyId);
+  });
+
+  it("records no issue.created_without_parent row when a board user creates a child issue", async () => {
+    const companyId = await seedCompany("NBH");
+    await seedBoardMembership(companyId);
+    currentActor = boardActor(companyId);
+    const parent = await seedParent(companyId);
+
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "Board child card" })
+      .expect(201);
+
+    await expectNoCreatedWithoutParentRow(companyId);
+  });
+
+  it("records no issue.created_without_parent row when a user session creates a top-level issue", async () => {
+    const companyId = await seedCompany("NUT");
+    await seedBoardMembership(companyId);
+    currentActor = userActor(companyId);
+
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "User root card" })
+      .expect(201);
+
+    await expectNoCreatedWithoutParentRow(companyId);
+  });
+
+  it("records no issue.created_without_parent row when a user session creates a child issue", async () => {
+    const companyId = await seedCompany("NUH");
+    await seedBoardMembership(companyId);
+    currentActor = userActor(companyId);
+    const parent = await seedParent(companyId);
+
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "User child card" })
+      .expect(201);
+
+    await expectNoCreatedWithoutParentRow(companyId);
+  });
+
+  it("records exactly one issue.created_without_parent row when a task-watchdog product-bug follow-up create omits parentId", async () => {
+    // Regression: the audit trigger keys off the request body (no parentId),
+    // not the persisted parent, so a watchdog product-bug follow-up — a
+    // parentless agent create whose body omits parentId — must record a row
+    // even though it is otherwise excluded from the "orphan" intuition.
+    const companyId = await seedCompany("NWD");
+    const agentId = await seedAgent(companyId);
+    const { runId } = await seedWatchdogScope(companyId, agentId);
+    currentActor = { ...agentActor(companyId, agentId), runId };
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Watchdog product-bug follow-up",
+        watchdogDiscovery: { kind: "product_bug" },
+      })
+      .expect(201);
+    const createdId = res.body.id as string;
+
+    const rows = await waitForCreatedWithoutParentRows(companyId, 1);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      entityType: "issue",
+      entityId: createdId,
+      agentId,
+    });
   });
 
   it("still returns 201 and persists the issue when the audit insert fails for an agent top-level create", async () => {
@@ -268,6 +405,6 @@ describeEmbeddedPostgres("issue created without parent audit row (SUP-15668)", (
     const [persisted] = await db.select({ id: issues.id }).from(issues).where(eq(issues.id, createdId));
     expect(persisted).toMatchObject({ id: createdId });
     // The broken audit table swallowed the write; no row landed.
-    expect(await createdWithoutParentRows(companyId)).toHaveLength(0);
+    await expectNoCreatedWithoutParentRow(companyId);
   });
 });
