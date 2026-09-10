@@ -98,10 +98,27 @@ export function isTimerCandidateActionable(input: {
   return true;
 }
 
-// ADR-093 D1 / D3 — observability for a dispatch-suppressed candidate. Every
-// suppressed in_progress candidate writes exactly one activity row naming the
-// failing disjuncts, so a suppressed card is auditable even before the D3
-// board-visible park lands.
+// ADR-093 D1 / D3 — observability for a dispatch-suppressed candidate.
+//
+// The `issue.timer_dispatch_suppressed` row is written ONLY as a side effect of
+// the assignee agent's own timer dispatch gate actually running for a tick. The
+// sole writer is `maybeLogTimerDispatchSuppressed` in services/heartbeat.ts,
+// which is called solely from `timerWorkLeaseState`, and that function runs
+// only on the timer path: the enqueue gate (when the heartbeat policy's
+// `skipTimerWhenNoActionableWork` is on) and the generic-timer-run claim gate.
+// Both of those require `tickTimers` to have enqueued a timer wake for the
+// agent, which in turn requires `heartbeat.enabled === true` (the default is
+// false) and an elapsed interval.
+//
+// So the D1 promise "every suppressed in_progress candidate writes a row"
+// holds only while the assignee's heartbeat is firing. A lost-wake in_progress
+// card (all five §2a disjuncts false, lastActivityAt outside the settle
+// window) is observed only on an agent whose timer is running; on an agent
+// whose heartbeat is not enabled or whose tick has not reached the gate, the
+// card is never enumerated as a timer candidate and no suppression row is due.
+// That silent, un-re-armed state is the residual gap this row is meant to make
+// visible. Recovery / re-dispatch of suppressed cards is SUP-15581's half; this
+// module defines the predicate and the payload but does not re-arm anything.
 export const TIMER_DISPATCH_SUPPRESSED_ACTION = "issue.timer_dispatch_suppressed";
 
 export function buildTimerDispatchSuppressionDetails(input: {
@@ -120,4 +137,27 @@ export function buildTimerDispatchSuppressionDetails(input: {
     lastActivityAt: input.lastActivityAt ? input.lastActivityAt.toISOString() : null,
     adr: "ADR-093-D1",
   };
+}
+
+// ADR-093 D1 — one row per suppression decision, not one per sweep pass.
+// timerWorkLeaseState runs on successive timer ticks (both the enqueue and
+// claim gates), so a persistently suppressed card must not emit a new
+// timer_dispatch_suppressed row on every tick — that would make the observability
+// row itself an activity stream. The decision is: emit iff the issue has no
+// timer_dispatch_suppressed row in the trailing dedup window. The caller
+// (services/heartbeat.ts) supplies the issue's most recent suppression timestamp
+// and this constant as the window.
+export const TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS = 10 * 60 * 1000;
+
+export function shouldEmitTimerDispatchSuppression(input: {
+  lastSuppressedAt: Date | null;
+  now: Date;
+  windowMs?: number;
+}): boolean {
+  const windowMs = input.windowMs ?? TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS;
+  if (input.lastSuppressedAt === null) return true;
+  // Strictly outside the trailing window (matches the existing
+  // `createdAt >= now - window` existence check: a row at exactly the window edge
+  // still counts as "in window" and suppresses the emit).
+  return input.now.getTime() - input.lastSuppressedAt.getTime() > windowMs;
 }

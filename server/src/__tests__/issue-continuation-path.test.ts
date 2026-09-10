@@ -4,8 +4,10 @@ import {
   evaluateIssueContinuationPath,
   IN_PROGRESS_SETTLE_WINDOW_MS,
   isTimerCandidateActionable,
-  toContinuationPathDate,
+  shouldEmitTimerDispatchSuppression,
   TIMER_DISPATCH_SUPPRESSED_ACTION,
+  TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS,
+  toContinuationPathDate,
 } from "../services/issue-continuation-path.js";
 
 // ADR-093 D1 (SUP-14880): the §2a live-continuation-path predicate moved out of
@@ -167,5 +169,117 @@ describe("buildTimerDispatchSuppressionDetails (ADR-093 D1/D3 observability)", (
     });
     expect(details.lastActivityAt).toBeNull();
     expect(details.settledWithinWindow).toBe(true);
+  });
+});
+
+// SUP-15600 regression: the exact shape of the lost-wake card SUP-15566 —
+// in_progress, all five §2a disjuncts false, lastActivityAt 4h stale (far
+// outside the 5-minute settle window). This is the shape that, per the
+// dispatch-path combinator, is "suppressed" (not actionable), and the payload
+// builder must carry the all-false disjuncts so the single suppression row is
+// auditable.
+describe("SUP-15566 lost-wake shape (regression)", () => {
+  const FOUR_HOURS_AGO = new Date(NOW.getTime() - 4 * 60 * 60 * 1000);
+  const ALL_FALSE = {
+    activeRun: false,
+    monitorNextCheckAtInFuture: false,
+    watchdog: false,
+    scheduledRetry: false,
+    activeRecoveryAction: false,
+    successfulRunHandoffLive: false,
+  };
+
+  it("five disjuncts false + lastActivityAt 4h stale evaluates not-ok, all disjuncts false", () => {
+    const result = evaluateIssueContinuationPath(
+      {
+        activeRun: false,
+        monitorNextCheckAt: null,
+        watchdog: null,
+        scheduledRetry: null,
+        activeRecoveryAction: null,
+        successfulRunHandoff: { hasLiveContinuation: false },
+        lastActivityAt: FOUR_HOURS_AGO,
+      },
+      { now: NOW },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.settledWithinWindow).toBe(false);
+    expect(result.disjuncts).toEqual(ALL_FALSE);
+  });
+
+  it("the dispatch-path combinator marks that card suppressed (not actionable)", () => {
+    const result = evaluateIssueContinuationPath(
+      {
+        activeRun: false,
+        monitorNextCheckAt: null,
+        watchdog: null,
+        scheduledRetry: null,
+        activeRecoveryAction: null,
+        successfulRunHandoff: null,
+        lastActivityAt: FOUR_HOURS_AGO,
+      },
+      { now: NOW },
+    );
+    expect(isTimerCandidateActionable({ status: "in_progress", leased: false, continuationOk: result.ok })).toBe(false);
+  });
+
+  it("the suppression payload carries the failing disjuncts for that card", () => {
+    const result = evaluateIssueContinuationPath(
+      {
+        activeRun: false,
+        monitorNextCheckAt: null,
+        watchdog: null,
+        scheduledRetry: null,
+        activeRecoveryAction: null,
+        successfulRunHandoff: null,
+        lastActivityAt: FOUR_HOURS_AGO,
+      },
+      { now: NOW },
+    );
+    const details = buildTimerDispatchSuppressionDetails({
+      issueId: "sup-15566",
+      status: "in_progress",
+      disjuncts: result.disjuncts,
+      settledWithinWindow: result.settledWithinWindow,
+      lastActivityAt: result.lastActivityAt,
+    });
+    expect(details.status).toBe("in_progress");
+    expect(details.disjuncts).toEqual(ALL_FALSE);
+    expect(details.settledWithinWindow).toBe(false);
+    expect(details.reason).toBe("in_progress_without_live_continuation_path");
+    expect(details.lastActivityAt).toBe(FOUR_HOURS_AGO.toISOString());
+  });
+});
+
+// SUP-15600 criterion 3: one row per suppression decision, not one per sweep
+// pass. The dedup decision is extracted here as a pure, testable contract so the
+// "at most one row per trailing window" guarantee is asserted directly rather
+// than only by the DB query inside heartbeat.ts.
+describe("shouldEmitTimerDispatchSuppression (one row per suppression decision)", () => {
+  it("emits when the issue has no prior suppression row", () => {
+    expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt: null, now: NOW })).toBe(true);
+  });
+
+  it("suppresses a second decision within the trailing window", () => {
+    const lastSuppressedAt = new Date(NOW.getTime() - 5 * 60 * 1000); // 5 min ago < 10 min window
+    expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt, now: NOW })).toBe(false);
+  });
+
+  it("emits again once the trailing window has elapsed", () => {
+    const lastSuppressedAt = new Date(NOW.getTime() - 15 * 60 * 1000); // 15 min ago > 10 min window
+    expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt, now: NOW })).toBe(true);
+  });
+
+  it("a row at exactly the window edge still counts as in-window (matches gte semantics)", () => {
+    const lastSuppressedAt = new Date(NOW.getTime() - TIMER_DISPATCH_SUPPRESSED_DEDUP_WINDOW_MS);
+    expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt, now: NOW })).toBe(false);
+  });
+
+  it("honors an explicitly supplied window", () => {
+    const lastSuppressedAt = new Date(NOW.getTime() - 4 * 60 * 1000);
+    // 5-min window: last suppression 4 min ago is inside it -> suppress (no emit).
+    expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt, now: NOW, windowMs: 5 * 60 * 1000 })).toBe(false);
+    // 3-min window: last suppression 4 min ago is outside it -> emit.
+    expect(shouldEmitTimerDispatchSuppression({ lastSuppressedAt, now: NOW, windowMs: 3 * 60 * 1000 })).toBe(true);
   });
 });
