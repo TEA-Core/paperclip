@@ -107,6 +107,11 @@ import {
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
 import {
+  HOST_BOOT_ID_CONTEXT_KEY,
+  readHostRestartMarker,
+  resolveHostBootId,
+} from "../services/host-boot-identity.ts";
+import {
   readHotRestartIntent,
   resolveLegacyHotRestartIntentPath,
   resolveHotRestartReportPath,
@@ -1378,6 +1383,89 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runtimeMode: "native",
     });
     expect(runs[0]?.retryOfRunId).toBeNull();
+  });
+
+  it("marks a lost process as a host restart when the recorded boot id differs, keeping process_lost", async () => {
+    const currentBootId = await resolveHostBootId();
+    expect(typeof currentBootId).toBe("string");
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+      contextSnapshot: { [HOST_BOOT_ID_CONTEXT_KEY]: "boot-previous-host" },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const run = runs[0];
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.resultJson).toMatchObject({ stopReason: "process_lost" });
+    const marker = readHostRestartMarker(run?.resultJson as Record<string, unknown> | null);
+    expect(marker).not.toBeNull();
+    expect(marker).toMatchObject({
+      detected: true,
+      runBootId: "boot-previous-host",
+      currentBootId: currentBootId!,
+    });
+    expect(new Date(marker!.detectedAt).toISOString()).toBe(marker!.detectedAt);
+    expect(run?.error).toContain("Host restart detected");
+    expect(run?.error).toContain("boot-previous-host");
+    expect(run?.error).toContain(currentBootId!);
+  });
+
+  it("does not mark a host restart when the recorded boot id matches the current one", async () => {
+    const currentBootId = await resolveHostBootId();
+    expect(typeof currentBootId).toBe("string");
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+      contextSnapshot: { [HOST_BOOT_ID_CONTEXT_KEY]: currentBootId as string },
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.reapOrphanedRuns();
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const run = runs[0];
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.resultJson).toMatchObject({ stopReason: "process_lost" });
+    expect(readHostRestartMarker(run?.resultJson as Record<string, unknown> | null)).toBeNull();
+    expect((run?.resultJson as Record<string, unknown> | null)?.hostRestart).toBeUndefined();
+    expect(run?.error).toBe("Process lost -- child pid 999999999 is no longer running");
+  });
+
+  it("treats a run with no recorded boot id as unknown, not a host restart", async () => {
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+      includeIssue: false,
+      contextSnapshot: {},
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.reapOrphanedRuns();
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const run = runs[0];
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.resultJson).toMatchObject({ stopReason: "process_lost" });
+    expect(readHostRestartMarker(run?.resultJson as Record<string, unknown> | null)).toBeNull();
+    expect(run?.error).toBe("Process lost -- child pid 999999999 is no longer running");
   });
 
   it("skips generic timer wakes without invoking an adapter when no assigned work is actionable", async () => {
