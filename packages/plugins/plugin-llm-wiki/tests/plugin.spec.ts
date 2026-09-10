@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -3492,6 +3493,91 @@ Duplicate headings receive stable suffixes.
     expect(files.get("wiki/concepts/plugin-boundaries.md")).toContain("Plugin Boundaries");
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_pages"))).toBe(true);
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_page_revisions"))).toBe(true);
+  });
+
+  it("rejects write-page with missing/misnamed/empty contents and leaves the page byte-identical", async () => {
+    const harness = createTestHarness({ manifest });
+    const original = "# Shared\n\nExisting body.\n";
+    const files = new Map<string, string>([
+      ["wiki/concepts/shared.md", original],
+    ]);
+    const writes: Array<{ path: string; contents: string }> = [];
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const value = files.get(relativePath);
+      if (value == null) throw new Error("missing");
+      return value;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      writes.push({ path: relativePath, contents });
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+
+    // Misnamed field (`content` instead of `contents`) must fail before any write.
+    await expect(
+      harness.performAction("write-page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path: "wiki/concepts/shared.md",
+        content: "This used to be silently coerced into an empty overwrite.",
+      }),
+    ).rejects.toThrow("contents is required and must be a string");
+
+    // Absent `contents` must fail before any write.
+    await expect(
+      harness.performAction("write-page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path: "wiki/concepts/shared.md",
+      }),
+    ).rejects.toThrow("contents is required and must be a string");
+
+    // Explicit empty-string contents is rejected with a distinct message from the
+    // absent/misnamed case (AC3: explicit "" stays distinguishable from absent),
+    // and still performs no write.
+    await expect(
+      harness.performAction("write-page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path: "wiki/concepts/shared.md",
+        contents: "",
+      }),
+    ).rejects.toThrow("contents must be a non-empty string (empty contents are not allowed)");
+
+    // Absent `path` must fail before any write instead of defaulting to "".
+    await expect(
+      harness.performAction("write-page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        contents: "# New\n",
+      }),
+    ).rejects.toThrow("path is required and must be a non-empty string");
+
+    // write-template receives the same guard.
+    await expect(
+      harness.performAction("write-template", {
+        companyId: COMPANY_ID,
+        path: "AGENTS.md",
+        content: "wrong field name",
+      }),
+    ).rejects.toThrow("contents is required and must be a string");
+
+    // No write occurred for any rejected call; the target page is byte-identical.
+    expect(writes).toHaveLength(0);
+    expect(files.get("wiki/concepts/shared.md")).toBe(original);
+
+    // A well-formed call still succeeds and returns sha256(contents).
+    const next = "# Shared\n\nUpdated body.\n";
+    const result = await harness.performAction<{ hash: string }>("write-page", {
+      companyId: COMPANY_ID,
+      wikiId: "default",
+      path: "wiki/concepts/shared.md",
+      contents: next,
+    });
+    expect(result.hash).toBe(createHash("sha256").update(next, "utf8").digest("hex"));
+    expect(files.get("wiki/concepts/shared.md")).toBe(next);
   });
 
   it("blocks agent-tool writes to AGENTS.md but allows explicit board edits", async () => {

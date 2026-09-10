@@ -65,6 +65,23 @@ function stringField(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function requirePagePath(params: Record<string, unknown>): string {
+  const path = stringField(params.path);
+  if (!path) throw new Error("path is required and must be a non-empty string");
+  return path;
+}
+
+function requirePageContents(params: Record<string, unknown>): string {
+  const contents = params.contents;
+  if (typeof contents !== "string") {
+    throw new Error("contents is required and must be a string");
+  }
+  if (contents.length === 0) {
+    throw new Error("contents must be a non-empty string (empty contents are not allowed)");
+  }
+  return contents;
+}
+
 function routineKeyField(value: unknown): (typeof WIKI_MAINTENANCE_ROUTINE_KEYS)[number] {
   const routineKey = stringField(value);
   if (!routineKey) {
@@ -319,8 +336,8 @@ const plugin = definePlugin({
         companyId: readCompanyIdFromParams(params),
         wikiId: stringField(params.wikiId),
         spaceSlug: stringField(params.spaceSlug),
-        path: stringField(params.path) ?? "",
-        contents: typeof params.contents === "string" ? params.contents : "",
+        path: requirePagePath(params),
+        contents: requirePageContents(params),
         expectedHash: stringField(params.expectedHash),
         summary: stringField(params.summary),
         sourceRefs: params.sourceRefs,
@@ -331,8 +348,8 @@ const plugin = definePlugin({
     ctx.actions.register("write-template", async (params) => {
       return writeTemplate(ctx, {
         companyId: readCompanyIdFromParams(params),
-        path: stringField(params.path) ?? "",
-        contents: typeof params.contents === "string" ? params.contents : "",
+        path: requirePagePath(params),
+        contents: requirePageContents(params),
       });
     });
 
