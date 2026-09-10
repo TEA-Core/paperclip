@@ -97,6 +97,15 @@ if [[ ! -e "$base_cwd/.paperclip/config.json" && ! -L "$base_cwd/.paperclip/conf
   # PAPERCLIP_CONFIG at the target. Naming the target as its own source is never
   # right, so leave the source to the CLI in that case.
   if [[ "$source_config_path" != "$worktree_config_path" ]]; then
+    # A deployment may be configured entirely from process state (for example, a
+    # shared DATABASE_URL in the environment) and have no on-disk instance config
+    # anywhere. That is not an error: there is simply no seed source to clone
+    # from, so exit without demanding one. A source that is present but malformed
+    # (a symlink or a non-canonical alias) is still refused by the CLI.
+    if [[ ! -e "$source_config_path" && ! -L "$source_config_path" ]]; then
+      echo "No on-disk Paperclip seed source config found; the self-contained worktree has nothing to seed." >&2
+      exit 0
+    fi
     source_config_args=(--from-config "$source_config_path")
   fi
 fi
