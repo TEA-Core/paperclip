@@ -6,8 +6,8 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { prepareBaseRepoForWorkspace } from "../services/workspace-runtime.ts";
 
-// SUP-13858 — auto-reset a diverged base repo when every ahead commit is already
-// upstream by patch-id.
+// SUP-13858 / SUP-15572 — auto-reset a diverged base repo when every ahead commit's
+// content is already byte-identical at the base ref.
 //
 // `diverged` never resets, by design: resetting over real local work would be data
 // loss. But the rule has no escape hatch, so a base repo whose ahead commits are ALL
@@ -15,9 +15,15 @@ import { prepareBaseRepoForWorkspace } from "../services/workspace-runtime.ts";
 // were duplicates or belonged to a cancelled issue and ZERO were unshipped, and the
 // repo stayed stuck for 16 days.
 //
+// SUP-15572 replaced the patch-id proof — bounded to a 1000-commit window, so a repo
+// past the cap could never self-heal, and blind to fold-merge and squash absorption —
+// with a CONTENT proof: for each file the ahead work touched, HEAD's blob must equal
+// the base ref's blob. There is no commit-count window, and the proof is scoped to the
+// ahead work's files so behind-drift is never miscounted as lost work.
+//
 // Because the only thing this feature does is authorise discarding commits, the tests
-// are weighted towards the refusals: a unique commit, a merge commit, and a missing
-// merge base must each leave the repo untouched with the old warning verbatim.
+// are weighted towards the refusals: a unique commit and a merge that carries unique
+// content must each leave the repo untouched with the old warning verbatim.
 
 const execFileAsync = promisify(execFile);
 const tempRoots: string[] = [];
@@ -51,8 +57,9 @@ async function git(args: string[], cwd: string): Promise<string> {
 }
 
 /**
- * A commit whose DIFF is byte-identical wherever it is applied, so the patch-ids match
- * — but whose commit MESSAGE differs between the two repos, so the shas do not.
+ * A commit whose DIFF is byte-identical wherever it is applied, so the resulting blob
+ * is byte-identical in both repos — but whose commit MESSAGE differs between the two
+ * repos, so the commit shas do not.
  *
  * The message argument is load-bearing. With identical author, committer, tree, parent
  * and message, git produces the identical sha in both repos within the same second, and
@@ -101,8 +108,8 @@ describe("base repo auto-reset when every ahead commit is already upstream (SUP-
   it("resets, and pins the prior tip on a rescue ref that still resolves afterwards", async () => {
     const f = await makeOriginAndClone();
 
-    // Same change committed in both places: different sha, identical diff, so identical
-    // patch-id. This is the shape the whole feature is about.
+    // Same change committed in both places: different commit sha, byte-identical
+    // resulting files. This is the shape the whole feature is about.
     await commit(f.work, "dup1", "local dup1");
     await commit(f.work, "dup2", "local dup2");
     await commit(f.seed, "dup1", "upstream dup1");
@@ -121,7 +128,7 @@ describe("base repo auto-reset when every ahead commit is already upstream (SUP-
 
     const warning = resetWarning(warnings);
     expect(warning, `warnings were: ${JSON.stringify(warnings, null, 2)}`).toBeDefined();
-    expect(warning).toContain("all 2 ahead commit(s) were already upstream");
+    expect(warning).toContain("all 2 ahead commit(s) carried only content already at the base ref");
     expect(warning).toContain(priorTip.slice(0, 12));
     expect(divergedWarning(warnings)).toBeUndefined();
 
@@ -134,10 +141,12 @@ describe("base repo auto-reset when every ahead commit is already upstream (SUP-
     expect(await git(["log", "--format=%s", "-1", refMatch![0]], f.work)).toBe("local dup2");
   });
 
-  it("bounds the patch-id windows with an explicit --max-count on BOTH sides", async () => {
-    // Acceptance 4. Asserted on the real argv, via a git shim on PATH, because "it is
-    // bounded" is a safety property and reading it off the source would not prove the
-    // running command carries it.
+  it("proves duplication by content, not by a bounded patch-id window", async () => {
+    // SUP-15572. Asserted on the real argv, via a git shim on PATH, because "how the
+    // proof runs" is a safety property and reading it off the source would not prove
+    // the running commands. The point of the new proof: there is NO commit-count window
+    // and NO patch-id. The ahead work's files are enumerated against the resolved
+    // merge-base sha, and each is compared to the base ref by blob OID.
     const f = await makeOriginAndClone();
     await commit(f.work, "dup1", "local dup1");
     await commit(f.seed, "dup1", "upstream dup1");
@@ -161,24 +170,21 @@ describe("base repo auto-reset when every ahead commit is already upstream (SUP-
     pathBackup = undefined;
 
     const argv = await fs.readFile(logFile, "utf8");
-    const revLists = argv.split("\n").filter((line) => line.startsWith("rev-list --max-count="));
+    const lines = argv.split("\n").filter((line) => line.length > 0);
 
-    // The ahead side and the upstream side are separately capped. The upstream window
-    // is anchored on the resolved merge-base sha, not on a ref, so it cannot silently
-    // widen if the ref moves.
-    expect(revLists.some((l) => /rev-list --max-count=\d+ origin\/main\.\.HEAD$/.test(l))).toBe(true);
+    // No patch-id at all — the proof is content, not a stable-diff fingerprint.
+    expect(lines.filter((l) => l.includes("patch-id")), `patch-id argv: ${lines.join("\n")}`).toEqual([]);
+    // No commit-count window on either side — nothing is bounded by --max-count.
+    expect(lines.filter((l) => l.includes("--max-count")), `--max-count argv: ${lines.join("\n")}`).toEqual([]);
+
+    // The ahead work's files ARE enumerated, anchored on the resolved merge-base sha.
     expect(
-      revLists.some((l) => /rev-list --max-count=\d+ [0-9a-f]{40}\.\.origin\/main$/.test(l)),
-      `rev-list calls were:\n${revLists.join("\n")}`,
+      lines.some((l) => /diff -z --name-only --no-renames [0-9a-f]{40} HEAD$/.test(l)),
+      `diff calls were:\n${lines.filter((l) => l.startsWith("diff ")).join("\n")}`,
     ).toBe(true);
-    // No rev-list that ENUMERATES commits is unbounded. `--count` is excluded on
-    // purpose: it returns two integers rather than a commit list, it predates this
-    // change, and it is not what feeds the patch-id comparison.
-    const unboundedEnumerations = argv
-      .split("\n")
-      .filter((l) => l.startsWith("rev-list "))
-      .filter((l) => !l.includes("--max-count") && !l.includes("--count"));
-    expect(unboundedEnumerations, `unbounded rev-list enumerations: ${unboundedEnumerations.join(" | ")}`).toEqual([]);
+    // And the touched file is compared to the base ref by blob OID, both sides.
+    expect(lines.some((l) => /rev-parse HEAD:dup1$/.test(l)), `rev-parse argv:\n${lines.join("\n")}`).toBe(true);
+    expect(lines.some((l) => /rev-parse origin\/main:dup1$/.test(l)), `rev-parse argv:\n${lines.join("\n")}`).toBe(true);
   });
 });
 
@@ -208,9 +214,11 @@ describe("base repo auto-reset refuses whenever duplication is not proven (SUP-1
     expect(await git(["for-each-ref", "refs/paperclip/rescue"], f.work)).toBe("");
   });
 
-  it("fails closed on a merge commit — no single patch-id means UNIQUE, never duplicate", async () => {
-    // Acceptance 5. Every other ahead commit here IS a proven duplicate, so the merge
-    // commit is the only thing standing between this repo and a reset.
+  it("resets a fold merge whose resulting content is already upstream (merge-absorption immune)", async () => {
+    // SUP-15572. Under patch-id this merge could never prove duplicate: a merge has no
+    // single patch-id. Under the content proof it resets — the merge's resulting files
+    // are byte-identical at the base ref, so nothing unshipped is lost. This is the
+    // fold-merge absorption the old proof was blind to.
     const f = await makeOriginAndClone();
     const base = await git(["rev-parse", "HEAD"], f.work);
 
@@ -222,6 +230,30 @@ describe("base repo auto-reset refuses whenever duplication is not proven (SUP-1
 
     await commit(f.seed, "dupA", "upstream dupA");
     await commit(f.seed, "dupB", "upstream dupB");
+    await commit(f.seed, "c4");
+    await publish(f);
+
+    const originMain = await git(["rev-parse", "origin/main"], f.work);
+    const { warnings } = await prepare(f.work);
+
+    expect(await git(["rev-parse", "HEAD"], f.work)).toBe(originMain);
+    expect(resetWarning(warnings)).toBeDefined();
+    expect(divergedWarning(warnings)).toBeUndefined();
+  });
+
+  it("a merge that carries unique content still blocks the reset", async () => {
+    // SUP-15572 fail-closed guard: the content proof is merge-immune, but a merge that
+    // introduces a file the base ref does not have still vetoes the whole reset.
+    const f = await makeOriginAndClone();
+    const base = await git(["rev-parse", "HEAD"], f.work);
+
+    await commit(f.work, "dupA", "local dupA");
+    await git(["switch", "-q", "-c", "side", base], f.work);
+    await commit(f.work, "side-only");
+    await git(["switch", "-q", "main"], f.work);
+    await git(["merge", "-q", "--no-ff", "-m", "merge side", "side"], f.work);
+
+    await commit(f.seed, "dupA", "upstream dupA");
     await commit(f.seed, "c4");
     await publish(f);
 
