@@ -13,6 +13,7 @@ import {
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -519,6 +520,55 @@ describeEmbeddedPostgres("issue review attention", () => {
         state: "covered",
         paths: expect.arrayContaining([expect.objectContaining({ kind: "queued_wake" })]),
       });
+    });
+
+    it("does not count a same-card active run owned by another agent as the participant's card-scoped live path", async () => {
+      const { companyId, agentId } = await seed();
+      const otherAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: otherAgentId,
+        companyId,
+        name: "Other Agent",
+        role: "engineer",
+        status: "idle",
+      });
+      const issueId = await insertReview({
+        companyId,
+        agentId,
+        identifier: "RVA-FRESH-5",
+        executionState: pendingAgentState(agentId, pastGraceIso()),
+      });
+      // Another agent is actively running ON THIS CARD: a live path for the
+      // card, but not a maintained action path for the participant.
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: otherAgentId,
+        status: "running",
+        contextSnapshot: { issueId },
+      });
+
+      const row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === issueId);
+      const kinds = (row?.reviewAttention?.paths ?? []).map((path) => path.kind);
+      expect(kinds).not.toContain("execution_participant");
+      expect(kinds).toContain("active_run");
+    });
+
+    it("treats a legacy stage without pendingSince as stale even when updatedAt was just bumped by an unrelated update", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await insertReview({
+        companyId,
+        agentId,
+        identifier: "RVA-FRESH-6",
+        executionState: {
+          status: "pending",
+          currentParticipant: { type: "agent", agentId },
+        },
+      });
+      await db.update(issues).set({ updatedAt: new Date() }).where(eq(issues.id, issueId));
+
+      const row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === issueId);
+      const kinds = (row?.reviewAttention?.paths ?? []).map((path) => path.kind);
+      expect(kinds).not.toContain("execution_participant");
     });
   });
 });
