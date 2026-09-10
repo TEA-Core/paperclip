@@ -2798,7 +2798,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe("feature/live");
     await expect(readGit(
       repoRoot,
-      ["for-each-ref", "--format=%(refname:short)", "refs/heads/paperclip/rescue"],
+      ["for-each-ref", "--format=%(refname:short)", "refs/paperclip/rescue"],
     )).resolves.toBeNull();
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);

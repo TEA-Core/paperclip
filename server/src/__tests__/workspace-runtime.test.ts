@@ -39,6 +39,7 @@ import {
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   preserveUnpushedWorktreeCommits,
+  pruneExpiredRescueRefs,
   removeGitWorktreeArtifact,
   resolveGitExecutable,
   prepareBaseRepoForWorkspace,
@@ -1790,7 +1791,7 @@ describe("realizeExecutionWorkspace", () => {
 
     // Nothing was discarded: the modification is recoverable from a rescue ref.
     const rescueRefs = (await readGit(repoRoot, [
-      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+      "for-each-ref", "--format=%(refname)", "refs/paperclip/rescue/base-repo",
     ])).split("\n").filter(Boolean);
     expect(rescueRefs.some((ref) => ref.endsWith("/worktree"))).toBe(true);
     expect(rescueRefs.some((ref) => ref.endsWith("/head"))).toBe(true);
@@ -2187,7 +2188,7 @@ describe("realizeExecutionWorkspace", () => {
       expect.arrayContaining([expect.stringContaining("was restored to")]),
     );
     const firstRescueRefs = (await readGit(repoRoot, [
-      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+      "for-each-ref", "--format=%(refname)", "refs/paperclip/rescue/base-repo",
     ])).split("\n").filter(Boolean);
     const firstCount = firstRescueRefs.length;
     expect(firstCount).toBeGreaterThan(0);
@@ -2197,7 +2198,7 @@ describe("realizeExecutionWorkspace", () => {
       expect.arrayContaining([expect.stringContaining("was restored to")]),
     );
     const secondRescueRefs = (await readGit(repoRoot, [
-      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+      "for-each-ref", "--format=%(refname)", "refs/paperclip/rescue/base-repo",
     ])).split("\n").filter(Boolean);
     expect(secondRescueRefs.length).toBe(firstCount);
   });
@@ -2216,7 +2217,7 @@ describe("realizeExecutionWorkspace", () => {
     await realizeWorktreeForTest(repoRoot, "master");
 
     const rescueRefs = (await readGit(repoRoot, [
-      "for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/base-repo",
+      "for-each-ref", "--format=%(refname)", "refs/paperclip/rescue/base-repo",
     ])).split("\n").filter(Boolean);
     const prefixes = new Set(rescueRefs.map((ref) => ref.replace(/\/(head|worktree)$/, "")));
     expect(prefixes.size).toBe(2);
@@ -8965,7 +8966,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(repoRoot, [
       "for-each-ref",
       "--format=%(refname:short)",
-      "refs/heads/paperclip/rescue",
+      "refs/paperclip/rescue",
     ])).resolves.toBe("");
   }, 20_000);
 
@@ -13595,5 +13596,110 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
         }),
       },
     });
+  });
+});
+
+describe("pruneExpiredRescueRefs (SUP-15576)", () => {
+  // SUP-15576: base-repo rescue refs pin a PRE-EXISTING tip, so the pinned commit's
+  // committerdate is the wrong age signal. The pruner must age base-repo refs by the
+  // `<stamp>` baked into the ref name, keep aging worktree refs by committerdate, and
+  // never touch refs/paperclip/manual-rescue.
+
+  const pruneTempRoots: string[] = [];
+  afterEach(async () => {
+    while (pruneTempRoots.length > 0) {
+      const dir = pruneTempRoots.pop();
+      if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  async function gitIsolated(cwd: string, args: string[], extraEnv: Record<string, string> = {}): Promise<string> {
+    const { stdout } = await execFileAsync("git", args, {
+      cwd,
+      env: {
+        ...process.env,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_AUTHOR_NAME: "test",
+        GIT_AUTHOR_EMAIL: "test@example.com",
+        GIT_COMMITTER_NAME: "test",
+        GIT_COMMITTER_EMAIL: "test@example.com",
+        ...extraEnv,
+      },
+    });
+    return stdout.trim();
+  }
+
+  async function commitAt(cwd: string, file: string, committerDate?: string): Promise<string> {
+    await fs.writeFile(path.join(cwd, file), `${file}\n`, "utf8");
+    await gitIsolated(cwd, ["add", file]);
+    await gitIsolated(
+      cwd,
+      ["commit", "-qm", file],
+      committerDate ? { GIT_COMMITTER_DATE: committerDate, GIT_AUTHOR_DATE: committerDate } : {},
+    );
+    return gitIsolated(cwd, ["rev-parse", "HEAD"]);
+  }
+
+  async function makeRepo(): Promise<string> {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "sup15576-prune-"));
+    pruneTempRoots.push(root);
+    await gitIsolated(root, ["init", "-q", "-b", "main"]);
+    await fs.writeFile(path.join(root, "README.md"), "base\n", "utf8");
+    await gitIsolated(root, ["add", "README.md"]);
+    await gitIsolated(root, ["commit", "-qm", "base"]);
+    return root;
+  }
+
+  const verify = (cwd: string, ref: string) =>
+    gitIsolated(cwd, ["rev-parse", "--verify", ref]).catch(() => null);
+
+  it("ages base-repo rescue refs by their name stamp, not the pinned tip's committerdate", async () => {
+    const root = await makeRepo();
+    // A tip committed long ago... and a tip committed now.
+    const oldTip = await commitAt(root, "old", "2020-01-01T00:00:00Z");
+    const freshTip = await commitAt(root, "fresh");
+
+    // Old stamp but fresh tip → the ref is old by its stamp, so it must be pruned.
+    await gitIsolated(root, ["update-ref", "refs/paperclip/rescue/base-repo/20200101T000000Z/head", freshTip]);
+    // Fresh stamp but old tip → the ref is fresh by its stamp, so it must survive.
+    const nowStamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+    await gitIsolated(root, ["update-ref", `refs/paperclip/rescue/base-repo/${nowStamp}/head`, oldTip]);
+    // Undatable base-repo ref (no `<stamp>` prefix) → skipped, never pruned.
+    await gitIsolated(root, ["update-ref", "refs/paperclip/rescue/base-repo/undatable/head", oldTip]);
+
+    await pruneExpiredRescueRefs(root);
+
+    expect(await verify(root, "refs/paperclip/rescue/base-repo/20200101T000000Z/head")).toBe(null);
+    expect(await verify(root, `refs/paperclip/rescue/base-repo/${nowStamp}/head`)).toBe(oldTip);
+    expect(await verify(root, "refs/paperclip/rescue/base-repo/undatable/head")).toBe(oldTip);
+  });
+
+  it("still ages worktree rescue refs by committerdate (regression)", async () => {
+    const root = await makeRepo();
+    const oldTip = await commitAt(root, "old", "2020-01-01T00:00:00Z");
+    const freshTip = await commitAt(root, "fresh");
+
+    await gitIsolated(root, ["update-ref", "refs/paperclip/rescue/ws-old", oldTip]);
+    await gitIsolated(root, ["update-ref", "refs/paperclip/rescue/ws-new", freshTip]);
+
+    await pruneExpiredRescueRefs(root);
+
+    expect(await verify(root, "refs/paperclip/rescue/ws-old")).toBe(null);
+    expect(await verify(root, "refs/paperclip/rescue/ws-new")).toBe(freshTip);
+  });
+
+  it("never touches refs/paperclip/manual-rescue, even when it pins an old tip", async () => {
+    const root = await makeRepo();
+    const oldTip = await commitAt(root, "old", "2020-01-01T00:00:00Z");
+
+    await gitIsolated(root, ["update-ref", "refs/paperclip/manual-rescue/operator/record", oldTip]);
+    // Seed an expired base-repo ref so the pruner actually runs its sweep.
+    await gitIsolated(root, ["update-ref", "refs/paperclip/rescue/base-repo/20200101T000000Z/head", oldTip]);
+
+    await pruneExpiredRescueRefs(root);
+
+    expect(await verify(root, "refs/paperclip/manual-rescue/operator/record")).toBe(oldTip);
+    expect(await verify(root, "refs/paperclip/rescue/base-repo/20200101T000000Z/head")).toBe(null);
   });
 });
