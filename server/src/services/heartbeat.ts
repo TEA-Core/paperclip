@@ -621,6 +621,44 @@ const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
   CONFIGURATION_INCOMPLETE_FAILURE_CODE,
   WORKSPACE_VALIDATION_FAILURE_CODE,
 ]);
+// SUP-15589: how many consecutive pre-adapter setup failures on one issue are
+// tolerated before automatic re-dispatch is refused. See
+// countConsecutivePreAdapterSetupFailures for the loop this bounds.
+const PRE_ADAPTER_SETUP_FAILURE_MAX_ATTEMPTS = 3;
+const PRE_ADAPTER_SETUP_FAILURE_LOOKBACK = 50;
+// Count the run of consecutive pre-adapter setup failures at the newest end of an
+// issue's terminal runs.
+//
+// SUP-15589: an unbounded re-dispatch loop alternates a stale-run handoff
+// (`source: "assignment"`, enqueued by enqueueStaleRunHandoffWake) that fails at
+// pre-adapter setup with a run cancelled as `issue_assignee_changed`. Neither
+// existing guard counts it:
+//   - the stale-run hop counter only advances when a handoff run is itself
+//     re-cancelled as stale; a handoff run that fails at setup never re-enters that
+//     gate, so the counter pins at 1, and
+//   - didAutomaticRecoveryFail keys on the failing run's own retryReason, which a
+//     stale-run handoff carries none of.
+// A replacement dispatch is only produced while the streak is below the bound. A run
+// cancelled before the adapter started (for example `issue_assignee_changed`) is not
+// a dispatch attempt, so the streak looks through it; a success or a run that
+// reached the adapter ends the streak.
+function countConsecutivePreAdapterSetupFailures(
+  rows: ReadonlyArray<{ status: string; errorCode: string | null }>,
+): number {
+  let consecutive = 0;
+  for (const row of rows) {
+    const preAdapterFailure =
+      row.errorCode != null && PRE_ADAPTER_SETUP_FAILURE_CODES.has(row.errorCode);
+    if (row.status === "succeeded") break;
+    if (row.status === "cancelled" && !preAdapterFailure) continue;
+    if (preAdapterFailure) {
+      consecutive += 1;
+      continue;
+    }
+    break;
+  }
+  return consecutive;
+}
 const OPENCODE_DB_GROWTH_LIMIT_RECOVERY_CAUSE = "opencode_db_growth_limit";
 export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_participant_recovery";
@@ -15045,6 +15083,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
+  // SUP-15589: read this issue's recent terminal runs and count how many in a row
+  // failed before the adapter started. Used by both automatic re-dispatch producers
+  // (the stale-run handoff and the immediate-recovery retry) to refuse a
+  // replacement once a pre-adapter setup failure keeps repeating.
+  async function countPreAdapterSetupFailureStreakForIssue(
+    companyId: string,
+    issueId: string,
+  ): Promise<number> {
+    const rows = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(PRE_ADAPTER_SETUP_FAILURE_LOOKBACK);
+    return countConsecutivePreAdapterSetupFailures(rows);
+  }
+
   async function enqueueStaleRunHandoffWake(input: {
     cancelledRun: typeof heartbeatRuns.$inferSelect;
     previousContext: Record<string, unknown>;
@@ -15079,6 +15140,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         "warn",
         "Stale-run handoff stopped at the hop limit; issue ownership is still contradictory",
         {},
+      );
+      return null;
+    }
+
+    // SUP-15589: bound the alternating `setup_failed` -> `issue_assignee_changed`
+    // cycle. These runs die before the adapter starts, so the hop counter above never
+    // advances (the handoff run is never itself re-cancelled as stale) and this path
+    // would otherwise hand off forever. Once the issue has accumulated enough
+    // consecutive pre-adapter setup failures, stop handing off and record the
+    // exhaustion on the run.
+    const preAdapterSetupFailureStreak = await countPreAdapterSetupFailureStreakForIssue(
+      cancelledRun.companyId,
+      issueId,
+    );
+    if (preAdapterSetupFailureStreak >= PRE_ADAPTER_SETUP_FAILURE_MAX_ATTEMPTS) {
+      logger.warn(
+        { runId: cancelledRun.id, issueId, handoffAgentId, preAdapterSetupFailureStreak },
+        "claimQueuedRun: pre-adapter setup failure bound reached; not re-enqueueing stale-run handoff",
+      );
+      await recordOutcome(
+        "warn",
+        `Bounded retry exhausted after ${preAdapterSetupFailureStreak} consecutive pre-adapter setup failures on this issue; not queueing another stale-run handoff`,
+        {
+          preAdapterSetupFailureStreak,
+          maxAttempts: PRE_ADAPTER_SETUP_FAILURE_MAX_ATTEMPTS,
+        },
       );
       return null;
     }
@@ -19587,6 +19674,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : null;
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
+    // SUP-15589: bound the same pre-adapter setup failure loop from the
+    // immediate-recovery side. The entry path the 869-run incident took is the
+    // stale-run handoff in enqueueStaleRunHandoffWake (`source: "assignment"` via
+    // enqueueWakeup), which alternates with this retry: an assignment dispatch fails
+    // `setup_failed` before the adapter starts, the re-dispatch flips the assignee,
+    // that flip cancels the in-flight automation run as `issue_assignee_changed`, and
+    // the cycle repeats. Count the issue's consecutive pre-adapter setup failures and
+    // block this retry once the bound is reached instead of queueing another.
+    const preAdapterSetupFailureStreak =
+      contextIssueId != null &&
+      run.errorCode != null &&
+      PRE_ADAPTER_SETUP_FAILURE_CODES.has(run.errorCode)
+        ? await countPreAdapterSetupFailureStreakForIssue(run.companyId, contextIssueId)
+        : 0;
+    const preAdapterSetupLoopBounded =
+      preAdapterSetupFailureStreak >= PRE_ADAPTER_SETUP_FAILURE_MAX_ATTEMPTS;
+
     const promotionResult = await db.transaction(async (tx) => {
       // Lock the context issue (if any) AND every issue that still references this run.
       //
@@ -20543,6 +20647,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
         isOpenCodeDatabaseGrowthLimitFailedRun(run) ||
+        preAdapterSetupLoopBounded ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
       if (shouldBlockImmediately) {
         const workspaceValidationFailure = isWorkspaceValidationFailedRun(run);
@@ -20669,6 +20774,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     if (promotionResult?.kind === "blocked") {
+      if (preAdapterSetupLoopBounded) {
+        // SUP-15589: record a non-null retryExhaustedReason (getRetryExhaustedReason
+        // matches this lifecycle message) on the run whose re-dispatch was refused.
+        await appendRunEvent(run, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: `Bounded retry exhausted after ${preAdapterSetupFailureStreak} consecutive pre-adapter setup failures on this issue; no further automatic re-dispatch will be queued`,
+          payload: {
+            issueId: contextIssueId,
+            errorCode: run.errorCode,
+            preAdapterSetupFailureStreak,
+            maxAttempts: PRE_ADAPTER_SETUP_FAILURE_MAX_ATTEMPTS,
+          },
+        });
+      }
       await recovery.escalateStrandedAssignedIssue({
         issue: promotionResult.issue,
         previousStatus: promotionResult.previousStatus as "todo" | "in_progress" | "in_review",

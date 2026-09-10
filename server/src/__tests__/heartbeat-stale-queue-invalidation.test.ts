@@ -2068,6 +2068,164 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(allRuns[0]?.id).toBe(runId);
   });
 
+  it("bounds the alternating pre-adapter setup_failed / issue_assignee_changed cycle and records retry exhaustion", async () => {
+    // SUP-15589: an assignment dispatch fails `setup_failed` before the adapter
+    // starts, the re-dispatch flips the assignee, that flip cancels the in-flight
+    // run as `issue_assignee_changed`, and the cycle repeats. Neither the stale-run
+    // hop counter (it never advances when the handoff run dies at setup) nor
+    // didAutomaticRecoveryFail (keyed on a retryReason a stale-run handoff lacks)
+    // counted it, so 869 runs burned in 82 minutes with retryExhaustedReason null.
+    // Once the issue accumulates enough consecutive pre-adapter setup failures, the
+    // stale-run handoff must refuse to re-dispatch and record the exhaustion.
+    const { companyId, agentId: currentOwnerId } = await seedCompanyAndAgent({
+      agentName: "CurrentOwner",
+    });
+    const outgoingAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: outgoingAgentId,
+      companyId,
+      name: "OutgoingOwner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stuck in a pre-adapter setup failure loop",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: currentOwnerId,
+    });
+
+    // Three consecutive pre-adapter setup failures on this issue — the bound.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: currentOwnerId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        errorCode: "setup_failed",
+        startedAt: new Date(),
+        finishedAt: new Date(),
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+    }
+
+    // A queued run for the stale owner: the assignee has since flipped to
+    // currentOwnerId, so claiming it fails staleness and would normally hand off.
+    const { runId: staleRunId } = await seedQueuedRun({
+      companyId,
+      agentId: outgoingAgentId,
+      issueId,
+      wakeReason: "issue_assigned",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, staleRunId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    }, 10_000);
+
+    // Give a runaway handoff a chance to produce more runs, then require the bound
+    // to have held: three seeded failures plus the single cancelled run, no
+    // replacement, and a non-null retryExhaustedReason on the cancelled run.
+    await waitForCondition(async () => (await heartbeat.getRetryExhaustedReason(staleRunId)) != null, 3_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const staleRun = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, staleRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(staleRun?.status).toBe("cancelled");
+    expect(staleRun?.errorCode).toBe("issue_assignee_changed");
+
+    const allRuns = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(allRuns).toHaveLength(4);
+
+    const exhaustionReason = await heartbeat.getRetryExhaustedReason(staleRunId);
+    expect(exhaustionReason).toContain("Bounded retry exhausted");
+  });
+
+  it("still hands off a stale run while the pre-adapter setup failure streak is below the bound", async () => {
+    // The bound must not break the ordinary handoff path: below the threshold, a
+    // stale run still hands off to the issue's current owner.
+    const { companyId, agentId: currentOwnerId } = await seedCompanyAndAgent({
+      agentName: "CurrentOwner",
+    });
+    const outgoingAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: outgoingAgentId,
+      companyId,
+      name: "OutgoingOwner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Recovering from a transient setup failure",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: currentOwnerId,
+    });
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: currentOwnerId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        errorCode: "setup_failed",
+        startedAt: new Date(),
+        finishedAt: new Date(),
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+    }
+
+    const { runId: staleRunId } = await seedQueuedRun({
+      companyId,
+      agentId: outgoingAgentId,
+      issueId,
+      wakeReason: "issue_assigned",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    const handedOff = await waitForCondition(async () => {
+      const rows = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, currentOwnerId));
+      return rows.length > 2;
+    }, 10_000);
+    expect(handedOff).toBe(true);
+
+    const exhaustionReason = await heartbeat.getRetryExhaustedReason(staleRunId);
+    expect(exhaustionReason).toBeNull();
+  });
+
   it("still runs comment-driven wakes on in_review issues even when the agent is no longer the current participant", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const otherAgentId = randomUUID();
