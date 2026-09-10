@@ -23,6 +23,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 vi.hoisted(() => {
   process.env.PAPERCLIP_HOME = "/tmp/paperclip-test-home";
@@ -63,6 +64,7 @@ async function createApp(db: Db, actor: Express.Request["actor"]) {
   });
   app.use("/api", issueRoutes(db, {} as any));
   app.use("/api", activityRoutes(db));
+  app.use(reportUnexpectedRouteError("permissions-upgrade-boundary-routes"));
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error" });
   });

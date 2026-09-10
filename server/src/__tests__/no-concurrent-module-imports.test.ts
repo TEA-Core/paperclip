@@ -94,11 +94,57 @@ function matchBracket(source: string, open: number): number {
 /** A dynamic `import(` that is not a `typeof import(` type position. */
 const DYNAMIC_IMPORT = /(?<![.\w])import\s*\(/;
 
-function findConcurrentImports(source: string): number[] {
+/**
+ * Index just past the balanced `<...>` that starts at `open`, or -1 when the
+ * angle brackets do not balance. Nested type arguments (`Promise.all<[Promise<T>]>`)
+ * are why this counts depth rather than searching for the first `>`.
+ */
+function skipTypeArguments(source: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < source.length; i += 1) {
+    if (source[i] === "<") depth += 1;
+    else if (source[i] === ">") {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+/** Index of the first non-whitespace character at or after `from`. */
+function skipWhitespace(source: string, from: number): number {
+  let i = from;
+  while (i < source.length && /\s/.test(source[i]!)) i += 1;
+  return i;
+}
+
+/**
+ * Index of the `[` opening the array literal a `Promise.all` at `at` is called
+ * with, or -1 when this call site is not `Promise.all(<array literal>)`.
+ *
+ * The explicit-type-argument form is matched too. `Promise.all<[typeof
+ * import("a"), typeof import("b")]>([import("a"), import("b")])` resolves both
+ * graphs concurrently exactly like the bare form, so a matcher that only looked
+ * for the literal `Promise.all([` would let it through.
+ */
+function findCallArrayLiteral(source: string, at: number): number {
+  let i = skipWhitespace(source, at + "Promise.all".length);
+  if (source[i] === "<") {
+    i = skipTypeArguments(source, i);
+    if (i === -1) return -1;
+    i = skipWhitespace(source, i);
+  }
+  if (source[i] !== "(") return -1;
+  i = skipWhitespace(source, i + 1);
+  return source[i] === "[" ? i : -1;
+}
+
+export function findConcurrentImports(source: string): number[] {
   const lines: number[] = [];
-  const needle = "Promise.all([";
+  const needle = "Promise.all";
   for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + 1)) {
-    const open = at + needle.length - 1;
+    const open = findCallArrayLiteral(source, at);
+    if (open === -1) continue;
     const close = matchBracket(source, open);
     if (close === -1) continue;
     const body = source.slice(open + 1, close);
@@ -122,6 +168,46 @@ describe("module graphs are never resolved concurrently", () => {
 
   it("finds the server test files to scan", () => {
     expect(testFiles.length).toBeGreaterThan(300);
+  });
+
+  // The scanner is the whole guard, so its own matcher is worth pinning. These
+  // fixtures are strings rather than files so the shapes stay readable and this
+  // file does not have to contain the patterns it bans at statement position.
+  it("matches every concurrent-import shape, and nothing else", () => {
+    const A = 'vi.importActual<typeof import("../a.js")>("../a.js")';
+    const B = 'import("../b.js")';
+
+    // Bare call, both import forms.
+    expect(findConcurrentImports(`const x = await Promise.all([${A}, ${A}]);`)).toEqual([1]);
+    expect(findConcurrentImports(`const x = await Promise.all([${B}, ${B}]);`)).toEqual([1]);
+    expect(findConcurrentImports(`const x = await Promise.all([${A}, ${B}]);`)).toEqual([1]);
+
+    // Explicit type arguments, including a nested `<>` inside them, and
+    // whitespace or a newline before the array literal.
+    expect(
+      findConcurrentImports(
+        `const x = await Promise.all<[typeof import("../a.js"), typeof import("../b.js")]>([${B}, ${B}]);`,
+      ),
+    ).toEqual([1]);
+    expect(
+      findConcurrentImports(`const x = await Promise.all<[Promise<number>]> ( [ ${B} ] );`),
+    ).toEqual([1]);
+    expect(findConcurrentImports(`const x = await Promise.all([\n  ${B},\n]);`)).toEqual([1]);
+
+    // Reports the line the call starts on, and finds more than one per file.
+    expect(findConcurrentImports(`a\nconst x = await Promise.all([${B}]);`)).toEqual([2]);
+    expect(
+      findConcurrentImports(`const x = Promise.all([${B}]);\nconst y = Promise.all([${A}]);`),
+    ).toEqual([1, 2]);
+
+    // Not offenders: no module resolution, a type-only `typeof import`, an
+    // argument that is not an array literal, and a sequential await.
+    expect(findConcurrentImports("const x = await Promise.all([foo(), bar()]);")).toEqual([]);
+    expect(
+      findConcurrentImports('const x: Promise<[typeof import("../a.js")]> = q;'),
+    ).toEqual([]);
+    expect(findConcurrentImports("const x = await Promise.all(jobs.map((j) => j()));")).toEqual([]);
+    expect(findConcurrentImports(`const a = await ${B};\nconst b = await ${B};`)).toEqual([]);
   });
 
   it("has no Promise.all that resolves more than one module graph", () => {

@@ -12,6 +12,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { companyTransferRunService } from "../services/company-transfer-runs.js";
 import { sweepAbandonedImportTransferSpools } from "../services/company-import-transfers.js";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockCompanyService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -243,6 +244,7 @@ describeEmbeddedPostgres("company import transfer routes", () => {
       next();
     });
     built.use("/api/companies", companyRoutes(db, undefined, { importTransferSpoolRoot: spoolRoot }));
+    built.use(reportUnexpectedRouteError("company-import-transfer-routes"));
     built.use(errorHandler);
     return built;
   }

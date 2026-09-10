@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 function createSelectChain(rows: unknown[]) {
   const query = {
@@ -68,6 +69,7 @@ async function createApp(
       inviteResolutionNetwork: network,
     }),
   );
+  app.use(reportUnexpectedRouteError("invite-test-resolution-route"));
   app.use(middleware.errorHandler);
   return app;
 }

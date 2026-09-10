@@ -20,6 +20,7 @@ import {
 } from "../services/github-credential.js";
 import { GITHUB_PROBE_URL_BY_SCOPE } from "../routes/diagnostics.js";
 import type { Server } from "node:http";
+import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const FIXTURE_TOKEN = "ghp_test_token_value_for_unit_tests_only";
 const FIXTURE_APP_TOKEN = "ghs_test_installation_token_for_unit_tests_only";
@@ -1089,6 +1090,7 @@ describe("diagnostics route", () => {
       next();
     });
     app.use("/api", diagnosticsRoutes(mockDb));
+    app.use(reportUnexpectedRouteError("github-credential"));
     return app;
   }
 
