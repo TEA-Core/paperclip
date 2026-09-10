@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -334,7 +334,11 @@ import {
   type AgentOrgRow,
 } from "./agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
-import { isDeferrableWakeSkipReason as isDeferrableWakeSkipReasonInternal } from "./wake-skip-classification.js";
+import {
+  isDeferrableWakeSkipReason as isDeferrableWakeSkipReasonInternal,
+  readWakeIssueIdFromPayload,
+  WAKE_ISSUE_ID_PAYLOAD_PATHS,
+} from "./wake-skip-classification.js";
 import type { WakeSkipReason as WakeSkipReasonInternal } from "./wake-skip-classification.js";
 import {
   redactQuarantinedBodyForHigherTrust,
@@ -7854,6 +7858,27 @@ export {
   isDeferrableWakeSkipReason,
 } from "./wake-skip-classification.js";
 export type { WakeSkipReason, WakeSkipClass } from "./wake-skip-classification.js";
+
+// The SQL twin of `readWakeIssueIdFromPayload`, generated from the SAME path
+// list rather than hand-written, so the coalescing predicate and the key it is
+// matched against cannot disagree about which card a deferred wake names
+// (SUP-15552 review round 3). Yields:
+//   COALESCE(payload ->> 'issueId', payload ->> 'taskId',
+//            payload -> 'heartbeatSkip' ->> 'issueId')
+// Segments are bound as parameters and cast to text so Postgres resolves the
+// `jsonb -> text` operator rather than the `jsonb -> integer` overload.
+const wakeIssueIdFromPayloadSql = sql`COALESCE(${sql.join(
+  WAKE_ISSUE_ID_PAYLOAD_PATHS.map((path) =>
+    path.reduce<SQL>(
+      (expr, segment, index) =>
+        index === path.length - 1
+          ? sql`${expr} ->> ${segment}::text`
+          : sql`${expr} -> ${segment}::text`,
+      sql`${agentWakeupRequests.payload}`,
+    ),
+  ),
+  sql`, `,
+)})`;
 
 // Skip writes happen both outside and inside the issue-execution transaction,
 // so the shared write helper takes the executor explicitly instead of closing
@@ -20918,6 +20943,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     ) => {
       const deferrable = isDeferrableWakeSkipReasonInternal(skipReason);
       const idempotencyKey = opts.idempotencyKey ?? null;
+      // The payload this call actually stores: `patch.payload` when the caller
+      // overrode it (every `writeSkippedHeartbeatRequest` does, to attach
+      // `heartbeatSkip`), otherwise the wake's own payload. Deriving the
+      // coalescing key from anything else keys the lookup off a value the row
+      // does not contain.
+      const storedPayload = patch.payload !== undefined ? patch.payload : payload;
+      const coalescingIssueId = readWakeIssueIdFromPayload(storedPayload);
       if (deferrable) {
         // Write-time coalescing (SUP-15552): while the transient condition
         // persists an agent can be skipped repeatedly (timer, assignment and
@@ -20935,11 +20967,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // wake carries no card-specific payload, so merging two of them loses
         // nothing that the single re-drive does not deliver.
         //
-        // Keyed on `issueIdFromPayload`, not the enriched `issueId`: the
-        // predicate below reads `payload ->> 'issueId'`, and `payload` is what
-        // this insert actually writes. The enriched context snapshot can name a
-        // card the payload itself never carried, which would make the lookup
-        // and the row it is meant to find disagree.
+        // Keyed on the card as recorded in the payload THIS WRITE STORES, not
+        // on the enriched context snapshot: the predicate below reads the
+        // stored `payload`, and the enriched snapshot can name a card the
+        // payload itself never carries, which would make the lookup and the row
+        // it is meant to find disagree.
+        //
+        // Both the key and the predicate derive from
+        // `WAKE_ISSUE_ID_PAYLOAD_PATHS` — the same list the replay sweep walks.
+        // Reading only `payload ->> 'issueId'` here was a live defect (SUP-15552
+        // review round 3): both worktree-cutoff sites resolve the issue
+        // themselves and record it under `heartbeatSkip.issueId`, so when the
+        // caller passed the card through `contextSnapshot` rather than
+        // `payload` the key was null on both sides and the predicate degraded
+        // to `payload ->> 'issueId' IS NULL`. Two cutoff skips for DIFFERENT
+        // cards then matched each other, the second coalesced onto the first —
+        // which does not replace `payload` — and the second card's id was lost
+        // with the only wake that carried it. Exactly this card's defect,
+        // reintroduced by the fix for it.
         //
         // Coalescing is keyed on `idempotencyKey` as well as (agent, issue,
         // reason). A wake that carries an idempotency key is a DISTINCT durable
@@ -20962,9 +21007,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey === null
                 ? isNull(agentWakeupRequests.idempotencyKey)
                 : eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-              issueIdFromPayload
-                ? sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueIdFromPayload}`
-                : sql`${agentWakeupRequests.payload} ->> 'issueId' IS NULL`,
+              coalescingIssueId
+                ? sql`${wakeIssueIdFromPayloadSql} = ${coalescingIssueId}`
+                : sql`${wakeIssueIdFromPayloadSql} IS NULL`,
             ),
           )
           .limit(1);

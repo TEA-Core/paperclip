@@ -65,3 +65,47 @@ export function wakeSkipClassForReason(reason: string | null | undefined): WakeS
 export function isDeferrableWakeSkipReason(reason: string | null | undefined): boolean {
   return wakeSkipClassForReason(reason) === "deferrable";
 }
+
+// Which card a deferred wake belongs to, as recorded in `payload` — the single
+// source of truth for that derivation (SUP-15552 review round 3).
+//
+// Three writers name the card in three places and all of them are load-bearing:
+//   - `issueId`               — the ordinary issue-bound wake payload;
+//   - `taskId`                — the interchangeable spelling `enrichWakeContextSnapshot` accepts;
+//   - `heartbeatSkip.issueId` — the ONLY place the card appears when the caller
+//                               passed it through `contextSnapshot` instead of
+//                               `payload` and a skip site resolved the issue
+//                               itself (both worktree-cutoff sites do this).
+//
+// Every consumer of "which card is this wake for" MUST derive it from this
+// list. Two consumers deriving it two ways is this card's own defect class:
+// round 2 was a write that bypassed the classification, round 3 was the
+// coalescing predicate reading `payload ->> 'issueId'` while the writer stored
+// the card under `heartbeatSkip.issueId` — which silently merged two different
+// cards' deferred wakes onto one row and destroyed the second card's signal.
+// The paths are exported so the SQL predicate is built from the same list the
+// TypeScript reader walks and the two cannot drift.
+export const WAKE_ISSUE_ID_PAYLOAD_PATHS: readonly (readonly string[])[] = [
+  ["issueId"],
+  ["taskId"],
+  ["heartbeatSkip", "issueId"],
+];
+
+function readNonEmptyStringAt(value: unknown, path: readonly string[]): string | null {
+  let cursor: unknown = value;
+  for (const segment of path) {
+    if (typeof cursor !== "object" || cursor === null || Array.isArray(cursor)) return null;
+    cursor = (cursor as Record<string, unknown>)[segment];
+  }
+  if (typeof cursor !== "string") return null;
+  const trimmed = cursor.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+export function readWakeIssueIdFromPayload(payload: unknown): string | null {
+  for (const path of WAKE_ISSUE_ID_PAYLOAD_PATHS) {
+    const found = readNonEmptyStringAt(payload, path);
+    if (found) return found;
+  }
+  return null;
+}

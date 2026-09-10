@@ -80,7 +80,10 @@ import { isHeartbeatWakeOnDemandEnabled, parseHeartbeatPolicy } from "../heartbe
 // SUP-15552: shared with the heartbeat skip write path. Imported from the
 // standalone classification module, not from heartbeat.ts, which imports THIS
 // module — see wake-skip-classification.ts for why.
-import { DEFERRABLE_WAKE_SKIP_REASONS } from "../wake-skip-classification.js";
+import {
+  DEFERRABLE_WAKE_SKIP_REASONS,
+  readWakeIssueIdFromPayload,
+} from "../wake-skip-classification.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -8284,14 +8287,14 @@ export function recoveryService(db: Db, deps: {
     //     when the caller's payload never named it.
     // Reading only `payload.issueId` is the same drift-between-two-derivations
     // that let the cutoff skip stay terminal after it had been classified.
-    const readWakeIssueId = (payload: unknown) => {
-      const parsed = parseObject(payload);
-      return readNonEmptyString(parsed.issueId)
-        ?? readNonEmptyString(parsed.taskId)
-        ?? readNonEmptyString(parseObject(parsed.heartbeatSkip).issueId);
-    };
+    // Shared with the write path's coalescing key and its SQL twin
+    // (`WAKE_ISSUE_ID_PAYLOAD_PATHS` in wake-skip-classification.ts). This
+    // derivation existed here in a second, hand-written copy; the copy in
+    // heartbeat.ts read `payload.issueId` only, and the disagreement collapsed
+    // two cards' deferred cutoff wakes onto one row (SUP-15552 review round 3).
+    // One reader, one path list, no drift.
     const issueIdByWake = new Map<string, string | null>(
-      candidates.map((wake) => [wake.id, readWakeIssueId(wake.payload)]),
+      candidates.map((wake) => [wake.id, readWakeIssueIdFromPayload(wake.payload)]),
     );
     const candidateIssueIds = [
       ...new Set(
