@@ -3255,20 +3255,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return existingUnresolvedBlockerIssues(companyId, issueId).then((rows) => rows.map((row) => row.id));
   }
 
-  async function openChildIssues(issue: typeof issues.$inferSelect) {
-    return db
-      .select({ id: issues.id, identifier: issues.identifier })
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, issue.companyId),
-          eq(issues.parentId, issue.id),
-          visibleIssueCondition(),
-          notInArray(issues.status, ["done", "cancelled"]),
-        ),
-      );
-  }
-
   async function healthyOpenChildIssues(issue: typeof issues.$inferSelect) {
     const childCandidates = await db
       .select()
@@ -3291,10 +3277,36 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return openChildren;
   }
 
+  /**
+   * SUP-15590: a card that names an armed review/approval stage with a live
+   * participant is waiting on its OWN review stage, not on its children. Its
+   * continuation routes to that stage; this reconciler must not park the card
+   * on synthesized child edges and override the live review path.
+   */
+  function hasArmedReviewPathWithLiveParticipant(issue: typeof issues.$inferSelect): boolean {
+    const state = parseIssueExecutionState(issue.executionState);
+    if (!state) return false;
+    if (state.currentStageType !== "review" && state.currentStageType !== "approval") return false;
+    if (state.status !== "pending" && state.status !== "changes_requested") return false;
+    const participant = state.currentParticipant;
+    if (!participant) return false;
+    if (participant.type === "agent") return Boolean(participant.agentId);
+    if (participant.type === "user") return Boolean(participant.userId);
+    return false;
+  }
+
   async function resolveContinuationWaitingOnReview(issue: typeof issues.$inferSelect) {
+    // A card with an armed review/approval stage and a live participant is
+    // waiting on its OWN stage, not on its children. Return the card unchanged
+    // (truthy) so every caller treats the waiting-on-review report as disposed:
+    // parking on synthesized child edges would override the live review path,
+    // and handing it to the disposition-repair/escalation fallback would
+    // escalate or re-park a card that is not actually stuck.
+    if (hasArmedReviewPathWithLiveParticipant(issue)) return issue;
+
     const [existingBlockers, openChildren] = await Promise.all([
       existingUnresolvedBlockerIssues(issue.companyId, issue.id),
-      openChildIssues(issue),
+      healthyOpenChildIssues(issue),
     ]);
     const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
     if (blockedByIssueIds.length === 0) return null;

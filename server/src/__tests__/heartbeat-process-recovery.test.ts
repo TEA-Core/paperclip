@@ -4406,6 +4406,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const openChildTodoId = randomUUID();
     const openChildInProgressId = randomUUID();
     const doneChildId = randomUUID();
+    const deadChildId = randomUUID();
+    const liveMonitorAt = new Date(Date.now() + 3_600_000);
 
     await db.insert(issues).values([
       {
@@ -4415,6 +4417,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         title: "Sub-task still to do",
         status: "todo",
         priority: "medium",
+        monitorNextCheckAt: liveMonitorAt,
         issueNumber: 10,
         identifier: `${issuePrefix}-10`,
       },
@@ -4425,8 +4428,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         title: "Sub-task in progress",
         status: "in_progress",
         priority: "medium",
+        monitorNextCheckAt: liveMonitorAt,
         issueNumber: 11,
         identifier: `${issuePrefix}-11`,
+      },
+      {
+        id: deadChildId,
+        companyId,
+        parentId: issueId,
+        title: "Sub-task dead-parked with no live path",
+        status: "blocked",
+        priority: "medium",
+        issueNumber: 13,
+        identifier: `${issuePrefix}-13`,
       },
       {
         id: doneChildId,
@@ -4452,9 +4466,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // Original assignee is preserved — no reassignment to a recovery owner.
     expect(umbrella?.assigneeAgentId).toBe(agentId);
 
-    // Only the open children become first-class blockers; the done child is excluded.
+    // Only the open children that still have a live path become first-class
+    // blockers; the done child and the dead-parked child (no active execution
+    // path and no durable waiting path) are excluded.
     const blockers = await sourceBlockerIssueIds(companyId, issueId);
     expect(blockers.sort()).toEqual([openChildTodoId, openChildInProgressId].sort());
+    expect(blockers).not.toContain(deadChildId);
+    expect(blockers).not.toContain(doneChildId);
 
     // No stranded-recovery action/issue is opened for a deliberate wait.
     const recoveryIssues = await db
@@ -4471,6 +4489,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain(`${issuePrefix}-10`);
     expect(comments[0]?.body).toContain(`${issuePrefix}-11`);
     expect(comments[0]?.body).not.toContain(`${issuePrefix}-12`);
+    expect(comments[0]?.body).not.toContain(`${issuePrefix}-13`);
     // Plain language — the raw machine error code never leaks into the thread.
     expect(comments[0]?.body).not.toContain("issue_continuation_waiting_on_review");
     expect(comments[0]?.presentation).toMatchObject({
@@ -4571,6 +4590,158 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).not.toContain("another open issue");
     expect(comments[0]?.body).not.toContain(`${issuePrefix}-21`);
     expect(comments[0]?.body).not.toContain("issue_continuation_waiting_on_review");
+  });
+
+  it("does not park a card on synthesized child edges when a live review stage is armed (SUP-15552 replay)", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const reviewerId = randomUUID();
+    const reviewStageId = randomUUID();
+    // The card's real continuation is its own armed review stage (the reviewer),
+    // not its open children. The reconciler must route to that stage, not mint
+    // a child edge onto the card.
+    await db.update(issues).set({
+      executionState: {
+        status: "changes_requested",
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerId },
+        returnAssignee: { type: "agent", agentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: "changes_requested",
+      },
+    }).where(eq(issues.id, issueId));
+
+    const openChildId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: openChildId,
+        companyId,
+        parentId: issueId,
+        title: "Open sub-task with a live path",
+        status: "in_progress",
+        priority: "medium",
+        monitorNextCheckAt: new Date(Date.now() + 3_600_000),
+        issueNumber: 10,
+        identifier: `${issuePrefix}-10`,
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // The reconciler disposes the report against the card's own live review
+    // stage instead of parking it on the child.
+    expect(result.waitingOnReviewResolved).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.dispositionRepairRequeued).toBe(0);
+
+    const umbrella = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(umbrella?.status).toBe("in_progress");
+    expect(umbrella?.assigneeAgentId).toBe(agentId);
+    // No synthesized child edge and no pre-existing blocker edge were minted.
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+    // No "nothing you need to do" system comment for a park that did not happen.
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((c) => c.body.includes("This task is waiting on"))).toBe(false);
+    expect(comments.some((c) => c.body.includes("nothing you need to do"))).toBe(false);
+  });
+
+  it("does not park a card on synthesized child edges when a live approval stage is armed", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const approvalStageId = randomUUID();
+    await db.update(issues).set({
+      executionState: {
+        status: "pending",
+        currentStageId: approvalStageId,
+        currentStageIndex: 0,
+        currentStageType: "approval",
+        currentParticipant: { type: "user", userId: "local-board" },
+        returnAssignee: { type: "user", userId: "responsible-user" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+
+    const openChildId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: openChildId,
+        companyId,
+        parentId: issueId,
+        title: "Open sub-task with a live path",
+        status: "in_progress",
+        priority: "medium",
+        monitorNextCheckAt: new Date(Date.now() + 3_600_000),
+        issueNumber: 10,
+        identifier: "TAPPROV-10",
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.waitingOnReviewResolved).toBe(1);
+    const umbrella = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(umbrella?.status).toBe("in_progress");
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((c) => c.body.includes("This task is waiting on"))).toBe(false);
+  });
+
+  it("leaves a card for escalation when it has no live review path and no healthy child", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const deadChildId = randomUUID();
+    // The only child is dead-parked: no active execution path, no durable
+    // waiting path. There is also no live review/approval stage. The reconciler
+    // must not write a wait nobody can clear.
+    await db.insert(issues).values([
+      {
+        id: deadChildId,
+        companyId,
+        parentId: issueId,
+        title: "Dead-parked sub-task with no live path",
+        status: "blocked",
+        priority: "medium",
+        issueNumber: 10,
+        identifier: `${issuePrefix}-10`,
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.waitingOnReviewResolved).toBe(0);
+    // Left for the recovery/escalation path instead of a wait nobody can clear.
+    expect(result.dispositionRepairRequeued).toBe(1);
+    const umbrella = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(umbrella?.status).toBe("in_progress");
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((c) => c.body.includes("This task is waiting on"))).toBe(false);
   });
 
   it("repairs the PAP-16986 deliberate wait through the original owner when no target exists", async () => {
