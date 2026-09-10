@@ -51,6 +51,9 @@ vi.mock("../config.js", () => ({
   // tailnet-probe side effects.
   pendingReviewRearmWindowMsFromEnv: () =>
     Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_REARM_WINDOW_MS) || 30 * 60 * 1000),
+  // SUP-15565: issues.ts also imports this env-only participant-grace accessor.
+  pendingReviewParticipantGraceMsFromEnv: () =>
+    Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_PARTICIPANT_GRACE_MS) || 30 * 60 * 1000),
 }));
 
 vi.mock("../telemetry.ts", () => ({

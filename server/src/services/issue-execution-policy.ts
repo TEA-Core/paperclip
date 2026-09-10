@@ -819,6 +819,7 @@ function buildPendingState(input: {
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
+    pendingSince: new Date().toISOString(),
   };
 }
 

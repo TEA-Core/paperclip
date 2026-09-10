@@ -754,6 +754,14 @@ export interface IssueExecutionState {
   monitor?: IssueExecutionMonitorState | null;
   /** Consecutive agent-initiated changes-requested rounds on the current stage. */
   changesRequestedCount?: number;
+  /**
+   * When the current pending review stage armed (ISO). Bounds the review-
+   * attention `execution_participant` path so a live participant running only
+   * on other assignments cannot keep a card `covered` indefinitely (SUP-15565).
+   * Absent on rows armed before this shipped; the scorer falls back to the
+   * issue's `updatedAt`.
+   */
+  pendingSince?: string | null;
 }
 
 export interface IssueExecutionDecision {

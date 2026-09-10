@@ -159,7 +159,13 @@ describeEmbeddedPostgres("issue review attention", () => {
       companyId,
       agentId,
       identifier: "RVA-6",
-      executionState: { status: "pending", currentParticipant: { type: "agent", agentId } },
+      // Armed within the participant grace window (SUP-15565) so a live
+      // invokable participant is still a maintained execution_participant path.
+      executionState: {
+        status: "pending",
+        currentParticipant: { type: "agent", agentId },
+        pendingSince: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      },
     });
     const activeRunIssueId = await insertReview({ companyId, agentId, identifier: "RVA-7" });
     const recoveryIssueId = await insertReview({ companyId, agentId, identifier: "RVA-8" });
@@ -263,7 +269,13 @@ describeEmbeddedPostgres("issue review attention", () => {
       companyId,
       agentId,
       identifier: "RVA-ESC-2",
-      executionState: { status: "pending", currentParticipant: { type: "agent", agentId } },
+      // Armed within the participant grace window (SUP-15565): a live
+      // invokable participant still maintains the card.
+      executionState: {
+        status: "pending",
+        currentParticipant: { type: "agent", agentId },
+        pendingSince: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      },
     });
 
     const rows = await svc.list(companyId, { status: "in_review" });
@@ -415,6 +427,98 @@ describeEmbeddedPostgres("issue review attention", () => {
     expect(row?.reviewAttention).toMatchObject({
       state: "covered",
       paths: [expect.objectContaining({ kind: "queued_wake" })],
+    });
+  });
+
+  describe("execution_participant freshness gate (SUP-15565)", () => {
+    // A live, invokable review participant who has never been woken for this
+    // card must stop keeping the card `covered` indefinitely. The gate bounds
+    // the execution_participant path by the stage-arm grace window; past it,
+    // only a card-scoped live path (active run / non-stale queued wake on THIS
+    // card) keeps the card covered.
+
+    const pastGraceIso = () => new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const withinGraceIso = () => new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const pendingAgentState = (agentId: string, pendingSince: string) => ({
+      status: "pending",
+      currentParticipant: { type: "agent", agentId },
+      pendingSince,
+    });
+
+    it("stalls a card whose live participant is past the grace with no card-scoped path", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await insertReview({
+        companyId,
+        agentId,
+        identifier: "RVA-FRESH-1",
+        executionState: pendingAgentState(agentId, pastGraceIso()),
+      });
+
+      const row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === issueId);
+      expect(row?.reviewAttention).toMatchObject({ state: "stalled", paths: [] });
+    });
+
+    it("keeps a card covered via execution_participant when the stage armed within the grace", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await insertReview({
+        companyId,
+        agentId,
+        identifier: "RVA-FRESH-2",
+        executionState: pendingAgentState(agentId, withinGraceIso()),
+      });
+
+      const row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === issueId);
+      expect(row?.reviewAttention).toMatchObject({
+        state: "covered",
+        paths: [expect.objectContaining({ kind: "execution_participant" })],
+      });
+    });
+
+    it("stalls a card when its participant is past the grace but only busy on another card", async () => {
+      const { companyId, agentId } = await seed();
+      const cardIssueId = await insertReview({
+        companyId,
+        agentId,
+        identifier: "RVA-FRESH-3",
+        executionState: pendingAgentState(agentId, pastGraceIso()),
+      });
+      // The participant's only live activity is a run on a different in_review
+      // card; that run is not scoped to this card, so it does not maintain it.
+      const otherIssueId = await insertReview({ companyId, agentId, identifier: "RVA-FRESH-3B" });
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId,
+        status: "running",
+        contextSnapshot: { issueId: otherIssueId },
+      });
+
+      const row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === cardIssueId);
+      expect(row?.reviewAttention).toMatchObject({ state: "stalled", paths: [] });
+    });
+
+    it("keeps a card covered via queued_wake when the participant is past the grace but has a fresh card-scoped wake", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await insertReview({
+        companyId,
+        agentId,
+        identifier: "RVA-FRESH-4",
+        executionState: pendingAgentState(agentId, pastGraceIso()),
+      });
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "execution_review_requested",
+        status: "queued",
+        payload: { issueId, mutation: "update", rearm: true },
+        requestedAt: new Date(),
+      });
+
+      const row = (await svc.list(companyId, { status: "in_review" })).find((issue) => issue.id === issueId);
+      expect(row?.reviewAttention).toMatchObject({
+        state: "covered",
+        paths: expect.arrayContaining([expect.objectContaining({ kind: "queued_wake" })]),
+      });
     });
   });
 });

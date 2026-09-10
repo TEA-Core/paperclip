@@ -133,6 +133,14 @@ export function pendingReviewRearmWindowMsFromEnv(): number {
   return Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_REARM_WINDOW_MS) || 30 * 60 * 1000);
 }
 
+// Participant freshness window for the review-attention `execution_participant`
+// path (SUP-15565): a live review participant running only on other assignments
+// must not keep a card `covered` longer than this window after the stage armed.
+// Env-only, mirrors pendingReviewRearmWindowMsFromEnv.
+export function pendingReviewParticipantGraceMsFromEnv(): number {
+  return Math.max(30 * 60 * 1000, Number(process.env.PENDING_REVIEW_PARTICIPANT_GRACE_MS) || 30 * 60 * 1000);
+}
+
 export function loadConfig(): Config {
   const fileConfig = readConfigFile();
   const fileDatabaseMode =
