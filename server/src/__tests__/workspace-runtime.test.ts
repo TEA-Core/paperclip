@@ -1961,6 +1961,82 @@ describe("realizeExecutionWorkspace", () => {
     expect(divergedWarning).toContain("Ahead commits: Diverged commit");
   });
 
+  it("resets a base repo whose ahead content is already upstream, even when the upstream window exceeds the old 1000-commit cap", async () => {
+    // SUP-15572 regression: a base repo more than 1000 commits behind its base ref
+    // could never self-heal — the old proof bailed on the window cap before inspecting
+    // a single commit. The proof is now content, so a fully-duplicate ahead set resets
+    // regardless of how far behind the base is.
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+
+    // Seed one real upstream commit that the local ahead commit will mirror...
+    await fs.writeFile(path.join(sourceRepo, "dup.txt"), "dup\n", "utf8");
+    await runGit(sourceRepo, ["add", "dup.txt"]);
+    await runGit(sourceRepo, ["commit", "-m", "upstream dup"]);
+    // ...and one real upstream change to a base file, so the base repo is genuinely
+    // behind on content it has not synced. This is the incident shape: the two trees
+    // differ, so a naive whole-tree comparison would refuse and re-freeze the repo.
+    await fs.writeFile(path.join(sourceRepo, "drift.txt"), "drifted\n", "utf8");
+    await runGit(sourceRepo, ["add", "drift.txt"]);
+    await runGit(sourceRepo, ["commit", "-q", "-m", "upstream drift"]);
+    // ...then push the base repo far past the old 1000-commit cap.
+    for (let i = 0; i < 1000; i += 1) {
+      await runGit(sourceRepo, ["commit", "--allow-empty", "-q", "-m", `upstream filler ${i}`]);
+    }
+    await runGit(sourceRepo, ["push", remotePath, "master"]);
+    const remoteTip = await readGit(sourceRepo, ["rev-parse", "master"]);
+
+    // Local: the SAME content as a local-only ahead commit. The base repo is now 1
+    // ahead and 1002 behind, and its tree differs from the remote tip (drift.txt is
+    // only upstream).
+    await fs.writeFile(path.join(repoRoot, "dup.txt"), "dup\n", "utf8");
+    await runGit(repoRoot, ["add", "dup.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "local dup (already upstream)"]);
+
+    // Guard: the trees really do differ, so the reset below cannot be the trivial
+    // "identical trees" case — it is the scoped content proof doing the work.
+    expect(await readGit(sourceRepo, ["rev-parse", "master:drift.txt"])).toMatch(/^[0-9a-f]{40}$/);
+    await expect(readGit(repoRoot, ["rev-parse", "HEAD:drift.txt"])).rejects.toThrow();
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const resetWarning = workspace.warnings.find((w) => w.includes("was reset to") && w.includes("master"));
+    expect(resetWarning).toBeDefined();
+    expect(resetWarning).toContain("carried only content already at the base ref");
+    // The warn-only fallback did NOT fire: the reset, not a divergence warning, ran.
+    expect(workspace.warnings.some((w) => w.includes("has diverged from"))).toBe(false);
+    // And the base repo's HEAD actually moved to the remote tip.
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(remoteTip);
+  }, 90_000);
+
+  it("still preserves local commits when the ahead content is unique, even past the old 1000-commit window", async () => {
+    // Fail-closed guard: removing the window cap must not turn "far behind" into
+    // "auto reset". A genuinely-unique ahead commit is preserved, not discarded.
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+
+    await fs.writeFile(path.join(sourceRepo, "dup.txt"), "dup\n", "utf8");
+    await runGit(sourceRepo, ["add", "dup.txt"]);
+    await runGit(sourceRepo, ["commit", "-m", "upstream dup"]);
+    for (let i = 0; i < 1000; i += 1) {
+      await runGit(sourceRepo, ["commit", "--allow-empty", "-q", "-m", `upstream filler ${i}`]);
+    }
+    await runGit(sourceRepo, ["push", remotePath, "master"]);
+
+    // Local: content that is NOT upstream.
+    await fs.writeFile(path.join(repoRoot, "unique.txt"), "only-here\n", "utf8");
+    await runGit(repoRoot, ["add", "unique.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "local unique work"]);
+    const localTipBefore = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "master");
+    const divergedWarning = workspace.warnings.find((w) =>
+      w.includes("has diverged from") && w.includes("behind"),
+    );
+    expect(divergedWarning).toBeDefined();
+    expect(divergedWarning).toContain("Local commits preserved");
+    expect(workspace.warnings.some((w) => w.includes("was reset to"))).toBe(false);
+    // HEAD did not move: nothing was reset.
+    expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(localTipBefore);
+  }, 90_000);
+
   it("does not emit an ahead/diverged warning when the base repo is clean and in sync", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
     const workspace = await realizeWorktreeForTest(repoRoot, "master");

@@ -4202,114 +4202,91 @@ async function resolveBaseRepoShallowState(
     .catch(() => "");
   const divergenceComputable = !shallow && mergeBase.length > 0;
   const graftCommits = divergenceComputable ? [] : await readShallowGraftCommits(repoRoot);
-  // SUP-13858 reuses the merge base to bound its patch-id window. Resolving it twice
-  // could disagree if a concurrent fetch lands between the two calls.
+  // SUP-15572 reuses the merge base to scope its content proof to the ahead work's
+  // files. Resolving it twice could disagree if a concurrent fetch lands between the
+  // two calls.
   return { divergenceComputable, graftCommits, warnings, mergeBase: mergeBase.length > 0 ? mergeBase : null };
 }
 
 /**
- * SUP-13858: how far the patch-id comparison may look, on EITHER side.
- *
- * Bounded on purpose, and the bound is the safety property, not a performance
- * tweak. Comparing whole histories is what produced the fabricated counts T1
- * exists to stop; a reset authorised off an unbounded scan would be the same
- * mistake with a destructive ending. Exceeding the window is treated as
- * "cannot prove duplication", which means no reset.
- */
-const BASE_REPO_PATCH_ID_WINDOW_COMMITS = 1000;
-
-/** Run git with `input` on stdin. Needed because `git patch-id` reads a diff there. */
-async function runGitWithStdin(args: string[], cwd: string, input: string): Promise<string> {
-  const proc = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
-    const child = spawn("git", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
-    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ stdout, stderr, code }));
-    child.stdin?.on("error", () => {});
-    child.stdin?.end(input);
-  });
-  if (proc.code !== 0) throw new Error(proc.stderr.trim() || `git ${args.join(" ")} failed`);
-  return proc.stdout.trim();
-}
-
-/**
- * Stable patch-id for one commit, or null when it cannot be determined.
- *
- * Null is the FAIL-CLOSED answer and every caller must read it as "this commit is
- * unique". A merge commit lands here by design: `git show --format=` prints no diff
- * for one, so there is no single patch-id to compare and a merge must never be
- * counted as a duplicate of anything.
- */
-async function resolveCommitPatchId(repoRoot: string, sha: string): Promise<string | null> {
-  const diff = await runGit(["show", "--format=", "--no-color", sha], repoRoot).catch(() => null);
-  if (!diff) return null;
-  const output = await runGitWithStdin(["patch-id", "--stable"], repoRoot, `${diff}\n`).catch(() => null);
-  if (!output) return null;
-  const id = output.split(/\s+/)[0] ?? "";
-  return /^[0-9a-f]{40,}$/.test(id) ? id : null;
-}
-
-/**
- * SUP-13858: is EVERY ahead commit already upstream, by patch-id?
+ * SUP-15572: does the base repo's ahead work carry any content the base ref lacks?
  *
  * Only ever used to authorise discarding local commits, so it is written to be wrong
- * in one direction only. Every uncertainty — an unreadable commit, an empty patch-id,
- * a merge, a window overrun, a git failure — returns `false` with a reason. Nothing
- * about "I could not tell" may read as "safe to reset".
+ * in one direction only. The proof is CONTENT, not ancestry and not patch-id. A hard
+ * reset to the base ref adopts the base ref's tree wholesale, so it is safe exactly
+ * when the ahead work introduced no file whose content is not already byte-identical at
+ * the base ref. That is the test, and it is scoped to the files the ahead work actually
+ * touched (merge-base -> HEAD): for each such file, HEAD's blob OID must equal the base
+ * ref's blob OID.
+ *
+ * Scoped to the ahead work's files, not the whole tree. Comparing the two full trees
+ * would count the behind-drift — base files upstream has since changed, which the stale
+ * local clone still holds at their old bytes — as "content the reset would lose", and
+ * would freeze every repo that is merely behind. The behind-drift is not ahead work; it
+ * is exactly what the reset is for.
+ *
+ * Content, not patch-id, on purpose. Patch-id only matches a change that reached
+ * upstream by cherry-pick. The same content reached by a fold merge or a squash has a
+ * different patch-id, so the proof would fail even when the resulting files are
+ * byte-identical — and fold and squash are the normal ways work reaches this fork's
+ * fold branch. And because the answer comes from blob OIDs rather than from a commit
+ * count, there is no window to exceed: whether the base ref is 1 or 100,000 commits
+ * ahead, the check is the same handful of blob comparisons. SUP-13858's 1000-commit
+ * window made the gate bail before inspecting a single commit once the base ref drifted
+ * past it, so a repo that crossed the cap could never self-heal no matter how redundant
+ * its ahead commits were.
  */
 async function resolveBaseRepoAheadCommitsAllUpstream(input: {
   repoRoot: string;
   baseRef: string;
   mergeBase: string | null;
 }): Promise<{ allUpstream: boolean; aheadCount: number; reason: string | null }> {
-  const cap = BASE_REPO_PATCH_ID_WINDOW_COMMITS;
-  const revList = async (range: string) =>
-    (await runGit(["rev-list", `--max-count=${cap + 1}`, range], input.repoRoot).catch(() => ""))
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-
-  const aheadShas = await revList(`${input.baseRef}..HEAD`);
-  if (aheadShas.length === 0) return { allUpstream: false, aheadCount: 0, reason: "no ahead commits to compare" };
-  if (aheadShas.length > cap) {
-    return { allUpstream: false, aheadCount: aheadShas.length, reason: `more than ${cap} ahead commits` };
+  const aheadCountRaw = await runGit(["rev-list", "--count", `${input.baseRef}..HEAD`], input.repoRoot).catch(
+    () => null,
+  );
+  const aheadCount = aheadCountRaw === null ? Number.NaN : Number.parseInt(aheadCountRaw, 10);
+  if (Number.isNaN(aheadCount) || aheadCount < 0) {
+    return { allUpstream: false, aheadCount: 0, reason: "could not count ahead commits" };
   }
-
-  // The upstream side is bounded by the merge base. Without one there is no honest
-  // window at all, and T1 has already classified that case as indeterminate anyway.
+  if (aheadCount === 0) {
+    return { allUpstream: false, aheadCount: 0, reason: "no ahead commits to compare" };
+  }
   if (!input.mergeBase) {
-    return { allUpstream: false, aheadCount: aheadShas.length, reason: "no merge base — no bounded upstream window" };
-  }
-  const upstreamShas = await revList(`${input.mergeBase}..${input.baseRef}`);
-  if (upstreamShas.length > cap) {
-    return { allUpstream: false, aheadCount: aheadShas.length, reason: `upstream window exceeds ${cap} commits` };
+    return { allUpstream: false, aheadCount, reason: "no merge base — cannot scope the ahead work's content" };
   }
 
-  const upstreamPatchIds = new Set<string>();
-  for (const sha of upstreamShas) {
-    const id = await resolveCommitPatchId(input.repoRoot, sha);
-    // An indeterminate UPSTREAM commit only shrinks the duplicate set, so it can be
-    // skipped: it can cause a false "unique", never a false "duplicate".
-    if (id) upstreamPatchIds.add(id);
-  }
+  const blobOid = (ref: string, file: string) =>
+    runGit(["rev-parse", `${ref}:${file}`], input.repoRoot)
+      .then((oid) => oid.trim())
+      .catch(() => null);
 
-  for (const sha of aheadShas) {
-    const id = await resolveCommitPatchId(input.repoRoot, sha);
-    if (!id) {
+  // Enumerate via runGitPathListing, not runGit: a NUL-separated file list read through
+  // the default 256 KiB capture would keep the LAST bytes on a large ahead work and
+  // mark nothing truncated, so a changed file could fall off the end of the list and be
+  // skipped by the proof below — the one direction this gate must never go wrong in.
+  const aheadFiles = await runGitPathListing(
+    ["diff", "-z", "--name-only", "--no-renames", input.mergeBase, "HEAD"],
+    input.repoRoot,
+  );
+  if (!aheadFiles.complete) {
+    return {
+      allUpstream: false,
+      aheadCount,
+      reason: "could not fully list the ahead work's files — git failure or truncated listing",
+    };
+  }
+  for (const file of aheadFiles.paths) {
+    const headOid = await blobOid("HEAD", file);
+    const baseOid = await blobOid(input.baseRef, file);
+    if (headOid === null || baseOid === null || headOid !== baseOid) {
       return {
         allUpstream: false,
-        aheadCount: aheadShas.length,
-        reason: `indeterminate patch-id for ${sha.slice(0, 12)} (merge commit or unreadable diff)`,
+        aheadCount,
+        reason: `ahead work touches ${file}, which is not byte-identical at ${input.baseRef}`,
       };
     }
-    if (!upstreamPatchIds.has(id)) {
-      return { allUpstream: false, aheadCount: aheadShas.length, reason: `${sha.slice(0, 12)} is not upstream` };
-    }
   }
-  return { allUpstream: true, aheadCount: aheadShas.length, reason: null };
+  return { allUpstream: true, aheadCount, reason: null };
 }
 
 /**
@@ -4339,8 +4316,8 @@ async function resetBaseRepoToBaseRefWithRescue(input: {
       reset: false,
       rescueRef: null,
       warnings: [
-        `Base repository at ${input.repoRoot} has ${input.aheadCount} ahead commit(s) already upstream, ` +
-          `but the rescue ref could not be created (${detail}). NOT reset — local commits preserved.`,
+        `Base repository at ${input.repoRoot} has ${input.aheadCount} ahead commit(s) whose content is already at the ` +
+          `base ref, but the rescue ref could not be created (${detail}). NOT reset — local commits preserved.`,
       ],
     };
   }
@@ -4353,8 +4330,8 @@ async function resetBaseRepoToBaseRefWithRescue(input: {
       reset: false,
       rescueRef: null,
       warnings: [
-        `Base repository at ${input.repoRoot} has ${input.aheadCount} ahead commit(s) already upstream, ` +
-          `but the rescue ref ${rescueRef} did not resolve to the prior tip ${input.priorTip.slice(0, 12)} ` +
+        `Base repository at ${input.repoRoot} has ${input.aheadCount} ahead commit(s) whose content is already at the ` +
+          `base ref, but the rescue ref ${rescueRef} did not resolve to the prior tip ${input.priorTip.slice(0, 12)} ` +
           `(got ${pinned ? pinned.slice(0, 12) : "nothing"}). NOT reset — local commits preserved.`,
       ],
     };
@@ -4379,7 +4356,7 @@ async function resetBaseRepoToBaseRefWithRescue(input: {
     rescueRef,
     warnings: [
       `Base repository at ${input.repoRoot} was reset to ${input.baseRef}: all ${input.aheadCount} ahead ` +
-        `commit(s) were already upstream (same patch-id), so none represented unshipped work. ` +
+        `commit(s) carried only content already at the base ref, so none represented unshipped work. ` +
         `Prior tip ${input.priorTip.slice(0, 12)} is preserved at ${rescueRef}.`,
     ],
   };
@@ -5081,11 +5058,12 @@ export async function prepareBaseRepoForWorkspace(input: {
             : `Could not fast-forward base repository at ${input.repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
         );
       } else if (decision.action === "diverged") {
-        // SUP-13858: `diverged` never resets, by design — which is right when the ahead
-        // commits are real work, and a permanent freeze when they are not. In the
-        // motivating incident 20 of 22 ahead commits were duplicates or belonged to a
-        // cancelled issue and ZERO were unshipped, yet the base repo stayed stuck for
-        // 16 days. So: prove every ahead commit is already upstream by patch-id, pin the
+        // SUP-13858 / SUP-15572: `diverged` never resets, by design — which is right
+        // when the ahead commits are real work, and a permanent freeze when they are
+        // not. In the motivating incident 20 of 22 ahead commits were duplicates or
+        // belonged to a cancelled issue and ZERO were unshipped, yet the base repo
+        // stayed stuck for 16 days. So: prove the ahead work's content is already at
+        // the base ref (by blob, not patch-id, with no commit-count window), pin the
         // tip, and only then reset. Anything short of proof falls through to the
         // unchanged warning below.
         const upstreamCheck = await resolveBaseRepoAheadCommitsAllUpstream({
