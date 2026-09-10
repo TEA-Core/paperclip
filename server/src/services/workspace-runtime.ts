@@ -72,6 +72,13 @@ import { workspaceOperationService, type WorkspaceOperationRecorder } from "./wo
 import { executionWorkspaceService, readExecutionWorkspaceConfig, type ExecutionWorkspaceBranchReconcileMode } from "./execution-workspaces.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
 import { logActivity } from "./activity-log.js";
+import {
+  buildDivergenceAlertText,
+  clearDivergenceRecord,
+  observeDivergedRefusal,
+  resolveDivergenceAlertThresholdMs,
+  type BaseRepoDivergenceAlert,
+} from "./base-repo-divergence-alert.js";
 import { logger } from "../middleware/logger.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
@@ -1187,6 +1194,56 @@ async function remoteExists(repoRoot: string, remote: string): Promise<boolean> 
   return runGit(["remote", "get-url", remote], repoRoot)
     .then(() => true)
     .catch(() => false);
+}
+
+/**
+ * SUP-15647: a stable, canonical identity for the repository a base-repo
+ * checkout represents, used as the divergence-episode key. The sidecar that
+ * tracks a non-resettable divergence lives under the checkout path, so a mere
+ * path match cannot prove the same repository: a different repository
+ * materialized at the same path must start a fresh episode rather than inherit
+ * the previous one's age. The identity is the checkout's canonical fetch-remote
+ * URL with any embedded credentials/userinfo stripped; when no remote identity
+ * can be resolved it falls back to the resolved checkout path, which stays
+ * deterministic for that checkout. Fail-open: a git error never blocks
+ * provisioning, it only degrades the identity to the path fallback.
+ */
+async function resolveCanonicalBaseRepoIdentity(repoRoot: string): Promise<string> {
+  const pathFallback = path.resolve(repoRoot);
+  const remotesRaw = await runGit(["remote"], repoRoot).catch(() => null);
+  const remotes = remotesRaw
+    ? remotesRaw.split("\n").map((name) => name.trim()).filter((name) => name.length > 0)
+    : [];
+  // Prefer `origin` (the canonical default remote the base ref tracks); fall back
+  // to any other configured remote so two checkouts of the same repository share
+  // one identity regardless of which remote names are present.
+  const candidates = remotes.includes("origin")
+    ? ["origin", ...remotes.filter((name) => name !== "origin")]
+    : remotes;
+  for (const remote of candidates) {
+    const rawUrl = await runGit(["remote", "get-url", remote], repoRoot).catch(() => null);
+    const identity = stripRemoteUrlCredentials(rawUrl ?? "");
+    if (identity.length > 0) return identity;
+  }
+  return pathFallback;
+}
+
+/**
+ * Strip embedded credentials/userinfo from a git remote URL so the canonical
+ * identity carries no secret and does not change when only the credential does.
+ * Handles both scheme form (`scheme://user:pass@host/...`) and scp form
+ * (`user@host:repo`); a bare path or an empty string is returned unchanged.
+ */
+function stripRemoteUrlCredentials(remoteUrl: string): string {
+  let url = remoteUrl.trim();
+  if (url.length === 0) return url;
+  // Scheme form: drop `user:pass@` (or `user@`) immediately after `scheme://`.
+  url = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/i, "$1");
+  // scp-like form (`user@host:repo`, no `://`): drop the leading `user@`.
+  if (!url.includes("://")) {
+    url = url.replace(/^[^/\s@]+@(?=[^:]*:)/, "");
+  }
+  return url.trim();
 }
 
 const GIT_WORKTREE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
@@ -4950,6 +5007,10 @@ export async function prepareBaseRepoForWorkspace(input: {
   worktreeBaseRef: string;
   worktreeBaseSha: string | null;
   localBaseUnsafe: boolean;
+  // SUP-15615: set when a non-resettable diverged base repo has persisted past
+  // the configured age threshold — the first-class, escalated signal (distinct
+  // from the routine advisory in `warnings`). Null otherwise.
+  divergenceAlert: BaseRepoDivergenceAlert | null;
 }> {
   const resolution = await resolveAuthoritativeBaseRef(
     input.repoRoot,
@@ -4984,6 +5045,7 @@ export async function prepareBaseRepoForWorkspace(input: {
   // the dispatch proceeds whatever happens here, because the issue being run did
   // not cause the mess and must not be held hostage to it.
   const baseRepoHygieneWarnings: string[] = [];
+  let divergenceAlert: BaseRepoDivergenceAlert | null = null;
   try {
     const hygiene = await inspectBaseRepoHygiene(input.repoRoot);
     if (hygiene) {
@@ -5053,6 +5115,9 @@ export async function prepareBaseRepoForWorkspace(input: {
               : ""),
           ...result.warnings,
         );
+        // SUP-15615: a restore puts the base back on its default ref, so it is no
+        // longer in the stuck-diverged state — drop any tracked divergence.
+        await clearDivergenceRecord(input.repoRoot);
       } else if (decision.action === "fastForward") {
         const result = await fastForwardBaseRepoToDefaultRef({
           repoRoot: input.repoRoot,
@@ -5068,6 +5133,9 @@ export async function prepareBaseRepoForWorkspace(input: {
                   : "")
             : `Could not fast-forward base repository at ${input.repoRoot} to ${baseRef}: ${result.warnings.join("; ")}`,
         );
+        // SUP-15615: a successful fast-forward puts the base on its default ref —
+        // no longer stuck-diverged, so drop any tracked divergence.
+        if (result.fastForwarded) await clearDivergenceRecord(input.repoRoot);
       } else if (decision.action === "diverged") {
         // SUP-13858 / SUP-15572: `diverged` never resets, by design — which is right
         // when the ahead commits are real work, and a permanent freeze when they are
@@ -5096,6 +5164,9 @@ export async function prepareBaseRepoForWorkspace(input: {
         if (resetOutcome) {
           baseRepoHygieneWarnings.push(...resetOutcome.warnings);
           for (const warning of resetOutcome.warnings) logger.warn(warning);
+          // SUP-15615: the auto-reset self-healed this repo, so it is no longer in
+          // the stuck-diverged state — drop any tracked divergence (no signal).
+          await clearDivergenceRecord(input.repoRoot);
         } else {
           // Unchanged, verbatim: at least one ahead commit is unique, or duplication
           // could not be proven. Warn, preserve, never reset.
@@ -5121,6 +5192,41 @@ export async function prepareBaseRepoForWorkspace(input: {
           }
           baseRepoHygieneWarnings.push(message);
           logger.warn(message);
+          // SUP-15615: this is the non-resettable diverged state. Track when it
+          // began (per base repo) and, if it has persisted past the configured
+          // age threshold, escalate to a first-class signal — a distinct alert
+          // line plus a durable board attention row — not just the advisory.
+          // SUP-15647: key the divergence episode on a stable repository identity
+          // (the checkout's canonical fetch-remote URL), not the mutable checkout
+          // path, so a different repository materialized at the same path starts
+          // a fresh episode instead of inheriting the previous one's age.
+          const repoIdentity = await resolveCanonicalBaseRepoIdentity(input.repoRoot);
+          const observation = await observeDivergedRefusal(input.repoRoot, {
+            baseRef,
+            repoIdentity,
+            aheadCount: decision.aheadCount,
+            behindCount: decision.behindCount,
+            aheadCommitSubjects: decision.aheadCommitSubjects,
+            nowMs: Date.now(),
+            thresholdMs: resolveDivergenceAlertThresholdMs(),
+          });
+          if (observation.shouldEmitFirstClassSignal) {
+            const alert: BaseRepoDivergenceAlert = {
+              repoIdentity,
+              baseRef,
+              aheadCount: decision.aheadCount,
+              behindCount: decision.behindCount,
+              aheadCommitSubjects: decision.aheadCommitSubjects,
+              firstObservedAtMs: observation.record.firstObservedAtMs,
+              lastObservedAtMs: observation.record.lastObservedAtMs,
+              divergenceAgeMs: observation.ageMs,
+              thresholdMs: observation.thresholdMs,
+            };
+            const alertText = buildDivergenceAlertText(alert);
+            baseRepoHygieneWarnings.push(alertText);
+            logger.warn(alertText);
+            divergenceAlert = alert;
+          }
         }
       } else if (decision.action === "indeterminate") {
         // No integers in this message, by contract: the whole point is that there is
@@ -5147,6 +5253,10 @@ export async function prepareBaseRepoForWorkspace(input: {
         baseRepoHygieneWarnings.push(message);
         logger.warn(message);
       } else if (decision.action === "ok") {
+        // SUP-15615: `ok` means the base is on its default ref and not stuck-
+        // diverged (in sync, or merely ahead-only/unmerged). Drop any tracked
+        // divergence so an in-sync or self-healed base leaves no signal.
+        await clearDivergenceRecord(input.repoRoot);
         if (shallowState.divergenceComputable && headSha && currentBaseRefSha && headSha !== currentBaseRefSha) {
           const revList = await runGit(
             ["rev-list", "--left-right", "--count", `HEAD...${baseRef}`],
@@ -5181,7 +5291,47 @@ export async function prepareBaseRepoForWorkspace(input: {
     worktreeBaseRef,
     worktreeBaseSha,
     localBaseUnsafe,
+    divergenceAlert,
   };
+}
+
+async function emitBaseRepoDivergenceSignal(input: {
+  db: Db | null | undefined;
+  companyId: string;
+  agentId: string | null;
+  runId: string | null;
+  projectId: string | null;
+  alert: BaseRepoDivergenceAlert;
+}) {
+  if (!input.db) return;
+  // SUP-15615: the first-class signal — a durable, board-published attention row
+  // that is deliberately distinct from the routine per-realization advisory that
+  // also lands in the workspace-ready comment. Best-effort: logActivity swallows
+  // its own errors, so a signal failure never blocks the dispatch that produced
+  // it (the alert line is already in the comment by the time we get here).
+  await logActivity(input.db, {
+    companyId: input.companyId,
+    actorType: "system",
+    actorId: "workspace_runtime",
+    agentId: input.agentId,
+    runId: input.runId,
+    action: "base_repo.divergence_threshold_exceeded",
+    entityType: "project_base_repo",
+    entityId: input.projectId ?? input.alert.repoIdentity,
+    details: {
+      signalKind: "base_repo_divergence_threshold_exceeded",
+      baseRepoPath: input.alert.repoIdentity,
+      baseRef: input.alert.baseRef,
+      aheadCount: input.alert.aheadCount,
+      behindCount: input.alert.behindCount,
+      aheadCommitSubjects: input.alert.aheadCommitSubjects,
+      firstObservedAtMs: input.alert.firstObservedAtMs,
+      lastObservedAtMs: input.alert.lastObservedAtMs,
+      divergenceAgeMs: input.alert.divergenceAgeMs,
+      thresholdMs: input.alert.thresholdMs,
+      actor: { type: "system", id: "workspace_runtime", source: "workspace_runtime" },
+    },
+  });
 }
 
 export async function realizeExecutionWorkspace(input: {
@@ -5319,6 +5469,16 @@ export async function realizeExecutionWorkspace(input: {
     resolveGitAuth: input.resolveGitAuth ?? null,
     recorder: input.recorder ?? null,
   });
+  if (baseRepoHygiene.divergenceAlert) {
+    await emitBaseRepoDivergenceSignal({
+      db: input.db,
+      companyId: input.agent.companyId,
+      agentId: input.agent.id,
+      runId: input.heartbeatRunId ?? null,
+      projectId: input.base.projectId,
+      alert: baseRepoHygiene.divergenceAlert,
+    });
+  }
   const baseRef = baseRepoHygiene.baseRef;
   const currentBaseRefSha = baseRepoHygiene.baseRefSha;
   // The fork's base-repo hygiene already raises UnresolvedWorkspaceBaseRefError
@@ -5807,7 +5967,17 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           resolveGitAuth: input.resolveGitAuth ?? null,
           recorder: input.recorder ?? null,
         })
-      : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: reuseBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false };
+      : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: reuseBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
+    if (baseRepoHygiene.divergenceAlert) {
+      await emitBaseRepoDivergenceSignal({
+        db: input.db,
+        companyId: input.agent.companyId,
+        agentId: input.agent.id,
+        runId: input.heartbeatRunId ?? null,
+        projectId: input.workspace.projectId ?? input.base.projectId,
+        alert: baseRepoHygiene.divergenceAlert,
+      });
+    }
     const currentBaseRefSha = baseRepoHygiene.baseRefSha;
     // An unstarted-worktree refresh can fast-forward the checked-out branch.
     // Never run it for an attached operator-owned ref.
@@ -5865,7 +6035,17 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         resolveGitAuth: input.resolveGitAuth ?? null,
         recorder: input.recorder ?? null,
       })
-    : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: restoreBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false };
+    : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: restoreBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
+  if (baseRepoHygiene.divergenceAlert) {
+    await emitBaseRepoDivergenceSignal({
+      db: input.db,
+      companyId: input.agent.companyId,
+      agentId: input.agent.id,
+      runId: input.heartbeatRunId ?? null,
+      projectId: input.workspace.projectId ?? input.base.projectId,
+      alert: baseRepoHygiene.divergenceAlert,
+    });
+  }
   const restoreCurrentBaseRefSha = baseRepoHygiene.baseRefSha;
   const restoreWorktreeBaseRef = baseRepoHygiene.worktreeBaseRef;
   const restoreWorktreeBaseSha = baseRepoHygiene.worktreeBaseSha;
