@@ -58,6 +58,7 @@ import {
   createCarrierPromotionSweepService,
   createCarrierStrandedSurfaceService,
   createDoneCloseLandingBackstopService,
+  createSummarySlotRefreshSweepService,
   createToastReadabilitySweepService,
   externalObjectService,
   executionWorkspaceService,
@@ -1214,6 +1215,9 @@ export async function startServer(): Promise<StartedServer> {
       wakeup: heartbeat.wakeup,
     });
     const carrierPromotionSweep = createCarrierPromotionSweepService(db as any);
+    const summarySlotRefreshSweep = createSummarySlotRefreshSweepService(db as any, {
+      wakeup: heartbeat.wakeup,
+    });
     const prDelivery = prDeliveryService(db as any);
     const branchPrReconciler = createBranchPrReconcilerSweepService(db as any, {
       recordAtOpen: prDelivery.recordAtOpen,
@@ -1232,9 +1236,24 @@ export async function startServer(): Promise<StartedServer> {
           }
           return result;
         })
+         .catch((err) => {
+           logger.error({ err }, "carrier promotion sweep failed");
+         }), { name: "carrierPromotion" });
+    };
+    /** Fires one summary-slot refresh sweep on the heartbeat tick (SUP-12426, shape 2): claims a generation task for stale/failed summary slots so the Summarizer can complete a write that the board-only generate gate can no longer trigger. Cadence is gated inside the service so a non-due tick is a cheap no-op. */
+    const scheduleSummarySlotRefreshSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(summarySlotRefreshSweep
+        .sweep()
+        .then((result) => {
+          if (result.candidates > 0 || result.claimed > 0 || result.inFlight > 0 || result.failed > 0) {
+            logger.info(result, "summary slot refresh sweep dispositioned stale summary slots");
+          }
+          return result;
+        })
         .catch((err) => {
-          logger.error({ err }, "carrier promotion sweep failed");
-        }), { name: "carrierPromotion" });
+          logger.error({ err }, "summary slot refresh sweep failed");
+        }), { name: "summarySlotRefresh" });
     };
     /** Fires one carrier orphan janitor sweep on the heartbeat tick; logs when an orphan carrier was disposed (ADR-083 D14 deletion path, separately disableable from the surface path). */
     const scheduleCarrierOrphanJanitor = () => {
@@ -1749,6 +1768,7 @@ export async function startServer(): Promise<StartedServer> {
         scheduleTerminalWorkspaceSweep();
         scheduleDoneCloseLandingBackstopSweep();
         scheduleCarrierPromotionSweep();
+        scheduleSummarySlotRefreshSweep();
         scheduleAdapterLoginReaperSweep();
         scheduleSetupTokenReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();

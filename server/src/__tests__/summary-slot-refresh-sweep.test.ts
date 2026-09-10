@@ -1,0 +1,239 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  SUMMARY_SLOT_REFRESH_ACTOR_ID,
+  createSummarySlotRefreshSweepService,
+} from "../services/summary-slot-refresh-sweep.js";
+
+const COMPANY = "11111111-1111-4111-8111-111111111111";
+const SCOPES = [
+  { companyId: COMPANY, scopeKind: "workspaces_overview", slotKey: "header", scopeId: null },
+] as const;
+
+const mockGenerate = vi.hoisted(() => vi.fn());
+vi.mock("../services/summary-slots.js", () => ({
+  summarySlotService: () => ({ generate: mockGenerate }),
+}));
+
+const mockGetExperimental = vi.hoisted(
+  () => vi.fn().mockResolvedValue({ enableSummaries: true }),
+);
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => ({ getExperimental: mockGetExperimental }),
+}));
+
+const mockQueueWakeup = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock("../services/issue-assignment-wakeup.js", () => ({
+  queueIssueAssignmentWakeup: mockQueueWakeup,
+}));
+
+vi.mock("../middleware/logger.js", () => ({
+  logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+/** A canned in-flight-or-minted `generate` response. */
+function generateResponse(overrides: {
+  alreadyGenerating?: boolean;
+  generatingIssueId?: string;
+  assigneeAgentId?: string | null;
+  status?: string;
+} = {}) {
+  return {
+    slot: { id: "slot-1", companyId: COMPANY, scopeKind: "workspaces_overview", slotKey: "header", status: "generating" },
+    generatingIssue: {
+      id: overrides.generatingIssueId ?? "issue-1",
+      identifier: "SUP-9999",
+      title: "Summarize workspaces overview",
+      status: overrides.status ?? "todo",
+      assigneeAgentId: overrides.assigneeAgentId === undefined ? "summarizer-agent" : overrides.assigneeAgentId,
+    },
+    alreadyGenerating: overrides.alreadyGenerating ?? false,
+  };
+}
+
+/** Builds a fake drizzle db whose discovery select() serves the given candidate rows. */
+function makeDb(rows: Array<Record<string, unknown>>) {
+  return {
+    select: vi.fn(() => ({
+      from: () => ({
+        where: () => Promise.resolve(rows),
+      }),
+    })),
+  };
+}
+
+/** Wires the sweep service over a fake db. */
+function makeService(
+  rows: Array<Record<string, unknown>>,
+  opts: { sweepIntervalMs?: number; now?: () => Date; wakeup?: () => Promise<unknown> } = {},
+) {
+  const db = makeDb(rows);
+  const service = createSummarySlotRefreshSweepService(db as never, {
+    now: opts.now ?? (() => new Date("2026-09-10T00:00:00Z")),
+    sweepIntervalMs: opts.sweepIntervalMs ?? 0,
+    wakeup: opts.wakeup,
+  });
+  return { db, service };
+}
+
+beforeEach(() => {
+  mockGenerate.mockReset();
+  mockQueueWakeup.mockReset().mockResolvedValue(undefined);
+  mockGetExperimental.mockReset().mockResolvedValue({ enableSummaries: true });
+});
+
+describe("createSummarySlotRefreshSweepService", () => {
+  it("uses the documented actor id", () => {
+    expect(SUMMARY_SLOT_REFRESH_ACTOR_ID).toBe("system:summary-slot-refresh");
+  });
+
+  it("claims a fresh generation task for a stale/failed slot and wakes the Summarizer (AC-1, AC-4)", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "idle", lastGeneratedAt: new Date("2026-08-01T00:00:00Z") },
+      { ...SCOPES[0], status: "failed" },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse());
+    const { db, service } = makeService(rows, { wakeup: vi.fn().mockResolvedValue(undefined) });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 2,
+      claimed: 2,
+      inFlight: 0,
+      failed: 0,
+    });
+
+    expect(mockGenerate).toHaveBeenCalledTimes(2);
+    expect(mockGenerate.mock.calls[0]![0]).toEqual({
+      companyId: COMPANY,
+      scopeKind: "workspaces_overview",
+      slotKey: "header",
+      scopeId: null,
+    });
+    expect(mockGenerate.mock.calls[0]![1]).toEqual({ agentId: null, userId: null, runId: null });
+    // Every fresh claim fires the same assignment wake the HTTP route fires.
+    expect(mockQueueWakeup).toHaveBeenCalledTimes(2);
+    expect(mockQueueWakeup).toHaveBeenCalledWith(expect.objectContaining({
+      reason: "summary_slot_generation_requested",
+      mutation: "summary_slot.generate",
+      contextSource: "summary-slot-refresh-sweep",
+      requestedByActorType: "system",
+      issue: expect.objectContaining({ id: "issue-1" }),
+    }));
+    expect(db.select).toHaveBeenCalledTimes(1);
+  });
+
+  it("is a settings no-op when summaries are disabled (AC-2)", async () => {
+    mockGetExperimental.mockResolvedValue({ enableSummaries: false });
+    const rows = [{ ...SCOPES[0], status: "idle", lastGeneratedAt: null }];
+    const { db, service } = makeService(rows, { wakeup: vi.fn() });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: false,
+      candidates: 0,
+      claimed: 0,
+      inFlight: 0,
+      failed: 0,
+    });
+    // Discovery never runs when the feature flag is off.
+    expect(db.select).not.toHaveBeenCalled();
+    expect(mockGenerate).not.toHaveBeenCalled();
+    expect(mockQueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("leaves an in-flight slot alone when a live generation issue exists (AC-3)", async () => {
+    const rows = [{ ...SCOPES[0], status: "generating", generatingIssueId: "issue-live" }];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: true }));
+    const { service } = makeService(rows, { wakeup: vi.fn() });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 1,
+      failed: 0,
+    });
+    expect(mockGenerate).toHaveBeenCalledTimes(1);
+    expect(mockQueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("counts a failed generate and does not wake (retry next sweep)", async () => {
+    const rows = [{ ...SCOPES[0], status: "failed" }];
+    mockGenerate.mockRejectedValue(new Error("Summarizer built-in agent is not configured"));
+    const { service } = makeService(rows, { wakeup: vi.fn() });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 0,
+      failed: 1,
+    });
+    expect(mockQueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("skips the wake when no wakeup dispatcher is injected but still claims", async () => {
+    const rows = [{ ...SCOPES[0], status: "idle", lastGeneratedAt: null }];
+    mockGenerate.mockResolvedValue(generateResponse());
+    const { service } = makeService(rows);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      failed: 0,
+    });
+    expect(mockQueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("performs no work when no candidate slot is selected", async () => {
+    const { db, service } = makeService([], { wakeup: vi.fn() });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 0,
+      claimed: 0,
+      inFlight: 0,
+      failed: 0,
+    });
+    expect(db.select).toHaveBeenCalledTimes(1);
+    expect(mockGenerate).not.toHaveBeenCalled();
+    expect(mockQueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("keeps every non-due tick a no-op behind the min-interval gate (AC-5)", async () => {
+    let clock = new Date("2026-09-10T00:00:00Z").getTime();
+    const rows = [{ ...SCOPES[0], status: "failed" }];
+    mockGenerate.mockResolvedValue(generateResponse());
+    const { db, service } = makeService(rows, {
+      sweepIntervalMs: 60 * 60 * 1000,
+      now: () => new Date(clock),
+      wakeup: vi.fn(),
+    });
+
+    await expect(service.sweep()).resolves.toMatchObject({ due: true, claimed: 1 });
+    const selectsAfterFirst = db.select.mock.calls.length;
+
+    clock += 30 * 1000;
+    await expect(service.sweep()).resolves.toEqual({
+      due: false,
+      summariesEnabled: false,
+      candidates: 0,
+      claimed: 0,
+      inFlight: 0,
+      failed: 0,
+    });
+    expect(db.select.mock.calls.length).toBe(selectsAfterFirst);
+    expect(mockGenerate).toHaveBeenCalledTimes(1);
+
+    clock += 61 * 60 * 1000;
+    await expect(service.sweep()).resolves.toMatchObject({ due: true, claimed: 1 });
+    expect(mockGenerate).toHaveBeenCalledTimes(2);
+  });
+});
