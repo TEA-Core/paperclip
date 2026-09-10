@@ -76,6 +76,7 @@ const mockFeedbackService = vi.hoisted(() => ({
   saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
 }));
 const mockInstanceSettingsService = vi.hoisted(() => ({
+  getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),
   get: vi.fn(async () => ({
     id: "instance-settings-1",
     general: {

@@ -71,6 +71,10 @@ vi.mock("../services/index.js", () => ({
     completeTestRunForIssue: vi.fn(async () => null),
   }),
   executionWorkspaceService: () => ({}),
+  feedbackService: () => ({}),
+  instanceSettingsService: () => ({
+    getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),
+  }),
   goalService: () => ({
     getById: vi.fn(),
     getDefaultCompanyGoal: vi.fn(),
