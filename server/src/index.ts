@@ -1508,6 +1508,23 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
 
+        // B2: repair cards left stranded by the restart. Runs after the reap
+        // above so B1's resultJson.hostRestart marker is present on the last run.
+        try {
+          const strandSweep = await heartbeat.sweepHostRestartStrandedIssues();
+          if (strandSweep.reArmed.length > 0 || strandSweep.escalated.length > 0) {
+            logger.warn(
+              { ...strandSweep },
+              "startup host-restart strand sweep repaired stranded cards",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup host-restart strand sweep failed - periodic recovery will serve as degraded backstop",
+          );
+        }
+
         // SUP-13949: the startup pass is the one that matters most. A server
         // that died mid-run left its scratch directories and their detached
         // process groups behind with nothing holding a handle to them, so this

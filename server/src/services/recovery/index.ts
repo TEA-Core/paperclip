@@ -81,3 +81,16 @@ export type {
   StrandedRecoveryEscalationNotice,
   StrandedRecoveryNoticeSeed,
 } from "./stranded-notice.js";
+export {
+  buildHostRestartStrandEscalationComment,
+  buildRearmMonitorPatch,
+  decideHostRestartStrandRepair,
+  sweepHostRestartStrandedIssues,
+} from "./host-restart-strand-sweep.js";
+export type {
+  HostRestartStrandCandidate,
+  HostRestartStrandDecision,
+  HostRestartStrandFacts,
+  HostRestartStrandPlanItem,
+  HostRestartStrandSweepReport,
+} from "./host-restart-strand-sweep.js";
