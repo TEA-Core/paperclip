@@ -180,6 +180,45 @@ describeEmbeddedPostgres("heartbeat write path records deferrable vs terminal sk
     expect(rows[0].coalescedCount).toBeGreaterThanOrEqual(1);
   });
 
+  it("(boundedness) repeat GENERIC deferrable skips coalesce too, and never merge into an issue-bound one", async () => {
+    const { agentId } = await seedActiveAgent();
+    const issueId = randomUUID();
+
+    dispatchQuiesce.engage({ reason: "test-quiesce", ttlMs: 60_000 });
+
+    const heartbeat = heartbeatService(db);
+    // Three generic wakes (no payload.issueId) — a suppressed timer tick.
+    for (let i = 0; i < 3; i += 1) {
+      await heartbeat.wakeup(agentId, {
+        source: "timer",
+        triggerDetail: "system",
+        requestedByActorType: "system",
+        requestedByActorId: "deferred_wake_test",
+      });
+    }
+    // …plus one for a specific card. A generic wake carries no card payload, so
+    // it must not be absorbed into the card's row (or vice versa): they are
+    // different signals and the sweep re-drives each on its own.
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      requestedByActorType: "system",
+      requestedByActorId: "deferred_wake_test",
+    });
+
+    const rows = await readSkips(agentId);
+    expect(rows).toHaveLength(2);
+    const generic = rows.find((r) => !(r.payload as { issueId?: string } | null)?.issueId);
+    const bound = rows.find((r) => (r.payload as { issueId?: string } | null)?.issueId === issueId);
+    expect(generic).toBeDefined();
+    expect(bound).toBeDefined();
+    expect(generic!.finishedAt).toBeNull();
+    expect(generic!.coalescedCount).toBeGreaterThanOrEqual(1);
+    expect(bound!.finishedAt).toBeNull();
+  });
+
   it("acceptance #5: a terminal skip (heartbeat.disabled) stays skipped with finishedAt set", async () => {
     const { agentId } = await seedActiveAgent({ heartbeatEnabled: false });
 
@@ -496,6 +535,169 @@ describeEmbeddedPostgres("recovery deferred-wake replay sweep (SUP-15552)", () =
       .then((rows) => rows[0]);
     expect(row.status).toBe("skipped");
     expect(row.finishedAt).not.toBeNull();
+  });
+
+  // Regression (review round 1, `deferred-wake-replay-drops-generic-wake`): the
+  // first cut of the sweep `continue`d on any candidate whose payload had no
+  // `issueId`, so a generic timer/on-demand wake deferred by the suppression was
+  // left `finishedAt IS NULL` forever — never re-driven and never retired. That
+  // is the very defect this card exists to fix, reproduced one case over: the
+  // ruling classifies a skip by its REASON, not by whether the wake named a card.
+  it("a GENERIC (no-issueId) deferrable skip is re-driven once the suppression clears", async () => {
+    const { companyId, agentId } = await seedCard();
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      source: "timer",
+      triggerDetail: "system",
+      reason: "heartbeat.scheduling_suppressed",
+      status: "skipped",
+      finishedAt: null,
+      payload: { source: "timer" },
+    });
+
+    const enqueueWakeup = vi.fn().mockResolvedValue({ id: randomUUID(), agentId } as never);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+
+    const result = await recovery.reconcileDeferredWakeupReplay();
+
+    expect(result.reDriven).toBe(1);
+    expect(result.genericReDriven).toBe(1);
+    // No card was named, so nothing is reported under issueIds.
+    expect(result.issueIds).toEqual([]);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    const [enqAgentId, enqOpts] = enqueueWakeup.mock.calls[0] as [
+      string,
+      { payload?: Record<string, unknown> | null; source?: string },
+    ];
+    expect(enqAgentId).toBe(agentId);
+    // The ORIGINAL nullable payload and source are carried through unchanged.
+    expect(enqOpts.source).toBe("timer");
+    expect(enqOpts.payload).toMatchObject({ source: "timer" });
+    expect((enqOpts.payload as { issueId?: string } | null)?.issueId).toBeUndefined();
+
+    // …and the row is retired, so a second sweep does not drive it again.
+    const row = await db
+      .select({ status: agentWakeupRequests.status, finishedAt: agentWakeupRequests.finishedAt })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0]);
+    expect(row.status).toBe("skipped");
+    expect(row.finishedAt).not.toBeNull();
+
+    const second = await recovery.reconcileDeferredWakeupReplay();
+    expect(second.reDriven).toBe(0);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("a generic deferrable skip is re-driven end-to-end through the real heartbeat write path", async () => {
+    const { agentId } = await seedCard();
+
+    // enqueue → skip: a suppressed on-demand wake that names no card.
+    dispatchQuiesce.engage({ reason: "test-quiesce", ttlMs: 60_000 });
+    const heartbeat = heartbeatService(db);
+    const skipped = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "ping",
+      requestedByActorType: "system",
+      requestedByActorId: "generic_wake_e2e",
+    });
+    expect(skipped).toBeNull();
+
+    const pending = await db
+      .select({ status: agentWakeupRequests.status, finishedAt: agentWakeupRequests.finishedAt, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0]);
+    expect(pending.status).toBe("skipped");
+    expect(pending.finishedAt).toBeNull();
+    expect((pending.payload as { issueId?: string } | null)?.issueId).toBeUndefined();
+
+    // clear → re-drive.
+    dispatchQuiesce.release();
+    const enqueueWakeup = vi.fn().mockResolvedValue({ id: randomUUID(), agentId } as never);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+
+    const result = await recovery.reconcileDeferredWakeupReplay();
+
+    expect(result.reDriven).toBe(1);
+    expect(result.genericReDriven).toBe(1);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    const [, opts] = enqueueWakeup.mock.calls[0] as [string, { source?: string; triggerDetail?: string }];
+    expect(opts.source).toBe("on_demand");
+    expect(opts.triggerDetail).toBe("ping");
+  });
+
+  it("a generic deferrable skip is re-driven alongside an issue-bound one, not instead of it", async () => {
+    const { companyId, agentId, issueId } = await seedCard();
+    await seedDeferrableWake(companyId, agentId, issueId);
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      source: "on_demand",
+      triggerDetail: "ping",
+      reason: "heartbeat.scheduling_suppressed",
+      status: "skipped",
+      finishedAt: null,
+      payload: {},
+    });
+
+    const enqueueWakeup = vi.fn().mockResolvedValue({ id: randomUUID(), agentId } as never);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+
+    const result = await recovery.reconcileDeferredWakeupReplay();
+
+    expect(result.reDriven).toBe(2);
+    expect(result.genericReDriven).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
+    const finished = await db
+      .select({ finishedAt: agentWakeupRequests.finishedAt })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.map((r) => r.finishedAt));
+    expect(finished.every((f) => f !== null)).toBe(true);
+  });
+
+  it("a terminal-reason generic skip is still never re-driven", async () => {
+    const { companyId, agentId } = await seedCard();
+    for (const reason of ["agent.not_invokable", "heartbeat.timer.no_actionable_work"]) {
+      await db.insert(agentWakeupRequests).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        source: "timer",
+        triggerDetail: "system",
+        reason,
+        status: "skipped",
+        finishedAt: new Date(),
+        payload: {},
+      });
+    }
+
+    const enqueueWakeup = vi.fn().mockResolvedValue(null);
+    const recovery = recoveryService(db, {
+      enqueueWakeup,
+      resolveSchedulingSuppression: vi.fn().mockResolvedValue({ suppressed: false, reason: null }),
+    });
+
+    const result = await recovery.reconcileDeferredWakeupReplay();
+
+    expect(result.checked).toBe(0);
+    expect(result.reDriven).toBe(0);
+    expect(result.genericReDriven).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("acceptance #3: re-drive is idempotent — a second sweep does not drive the same wake again", async () => {
