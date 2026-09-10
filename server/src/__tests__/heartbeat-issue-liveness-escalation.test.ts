@@ -1567,9 +1567,9 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       expect(escalations).toHaveLength(0);
     });
 
-    it("keeps a legacy in_review blocker covered when its updatedAt is within the grace window", async () => {
+    it("escalates a legacy in_review blocker armed without an immutable pendingSince, ignoring its fresh updatedAt", async () => {
       await enableAutoRecovery();
-      const { companyId, coderId, blockerIssueId } = await seedBlockedChain();
+      const { companyId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
       const updatedRecently = new Date(Date.now() - 1 * 60 * 1000);
       await db
         .update(issues)
@@ -1583,13 +1583,23 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
       const result = await heartbeatService(db).reconcileIssueGraphLiveness();
 
-      expect(result.findings).toBe(0);
-      expect(result.escalationsCreated).toBe(0);
+      expect(result.findings).toBe(1);
+      expect(result.escalationsCreated).toBe(1);
       const escalations = await db
         .select()
         .from(issues)
         .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
-      expect(escalations).toHaveLength(0);
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]).toMatchObject({
+        parentId: blockerIssueId,
+        originId: [
+          "harness_liveness",
+          companyId,
+          blockedIssueId,
+          "in_review_without_action_path",
+          blockerIssueId,
+        ].join(":"),
+      });
     });
   });
 
