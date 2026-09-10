@@ -20905,13 +20905,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     ) => {
       const deferrable = isDeferrableWakeSkipReasonInternal(skipReason);
       const idempotencyKey = opts.idempotencyKey ?? null;
-      if (deferrable && issueId) {
+      if (deferrable) {
         // Write-time coalescing (SUP-15552): while the transient condition
-        // persists a busy card can be skipped repeatedly (timer, comment-driven
-        // wakes). Coalesce a repeat deferrable skip of the SAME reason for the
-        // same (agent, issue) onto the existing pending row instead of
-        // inserting a fresh row, so the recovery sweep's candidate set stays
-        // bounded and per-reason blast-radius counts stay meaningful.
+        // persists an agent can be skipped repeatedly (timer, assignment and
+        // comment-driven wakes). Coalesce a repeat deferrable skip of the SAME
+        // reason for the same (agent, issue) onto the existing pending row
+        // instead of inserting a fresh row, so the recovery sweep's candidate
+        // set stays bounded and per-reason blast-radius counts stay meaningful.
+        //
+        // A wake with no `payload.issueId` — a generic timer or on-demand wake —
+        // coalesces on (agent, reason, key) with `issueId` absent on both sides.
+        // Generic skips are re-driven by the sweep exactly like issue-bound
+        // ones, so leaving them uncoalesced would let a single agent under a
+        // long suppression accumulate one pending row per timer tick and crowd
+        // every other card out of the sweep's bounded candidate set. A generic
+        // wake carries no card-specific payload, so merging two of them loses
+        // nothing that the single re-drive does not deliver.
+        //
+        // Keyed on `issueIdFromPayload`, not the enriched `issueId`: the
+        // predicate below reads `payload ->> 'issueId'`, and `payload` is what
+        // this insert actually writes. The enriched context snapshot can name a
+        // card the payload itself never carried, which would make the lookup
+        // and the row it is meant to find disagree.
         //
         // Coalescing is keyed on `idempotencyKey` as well as (agent, issue,
         // reason). A wake that carries an idempotency key is a DISTINCT durable
@@ -20934,7 +20949,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey === null
                 ? isNull(agentWakeupRequests.idempotencyKey)
                 : eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+              issueIdFromPayload
+                ? sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueIdFromPayload}`
+                : sql`${agentWakeupRequests.payload} ->> 'issueId' IS NULL`,
             ),
           )
           .limit(1);

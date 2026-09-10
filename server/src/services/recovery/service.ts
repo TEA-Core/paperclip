@@ -8208,6 +8208,7 @@ export function recoveryService(db: Db, deps: {
     const result = {
       checked: 0,
       reDriven: 0,
+      genericReDriven: 0,
       reDriveFailed: 0,
       livePathSkipped: 0,
       suppressedSkipped: 0,
@@ -8266,6 +8267,9 @@ export function recoveryService(db: Db, deps: {
 
     // Open, visible issues only: a deferrable skip whose issue has since been
     // closed/cancelled/hidden has nothing left to drive.
+    // Every candidate can be generic (no `payload.issueId`), in which case there
+    // is nothing to look up — and an empty `inArray` is not a query worth
+    // issuing.
     const openIssueFilters = [
       inArray(issues.id, candidateIssueIds),
       notInArray(issues.status, ["done", "cancelled"]),
@@ -8273,26 +8277,40 @@ export function recoveryService(db: Db, deps: {
     ];
     if (opts?.companyId) openIssueFilters.push(eq(issues.companyId, opts.companyId));
     const openIssueIds = new Set(
-      (await db
-        .select({ id: issues.id })
-        .from(issues)
-        .where(and(...openIssueFilters)))
-        .map((i) => i.id),
+      candidateIssueIds.length === 0
+        ? []
+        : (await db
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(...openIssueFilters)))
+            .map((i) => i.id),
     );
 
     for (const wake of candidates) {
       const issueId = issueIdByWake.get(wake.id);
-      if (!issueId) continue; // generic (no-issue) wake — stays deferrable, harmless.
-      if (!openIssueIds.has(issueId)) continue; // issue no longer open/visible.
 
-      // Idempotency (A): another path already owns a live execution path for
-      // this card — never drive a second run.
-      if (
-        (await hasActiveExecutionPath(wake.companyId, issueId, wake.agentId)) ||
-        (await hasQueuedIssueWake(wake.companyId, issueId, wake.agentId))
-      ) {
-        result.livePathSkipped++;
-        continue;
+      // A wake with no `payload.issueId` — a generic timer or on-demand wake —
+      // is a durable signal too, and the ruling is about the SKIP REASON, not
+      // about whether the wake happened to name a card. Dropping it here was
+      // the same defect one layer over: the wake would sit `finishedAt IS NULL`
+      // forever, never re-driven and never retired. Generic wakes are therefore
+      // re-driven as well; only the issue-state and live-execution-path guards
+      // below are issue-bound, because there is no card whose state could have
+      // superseded the wake. Duplicate suppression for a generic re-drive is
+      // enqueueWakeup's own same-scope coalescing, which merges onto the agent's
+      // existing queued/running run instead of starting a second one.
+      if (issueId) {
+        if (!openIssueIds.has(issueId)) continue; // issue no longer open/visible.
+
+        // Idempotency (A): another path already owns a live execution path for
+        // this card — never drive a second run.
+        if (
+          (await hasActiveExecutionPath(wake.companyId, issueId, wake.agentId)) ||
+          (await hasQueuedIssueWake(wake.companyId, issueId, wake.agentId))
+        ) {
+          result.livePathSkipped++;
+          continue;
+        }
       }
 
       // Idempotency (B): compare-and-swap so two concurrent sweeps cannot both
@@ -8336,7 +8354,8 @@ export function recoveryService(db: Db, deps: {
         if (run) {
           result.reDriven++;
           result.wakeIds.push(wake.id);
-          result.issueIds.push(issueId);
+          if (issueId) result.issueIds.push(issueId);
+          else result.genericReDriven++;
         } else {
           // enqueueWakeup no-opped on a still-active gate. It wrote its own
           // skip row on the way out, so if that gate was itself deferrable the
@@ -8360,8 +8379,14 @@ export function recoveryService(db: Db, deps: {
 
     if (result.reDriven > 0) {
       logger.info(
-        { reDriven: result.reDriven, livePathSkipped: result.livePathSkipped, issueIds: result.issueIds, source: logSource },
-        "deferred dispatch-suppression wakes re-driven onto open cards",
+        {
+          reDriven: result.reDriven,
+          genericReDriven: result.genericReDriven,
+          livePathSkipped: result.livePathSkipped,
+          issueIds: result.issueIds,
+          source: logSource,
+        },
+        "deferred dispatch-suppression wakes re-driven",
       );
     }
 
