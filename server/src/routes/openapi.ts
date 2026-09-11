@@ -867,6 +867,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "PATCH /api/issues/{id}/queued-comments/{commentId}",
   "PUT /api/issues/{id}/queued-comments/order",
   "DELETE /api/issues/{id}/queued-comments/{commentId}",
+  // Added upstream in the 2026-09-11 slice-2b fold range (#12685). The handler calls
+  // assertBoard() unconditionally and also requires a board user context.
+  "POST /api/issues/{id}/queued-comments/{commentId}/steer",
   "GET /api/tools/oauth/cloud-connector/enrollment",
   // Both added upstream in the 2026-09-07 fold range. Their handlers call
   // assertBoard() unconditionally, so publishing them as agent-callable made the
@@ -1118,6 +1121,11 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   // to ignore conditional assertions, which would have unregistered that route too.
   // Effect is on the published document only; enforcement stays in the handler.
   "POST /api/agents/{id}/heartbeat/invoke",
+  // Conditional too, same precedent (2026-09-11 slice-2b fold range, upstream #12776).
+  // An agent may manage its own instructions bundle through assertCanManageInstructionsPath;
+  // switching the bundle to `mode: "external"` adds assertInstanceAdmin(). Registered here so
+  // the published document stays on the conservative side; the handler still enforces.
+  "PATCH /api/agents/{id}/instructions-bundle",
   "POST /api/companies",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
