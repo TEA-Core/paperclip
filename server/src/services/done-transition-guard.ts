@@ -20,6 +20,7 @@ import { logger } from "../middleware/logger.js";
 import type { IssueComment } from "@paperclipai/shared";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import { resolveGatedPrincipal } from "./approval-status-reconciler.js";
 
 export class GitHubAuthError extends Error {
   readonly status: number;
@@ -1050,27 +1051,47 @@ async function countLadderedChildren(
  * execution policy, report which of the three ADR-072 close-ladder stages
  * (review:support-QAE, review:coder-LE, approval:exec-CTO) are absent.
  *
-  * A stage satisfies a requirement when its `type` matches the required stage
-  * type AND at least one of its agent participants resolves to the required
-  * agent urlKey. Stages carry participant agent ids, not names, so the agent
-  * names are resolved in a single indexed read over the union of all
-  * participant agent ids, then compared via `normalizeAgentUrlKey`. That read
-  * is scoped to the issue's company so an agent from another company can never
-  * be counted as satisfying a close-ladder stage.
-  *
-  * Returns the labels of the missing requirements; an empty array means the
-  * ladder carries the full close-ladder shape. A missing/stages-less policy
-  * reports every requirement as missing.
-  */
+ * A stage satisfies a requirement when its `type` matches the required stage
+ * type AND at least one of its agent participants resolves to the required
+ * agent urlKey. Stages carry participant agent ids, not names, so the agent
+ * names are resolved in a single indexed read over the union of all
+ * participant agent ids, then compared via `normalizeAgentUrlKey`. That read
+ * is scoped to the issue's company so an agent from another company can never
+ * be counted as satisfying a close-ladder stage.
+ *
+ * SUP-15650: a rung is RE-SEATED when the ADR-072 agent it names IS the card's
+ * gated principal. The principal is resolved through {@link resolveGatedPrincipal}
+ * — the SAME ADR-092 D3 order Guard B (ADR-073 stage integrity) uses — so the
+ * two guards cannot drift on who the principal is. A requirement whose agent
+ * urlKey resolves to that principal is then satisfied only by a stage of the
+ * same type carrying at least one participant agent that is NOT the principal:
+ * the rung moves to an independent agent and is never dropped. A stage of the
+ * right type whose ONLY agent participant is the principal does NOT satisfy
+ * the requirement (a self-held rung is not a rung), so a ladder with fewer
+ * independent gates than ADR-072 requires still refuses. Every rung the
+ * principal does not hold keeps its verbatim agent requirement.
+ *
+ * Returns the labels of the missing requirements; an empty array means the
+ * ladder carries the full close-ladder shape. A missing/stages-less policy
+ * reports every requirement as missing.
+ */
 async function findMissingAdr072CloseLadderStages(
   db: Db,
   companyId: string,
   executionPolicy: unknown,
+  executionState: unknown,
+  createdByAgentId: string | null | undefined,
 ): Promise<string[]> {
-  const rawStages =
+  const policy: Record<string, unknown> =
     executionPolicy != null && typeof executionPolicy === "object"
-      ? (executionPolicy as { stages?: unknown }).stages
-      : undefined;
+      ? (executionPolicy as Record<string, unknown>)
+      : {};
+  const state: Record<string, unknown> =
+    executionState != null && typeof executionState === "object"
+      ? (executionState as Record<string, unknown>)
+      : {};
+
+  const rawStages = policy.stages;
   if (!Array.isArray(rawStages)) {
     return ADR072_CLOSE_LADDER.map((requirement) => requirement.label);
   }
@@ -1085,6 +1106,11 @@ async function findMissingAdr072CloseLadderStages(
       participants: Array.isArray(stage.participants) ? stage.participants : [],
     }));
 
+  // SUP-15650: the card's gated principal, resolved in the one shared ADR-092
+  // D3 order Guard B uses. When it is unresolvable the set is empty and every
+  // rung below stays verbatim — the conservative behaviour.
+  const gated = resolveGatedPrincipal(policy, state, createdByAgentId);
+
   const agentIds = new Set<string>();
   for (const stage of stages) {
     for (const participant of stage.participants) {
@@ -1098,6 +1124,9 @@ async function findMissingAdr072CloseLadderStages(
       }
     }
   }
+  // Include the principal's agent ids so the read below can resolve their
+  // urlKeys too (needed to tell a principal-held rung from an ordinary one).
+  for (const agentId of gated.agentIds) agentIds.add(agentId);
 
   const agentIdToUrlKey = new Map<string, string | null>();
   if (agentIds.size > 0) {
@@ -1110,8 +1139,17 @@ async function findMissingAdr072CloseLadderStages(
     }
   }
 
+  // The urlKeys the principal resolves to. A rung whose required agent urlKey
+  // lands here is the principal's own rung and gets re-seated.
+  const principalUrlKeys = new Set<string>();
+  for (const agentId of gated.agentIds) {
+    const urlKey = agentIdToUrlKey.get(agentId);
+    if (urlKey !== null && urlKey !== undefined) principalUrlKeys.add(urlKey);
+  }
+
   const missing: string[] = [];
   for (const requirement of ADR072_CLOSE_LADDER) {
+    const principalHoldsRung = principalUrlKeys.has(requirement.agentUrlKey);
     const satisfied = stages.some(
       (stage) =>
         stage.type === requirement.stageType &&
@@ -1124,9 +1162,16 @@ async function findMissingAdr072CloseLadderStages(
           ) {
             return false;
           }
+          const agentId = (participant as { agentId: string }).agentId;
+          if (principalHoldsRung) {
+            // Re-seated rung: satisfied only by an INDEPENDENT (non-principal)
+            // agent participant. A rung held only by the principal is not a
+            // rung — the gate must move to another agent, never drop.
+            return !gated.agentIds.has(agentId);
+          }
+          // Ordinary rung: the participant must resolve to the required agent.
           return (
-            agentIdToUrlKey.get((participant as { agentId: string }).agentId) ===
-            requirement.agentUrlKey
+            agentIdToUrlKey.get(agentId) === requirement.agentUrlKey
           );
         }),
     );
@@ -1162,6 +1207,7 @@ export async function evaluateDoneTransitionGuard(
     projectWorkspaceId: string | null;
     executionWorkspaceId: string | null;
     parentId?: string | null;
+    createdByAgentId?: string | null;
     executionPolicy?: unknown;
     executionState?: unknown;
   },
@@ -1248,6 +1294,8 @@ export async function evaluateDoneTransitionGuard(
         db,
         issue.companyId,
         issue.executionPolicy,
+        issue.executionState,
+        issue.createdByAgentId,
       );
       if (missingStageLabels.length > 0) {
         ladderShape = {
