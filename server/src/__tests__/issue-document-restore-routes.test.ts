@@ -353,7 +353,7 @@ describe("issue document revision routes", () => {
     }));
   });
 
-  it("blocks cheap status-only recovery runs from restoring issue documents", async () => {
+  it("blocks status-only recovery runs from restoring issue documents", async () => {
     mockIssueService.getById.mockResolvedValueOnce({
       id: issueId,
       companyId,
@@ -372,7 +372,6 @@ describe("issue document revision routes", () => {
         source: "agent_jwt",
       },
       createRunContextDb({
-        modelProfile: "cheap",
         recoveryIntent: "status_only",
         allowDeliverableWork: false,
         allowDocumentUpdates: false,
@@ -383,7 +382,7 @@ describe("issue document revision routes", () => {
       .send({});
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("Cheap status-only recovery runs cannot update issue documents");
+    expect(res.body.error).toContain("Status-only recovery runs cannot update issue documents");
     expect(mockDocumentsService.restoreIssueDocumentRevision).not.toHaveBeenCalled();
   });
 

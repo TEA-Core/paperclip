@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
+import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -158,39 +159,10 @@ function registerModuleMocks() {
   }));
 }
 
-function createApp() {
-  const app = express();
-  app.use(express.json());
-  return app;
-}
+let lastErrorContext: unknown;
 
-async function installActor(app: express.Express, actor?: Record<string, unknown>) {
-  const { issueRoutes } = await import("../routes/issues.js");
-  const { errorHandler } = await import("../middleware/index.js");
-
-  app.use((req, _res, next) => {
-    (req as any).actor = actor ?? {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
-    next();
-  });
-  const db = {
-    select: vi.fn(() => ({
-      from: vi.fn(() => ({
-        where: vi.fn(() => ({
-          orderBy: vi.fn(async () => mockAuthoritativeQueueWakes),
-        })),
-      })),
-    })),
-  };
-  app.use("/api", issueRoutes(db as any, {} as any));
-  app.use(reportUnexpectedRouteError("issue-comment-cancel-routes"));
-  app.use(errorHandler);
-  return app;
+function describeResponse(res: request.Response) {
+  return JSON.stringify({ body: res.body, errorContext: lastErrorContext });
 }
 
 function makeIssue() {
@@ -221,23 +193,54 @@ function makeComment(overrides: Record<string, unknown> = {}) {
 }
 
 describe.sequential("issue comment cancel routes", () => {
+  const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
+    // Await one module graph at a time: a concurrent Promise.all drains vitest's
+    // pending mock queue twice and can drop the services/index mock (see
+    // no-concurrent-module-imports.test.ts).
+    const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js");
+    const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js");
+    return { issueRoutes, errorHandler };
+  });
+
+  function installActor(app: express.Express, actor?: Record<string, unknown>) {
+    const { issueRoutes, errorHandler } = routeModules.value;
+
+    app.use((req, res, next) => {
+      res.on("finish", () => {
+        lastErrorContext = (res as any).__errorContext ?? null;
+      });
+      (req as any).actor = actor ?? {
+        type: "board",
+        userId: "local-board",
+        companyIds: ["company-1"],
+        source: "local_implicit",
+        isInstanceAdmin: false,
+      };
+      next();
+    });
+    const db = {
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn(() => ({
+            orderBy: vi.fn(async () => mockAuthoritativeQueueWakes),
+          })),
+        })),
+      })),
+    };
+    app.use("/api", issueRoutes(db as any, {} as any));
+    app.use(reportUnexpectedRouteError("issue-comment-cancel-routes"));
+    app.use(errorHandler);
+    return app;
+  }
+
+  function createApp() {
+    const app = express();
+    app.use(express.json());
+    return app;
+  }
+
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/access.js");
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/decision-training.js");
-    vi.doUnmock("../services/external-objects.js");
-    vi.doUnmock("../services/feedback.js");
-    vi.doUnmock("../services/heartbeat.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/instance-settings.js");
-    vi.doUnmock("../services/issues.js");
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
+    lastErrorContext = undefined;
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
@@ -383,7 +386,7 @@ describe.sequential("issue comment cancel routes", () => {
     const res = await request(await installActor(createApp()))
       .delete("/api/issues/11111111-1111-4111-8111-111111111111/comments/comment-1");
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.status, describeResponse(res)).toBe(200);
     expect(res.body).toMatchObject({
       id: "comment-1",
       body: "",
@@ -458,7 +461,7 @@ describe.sequential("issue comment cancel routes", () => {
     const res = await request(await installActor(createApp()))
       .delete("/api/issues/11111111-1111-4111-8111-111111111111/comments/comment-1");
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.status, describeResponse(res)).toBe(200);
     expect(mockIssueService.tombstoneComment).toHaveBeenCalledWith(
       "comment-1",
       expect.anything(),

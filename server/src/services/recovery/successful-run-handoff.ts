@@ -4,7 +4,7 @@ import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
 import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
 import { isExternalPullAgent } from "../agent-work-delivery.js";
-import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
+import { withRecoveryContext } from "./status-only-context.js";
 import {
   agentLinkRow,
   issueLinkRow,
@@ -614,7 +614,7 @@ export function decideSuccessfulRunHandoff(input: {
     nextAction: input.nextAction,
     detectedProgressSummary: input.detectedProgressSummary,
   });
-  const payload = withRecoveryModelProfileHint({
+  const payload = withRecoveryContext({
     issueId: issue.id,
     taskId: issue.id,
     sourceIssueId: issue.id,
@@ -642,7 +642,7 @@ export function decideSuccessfulRunHandoff(input: {
     }),
     payload,
     instruction,
-    contextSnapshot: withRecoveryModelProfileHint({
+    contextSnapshot: withRecoveryContext({
       ...payload,
       wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
       livenessState: input.livenessState,

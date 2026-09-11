@@ -14,10 +14,14 @@ export type PullRequestMergeDetails = {
   state: PullRequestMergeState;
   headRef: string | null;
   headSha: string | null;
+  workProductState?: "open" | "draft" | "merged" | "closed";
+  draft?: boolean;
+  baseRef?: string | null;
   mergedAt?: string | null;
   mergeCommitSha?: string | null;
   additions?: number | null;
   deletions?: number | null;
+  changedFiles?: number | null;
 };
 
 export type PullRequestMergeStateResolver = (
@@ -99,16 +103,26 @@ export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeD
     });
     if (!result.ok) return { state: "unknown", headRef: null, headSha: null, mergedAt: null, mergeCommitSha: null };
     const data = readRecord(result.snapshot.data);
+    const statusKey = result.snapshot.statusKey;
+    const workProductState = statusKey === "open" || statusKey === "draft" || statusKey === "merged" || statusKey === "closed"
+      ? statusKey
+      : undefined;
     return {
-      state: result.snapshot.statusKey === "merged" || data?.merged === true
+      state: statusKey === "merged" || data?.merged === true
         ? "merged"
-        : "open",
+        : statusKey === "open" || statusKey === "draft" || statusKey === "closed"
+          ? "open"
+          : "unknown",
       headRef: typeof data?.headRef === "string" ? data.headRef : null,
       headSha: typeof data?.headSha === "string" ? data.headSha : null,
+      ...(workProductState ? { workProductState } : {}),
+      draft: data?.draft === true,
+      baseRef: typeof data?.baseRef === "string" ? data.baseRef : null,
       mergedAt: typeof data?.merged_at === "string" ? data.merged_at : null,
       mergeCommitSha: typeof data?.merge_commit_sha === "string" ? data.merge_commit_sha : null,
       additions: typeof data?.additions === "number" ? data.additions : null,
       deletions: typeof data?.deletions === "number" ? data.deletions : null,
+      changedFiles: typeof data?.changedFiles === "number" ? data.changedFiles : null,
     };
   };
 }

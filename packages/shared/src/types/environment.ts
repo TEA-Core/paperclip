@@ -30,6 +30,10 @@ export interface FakeSandboxEnvironmentConfig {
   reuseLease: boolean;
   /** Stream agent CLI stdout/stderr during sandbox runs (bridge log-tail loop). */
   streamRunLogs?: boolean;
+  /** Override the paperclip_runner lifecycle for this environment. */
+  runnerLifecycleMode?: "inherit" | "per_turn" | "warm";
+  /** Warm runner idle timeout in milliseconds when runnerLifecycleMode is warm. */
+  runnerIdleTimeoutMs?: number;
   /**
    * Stream the interactive ACP agent output through the persistent session log
    * stream instead of the host output-file poll. Default OFF.
@@ -49,6 +53,10 @@ export interface PluginSandboxEnvironmentConfig {
   timeoutMs?: number;
   /** Stream agent CLI stdout/stderr during sandbox runs (bridge log-tail loop). */
   streamRunLogs?: boolean;
+  /** Override the paperclip_runner lifecycle for this environment. */
+  runnerLifecycleMode?: "inherit" | "per_turn" | "warm";
+  /** Warm runner idle timeout in milliseconds when runnerLifecycleMode is warm. */
+  runnerIdleTimeoutMs?: number;
   /**
    * Stream the interactive ACP agent output through the persistent session log
    * stream instead of the host output-file poll. Default OFF.

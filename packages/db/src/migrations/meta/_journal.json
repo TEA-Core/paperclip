@@ -1744,6 +1744,34 @@
       "when": 1788762005000,
       "tag": "0250_heartbeat_run_event_sequence_uniqueness",
       "breakpoints": true
+    },
+    {
+      "idx": 249,
+      "version": "7",
+      "when": 1788762006000,
+      "tag": "0251_remove_cheap_model_profiles",
+      "breakpoints": true
+    },
+    {
+      "idx": 250,
+      "version": "7",
+      "when": 1788762007000,
+      "tag": "0252_clammy_colonel_america",
+      "breakpoints": true
+    },
+    {
+      "idx": 251,
+      "version": "7",
+      "when": 1788762008000,
+      "tag": "0253_graceful_infant_terrible",
+      "breakpoints": true
+    },
+    {
+      "idx": 252,
+      "version": "7",
+      "when": 1788762009000,
+      "tag": "0254_sturdy_santa_claus",
+      "breakpoints": true
     }
   ]
 }

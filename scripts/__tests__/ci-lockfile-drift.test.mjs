@@ -94,7 +94,12 @@ test("every docker.yml job that builds an image refreshes the lockfile for the b
   for (const [name, body] of jobs(dockerWorkflow)) {
     if (!body.includes("docker/build-push-action")) continue;
 
-    const refreshIndex = body.indexOf("pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile");
+    // Upstream #12829 moved the lock-repair paths to `--resolution-only` (still a full
+    // resolution pass, without the unrelated platform-metadata churn `--lockfile-only`
+    // caused). What this pins is that a refresh runs before the build, not which flag.
+    const refreshIndex = body.search(
+      /pnpm install --(?:resolution-only|lockfile-only) --ignore-scripts --no-frozen-lockfile/,
+    );
     assert.ok(
       refreshIndex !== -1,
       `job \`${name}\` builds an image whose deps stage runs a frozen install, so it must refresh the lockfile first`,
