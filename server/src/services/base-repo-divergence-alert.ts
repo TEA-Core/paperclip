@@ -20,14 +20,25 @@ import path from "node:path";
  * published attention row plus a distinct alert line — rather than leaving the
  * operator to the inline warning.
  *
- * The once-per-episode guarantee is enforced by an O_EXCL claim marker under the
- * checkout's `.paperclip/` tree rather than any mutual-exclusion lock: one
- * atomic create that a single concurrent observer — across processes, not just
- * within one server — can win for a given episode. There is therefore no lock to
- * go stale, no liveness oracle, and no recovery window. It is deliberately
- * best-effort everywhere: a tracking or signal failure must never block a
- * dispatch, and a base repo that is in sync or that self-heals promptly produces
- * no signal and no residue.
+ * Two primitives, each a single atomic operation with no mutual-exclusion lock:
+ *
+ *  - The once-per-episode alert is an O_EXCL claim marker under the checkout's
+ *    `.paperclip/` tree, keyed on a stable hash of the episode's identity (the
+ *    canonical repo identity and the base ref), never a timestamp. One
+ *    concurrent observer — across processes, not just within one server — can
+ *    win it, so a divergence alerts at most once per episode. There is therefore
+ *    no lock to go stale, no liveness oracle, and no recovery window.
+ *  - The observation state (when the episode began and was last seen) is
+ *    append-only per writer: each process publishes its own entry under
+ *    `.paperclip/base-repo-divergence-obs-<h>/`, and every read re-merges all
+ *    entries with the convergent sidecar summary — `min` over the starts, `max`
+ *    over the ends. Because each entry path has exactly one writer for the life
+ *    of a process, the earliest start is preserved across processes without a
+ *    lock and without a lost read→derive→rename.
+ *
+ * It is deliberately best-effort everywhere: a tracking or signal failure must
+ * never block a dispatch, and a base repo that is in sync or that self-heals
+ * promptly produces no signal and no residue.
  */
 
 export const DEFAULT_BASE_REPO_DIVERGENCE_ALERT_AGE_DAYS = 7;
@@ -111,7 +122,7 @@ export interface BaseRepoDivergenceRecord {
 export const DIVERGENCE_RECORD_RELATIVE_PATH = path.join(".paperclip", "base-repo-divergence.json");
 
 /**
- * The record lives in the base-repo checkout's `.paperclip/` directory — the
+ * The sidecar lives in the base-repo checkout's `.paperclip/` directory — the
  * same gitignored tree the agent worktrees live under — so it is keyed
  * naturally to that base repo, outlives any individual worktree, never lands
  * in `git status`, and needs no database migration.
@@ -121,17 +132,13 @@ export function divergenceRecordPath(repoRoot: string): string {
 }
 
 /**
- * The once-per-episode claim is a single `O_EXCL` create, won by at most one
- * concurrent observer — across processes, not just within a server — so a
- * divergence alert fires at most once no matter how many provisioning workers
- * race to observe it.
- *
- * The marker is keyed on this stable hash of the episode's identity: the
- * canonical repo identity and the base ref it has diverged from, never a
- * timestamp. A checkout repointed at a different repo or ref hashes to a
- * different marker and therefore starts a fresh episode; two workers whose
- * clocks differ by milliseconds always agree on the same marker, so the
- * at-most-once guarantee holds at any threshold, including zero.
+ * The stable episode key: a hash of the canonical repo identity and the base
+ * ref it has diverged from, never a timestamp. It keys both the O_EXCL claim
+ * marker and the per-writer observation entries, so a checkout repointed at a
+ * different repo or ref both starts a fresh alert episode and a fresh entry
+ * directory; two workers whose clocks differ by milliseconds always agree on
+ * the same key, so the at-most-once guarantee holds at any threshold,
+ * including zero.
  */
 export function divergenceAlertEpisodeHash(repoIdentity: string, baseRef: string): string {
   return createHash("sha256").update(`${repoIdentity}\u0000${baseRef}`).digest("hex").slice(0, 32);
@@ -143,6 +150,107 @@ export function divergenceAlertMarkerPath(repoRoot: string, repoIdentity: string
     ".paperclip",
     `base-repo-divergence-alerted-${divergenceAlertEpisodeHash(repoIdentity, baseRef)}.marker`,
   );
+}
+
+/**
+ * One process-level identity, generated once per process load. Combined with
+ * the pid it names a single writer for the life of the process, so pid reuse
+ * across a restart can never collide with a previous process's observation
+ * entry.
+ */
+const PROCESS_INSTANCE_ID = randomUUID();
+
+/**
+ * The observation entries for one episode live under the checkout's
+ * `.paperclip/` tree, keyed on the same episode hash as the claim marker.
+ */
+function divergenceObservationEntryDir(repoRoot: string, repoIdentity: string, baseRef: string): string {
+  return path.join(
+    repoRoot,
+    ".paperclip",
+    `base-repo-divergence-obs-${divergenceAlertEpisodeHash(repoIdentity, baseRef)}`,
+  );
+}
+
+/** This process's single-writer observation entry for one episode. */
+function processObservationEntryPath(repoRoot: string, repoIdentity: string, baseRef: string): string {
+  return path.join(
+    divergenceObservationEntryDir(repoRoot, repoIdentity, baseRef),
+    `entry-${process.pid}-${PROCESS_INSTANCE_ID}.json`,
+  );
+}
+
+interface ObservationEntry {
+  firstObservedAtMs: number;
+  lastObservedAtMs: number;
+}
+
+/**
+ * Read every observation entry for an episode. Unparseable files and in-flight
+ * `*.tmp` files are skipped silently (fail-open); a missing directory yields no
+ * entries. Never throws.
+ */
+async function readObservationEntries(
+  repoRoot: string,
+  repoIdentity: string,
+  baseRef: string,
+): Promise<ObservationEntry[]> {
+  const dir = divergenceObservationEntryDir(repoRoot, repoIdentity, baseRef);
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+  const out: ObservationEntry[] = [];
+  for (const name of names) {
+    if (name.endsWith(".tmp")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await fs.readFile(path.join(dir, name), "utf8"));
+    } catch {
+      continue;
+    }
+    const rec = parsed as Partial<ObservationEntry>;
+    if (
+      typeof rec.firstObservedAtMs === "number" && Number.isFinite(rec.firstObservedAtMs) &&
+      typeof rec.lastObservedAtMs === "number" && Number.isFinite(rec.lastObservedAtMs)
+    ) {
+      out.push({ firstObservedAtMs: rec.firstObservedAtMs, lastObservedAtMs: rec.lastObservedAtMs });
+    }
+  }
+  return out;
+}
+
+/**
+ * Pure fold of the candidate observation times into the merged start/end.
+ * `bound` is the clock-skew guard: a start candidate strictly after `bound` is
+ * dropped (the effect of today's `prior.firstObservedAtMs <= nowMs`), applied
+ * uniformly to every candidate. The end is an unfiltered max. `fallbackFirst`
+ * stands in when the guard empties the start candidates (the public read path;
+ * the decision path always seeds the fresh `nowMs`).
+ */
+function foldObservation(
+  firstCandidates: number[],
+  lastCandidates: number[],
+  bound: number,
+  fallbackFirst: number,
+): { firstObservedAtMs: number; lastObservedAtMs: number } {
+  let first = fallbackFirst;
+  let sawStart = false;
+  for (const v of firstCandidates) {
+    if (v > bound) continue;
+    if (!sawStart || v < first) first = v;
+    sawStart = true;
+  }
+  let last = -Infinity;
+  for (const v of lastCandidates) {
+    if (v > last) last = v;
+  }
+  return {
+    firstObservedAtMs: first,
+    lastObservedAtMs: Number.isFinite(last) ? last : fallbackFirst,
+  };
 }
 
 /**
@@ -202,7 +310,13 @@ async function divergenceAlertMarkerPresent(
   }
 }
 
-export async function readDivergenceRecord(repoRoot: string): Promise<BaseRepoDivergenceRecord | null> {
+/**
+ * Read the raw convergent sidecar without merging the per-writer entries.
+ * Returns the parsed, validated record or null when absent or malformed. This
+ * is the cache half of the observation state; the authoritative merge is done
+ * by {@link readDivergenceRecord} and the decision path.
+ */
+async function readRawSidecar(repoRoot: string): Promise<BaseRepoDivergenceRecord | null> {
   try {
     const text = await fs.readFile(divergenceRecordPath(repoRoot), "utf8");
     const parsed = JSON.parse(text) as Partial<BaseRepoDivergenceRecord>;
@@ -232,13 +346,48 @@ export async function readDivergenceRecord(repoRoot: string): Promise<BaseRepoDi
 }
 
 /**
- * Remove the record and any alert markers under the checkout's `.paperclip/`
- * tree. Best-effort: a stale sidecar or marker must never block provisioning.
+ * Public read of the episode's observation state: the sidecar's convergent
+ * summary merged with every per-writer entry (`min` over the starts, `max` over
+ * the ends). The signature is unchanged — no identity argument; the episode key
+ * is derived from the sidecar's OWN identity + ref. Absent or malformed
+ * sidecar -> null, unchanged.
+ */
+export async function readDivergenceRecord(repoRoot: string): Promise<BaseRepoDivergenceRecord | null> {
+  const sidecar = await readRawSidecar(repoRoot);
+  if (!sidecar) return null;
+  const entries = await readObservationEntries(repoRoot, sidecar.repoIdentity, sidecar.baseRef);
+  const lastCandidates: number[] = [sidecar.lastObservedAtMs];
+  for (const e of entries) lastCandidates.push(e.lastObservedAtMs);
+  const bound = lastCandidates.reduce((m, v) => Math.max(m, v), sidecar.lastObservedAtMs);
+  const firstCandidates: number[] = [sidecar.firstObservedAtMs];
+  for (const e of entries) firstCandidates.push(e.firstObservedAtMs);
+  const merged = foldObservation(firstCandidates, lastCandidates, bound, sidecar.firstObservedAtMs);
+  return {
+    ...sidecar,
+    firstObservedAtMs: merged.firstObservedAtMs,
+    lastObservedAtMs: merged.lastObservedAtMs,
+    // Derived from marker presence, never trusted from the persisted shape: the
+    // summary is last-writer-wins and can be clobbered by a concurrent writer,
+    // but dedup is the O_EXCL marker, so a stale summary can no longer break it.
+    alertedForFirstObservedAtMs: (await divergenceAlertMarkerPresent(
+      repoRoot,
+      sidecar.repoIdentity,
+      sidecar.baseRef,
+    ))
+      ? merged.firstObservedAtMs
+      : null,
+  };
+}
+
+/**
+ * Remove the record, the alert markers, and every observation entry directory
+ * under the checkout's `.paperclip/` tree. Best-effort: a stale artifact must
+ * never block provisioning.
  *
  * This is the ONLY unlink reachable from the module. It runs exclusively on the
  * episode-ended path (a reset, restore, fast-forward, or in-sync base) and is
  * never called from {@link observeDivergedRefusal}, so it cannot race a claim
- * decision for the same episode.
+ * decision or an in-flight entry write for the same episode.
  */
 export async function clearDivergenceRecord(repoRoot: string): Promise<void> {
   try {
@@ -252,6 +401,8 @@ export async function clearDivergenceRecord(repoRoot: string): Promise<void> {
     for (const entry of entries) {
       if (entry.startsWith("base-repo-divergence-alerted-") && entry.endsWith(".marker")) {
         await fs.rm(path.join(dir, entry), { force: true }).catch(() => {});
+      } else if (entry.startsWith("base-repo-divergence-obs-")) {
+        await fs.rm(path.join(dir, entry), { recursive: true, force: true }).catch(() => {});
       }
     }
   } catch {
@@ -280,12 +431,13 @@ export interface DivergedRefusalObservation {
 
 /**
  * In-process per-repo-root serialization for {@link observeDivergedRefusal}.
- * Kept for write economy — coalescing concurrent read-modify-writes of the
- * sidecar within one server process — and because in-process ordering is a
- * preserved behaviour. It is NO LONGER what makes the alert fire at most once
- * per episode: that guarantee now comes from the O_EXCL claim marker, which is
- * won by at most one observer even across processes. Serialization is
- * therefore not load-bearing for dedup any more.
+ * It is load-bearing for a NARROWER property than the module claims elsewhere:
+ * it keeps THIS process's own observation entry (and its sidecar summary) a
+ * single-writer path when two provisioning passes for the same checkout overlap
+ * in-process, so one pass's read→fold→rename cannot interleave with the
+ * other's. It is NOT what makes the alert fire at most once per episode — that
+ * guarantee comes from the O_EXCL claim marker, which is won by at most one
+ * observer even across processes.
  */
 const observeChains = new Map<string, Promise<unknown>>();
 
@@ -306,24 +458,26 @@ function serializeObservationByKey<T>(key: string, task: () => Promise<T>): Prom
  * Record one observation of the diverged-refused state and decide whether a
  * first-class signal is due.
  *
- * `firstObservedAtMs` preserves the EARLIEST observation seen so far, so the
- * age grows monotonically for the life of a divergence episode regardless of
- * how many times the repo is probed. `lastObservedAtMs` and the ahead/behind
- * counts/subjects are refreshed to the newest observation.
+ * The observation state is merged on read: this process reads the convergent
+ * sidecar (trusted only when it was written for the SAME repo identity + base
+ * ref) and every per-writer entry, folds them to `firstObservedAtMs = min(...)`
+ * and `lastObservedAtMs = max(...)` — the clock-skew guard drops any start after
+ * `nowMs` — then republishes both its sidecar summary and its own single-writer
+ * entry. Because each entry path has exactly one writer for the life of the
+ * process, the fold preserves the earliest start even when many processes
+ * observe the same episode concurrently, with no lost update and no lock. An
+ * in-flight observer whose entry is not yet written may still return a start
+ * later than the eventual global min; that is inherent, fail-late (never a
+ * spurious early alert), and self-heals on the next pass.
  *
- * A prior record is only reused when it was written for the SAME repo identity
- * and base ref. The record lives under the checkout path's `.paperclip/` tree,
- * so a path that now hosts a different repository or ref must not inherit an
- * old `firstObservedAtMs` — that would manufacture an instantly-old episode and
- * emit a spurious alert, breaking per-base-repo tracking and the no-noise rule.
+ * A path that now hosts a different repository or base ref starts a fresh
+ * episode (a new hash, an empty entry directory) rather than inheriting an old
+ * start, so it cannot manufacture an instantly-old episode or a spurious alert.
  *
- * Observations for the same checkout path are serialized (see
- * {@link serializeObservationByKey}) for write economy, but the once-per-episode
- * guarantee no longer depends on that. It now comes from the O_EXCL claim
- * marker: when the threshold is crossed, exactly one concurrent observer —
- * across processes — can create the episode's marker, so one divergence episode
- * yields at most one first-class signal no matter how many workers race to
- * observe it.
+ * The once-per-episode guarantee is the O_EXCL claim marker: when the threshold
+ * is crossed, exactly one concurrent observer — across processes — can create
+ * the episode's marker, so one divergence episode yields at most one
+ * first-class signal no matter how many workers race to observe it.
  */
 export function observeDivergedRefusal(
   repoRoot: string,
@@ -340,24 +494,29 @@ async function recordDivergedRefusal(
 ): Promise<DivergedRefusalObservation> {
   const nowMs = input.nowMs ?? Date.now();
   const thresholdMs = input.thresholdMs ?? resolveDivergenceAlertThresholdMs();
-  const existing = await readDivergenceRecord(repoRoot);
-  // Only trust a prior record written for the current repo identity AND base
-  // ref; otherwise start a fresh episode rather than inheriting its age.
-  const prior =
-    existing && existing.repoIdentity === input.repoIdentity && existing.baseRef === input.baseRef
-      ? existing
-      : null;
-  // A future-dated existing record (clock skew) must not shrink the window we
-  // have already been watching; fall back to now for that episode's start.
-  const firstObservedAtMs =
-    prior && prior.firstObservedAtMs <= nowMs ? prior.firstObservedAtMs : nowMs;
+
+  // Merge on read: fold the sidecar (trusted only when it matches this input's
+  // identity + ref) and every per-writer entry with the fresh observation.
+  const sidecar = await readRawSidecar(repoRoot);
+  const sidecarMatches =
+    sidecar !== null && sidecar.repoIdentity === input.repoIdentity && sidecar.baseRef === input.baseRef;
+  const entries = await readObservationEntries(repoRoot, input.repoIdentity, input.baseRef);
+
+  const firstCandidates: number[] = [nowMs];
+  if (sidecarMatches && sidecar!.firstObservedAtMs <= nowMs) firstCandidates.push(sidecar!.firstObservedAtMs);
+  for (const e of entries) if (e.firstObservedAtMs <= nowMs) firstCandidates.push(e.firstObservedAtMs);
+  const lastCandidates: number[] = [nowMs];
+  if (sidecarMatches) lastCandidates.push(sidecar!.lastObservedAtMs);
+  for (const e of entries) lastCandidates.push(e.lastObservedAtMs);
+
+  const { firstObservedAtMs, lastObservedAtMs } = foldObservation(firstCandidates, lastCandidates, nowMs, nowMs);
   const ageMs = Math.max(0, nowMs - firstObservedAtMs);
   const alertDue = ageMs >= thresholdMs;
 
   // The alert decision IS one atomic create: an O_EXCL marker for this episode.
-  // It is attempted ONLY when the threshold is already crossed, so a
-  // below-threshold pass leaves no residue. Exactly one concurrent observer
-  // (across processes) can win; every other sees EEXIST and stays quiet.
+  // Attempted ONLY when the threshold is already crossed, so a below-threshold
+  // pass claims nothing. Exactly one concurrent observer (across processes) can
+  // win; every other sees EEXIST and stays quiet.
   let shouldEmitFirstClassSignal = false;
   if (alertDue) {
     shouldEmitFirstClassSignal = await tryClaimDivergenceAlertEpisode(
@@ -368,7 +527,7 @@ async function recordDivergedRefusal(
   }
 
   // Observability / back-compat only: mirror whether the episode holds its claim
-  // marker. It is derived from marker presence and is never an input to
+  // marker. Derived from marker presence and never an input to
   // `shouldEmitFirstClassSignal`.
   const alertedForFirstObservedAtMs = alertDue
     ? (await divergenceAlertMarkerPresent(repoRoot, input.repoIdentity, input.baseRef)
@@ -380,12 +539,24 @@ async function recordDivergedRefusal(
     repoIdentity: input.repoIdentity,
     baseRef: input.baseRef,
     firstObservedAtMs,
-    lastObservedAtMs: nowMs,
+    lastObservedAtMs,
     aheadCount: input.aheadCount,
     behindCount: input.behindCount,
     aheadCommitSubjects: input.aheadCommitSubjects,
     alertedForFirstObservedAtMs,
   };
+
+  // The sidecar stays as a convergent, last-writer-wins summary/cache.
+  await writeRecordSidecar(repoRoot, record);
+
+  // This process's own single-writer entry is the durable per-writer record.
+  await writeProcessObservationEntry(repoRoot, input.repoIdentity, input.baseRef, nowMs);
+
+  return { record, ageMs, thresholdMs, alertDue, shouldEmitFirstClassSignal };
+}
+
+/** Best-effort tmp+rename publish of the convergent sidecar summary. */
+async function writeRecordSidecar(repoRoot: string, record: BaseRepoDivergenceRecord): Promise<void> {
   try {
     await fs.mkdir(path.dirname(divergenceRecordPath(repoRoot)), { recursive: true });
     const target = divergenceRecordPath(repoRoot);
@@ -396,7 +567,46 @@ async function recordDivergedRefusal(
     // Best-effort: even if the write fails the in-memory decision is still
     // returned, so a stuck base repo still alerts from memory this pass.
   }
-  return { record, ageMs, thresholdMs, alertDue, shouldEmitFirstClassSignal };
+}
+
+/**
+ * Publish this process's running start/end for the episode to its single-writer
+ * entry (tmp+rename, tmp inside the entry dir, name carrying pid + uuid). One
+ * writer per path for the life of the process, so an entry write can never lose
+ * another writer's update under any interleaving. Best-effort: a failure never
+ * blocks a dispatch.
+ */
+async function writeProcessObservationEntry(
+  repoRoot: string,
+  repoIdentity: string,
+  baseRef: string,
+  nowMs: number,
+): Promise<void> {
+  try {
+    const dir = divergenceObservationEntryDir(repoRoot, repoIdentity, baseRef);
+    const target = processObservationEntryPath(repoRoot, repoIdentity, baseRef);
+    await fs.mkdir(dir, { recursive: true });
+    // This process is the sole writer of its own entry; fold this observation
+    // into its running min/max so a repeated probe preserves the earliest start.
+    let first = nowMs;
+    let last = nowMs;
+    try {
+      const prev = JSON.parse(await fs.readFile(target, "utf8")) as Partial<ObservationEntry>;
+      if (typeof prev.firstObservedAtMs === "number" && Number.isFinite(prev.firstObservedAtMs)) {
+        first = Math.min(first, prev.firstObservedAtMs);
+      }
+      if (typeof prev.lastObservedAtMs === "number" && Number.isFinite(prev.lastObservedAtMs)) {
+        last = Math.max(last, prev.lastObservedAtMs);
+      }
+    } catch {
+      // First observation for this process, or unreadable: start fresh from now.
+    }
+    const tmp = path.join(dir, `entry-${process.pid}-${randomUUID()}.tmp`);
+    await fs.writeFile(tmp, JSON.stringify({ firstObservedAtMs: first, lastObservedAtMs: last }, null, 2), "utf8");
+    await fs.rename(tmp, target);
+  } catch {
+    // Best-effort: a failed entry write never blocks a dispatch.
+  }
 }
 
 /** The structured payload for the first-class attention row. */

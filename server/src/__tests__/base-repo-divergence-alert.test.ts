@@ -23,9 +23,12 @@ import {
 // `diverged` state should emit a first-class signal once it has persisted past a
 // configurable age threshold, deduplicated to fire once per episode. The
 // once-per-episode guarantee is an O_EXCL claim marker under `.paperclip/` (not a
-// mutual-exclusion lock), so these tests cover: the pure age/threshold decision,
-// the per-base-repo sidecar record, the alert text, the marker keying, and —
-// behaviorally — the real multi-process claim, the no-unlink invariant, crash
+// mutual-exclusion lock), and the observation state is append-only per writer —
+// each process publishes its own entry and every read re-merges them (min over
+// the starts, max over the ends) with the convergent sidecar. These tests cover:
+// the pure age/threshold decision, the per-base-repo sidecar record, the alert
+// text, the marker keying, and — behaviorally — the real multi-process claim,
+// cross-process observation convergence, the no-unlink invariant, crash
 // resilience, fail-open, idempotence, and the export surface.
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -59,6 +62,22 @@ async function listAlertMarkers(repoRoot: string): Promise<string[]> {
   return entries
     .filter((e) => e.startsWith("base-repo-divergence-alerted-") && e.endsWith(".marker"))
     .map((e) => path.join(dir, e));
+}
+
+/**
+ * Every `base-repo-divergence*` artifact name under the checkout's `.paperclip/`
+ * tree (sidecar, alert markers, and observation entry directories) — the full
+ * residue surface that {@link clearDivergenceRecord} must remove on reset.
+ */
+async function listDivergenceArtifacts(repoRoot: string): Promise<string[]> {
+  const dir = path.join(repoRoot, ".paperclip");
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+  return entries.filter((e) => e.startsWith("base-repo-divergence"));
 }
 
 /** Seed an over-threshold sidecar (same identity+ref) with NO marker on disk. */
@@ -486,6 +505,69 @@ describe("multi-process claim (T1)", () => {
   }, 90_000);
 });
 
+describe("cross-process observation convergence (T7)", () => {
+  // The unseeded first-observation race: independent processes with DIFFERENT
+  // observation times, no prior sidecar. This is what T1 (which seeds a shared
+  // start) does not cover. With no lock, the only thing that preserves the
+  // earliest start is the per-writer entry + merge-on-read.
+  it("N children with distinct nowMs converge to min/max start/end and alert exactly once", async () => {
+    const root = await makeRepoRoot();
+    const N = 8;
+    const base = 1_700_000_000_000;
+    const step = 37_000;
+    const nowMsList = Array.from({ length: N }, (_, i) => base + i * step);
+    const minNow = nowMsList[0];
+    const maxNow = nowMsList[N - 1];
+
+    // NO seeded sidecar: the first-observation race is what this covers. Each
+    // child is injected a distinct nowMs and thresholdMs: 0 (the hardest P4
+    // setting; nowMs is already an input, so no fake timers are needed).
+    const readyDir = await fs.mkdtemp(path.join(os.tmpdir(), "sup15700-ready-"));
+    tempRoots.push(readyDir);
+    const tsxCli = await findTsxCli();
+    const probeFile = path.join(root, "__probe-race.ts");
+    await fs.writeFile(probeFile, PROBE_RACE, "utf8");
+
+    const children = nowMsList.map((nowMs) =>
+      spawnProbe(probeFile, [root, "main", String(nowMs), "0", String(N), readyDir], tsxCli),
+    );
+    const results = await Promise.all(children.map((c) => runToCompletion(c)));
+
+    const verdicts = results.map((r) => JSON.parse(r.out.trim()) as { shouldEmit?: boolean; error?: string });
+    expect(verdicts, `children: ${JSON.stringify(results)}`).toHaveLength(N);
+    expect(verdicts.filter((v) => v.error), `errors: ${JSON.stringify(verdicts)}`).toEqual([]);
+    // The marker is keyed on h, never a timestamp, so exactly one child wins it.
+    expect(verdicts.filter((v) => v.shouldEmit === true).length, "exactly one winner").toBe(1);
+    expect(await listAlertMarkers(root)).toHaveLength(1);
+
+    // Post-join, EVERY subsequent read yields exactly min/max over all
+    // observations. (Deliberately NOT asserting any racing child's own returned
+    // firstObservedAtMs — an observation not yet written cannot be known, and
+    // that in-flight skew is fail-late and self-heals next pass.)
+    const merged = await readDivergenceRecord(root);
+    expect(merged?.firstObservedAtMs).toBe(minNow);
+    expect(merged?.lastObservedAtMs).toBe(maxNow);
+
+    // A follow-up observation at max(nowMs) republishes the merge; the RAW
+    // sidecar now carries exactly that min/max (convergence, independent of
+    // which process won).
+    await observeDivergedRefusal(root, {
+      baseRef: "main",
+      repoIdentity: root,
+      aheadCount: 3,
+      behindCount: 1,
+      aheadCommitSubjects: ["a"],
+      nowMs: maxNow,
+      thresholdMs: 0,
+    });
+    const rawSidecar = JSON.parse(
+      await fs.readFile(divergenceRecordPath(root), "utf8"),
+    ) as { firstObservedAtMs?: number; lastObservedAtMs?: number };
+    expect(rawSidecar.firstObservedAtMs).toBe(minNow);
+    expect(rawSidecar.lastObservedAtMs).toBe(maxNow);
+  }, 90_000);
+});
+
 describe("no-unlink invariant (T2)", () => {
   it("never unlinks on the observe path, while clearDivergenceRecord is the only unlink", async () => {
     const rmSpy = vi.spyOn(fs, "rm");
@@ -581,11 +663,12 @@ describe("fail-open (T4)", () => {
 });
 
 describe("idempotence and no-noise (T5)", () => {
-  it("below-threshold leaves no residue; an alerted episode stays quiet; a new episode alerts once", async () => {
+  it("below-threshold writes an entry (residue) but no marker; an alerted episode stays quiet; a new episode alerts once; clear removes every artifact", async () => {
     const root = await makeRepoRoot();
     const now = 1_700_000_000_000;
 
-    // Below threshold -> no marker, no residue.
+    // Below threshold -> an observation entry is written (expected residue), but
+    // NO claim marker.
     const below = await observeDivergedRefusal(root, {
       baseRef: "main",
       repoIdentity: root,
@@ -597,6 +680,7 @@ describe("idempotence and no-noise (T5)", () => {
     });
     expect(below.shouldEmitFirstClassSignal).toBe(false);
     expect(await listAlertMarkers(root)).toEqual([]);
+    expect((await listDivergenceArtifacts(root)).some((e) => e.startsWith("base-repo-divergence-obs-"))).toBe(true);
 
     // Cross the threshold -> alert once, exactly one marker.
     const at = await observeDivergedRefusal(root, {
@@ -662,6 +746,11 @@ describe("idempotence and no-noise (T5)", () => {
     expect(markers).toEqual(
       [divergenceAlertMarkerPath(root, root, "main"), divergenceAlertMarkerPath(root, root, "release")].sort(),
     );
+
+    // After reset, NO base-repo-divergence* path remains under .paperclip/ — the
+    // sidecar, both markers, and both observation entry directories.
+    await clearDivergenceRecord(root);
+    expect(await listDivergenceArtifacts(root)).toEqual([]);
   });
 });
 
@@ -696,6 +785,9 @@ describe("clearDivergenceRecord / readDivergenceRecord", () => {
     expect(await readDivergenceRecord(repoRoot)).toBeNull();
     // The marker is cleared too, so a fresh episode could alert again.
     expect(await listAlertMarkers(repoRoot)).toEqual([]);
+    // So are the sidecar and the observation entry directories: no
+    // base-repo-divergence* artifact remains under .paperclip/.
+    expect(await listDivergenceArtifacts(repoRoot)).toEqual([]);
 
     // Clearing a path with no record is a no-op, not an error.
     await expect(clearDivergenceRecord(repoRoot)).resolves.toBeUndefined();
