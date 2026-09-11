@@ -1975,7 +1975,9 @@ describe("agent issue mutation checkout ownership", () => {
       ["reopen", { reopen: true }],
       ["resume", { resume: true }],
       ["comment", { comment: "Ancestor comment" }],
-      ["assigneeAdapterOverrides", { assigneeAdapterOverrides: { modelProfile: "cheap" } }],
+      // Upstream #12683 removed model profiles, so `modelProfile` now fails the strict
+      // overrides schema (400) before the escape-hatch check; use a key the schema accepts.
+      ["assigneeAdapterOverrides", { assigneeAdapterOverrides: { useProjectWorkspace: true } }],
     ])("rejects ancestor escape hatch from setting %s", async (_field, patch) => {
       const res = await request(await createApp(ancestorActor()))
         .patch(`/api/issues/${issueId}`)

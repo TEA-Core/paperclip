@@ -113,7 +113,7 @@ describe("heartbeat_run_events error retention (appendRunEvent insert values)", 
       event: {
         eventType: "error",
         level: "error",
-        message: `git push failed: GITHUB_TOKEN=${githubToken}`,
+        message: `remote authentication failed: GITHUB_TOKEN=${githubToken}`,
         error: `fatal: Authentication failed with ${githubToken} ${"w".repeat(PAYLOAD_STRING_BOUND + 256)}`,
       },
       currentUserRedactionOptions: NOOP_REDACTION,
