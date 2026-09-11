@@ -313,6 +313,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES, hasPendingWakeInteraction, recoveryService } from "./recovery/service.js";
+import { sweepHostRestartStrandedIssues as runHostRestartStrandSweep } from "./recovery/host-restart-strand-sweep.js";
 import { collectDispositionRepairSourceState } from "./recovery/disposition-repair.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
@@ -16295,6 +16296,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStillbornAssignedBacklog({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  // B2: repair cards left with a null monitor and no live run after a host
+  // restart. Must run after reapOrphanedRuns, which stamps resultJson.hostRestart.
+  async function sweepHostRestartStrandedIssues() {
+    return runHostRestartStrandSweep({ db });
+  }
+
   async function reconcileCancelledOnlyBlockerDependents(opts?: { issueCreatedAtGte?: Date | null; limit?: number }) {
     return recovery.reconcileCancelledOnlyBlockerDependents({ issueCreatedAtGte: await getWorktreeExecutionCutoff(), ...(opts ?? {}) });
   }
@@ -23172,6 +23179,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileIssueGraphLiveness,
 
     reconcileStillbornAssignedBacklog,
+
+    sweepHostRestartStrandedIssues,
 
     reconcileCancelledOnlyBlockerDependents,
 
