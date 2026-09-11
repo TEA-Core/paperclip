@@ -10,8 +10,11 @@
 #   paperclip-gh-wrapper.sh [gh args...]
 #
 # Behavior:
-#   - Resolves the target owner/repo (--repo flag > GH_REPO > PAPERCLIP_GIT_REPO
-#     > current repo's github.com remote > PAPERCLIP_WORKSPACE_REPO_URL).
+#   - Resolves the target owner/repo (--repo / -R flag > `gh api repos/<o>/<r>/...`
+#     path > GH_REPO > PAPERCLIP_GIT_REPO > current repo's github.com remote >
+#     PAPERCLIP_WORKSPACE_REPO_URL).
+#   - Refuses `gh auth login|logout|refresh|setup-git|switch`: nothing may store a
+#     GitHub credential in the run's HOME.
 #   - Mints a token for that repo from
 #       POST $PAPERCLIP_API_URL/api/agents/me/github/installation-tokens
 #     with Authorization: Bearer $PAPERCLIP_API_KEY.
@@ -56,15 +59,47 @@ parse_owner_repo() {
   esac
 }
 
-OWNER_REPO=""
-# 1) --repo flag: `gh [--repo owner/repo]` (value in the following arg)
 args=("$@")
 n=${#args[@]}
+
+# Credentials are minted per call. A gh login would persist a token under $HOME that
+# every later unwrapped gh, and `gh auth git-credential`, would then serve.
+if [ "${args[0]:-}" = "auth" ]; then
+  case "${args[1]:-}" in
+    login|logout|refresh|setup-git|switch)
+      fail "gh auth ${args[1]} is disabled in Paperclip runs: GitHub credentials are minted per call by the Paperclip broker and must not be stored." ;;
+  esac
+fi
+
+OWNER_REPO=""
+# 1) repo flag: --repo owner/repo, --repo=owner/repo, -R owner/repo, -Rowner/repo
 for ((idx=0; idx<n; idx++)); do
-  if [ "${args[idx]}" = "--repo" ] && [ $((idx+1)) -lt "$n" ]; then
-    OWNER_REPO="$(parse_owner_repo "${args[idx+1]}")"; break
-  fi
+  a="${args[idx]}"
+  case "$a" in
+    --repo|-R)
+      if [ $((idx+1)) -lt "$n" ]; then OWNER_REPO="$(parse_owner_repo "${args[idx+1]}")"; fi
+      break ;;
+    --repo=*) OWNER_REPO="$(parse_owner_repo "${a#--repo=}")"; break ;;
+    -R?*) OWNER_REPO="$(parse_owner_repo "${a#-R}")"; break ;;
+  esac
 done
+# 2) `gh api repos/<owner>/<repo>/...`: the endpoint path names the target repo, and a
+#    token minted for the cwd repo would 404 on any other private repo. `{owner}/{repo}`
+#    placeholders are left to the fallbacks below, which is where gh fills them from.
+if [ -z "$OWNER_REPO" ] && [ "${args[0]:-}" = "api" ]; then
+  for ((idx=1; idx<n; idx++)); do
+    a="${args[idx]#/}"
+    case "$a" in
+      repos/\{*) break ;;
+      repos/*/*)
+        rest="${a#repos/}"; api_owner="${rest%%/*}"; rest="${rest#*/}"; api_repo="${rest%%[/?#]*}"
+        if [ -n "$api_owner" ] && [ -n "$api_repo" ]; then
+          OWNER_REPO="$(parse_owner_repo "$api_owner/$api_repo")"
+        fi
+        break ;;
+    esac
+  done
+fi
 # GH_REPO env
 if [ -z "$OWNER_REPO" ] && [ -n "${GH_REPO:-}" ]; then OWNER_REPO="$(parse_owner_repo "$GH_REPO")"; fi
 # PAPERCLIP_GIT_REPO
@@ -128,7 +163,7 @@ fi
 # The fleet App has no installation key for this company yet (transition state): a `gh`
 # call can't be authenticated, so fail legibly rather than exec gh with no token.
 if [ -z "$TOKEN" ] && [ "$ERR_CODE" = "app_not_configured" ]; then
-  fail "could not authenticate: the fleet GitHub App is not configured for this company (broker code=app_not_configured). Configure the App, then retry; or set a one-shot GH_TOKEN for this invocation."
+  fail "could not authenticate: the fleet GitHub App is not configured for this company (broker code=app_not_configured). This needs operator action on the App configuration; do not work around it with a personal token."
 fi
 [ -n "$TOKEN" ] || fail "GitHub token mint failed${ERR_MSG:+: $ERR_MSG} (owner/repo: $OWNER_REPO)."
 
