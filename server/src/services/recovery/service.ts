@@ -116,7 +116,7 @@ import {
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../issue-assignee-review-gate.js";
-import { loadConfig, pendingReviewParticipantGraceMsFromEnv, pendingReviewRearmWindowMsFromEnv } from "../../config.js";
+import { loadConfig } from "../../config.js";
 import {
   canAgentSatisfyIssueWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,

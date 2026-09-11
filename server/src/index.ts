@@ -1694,11 +1694,16 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
-        const dependencyWakesReconciled = await heartbeat.reconcileResolvedDependencyWakes();
-        if (dependencyWakesReconciled.healed > 0) {
+        // The fork schedules the issue-graph liveness orchestrator, not upstream's bare
+        // dependency-wake backstop. It runs that backstop AND the fork sweeps that share this
+        // timer (SUP-14881 dispatch-suppression park, SUP-15552 deferred-wake replay, SUP-15553
+        // todo-stranded park, blocked-without-blockers heal). Upstream #12681 swapped this call
+        // when it retired its escalation experiment; taking the swap silently stops those sweeps.
+        const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
+        if (issueGraphReconciled.dependencyWakesHealed > 0) {
           logger.warn(
-            { ...dependencyWakesReconciled },
-            "startup dependency-wake reconciliation restored task execution paths",
+            { ...issueGraphReconciled },
+            "startup issue-graph liveness reconciliation changed issue graph state",
           );
         }
 
@@ -2016,9 +2021,10 @@ export async function startServer(): Promise<StartedServer> {
               }
             })
             .then(async () => {
-              const reconciled = await heartbeat.reconcileResolvedDependencyWakes();
-              if (reconciled.healed > 0) {
-                logger.warn({ ...reconciled }, "periodic dependency-wake reconciliation restored task execution paths");
+              // The orchestrator, not the bare backstop: fork sweeps ride on it (see the startup call).
+              const reconciled = await heartbeat.reconcileIssueGraphLiveness();
+              if (reconciled.dependencyWakesHealed > 0) {
+                logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
               }
             })
             .then(async () => {

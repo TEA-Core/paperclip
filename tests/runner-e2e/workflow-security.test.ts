@@ -13,7 +13,11 @@ const buildRemoteProviderPackNeeds =
   /needs:\s*\[\s*authorize,\s*target_lock,\s*catalog,\s*daytona_image,\s*build_runner_artifacts,?\s*\]/u;
 
 describe("public repository paid workflow security", () => {
-  it("pins ordinary PR CI to the trusted Node-before-pnpm workflow", async () => {
+  // TEA-Core fork: upstream's pr.yml delegates the whole PR run to a reusable pr-trusted.yml
+  // pinned at an immutable SHA. This fork's pr.yml runs its jobs inline so it can gate
+  // `fold/**` branches and report the required checks on merge_group entries, so there is no
+  // pinned call to assert (see scripts/__tests__/e2e-shard.test.mjs for the same divergence).
+  it.skip("pins ordinary PR CI to the trusted Node-before-pnpm workflow", async () => {
     const ordinaryPrWorkflow = await readFile(
       path.join(repositoryRoot, ".github/workflows/pr.yml"),
       "utf8",

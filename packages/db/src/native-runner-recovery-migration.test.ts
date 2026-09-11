@@ -31,7 +31,7 @@ describeEmbeddedPostgres("native runner recovery migration", () => {
 
       const migration = await readFile(
         new URL(
-          "./migrations/0238_graceful_infant_terrible.sql",
+          "./migrations/0253_graceful_infant_terrible.sql",
           import.meta.url,
         ),
         "utf8",

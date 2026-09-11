@@ -81,3 +81,6 @@ tests/storybook-visual/playwright-report/
 .vercel/
 .env.local
 test-results/
+
+# fold-sync.sh writes its conflict list into the merge worktree; slice 1 committed it by accident.
+/.fold-sync-conflicts.txt

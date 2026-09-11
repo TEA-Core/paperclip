@@ -62,9 +62,10 @@ export type GitAuthInvocation = {
 };
 
 /**
- * Resolve auth for one remote URL. Returns null when the URL is out of scope (non-GitHub,
- * ssh, or already credentialed) or when no token is available — callers then run git with
- * ambient behavior, exactly as before this module existed.
+ * Resolve auth for one remote URL. Returns null when the URL is out of scope (non-GitHub, or
+ * already credentialed) or when no token is available — callers then run git with ambient
+ * behavior, exactly as before this module existed. GitHub SSH remotes are in scope: the
+ * invocation rewrites them to HTTPS via `url.<base>.insteadOf`.
  */
 export type GitRemoteAuthProvider = (remoteUrl: string) => Promise<GitAuthInvocation | null>;
 
@@ -203,11 +204,15 @@ type GitCredentialSecretsDeps = {
 /**
  * Parse `owner`/`repo` from a GitHub remote URL (only called after
  * `isSupportedGitHubRemoteUrl` has gated it): the first two pathname segments, trailing `.git`
- * dropped. Null when the URL carries no owner/repo path — including scp-style
- * `git@github.com:owner/repo` remotes, which `new URL` cannot parse and which therefore
- * resolve unscoped (no per-repo probe).
+ * dropped. Null when the URL carries no owner/repo path.
+ *
+ * scp-style `git@github.com:owner/repo(.git)` has no URL form, so it is parsed directly.
+ * Without that it resolved unscoped: no per-repo 401/403 probe, so the SUP-13224 fall-through
+ * to the next candidate never ran and the first token found won for every SSH remote.
  */
 function parseOwnerRepo(remoteUrl: string): { owner: string; repo: string } | null {
+  const scp = /^git@(?:www\.)?github\.com:([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i.exec(remoteUrl);
+  if (scp) return { owner: scp[1]!, repo: scp[2]! };
   let parsed: URL;
   try {
     parsed = new URL(remoteUrl);
