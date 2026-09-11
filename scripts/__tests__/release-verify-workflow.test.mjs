@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -132,4 +132,42 @@ test("release verify workflow covers the same split test surface as stable PR ve
 
   assert.match(verifyWorkflow, /pnpm test:run:general -- --group/);
   assert.match(verifyWorkflow, /pnpm test:run:serialized -- --shard-index/);
+});
+
+test("no workflow repeats a step name within one job", () => {
+  // A 3-way merge that resolves a conflicted region by keeping BOTH sides
+  // leaves a whole step twice, back to back, with no conflict marker. YAML
+  // accepts it and Actions runs both copies. Fold 1446a58c0 (2026-08-30) did
+  // exactly that to publish_stable's "Build Docker images for the stable tag"
+  // step, so every stable release dispatched docker.yml twice at the same tag.
+  // A repeated step name inside one job is how that defect shows up in a
+  // workflow, and no workflow here repeats one on purpose. If a future step
+  // genuinely needs the same label, rename one of them.
+  const workflowsDir = path.join(repoRoot, ".github/workflows");
+  const offenders = [];
+  for (const file of readdirSync(workflowsDir).filter((name) => /\.ya?ml$/.test(name))) {
+    const lines = readWorkflow(file).split("\n");
+    const jobsAt = lines.findIndex((line) => /^jobs:\s*$/.test(line));
+    if (jobsAt === -1) continue;
+    let job = null;
+    let seen = new Map();
+    const flush = () => {
+      for (const [name, count] of seen) {
+        if (count > 1) offenders.push(`${file} > ${job}: "${name}" x${count}`);
+      }
+    };
+    for (const line of lines.slice(jobsAt + 1)) {
+      const jobMatch = line.match(/^ {2}([A-Za-z0-9_-]+):\s*$/);
+      if (jobMatch) {
+        flush();
+        job = jobMatch[1];
+        seen = new Map();
+        continue;
+      }
+      const stepMatch = line.match(/^\s+- name:\s*(.+?)\s*$/);
+      if (job && stepMatch) seen.set(stepMatch[1], (seen.get(stepMatch[1]) ?? 0) + 1);
+    }
+    flush();
+  }
+  assert.deepEqual(offenders, [], `duplicated steps:\n${offenders.join("\n")}`);
 });
