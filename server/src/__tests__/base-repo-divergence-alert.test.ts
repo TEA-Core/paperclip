@@ -203,6 +203,23 @@ function runToCompletion(child: ChildProcess): Promise<{ code: number | null; ou
   });
 }
 
+/**
+ * Await a probe being fully reaped. `close` fires only after the child has
+ * exited AND its stdio pipes are closed — for the detached tsx process group,
+ * that is after the whole tree is down. Establish this promise BEFORE the
+ * SIGKILL so the reap can never be missed; if the child is already gone it
+ * resolves at once instead of waiting on a `close` event that already fired.
+ */
+function waitForReap(child: ChildProcess): Promise<void> {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    child.once("close", () => resolve());
+  });
+}
+
 async function waitForFile(dir: string, prefix: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -636,9 +653,17 @@ describe("crash resilience (T3)", () => {
     await waitForFile(readyDir, "seam-", 8000);
     expect(await listAlertMarkers(root), "no marker may exist while paused pre-claim").toEqual([]);
 
+    // Establish the reap promise BEFORE the SIGKILL: the close listener is in
+    // place before the process group dies, so the reap can never be missed, and
+    // an already-reaped child resolves immediately rather than hanging the await
+    // (the prior close-after-kill ordering let a fast group kill skip the
+    // listener and wedge the test).
+    const reaped = waitForReap(child);
     // Kill the whole process group mid-observe (direct child + tsx grandchild).
     killProbeGroup(child);
-    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+    // The probe is fully reaped (exited AND stdio closed) before the post-crash
+    // assertion, so no late O_EXCL create can land a marker.
+    await reaped;
 
     // The killed worker never reached the O_EXCL create, so no marker exists.
     expect(await listAlertMarkers(root), "a killed mid-observe worker must leave no marker").toEqual([]);
