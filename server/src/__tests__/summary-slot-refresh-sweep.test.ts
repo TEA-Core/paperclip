@@ -26,6 +26,11 @@ vi.mock("../services/issue-assignment-wakeup.js", () => ({
   queueIssueAssignmentWakeup: mockQueueWakeup,
 }));
 
+const mockLogActivity = vi.hoisted(() => vi.fn().mockResolvedValue({}));
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mockLogActivity,
+}));
+
 vi.mock("../middleware/logger.js", () => ({
   logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
@@ -38,7 +43,7 @@ function generateResponse(overrides: {
   status?: string;
 } = {}) {
   return {
-    slot: { id: "slot-1", companyId: COMPANY, scopeKind: "workspaces_overview", slotKey: "header", status: "generating" },
+    slot: { id: "slot-1", companyId: COMPANY, scopeKind: "workspaces_overview", scopeId: null, slotKey: "header", status: "generating" },
     generatingIssue: {
       id: overrides.generatingIssueId ?? "issue-1",
       identifier: "SUP-9999",
@@ -78,6 +83,7 @@ function makeService(
 beforeEach(() => {
   mockGenerate.mockReset();
   mockQueueWakeup.mockReset().mockResolvedValue(undefined);
+  mockLogActivity.mockReset().mockResolvedValue({});
   mockGetExperimental.mockReset().mockResolvedValue({ enableSummaries: true });
 });
 
@@ -143,7 +149,7 @@ describe("createSummarySlotRefreshSweepService", () => {
     expect(mockQueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("leaves an in-flight slot alone when a live generation issue exists (AC-3)", async () => {
+  it("does not re-fire generate for an in-flight slot, but re-delivers its assignee wake (AC-3)", async () => {
     const rows = [{ ...SCOPES[0], status: "generating", generatingIssueId: "issue-live" }];
     mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: true }));
     const { service } = makeService(rows, { wakeup: vi.fn() });
@@ -157,7 +163,104 @@ describe("createSummarySlotRefreshSweepService", () => {
       failed: 0,
     });
     expect(mockGenerate).toHaveBeenCalledTimes(1);
-    expect(mockQueueWakeup).not.toHaveBeenCalled();
+    // The slot already has a live generation issue, so `generate` is not
+    // re-fired to mint a second one (AC-3). But the assignee wake IS re-delivered
+    // so a wake that was rejected on the minting tick is retried instead of
+    // stranding the slot unwoken. No fresh-claim audit entry is recorded for an
+    // in-flight slot (the entry was written on the tick that minted the issue).
+    expect(mockQueueWakeup).toHaveBeenCalledTimes(1);
+    expect(mockQueueWakeup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        rethrowOnError: true,
+        issue: expect.objectContaining({ id: "issue-1" }),
+      }),
+    );
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("retries a stranded slot: a rejected mint-tick wake is re-delivered on the next sweep instead of stranding it", async () => {
+    const rows = [{ ...SCOPES[0], status: "idle", lastGeneratedAt: null }];
+    // Sweep 1 mints a fresh issue but its assignee wake is rejected (rethrows),
+    // so the claim counts a failure. Sweep 2 sees the slot already generating
+    // and re-delivers the wake successfully.
+    mockGenerate
+      .mockResolvedValueOnce(generateResponse({ alreadyGenerating: false }))
+      .mockResolvedValueOnce(generateResponse({ alreadyGenerating: true }));
+    mockQueueWakeup
+      .mockRejectedValueOnce(new Error("dispatcher unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const { service } = makeService(rows, { wakeup: vi.fn() });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 0,
+      failed: 1,
+    });
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 1,
+      failed: 0,
+    });
+    // `generate` ran on both due sweeps but never minted a second issue; the
+    // wake was delivered twice (once per due sweep), so the slot is not left
+    // unwoken.
+    expect(mockGenerate).toHaveBeenCalledTimes(2);
+    expect(mockQueueWakeup).toHaveBeenCalledTimes(2);
+  });
+
+  it("counts a rejected in-flight re-wake as failed, not in-flight, so the slot is retried", async () => {
+    const rows = [{ ...SCOPES[0], status: "generating", generatingIssueId: "issue-live" }];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: true }));
+    mockQueueWakeup.mockRejectedValueOnce(new Error("dispatcher unavailable"));
+    const { service } = makeService(rows, { wakeup: vi.fn() });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 0,
+      failed: 1,
+    });
+  });
+
+  it("records a route-equivalent summary_slot.generate_requested activity entry on a fresh claim", async () => {
+    const rows = [{ ...SCOPES[0], status: "idle", lastGeneratedAt: null }];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false }));
+    const { service, db } = makeService(rows, { wakeup: vi.fn() });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      failed: 0,
+    });
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(db, {
+      companyId: COMPANY,
+      actorType: "system",
+      actorId: SUMMARY_SLOT_REFRESH_ACTOR_ID,
+      action: "summary_slot.generate_requested",
+      entityType: "summary_slot",
+      entityId: "slot-1",
+      issueId: "issue-1",
+      details: {
+        scopeKind: "workspaces_overview",
+        scopeId: null,
+        slotKey: "header",
+        generatingIssueId: "issue-1",
+        alreadyGenerating: false,
+        source: "summary-slot-refresh-sweep",
+      },
+    });
   });
 
   it("counts a failed generate and does not wake (retry next sweep)", async () => {

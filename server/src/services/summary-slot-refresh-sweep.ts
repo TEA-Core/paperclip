@@ -2,6 +2,7 @@ import { and, eq, isNull, lt, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { summarySlots } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
+import { logActivity } from "./activity-log.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
   queueIssueAssignmentWakeup,
@@ -32,11 +33,15 @@ import { summarySlotService } from "./summary-slots.js";
  *     a recently-written summary is never re-fired.
  *
  * For each candidate the sweep calls `summarySlotService(db).generate` at the
- * service layer — the exact consume-contract the HTTP route uses — and, when a
- * fresh generation task is minted (not `alreadyGenerating`), fires the same
- * assignment wakeup the route fires so the Summarizer claims it. The route's
- * board gate is left untouched: this path is board-side, in-process, and does
- * not introduce any new credential or auth branch.
+ * service layer — the exact consume-contract the HTTP route uses. For a fresh
+ * claim it records the route-equivalent `summary_slot.generate_requested`
+ * activity entry and fires the same assignment wakeup the route fires so the
+ * Summarizer claims it. For a slot that is already `generating` with an active
+ * issue it does not re-fire `generate`, but re-delivers the assignee wake so a
+ * wake that was rejected on the minting tick is retried instead of leaving the
+ * slot stranded unwoken. The route's board gate is left untouched: this path is
+ * board-side, in-process, and does not introduce any new credential or auth
+ * branch.
  */
 
 const DEFAULT_STALE_MS = 24 * 60 * 60 * 1000;
@@ -68,9 +73,9 @@ export interface SummarySlotRefreshSweepResult {
   candidates: number;
   /** Slots whose `generate` minted a fresh task AND whose assignee wake was delivered (or no wake dispatcher was configured). */
   claimed: number;
-  /** Slots already in flight: a live generation issue existed, so no re-fire. */
+  /** Slots already in flight: a live generation issue existed, so no re-fire; the assignee wake is re-delivered so a previously-rejected wake is retried. */
   inFlight: number;
-  /** Slots whose `generate` or its assignee wake threw (Summarizer not configured, target gone, wake rejected, etc.); retried next sweep. */
+  /** Slots whose `generate`, its assignee wake, or an in-flight re-wake threw (Summarizer not configured, target gone, wake rejected, etc.); retried next sweep. */
   failed: number;
 }
 
@@ -157,6 +162,37 @@ export function createSummarySlotRefreshSweepService(
 
     const slotService = summarySlotService(db);
 
+    /**
+     * Delivers the assignee wake for a (fresh or in-flight) generation issue,
+     * mirroring the HTTP route. Rethrows when the wake is rejected so the caller
+     * can count it a failure and retry on the next sweep instead of silently
+     * claiming a slot whose Summarizer was never woken.
+     */
+    async function fireWakeFor(
+      generatingIssue: { id: string; assigneeAgentId?: string | null; status: string },
+      taskKey: string,
+    ): Promise<void> {
+      if (!opts.wakeup) return;
+      await queueIssueAssignmentWakeup({
+        heartbeat: { wakeup: opts.wakeup },
+        issue: {
+          id: generatingIssue.id,
+          assigneeAgentId: generatingIssue.assigneeAgentId ?? null,
+          status: generatingIssue.status,
+        },
+        reason: "summary_slot_generation_requested",
+        mutation: "summary_slot.generate",
+        contextSource: "summary-slot-refresh-sweep",
+        requestedByActorType: "system",
+        taskKey,
+        // Mirror the HTTP route (routes/summary-slots.ts): a rejected assignee
+        // wake must surface as a failure, not resolve silently. Without this the
+        // helper logs-and-resolves on a rejected wake and this tick would count a
+        // claim for a slot whose Summarizer was never woken.
+        rethrowOnError: true,
+      });
+    }
+
     for (const candidate of candidates) {
       result.candidates += 1;
       try {
@@ -170,31 +206,42 @@ export function createSummarySlotRefreshSweepService(
           { agentId: null, userId: null, runId: null },
         );
         if (res.alreadyGenerating) {
-          // A live generation issue already owns this slot; do not re-fire.
+          // A live generation issue already owns this slot: do not re-fire
+          // `generate` (no second issue). But re-deliver the assignee wake — a
+          // wake that was rejected on the tick that minted the issue would
+          // otherwise strand the slot: it stays `generating` with an active
+          // issue, so it is a candidate on every sweep, and without a re-wake the
+          // Summarizer is never told to claim it. A rejected re-wake throws into
+          // the catch below and counts `failed`, so the slot is retried, not
+          // stranded.
+          await fireWakeFor(res.generatingIssue, summarySlotRefreshTaskKey(candidate));
+          // In-flight only when the re-wake was delivered (or no dispatcher is
+          // configured); a rejected re-wake lands in the catch -> `failed`.
           result.inFlight += 1;
           continue;
         }
-        if (opts.wakeup) {
-          await queueIssueAssignmentWakeup({
-            heartbeat: { wakeup: opts.wakeup },
-            issue: {
-              id: res.generatingIssue.id,
-              assigneeAgentId: res.generatingIssue.assigneeAgentId ?? null,
-              status: res.generatingIssue.status,
-            },
-            reason: "summary_slot_generation_requested",
-            mutation: "summary_slot.generate",
-            contextSource: "summary-slot-refresh-sweep",
-            requestedByActorType: "system",
-            taskKey: summarySlotRefreshTaskKey(candidate),
-            // Mirror the HTTP route (routes/summary-slots.ts): a rejected
-            // assignee wake must surface as a failure, not resolve silently.
-            // Without this the helper logs-and-resolves on a rejected wake and
-            // this tick would count a claim for a slot whose Summarizer was
-            // never woken.
-            rethrowOnError: true,
-          });
-        }
+        // Fresh claim: a generation issue was minted and the slot flipped to
+        // `generating`. Record the route-equivalent audit entry (AGENTS.md:
+        // "activity logging for mutating actions") before firing the wake, so
+        // the claim is audited even if the wake then fails.
+        await logActivity(db, {
+          companyId: candidate.companyId,
+          actorType: "system",
+          actorId: SUMMARY_SLOT_REFRESH_ACTOR_ID,
+          action: "summary_slot.generate_requested",
+          entityType: "summary_slot",
+          entityId: res.slot.id,
+          issueId: res.generatingIssue.id,
+          details: {
+            scopeKind: res.slot.scopeKind,
+            scopeId: res.slot.scopeId,
+            slotKey: res.slot.slotKey,
+            generatingIssueId: res.generatingIssue.id,
+            alreadyGenerating: res.alreadyGenerating,
+            source: "summary-slot-refresh-sweep",
+          },
+        });
+        await fireWakeFor(res.generatingIssue, summarySlotRefreshTaskKey(candidate));
         // Count the claim only after the wake has been delivered (or no wake
         // dispatcher was configured). A rejected wake throws and lands in the
         // catch below, so it counts `failed` and is retried next sweep — never
