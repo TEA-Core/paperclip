@@ -50,8 +50,8 @@ function asBoolean(value: unknown) {
   return typeof value === "boolean" ? value : null;
 }
 
-function asNumber(value: unknown) {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+function asNonNegativeInteger(value: unknown) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 function asNestedString(record: Record<string, unknown>, key: string, nestedKey: string) {
@@ -205,9 +205,9 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
   const headSha = asNestedString(body, "head", "sha");
   const baseRef = asNestedString(body, "base", "ref");
   const reviewDecision = asString(body.review_decision);
-  const additions = asNumber(body.additions);
-  const deletions = asNumber(body.deletions);
-  const changedFiles = asNumber(body.changed_files);
+  const additions = asNonNegativeInteger(body.additions);
+  const deletions = asNonNegativeInteger(body.deletions);
+  const changedFiles = asNonNegativeInteger(body.changed_files);
 
   let statusKey = state;
   let statusLabel = state === "open" ? "Open" : state === "closed" ? "Closed" : "Unknown";
@@ -270,9 +270,11 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       ...(asString(body.merge_commit_sha) ? { merge_commit_sha: asString(body.merge_commit_sha) } : {}),
       ...(asString(body.closed_at) ? { closed_at: asString(body.closed_at) } : {}),
       ...(reviewDecision ? { reviewDecision } : {}),
-      ...(additions != null ? { additions } : {}),
-      ...(deletions != null ? { deletions } : {}),
-      ...(changedFiles != null ? { changed_files: changedFiles } : {}),
+      ...(additions !== null ? { additions } : {}),
+      ...(deletions !== null ? { deletions } : {}),
+      // `changedFiles` feeds the upstream work-product card (github-pull-request-merge.ts);
+      // `changed_files` is the fork's delivered-LOC key (SUP-14874), kept for its readers.
+      ...(changedFiles !== null ? { changedFiles, changed_files: changedFiles } : {}),
     },
   };
 }

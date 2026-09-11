@@ -58,6 +58,9 @@
 //     scripted data and exit in one stdout write. The host then reads the open
 //     reply and the notifications in one batch, so a test proves the host holds
 //     and replays a frame that arrives before the route binds.
+//   - `emitScriptedFramesAfterFirstWrite`: when true, the fixture holds the
+//     scripted data and exit until it has acknowledged the first channel write.
+//     This gives tests a deterministic post-bind trigger without timing delays.
 const readline = require("node:readline");
 
 // Small fixed delay (ms) that separates the non-batched scripted frames from the
@@ -182,6 +185,10 @@ rl.on("line", (line) => {
       noWriteReply: mode === "no-write-reply",
       writeReplyDelayMs:
         typeof directive.writeReplyDelayMs === "number" ? directive.writeReplyDelayMs : 0,
+      scriptedFramesAfterFirstWrite:
+        directive.emitScriptedFramesAfterFirstWrite === true
+          ? scriptedFrameLines(directive, hostRouteId, workerSessionId)
+          : null,
       emitAfterCloseChunk:
         typeof directive.emitAfterCloseChunk === "string" ? directive.emitAfterCloseChunk : null,
     });
@@ -237,10 +244,14 @@ rl.on("line", (line) => {
     // `sid` or `rid` to force a mismatch. The fixed delay keeps this frame in a
     // separate pipe read from the open reply even when the host event loop is
     // starved by merge_group load (a `setImmediate` here could coalesce with the
-    // open reply and land the frame in the pre-bind hold instead).
-    setTimeout(() => {
-      process.stdout.write(scriptedFrameLines(directive, hostRouteId, workerSessionId));
-    }, NON_BATCHED_FRAME_DELAY_MS);
+    // open reply and land the frame in the pre-bind hold instead). A directive
+    // with `emitScriptedFramesAfterFirstWrite` defers the frames to the first
+    // write reply instead.
+    if (directive.emitScriptedFramesAfterFirstWrite !== true) {
+      setTimeout(() => {
+        process.stdout.write(scriptedFrameLines(directive, hostRouteId, workerSessionId));
+      }, NON_BATCHED_FRAME_DELAY_MS);
+    }
     return;
   }
 
@@ -273,7 +284,16 @@ rl.on("line", (line) => {
         },
       });
     }
-    const replyWrite = () => send({ jsonrpc: "2.0", id: message.id, result: null });
+    const replyWrite = () => {
+      send({ jsonrpc: "2.0", id: message.id, result: null });
+      const deferredFrames = entry.scriptedFramesAfterFirstWrite;
+      entry.scriptedFramesAfterFirstWrite = null;
+      if (deferredFrames) {
+        // Emit only after acknowledging the host trigger. The trigger can only be
+        // sent through a returned session, so the route is definitively bound.
+        setImmediate(() => process.stdout.write(deferredFrames));
+      }
+    };
     if (entry.writeReplyDelayMs > 0) {
       // Delay the write reply, so the host holds the pending-write reservation for
       // a measurable time before the RPC settles.

@@ -1174,6 +1174,31 @@ describe("resolveWorkspaceAfterLowTrustPreflight", () => {
 });
 
 describe("resolveRuntimeSessionParamsForWorkspace", () => {
+  it("keeps a legacy projectless Codex session in the default agent workspace", () => {
+    const agentId = "agent-projectless-legacy";
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir(agentId);
+    const previousSessionParams = {
+      sessionId: "legacy-session-1",
+      cwd: fallbackCwd,
+    };
+
+    const result = resolveRuntimeSessionParamsForWorkspace({
+      agentId,
+      previousSessionParams,
+      resolvedWorkspace: buildResolvedWorkspace({
+        cwd: fallbackCwd,
+        source: "agent_home",
+        projectId: null,
+        workspaceId: null,
+      }),
+    });
+
+    expect(result).toEqual({
+      sessionParams: previousSessionParams,
+      warning: null,
+    });
+  });
+
   it("migrates fallback workspace sessions to project workspace when project cwd becomes available", () => {
     const agentId = "agent-123";
     const fallbackCwd = resolveDefaultAgentWorkspaceDir(agentId);
@@ -2547,6 +2572,45 @@ describe("effective run session config freshness", () => {
     ).toMatchObject({
       reset: true,
       changedCategories: ["workspaceConfig"],
+    });
+  });
+
+  it("does not reset when a reusable execution workspace becomes realized", async () => {
+    const base = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        reusableExecutionWorkspaceConfig: null,
+        existingExecutionWorkspace: null,
+      },
+    });
+    const realized = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        reusableExecutionWorkspaceConfig: {
+          strategyType: "project_primary",
+          workspaceGeneration: 1,
+        },
+        existingExecutionWorkspace: {
+          id: "workspace-realized-after-first-turn",
+          mode: "shared_workspace",
+          strategyType: "project_primary",
+        },
+      },
+    });
+
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: realized,
+      }),
+    ).toMatchObject({
+      reset: false,
+      changedCategories: [],
+      reasons: [],
     });
   });
 

@@ -40,7 +40,6 @@ vi.mock("../adapters/index.js", () => ({
     execute: adapterExecute,
     supportsLocalAgentJwt: false,
   }),
-  listAdapterModelProfiles: async () => [],
   runningProcesses: new Map(),
 }));
 
@@ -123,7 +122,7 @@ describe("P6-32 legacy finalization regression", () => {
       id: runId,
       status: "succeeded",
       runtimeMode: "legacy",
-      runtimeModeReason: "instance_flag_disabled",
+      runtimeModeReason: "direct_adapter",
       resultJson: { summary: "Legacy bytes", nested: { count: 1, ok: true } },
     });
     await expect(reconcileNativeFinalizations(db, [runId])).resolves.toEqual([]);

@@ -35,6 +35,12 @@ import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
+import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
+import {
+  StartupRefusalError,
+  migrationRefusalError,
+  shouldReportStartupFailure,
+} from "./startup-refusals.js";
 import {
   getManagedInstanceConfig,
   type ManagedInstanceConfig,
@@ -64,6 +70,7 @@ import {
   executionWorkspaceService,
   heartbeatService,
   issueThreadInteractionService,
+  githubConnectionEventService,
   issueService,
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
@@ -113,12 +120,14 @@ import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent
 import {
   coordinateHeartbeatSchedulerShutdown,
   createShutdownDeadline,
+  drainRunExecutionFinalizersForShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
   resolveShutdownDeadlineMs,
   sweepDetachedRunProcesses,
   withShutdownDeadline,
   finalizeServerShutdown,
 } from "./shutdown.js";
+import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
 import {
@@ -165,9 +174,11 @@ export interface StartedServer {
   listenPort: number;
   apiUrl: string;
   databaseUrl: string;
+  shutdown: (signal?: "SIGINT" | "SIGTERM") => Promise<void>;
 }
 
 export async function startServer(): Promise<StartedServer> {
+  setStartupRecoveryPhase("starting");
   warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
 
   process.umask(0o002);
@@ -268,12 +279,20 @@ export async function startServer(): Promise<StartedServer> {
   
     const apply = autoApply ? true : await promptApplyMigrations(state.pendingMigrations);
     if (!apply) {
-      throw new Error(
+      // A database with zero applied migrations and zero tables has
+      // never been migrated: under a managed-cloud supervisor that is
+      // the expected first-boot race (the harness migrates and
+      // restarts), so the refusal carries the supervised-transient
+      // class. Applied history — or pre-existing tables beside an empty
+      // journal — means drift and keeps the plain, always-reported
+      // Error.
+      throw migrationRefusalError(
+        state,
         `${label} has pending migrations (${formatPendingMigrationSummary(state.pendingMigrations)}). ` +
           "Refusing to start against a stale schema. Run pnpm db:migrate or set PAPERCLIP_MIGRATION_AUTO_APPLY=true.",
       );
     }
-  
+
     logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
     await applyPendingMigrations(connectionString);
     return "applied (pending migrations)";
@@ -293,7 +312,13 @@ export async function startServer(): Promise<StartedServer> {
       return;
     }
     if (!config.databaseUrl) {
-      throw new Error(
+      // Under a managed-cloud supervisor a missing DATABASE_URL on boot
+      // is the config-application race (the container can start before
+      // the staged variables land), not operator error — the supervisor
+      // restarts once the config holds. A malformed value below is a
+      // real misconfiguration and stays an always-reported Error.
+      throw new StartupRefusalError(
+        "database-contract-unmet",
         "authenticated public deployments require DATABASE_URL or config.database.connectionString; refusing embedded PostgreSQL fallback",
       );
     }
@@ -588,6 +613,12 @@ export async function startServer(): Promise<StartedServer> {
     startupDbInfo = { mode: "embedded-postgres", dataDir, port };
   }
   
+  // A claimed warm-pool stack may restart while its provider environment still
+  // names the pool host. Restore the signed, durable identity before Better
+  // Auth, routes, or child-runtime configuration capture any public URL.
+  const restoredCloudRuntimeIdentity = await initializeCloudRuntimeIdentity(db as any);
+  if (restoredCloudRuntimeIdentity) config = loadConfig();
+
   if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host)) {
     throw new Error(
       `local_trusted mode requires loopback host binding (received: ${config.host}). ` +
@@ -894,7 +925,9 @@ export async function startServer(): Promise<StartedServer> {
   process.env.PAPERCLIP_RUNTIME_API_URL = runtimeApiUrl;
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
-  
+
+  let startupListenerBound = false;
+  try {
   setupRunnerPrpWebSocketServer(server, { apiUrl: configuredApiUrl });
   setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
     pluginWorkerManager,
@@ -917,6 +950,28 @@ export async function startServer(): Promise<StartedServer> {
       return { userId: actor.userId, companyIds: actor.companyIds };
     },
   });
+
+  setStartupRecoveryPhase("recovering");
+  // Bind the shared HTTP/PRP listener before native startup recovery. A
+  // runnerd process that survived a controller crash is already reconnecting
+  // to this address; delaying listen until after orphan reconciliation makes
+  // authenticated adoption impossible and turns a healthy process into a
+  // duplicate-provider risk.
+  await new Promise<void>((resolveListen, rejectListen) => {
+    const onError = (err: Error) => {
+      server.off("error", onError);
+      rejectListen(err);
+    };
+    server.once("error", onError);
+    server.listen(listenPort, config.host, () => {
+      server.off("error", onError);
+      logger.info(
+        `Server listener bound on ${config.host}:${listenPort}; startup recovery in progress`,
+      );
+      resolveListen();
+    });
+  });
+  startupListenerBound = true;
 
   try {
     const result = await workspaceOperationService(db as any)
@@ -1049,6 +1104,7 @@ export async function startServer(): Promise<StartedServer> {
     signal: "SIGINT" | "SIGTERM",
     runIds?: readonly string[] | null,
   ) => Promise<unknown>) | null = null;
+  let drainHeartbeatExecutionFinalizers: (() => Promise<void>) | null = null;
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{
     skipDrain: boolean;
     drainRunIds?: string[];
@@ -1179,6 +1235,40 @@ export async function startServer(): Promise<StartedServer> {
     if (heartbeatSchedulerStopped) return;
     trackHeartbeatSchedulerWork(runEnvironmentLeaseCleanupSweep(ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS));
   };
+  const githubConnectionEvents = githubConnectionEventService(db as any, {
+    wakeup: environmentLeaseCleanupHeartbeat.wakeup,
+  });
+  const tools = toolAccessService(db as any, {
+    deploymentMode: config.deploymentMode,
+    deploymentExposure: config.deploymentExposure,
+    trustedLocalStdioRuntimeHost: process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
+      ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
+      ?? null,
+  });
+  const scheduleGitHubConnectionEventPoll = () => {
+    if (heartbeatSchedulerStopped) return;
+    trackHeartbeatSchedulerWork(githubConnectionEvents.pollOnce()
+      .then((result) => {
+        if (result.leased > 0 || result.failed > 0) {
+          logger.info(result, "GitHub connection event poll completed");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "GitHub connection event poll failed");
+      }));
+  };
+  const scheduleGitHubConnectionContinuitySweep = () => {
+    if (heartbeatSchedulerStopped) return;
+    trackHeartbeatSchedulerWork(tools.sweepGitHubConnectionContinuity()
+      .then((result) => {
+        if (result.due > 0 || result.failed > 0) {
+          logger.info(result, "GitHub connection continuity sweep completed");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "GitHub connection continuity sweep failed");
+      }));
+  };
 
   await questionResponseDeliveries.sweepPending().then((result) => {
     if (result.scanned > 0) {
@@ -1187,6 +1277,8 @@ export async function startServer(): Promise<StartedServer> {
   }).catch((err) => {
     logger.error({ err }, "startup question-response delivery sweep failed");
   });
+  scheduleGitHubConnectionEventPoll();
+  scheduleGitHubConnectionContinuitySweep();
 
   if (heartbeat) {
     const secretProposals = createSecretProposalsService(db as any);
@@ -1197,6 +1289,8 @@ export async function startServer(): Promise<StartedServer> {
     drainHeartbeatRunsForShutdown = (signal, runIds) => (
       heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
     );
+    drainHeartbeatExecutionFinalizers = () =>
+      heartbeat.drainActiveRunExecutions();
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
@@ -1464,13 +1558,6 @@ export async function startServer(): Promise<StartedServer> {
         }));
     };
 
-    const tools = toolAccessService(db as any, {
-      deploymentMode: config.deploymentMode,
-      deploymentExposure: config.deploymentExposure,
-      trustedLocalStdioRuntimeHost: process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
-        ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
-        ?? null,
-    });
     const worktreeRunExecutionActivation = await resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),
     });
@@ -1492,6 +1579,32 @@ export async function startServer(): Promise<StartedServer> {
       );
     } else {
       const startupHeartbeatRecovery = (async () => {
+        try {
+          const nativeRecovery =
+            await heartbeat.recoverNativeRunsAfterRestart();
+          if (nativeRecovery.dispositions.length > 0) {
+            logger.info(
+              {
+                restartKind: nativeRecovery.restartKind,
+                claims: nativeRecovery.claims.map((claim) => ({
+                  runId: claim.runId,
+                  disposition: claim.kind,
+                  controllerGeneration: claim.controllerGeneration,
+                })),
+                awaitingEvidenceRunIds:
+                  nativeRecovery.awaitingEvidenceRunIds,
+                blockedRunIds: nativeRecovery.blockedRunIds,
+              },
+              "startup native runner restart recovery classified",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup native runner restart recovery failed closed",
+          );
+          throw err;
+        }
         try {
           const hotRestart = await heartbeat.reconcileHotRestartAdoption();
           if (hotRestart.mode === "reported") {
@@ -1581,11 +1694,11 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
-        const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
-        if (issueGraphReconciled.escalationsCreated > 0 || issueGraphReconciled.dependencyWakesHealed > 0) {
+        const dependencyWakesReconciled = await heartbeat.reconcileResolvedDependencyWakes();
+        if (dependencyWakesReconciled.healed > 0) {
           logger.warn(
-            { ...issueGraphReconciled },
-            "startup issue-graph liveness reconciliation changed issue graph state",
+            { ...dependencyWakesReconciled },
+            "startup dependency-wake reconciliation restored task execution paths",
           );
         }
 
@@ -1667,6 +1780,7 @@ export async function startServer(): Promise<StartedServer> {
         }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
+        throw err;
       });
       trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
       await startupHeartbeatRecovery;
@@ -1765,6 +1879,8 @@ export async function startServer(): Promise<StartedServer> {
         scheduleMergedOperatorMergeCardSweep();
         schedulePrMergeStateSweep();
         scheduleBranchPrReconcilerSweep();
+        scheduleGitHubConnectionEventPoll();
+        scheduleGitHubConnectionContinuitySweep();
         scheduleTerminalWorkspaceSweep();
         scheduleDoneCloseLandingBackstopSweep();
         scheduleCarrierPromotionSweep();
@@ -1900,9 +2016,9 @@ export async function startServer(): Promise<StartedServer> {
               }
             })
             .then(async () => {
-              const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-              if (reconciled.escalationsCreated > 0 || reconciled.dependencyWakesHealed > 0) {
-                logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
+              const reconciled = await heartbeat.reconcileResolvedDependencyWakes();
+              if (reconciled.healed > 0) {
+                logger.warn({ ...reconciled }, "periodic dependency-wake reconciliation restored task execution paths");
               }
             })
             .then(async () => {
@@ -2009,6 +2125,8 @@ export async function startServer(): Promise<StartedServer> {
       scheduleExternalObjectRefreshSweep(new Date());
       scheduleOpenCodeLogRotationSweep();
       scheduleEnvironmentLeaseCleanupSweep();
+      scheduleGitHubConnectionEventPoll();
+      scheduleGitHubConnectionContinuitySweep();
     });
   }
   
@@ -2106,35 +2224,27 @@ export async function startServer(): Promise<StartedServer> {
     throw err;
   }
 
-  await new Promise<void>((resolveListen, rejectListen) => {
-    const onError = (err: Error) => {
-      server.off("error", onError);
-      rejectListen(err);
-    };
-
-    server.once("error", onError);
-    server.listen(listenPort, config.host, () => {
-      server.off("error", onError);
-      logger.info(`Server listening on ${config.host}:${listenPort}`);
-      void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {
-        if (notified) logger.info("Notified systemd that Paperclip is ready");
+  setStartupRecoveryPhase("ready");
+  logger.info(`Server startup recovery complete on ${config.host}:${listenPort}`);
+  void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {
+    if (notified) logger.info("Notified systemd that Paperclip is ready");
+  });
+  if (process.env.PAPERCLIP_OPEN_ON_LISTEN === "true") {
+    const openHost = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host;
+    const url = `http://${openHost}:${listenPort}`;
+    void import("open")
+      .then((mod) => mod.default(url))
+      .then(() => {
+        logger.info(`Opened browser at ${url}`);
+      })
+      .catch((err) => {
+        logger.warn({ err, url }, "Failed to open browser on startup");
       });
-      if (process.env.PAPERCLIP_OPEN_ON_LISTEN === "true") {
-        const openHost = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host;
-        const url = `http://${openHost}:${listenPort}`;
-        void import("open")
-          .then((mod) => mod.default(url))
-          .then(() => {
-            logger.info(`Opened browser at ${url}`);
-          })
-          .catch((err) => {
-            logger.warn({ err, url }, "Failed to open browser on startup");
-          });
-      }
-        printStartupBanner({
-          bind: config.bind,
-          host: config.host,
-          deploymentMode: config.deploymentMode,
+  }
+  printStartupBanner({
+    bind: config.bind,
+    host: config.host,
+    deploymentMode: config.deploymentMode,
         deploymentExposure: config.deploymentExposure,
         authReady,
         requestedPort: requestedListenPort,
@@ -2148,177 +2258,212 @@ export async function startServer(): Promise<StartedServer> {
         databaseBackupIntervalMinutes: config.databaseBackupIntervalMinutes,
         databaseBackupRetentionDays: config.databaseBackupRetentionDays,
         databaseBackupDir: config.databaseBackupDir,
-      });
-
-      const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
-      if (boardClaimUrl) {
-        const red = "\x1b[41m\x1b[30m";
-        const yellow = "\x1b[33m";
-        const reset = "\x1b[0m";
-        console.log(
-          [
-            `${red}  BOARD CLAIM REQUIRED  ${reset}`,
-            `${yellow}This instance was previously local_trusted and still has local-board as the only admin.${reset}`,
-            `${yellow}Sign in with a real user and open this one-time URL to claim ownership:${reset}`,
-            `${yellow}${boardClaimUrl}${reset}`,
-            `${yellow}If you are connecting over Tailscale, replace the host in this URL with your Tailscale IP/MagicDNS name.${reset}`,
-          ].join("\n"),
-        );
-      }
-
-      resolveListen();
-    });
   });
-  
-  {
-    const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
-      await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
-      heartbeatSchedulerStopped = true;
-      // SUP-14227: surface the latch in the liveness snapshot so a reader can
-      // tell "scheduler stopped (all sweeps frozen)" from "ran, found nothing".
-      sweepLivenessTracker.setSchedulerStopped(true);
-      if (heartbeatSchedulerInterval) {
-        clearInterval(heartbeatSchedulerInterval);
-        heartbeatSchedulerInterval = null;
-      }
-
-      // SUP-10309. Run children are detached, so they never receive the
-      // container's signals -- only this handler can reach them, and only
-      // before Docker's stop timeout SIGKILLs us. Every stage below runs
-      // against one shared budget, and a backstop timer guarantees the exit
-      // even if a stage wedges somewhere this handler cannot bound.
-      const shutdownDeadline = createShutdownDeadline(resolveShutdownDeadlineMs());
-      let killSweepArmed = false;
-      let killSweepDone = false;
-      const killSurvivingRunChildren = (reason: string) => {
-        if (!killSweepArmed || killSweepDone) return;
-        killSweepDone = true;
-        const entries = [...runningProcesses.entries()];
-        if (entries.length === 0) return;
-        const swept = sweepDetachedRunProcesses({ entries });
-        runningProcesses.clear();
-        logger.warn(
-          {
-            signal,
-            reason,
-            killed: swept.signalled.length,
-            alreadyGone: swept.failed.length,
-            untargetable: swept.skipped.length,
-            runIds: swept.signalled,
-          },
-          "SIGKILLed detached run process groups that outlived the graceful drain",
-        );
-      };
-      const forcedExitTimer = setTimeout(() => {
-        killSurvivingRunChildren("shutdown_deadline_exceeded");
-        logger.error(
-          { signal, deadlineMs: shutdownDeadline.totalMs },
-          "shutdown deadline exceeded; forcing exit",
-        );
-        process.exit(0);
-      }, shutdownDeadline.totalMs);
-
-      const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
-        signal,
-        prepareHotRestartShutdown,
-        waitForHeartbeatSchedulerIdle,
-        deadline: shutdownDeadline,
-      });
-      const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
-      // A hot restart deliberately leaves run children alive for the incoming
-      // server to adopt. Arming the sweep on that path would kill exactly what
-      // the restart is trying to preserve.
-      killSweepArmed = !skipHeartbeatDrain;
-      if (heartbeatShutdown.schedulerIdleTimedOut) {
-        logger.warn(
-          { signal, deadlineMs: shutdownDeadline.totalMs },
-          "heartbeat scheduler did not go idle within the shutdown deadline; continuing without it",
-        );
-      }
-      const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
-      if (skipHeartbeatDrain) {
-        logger.info(
-          { signal, hotRestart: heartbeatShutdown.hotRestart },
-          "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
-        );
-      } else if (heartbeatShutdown.preparationError) {
-        logger.error(
-          { err: heartbeatShutdown.preparationError, signal },
-          "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
-        );
-      }
-
-      const telemetryClient = getTelemetryClient();
-      if (telemetryClient) {
-        telemetryClient.stop();
-        await telemetryClient.flush();
-      }
-
-      if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-        try {
-          // The drain waits `graceSec` per run, sequentially, so on a busy
-          // server it alone can outlast the container's stop timeout. Give it
-          // whatever is left of the budget and no more; the kill sweep below
-          // is what guarantees nothing detached survives either way.
-          const drain = await withShutdownDeadline(
-            drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds),
-            shutdownDeadline,
-          );
-          if (drain.completed) {
-            logger.info({ signal, drain: drain.value }, "graceful heartbeat run drain complete");
-          } else {
-            logger.warn(
-              { signal, deadlineMs: shutdownDeadline.totalMs },
-              "graceful heartbeat run drain exceeded the shutdown deadline; killing survivors",
-            );
-          }
-        } catch (err) {
-          logger.error({ err, signal }, "graceful heartbeat run drain failed");
-        }
-      }
-
-      killSurvivingRunChildren("post_drain_sweep");
-
-      // Whatever the drain did not finalize (timed-out runs, the hot-restart
-      // skip path) still has a local-only tail when the in-flight run-log
-      // mirror is enabled; upload those tails now so an orderly restart
-      // never loses run output. No-op when the mirror is off.
-      try {
-        await flushInFlightRunLogMirrors();
-      } catch (err) {
-        logger.error({ err, signal }, "run-log in-flight mirror flush failed");
-      }
-
-      const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
-        ?.paperclipShutdown;
-      const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
-        ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
-        : null;
-
-      // Await the ordered application teardown before the process exits. A live
-      // setup-token login session must stop and release its sandbox lease before
-      // the database and the provider stop, so an orderly shutdown never leaves a
-      // sandbox lease or confidential login state alive past the process exit.
-      await finalizeServerShutdown({
-        signal,
-        shutdownAppServices: appShutdown,
-        stopEmbeddedPostgres,
-        shutdownInstrumentation,
-        shutdownSentry,
-        log: logger,
-      });
-
-      clearTimeout(forcedExitTimer);
-      process.exit(0);
-    };
-
-    process.once("SIGINT", () => {
-      void shutdown("SIGINT");
-    });
-    process.once("SIGTERM", () => {
-      void shutdown("SIGTERM");
-    });
+  const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
+  if (boardClaimUrl) {
+    const red = "\x1b[41m\x1b[30m";
+    const yellow = "\x1b[33m";
+    const reset = "\x1b[0m";
+    console.log(
+      [
+        `${red}  BOARD CLAIM REQUIRED  ${reset}`,
+        `${yellow}This instance was previously local_trusted and still has local-board as the only admin.${reset}`,
+        `${yellow}Sign in with a real user and open this one-time URL to claim ownership:${reset}`,
+        `${yellow}${boardClaimUrl}${reset}`,
+        `${yellow}If you are connecting over Tailscale, replace the host in this URL with your Tailscale IP/MagicDNS name.${reset}`,
+      ].join("\n"),
+    );
   }
+  
+  const shutdown = async (
+    signal: "SIGINT" | "SIGTERM",
+    exitProcess: boolean,
+  ) => {
+    await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
+    heartbeatSchedulerStopped = true;
+    // SUP-14227: surface the latch in the liveness snapshot so a reader can
+    // tell "scheduler stopped (all sweeps frozen)" from "ran, found nothing".
+    sweepLivenessTracker.setSchedulerStopped(true);
+    if (heartbeatSchedulerInterval) {
+      clearInterval(heartbeatSchedulerInterval);
+      heartbeatSchedulerInterval = null;
+    }
+
+    // SUP-10309. Run children are detached, so they never receive the
+    // container's signals -- only this handler can reach them, and only
+    // before Docker's stop timeout SIGKILLs us. Every stage below runs
+    // against one shared budget, and a backstop timer guarantees the exit
+    // even if a stage wedges somewhere this handler cannot bound.
+    const shutdownDeadline = createShutdownDeadline(resolveShutdownDeadlineMs());
+    let killSweepArmed = false;
+    let killSweepDone = false;
+    const killSurvivingRunChildren = (reason: string) => {
+      if (!killSweepArmed || killSweepDone) return;
+      killSweepDone = true;
+      const entries = [...runningProcesses.entries()];
+      if (entries.length === 0) return;
+      const swept = sweepDetachedRunProcesses({ entries });
+      runningProcesses.clear();
+      logger.warn(
+        {
+          signal,
+          reason,
+          killed: swept.signalled.length,
+          alreadyGone: swept.failed.length,
+          untargetable: swept.skipped.length,
+          runIds: swept.signalled,
+        },
+        "SIGKILLed detached run process groups that outlived the graceful drain",
+      );
+    };
+    // The forced exit is a backstop for the signal-driven path only. The
+    // programmatic `StartedServer.shutdown()` (exitProcess=false) must return
+    // to its caller, never exit the host process out from under it.
+    const forcedExitTimer = exitProcess
+      ? setTimeout(() => {
+          killSurvivingRunChildren("shutdown_deadline_exceeded");
+          logger.error(
+            { signal, deadlineMs: shutdownDeadline.totalMs },
+            "shutdown deadline exceeded; forcing exit",
+          );
+          process.exit(0);
+        }, shutdownDeadline.totalMs)
+      : null;
+
+    const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
+      signal,
+      prepareHotRestartShutdown,
+      waitForHeartbeatSchedulerIdle,
+      deadline: shutdownDeadline,
+    });
+    const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+    // A hot restart deliberately leaves run children alive for the incoming
+    // server to adopt. Arming the sweep on that path would kill exactly what
+    // the restart is trying to preserve.
+    killSweepArmed = !skipHeartbeatDrain;
+    if (heartbeatShutdown.schedulerIdleTimedOut) {
+      logger.warn(
+        { signal, deadlineMs: shutdownDeadline.totalMs },
+        "heartbeat scheduler did not go idle within the shutdown deadline; continuing without it",
+      );
+    }
+    const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
+    if (skipHeartbeatDrain) {
+      logger.info(
+        { signal, hotRestart: heartbeatShutdown.hotRestart },
+        "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
+      );
+    } else if (heartbeatShutdown.preparationError) {
+      logger.error(
+        { err: heartbeatShutdown.preparationError, signal },
+        "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
+      );
+    }
+
+    const telemetryClient = getTelemetryClient();
+    if (telemetryClient) {
+      telemetryClient.stop();
+      await telemetryClient.flush();
+    }
+
+    if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
+      try {
+        // The drain waits `graceSec` per run, sequentially, so on a busy
+        // server it alone can outlast the container's stop timeout. Give it
+        // whatever is left of the budget and no more; the kill sweep below
+        // is what guarantees nothing detached survives either way.
+        const drain = await withShutdownDeadline(
+          drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds),
+          shutdownDeadline,
+        );
+        if (drain.completed) {
+          logger.info({ signal, drain: drain.value }, "graceful heartbeat run drain complete");
+        } else {
+          logger.warn(
+            { signal, deadlineMs: shutdownDeadline.totalMs },
+            "graceful heartbeat run drain exceeded the shutdown deadline; killing survivors",
+          );
+        }
+      } catch (err) {
+        logger.error({ err, signal }, "graceful heartbeat run drain failed");
+      }
+    }
+
+    killSurvivingRunChildren("post_drain_sweep");
+
+    if (!skipHeartbeatDrain) {
+      // The execution finalizer drain runs after the kill sweep: an execution
+      // whose child was just killed can now settle instead of holding the drain
+      // open until its own timeout. It is also held to whatever is left of the
+      // shared SUP-10309 budget, so it cannot starve the teardown below.
+      try {
+        const finalizers = await withShutdownDeadline(
+          drainRunExecutionFinalizersForShutdown({
+            signal,
+            drain: drainHeartbeatExecutionFinalizers,
+            log: logger,
+          }),
+          shutdownDeadline,
+        );
+        if (!finalizers.completed) {
+          logger.warn(
+            { signal, deadlineMs: shutdownDeadline.totalMs },
+            "heartbeat execution finalizer drain exceeded the shutdown deadline; continuing",
+          );
+        }
+      } catch (err) {
+        logger.error({ err, signal }, "heartbeat execution finalizer drain failed");
+      }
+    }
+
+    // Whatever the drain did not finalize (timed-out runs, the hot-restart
+    // skip path) still has a local-only tail when the in-flight run-log
+    // mirror is enabled; upload those tails now so an orderly restart
+    // never loses run output. No-op when the mirror is off.
+    try {
+      await flushInFlightRunLogMirrors();
+    } catch (err) {
+      logger.error({ err, signal }, "run-log in-flight mirror flush failed");
+    }
+
+    const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
+      ?.paperclipShutdown;
+    const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
+      ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
+      : null;
+
+    // Await the ordered application teardown before the process exits. A live
+    // setup-token login session must stop and release its sandbox lease before
+    // the database and the provider stop, so an orderly shutdown never leaves a
+    // sandbox lease or confidential login state alive past the process exit.
+    await finalizeServerShutdown({
+      signal,
+      shutdownAppServices: appShutdown,
+      stopEmbeddedPostgres,
+      shutdownInstrumentation,
+      shutdownSentry,
+      log: logger,
+    });
+
+    if (!exitProcess && server.listening) {
+      await new Promise<void>((resolveClose, rejectClose) => {
+        server.close((err) => {
+          if (err) rejectClose(err);
+          else resolveClose();
+        });
+      });
+    }
+
+    if (forcedExitTimer) clearTimeout(forcedExitTimer);
+    if (exitProcess) process.exit(0);
+  };
+
+  process.once("SIGINT", () => {
+    void shutdown("SIGINT", true);
+  });
+  process.once("SIGTERM", () => {
+    void shutdown("SIGTERM", true);
+  });
 
   return {
     server,
@@ -2326,7 +2471,35 @@ export async function startServer(): Promise<StartedServer> {
     listenPort,
     apiUrl: configuredApiUrl,
     databaseUrl: activeDatabaseConnectionString,
+    shutdown: (signal = "SIGTERM") => shutdown(signal, false),
   };
+  } catch (error) {
+    if (startupListenerBound) {
+      await new Promise<void>((resolveClose) => {
+        try {
+          server.close((closeError?: Error) => {
+            if (
+              closeError &&
+              (closeError as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING"
+            ) {
+              logger.error(
+                { err: closeError },
+                "failed to close HTTP listener after startup failure",
+              );
+            }
+            resolveClose();
+          });
+        } catch (closeError) {
+          logger.error(
+            { err: closeError },
+            "failed to close HTTP listener after startup failure",
+          );
+          resolveClose();
+        }
+      });
+    }
+    throw error;
+  }
 }
 
 function isMainModule(metaUrl: string): boolean {
@@ -2342,7 +2515,12 @@ function isMainModule(metaUrl: string): boolean {
 if (isMainModule(import.meta.url)) {
   void startServer().catch(async (err) => {
     logger.error({ err }, "Paperclip server failed to start");
-    captureException(err);
+    // Supervised-transient refusals in managed-cloud deployments are an
+    // expected provisioning phase (see startup-refusals.ts) — they log
+    // and exit nonzero but do not page Sentry.
+    if (shouldReportStartupFailure(err)) {
+      captureException(err);
+    }
     await shutdownSentry();
     process.exit(1);
   });

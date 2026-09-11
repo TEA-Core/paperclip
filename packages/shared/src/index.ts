@@ -314,6 +314,7 @@ export {
 } from "./app-definitions.js";
 export { APP_DEFINITIONS } from "./app-definitions.generated.js";
 export * from "./google-workspace-connectors.js";
+export * from "./github-connectors.js";
 export {
   BLOCKED_MCP_PROVIDERS,
   SELF_SERVE_MCP_CANDIDATES,
@@ -366,7 +367,6 @@ export {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   WORKSPACE_BRANCH_ROUTINE_VARIABLE,
   ADAPTER_AGNOSTIC_KEYS,
-  MODEL_PROFILE_KEYS,
   AGENT_ICON_NAMES,
   PROJECT_ICON_NAMES,
   ISSUE_STATUSES,
@@ -566,7 +566,6 @@ export {
   type AgentAdapterType,
   type AgentRole,
   type AdapterAgnosticKey,
-  type ModelProfileKey,
   type AgentIconName,
   type ProjectIconName,
   type IssueStatus,
@@ -899,8 +898,6 @@ export type {
   InstanceSettings,
   ManagedExperimentalFeatureKey,
   ManagedSettingMetadata,
-  IssueGraphLivenessAutoRecoveryPreview,
-  IssueGraphLivenessAutoRecoveryPreviewItem,
   BackupRetentionPolicy,
   Agent,
   AgentAccessState,
@@ -1060,6 +1057,9 @@ export type {
   DocumentTextRange,
   UpdateDocumentAnnotationThreadRequest,
   AttachmentArtifactWorkProductMetadata,
+  PullRequestWorkProductState,
+  PullRequestWorkProductMetadata,
+  CommitWorkProductMetadata,
   ExternalObject,
   ExternalObjectMention,
   ExternalObjectMentionGroup,
@@ -1447,6 +1447,7 @@ export type {
   ToolConnectionTestToolAccess,
   ToolConnectionAccessSummary,
   ToolConnectionTestAgent,
+  ToolConnectionTestAgentAccessResponse,
   ToolConnectionTestAgentsResponse,
   ToolConnectionTestCallResult,
   ToolConnectionTestCallStatus,
@@ -1736,9 +1737,6 @@ export {
   WEEKLY_RETENTION_PRESETS,
   MONTHLY_RETENTION_PRESETS,
   DEFAULT_BACKUP_RETENTION,
-  DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
-  MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
-  MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   PAPERCLIP_CLOUD_MANAGED_BY,
 } from "./types/instance.js";
 
@@ -1782,7 +1780,6 @@ export {
   managedSettingMetadataSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceSettingsSchema,
-  issueGraphLivenessAutoRecoveryRequestSchema,
   createSmokeRunSchema,
   updateSmokeRunSchema,
   recordSmokeRunStepSchema,
@@ -1798,7 +1795,6 @@ export {
   trustAuthorizationPolicySchema,
   type PatchInstanceExperimentalSettings,
   type PatchInstanceSettings,
-  type IssueGraphLivenessAutoRecoveryRequest,
   type CreateSmokeRun,
   type UpdateSmokeRun,
   type RecordSmokeRunStep,
@@ -1853,6 +1849,7 @@ export {
   agentSkillSyncSchema,
   type AgentSkillSync,
   createAgentSchema,
+  agentRuntimeConfigSchema,
   builtInAgentEmptyMutationSchema,
   builtInAgentProvisionSchema,
   builtInAgentResetSchema,
@@ -2749,3 +2746,4 @@ export {
   isPaperclipDevRunnerCommand,
   rewriteUrlHostToLoopback,
 } from "./runtime-exposure/loopback-bind.js";
+export { ACCOUNT_HANDLE_MAX_LENGTH, toAccountHandle } from "./account-handle.js";
