@@ -83,6 +83,12 @@ export {
   type CarrierPromotionSweepResult,
 } from "./carrier-promotion-sweep.js";
 export {
+  SUMMARY_SLOT_REFRESH_ACTOR_ID,
+  createSummarySlotRefreshSweepService,
+  type SummarySlotRefreshSweepOptions,
+  type SummarySlotRefreshSweepResult,
+} from "./summary-slot-refresh-sweep.js";
+export {
   CARRIER_ORPHAN_JANITOR_ACTOR_ID,
   CARRIER_ORPHAN_JANITOR_CLOSED_ACTION,
   closeGitHubPullRequest,

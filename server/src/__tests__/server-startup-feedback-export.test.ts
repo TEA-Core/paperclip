@@ -325,6 +325,16 @@ vi.mock("../services/index.js", () => ({
   createDoneCloseLandingBackstopService: vi.fn(() => ({
     sweep: vi.fn(async () => ({ due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0 })),
   })),
+  createSummarySlotRefreshSweepService: vi.fn(() => ({
+    sweep: vi.fn(async () => ({
+      due: false,
+      summariesEnabled: false,
+      candidates: 0,
+      claimed: 0,
+      inFlight: 0,
+      failed: 0,
+    })),
+  })),
   feedbackService: feedbackServiceFactoryMock,
   bootstrapExecutionPolicyFromEnv: vi.fn(async () => null),
   applyManagedEnvironments: vi.fn(async () => null),
