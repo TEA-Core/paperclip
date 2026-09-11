@@ -12,6 +12,7 @@ import {
 import {
   type GenerateSummarySlotResponse,
   type GetSummarySlotResponse,
+  type IssueExecutionStagePrincipal,
   type IssueStatus,
   type ListSummarySlotRevisionsResponse,
   type SummarySlot,
@@ -132,6 +133,36 @@ function scopeLabel(scopeKind: SummarySlotScopeKind): string {
     default:
       return "target";
   }
+}
+
+/**
+ * Summary-generation issues are the Summarizer's to own: they carry the
+ * sentinel payload and only the Summarizer may write the slot (see
+ * `assertSummarizerWriter`). A review-stage `changes_requested` bounce must
+ * therefore always route back to the Summarizer agent, never to a
+ * `returnAssigneeAgentId` that a policy may have been given. This returns the
+ * Summarizer principal when the issue is an active (or terminal-cleared)
+ * generation task for some slot in its company, and `null` otherwise so
+ * non-summary issues keep their normal return-assignee routing.
+ */
+export async function resolveSummaryGenerationReturnAssignee(
+  db: Db,
+  issue: { id: string; companyId: string },
+): Promise<IssueExecutionStagePrincipal | null> {
+  const slot = await db
+    .select({ id: summarySlots.id })
+    .from(summarySlots)
+    .where(
+      and(
+        eq(summarySlots.companyId, issue.companyId),
+        eq(summarySlots.generatingIssueId, issue.id),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+  if (!slot) return null;
+  const builtIn = await builtInAgentService(db).get(issue.companyId, SUMMARIZER_BUILT_IN_KEY);
+  if (builtIn.status !== "ready" || !builtIn.agentId) return null;
+  return { type: "agent", agentId: builtIn.agentId, userId: null };
 }
 
 export function summarySlotService(db: Db) {

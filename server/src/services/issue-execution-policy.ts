@@ -53,6 +53,14 @@ type TransitionInput = {
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
+  /**
+   * When set, a `changes_requested` bounce routes to this principal instead of
+   * the policy/legacy return assignee. The summary-generation issue path uses
+   * it to guarantee the task always bounces back to the Summarizer agent even
+   * when its policy carries a non-Summarizer `returnAssigneeAgentId`
+   * (SUP-15768).
+   */
+  forcedReturnAssignee?: IssueExecutionStagePrincipal | null;
 };
 
 export type ReviewEscalationSignal = {
@@ -1146,11 +1154,13 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Requesting changes requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
         }
-        const returnAssignee = resolveReturnAssignee({
-          policy: input.policy,
-          existingState,
-          currentAssignee,
-        });
+        const returnAssignee =
+          input.forcedReturnAssignee ??
+          resolveReturnAssignee({
+            policy: input.policy,
+            existingState,
+            currentAssignee,
+          });
         if (!returnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
         }

@@ -276,6 +276,7 @@ import {
   setIssueExecutionPolicyMonitorScheduledBy,
   type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
+import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../services/issue-assignee-review-gate.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -804,6 +805,12 @@ async function applyReviewEscalationDecision(args: {
   const existingState = parseIssueExecutionState(issue.executionState);
   if (!policy || !existingState) return null;
 
+  // Re-opening an escalated review bounces the summary-generation task back to
+  // the Summarizer, never to a policy `returnAssigneeAgentId` (SUP-15768).
+  const summaryForcedReturnAssignee =
+    requestedStatus === "in_progress"
+      ? await resolveSummaryGenerationReturnAssignee(db, issue)
+      : null;
   const transition = applyIssueExecutionPolicyTransition({
     issue,
     policy,
@@ -812,6 +819,7 @@ async function applyReviewEscalationDecision(args: {
     requestedAssigneePatch: {},
     actor,
     commentBody: decisionBody,
+    forcedReturnAssignee: summaryForcedReturnAssignee,
   });
   if (!transition.decision) return null;
   const decisionId = randomUUID();
@@ -12541,11 +12549,20 @@ export function issueRoutes(
       }
     }
 
+    const requestedTransitionStatus =
+      typeof updateFields.status === "string" ? updateFields.status : undefined;
+    // A summary-generation issue must always bounce back to the Summarizer
+    // agent, never to a policy `returnAssigneeAgentId` (SUP-15768). Only the
+    // status-transition path can trigger a `changes_requested` bounce, so the
+    // lookup is skipped for statusless patches.
+    const summaryForcedReturnAssignee = requestedTransitionStatus
+      ? await resolveSummaryGenerationReturnAssignee(db, existing)
+      : null;
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
       previousPolicy: previousExecutionPolicy,
-      requestedStatus: typeof updateFields.status === "string" ? updateFields.status : undefined,
+      requestedStatus: requestedTransitionStatus,
       requestedAssigneePatch: {
         assigneeAgentId: normalizedAssigneeAgentId,
         assigneeUserId:
@@ -12559,6 +12576,7 @@ export function issueRoutes(
       commentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
+      forcedReturnAssignee: summaryForcedReturnAssignee,
     });
     const decisionId = transition.decision ? randomUUID() : null;
     if (decisionId) {

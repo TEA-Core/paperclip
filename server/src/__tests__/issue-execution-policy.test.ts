@@ -2901,6 +2901,79 @@ describe("issue execution policy transitions", () => {
         lastDecisionOutcome: "changes_requested",
       });
     });
+
+    it("routes changes_requested to a forced return assignee even when returnAssigneeAgentId is set", () => {
+      const policy = policyWithReturnAssignee(returnAgentId);
+      const reviewStageId = policy.stages[0].id;
+      const summarizerAgentId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Needs fixes",
+        forcedReturnAssignee: { type: "agent", agentId: summarizerAgentId, userId: null },
+      });
+
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBe(summarizerAgentId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        returnAssignee: { type: "agent", agentId: summarizerAgentId },
+        lastDecisionOutcome: "changes_requested",
+      });
+    });
+
+    it("keeps legacy routing when forcedReturnAssignee is null", () => {
+      const policy = policyWithReturnAssignee(returnAgentId);
+      const reviewStageId = policy.stages[0].id;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Needs fixes",
+        forcedReturnAssignee: null,
+      });
+
+      expect(result.patch.assigneeAgentId).toBe(returnAgentId);
+    });
   });
 
   describe("a stage gated solely by its own return assignee fails loud", () => {
