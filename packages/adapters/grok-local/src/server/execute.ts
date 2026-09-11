@@ -379,6 +379,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                     readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
                     hostHomeDir: hostGrokHome,
                     log: (line) => onLog("stdout", `${line}\n`),
+                    // spawn-env-guard: read-only — copyBackGrokAuth only reads
+                    // PAPERCLIP_HOME / PAPERCLIP_INSTANCE_ID to locate the managed
+                    // Grok home and its lock; nothing is spawned with this env, and
+                    // sanitizing would strip exactly those keys.
                     env: process.env,
                   }).catch(() => undefined)),
               },
