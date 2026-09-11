@@ -27,7 +27,7 @@ const isProduction = process.env.NODE_ENV === "production";
 // handle this module could close, so every extra evaluation leaks one worker
 // thread, one MessagePort and that worker's whole V8 isolate for the life of
 // the process. A server process evaluates this module once, so the cache is
-// inert in production. The server test suites do not: 47 files under
+// inert in production. The server test suites do not: 46 files under
 // `server/src/__tests__` call `vi.resetModules()` in `beforeEach` and then
 // re-import a module that reaches this one, so the module is evaluated once
 // per test and a 50-test suite ends holding 50 live worker threads.

@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * re-evaluates the module leaks one worker — thread, MessagePort and V8
  * isolate — per evaluation, for the life of the process.
  *
- * That is not hypothetical: 47 files under `server/src/__tests__` call
+ * That is not hypothetical: 46 files under `server/src/__tests__` call
  * `vi.resetModules()` in `beforeEach` and then re-import a module that reaches
  * this one, so a 50-test suite re-evaluates it 50 times. This test pins the
  * transport to one per process, and fails if the cache is ever removed.
