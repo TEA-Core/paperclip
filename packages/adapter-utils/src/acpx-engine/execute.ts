@@ -3603,6 +3603,20 @@ async function readChildStderrTail(input: {
   }
 }
 
+// The ACP SDK reports an agent-side exception as JSON-RPC -32603 "Internal error"
+// and carries the underlying message only in `data.details` (for example the SDK
+// failing to spawn the CLI in a cwd the agent uid cannot enter). Like the stderr
+// tail it is child-provided text, so it rides the same suppression flag.
+function readAcpErrorDetails(err: unknown): string | null {
+  if (!err || typeof err !== "object") return null;
+  const data = (err as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const details = (data as { details?: unknown }).details;
+  if (typeof details !== "string") return null;
+  const trimmed = details.trim();
+  return trimmed.length > 0 ? trimmed.slice(0, 4096) : null;
+}
+
 async function emitAcpxFailure(input: {
   ctx: AdapterExecutionContext;
   prepared: AcpxPreparedRuntime;
@@ -3631,6 +3645,7 @@ async function emitAcpxFailure(input: {
   const childStderrTail = suppressChildStderrTail
     ? null
     : await readChildStderrTail({ logPath: prepared.childStderrLogPath });
+  const acpErrorDetails = suppressChildStderrTail ? null : readAcpErrorDetails(err);
   if (childStderrTail) {
     await ctx.onLog(
       "stderr",
@@ -3643,6 +3658,7 @@ async function emitAcpxFailure(input: {
     phase,
     ...classified.errorMeta,
     ...(childStderrTail ? { childStderrTail } : {}),
+    ...(acpErrorDetails ? { acpErrorDetails } : {}),
   });
   return { classified, message, childStderrTail };
 }
@@ -5052,12 +5068,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
         const terminalFailureClassification =
           terminal.status === "failed" ? classifyError(acpErrorFromTerminalError(terminal.error), "turn") : null;
+        const terminalErrorDetails = terminal.status === "failed" ? readAcpErrorDetails(terminal.error) : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
           summary: channelLost ? "duplex_channel_lost" : terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
           ...(terminalFailureClassification ? { errorCode: terminalFailureClassification.errorCode } : {}),
+          ...(terminalErrorDetails ? { acpErrorDetails: terminalErrorDetails } : {}),
         });
         // The one clean-completion path clears the run failure flag; every other
         // path keeps it set, so the run root span closes with error status. A
